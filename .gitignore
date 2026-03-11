@@ -1,0 +1,19 @@
+## Build output
+**/bin/
+**/obj/
+
+## IDE
+.vs/
+*.user
+*.suo
+
+## OS
+Thumbs.db
+.DS_Store
+
+## Runtime state
+workspaces/
+agents/history/
+
+## Secrets
+.env
