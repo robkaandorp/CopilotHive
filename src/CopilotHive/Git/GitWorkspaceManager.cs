@@ -21,19 +21,20 @@ public sealed class GitWorkspaceManager
 
         if (!Directory.Exists(Path.Combine(_bareRepoPath, "HEAD")))
         {
-            await RunGitAsync(_bareRepoPath, ["init", "--bare"], ct);
+            await RunGitAsync(_bareRepoPath, ["init", "--bare", "--initial-branch=main"], ct);
             // Create an initial commit so main branch exists
             var tempClone = Path.Combine(_workspacePath, "_init-temp");
             try
             {
                 await RunGitAsync(_workspacePath, ["clone", _bareRepoPath, "_init-temp"], ct);
+                await RunGitAsync(tempClone, ["config", "user.email", "copilothive@local"], ct);
+                await RunGitAsync(tempClone, ["config", "user.name", "CopilotHive"], ct);
                 await RunGitAsync(tempClone, ["commit", "--allow-empty", "-m", "Initial commit"], ct);
                 await RunGitAsync(tempClone, ["push", "origin", "main"], ct);
             }
             finally
             {
-                if (Directory.Exists(tempClone))
-                    Directory.Delete(tempClone, recursive: true);
+                await ForceDeleteDirectoryAsync(tempClone);
             }
         }
     }
@@ -43,9 +44,14 @@ public sealed class GitWorkspaceManager
         var clonePath = Path.Combine(_workspacePath, workerName);
 
         if (Directory.Exists(clonePath))
-            Directory.Delete(clonePath, recursive: true);
+            await ForceDeleteDirectoryAsync(clonePath);
 
         await RunGitAsync(_workspacePath, ["clone", _bareRepoPath, workerName], ct);
+
+        // Configure git user so commits work in isolated clones
+        await RunGitAsync(clonePath, ["config", "user.email", "copilothive@local"], ct);
+        await RunGitAsync(clonePath, ["config", "user.name", "CopilotHive"], ct);
+
         return clonePath;
     }
 
@@ -90,6 +96,37 @@ public sealed class GitWorkspaceManager
     public async Task<string> GetDiffAsync(string clonePath, string baseBranch = "main", CancellationToken ct = default)
     {
         return await RunGitAsync(clonePath, ["diff", baseBranch], ct);
+    }
+
+    /// <summary>
+    /// Delete a directory with retries — on Windows, git processes may hold brief file locks.
+    /// </summary>
+    private static async Task ForceDeleteDirectoryAsync(string path, int maxRetries = 5)
+    {
+        for (var i = 0; i < maxRetries; i++)
+        {
+            if (!Directory.Exists(path))
+                return;
+
+            try
+            {
+                // Clear read-only attributes that git sets on pack files
+                foreach (var file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
+                {
+                    File.SetAttributes(file, FileAttributes.Normal);
+                }
+                Directory.Delete(path, recursive: true);
+                return;
+            }
+            catch (UnauthorizedAccessException) when (i < maxRetries - 1)
+            {
+                await Task.Delay(200 * (i + 1));
+            }
+            catch (IOException) when (i < maxRetries - 1)
+            {
+                await Task.Delay(200 * (i + 1));
+            }
+        }
     }
 
     private static async Task<string> RunGitAsync(string workingDir, string[] args, CancellationToken ct)

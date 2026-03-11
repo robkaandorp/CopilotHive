@@ -10,9 +10,14 @@ public sealed class CopilotWorkerClient : IAsyncDisposable
 {
     private readonly CopilotClient _client;
     private CopilotSession? _session;
+    private readonly int _port;
+
+    public int MaxConnectRetries { get; init; } = 12;
+    public TimeSpan RetryDelay { get; init; } = TimeSpan.FromSeconds(5);
 
     public CopilotWorkerClient(int port, string model, string? gitHubToken = null)
     {
+        _port = port;
         _client = new CopilotClient(new CopilotClientOptions
         {
             CliUrl = $"localhost:{port}",
@@ -23,11 +28,30 @@ public sealed class CopilotWorkerClient : IAsyncDisposable
 
     public async Task ConnectAsync(CancellationToken ct = default)
     {
-        await _client.StartAsync();
-        _session = await _client.CreateSessionAsync(new SessionConfig
+        Exception? lastException = null;
+
+        for (var attempt = 1; attempt <= MaxConnectRetries; attempt++)
         {
-            Streaming = false,
-        });
+            try
+            {
+                await _client.StartAsync();
+                _session = await _client.CreateSessionAsync(new SessionConfig
+                {
+                    Streaming = false,
+                });
+                Console.WriteLine($"[SDK] Connected to worker on port {_port} (attempt {attempt})");
+                return;
+            }
+            catch (Exception ex) when (attempt < MaxConnectRetries)
+            {
+                lastException = ex;
+                Console.WriteLine($"[SDK] Connection attempt {attempt}/{MaxConnectRetries} to port {_port} failed: {ex.Message}");
+                await Task.Delay(RetryDelay, ct);
+            }
+        }
+
+        throw new CopilotWorkerException(
+            $"Failed to connect to worker on port {_port} after {MaxConnectRetries} attempts: {lastException?.Message}");
     }
 
     /// <summary>
