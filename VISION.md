@@ -192,20 +192,40 @@ and **Ollama**. This means:
 
 ## Roadmap
 
-### v0.1 — Prove the Loop
+### v0.1 — Prove the Loop ✅
 Orchestrator + Coder + Tester. Minimal working loop that delegates a coding task,
 runs tests, collects metrics, and iterates.
 
-### v0.2 — Reviewer + Metrics-Driven Improvement
+### v0.2 — Bootstrap: CopilotHive Develops Itself
+The first real workload for CopilotHive is **itself**. This is the ultimate validation:
+if the system can't improve its own codebase, it can't improve anything else.
+
+**The bootstrap sequence:**
+1. Add a test project so the tester has something to measure.
+2. Run CopilotHive with `--goal="Write unit tests for the CopilotHive codebase"` —
+   the coder writes tests, the tester runs them, metrics are established.
+3. Run CopilotHive with `--goal="Add retry logic and error handling"` —
+   measurable improvement over the baseline.
+4. Run CopilotHive with `--goal="Implement AGENTS.md self-improvement"` —
+   the system begins evolving its own instructions.
+
+**Why this works:**
+- The codebase is small and self-contained — perfect scope for early iterations.
+- Clear metrics: does it build? Do tests pass? Does the loop complete?
+- Improvements compound — if the coder improves the orchestrator, the next iteration
+  benefits immediately.
+- It validates the architecture end-to-end.
+
+### v0.3 — Reviewer + Metrics-Driven Improvement
 Add the reviewer role. Orchestrator rewrites worker AGENTS.md based on metrics.
 Iteration-over-iteration comparison.
 
-### v0.3 — Self-Improving Orchestrator
+### v0.4 — Self-Improving Orchestrator
 Orchestrator updates its own AGENTS.md. Rollback on regression. Version history
 as a feedback signal.
 
-### v0.4 — Dynamic Scaling + Merge Worker + Docs
+### v0.5 — Dynamic Scaling + Merge Worker + Docs
 Dynamic worker count. Merge worker for conflict resolution. Documentation writer.
 
-### v0.5 — BYOK / Multi-Model
+### v0.6 — BYOK / Multi-Model
 Different models per role. Ollama for simple tasks. Cost optimization.
