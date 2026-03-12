@@ -4,7 +4,7 @@ using CopilotHive.Configuration;
 
 namespace CopilotHive.Workers;
 
-public sealed class DockerWorkerManager : IAsyncDisposable
+public sealed class DockerWorkerManager : IWorkerManager
 {
     private readonly DockerClient _docker;
     private readonly HiveConfiguration _config;

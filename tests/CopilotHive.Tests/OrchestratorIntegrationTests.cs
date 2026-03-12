@@ -1,0 +1,342 @@
+using CopilotHive.Configuration;
+using CopilotHive.Orchestration;
+using CopilotHive.Tests.Fakes;
+using CopilotHive.Workers;
+
+namespace CopilotHive.Tests;
+
+public class OrchestratorIntegrationTests : IDisposable
+{
+    private readonly string _tempDir;
+
+    public OrchestratorIntegrationTests()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-orch-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_tempDir);
+        // Create agents directory with required AGENTS.md files
+        var agentsDir = Path.Combine(_tempDir, "agents");
+        Directory.CreateDirectory(agentsDir);
+        File.WriteAllText(Path.Combine(agentsDir, "coder.agents.md"), "# Coder\nYou write code.");
+        File.WriteAllText(Path.Combine(agentsDir, "tester.agents.md"), "# Tester\nYou test code.");
+    }
+
+    private HiveConfiguration CreateConfig(int maxIterations = 1, int maxRetries = 0) => new()
+    {
+        Goal = "Write a hello world program",
+        WorkspacePath = Path.Combine(_tempDir, "workspaces"),
+        AgentsPath = Path.Combine(_tempDir, "agents"),
+        MetricsPath = Path.Combine(_tempDir, "metrics"),
+        MaxIterations = maxIterations,
+        MaxRetriesPerTask = maxRetries,
+        GitHubToken = "fake-token",
+    };
+
+    [Fact]
+    public async Task FullIteration_CoderThenTester_SpawnsCorrectRoles()
+    {
+        var workerManager = new FakeWorkerManager();
+        var clientFactory = new FakeCopilotClientFactory(prompt =>
+        {
+            if (prompt.Contains("You are working on this goal"))
+                return "I wrote the code and unit tests. All committed.";
+
+            return """
+                Build succeeded. Tests run.
+
+                TEST_REPORT:
+                build_success: true
+                unit_tests_total: 5
+                unit_tests_passed: 5
+                integration_tests_total: 2
+                integration_tests_passed: 2
+                runtime_verified: true
+                coverage_percent: 85
+                verdict: PASS
+                summary: All tests pass, application starts correctly.
+                issues:
+                """;
+        });
+
+        var config = CreateConfig();
+        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await orchestrator.RunAsync();
+
+        // Verify both coder and tester were spawned
+        Assert.Contains(workerManager.SpawnHistory, s => s.Role == WorkerRole.Coder);
+        Assert.Contains(workerManager.SpawnHistory, s => s.Role == WorkerRole.Tester);
+    }
+
+    [Fact]
+    public async Task FullIteration_PassingTests_MergesToMain()
+    {
+        var workerManager = new FakeWorkerManager();
+        var clientFactory = new FakeCopilotClientFactory(prompt =>
+        {
+            if (prompt.Contains("You are working on this goal"))
+                return "Code written and committed.";
+
+            return """
+                TEST_REPORT:
+                build_success: true
+                unit_tests_total: 3
+                unit_tests_passed: 3
+                integration_tests_total: 1
+                integration_tests_passed: 1
+                runtime_verified: true
+                coverage_percent: 90
+                verdict: PASS
+                summary: Everything passes.
+                issues:
+                """;
+        });
+
+        var config = CreateConfig();
+        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await orchestrator.RunAsync();
+
+        // Coder(1) + Tester(1) = 2 worker spawns (merge uses git directly, no worker)
+        Assert.Equal(2, workerManager.SpawnHistory.Count);
+    }
+
+    [Fact]
+    public async Task FailingTests_TriggersRetryLoop()
+    {
+        var callCount = 0;
+        var workerManager = new FakeWorkerManager();
+        var clientFactory = new FakeCopilotClientFactory(prompt =>
+        {
+            if (prompt.Contains("You are working on this goal"))
+                return "Code written.";
+
+            if (prompt.Contains("tester found issues"))
+                return "Fixed the bugs.";
+
+            callCount++;
+            // First test run fails, second passes
+            if (callCount <= 1)
+                return """
+                    TEST_REPORT:
+                    build_success: true
+                    unit_tests_total: 5
+                    unit_tests_passed: 3
+                    integration_tests_total: 0
+                    integration_tests_passed: 0
+                    runtime_verified: false
+                    coverage_percent: 60
+                    verdict: FAIL
+                    summary: Two tests failing, app crashes on startup.
+                    issues:
+                    - NullReferenceException in Program.Main
+                    - Missing error handling in FileReader
+                    """;
+
+            return """
+                TEST_REPORT:
+                build_success: true
+                unit_tests_total: 5
+                unit_tests_passed: 5
+                integration_tests_total: 1
+                integration_tests_passed: 1
+                runtime_verified: true
+                coverage_percent: 82
+                verdict: PASS
+                summary: All issues resolved.
+                issues:
+                """;
+        });
+
+        var config = CreateConfig(maxRetries: 2);
+        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await orchestrator.RunAsync();
+
+        // Should have: coder + tester(fail) + coder(fix) + tester(pass) + merge
+        Assert.True(workerManager.SpawnHistory.Count >= 4);
+    }
+
+    [Fact]
+    public async Task WorkersAreStoppedAfterUse()
+    {
+        var workerManager = new FakeWorkerManager();
+        var clientFactory = new FakeCopilotClientFactory(_ => """
+            TEST_REPORT:
+            build_success: true
+            unit_tests_total: 1
+            unit_tests_passed: 1
+            integration_tests_total: 0
+            integration_tests_passed: 0
+            runtime_verified: true
+            coverage_percent: 100
+            verdict: PASS
+            summary: Done.
+            issues:
+            """);
+
+        var config = CreateConfig();
+        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await orchestrator.RunAsync();
+
+        // All spawned workers should have been stopped
+        Assert.Empty(workerManager.Workers);
+        Assert.Equal(workerManager.SpawnHistory.Count, workerManager.StopHistory.Count);
+    }
+
+    [Fact]
+    public async Task ParseTestReport_ExtractsAllFields()
+    {
+        var workerManager = new FakeWorkerManager();
+        var clientFactory = new FakeCopilotClientFactory(prompt =>
+        {
+            if (prompt.Contains("You are working on this goal"))
+                return "Code done.";
+
+            return """
+                Some preamble text here.
+
+                TEST_REPORT:
+                build_success: true
+                unit_tests_total: 12
+                unit_tests_passed: 10
+                integration_tests_total: 3
+                integration_tests_passed: 3
+                runtime_verified: true
+                coverage_percent: 78.5
+                verdict: PARTIAL
+                summary: Build works, most tests pass, but 2 unit tests failing.
+                issues:
+                - TimeoutException in async test
+                - Off-by-one error in pagination
+                """;
+        });
+
+        var config = CreateConfig();
+        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await orchestrator.RunAsync();
+
+        // Verify metrics were recorded — check the metrics file
+        var metricsDir = Path.Combine(_tempDir, "metrics");
+        Assert.True(Directory.Exists(metricsDir));
+        var metricsFiles = Directory.GetFiles(metricsDir, "*.json");
+        Assert.NotEmpty(metricsFiles);
+
+        var json = await File.ReadAllTextAsync(metricsFiles[0]);
+        Assert.Contains("\"totalTests\": 12", json);
+        Assert.Contains("\"passedTests\": 10", json);
+        Assert.Contains("\"integrationTestsTotal\": 3", json);
+        Assert.Contains("\"runtimeVerified\": true", json);
+        Assert.Contains("\"verdict\": \"PARTIAL\"", json);
+    }
+
+    [Fact]
+    public async Task MultipleIterations_StopsOnAllTestsPassing()
+    {
+        var iterationCount = 0;
+        var workerManager = new FakeWorkerManager();
+        var clientFactory = new FakeCopilotClientFactory(prompt =>
+        {
+            if (prompt.Contains("You are working on this goal"))
+            {
+                iterationCount++;
+                return $"Iteration {iterationCount} code.";
+            }
+
+            return """
+                TEST_REPORT:
+                build_success: true
+                unit_tests_total: 3
+                unit_tests_passed: 3
+                integration_tests_total: 0
+                integration_tests_passed: 0
+                runtime_verified: true
+                coverage_percent: 90
+                verdict: PASS
+                summary: All good.
+                issues:
+                """;
+        });
+
+        var config = CreateConfig(maxIterations: 5);
+        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await orchestrator.RunAsync();
+
+        // Should stop after first iteration since all tests pass
+        Assert.Equal(1, iterationCount);
+    }
+
+    [Fact]
+    public async Task BackwardsCompatible_OldMetricsFormat_StillParsed()
+    {
+        var workerManager = new FakeWorkerManager();
+        var clientFactory = new FakeCopilotClientFactory(prompt =>
+        {
+            if (prompt.Contains("You are working on this goal"))
+                return "Done.";
+
+            // Old format without TEST_REPORT block
+            return """
+                METRICS:
+                total_tests: 8
+                passed_tests: 8
+                failed_tests: 0
+                coverage_percent: 75
+                """;
+        });
+
+        var config = CreateConfig();
+        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await orchestrator.RunAsync();
+
+        // Should still parse and record — verify no crash
+        var metricsFiles = Directory.GetFiles(Path.Combine(_tempDir, "metrics"), "*.json");
+        Assert.NotEmpty(metricsFiles);
+
+        var json = await File.ReadAllTextAsync(metricsFiles[0]);
+        Assert.Contains("\"totalTests\": 8", json);
+        Assert.Contains("\"passedTests\": 8", json);
+    }
+
+    [Fact]
+    public async Task ClientFactory_CreatesClientPerWorker()
+    {
+        var clientFactory = new FakeCopilotClientFactory(_ => """
+            TEST_REPORT:
+            build_success: true
+            unit_tests_total: 1
+            unit_tests_passed: 1
+            integration_tests_total: 0
+            integration_tests_passed: 0
+            runtime_verified: true
+            coverage_percent: 100
+            verdict: PASS
+            summary: Pass.
+            issues:
+            """);
+
+        var config = CreateConfig();
+        await using var orchestrator = new Orchestrator(config, new FakeWorkerManager(), clientFactory);
+        await orchestrator.RunAsync();
+
+        // Each worker gets its own client (coder + tester = 2)
+        Assert.Equal(2, clientFactory.CreatedClients.Count);
+        Assert.All(clientFactory.CreatedClients, c => Assert.True(c.Connected));
+        Assert.All(clientFactory.CreatedClients, c => Assert.True(c.Disposed));
+    }
+
+    public void Dispose()
+    {
+        for (var i = 0; i < 5; i++)
+        {
+            try
+            {
+                if (!Directory.Exists(_tempDir)) return;
+                foreach (var file in Directory.EnumerateFiles(_tempDir, "*", SearchOption.AllDirectories))
+                    File.SetAttributes(file, FileAttributes.Normal);
+                Directory.Delete(_tempDir, recursive: true);
+                return;
+            }
+            catch (Exception) when (i < 4)
+            {
+                Thread.Sleep(200 * (i + 1));
+            }
+        }
+    }
+}

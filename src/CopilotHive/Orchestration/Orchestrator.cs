@@ -11,15 +11,27 @@ namespace CopilotHive.Orchestration;
 public sealed class Orchestrator : IAsyncDisposable
 {
     private readonly HiveConfiguration _config;
-    private readonly DockerWorkerManager _dockerManager;
+    private readonly IWorkerManager _workerManager;
+    private readonly ICopilotClientFactory _clientFactory;
     private readonly GitWorkspaceManager _gitManager;
     private readonly AgentsManager _agentsManager;
     private readonly MetricsTracker _metricsTracker;
 
     public Orchestrator(HiveConfiguration config)
+        : this(config,
+               new DockerWorkerManager(config),
+               new CopilotClientFactory(config.Model, config.GitHubToken))
+    {
+    }
+
+    public Orchestrator(
+        HiveConfiguration config,
+        IWorkerManager workerManager,
+        ICopilotClientFactory clientFactory)
     {
         _config = config;
-        _dockerManager = new DockerWorkerManager(config);
+        _workerManager = workerManager;
+        _clientFactory = clientFactory;
         _gitManager = new GitWorkspaceManager(config.WorkspacePath);
         _agentsManager = new AgentsManager(config.AgentsPath);
         _metricsTracker = new MetricsTracker(config.MetricsPath);
@@ -189,18 +201,17 @@ public sealed class Orchestrator : IAsyncDisposable
         string prompt, CancellationToken ct)
     {
         var agentsMdPath = _agentsManager.GetAgentsMdPath(agentRole);
-        var worker = await _dockerManager.SpawnWorkerAsync(role, clonePath, agentsMdPath, ct);
+        var worker = await _workerManager.SpawnWorkerAsync(role, clonePath, agentsMdPath, ct);
 
         try
         {
-            await using var client = new CopilotWorkerClient(
-                worker.Port, _config.Model, _config.GitHubToken);
+            await using var client = _clientFactory.Create(worker.Port);
             await client.ConnectAsync(ct);
             return await client.SendTaskAsync(prompt, ct);
         }
         finally
         {
-            await _dockerManager.StopWorkerAsync(worker.Id, ct);
+            await _workerManager.StopWorkerAsync(worker.Id, ct);
         }
     }
 
@@ -213,7 +224,8 @@ public sealed class Orchestrator : IAsyncDisposable
         {
             var trimmed = line.Trim();
 
-            if (trimmed.StartsWith("TEST_REPORT:"))
+            // Both TEST_REPORT: and METRICS: start the report section
+            if (trimmed.StartsWith("TEST_REPORT:") || trimmed.StartsWith("METRICS:"))
             {
                 inReport = true;
                 inIssues = false;
@@ -247,7 +259,8 @@ public sealed class Orchestrator : IAsyncDisposable
                 metrics.IntegrationTestsPassed = ip;
             else if (TryParseField(trimmed, "runtime_verified:", out var rvVal))
                 metrics.RuntimeVerified = rvVal.Equals("true", StringComparison.OrdinalIgnoreCase);
-            else if (TryParseField(trimmed, "coverage_percent:", out var covVal) && double.TryParse(covVal, out var cov))
+            else if (TryParseField(trimmed, "coverage_percent:", out var covVal)
+                     && double.TryParse(covVal, System.Globalization.CultureInfo.InvariantCulture, out var cov))
                 metrics.CoveragePercent = cov;
             else if (TryParseField(trimmed, "verdict:", out var verdictVal))
                 metrics.Verdict = verdictVal;
@@ -285,6 +298,6 @@ public sealed class Orchestrator : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        await _dockerManager.DisposeAsync();
+        await _workerManager.DisposeAsync();
     }
 }

@@ -6,7 +6,7 @@ namespace CopilotHive.Copilot;
 /// Wraps the Copilot SDK to communicate with a headless worker container.
 /// Each instance connects to one worker on a specific port.
 /// </summary>
-public sealed class CopilotWorkerClient : IAsyncDisposable
+public sealed class CopilotWorkerClient : ICopilotWorkerClient
 {
     private readonly CopilotClient _client;
     private CopilotSession? _session;
