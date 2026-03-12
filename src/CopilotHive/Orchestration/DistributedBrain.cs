@@ -34,6 +34,16 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         - Do NOT wrap the JSON in markdown code fences. Return ONLY the JSON object.
         """;
 
+    /// <summary>
+    /// Permission handler that denies ALL tool/command execution.
+    /// The Brain is reasoning-only and must never run shell commands or file operations.
+    /// </summary>
+    private static readonly PermissionRequestHandler DenyAllPermissions =
+        (_, _) => Task.FromResult(new PermissionRequestResult
+        {
+            Kind = PermissionRequestResultKind.DeniedByRules,
+        });
+
     public DistributedBrain(int port, ILogger<DistributedBrain> logger)
     {
         _port = port;
@@ -84,7 +94,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         var session = await _copilotClient!.CreateSessionAsync(new SessionConfig
         {
             Streaming = false,
-            OnPermissionRequest = PermissionHandler.ApproveAll,
+            OnPermissionRequest = DenyAllPermissions,
         });
 
         if (_sessions.TryAdd(pipeline.GoalId, session))
@@ -133,7 +143,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         var session = await _copilotClient!.CreateSessionAsync(new SessionConfig
         {
             Streaming = false,
-            OnPermissionRequest = PermissionHandler.ApproveAll,
+            OnPermissionRequest = DenyAllPermissions,
         });
 
         // Replay the conversation: alternate user/assistant messages
