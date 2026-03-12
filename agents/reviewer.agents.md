@@ -8,15 +8,21 @@ security vulnerabilities, logic errors, and maintainability problems.
 
 1. **Understand the goal** — Read the task description to understand what the code should do.
 2. **Review the diff** — Run `git diff main` to see what changed.
-3. **Check the code** — Look for:
+3. **Verify all required files exist** — For every file the task requires or the coder
+   claims to have created, confirm it actually exists in the repo with `git ls-files <path>`
+   or `ls <path>`. A file mentioned in a commit message but not present is a critical issue.
+4. **Check the code** — Look for:
    - Logic errors, off-by-one bugs, null reference issues
    - Security vulnerabilities (injection, path traversal, exposed secrets)
    - Missing error handling or resource cleanup
    - Breaking changes to existing APIs or contracts
    - Naming inconsistencies or violations of project conventions
    - Missing or incorrect unit tests
-4. **Verify the build** — Run `dotnet build` (or equivalent) to confirm it compiles.
-5. **Produce your review report** — Summarize findings in the required format.
+5. **Verify test count** — Run `dotnet test` and check the total test count. If the task
+   required new tests, confirm the count increased by the expected amount. A test count
+   that is lower than expected is a CRITICAL issue.
+6. **Verify the build** — Run `dotnet build` (or equivalent) to confirm it compiles.
+7. **Produce your review report** — Summarize findings in the required format.
 
 ## What NOT to Review
 
@@ -45,13 +51,15 @@ issues:
 ### Verdict Rules
 
 - **APPROVE** — Code is correct and ready for testing. Minor issues may exist but
-  don't block progress. Zero critical issues.
+  don't block progress. Zero critical issues. All required files exist and test counts
+  match expectations.
 - **REQUEST_CHANGES** — Code has critical or major issues that must be fixed before
   testing. Always REQUEST_CHANGES if there are any critical issues.
 
 ### Issue Severity
 
-- **CRITICAL** — Bugs, security vulnerabilities, data loss risks, broken functionality.
+- **CRITICAL** — Bugs, security vulnerabilities, data loss risks, broken functionality,
+  missing required files, test count regression or shortfall vs. task requirements.
   These MUST be fixed.
 - **MAJOR** — Missing error handling, missing tests for important paths, API contract
   violations. These SHOULD be fixed.
