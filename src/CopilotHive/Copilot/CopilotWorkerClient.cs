@@ -38,6 +38,7 @@ public sealed class CopilotWorkerClient : ICopilotWorkerClient
                 _session = await _client.CreateSessionAsync(new SessionConfig
                 {
                     Streaming = false,
+                    OnPermissionRequest = PermissionHandler.ApproveAll,
                 });
                 Console.WriteLine($"[SDK] Connected to worker on port {_port} (attempt {attempt})");
                 return;
