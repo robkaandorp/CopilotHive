@@ -22,7 +22,7 @@ public sealed class Orchestrator : IAsyncDisposable
     public Orchestrator(HiveConfiguration config)
         : this(config,
                new DockerWorkerManager(config),
-               new CopilotClientFactory(config.Model, config.GitHubToken))
+               new CopilotClientFactory(config.GitHubToken))
     {
     }
 
@@ -43,6 +43,7 @@ public sealed class Orchestrator : IAsyncDisposable
     {
         Console.WriteLine($"[Orchestrator] Goal: {_config.Goal}");
         Console.WriteLine($"[Orchestrator] Max iterations: {_config.MaxIterations}");
+        Console.WriteLine($"[Orchestrator] Models — coder: {_config.GetModelForRole("coder")}, reviewer: {_config.GetModelForRole("reviewer")}, tester: {_config.GetModelForRole("tester")}, improver: {_config.GetModelForRole("improver")}");
 
         await _gitManager.InitBareRepoAsync(_config.SourcePath, ct);
 
@@ -287,8 +288,9 @@ public sealed class Orchestrator : IAsyncDisposable
         WorkerRole role, string clonePath, string agentRole,
         string prompt, CancellationToken ct)
     {
+        var model = _config.GetModelForRole(agentRole);
         var agentsMdPath = _agentsManager.GetAgentsMdPath(agentRole);
-        var worker = await _workerManager.SpawnWorkerAsync(role, clonePath, agentsMdPath, ct);
+        var worker = await _workerManager.SpawnWorkerAsync(role, clonePath, agentsMdPath, model, ct);
 
         try
         {
@@ -439,7 +441,7 @@ public sealed class Orchestrator : IAsyncDisposable
         try
         {
             var improverResponse = await RunWorkerAsync(
-                WorkerRole.Coder, // reuse coder role for container config
+                WorkerRole.Improver,
                 await _gitManager.CreateWorkerCloneAsync("improver", ct),
                 "improver",
                 combinedPrompt, ct);

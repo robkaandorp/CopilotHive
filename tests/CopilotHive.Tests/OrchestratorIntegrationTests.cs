@@ -427,6 +427,45 @@ public class OrchestratorIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task PerRoleModels_CorrectModelPassedToEachWorker()
+    {
+        var workerManager = new FakeWorkerManager();
+        var clientFactory = new FakeCopilotClientFactory(prompt =>
+        {
+            if (prompt.Contains("You are working on this goal"))
+                return "Code written.";
+            if (prompt.Contains("reviewing code changes"))
+                return ApproveReview;
+            return PassingTestReport;
+        });
+
+        var config = new HiveConfiguration
+        {
+            Goal = "Write hello world",
+            WorkspacePath = Path.Combine(_tempDir, "workspaces"),
+            AgentsPath = Path.Combine(_tempDir, "agents"),
+            MetricsPath = Path.Combine(_tempDir, "metrics"),
+            MaxIterations = 1,
+            MaxRetriesPerTask = 0,
+            GitHubToken = "fake-token",
+            CoderModel = "test-coder-model",
+            ReviewerModel = "test-reviewer-model",
+            TesterModel = "test-tester-model",
+        };
+
+        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await orchestrator.RunAsync();
+
+        var coderSpawn = workerManager.SpawnHistory.First(s => s.Role == WorkerRole.Coder);
+        var reviewerSpawn = workerManager.SpawnHistory.First(s => s.Role == WorkerRole.Reviewer);
+        var testerSpawn = workerManager.SpawnHistory.First(s => s.Role == WorkerRole.Tester);
+
+        Assert.Equal("test-coder-model", coderSpawn.Model);
+        Assert.Equal("test-reviewer-model", reviewerSpawn.Model);
+        Assert.Equal("test-tester-model", testerSpawn.Model);
+    }
+
+    [Fact]
     public void ParseReviewReport_ExtractsApproveVerdict()
     {
         var metrics = new CopilotHive.Metrics.IterationMetrics();

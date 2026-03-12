@@ -15,7 +15,7 @@ public sealed class CopilotWorkerClient : ICopilotWorkerClient
     public int MaxConnectRetries { get; init; } = 12;
     public TimeSpan RetryDelay { get; init; } = TimeSpan.FromSeconds(5);
 
-    public CopilotWorkerClient(int port, string model, string? gitHubToken = null)
+    public CopilotWorkerClient(int port, string? gitHubToken = null)
     {
         _port = port;
         // Don't pass GitHubToken — the external headless server manages its own auth

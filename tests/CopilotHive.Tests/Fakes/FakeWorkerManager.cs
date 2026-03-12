@@ -11,11 +11,11 @@ public sealed class FakeWorkerManager : IWorkerManager
     private int _nextPort = 9000;
 
     public IReadOnlyDictionary<string, WorkerInfo> Workers => _workers;
-    public List<(WorkerRole Role, string ClonePath)> SpawnHistory { get; } = [];
+    public List<(WorkerRole Role, string ClonePath, string Model)> SpawnHistory { get; } = [];
     public List<string> StopHistory { get; } = [];
 
     public Task<WorkerInfo> SpawnWorkerAsync(
-        WorkerRole role, string clonePath, string agentsMdPath, CancellationToken ct = default)
+        WorkerRole role, string clonePath, string agentsMdPath, string model, CancellationToken ct = default)
     {
         var port = _nextPort++;
         var id = $"fake-{role.ToString().ToLowerInvariant()}-{port}";
@@ -31,7 +31,7 @@ public sealed class FakeWorkerManager : IWorkerManager
         };
 
         _workers[id] = worker;
-        SpawnHistory.Add((role, clonePath));
+        SpawnHistory.Add((role, clonePath, model));
         return Task.FromResult(worker);
     }
 

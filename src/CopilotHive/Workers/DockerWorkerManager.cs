@@ -24,6 +24,7 @@ public sealed class DockerWorkerManager : IWorkerManager
         WorkerRole role,
         string clonePath,
         string agentsMdPath,
+        string model,
         CancellationToken ct = default)
     {
         var port = _nextPort++;
@@ -39,7 +40,7 @@ public sealed class DockerWorkerManager : IWorkerManager
                     "COPILOT_MODE=headless",
                     $"COPILOT_PORT=8000",
                     $"GH_TOKEN={_config.GitHubToken}",
-                    $"COPILOT_MODEL={_config.Model}",
+                    $"COPILOT_MODEL={model}",
                     "COPILOT_ALLOW_ALL=true",
                     "COPILOT_AUTO_UPDATE=true",
                 ],
@@ -75,7 +76,7 @@ public sealed class DockerWorkerManager : IWorkerManager
         };
 
         _workers[id] = worker;
-        Console.WriteLine($"[Hive] Spawned {role} worker: {id} on port {port}");
+        Console.WriteLine($"[Hive] Spawned {role} worker: {id} on port {port} (model: {model})");
         return worker;
     }
 

@@ -11,6 +11,7 @@ public interface IWorkerManager : IAsyncDisposable
         WorkerRole role,
         string clonePath,
         string agentsMdPath,
+        string model,
         CancellationToken ct = default);
 
     Task StopWorkerAsync(string workerId, CancellationToken ct = default);
