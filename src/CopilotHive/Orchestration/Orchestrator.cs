@@ -3,6 +3,7 @@ using CopilotHive.Agents;
 using CopilotHive.Configuration;
 using CopilotHive.Copilot;
 using CopilotHive.Git;
+using CopilotHive.Improvement;
 using CopilotHive.Metrics;
 using CopilotHive.Workers;
 
@@ -16,6 +17,7 @@ public sealed class Orchestrator : IAsyncDisposable
     private readonly GitWorkspaceManager _gitManager;
     private readonly AgentsManager _agentsManager;
     private readonly MetricsTracker _metricsTracker;
+    private readonly ImprovementAnalyzer _improvementAnalyzer = new();
 
     public Orchestrator(HiveConfiguration config)
         : this(config,
@@ -63,7 +65,14 @@ public sealed class Orchestrator : IAsyncDisposable
                     Console.WriteLine("[Orchestrator] ⚠ REGRESSION DETECTED — rolling back AGENTS.md");
                     _agentsManager.RollbackAgentsMd("coder");
                     _agentsManager.RollbackAgentsMd("tester");
+                    _agentsManager.RollbackAgentsMd("orchestrator");
                 }
+            }
+
+            // Phase 4: Self-improvement (skip on clean pass or if we're on the last iteration)
+            if (_improvementAnalyzer.ShouldImprove(metrics) && iteration < _config.MaxIterations)
+            {
+                await RunImprovementPhaseAsync(metrics, ct);
             }
 
             if (metrics.FailedTests == 0 && metrics.TotalTests > 0)
@@ -216,6 +225,115 @@ public sealed class Orchestrator : IAsyncDisposable
         {
             await _workerManager.StopWorkerAsync(worker.Id, ct);
         }
+    }
+
+    private async Task RunImprovementPhaseAsync(IterationMetrics metrics, CancellationToken ct)
+    {
+        Console.WriteLine("[Orchestrator] Phase 4: Self-Improvement");
+
+        var rolesToImprove = new[] { "coder", "tester", "orchestrator" };
+        var currentAgentsMd = new Dictionary<string, string>();
+        foreach (var role in rolesToImprove)
+        {
+            var content = _agentsManager.GetAgentsMd(role);
+            if (!string.IsNullOrEmpty(content))
+                currentAgentsMd[role] = content;
+        }
+
+        var requests = _improvementAnalyzer.BuildRequests(
+            metrics, _metricsTracker.History, currentAgentsMd);
+
+        // Build a combined prompt for the improver
+        var combinedPrompt = string.Join("\n\n---\n\n", requests.Select(r => r.Prompt));
+
+        try
+        {
+            var improverResponse = await RunWorkerAsync(
+                WorkerRole.Coder, // reuse coder role for container config
+                await _gitManager.CreateWorkerCloneAsync("improver", ct),
+                "improver",
+                combinedPrompt, ct);
+
+            var improvements = ParseImproverResponse(improverResponse);
+            var appliedCount = 0;
+
+            foreach (var (role, newContent) in improvements)
+            {
+                if (currentAgentsMd.ContainsKey(role))
+                {
+                    _agentsManager.UpdateAgentsMd(role, newContent);
+                    appliedCount++;
+                    Console.WriteLine($"[Orchestrator] 📝 Updated {role}.agents.md");
+                }
+            }
+
+            if (appliedCount == 0)
+                Console.WriteLine("[Orchestrator] No improvements applied this iteration.");
+            else
+                Console.WriteLine($"[Orchestrator] Applied {appliedCount} AGENTS.md improvement(s).");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Orchestrator] Improvement phase failed (non-fatal): {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Parses the improver's response to extract improved AGENTS.md content per role.
+    /// Expects blocks delimited by === IMPROVED {role}.agents.md === / === END {role}.agents.md ===
+    /// </summary>
+    internal static Dictionary<string, string> ParseImproverResponse(string response)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(response))
+            return result;
+
+        var lines = response.Split('\n');
+        string? currentRole = null;
+        var contentLines = new List<string>();
+
+        foreach (var line in lines)
+        {
+            var trimmed = line.Trim();
+
+            // Match: === IMPROVED coder.agents.md ===
+            if (trimmed.StartsWith("=== IMPROVED ", StringComparison.OrdinalIgnoreCase)
+                && trimmed.EndsWith(".agents.md ===", StringComparison.OrdinalIgnoreCase))
+            {
+                currentRole = trimmed
+                    .Replace("=== IMPROVED ", "", StringComparison.OrdinalIgnoreCase)
+                    .Replace(".agents.md ===", "", StringComparison.OrdinalIgnoreCase)
+                    .Trim();
+                contentLines.Clear();
+                continue;
+            }
+
+            // Match: === END coder.agents.md ===
+            if (currentRole is not null
+                && trimmed.StartsWith("=== END ", StringComparison.OrdinalIgnoreCase)
+                && trimmed.EndsWith(".agents.md ===", StringComparison.OrdinalIgnoreCase))
+            {
+                var content = string.Join('\n', contentLines).Trim();
+                if (!string.IsNullOrEmpty(content))
+                    result[currentRole] = content;
+
+                currentRole = null;
+                contentLines.Clear();
+                continue;
+            }
+
+            // Skip === UNCHANGED lines
+            if (trimmed.StartsWith("=== UNCHANGED ", StringComparison.OrdinalIgnoreCase))
+            {
+                currentRole = null;
+                continue;
+            }
+
+            if (currentRole is not null)
+                contentLines.Add(line);
+        }
+
+        return result;
     }
 
     internal static void ParseTestReport(string response, IterationMetrics metrics)
