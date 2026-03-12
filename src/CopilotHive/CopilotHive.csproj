@@ -13,6 +13,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\CopilotHive.Shared\CopilotHive.Shared.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <InternalsVisibleTo Include="CopilotHive.Tests" />
   </ItemGroup>
 

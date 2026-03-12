@@ -1,0 +1,7 @@
+*.md~
+*.swp
+*.bak
+.git
+.gitignore
+README.md
+LICENSE

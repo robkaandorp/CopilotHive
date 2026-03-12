@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\CopilotHive\CopilotHive.csproj" />
+    <ProjectReference Include="..\..\src\CopilotHive.Shared\CopilotHive.Shared.csproj" />
   </ItemGroup>
 
 </Project>

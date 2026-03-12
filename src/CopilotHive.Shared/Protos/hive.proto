@@ -1,0 +1,168 @@
+syntax = "proto3";
+
+option csharp_namespace = "CopilotHive.Shared.Grpc";
+
+package copilothive;
+
+// Workers connect to this service on the orchestrator
+service HiveOrchestrator {
+  // Worker registers itself with the orchestrator
+  rpc Register (RegisterRequest) returns (RegisterResponse);
+
+  // Bidirectional stream: worker connects, orchestrator sends tasks, worker reports results
+  rpc WorkStream (stream WorkerMessage) returns (stream OrchestratorMessage);
+
+  // Worker sends heartbeat to indicate it's alive
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+// === Registration ===
+
+message RegisterRequest {
+  string worker_id = 1;       // Unique worker identifier
+  WorkerRole role = 2;        // coder, reviewer, tester, improver
+  repeated string capabilities = 3;  // e.g., ["dotnet", "python", "nodejs"]
+}
+
+message RegisterResponse {
+  bool accepted = 1;
+  string orchestrator_version = 2;
+  string assigned_worker_id = 3;  // Server may reassign ID
+}
+
+// === Worker Roles ===
+
+enum WorkerRole {
+  WORKER_ROLE_UNSPECIFIED = 0;
+  WORKER_ROLE_CODER = 1;
+  WORKER_ROLE_REVIEWER = 2;
+  WORKER_ROLE_TESTER = 3;
+  WORKER_ROLE_IMPROVER = 4;
+}
+
+// === Bidirectional Stream Messages ===
+
+// Messages FROM the worker TO the orchestrator
+message WorkerMessage {
+  string worker_id = 1;
+  oneof payload {
+    TaskProgress progress = 2;
+    TaskComplete complete = 3;
+    WorkerReady ready = 4;
+  }
+}
+
+// Messages FROM the orchestrator TO the worker
+message OrchestratorMessage {
+  oneof payload {
+    TaskAssignment assignment = 2;
+    CancelTask cancel = 3;
+    UpdateAgents update_agents = 4;
+  }
+}
+
+// === Task Assignment ===
+
+message TaskAssignment {
+  string task_id = 1;
+  string goal_id = 2;
+  string goal_description = 3;
+  string prompt = 4;              // The crafted prompt from the brain
+  repeated RepositoryInfo repositories = 5;
+  BranchInfo branch_info = 6;
+  WorkerRole role = 7;
+  map<string, string> metadata = 8;  // Additional context
+}
+
+message RepositoryInfo {
+  string url = 1;                 // Git remote URL
+  string name = 2;                // Short name for the repo
+  string default_branch = 3;      // e.g., "main"
+}
+
+message BranchInfo {
+  string base_branch = 1;         // e.g., "main"
+  string feature_branch = 2;      // e.g., "copilothive/feature-xyz/coder-001"
+  BranchAction action = 3;
+}
+
+enum BranchAction {
+  BRANCH_ACTION_UNSPECIFIED = 0;
+  BRANCH_ACTION_CREATE = 1;       // Create new branch from base
+  BRANCH_ACTION_CHECKOUT = 2;     // Checkout existing branch
+  BRANCH_ACTION_MERGE = 3;        // Merge feature into base
+}
+
+// === Task Progress & Completion ===
+
+message TaskProgress {
+  string task_id = 1;
+  TaskStatus status = 2;
+  string message = 3;             // Brief status update
+  double progress_percent = 4;    // 0-100 if estimable
+}
+
+message TaskComplete {
+  string task_id = 1;
+  TaskStatus status = 2;
+  string output = 3;              // Full worker output
+  GitStatus git_status = 4;
+  TaskMetrics metrics = 5;
+}
+
+message WorkerReady {
+  // Worker is idle and ready for a new task
+}
+
+message CancelTask {
+  string task_id = 1;
+  string reason = 2;
+}
+
+message UpdateAgents {
+  string agents_md_content = 1;   // New AGENTS.md content
+  string role = 2;                // Which role's agents.md
+}
+
+// === Status & Metrics ===
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_IN_PROGRESS = 1;
+  TASK_STATUS_COMPLETED = 2;
+  TASK_STATUS_FAILED = 3;
+  TASK_STATUS_CANCELLED = 4;
+}
+
+message GitStatus {
+  string current_branch = 1;
+  string last_commit_sha = 2;
+  string last_commit_message = 3;
+  int32 files_changed = 4;
+  int32 insertions = 5;
+  int32 deletions = 6;
+  bool pushed = 7;
+}
+
+message TaskMetrics {
+  bool build_success = 1;
+  int32 total_tests = 2;
+  int32 passed_tests = 3;
+  int32 failed_tests = 4;
+  double coverage_percent = 5;
+  string verdict = 6;             // "PASS", "FAIL", "APPROVE", "REQUEST_CHANGES"
+  repeated string issues = 7;
+}
+
+// === Heartbeat ===
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  WorkerRole role = 2;
+  bool busy = 3;
+  string current_task_id = 4;     // Empty if idle
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+}
