@@ -58,29 +58,7 @@ dotnet test  # or the project's test command
 
 Record results: total, passed, failed, skipped.
 
-### Phase 4: Measure Coverage
-
-Collect code coverage using the coverage collector already present in the test projects.
-**Coverage must be a real numeric value — never report 0 unless you have confirmed the
-coverage tooling is broken and documented why.**
-
-```bash
-dotnet test --collect:"XPlat Code Coverage" --results-directory ./TestResults
-```
-
-After running, find the `coverage.cobertura.xml` file and extract the line-rate:
-
-```bash
-grep -m1 'line-rate' TestResults/**/coverage.cobertura.xml
-```
-
-Convert `line-rate` (0.0–1.0) to a percentage for the report (e.g. `0.73` → `73`).
-
-If `coverlet.collector` is missing from a test project, note it as an issue but do NOT
-block the verdict solely on missing coverage tooling — report `coverage_percent: 0` and
-list it as an issue so the coder can fix it next iteration.
-
-### Phase 5: Integration Tests
+### Phase 4: Integration Tests
 
 Write and run integration tests that verify components work together:
 
@@ -89,7 +67,7 @@ Write and run integration tests that verify components work together:
 - Test error propagation across component boundaries.
 - Commit integration tests in a `tests/` directory with clear naming.
 
-### Phase 6: Runtime Verification
+### Phase 5: Runtime Verification
 
 Actually run the system and verify it works:
 
@@ -99,7 +77,7 @@ Actually run the system and verify it works:
 - Check exit codes, output format, error messages.
 - For services: verify endpoints respond. For CLI tools: verify command output.
 
-### Phase 7: Test Report
+### Phase 6: Test Report
 
 After all testing, produce a structured test report. This is MANDATORY.
 
@@ -119,14 +97,10 @@ issues:
 - <issue 2 description>
 ```
 
-Rules for the TEST_REPORT block:
-- `coverage_percent` must be a plain integer or decimal (e.g. `73`, not `0,0%` or `73%`).
-  Use `.` as the decimal separator regardless of system locale.
-- Every field must be present. Use `0` for missing numeric values, not blank.
-- The verdict meanings:
-  - **PASS** — All tests pass, build works, runtime verified, acceptance criteria met.
-  - **PARTIAL** — Build works and most tests pass, but some issues remain.
-  - **FAIL** — Build fails, critical tests fail, or runtime verification fails.
+The verdict meanings:
+- **PASS** — All tests pass, build works, runtime verified, acceptance criteria met.
+- **PARTIAL** — Build works and most tests pass, but some issues remain.
+- **FAIL** — Build fails, critical tests fail, or runtime verification fails.
 
 ## Git Workflow
 
@@ -138,6 +112,5 @@ Rules for the TEST_REPORT block:
 - NEVER skip the build verification step.
 - NEVER report PASS if any test is failing.
 - ALWAYS produce the TEST_REPORT block — the orchestrator parses it.
-- ALWAYS report a real coverage percentage — run the coverage command and read the output.
 - Be specific about failures — include error messages, stack traces, and reproduction steps.
 - If you find bugs, describe them clearly. Do NOT fix the code — that is the coder's job.

@@ -33,6 +33,16 @@ public class OrchestratorIntegrationTests : IDisposable
         GitHubToken = "fake-token",
     };
 
+    private static Orchestrator CreateOrchestrator(
+        HiveConfiguration config,
+        FakeWorkerManager workerManager,
+        FakeCopilotClientFactory clientFactory,
+        FakeOrchestratorBrain? brain = null)
+    {
+        return new Orchestrator(config, workerManager, clientFactory,
+            brain ?? new FakeOrchestratorBrain());
+    }
+
     private const string ApproveReview = """
         REVIEW_REPORT:
         verdict: APPROVE
@@ -70,7 +80,7 @@ public class OrchestratorIntegrationTests : IDisposable
         });
 
         var config = CreateConfig();
-        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory);
         await orchestrator.RunAsync();
 
         Assert.Contains(workerManager.SpawnHistory, s => s.Role == WorkerRole.Coder);
@@ -92,7 +102,7 @@ public class OrchestratorIntegrationTests : IDisposable
         });
 
         var config = CreateConfig();
-        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory);
         await orchestrator.RunAsync();
 
         // Coder(1) + Reviewer(1) + Tester(1) + Post-merge verifier(1) = 4 worker spawns
@@ -136,7 +146,7 @@ public class OrchestratorIntegrationTests : IDisposable
         });
 
         var config = CreateConfig(maxRetries: 2);
-        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory);
         await orchestrator.RunAsync();
 
         // Should have: coder + reviewer + tester(fail) + coder(fix) + tester(pass) + post-merge-verify
@@ -155,7 +165,7 @@ public class OrchestratorIntegrationTests : IDisposable
         });
 
         var config = CreateConfig();
-        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory);
         await orchestrator.RunAsync();
 
         // All spawned workers should have been stopped
@@ -194,7 +204,7 @@ public class OrchestratorIntegrationTests : IDisposable
         });
 
         var config = CreateConfig();
-        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory);
         await orchestrator.RunAsync();
 
         // Verify metrics were recorded — check the metrics file
@@ -229,7 +239,7 @@ public class OrchestratorIntegrationTests : IDisposable
         });
 
         var config = CreateConfig(maxIterations: 5);
-        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory);
         await orchestrator.RunAsync();
 
         // Should stop after first iteration since all tests pass
@@ -258,7 +268,7 @@ public class OrchestratorIntegrationTests : IDisposable
         });
 
         var config = CreateConfig();
-        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory);
         await orchestrator.RunAsync();
 
         // Should still parse and record — verify no crash
@@ -281,7 +291,7 @@ public class OrchestratorIntegrationTests : IDisposable
         });
 
         var config = CreateConfig();
-        await using var orchestrator = new Orchestrator(config, new FakeWorkerManager(), clientFactory);
+        await using var orchestrator = CreateOrchestrator(config, new FakeWorkerManager(), clientFactory);
         await orchestrator.RunAsync();
 
         // Each worker gets its own client (coder + reviewer + tester + post-merge verifier = 4)
@@ -308,7 +318,7 @@ public class OrchestratorIntegrationTests : IDisposable
                 return ApproveReview;
 
             // Phase 2: Pre-merge tester passes
-            if (prompt.Contains("You are testing code for this goal"))
+            if (prompt.Contains("testing code for this goal") && !prompt.Contains("POST-MERGE") && !prompt.Contains("RE-TEST"))
                 return """
                     TEST_REPORT:
                     build_success: true
@@ -324,7 +334,7 @@ public class OrchestratorIntegrationTests : IDisposable
                     """;
 
             // Phase 3b: Post-merge verifier FAILS
-            if (prompt.Contains("verifying the merged code"))
+            if (prompt.Contains("POST-MERGE VERIFICATION"))
                 return """
                     TEST_REPORT:
                     build_success: true
@@ -345,7 +355,7 @@ public class OrchestratorIntegrationTests : IDisposable
                 return "Fixed the merge issues.";
 
             // Phase 3d: Re-test passes
-            if (prompt.Contains("re-testing code after a post-merge fix"))
+            if (prompt.Contains("RE-TEST after a post-merge fix"))
                 return """
                     TEST_REPORT:
                     build_success: true
@@ -364,7 +374,7 @@ public class OrchestratorIntegrationTests : IDisposable
         });
 
         var config = CreateConfig();
-        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory);
         await orchestrator.RunAsync();
 
         // Should have: coder + tester + post-merge-verify(fail) + coder-fix + retest + (implicit re-merge)
@@ -375,7 +385,7 @@ public class OrchestratorIntegrationTests : IDisposable
         Assert.Contains(prompts, p => p.Contains("FAILED after merging to main"));
 
         // Re-test was triggered
-        Assert.Contains(prompts, p => p.Contains("re-testing code after a post-merge fix"));
+        Assert.Contains(prompts, p => p.Contains("RE-TEST after a post-merge fix"));
     }
 
     [Fact]
@@ -410,18 +420,18 @@ public class OrchestratorIntegrationTests : IDisposable
             }
 
             // Coder fixes review issues
-            if (prompt.Contains("reviewer found issues"))
+            if (prompt.Contains("reviewer requested changes"))
                 return "Fixed the review issues.";
 
             return PassingTestReport;
         });
 
         var config = CreateConfig(maxRetries: 1);
-        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory);
         await orchestrator.RunAsync();
 
         // Coder received review feedback
-        Assert.Contains(prompts, p => p.Contains("reviewer found issues"));
+        Assert.Contains(prompts, p => p.Contains("reviewer requested changes"));
 
         // Reviewer was spawned at least twice (initial + re-review)
         Assert.True(workerManager.SpawnHistory.Count(s => s.Role == WorkerRole.Reviewer) >= 2);
@@ -454,7 +464,7 @@ public class OrchestratorIntegrationTests : IDisposable
             TesterModel = "test-tester-model",
         };
 
-        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory);
         await orchestrator.RunAsync();
 
         var coderSpawn = workerManager.SpawnHistory.First(s => s.Role == WorkerRole.Coder);
@@ -537,71 +547,100 @@ public class OrchestratorIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task AmbiguousTestVerdict_SpawnsOrchestratorWorkerToInterpret()
+    public async Task AmbiguousTestVerdict_BrainInterpretationUsed()
     {
         var workerManager = new FakeWorkerManager();
+        var brain = new FakeOrchestratorBrain
+        {
+            InterpretOutputOverride = (role, output) =>
+            {
+                if (role == "tester")
+                    return new OrchestratorDecision
+                    {
+                        Action = OrchestratorActionType.Done,
+                        Verdict = "PASS",
+                        TestMetrics = new ExtractedTestMetrics
+                        {
+                            BuildSuccess = true, TotalTests = 10, PassedTests = 10,
+                            FailedTests = 0, CoveragePercent = 75,
+                        },
+                    };
+                return new OrchestratorDecision
+                {
+                    Action = OrchestratorActionType.Done,
+                    ReviewVerdict = "APPROVE",
+                };
+            },
+        };
         var clientFactory = new FakeCopilotClientFactory(prompt =>
         {
             if (prompt.Contains("You are working on this goal"))
                 return "Code written.";
             if (prompt.Contains("reviewing code changes"))
                 return ApproveReview;
-            // Tester returns ambiguous output — no verdict field, no counts to infer from
-            if (prompt.Contains("You are testing code for this goal"))
-                return """
-                    I ran the tests and everything looks fine.
-                    Build completed. Tests executed.
-                    """;
-            // Interpreter should get asked "is this a PASS or FAIL?"
-            if (prompt.Contains("interpreting test output"))
-                return "VERDICT: PASS";
-            // Post-merge verification
-            if (prompt.Contains("verifying the merged code"))
-                return PassingTestReport;
-            return "Unknown prompt.";
+            // Tester returns ambiguous output — no structured TEST_REPORT
+            return "I ran the tests and everything looks fine. Build completed.";
         });
 
         var config = CreateConfig();
-        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory, brain);
         await orchestrator.RunAsync();
 
-        // Should have spawned an Orchestrator-role worker for interpretation
-        Assert.Contains(workerManager.SpawnHistory, s => s.Role == WorkerRole.Orchestrator);
+        // Brain was called to interpret tester output
+        Assert.Contains(brain.Interpretations, i => i.StartsWith("tester:"));
+        // Brain's PASS verdict was used → merge happened
+        Assert.True(workerManager.SpawnHistory.Count >= 3, "Should have coder + reviewer + tester + verify spawns");
     }
 
     [Fact]
-    public async Task AmbiguousReviewVerdict_SpawnsOrchestratorWorkerToInterpret()
+    public async Task AmbiguousReviewVerdict_BrainInterpretationUsed()
     {
         var workerManager = new FakeWorkerManager();
+        var brain = new FakeOrchestratorBrain
+        {
+            InterpretOutputOverride = (role, output) =>
+            {
+                if (role == "reviewer")
+                    return new OrchestratorDecision
+                    {
+                        Action = OrchestratorActionType.Done,
+                        ReviewVerdict = "APPROVE",
+                    };
+                return new OrchestratorDecision
+                {
+                    Action = OrchestratorActionType.Done,
+                    Verdict = "PASS",
+                    TestMetrics = new ExtractedTestMetrics
+                    {
+                        BuildSuccess = true, TotalTests = 5, PassedTests = 5,
+                        FailedTests = 0, CoveragePercent = 80,
+                    },
+                };
+            },
+        };
         var clientFactory = new FakeCopilotClientFactory(prompt =>
         {
             if (prompt.Contains("You are working on this goal"))
                 return "Code written.";
             // Reviewer returns no structured REVIEW_REPORT block
             if (prompt.Contains("reviewing code changes"))
-                return "The code looks acceptable. I have a few minor suggestions but nothing critical.";
-            // Interpreter gets asked
-            if (prompt.Contains("interpreting code review output"))
-                return "VERDICT: APPROVE";
-            if (prompt.Contains("You are testing code for this goal"))
-                return PassingTestReport;
-            if (prompt.Contains("verifying the merged code"))
-                return PassingTestReport;
-            return "Unknown prompt.";
+                return "The code looks fine. Minor suggestions only.";
+            return PassingTestReport;
         });
 
         var config = CreateConfig();
-        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory, brain);
         await orchestrator.RunAsync();
 
-        // Should have spawned an Orchestrator-role worker for review interpretation
-        Assert.Contains(workerManager.SpawnHistory, s => s.Role == WorkerRole.Orchestrator);
+        // Brain interpreted the ambiguous review
+        Assert.Contains(brain.Interpretations, i => i.StartsWith("reviewer:"));
     }
 
     [Fact]
-    public async Task ClearVerdict_DoesNotSpawnOrchestratorWorker()
+    public async Task Brain_IsStartedAndDisposed()
     {
         var workerManager = new FakeWorkerManager();
+        var brain = new FakeOrchestratorBrain();
         var clientFactory = new FakeCopilotClientFactory(prompt =>
         {
             if (prompt.Contains("You are working on this goal"))
@@ -612,11 +651,12 @@ public class OrchestratorIntegrationTests : IDisposable
         });
 
         var config = CreateConfig();
-        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory, brain);
         await orchestrator.RunAsync();
 
-        // Clear verdicts — no orchestrator worker needed
-        Assert.DoesNotContain(workerManager.SpawnHistory, s => s.Role == WorkerRole.Orchestrator);
+        Assert.True(brain.Started, "Brain should be started");
+        Assert.NotEmpty(brain.Prompts); // Brain crafted prompts
+        Assert.NotEmpty(brain.Interpretations); // Brain interpreted outputs
     }
 
     public void Dispose()

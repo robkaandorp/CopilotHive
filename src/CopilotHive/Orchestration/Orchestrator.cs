@@ -18,6 +18,7 @@ public sealed class Orchestrator : IAsyncDisposable
     private readonly AgentsManager _agentsManager;
     private readonly MetricsTracker _metricsTracker;
     private readonly ImprovementAnalyzer _improvementAnalyzer = new();
+    private readonly IOrchestratorBrain _brain;
 
     public Orchestrator(HiveConfiguration config)
         : this(config,
@@ -30,6 +31,15 @@ public sealed class Orchestrator : IAsyncDisposable
         HiveConfiguration config,
         IWorkerManager workerManager,
         ICopilotClientFactory clientFactory)
+        : this(config, workerManager, clientFactory, brain: null)
+    {
+    }
+
+    public Orchestrator(
+        HiveConfiguration config,
+        IWorkerManager workerManager,
+        ICopilotClientFactory clientFactory,
+        IOrchestratorBrain? brain)
     {
         _config = config;
         _workerManager = workerManager;
@@ -37,6 +47,10 @@ public sealed class Orchestrator : IAsyncDisposable
         _gitManager = new GitWorkspaceManager(config.WorkspacePath);
         _agentsManager = new AgentsManager(config.AgentsPath);
         _metricsTracker = new MetricsTracker(config.MetricsPath);
+        _brain = brain ?? new OrchestratorBrain(
+            config, workerManager, clientFactory,
+            config.WorkspacePath,
+            new AgentsManager(config.AgentsPath).GetAgentsMdPath("orchestrator"));
     }
 
     public async Task RunAsync(CancellationToken ct = default)
@@ -47,6 +61,12 @@ public sealed class Orchestrator : IAsyncDisposable
 
         await _workerManager.CleanupStaleContainersAsync(ct);
         await _gitManager.InitBareRepoAsync(_config.SourcePath, ct);
+
+        // Start persistent orchestrator brain
+        Console.WriteLine("[Orchestrator] Starting orchestrator brain...");
+        await _brain.StartAsync(ct);
+        Console.WriteLine("[Orchestrator] Brain ready.");
+
 
         for (var iteration = 1; iteration <= _config.MaxIterations; iteration++)
         {
@@ -91,26 +111,30 @@ public sealed class Orchestrator : IAsyncDisposable
         var branchName = $"iteration-{iteration:D3}";
         var metrics = new IterationMetrics { Iteration = iteration };
 
-        // Phase 1: Coder
+        // Ask the brain to plan this iteration
+        var previousMetrics = _metricsTracker.History.LastOrDefault();
+        var plan = await _brain.PlanIterationAsync(iteration, _config.Goal, previousMetrics, ct);
+        Console.WriteLine($"[Brain] Plan: {plan.Reason ?? plan.Action.ToString()}");
+
+        // Phase 1: Coding — brain crafts the prompt
         Console.WriteLine("[Orchestrator] Phase 1: Coding");
         var coderClone = await _gitManager.CreateWorkerCloneAsync($"coder-{iteration}", ct);
         await _gitManager.CreateBranchAsync(coderClone, $"coder/{branchName}", ct);
 
+        var coderPrompt = await _brain.CraftPromptAsync(
+            "coder", _config.Goal, iteration, branchName, additionalContext: null, ct);
         var coderResponse = await RunWorkerAsync(
-            WorkerRole.Coder, coderClone, "coder",
-            $"""
-            You are working on this goal: {_config.Goal}
-
-            This is iteration {iteration}. Work on the coder/{branchName} branch.
-            Write the code and commit your changes with clear commit messages.
-            Do NOT run git push — the orchestrator handles that.
-            """, ct);
+            WorkerRole.Coder, coderClone, "coder", coderPrompt, ct);
         Console.WriteLine($"[Coder] {Truncate(coderResponse, 200)}");
 
         await _gitManager.RepairRemoteAsync(coderClone, ct);
         await _gitManager.PushBranchAsync(coderClone, $"coder/{branchName}", ct);
 
-        // Phase 1.5: Code Review → Fix loop
+        // Inform brain of coder result
+        await _brain.InformAsync(
+            $"Coder completed. Output summary: {Truncate(coderResponse, 500)}", ct);
+
+        // Phase 1.5: Code Review — brain decides verdict and crafts feedback
         for (var reviewRetry = 0; reviewRetry <= _config.MaxRetriesPerTask; reviewRetry++)
         {
             var reviewPhase = reviewRetry == 0
@@ -118,22 +142,48 @@ public sealed class Orchestrator : IAsyncDisposable
                 : $"Phase 1.5: Review retry {reviewRetry}/{_config.MaxRetriesPerTask}";
             Console.WriteLine($"[Orchestrator] {reviewPhase}");
 
+            // Ask brain if we should skip review (e.g., docs-only change)
+            if (reviewRetry == 0)
+            {
+                var skipDecision = await _brain.DecideNextStepAsync(
+                    "pre_review",
+                    $"The coder has finished. Should we review this change or skip directly to testing?\nCoder output: {Truncate(coderResponse, 500)}",
+                    ct);
+                if (skipDecision.Action == OrchestratorActionType.Skip)
+                {
+                    Console.WriteLine($"[Brain] Skipping review: {skipDecision.Reason}");
+                    break;
+                }
+            }
+
             var reviewClone = await _gitManager.CreateWorkerCloneAsync(
                 $"reviewer-{iteration}-{reviewRetry}", ct);
             await _gitManager.PullBranchAsync(reviewClone, $"coder/{branchName}", ct);
 
+            var reviewContext = reviewRetry > 0
+                ? $"This is review attempt {reviewRetry + 1}. The coder addressed previous review feedback."
+                : null;
+            var reviewPrompt = await _brain.CraftPromptAsync(
+                "reviewer", _config.Goal, iteration, branchName, reviewContext, ct);
             var reviewResponse = await RunWorkerAsync(
-                WorkerRole.Reviewer, reviewClone, "reviewer",
-                $"""
-                You are reviewing code changes for this goal: {_config.Goal}
-
-                This is iteration {iteration}. The coder's work is on branch coder/{branchName}.
-                Review the diff against main and produce a REVIEW_REPORT block.
-                Do NOT modify any code. Do NOT run git push.
-                """, ct);
+                WorkerRole.Reviewer, reviewClone, "reviewer", reviewPrompt, ct);
             Console.WriteLine($"[Reviewer] {Truncate(reviewResponse, 300)}");
 
-            var reviewVerdict = await InterpretReviewOutputAsync(reviewResponse, metrics, ct);
+            // Brain interprets the review output
+            var reviewDecision = await _brain.InterpretOutputAsync("reviewer", reviewResponse, ct);
+            var reviewVerdict = reviewDecision.ReviewVerdict ?? reviewDecision.Verdict ?? "";
+
+            // Also run string parsing as supplementary data for metrics
+            ParseReviewReport(reviewResponse, metrics);
+
+            // Use brain's verdict, falling back to string parser
+            if (string.IsNullOrEmpty(reviewVerdict))
+                reviewVerdict = metrics.ReviewVerdict;
+            else
+                metrics.ReviewVerdict = reviewVerdict;
+
+            if (reviewDecision.Issues?.Count > 0)
+                metrics.ReviewIssues = reviewDecision.Issues;
 
             if (reviewVerdict.Equals("APPROVE", StringComparison.OrdinalIgnoreCase))
             {
@@ -141,33 +191,30 @@ public sealed class Orchestrator : IAsyncDisposable
                 break;
             }
 
-            // Review requested changes — send feedback to coder
+            // Review requested changes — brain crafts feedback for coder
             if (reviewRetry < _config.MaxRetriesPerTask)
             {
-                var reviewIssues = metrics.ReviewIssues.Count > 0
-                    ? "Review issues:\n- " + string.Join("\n- ", metrics.ReviewIssues)
-                    : "See reviewer report for details.";
-
                 Console.WriteLine($"[Orchestrator] Reviewer verdict: {reviewVerdict} — sending feedback to coder");
+
+                var fixContext = $"""
+                    The reviewer requested changes.
+                    Review verdict: {reviewVerdict}
+                    Issues: {string.Join("; ", reviewDecision.Issues ?? metrics.ReviewIssues)}
+                    Full review: {Truncate(reviewResponse, 2000)}
+                    """;
+                var fixPrompt = await _brain.CraftPromptAsync(
+                    "coder", _config.Goal, iteration, branchName, fixContext, ct);
 
                 await _gitManager.PullBranchAsync(coderClone, $"coder/{branchName}", ct);
                 var fixResponse = await RunWorkerAsync(
-                    WorkerRole.Coder, coderClone, "coder",
-                    $"""
-                    The code reviewer found issues with your code. Their verdict: {reviewVerdict}
-
-                    {reviewIssues}
-
-                    Reviewer's full report:
-                    {Truncate(reviewResponse, 2000)}
-
-                    Fix the issues and commit your changes.
-                    Do NOT run git push — the orchestrator handles that.
-                    """, ct);
+                    WorkerRole.Coder, coderClone, "coder", fixPrompt, ct);
                 Console.WriteLine($"[Coder:review-fix] {Truncate(fixResponse, 200)}");
 
                 await _gitManager.RepairRemoteAsync(coderClone, ct);
                 await _gitManager.PushBranchAsync(coderClone, $"coder/{branchName}", ct);
+
+                await _brain.InformAsync(
+                    $"Coder addressed review feedback. Output: {Truncate(fixResponse, 300)}", ct);
             }
             else
             {
@@ -185,47 +232,46 @@ public sealed class Orchestrator : IAsyncDisposable
             var testerClone = await _gitManager.CreateWorkerCloneAsync($"tester-{iteration}-{retry}", ct);
             await _gitManager.PullBranchAsync(testerClone, $"coder/{branchName}", ct);
 
+            var testContext = retry > 0
+                ? $"This is test attempt {retry + 1}. The coder fixed issues from the previous test run."
+                : null;
+            var testerPrompt = await _brain.CraftPromptAsync(
+                "tester", _config.Goal, iteration, branchName, testContext, ct);
             testerResponse = await RunWorkerAsync(
-                WorkerRole.Tester, testerClone, "tester",
-                $"""
-                You are testing code for this goal: {_config.Goal}
-
-                This is iteration {iteration}. The coder's work is on branch coder/{branchName}.
-
-                Follow your full testing workflow:
-                1. Create a TEST_PLAN.md with scope, acceptance criteria, and test cases.
-                2. Build the project — if it fails, stop and report FAIL immediately.
-                3. Run all existing tests (unit tests written by the coder).
-                4. Write integration tests that verify components work together.
-                5. Run the application and verify it starts and works correctly.
-                6. Produce the TEST_REPORT block with your findings.
-
-                Commit your test plan, integration tests, and test report on the branch.
-                Do NOT run git push — the orchestrator handles that.
-
-                IMPORTANT: End your response with a TEST_REPORT block in the exact format
-                specified in your instructions.
-                """, ct);
+                WorkerRole.Tester, testerClone, "tester", testerPrompt, ct);
             Console.WriteLine($"[Tester] {Truncate(testerResponse, 300)}");
 
-            await InterpretTestOutputAsync(testerResponse, metrics, ct);
+            // Brain interprets test output
+            var testDecision = await _brain.InterpretOutputAsync("tester", testerResponse, ct);
 
-            // All tests pass AND runtime verified → done
+            // Also run string parsing as supplementary data
+            ParseTestReport(testerResponse, metrics);
+
+            // Apply brain's interpretation (overrides string parsing when available)
+            ApplyTestDecision(testDecision, metrics);
+
+            // All tests pass → done
             if (IsPassingVerdict(metrics.Verdict))
             {
                 Console.WriteLine("[Orchestrator] ✅ Tester verdict: PASS");
                 break;
             }
 
-            // Tests fail and we have retries left → send feedback to coder
+            // Tests fail and we have retries left → brain crafts feedback for coder
             if (retry < _config.MaxRetriesPerTask)
             {
                 metrics.RetryCount++;
-                var issuesSummary = metrics.Issues.Count > 0
-                    ? "Issues found:\n- " + string.Join("\n- ", metrics.Issues)
-                    : "See tester report for details.";
 
                 Console.WriteLine($"[Orchestrator] Verdict: {metrics.Verdict} — sending feedback to coder");
+
+                var fixContext = $"""
+                    The tester found issues.
+                    Verdict: {metrics.Verdict}
+                    Issues: {string.Join("; ", testDecision.Issues ?? metrics.Issues)}
+                    Full report: {Truncate(testerResponse, 2000)}
+                    """;
+                var fixPrompt = await _brain.CraftPromptAsync(
+                    "coder", _config.Goal, iteration, branchName, fixContext, ct);
 
                 // Push tester's test files so coder can see them
                 await _gitManager.RepairRemoteAsync(testerClone, ct);
@@ -234,18 +280,7 @@ public sealed class Orchestrator : IAsyncDisposable
                 // Pull tester's changes into coder clone and send fix prompt
                 await _gitManager.PullBranchAsync(coderClone, $"coder/{branchName}", ct);
                 var fixResponse = await RunWorkerAsync(
-                    WorkerRole.Coder, coderClone, "coder",
-                    $"""
-                    The tester found issues with your code. Their verdict: {metrics.Verdict}
-
-                    {issuesSummary}
-
-                    Tester's full report:
-                    {Truncate(testerResponse, 2000)}
-
-                    Fix the code AND update your unit tests. Commit your changes.
-                    Do NOT run git push — the orchestrator handles that.
-                    """, ct);
+                    WorkerRole.Coder, coderClone, "coder", fixPrompt, ct);
                 Console.WriteLine($"[Coder:fix] {Truncate(fixResponse, 200)}");
 
                 await _gitManager.RepairRemoteAsync(coderClone, ct);
@@ -285,6 +320,28 @@ public sealed class Orchestrator : IAsyncDisposable
         return metrics;
     }
 
+    /// <summary>
+    /// Applies the brain's test interpretation to metrics, preferring brain values over string parsing.
+    /// </summary>
+    private static void ApplyTestDecision(OrchestratorDecision decision, IterationMetrics metrics)
+    {
+        if (!string.IsNullOrEmpty(decision.Verdict))
+            metrics.Verdict = decision.Verdict;
+
+        if (decision.TestMetrics is { } tm)
+        {
+            if (tm.BuildSuccess.HasValue) metrics.BuildSuccess = tm.BuildSuccess.Value;
+            if (tm.TotalTests.HasValue && tm.TotalTests.Value > 0) metrics.TotalTests = tm.TotalTests.Value;
+            if (tm.PassedTests.HasValue && tm.PassedTests.Value > 0) metrics.PassedTests = tm.PassedTests.Value;
+            if (tm.FailedTests.HasValue) metrics.FailedTests = tm.FailedTests.Value;
+            if (tm.CoveragePercent.HasValue && tm.CoveragePercent.Value > 0)
+                metrics.CoveragePercent = tm.CoveragePercent.Value;
+        }
+
+        if (decision.Issues?.Count > 0 && metrics.Issues.Count == 0)
+            metrics.Issues.AddRange(decision.Issues);
+    }
+
     private async Task<string> RunWorkerAsync(
         WorkerRole role, string clonePath, string agentRole,
         string prompt, CancellationToken ct)
@@ -306,124 +363,6 @@ public sealed class Orchestrator : IAsyncDisposable
     }
 
     /// <summary>
-    /// Uses the orchestrator's LLM to interpret a tester's output and extract structured metrics.
-    /// Falls back to string-based parsing if LLM interpretation fails.
-    /// </summary>
-    private async Task InterpretTestOutputAsync(
-        string testerResponse, IterationMetrics metrics, CancellationToken ct)
-    {
-        // First: always run string-based parsing as baseline
-        ParseTestReport(testerResponse, metrics);
-
-        // If string parsing found a clear verdict, trust it
-        if (IsPassingVerdict(metrics.Verdict)
-            || metrics.Verdict.Equals("FAIL", StringComparison.OrdinalIgnoreCase)
-            || metrics.Verdict.Equals("PARTIAL", StringComparison.OrdinalIgnoreCase))
-            return;
-
-        // Ambiguous or missing verdict — ask the orchestrator LLM
-        Console.WriteLine("[Orchestrator] Verdict ambiguous — using LLM to interpret tester output");
-        try
-        {
-            var interpreterClone = await _gitManager.CreateWorkerCloneAsync("interpreter", ct);
-            var interpretation = await RunWorkerAsync(
-                WorkerRole.Orchestrator, interpreterClone, "orchestrator",
-                $"""
-                You are interpreting test output from a worker. Read the output below and determine the outcome.
-
-                Reply with EXACTLY one line in this format:
-                VERDICT: PASS
-                or
-                VERDICT: FAIL
-
-                Rules:
-                - If ALL tests passed and the build succeeded → VERDICT: PASS
-                - If ANY test failed or the build failed → VERDICT: FAIL
-                - If partial success (some tests pass, some fail) → VERDICT: PARTIAL
-                - When in doubt, say FAIL
-
-                === TESTER OUTPUT ===
-                {Truncate(testerResponse, 4000)}
-                === END OUTPUT ===
-                """, ct);
-
-            var verdictLine = interpretation.Split('\n')
-                .Select(l => l.Trim())
-                .FirstOrDefault(l => l.StartsWith("VERDICT:", StringComparison.OrdinalIgnoreCase));
-
-            if (verdictLine is not null)
-            {
-                var llmVerdict = verdictLine["VERDICT:".Length..].Trim();
-                Console.WriteLine($"[Orchestrator] LLM interpreted verdict: {llmVerdict}");
-                metrics.Verdict = llmVerdict;
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[Orchestrator] LLM interpretation failed, using string-parsed verdict: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// Uses the orchestrator's LLM to interpret a reviewer's output when parsing fails.
-    /// Falls back to the string-based parser result.
-    /// </summary>
-    private async Task<string> InterpretReviewOutputAsync(
-        string reviewResponse, IterationMetrics metrics, CancellationToken ct)
-    {
-        // First: always run string-based parsing
-        var verdict = ParseReviewReport(reviewResponse, metrics);
-
-        // If we got a clear verdict, trust it
-        if (verdict.Equals("APPROVE", StringComparison.OrdinalIgnoreCase)
-            || verdict.Equals("REQUEST_CHANGES", StringComparison.OrdinalIgnoreCase))
-            return verdict;
-
-        // Ambiguous — ask the orchestrator LLM
-        Console.WriteLine("[Orchestrator] Review verdict ambiguous — using LLM to interpret");
-        try
-        {
-            var interpreterClone = await _gitManager.CreateWorkerCloneAsync("interpreter", ct);
-            var interpretation = await RunWorkerAsync(
-                WorkerRole.Orchestrator, interpreterClone, "orchestrator",
-                $"""
-                You are interpreting code review output from a worker. Read the output below and determine the verdict.
-
-                Reply with EXACTLY one line in this format:
-                VERDICT: APPROVE
-                or
-                VERDICT: REQUEST_CHANGES
-
-                Rules:
-                - If the reviewer approves the code with no blocking issues → VERDICT: APPROVE
-                - If the reviewer requests changes or found critical/major issues → VERDICT: REQUEST_CHANGES
-                - When in doubt, say REQUEST_CHANGES
-
-                === REVIEWER OUTPUT ===
-                {Truncate(reviewResponse, 4000)}
-                === END OUTPUT ===
-                """, ct);
-
-            var verdictLine = interpretation.Split('\n')
-                .Select(l => l.Trim())
-                .FirstOrDefault(l => l.StartsWith("VERDICT:", StringComparison.OrdinalIgnoreCase));
-
-            if (verdictLine is not null)
-            {
-                verdict = verdictLine["VERDICT:".Length..].Trim();
-                Console.WriteLine($"[Orchestrator] LLM interpreted review verdict: {verdict}");
-                metrics.ReviewVerdict = verdict;
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[Orchestrator] LLM interpretation failed, using string-parsed verdict: {ex.Message}");
-        }
-
-        return verdict;
-    }
-
-    /// <summary>
     /// Runs post-merge verification: tests main after merge, reverts + sends to coder if tests fail.
     /// Returns true if main is in a good state (tests pass), false otherwise.
     /// </summary>
@@ -433,20 +372,20 @@ public sealed class Orchestrator : IAsyncDisposable
     {
         var verifyClone = await _gitManager.CreateWorkerCloneAsync($"verify-{iteration}", ct);
 
+        var verifyPrompt = await _brain.CraftPromptAsync(
+            "tester", _config.Goal, iteration, branchName,
+            "This is POST-MERGE VERIFICATION. A merge was just completed to main. Run ALL tests on the main branch to verify nothing was broken by the merge.",
+            ct);
         var verifyResponse = await RunWorkerAsync(
-            WorkerRole.Tester, verifyClone, "tester",
-            $"""
-            You are verifying the merged code on the main branch for this goal: {_config.Goal}
-
-            A merge was just completed to main. Run ALL tests on the main branch to verify
-            nothing was broken by the merge.
-            Follow your standard testing workflow and produce a TEST_REPORT block.
-            Do NOT run git push.
-            """, ct);
+            WorkerRole.Tester, verifyClone, "tester", verifyPrompt, ct);
         Console.WriteLine($"[Tester:verify] {Truncate(verifyResponse, 300)}");
 
         var verifyMetrics = new IterationMetrics { Iteration = iteration };
-        await InterpretTestOutputAsync(verifyResponse, verifyMetrics, ct);
+        ParseTestReport(verifyResponse, verifyMetrics);
+
+        // Brain interprets
+        var verifyDecision = await _brain.InterpretOutputAsync("tester", verifyResponse, ct);
+        ApplyTestDecision(verifyDecision, verifyMetrics);
 
         if (IsPassingVerdict(verifyMetrics.Verdict))
         {
@@ -470,28 +409,21 @@ public sealed class Orchestrator : IAsyncDisposable
             Console.WriteLine($"[Orchestrator] ⚠ Could not revert merge: {ex.Message}");
         }
 
-        // Send failure feedback to coder
+        // Send failure feedback to coder — brain crafts the prompt
         Console.WriteLine("[Orchestrator] Phase 3c: Coder fixing post-merge failures");
-        var issuesSummary = verifyMetrics.Issues.Count > 0
-            ? "Issues found after merge:\n- " + string.Join("\n- ", verifyMetrics.Issues)
-            : "See tester report for details.";
+        var postMergeFixContext = $"""
+            Code PASSED on the feature branch but FAILED after merging to main.
+            Tester verdict after merge: {verifyMetrics.Verdict}
+            Issues: {string.Join("; ", verifyMetrics.Issues)}
+            Full report: {Truncate(verifyResponse, 2000)}
+            """;
+
+        var fixPrompt = await _brain.CraftPromptAsync(
+            "coder", _config.Goal, iteration, branchName, postMergeFixContext, ct);
 
         await _gitManager.PullBranchAsync(coderClone, $"coder/{branchName}", ct);
         var fixResponse = await RunWorkerAsync(
-            WorkerRole.Coder, coderClone, "coder",
-            $"""
-            Your code PASSED testing on the feature branch but FAILED after merging to main.
-            This means the merge introduced issues (likely conflicts with existing code on main).
-
-            Tester verdict after merge: {verifyMetrics.Verdict}
-            {issuesSummary}
-
-            Tester's full report:
-            {Truncate(verifyResponse, 2000)}
-
-            Fix the code so it works correctly when merged with main.
-            Commit your changes. Do NOT run git push.
-            """, ct);
+            WorkerRole.Coder, coderClone, "coder", fixPrompt, ct);
         Console.WriteLine($"[Coder:postmerge-fix] {Truncate(fixResponse, 200)}");
 
         await _gitManager.RepairRemoteAsync(coderClone, ct);
@@ -502,17 +434,16 @@ public sealed class Orchestrator : IAsyncDisposable
         var retestClone = await _gitManager.CreateWorkerCloneAsync($"retest-{iteration}", ct);
         await _gitManager.PullBranchAsync(retestClone, $"coder/{branchName}", ct);
 
+        var retestPrompt = await _brain.CraftPromptAsync(
+            "tester", _config.Goal, iteration, branchName,
+            "This is a RE-TEST after a post-merge fix. The coder fixed issues that appeared after merging to main. Run ALL tests.", ct);
         var retestResponse = await RunWorkerAsync(
-            WorkerRole.Tester, retestClone, "tester",
-            $"""
-            You are re-testing code after a post-merge fix for this goal: {_config.Goal}
-            The coder fixed issues that appeared after merging to main.
-            Run ALL tests and produce a TEST_REPORT block.
-            Do NOT run git push.
-            """, ct);
+            WorkerRole.Tester, retestClone, "tester", retestPrompt, ct);
         Console.WriteLine($"[Tester:retest] {Truncate(retestResponse, 300)}");
 
         ParseTestReport(retestResponse, metrics);
+        var retestDecision = await _brain.InterpretOutputAsync("tester", retestResponse, ct);
+        ApplyTestDecision(retestDecision, metrics);
 
         if (!IsPassingVerdict(metrics.Verdict))
         {
@@ -854,6 +785,7 @@ public sealed class Orchestrator : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        await _brain.DisposeAsync();
         await _workerManager.DisposeAsync();
     }
 }
