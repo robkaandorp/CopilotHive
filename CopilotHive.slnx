@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/CopilotHive/CopilotHive.csproj" />
     <Project Path="src/CopilotHive.Shared/CopilotHive.Shared.csproj" />
+    <Project Path="src/CopilotHive.Worker/CopilotHive.Worker.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CopilotHive.Tests/CopilotHive.Tests.csproj" />
