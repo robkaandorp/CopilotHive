@@ -25,17 +25,16 @@ RUN dotnet publish src/CopilotHive/CopilotHive.csproj \
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 
-# Install git, curl, Node.js, and Copilot CLI for the Brain
+# Install git, curl, Node.js 24, and Copilot CLI for the Brain
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl git ca-certificates gnupg && \
     mkdir -p /etc/apt/keyrings && \
     curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
       | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" \
       > /etc/apt/sources.list.d/nodesource.list && \
     apt-get update && \
     apt-get install -y nodejs build-essential python3 libicu-dev && \
-    npm install -g @anthropic-ai/claude-code@latest || true && \
     npm install -g @github/copilot && \
     rm -rf /var/lib/apt/lists/*
 
