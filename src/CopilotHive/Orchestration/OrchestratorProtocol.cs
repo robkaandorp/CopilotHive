@@ -23,7 +23,7 @@ public enum OrchestratorActionType
 public sealed record OrchestratorDecision
 {
     [JsonPropertyName("action")]
-    public required OrchestratorActionType Action { get; init; }
+    public OrchestratorActionType Action { get; init; } = OrchestratorActionType.Done;
 
     [JsonPropertyName("prompt")]
     public string? Prompt { get; init; }
