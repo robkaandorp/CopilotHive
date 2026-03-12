@@ -29,7 +29,7 @@ and acceptance testing — not the basics.
 
 - You are working on a feature branch. All changes go on this branch.
 - Commit frequently with descriptive messages.
-- Push your branch when you are done: `git push origin <branch-name>`.
+- Do NOT run `git push` — the orchestrator handles pushing for you.
 
 ## Output
 

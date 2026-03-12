@@ -91,11 +91,12 @@ public sealed class Orchestrator : IAsyncDisposable
             You are working on this goal: {_config.Goal}
 
             This is iteration {iteration}. Work on the coder/{branchName} branch.
-            Write the code, commit your changes with clear commit messages.
-            When done, push your branch with: git push origin coder/{branchName}
+            Write the code and commit your changes with clear commit messages.
+            Do NOT run git push — the orchestrator handles that.
             """, ct);
         Console.WriteLine($"[Coder] {Truncate(coderResponse, 200)}");
 
+        await _gitManager.RepairRemoteAsync(coderClone, ct);
         await _gitManager.PushBranchAsync(coderClone, $"coder/{branchName}", ct);
 
         // Phase 2: Test → Fix loop (up to MaxRetriesPerTask attempts)
@@ -124,7 +125,7 @@ public sealed class Orchestrator : IAsyncDisposable
                 6. Produce the TEST_REPORT block with your findings.
 
                 Commit your test plan, integration tests, and test report on the branch.
-                Push with: git push origin coder/{branchName}
+                Do NOT run git push — the orchestrator handles that.
 
                 IMPORTANT: End your response with a TEST_REPORT block in the exact format
                 specified in your instructions.
@@ -151,6 +152,7 @@ public sealed class Orchestrator : IAsyncDisposable
                 Console.WriteLine($"[Orchestrator] Verdict: {metrics.Verdict} — sending feedback to coder");
 
                 // Push tester's test files so coder can see them
+                await _gitManager.RepairRemoteAsync(testerClone, ct);
                 await _gitManager.PushBranchAsync(testerClone, $"coder/{branchName}", ct);
 
                 // Pull tester's changes into coder clone and send fix prompt
@@ -165,11 +167,12 @@ public sealed class Orchestrator : IAsyncDisposable
                     Tester's full report:
                     {Truncate(testerResponse, 2000)}
 
-                    Fix the code AND update your unit tests. Commit and push with:
-                    git push origin coder/{branchName}
+                    Fix the code AND update your unit tests. Commit your changes.
+                    Do NOT run git push — the orchestrator handles that.
                     """, ct);
                 Console.WriteLine($"[Coder:fix] {Truncate(fixResponse, 200)}");
 
+                await _gitManager.RepairRemoteAsync(coderClone, ct);
                 await _gitManager.PushBranchAsync(coderClone, $"coder/{branchName}", ct);
             }
         }
@@ -225,7 +228,8 @@ public sealed class Orchestrator : IAsyncDisposable
             var trimmed = line.Trim();
 
             // Both TEST_REPORT: and METRICS: start the report section
-            if (trimmed.StartsWith("TEST_REPORT:") || trimmed.StartsWith("METRICS:"))
+            // Also handle TEST_REPORT without colon (LLMs are creative with formatting)
+            if (trimmed.StartsWith("TEST_REPORT") || trimmed.StartsWith("METRICS:"))
             {
                 inReport = true;
                 inIssues = false;
@@ -264,10 +268,21 @@ public sealed class Orchestrator : IAsyncDisposable
                 metrics.CoveragePercent = cov;
             else if (TryParseField(trimmed, "verdict:", out var verdictVal))
                 metrics.Verdict = verdictVal;
+            // LLMs sometimes use "Status:" instead of "verdict:"
+            else if (TryParseField(trimmed, "status:", out var statusVal))
+                metrics.Verdict = statusVal;
             else if (TryParseField(trimmed, "summary:", out var summaryVal))
                 metrics.TestReportSummary = summaryVal;
-            else if (trimmed == "issues:")
+            else if (trimmed.StartsWith("issues:", StringComparison.OrdinalIgnoreCase))
                 inIssues = true;
+
+            // Short-form aliases (LLMs abbreviate)
+            else if (TryParseField(trimmed, "total:", out var shortTotal) && int.TryParse(shortTotal, out var st))
+                metrics.TotalTests = st;
+            else if (TryParseField(trimmed, "passed:", out var shortPassed) && int.TryParse(shortPassed, out var sp))
+                metrics.PassedTests = sp;
+            else if (TryParseField(trimmed, "failed:", out var shortFailed) && int.TryParse(shortFailed, out var sf))
+                metrics.FailedTests = sf;
 
             // Also support the old METRICS: format for backwards compatibility
             else if (TryParseField(trimmed, "total_tests:", out var oldTotal) && int.TryParse(oldTotal, out var ot))

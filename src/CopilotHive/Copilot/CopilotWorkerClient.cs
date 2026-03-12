@@ -18,23 +18,26 @@ public sealed class CopilotWorkerClient : ICopilotWorkerClient
     public CopilotWorkerClient(int port, string model, string? gitHubToken = null)
     {
         _port = port;
+        // Don't pass GitHubToken — the external headless server manages its own auth
         _client = new CopilotClient(new CopilotClientOptions
         {
             CliUrl = $"localhost:{port}",
             AutoStart = false,
-            GitHubToken = gitHubToken,
         });
     }
 
     public async Task ConnectAsync(CancellationToken ct = default)
     {
+        // Wait for the container to boot before first connection attempt
+        await Task.Delay(TimeSpan.FromSeconds(10), ct);
+
+        await _client.StartAsync();
         Exception? lastException = null;
 
         for (var attempt = 1; attempt <= MaxConnectRetries; attempt++)
         {
             try
             {
-                await _client.StartAsync();
                 _session = await _client.CreateSessionAsync(new SessionConfig
                 {
                     Streaming = false,

@@ -60,6 +60,16 @@ public sealed class GitWorkspaceManager
         await RunGitAsync(clonePath, ["checkout", "-b", branchName], ct);
     }
 
+    /// <summary>
+    /// Repair the remote URL after a Docker container may have corrupted it.
+    /// Workers run inside containers where the host path doesn't exist,
+    /// so Copilot may modify .git/config. This resets it to the correct bare repo path.
+    /// </summary>
+    public async Task RepairRemoteAsync(string clonePath, CancellationToken ct = default)
+    {
+        await RunGitAsync(clonePath, ["remote", "set-url", "origin", _bareRepoPath], ct);
+    }
+
     public async Task PushBranchAsync(string clonePath, string branchName, CancellationToken ct = default)
     {
         await RunGitAsync(clonePath, ["push", "origin", branchName, "--force"], ct);

@@ -105,7 +105,7 @@ The verdict meanings:
 ## Git Workflow
 
 - Commit your test plan, integration tests, and test report on the current branch.
-- Push when done: `git push origin <branch-name>`.
+- Do NOT run `git push` — the orchestrator handles pushing for you.
 
 ## Important Rules
 
