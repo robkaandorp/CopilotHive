@@ -25,6 +25,21 @@ You are responsible for writing unit tests alongside your code:
 Unit tests are YOUR responsibility. The tester role handles integration, system,
 and acceptance testing — not the basics.
 
+## Code Coverage
+
+Ensure code coverage is measurable. When adding new projects or test projects:
+
+- Verify that `coverlet.collector` or `coverlet.msbuild` is referenced in the test project.
+- Run tests with coverage collection enabled:
+  ```bash
+  dotnet test --collect:"XPlat Code Coverage"
+  ```
+- If coverage cannot be collected (e.g. missing package), add it:
+  ```bash
+  dotnet add <TestProject> package coverlet.collector
+  ```
+- Do NOT leave coverage at 0% — if coverage tooling is missing, fix it as part of your task.
+
 ## Git Workflow
 
 - You are working on a feature branch. All changes go on this branch.
@@ -36,4 +51,5 @@ and acceptance testing — not the basics.
 When you are finished, summarize:
 - What you built and any decisions you made.
 - What unit tests you wrote and their results.
+- The coverage percentage achieved (run `dotnet test --collect:"XPlat Code Coverage"` and report the result).
 - Any known limitations or areas that need integration testing.
