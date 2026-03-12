@@ -9,6 +9,7 @@ public sealed class DockerWorkerManager : IWorkerManager
     private readonly DockerClient _docker;
     private readonly HiveConfiguration _config;
     private readonly Dictionary<string, WorkerInfo> _workers = [];
+    private readonly string _sessionId = Guid.NewGuid().ToString("N")[..8];
     private int _nextPort;
 
     public DockerWorkerManager(HiveConfiguration config)
@@ -20,6 +21,35 @@ public sealed class DockerWorkerManager : IWorkerManager
 
     public IReadOnlyDictionary<string, WorkerInfo> Workers => _workers;
 
+    /// <summary>
+    /// Removes any stale copilothive-* containers left over from previous runs.
+    /// Called automatically before the first worker is spawned.
+    /// </summary>
+    public async Task CleanupStaleContainersAsync(CancellationToken ct = default)
+    {
+        var containers = await _docker.Containers.ListContainersAsync(
+            new ContainersListParameters { All = true }, ct);
+
+        foreach (var container in containers)
+        {
+            var name = container.Names.FirstOrDefault()?.TrimStart('/') ?? "";
+            if (!name.StartsWith("copilothive-")) continue;
+
+            try
+            {
+                await _docker.Containers.RemoveContainerAsync(
+                    container.ID,
+                    new ContainerRemoveParameters { Force = true },
+                    ct);
+                Console.WriteLine($"[Hive] Cleaned up stale container: {name}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Hive] Warning: could not remove stale container {name}: {ex.Message}");
+            }
+        }
+    }
+
     public async Task<WorkerInfo> SpawnWorkerAsync(
         WorkerRole role,
         string clonePath,
@@ -28,7 +58,7 @@ public sealed class DockerWorkerManager : IWorkerManager
         CancellationToken ct = default)
     {
         var port = _nextPort++;
-        var id = $"copilothive-{role.ToString().ToLowerInvariant()}-{port}";
+        var id = $"copilothive-{_sessionId}-{role.ToString().ToLowerInvariant()}-{port}";
 
         var response = await _docker.Containers.CreateContainerAsync(
             new CreateContainerParameters
@@ -85,15 +115,29 @@ public sealed class DockerWorkerManager : IWorkerManager
         if (!_workers.TryGetValue(workerId, out var worker))
             return;
 
-        await _docker.Containers.StopContainerAsync(
-            worker.ContainerId,
-            new ContainerStopParameters { WaitBeforeKillSeconds = 5 },
-            ct);
+        try
+        {
+            await _docker.Containers.StopContainerAsync(
+                worker.ContainerId,
+                new ContainerStopParameters { WaitBeforeKillSeconds = 5 },
+                ct);
+        }
+        catch (Exception)
+        {
+            // Container may already be stopped
+        }
 
-        await _docker.Containers.RemoveContainerAsync(
-            worker.ContainerId,
-            new ContainerRemoveParameters { Force = true },
-            ct);
+        try
+        {
+            await _docker.Containers.RemoveContainerAsync(
+                worker.ContainerId,
+                new ContainerRemoveParameters { Force = true },
+                ct);
+        }
+        catch (Exception)
+        {
+            // Container may already be removed
+        }
 
         _workers.Remove(workerId);
         Console.WriteLine($"[Hive] Stopped worker: {workerId}");

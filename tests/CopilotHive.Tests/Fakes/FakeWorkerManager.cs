@@ -13,6 +13,13 @@ public sealed class FakeWorkerManager : IWorkerManager
     public IReadOnlyDictionary<string, WorkerInfo> Workers => _workers;
     public List<(WorkerRole Role, string ClonePath, string Model)> SpawnHistory { get; } = [];
     public List<string> StopHistory { get; } = [];
+    public bool CleanupCalled { get; private set; }
+
+    public Task CleanupStaleContainersAsync(CancellationToken ct = default)
+    {
+        CleanupCalled = true;
+        return Task.CompletedTask;
+    }
 
     public Task<WorkerInfo> SpawnWorkerAsync(
         WorkerRole role, string clonePath, string agentsMdPath, string model, CancellationToken ct = default)

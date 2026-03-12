@@ -43,8 +43,9 @@ public sealed class Orchestrator : IAsyncDisposable
     {
         Console.WriteLine($"[Orchestrator] Goal: {_config.Goal}");
         Console.WriteLine($"[Orchestrator] Max iterations: {_config.MaxIterations}");
-        Console.WriteLine($"[Orchestrator] Models — coder: {_config.GetModelForRole("coder")}, reviewer: {_config.GetModelForRole("reviewer")}, tester: {_config.GetModelForRole("tester")}, improver: {_config.GetModelForRole("improver")}");
+        Console.WriteLine($"[Orchestrator] Models — coder: {_config.GetModelForRole("coder")}, reviewer: {_config.GetModelForRole("reviewer")}, tester: {_config.GetModelForRole("tester")}, improver: {_config.GetModelForRole("improver")}, orchestrator: {_config.GetModelForRole("orchestrator")}");
 
+        await _workerManager.CleanupStaleContainersAsync(ct);
         await _gitManager.InitBareRepoAsync(_config.SourcePath, ct);
 
         for (var iteration = 1; iteration <= _config.MaxIterations; iteration++)
@@ -132,7 +133,7 @@ public sealed class Orchestrator : IAsyncDisposable
                 """, ct);
             Console.WriteLine($"[Reviewer] {Truncate(reviewResponse, 300)}");
 
-            var reviewVerdict = ParseReviewReport(reviewResponse, metrics);
+            var reviewVerdict = await InterpretReviewOutputAsync(reviewResponse, metrics, ct);
 
             if (reviewVerdict.Equals("APPROVE", StringComparison.OrdinalIgnoreCase))
             {
@@ -207,7 +208,7 @@ public sealed class Orchestrator : IAsyncDisposable
                 """, ct);
             Console.WriteLine($"[Tester] {Truncate(testerResponse, 300)}");
 
-            ParseTestReport(testerResponse, metrics);
+            await InterpretTestOutputAsync(testerResponse, metrics, ct);
 
             // All tests pass AND runtime verified → done
             if (IsPassingVerdict(metrics.Verdict))
@@ -305,6 +306,124 @@ public sealed class Orchestrator : IAsyncDisposable
     }
 
     /// <summary>
+    /// Uses the orchestrator's LLM to interpret a tester's output and extract structured metrics.
+    /// Falls back to string-based parsing if LLM interpretation fails.
+    /// </summary>
+    private async Task InterpretTestOutputAsync(
+        string testerResponse, IterationMetrics metrics, CancellationToken ct)
+    {
+        // First: always run string-based parsing as baseline
+        ParseTestReport(testerResponse, metrics);
+
+        // If string parsing found a clear verdict, trust it
+        if (IsPassingVerdict(metrics.Verdict)
+            || metrics.Verdict.Equals("FAIL", StringComparison.OrdinalIgnoreCase)
+            || metrics.Verdict.Equals("PARTIAL", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        // Ambiguous or missing verdict — ask the orchestrator LLM
+        Console.WriteLine("[Orchestrator] Verdict ambiguous — using LLM to interpret tester output");
+        try
+        {
+            var interpreterClone = await _gitManager.CreateWorkerCloneAsync("interpreter", ct);
+            var interpretation = await RunWorkerAsync(
+                WorkerRole.Orchestrator, interpreterClone, "orchestrator",
+                $"""
+                You are interpreting test output from a worker. Read the output below and determine the outcome.
+
+                Reply with EXACTLY one line in this format:
+                VERDICT: PASS
+                or
+                VERDICT: FAIL
+
+                Rules:
+                - If ALL tests passed and the build succeeded → VERDICT: PASS
+                - If ANY test failed or the build failed → VERDICT: FAIL
+                - If partial success (some tests pass, some fail) → VERDICT: PARTIAL
+                - When in doubt, say FAIL
+
+                === TESTER OUTPUT ===
+                {Truncate(testerResponse, 4000)}
+                === END OUTPUT ===
+                """, ct);
+
+            var verdictLine = interpretation.Split('\n')
+                .Select(l => l.Trim())
+                .FirstOrDefault(l => l.StartsWith("VERDICT:", StringComparison.OrdinalIgnoreCase));
+
+            if (verdictLine is not null)
+            {
+                var llmVerdict = verdictLine["VERDICT:".Length..].Trim();
+                Console.WriteLine($"[Orchestrator] LLM interpreted verdict: {llmVerdict}");
+                metrics.Verdict = llmVerdict;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Orchestrator] LLM interpretation failed, using string-parsed verdict: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Uses the orchestrator's LLM to interpret a reviewer's output when parsing fails.
+    /// Falls back to the string-based parser result.
+    /// </summary>
+    private async Task<string> InterpretReviewOutputAsync(
+        string reviewResponse, IterationMetrics metrics, CancellationToken ct)
+    {
+        // First: always run string-based parsing
+        var verdict = ParseReviewReport(reviewResponse, metrics);
+
+        // If we got a clear verdict, trust it
+        if (verdict.Equals("APPROVE", StringComparison.OrdinalIgnoreCase)
+            || verdict.Equals("REQUEST_CHANGES", StringComparison.OrdinalIgnoreCase))
+            return verdict;
+
+        // Ambiguous — ask the orchestrator LLM
+        Console.WriteLine("[Orchestrator] Review verdict ambiguous — using LLM to interpret");
+        try
+        {
+            var interpreterClone = await _gitManager.CreateWorkerCloneAsync("interpreter", ct);
+            var interpretation = await RunWorkerAsync(
+                WorkerRole.Orchestrator, interpreterClone, "orchestrator",
+                $"""
+                You are interpreting code review output from a worker. Read the output below and determine the verdict.
+
+                Reply with EXACTLY one line in this format:
+                VERDICT: APPROVE
+                or
+                VERDICT: REQUEST_CHANGES
+
+                Rules:
+                - If the reviewer approves the code with no blocking issues → VERDICT: APPROVE
+                - If the reviewer requests changes or found critical/major issues → VERDICT: REQUEST_CHANGES
+                - When in doubt, say REQUEST_CHANGES
+
+                === REVIEWER OUTPUT ===
+                {Truncate(reviewResponse, 4000)}
+                === END OUTPUT ===
+                """, ct);
+
+            var verdictLine = interpretation.Split('\n')
+                .Select(l => l.Trim())
+                .FirstOrDefault(l => l.StartsWith("VERDICT:", StringComparison.OrdinalIgnoreCase));
+
+            if (verdictLine is not null)
+            {
+                verdict = verdictLine["VERDICT:".Length..].Trim();
+                Console.WriteLine($"[Orchestrator] LLM interpreted review verdict: {verdict}");
+                metrics.ReviewVerdict = verdict;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Orchestrator] LLM interpretation failed, using string-parsed verdict: {ex.Message}");
+        }
+
+        return verdict;
+    }
+
+    /// <summary>
     /// Runs post-merge verification: tests main after merge, reverts + sends to coder if tests fail.
     /// Returns true if main is in a good state (tests pass), false otherwise.
     /// </summary>
@@ -327,7 +446,7 @@ public sealed class Orchestrator : IAsyncDisposable
         Console.WriteLine($"[Tester:verify] {Truncate(verifyResponse, 300)}");
 
         var verifyMetrics = new IterationMetrics { Iteration = iteration };
-        ParseTestReport(verifyResponse, verifyMetrics);
+        await InterpretTestOutputAsync(verifyResponse, verifyMetrics, ct);
 
         if (IsPassingVerdict(verifyMetrics.Verdict))
         {

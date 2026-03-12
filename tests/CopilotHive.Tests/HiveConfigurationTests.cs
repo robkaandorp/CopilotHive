@@ -67,4 +67,29 @@ public class HiveConfigurationTests
         Assert.Equal("gpt-5.3-codex", config.GetModelForRole("REVIEWER"));
         Assert.Equal("claude-sonnet-4.6", config.GetModelForRole("Tester"));
     }
+
+    [Fact]
+    public void GetModelForRole_Orchestrator_DefaultsSonnet()
+    {
+        var config = new HiveConfiguration
+        {
+            Goal = "test",
+            GitHubToken = "fake",
+        };
+
+        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole("orchestrator"));
+    }
+
+    [Fact]
+    public void GetModelForRole_Orchestrator_WithOverride()
+    {
+        var config = new HiveConfiguration
+        {
+            Goal = "test",
+            GitHubToken = "fake",
+            OrchestratorModel = "gpt-5-mini",
+        };
+
+        Assert.Equal("gpt-5-mini", config.GetModelForRole("orchestrator"));
+    }
 }

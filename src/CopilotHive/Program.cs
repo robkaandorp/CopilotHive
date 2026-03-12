@@ -11,6 +11,7 @@ var coderModel = args.FirstOrDefault(a => a.StartsWith("--coder-model="))?[14..]
 var reviewerModel = args.FirstOrDefault(a => a.StartsWith("--reviewer-model="))?[17..];
 var testerModel = args.FirstOrDefault(a => a.StartsWith("--tester-model="))?[15..];
 var improverModel = args.FirstOrDefault(a => a.StartsWith("--improver-model="))?[17..];
+var orchestratorModel = args.FirstOrDefault(a => a.StartsWith("--orchestrator-model="))?[21..];
 var alwaysImprove = args.Contains("--always-improve");
 
 var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN")
@@ -30,6 +31,7 @@ if (string.IsNullOrEmpty(goal))
     Console.Error.WriteLine("  --reviewer-model=<model> Model for reviewer role (default: gpt-5.3-codex)");
     Console.Error.WriteLine("  --tester-model=<model>   Model for tester role (default: claude-sonnet-4.6)");
     Console.Error.WriteLine("  --improver-model=<model> Model for improver role (default: claude-sonnet-4.6)");
+    Console.Error.WriteLine("  --orchestrator-model=<m> Model for orchestrator interpretation (default: claude-sonnet-4.6)");
     Console.Error.WriteLine();
     Console.Error.WriteLine("Environment:");
     Console.Error.WriteLine("  GH_TOKEN                 GitHub PAT with Copilot permissions (required)");
@@ -69,6 +71,7 @@ var config = new HiveConfiguration
     ReviewerModel = reviewerModel,
     TesterModel = testerModel,
     ImproverModel = improverModel,
+    OrchestratorModel = orchestratorModel,
     AlwaysImprove = alwaysImprove,
     GitHubToken = ghToken,
 };

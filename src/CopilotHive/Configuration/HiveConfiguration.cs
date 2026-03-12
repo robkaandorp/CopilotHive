@@ -29,6 +29,9 @@ public sealed class HiveConfiguration
     /// <summary>Model for the improver role (default: claude-sonnet-4.6).</summary>
     public string? ImproverModel { get; init; }
 
+    /// <summary>Model for the orchestrator's output interpretation (default: claude-sonnet-4.6).</summary>
+    public string? OrchestratorModel { get; init; }
+
     /// <summary>
     /// Resolves the model to use for a given agent role.
     /// Falls back to <see cref="Model"/> when no role-specific override is set.
@@ -39,6 +42,7 @@ public sealed class HiveConfiguration
         "reviewer" => ReviewerModel ?? "gpt-5.3-codex",
         "tester" => TesterModel ?? "claude-sonnet-4.6",
         "improver" => ImproverModel ?? "claude-sonnet-4.6",
+        "orchestrator" => OrchestratorModel ?? "claude-sonnet-4.6",
         _ => Model,
     };
 }

@@ -19,6 +19,7 @@ public class OrchestratorIntegrationTests : IDisposable
         File.WriteAllText(Path.Combine(agentsDir, "coder.agents.md"), "# Coder\nYou write code.");
         File.WriteAllText(Path.Combine(agentsDir, "tester.agents.md"), "# Tester\nYou test code.");
         File.WriteAllText(Path.Combine(agentsDir, "reviewer.agents.md"), "# Reviewer\nYou review code.");
+        File.WriteAllText(Path.Combine(agentsDir, "orchestrator.agents.md"), "# Orchestrator\nYou interpret output.");
     }
 
     private HiveConfiguration CreateConfig(int maxIterations = 1, int maxRetries = 0) => new()
@@ -533,6 +534,89 @@ public class OrchestratorIntegrationTests : IDisposable
     public void IsPassingVerdict_CorrectlyClassifies(string verdict, bool expected)
     {
         Assert.Equal(expected, Orchestrator.IsPassingVerdict(verdict));
+    }
+
+    [Fact]
+    public async Task AmbiguousTestVerdict_SpawnsOrchestratorWorkerToInterpret()
+    {
+        var workerManager = new FakeWorkerManager();
+        var clientFactory = new FakeCopilotClientFactory(prompt =>
+        {
+            if (prompt.Contains("You are working on this goal"))
+                return "Code written.";
+            if (prompt.Contains("reviewing code changes"))
+                return ApproveReview;
+            // Tester returns ambiguous output — no verdict field, no counts to infer from
+            if (prompt.Contains("You are testing code for this goal"))
+                return """
+                    I ran the tests and everything looks fine.
+                    Build completed. Tests executed.
+                    """;
+            // Interpreter should get asked "is this a PASS or FAIL?"
+            if (prompt.Contains("interpreting test output"))
+                return "VERDICT: PASS";
+            // Post-merge verification
+            if (prompt.Contains("verifying the merged code"))
+                return PassingTestReport;
+            return "Unknown prompt.";
+        });
+
+        var config = CreateConfig();
+        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await orchestrator.RunAsync();
+
+        // Should have spawned an Orchestrator-role worker for interpretation
+        Assert.Contains(workerManager.SpawnHistory, s => s.Role == WorkerRole.Orchestrator);
+    }
+
+    [Fact]
+    public async Task AmbiguousReviewVerdict_SpawnsOrchestratorWorkerToInterpret()
+    {
+        var workerManager = new FakeWorkerManager();
+        var clientFactory = new FakeCopilotClientFactory(prompt =>
+        {
+            if (prompt.Contains("You are working on this goal"))
+                return "Code written.";
+            // Reviewer returns no structured REVIEW_REPORT block
+            if (prompt.Contains("reviewing code changes"))
+                return "The code looks acceptable. I have a few minor suggestions but nothing critical.";
+            // Interpreter gets asked
+            if (prompt.Contains("interpreting code review output"))
+                return "VERDICT: APPROVE";
+            if (prompt.Contains("You are testing code for this goal"))
+                return PassingTestReport;
+            if (prompt.Contains("verifying the merged code"))
+                return PassingTestReport;
+            return "Unknown prompt.";
+        });
+
+        var config = CreateConfig();
+        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await orchestrator.RunAsync();
+
+        // Should have spawned an Orchestrator-role worker for review interpretation
+        Assert.Contains(workerManager.SpawnHistory, s => s.Role == WorkerRole.Orchestrator);
+    }
+
+    [Fact]
+    public async Task ClearVerdict_DoesNotSpawnOrchestratorWorker()
+    {
+        var workerManager = new FakeWorkerManager();
+        var clientFactory = new FakeCopilotClientFactory(prompt =>
+        {
+            if (prompt.Contains("You are working on this goal"))
+                return "Code written.";
+            if (prompt.Contains("reviewing code changes"))
+                return ApproveReview;
+            return PassingTestReport;
+        });
+
+        var config = CreateConfig();
+        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await orchestrator.RunAsync();
+
+        // Clear verdicts — no orchestrator worker needed
+        Assert.DoesNotContain(workerManager.SpawnHistory, s => s.Role == WorkerRole.Orchestrator);
     }
 
     public void Dispose()

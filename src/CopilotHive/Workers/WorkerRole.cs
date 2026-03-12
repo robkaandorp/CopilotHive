@@ -6,6 +6,7 @@ public enum WorkerRole
     Tester,
     Reviewer,
     Improver,
+    Orchestrator,
     DocsWriter,
     MergeWorker,
 }
