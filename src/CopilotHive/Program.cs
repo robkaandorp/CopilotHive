@@ -32,6 +32,10 @@ static async Task<int> RunServerAsync(string[] args)
 
     var builder = WebApplication.CreateBuilder(args);
 
+    // Suppress noisy health-check request logs
+    builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning);
+    builder.Logging.AddFilter("Microsoft.AspNetCore.Routing.EndpointMiddleware", LogLevel.Warning);
+
     builder.Services.AddGrpc();
     builder.Services.AddSingleton<WorkerPool>();
     builder.Services.AddSingleton<TaskQueue>();

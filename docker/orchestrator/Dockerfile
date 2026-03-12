@@ -1,5 +1,5 @@
 # ── Build stage ───────────────────────────────────────────────────────────────
-FROM mcr.microsoft.com/dotnet/sdk:10.0-preview AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 
 WORKDIR /src
 
@@ -23,7 +23,7 @@ RUN dotnet publish src/CopilotHive/CopilotHive.csproj \
     -o /app/publish
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
-FROM mcr.microsoft.com/dotnet/aspnet:10.0-preview AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl git && \
