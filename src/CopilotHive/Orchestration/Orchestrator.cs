@@ -63,9 +63,8 @@ public sealed class Orchestrator : IAsyncDisposable
                 if (_metricsTracker.HasRegressed(metrics))
                 {
                     Console.WriteLine("[Orchestrator] ⚠ REGRESSION DETECTED — rolling back AGENTS.md");
-                    _agentsManager.RollbackAgentsMd("coder");
-                    _agentsManager.RollbackAgentsMd("tester");
-                    _agentsManager.RollbackAgentsMd("orchestrator");
+                    foreach (var role in new[] { "coder", "tester", "orchestrator", "improver" })
+                        _agentsManager.RollbackAgentsMd(role);
                 }
             }
 
@@ -231,7 +230,7 @@ public sealed class Orchestrator : IAsyncDisposable
     {
         Console.WriteLine("[Orchestrator] Phase 4: Self-Improvement");
 
-        var rolesToImprove = new[] { "coder", "tester", "orchestrator" };
+        var rolesToImprove = new[] { "coder", "tester", "orchestrator", "improver" };
         var currentAgentsMd = new Dictionary<string, string>();
         foreach (var role in rolesToImprove)
         {
