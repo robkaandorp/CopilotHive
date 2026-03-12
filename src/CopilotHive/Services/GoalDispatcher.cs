@@ -182,13 +182,21 @@ public sealed class GoalDispatcher : BackgroundService
                 break;
 
             case OrchestratorActionType.Merge:
-                pipeline.AdvanceTo(GoalPhase.Merging);
-                await PerformMergeAsync(pipeline, ct);
+                // Enforce remaining phases before merge
+                var mergeEnforced = await EnforceRemainingPhasesAsync(pipeline, ct);
+                if (!mergeEnforced)
+                {
+                    pipeline.AdvanceTo(GoalPhase.Merging);
+                    await PerformMergeAsync(pipeline, ct);
+                }
                 break;
 
             case OrchestratorActionType.Done:
             case OrchestratorActionType.Skip:
-                await MarkGoalCompleted(pipeline, ct);
+                // Enforce minimum pipeline phases before allowing completion
+                var enforced = await EnforceRemainingPhasesAsync(pipeline, ct);
+                if (!enforced)
+                    await MarkGoalCompleted(pipeline, ct);
                 break;
 
             default:
@@ -207,6 +215,70 @@ public sealed class GoalDispatcher : BackgroundService
                 await DriveNextPhaseAsync(pipeline, synthetic, ct);
                 break;
         }
+    }
+
+    /// <summary>
+    /// When the Brain says "Done" too early, enforce any remaining mandatory pipeline phases.
+    /// Returns true if a phase was dispatched (i.e., don't mark complete yet).
+    /// Minimum phases: Coding → Testing → Review → Improve (if always_improve) → Merge.
+    /// </summary>
+    private async Task<bool> EnforceRemainingPhasesAsync(GoalPipeline pipeline, CancellationToken ct)
+    {
+        var alwaysImprove = _config?.Orchestrator?.AlwaysImprove ?? false;
+
+        // Determine the next mandatory phase based on what's been completed
+        var nextPhase = pipeline.Phase switch
+        {
+            GoalPhase.Coding => GoalPhase.Testing,
+            GoalPhase.Testing => GoalPhase.Review,
+            GoalPhase.Review when alwaysImprove => GoalPhase.Improve,
+            GoalPhase.Review => GoalPhase.Merging,
+            GoalPhase.Improve => GoalPhase.Merging,
+            _ => (GoalPhase?)null,
+        };
+
+        if (nextPhase is null)
+            return false;
+
+        _logger.LogInformation(
+            "Enforcing pipeline phase {Phase} for goal {GoalId} (Brain wanted Done at {CurrentPhase})",
+            nextPhase, pipeline.GoalId, pipeline.Phase);
+
+        switch (nextPhase)
+        {
+            case GoalPhase.Testing:
+                pipeline.AdvanceTo(GoalPhase.Testing);
+                var testPrompt = _brain is not null
+                    ? await _brain.CraftPromptAsync(pipeline, "tester", null, ct)
+                    : $"Run the existing tests and verify the changes for: {pipeline.Description}";
+                await DispatchToRole(pipeline, WorkerRole.Tester, testPrompt, ct);
+                return true;
+
+            case GoalPhase.Review:
+                pipeline.AdvanceTo(GoalPhase.Review);
+                var reviewPrompt = _brain is not null
+                    ? await _brain.CraftPromptAsync(pipeline, "reviewer", null, ct)
+                    : $"Review the code changes for: {pipeline.Description}";
+                await DispatchToRole(pipeline, WorkerRole.Reviewer, reviewPrompt, ct);
+                return true;
+
+            case GoalPhase.Improve:
+                pipeline.AdvanceTo(GoalPhase.Improve);
+                _logger.LogInformation("Dispatching Improver for goal {GoalId} (always_improve=true)", pipeline.GoalId);
+                var improvePrompt = _brain is not null
+                    ? await _brain.CraftPromptAsync(pipeline, "improver",
+                        "Review is complete. Suggest and apply improvements to code quality, naming, docs, or test coverage.", ct)
+                    : $"Improve the code for: {pipeline.Description}";
+                await DispatchToRole(pipeline, WorkerRole.Improver, improvePrompt, ct);
+                return true;
+
+            case GoalPhase.Merging:
+                pipeline.AdvanceTo(GoalPhase.Merging);
+                await PerformMergeAsync(pipeline, ct);
+                return true;
+        }
+
+        return false;
     }
 
     private async Task DispatchToRole(GoalPipeline pipeline, WorkerRole role, string? prompt, CancellationToken ct)

@@ -13,8 +13,9 @@ public enum GoalPhase
 {
     Planning,
     Coding,
-    Review,
     Testing,
+    Review,
+    Improve,
     Merging,
     Done,
     Failed,

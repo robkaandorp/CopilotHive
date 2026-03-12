@@ -43,7 +43,7 @@ WORKDIR /app
 COPY --from=build /app/publish .
 COPY agents/ /app/agents/
 COPY docker/orchestrator/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
 EXPOSE 5000 5001 8100
 
