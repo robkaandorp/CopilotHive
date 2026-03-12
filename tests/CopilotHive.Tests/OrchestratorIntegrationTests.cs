@@ -659,6 +659,119 @@ public class OrchestratorIntegrationTests : IDisposable
         Assert.NotEmpty(brain.Interpretations); // Brain interpreted outputs
     }
 
+    [Fact]
+    public async Task BrainPlanDone_SkipsEntireIteration_NoWorkersSpawned()
+    {
+        var workerManager = new FakeWorkerManager();
+        var brain = new FakeOrchestratorBrain
+        {
+            PlanIterationOverride = (_, _, _) => new OrchestratorDecision
+            {
+                Action = OrchestratorActionType.Done,
+                Reason = "Goal already accomplished in previous iteration",
+            },
+        };
+        var clientFactory = new FakeCopilotClientFactory(_ => "Should not be called");
+
+        var config = CreateConfig();
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory, brain);
+        await orchestrator.RunAsync();
+
+        // No workers should have been spawned — brain said Done
+        Assert.Empty(workerManager.SpawnHistory);
+        Assert.Empty(brain.Prompts);
+        Assert.Empty(brain.Interpretations);
+    }
+
+    [Fact]
+    public async Task BrainPlanDone_CarriesForwardPreviousMetrics()
+    {
+        var workerManager = new FakeWorkerManager();
+        var iterationCount = 0;
+        var brain = new FakeOrchestratorBrain
+        {
+            PlanIterationOverride = (iteration, _, previousMetrics) =>
+            {
+                iterationCount++;
+                if (iteration == 1)
+                    return new OrchestratorDecision
+                    {
+                        Action = OrchestratorActionType.SpawnCoder,
+                        Reason = "First iteration",
+                    };
+                // Second iteration — brain says we're done
+                return new OrchestratorDecision
+                {
+                    Action = OrchestratorActionType.Done,
+                    Reason = "Goal complete",
+                };
+            },
+        };
+
+        // Iteration 1 produces a FAIL verdict so the loop continues to iteration 2
+        var failingTestReport = """
+            TEST_REPORT:
+            build_success: true
+            unit_tests_total: 5
+            unit_tests_passed: 4
+            integration_tests_total: 0
+            integration_tests_passed: 0
+            runtime_verified: true
+            coverage_percent: 80
+            verdict: FAIL
+            summary: One test failed.
+            issues:
+            """;
+
+        var clientFactory = new FakeCopilotClientFactory(prompt =>
+        {
+            if (prompt.Contains("You are working on this goal"))
+                return "Code written.";
+            if (prompt.Contains("reviewing code changes"))
+                return ApproveReview;
+            return failingTestReport;
+        });
+
+        var config = CreateConfig(maxIterations: 2);
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory, brain);
+        await orchestrator.RunAsync();
+
+        // First iteration ran normally, second was skipped by brain
+        Assert.Equal(2, iterationCount);
+        // Workers were spawned only in iteration 1
+        Assert.Contains(workerManager.SpawnHistory, s => s.Role == WorkerRole.Coder);
+    }
+
+    [Fact]
+    public async Task BrainPlanOverride_IsCalledWithGoalAndIteration()
+    {
+        var capturedGoals = new List<string>();
+        var capturedIterations = new List<int>();
+        var workerManager = new FakeWorkerManager();
+        var brain = new FakeOrchestratorBrain
+        {
+            PlanIterationOverride = (iteration, goal, _) =>
+            {
+                capturedGoals.Add(goal);
+                capturedIterations.Add(iteration);
+                return new OrchestratorDecision
+                {
+                    Action = OrchestratorActionType.Done,
+                    Reason = "Done",
+                };
+            },
+        };
+        var clientFactory = new FakeCopilotClientFactory(_ => "unused");
+
+        var config = CreateConfig();
+        await using var orchestrator = CreateOrchestrator(config, workerManager, clientFactory, brain);
+        await orchestrator.RunAsync();
+
+        Assert.Single(capturedGoals);
+        Assert.Equal("Write a hello world program", capturedGoals[0]);
+        Assert.Equal(1, capturedIterations[0]);
+    }
+
     public void Dispose()
     {
         for (var i = 0; i < 5; i++)

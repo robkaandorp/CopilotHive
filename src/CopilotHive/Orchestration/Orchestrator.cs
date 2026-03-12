@@ -116,6 +116,24 @@ public sealed class Orchestrator : IAsyncDisposable
         var plan = await _brain.PlanIterationAsync(iteration, _config.Goal, previousMetrics, ct);
         Console.WriteLine($"[Brain] Plan: {plan.Reason ?? plan.Action.ToString()}");
 
+        // Brain can short-circuit the iteration when the goal is already complete
+        if (plan.Action == OrchestratorActionType.Done)
+        {
+            Console.WriteLine("[Orchestrator] Brain determined goal is already complete — skipping iteration");
+            metrics.Verdict = "PASS";
+            // Carry forward previous metrics so we don't lose test counts
+            if (previousMetrics is not null)
+            {
+                metrics.TotalTests = previousMetrics.TotalTests;
+                metrics.PassedTests = previousMetrics.PassedTests;
+                metrics.FailedTests = previousMetrics.FailedTests;
+                metrics.CoveragePercent = previousMetrics.CoveragePercent;
+                metrics.BuildSuccess = previousMetrics.BuildSuccess;
+            }
+            metrics.Duration = sw.Elapsed;
+            return metrics;
+        }
+
         // Phase 1: Coding — brain crafts the prompt
         Console.WriteLine("[Orchestrator] Phase 1: Coding");
         var coderClone = await _gitManager.CreateWorkerCloneAsync($"coder-{iteration}", ct);

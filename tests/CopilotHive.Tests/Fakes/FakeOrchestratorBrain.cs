@@ -26,6 +26,11 @@ public sealed class FakeOrchestratorBrain : IOrchestratorBrain
     public Func<string, string, OrchestratorDecision>? InterpretOutputOverride { get; set; }
 
     /// <summary>
+    /// Optional: override plan iteration. Default returns SpawnCoder.
+    /// </summary>
+    public Func<int, string, IterationMetrics?, OrchestratorDecision>? PlanIterationOverride { get; set; }
+
+    /// <summary>
     /// Optional: override next step decision. Default returns SpawnCoder.
     /// </summary>
     public Func<string, string, OrchestratorDecision>? DecideNextStepOverride { get; set; }
@@ -39,11 +44,14 @@ public sealed class FakeOrchestratorBrain : IOrchestratorBrain
     public Task<OrchestratorDecision> PlanIterationAsync(
         int iteration, string goal, IterationMetrics? previousMetrics, CancellationToken ct = default)
     {
-        return Task.FromResult(new OrchestratorDecision
-        {
-            Action = OrchestratorActionType.SpawnCoder,
-            Reason = "Default plan: start with coding",
-        });
+        var decision = PlanIterationOverride?.Invoke(iteration, goal, previousMetrics)
+            ?? new OrchestratorDecision
+            {
+                Action = OrchestratorActionType.SpawnCoder,
+                Reason = "Default plan: start with coding",
+            };
+
+        return Task.FromResult(decision);
     }
 
     public Task<string> CraftPromptAsync(
