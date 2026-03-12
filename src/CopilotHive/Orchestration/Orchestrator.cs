@@ -90,9 +90,9 @@ public sealed class Orchestrator : IAsyncDisposable
                 }
             }
 
-            // Phase 4: Self-improvement (skip on clean pass or if we're on the last iteration)
-            if ((_config.AlwaysImprove || _improvementAnalyzer.ShouldImprove(metrics))
-                && iteration < _config.MaxIterations)
+            // Phase 4: Self-improvement (skip on last iteration unless --always-improve)
+            if (_config.AlwaysImprove
+                || (_improvementAnalyzer.ShouldImprove(metrics) && iteration < _config.MaxIterations))
             {
                 await RunImprovementPhaseAsync(metrics, ct);
             }
