@@ -12,5 +12,6 @@ public sealed class HiveConfiguration
     public int MaxRetriesPerTask { get; init; } = 3;
     public int BasePort { get; init; } = 8001;
     public string Model { get; init; } = "claude-opus-4.6";
+    public bool AlwaysImprove { get; init; }
     public required string GitHubToken { get; init; }
 }

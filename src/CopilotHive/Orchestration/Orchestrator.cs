@@ -69,7 +69,8 @@ public sealed class Orchestrator : IAsyncDisposable
             }
 
             // Phase 4: Self-improvement (skip on clean pass or if we're on the last iteration)
-            if (_improvementAnalyzer.ShouldImprove(metrics) && iteration < _config.MaxIterations)
+            if ((_config.AlwaysImprove || _improvementAnalyzer.ShouldImprove(metrics))
+                && iteration < _config.MaxIterations)
             {
                 await RunImprovementPhaseAsync(metrics, ct);
             }
@@ -255,17 +256,26 @@ public sealed class Orchestrator : IAsyncDisposable
 
             var improvements = ParseImproverResponse(improverResponse);
             var appliedCount = 0;
+            var rejectedCount = 0;
 
             foreach (var (role, newContent) in improvements)
             {
-                if (currentAgentsMd.ContainsKey(role))
+                if (!currentAgentsMd.TryGetValue(role, out var originalContent))
+                    continue;
+
+                if (!ValidateImprovement(originalContent, newContent, role))
                 {
-                    _agentsManager.UpdateAgentsMd(role, newContent);
-                    appliedCount++;
-                    Console.WriteLine($"[Orchestrator] 📝 Updated {role}.agents.md");
+                    rejectedCount++;
+                    continue;
                 }
+
+                _agentsManager.UpdateAgentsMd(role, newContent);
+                appliedCount++;
+                Console.WriteLine($"[Orchestrator] 📝 Updated {role}.agents.md");
             }
 
+            if (rejectedCount > 0)
+                Console.WriteLine($"[Orchestrator] ⚠ Rejected {rejectedCount} improvement(s) that were too short (likely summaries, not full files).");
             if (appliedCount == 0)
                 Console.WriteLine("[Orchestrator] No improvements applied this iteration.");
             else
@@ -275,6 +285,33 @@ public sealed class Orchestrator : IAsyncDisposable
         {
             Console.WriteLine($"[Orchestrator] Improvement phase failed (non-fatal): {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Validates that improved content is a plausible full AGENTS.md replacement,
+    /// not a summary or placeholder. Rejects content that is too short absolutely
+    /// or relative to the original.
+    /// </summary>
+    internal static bool ValidateImprovement(string originalContent, string newContent, string role)
+    {
+        const int MinimumLineCount = 5;
+
+        var newLines = newContent.Split('\n').Length;
+        var originalLines = originalContent.Split('\n').Length;
+
+        if (newLines < MinimumLineCount)
+        {
+            Console.WriteLine($"[Orchestrator] ⚠ Rejected {role}.agents.md: only {newLines} lines (minimum {MinimumLineCount})");
+            return false;
+        }
+
+        if (originalLines > 0 && newLines < originalLines / 2)
+        {
+            Console.WriteLine($"[Orchestrator] ⚠ Rejected {role}.agents.md: {newLines} lines vs {originalLines} original (<50%)");
+            return false;
+        }
+
+        return true;
     }
 
     /// <summary>

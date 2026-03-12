@@ -7,6 +7,7 @@ var source = args.FirstOrDefault(a => a.StartsWith("--source="))?[9..];
 var maxIterations = int.TryParse(
     args.FirstOrDefault(a => a.StartsWith("--max-iterations="))?[17..], out var mi) ? mi : 10;
 var model = args.FirstOrDefault(a => a.StartsWith("--model="))?[8..] ?? "claude-opus-4.6";
+var alwaysImprove = args.Contains("--always-improve");
 
 var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN")
     ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
@@ -56,6 +57,7 @@ var config = new HiveConfiguration
     SourcePath = source,
     MaxIterations = maxIterations,
     Model = model,
+    AlwaysImprove = alwaysImprove,
     GitHubToken = ghToken,
 };
 

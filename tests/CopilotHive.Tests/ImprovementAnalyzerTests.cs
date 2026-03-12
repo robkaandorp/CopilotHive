@@ -232,4 +232,50 @@ public class ImprovementAnalyzerTests
         Assert.False(result.ContainsKey("coder"));
         Assert.True(result.ContainsKey("tester"));
     }
+
+    [Fact]
+    public void ValidateImprovement_AcceptsValidImprovement()
+    {
+        var original = string.Join('\n', Enumerable.Range(1, 20).Select(i => $"Line {i}"));
+        var improved = string.Join('\n', Enumerable.Range(1, 22).Select(i => $"Line {i}"));
+
+        Assert.True(Orchestrator.ValidateImprovement(original, improved, "coder"));
+    }
+
+    [Fact]
+    public void ValidateImprovement_RejectsTooFewLines()
+    {
+        var original = string.Join('\n', Enumerable.Range(1, 30).Select(i => $"Line {i}"));
+        var improved = "# Coder\nSummary only.";
+
+        Assert.False(Orchestrator.ValidateImprovement(original, improved, "coder"));
+    }
+
+    [Fact]
+    public void ValidateImprovement_RejectsTooShortRelativeToOriginal()
+    {
+        var original = string.Join('\n', Enumerable.Range(1, 40).Select(i => $"Line {i}"));
+        // 10 lines = 25% of 40 — should be rejected (<50%)
+        var improved = string.Join('\n', Enumerable.Range(1, 10).Select(i => $"Line {i}"));
+
+        Assert.False(Orchestrator.ValidateImprovement(original, improved, "coder"));
+    }
+
+    [Fact]
+    public void ValidateImprovement_AcceptsLongerThanOriginal()
+    {
+        var original = string.Join('\n', Enumerable.Range(1, 20).Select(i => $"Line {i}"));
+        var improved = string.Join('\n', Enumerable.Range(1, 50).Select(i => $"Line {i}"));
+
+        Assert.True(Orchestrator.ValidateImprovement(original, improved, "coder"));
+    }
+
+    [Fact]
+    public void ValidateImprovement_AcceptsExactlyHalfLength()
+    {
+        var original = string.Join('\n', Enumerable.Range(1, 20).Select(i => $"Line {i}"));
+        var improved = string.Join('\n', Enumerable.Range(1, 10).Select(i => $"Line {i}"));
+
+        Assert.True(Orchestrator.ValidateImprovement(original, improved, "coder"));
+    }
 }

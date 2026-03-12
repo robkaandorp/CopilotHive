@@ -16,18 +16,29 @@ problems observed while preserving what worked well.
 
 ## Rules
 
-1. **Output format** — Return the complete improved AGENTS.md content for each role,
-   wrapped in clearly labelled blocks:
+1. **Output format** — Return the **COMPLETE, READY-TO-USE** improved AGENTS.md file
+   for each role, wrapped in clearly labelled blocks. The content between the markers
+   **replaces the existing file entirely** — it must be a fully functional AGENTS.md,
+   NOT a summary, description, or diff of changes.
 
    ```
    === IMPROVED coder.agents.md ===
-   <full content here>
-   === END coder.agents.md ===
+   # Coder
 
-   === IMPROVED tester.agents.md ===
-   <full content here>
-   === END tester.agents.md ===
+   You are a software developer working as part of a team...
+
+   ## Working Style
+   - Read the task description carefully...
+   [... EVERY section, EVERY rule, EVERY instruction from the original,
+    plus your targeted improvements ...]
+   === END coder.agents.md ===
    ```
+
+   ⚠ **CRITICAL**: The content between `=== IMPROVED ===` and `=== END ===` markers
+   is written directly to disk as the new AGENTS.md file. If you write a summary like
+   "added section X about Y" or a description of changes, it will **destroy** the
+   agent's instructions. You MUST write the complete markdown document. If the original
+   file is 40 lines, your improved version should be at least 40 lines.
 
 2. **Preserve structured formats exactly** — If a role defines a report format
    (like TEST_REPORT), keep the field names and structure identical. Only improve
