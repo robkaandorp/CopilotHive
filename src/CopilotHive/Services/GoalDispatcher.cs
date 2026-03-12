@@ -107,8 +107,7 @@ public sealed class GoalDispatcher : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error driving pipeline {GoalId} to next phase", pipeline.GoalId);
-            pipeline.AdvanceTo(GoalPhase.Failed);
-            await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Failed, ct);
+            await MarkGoalFailed(pipeline, ex.Message, ct);
         }
     }
 
@@ -155,9 +154,7 @@ public sealed class GoalDispatcher : BackgroundService
             case OrchestratorActionType.RequestChanges:
                 if (!pipeline.IncrementReviewRetry())
                 {
-                    _logger.LogWarning("Pipeline {GoalId} exceeded max review retries", pipeline.GoalId);
-                    pipeline.AdvanceTo(GoalPhase.Failed);
-                    await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Failed, ct);
+                    await MarkGoalFailed(pipeline, "Exceeded max review retries", ct);
                     return;
                 }
                 pipeline.IncrementIteration();
@@ -170,9 +167,7 @@ public sealed class GoalDispatcher : BackgroundService
             case OrchestratorActionType.Retry:
                 if (!pipeline.IncrementTestRetry())
                 {
-                    _logger.LogWarning("Pipeline {GoalId} exceeded max test retries", pipeline.GoalId);
-                    pipeline.AdvanceTo(GoalPhase.Failed);
-                    await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Failed, ct);
+                    await MarkGoalFailed(pipeline, "Exceeded max test retries", ct);
                     return;
                 }
                 pipeline.IncrementIteration();
@@ -259,8 +254,7 @@ public sealed class GoalDispatcher : BackgroundService
     {
         if (pipeline.CoderBranch is null)
         {
-            _logger.LogWarning("Cannot merge pipeline {GoalId} — no coder branch set", pipeline.GoalId);
-            pipeline.AdvanceTo(GoalPhase.Failed);
+            await MarkGoalFailed(pipeline, "No coder branch set", ct);
             return;
         }
 
@@ -297,8 +291,7 @@ public sealed class GoalDispatcher : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Merge failed for pipeline {GoalId}", pipeline.GoalId);
-            pipeline.AdvanceTo(GoalPhase.Failed);
-            await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Failed, ct);
+            await MarkGoalFailed(pipeline, $"Merge failed: {ex.Message}", ct);
         }
     }
 
@@ -323,6 +316,7 @@ public sealed class GoalDispatcher : BackgroundService
     {
         pipeline.AdvanceTo(GoalPhase.Done);
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Completed, ct);
+        await CleanupBrainSessionAsync(pipeline.GoalId);
 
         var duration = pipeline.CompletedAt.HasValue
             ? (pipeline.CompletedAt.Value - pipeline.CreatedAt).TotalMinutes
@@ -334,6 +328,23 @@ public sealed class GoalDispatcher : BackgroundService
             pipeline.GoalId, pipeline.Iteration, duration,
             pipeline.Metrics.PassedTests, pipeline.Metrics.TotalTests,
             pipeline.Metrics.CoveragePercent);
+    }
+
+    private async Task MarkGoalFailed(GoalPipeline pipeline, string reason, CancellationToken ct)
+    {
+        pipeline.AdvanceTo(GoalPhase.Failed);
+        await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Failed, ct);
+        await CleanupBrainSessionAsync(pipeline.GoalId);
+        _logger.LogWarning("Goal {GoalId} failed: {Reason}", pipeline.GoalId, reason);
+    }
+
+    private async Task CleanupBrainSessionAsync(string goalId)
+    {
+        if (_brain is DistributedBrain brain)
+        {
+            try { await brain.CleanupGoalSessionAsync(goalId); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to cleanup Brain session for goal {GoalId}", goalId); }
+        }
     }
 
     private async Task DispatchNextGoalAsync(CancellationToken ct)

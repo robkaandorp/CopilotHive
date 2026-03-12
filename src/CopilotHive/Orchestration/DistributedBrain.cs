@@ -1,18 +1,21 @@
+using System.Collections.Concurrent;
 using CopilotHive.Copilot;
 using CopilotHive.Services;
+using GitHub.Copilot.SDK;
 
 namespace CopilotHive.Orchestration;
 
 /// <summary>
 /// LLM-powered brain that runs inside the orchestrator container.
-/// Uses the Copilot SDK to communicate with a local headless Copilot CLI instance.
-/// Maintains per-goal conversation histories for context-aware multi-phase orchestration.
+/// Uses the Copilot SDK with a separate session per goal so each goal
+/// gets its own native conversation context managed by Copilot.
 /// </summary>
 public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 {
     private readonly int _port;
     private readonly ILogger<DistributedBrain> _logger;
-    private ICopilotWorkerClient? _client;
+    private CopilotClient? _copilotClient;
+    private readonly ConcurrentDictionary<string, CopilotSession> _sessions = new();
 
     private const string SystemPrompt = """
         You are the CopilotHive Orchestrator Brain — a product owner and project manager
@@ -35,13 +38,80 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     public async Task ConnectAsync(CancellationToken ct = default)
     {
-        _client = new CopilotWorkerClient(_port) { MaxConnectRetries = 20, RetryDelay = TimeSpan.FromSeconds(5) };
-        await _client.ConnectAsync(ct);
-        _logger.LogInformation("Brain connected to Copilot on port {Port}", _port);
+        _copilotClient = new CopilotClient(new CopilotClientOptions
+        {
+            CliUrl = $"localhost:{_port}",
+            AutoStart = false,
+        });
 
-        // Prime the Brain with the system prompt
-        var primeResponse = await _client.SendTaskAsync(SystemPrompt, ct);
-        _logger.LogInformation("Brain primed: {Response}", Truncate(primeResponse, 200));
+        // Retry connection to Copilot CLI
+        Exception? lastException = null;
+        for (var attempt = 1; attempt <= 20; attempt++)
+        {
+            try
+            {
+                await _copilotClient.StartAsync();
+                _logger.LogInformation("Brain connected to Copilot on port {Port} (attempt {Attempt})", _port, attempt);
+                return;
+            }
+            catch (Exception ex) when (attempt < 20)
+            {
+                lastException = ex;
+                _logger.LogDebug("Brain connection attempt {Attempt}/20 failed: {Message}", attempt, ex.Message);
+                await Task.Delay(TimeSpan.FromSeconds(5), ct);
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"Brain failed to connect to Copilot on port {_port} after 20 attempts: {lastException?.Message}");
+    }
+
+    /// <summary>
+    /// Gets or creates a dedicated Copilot session for a goal.
+    /// Each session maintains its own conversation history natively.
+    /// </summary>
+    private async Task<CopilotSession> GetOrCreateSessionAsync(GoalPipeline pipeline, CancellationToken ct)
+    {
+        EnsureConnected();
+
+        if (_sessions.TryGetValue(pipeline.GoalId, out var existing))
+            return existing;
+
+        var session = await _copilotClient!.CreateSessionAsync(new SessionConfig
+        {
+            Streaming = false,
+            OnPermissionRequest = PermissionHandler.ApproveAll,
+        });
+
+        if (_sessions.TryAdd(pipeline.GoalId, session))
+        {
+            // Prime the new session with the system prompt and goal context
+            await SendToSessionAsync(session, $"""
+                {SystemPrompt}
+
+                You are now working on goal '{pipeline.GoalId}':
+                {pipeline.Description}
+
+                Acknowledge briefly and await instructions.
+                """, ct);
+
+            _logger.LogInformation("Created new Copilot session for goal {GoalId}", pipeline.GoalId);
+            return session;
+        }
+
+        // Another thread beat us — dispose ours and use theirs
+        await session.DisposeAsync();
+        return _sessions[pipeline.GoalId];
+    }
+
+    /// <summary>Removes and disposes the session for a completed/failed goal.</summary>
+    public async Task CleanupGoalSessionAsync(string goalId)
+    {
+        if (_sessions.TryRemove(goalId, out var session))
+        {
+            await session.DisposeAsync();
+            _logger.LogInformation("Cleaned up Copilot session for goal {GoalId}", goalId);
+        }
     }
 
     public async Task<OrchestratorDecision> PlanGoalAsync(GoalPipeline pipeline, CancellationToken ct = default)
@@ -164,18 +234,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {{schema}}
             """;
 
-        var decision = await AskAsync(pipeline, prompt, ct);
-        if (decision is not null)
-        {
-            pipeline.Conversation.Add(new ConversationEntry("system",
-                $"[Interpreted {workerRole} output: verdict={decision.Verdict ?? decision.ReviewVerdict}]"));
-        }
-        return decision ?? new OrchestratorDecision
-        {
-            Action = OrchestratorActionType.Done,
-            Verdict = "UNKNOWN",
-            Reason = "Failed to interpret output",
-        };
+        return await AskAsync(pipeline, prompt, ct)
+            ?? new OrchestratorDecision
+            {
+                Action = OrchestratorActionType.Done,
+                Verdict = "UNKNOWN",
+                Reason = "Failed to interpret output",
+            };
     }
 
     public async Task<OrchestratorDecision> DecideNextStepAsync(
@@ -206,24 +271,20 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     public async Task InformAsync(GoalPipeline pipeline, string information, CancellationToken ct = default)
     {
-        EnsureConnected();
-        var response = await _client!.SendTaskAsync(
-            $"[STATUS UPDATE for goal '{pipeline.GoalId}'] {information}\n\nAcknowledge briefly.", ct);
-        pipeline.Conversation.Add(new ConversationEntry("system", information));
-        pipeline.Conversation.Add(new ConversationEntry("assistant", Truncate(response, 200)));
+        var session = await GetOrCreateSessionAsync(pipeline, ct);
+        await SendToSessionAsync(session,
+            $"[STATUS UPDATE] {information}\n\nAcknowledge briefly.", ct);
     }
 
     private async Task<OrchestratorDecision?> AskAsync(GoalPipeline pipeline, string prompt, CancellationToken ct)
     {
-        EnsureConnected();
-
-        // Build context-aware prompt with conversation history
-        var contextualPrompt = BuildContextualPrompt(pipeline, prompt);
-        pipeline.Conversation.Add(new ConversationEntry("user", prompt));
-
         try
         {
-            var response = await _client!.SendTaskAsync(contextualPrompt, ct);
+            var session = await GetOrCreateSessionAsync(pipeline, ct);
+            var response = await SendToSessionAsync(session, prompt, ct);
+
+            // Keep audit log in the pipeline for debugging
+            pipeline.Conversation.Add(new ConversationEntry("user", Truncate(prompt, 500)));
             pipeline.Conversation.Add(new ConversationEntry("assistant", Truncate(response, 500)));
 
             var parsed = ProtocolJson.ParseFromLlmResponse<OrchestratorDecision>(response);
@@ -240,26 +301,33 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         }
     }
 
-    private static string BuildContextualPrompt(GoalPipeline pipeline, string prompt)
+    private static async Task<string> SendToSessionAsync(CopilotSession session, string prompt, CancellationToken ct)
     {
-        if (pipeline.Conversation.Count == 0)
-            return prompt;
+        var done = new TaskCompletionSource<string>();
+        var response = "";
 
-        // Include recent conversation context (last 6 entries max to stay within token budget)
-        var recentHistory = pipeline.Conversation
-            .TakeLast(6)
-            .Select(c => $"[{c.Role}]: {c.Content}");
+        using var subscription = session.On(evt =>
+        {
+            switch (evt)
+            {
+                case AssistantMessageEvent msg:
+                    response = msg.Data.Content;
+                    break;
+                case SessionIdleEvent:
+                    done.TrySetResult(response);
+                    break;
+                case SessionErrorEvent err:
+                    done.TrySetException(new InvalidOperationException(err.Data.Message));
+                    break;
+            }
+        });
 
-        return $"""
-            === CONVERSATION CONTEXT (goal: {pipeline.GoalId}) ===
-            {string.Join("\n", recentHistory)}
-            === END CONTEXT ===
-
-            {prompt}
-            """;
+        using var ctReg = ct.Register(() => done.TrySetCanceled());
+        await session.SendAsync(new MessageOptions { Prompt = prompt });
+        return await done.Task;
     }
 
-    private static string GetFallbackPrompt(string role, GoalPipeline pipeline) =>
+    internal static string GetFallbackPrompt(string role, GoalPipeline pipeline) =>
         role.ToLowerInvariant() switch
         {
             "coder" => $"""
@@ -290,19 +358,27 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     private void EnsureConnected()
     {
-        if (_client is null)
+        if (_copilotClient is null)
             throw new InvalidOperationException("Brain not connected. Call ConnectAsync first.");
     }
 
-    private static string Truncate(string text, int maxLength) =>
+    internal static string Truncate(string text, int maxLength) =>
         text.Length <= maxLength ? text : text[..maxLength] + "...";
 
     public async ValueTask DisposeAsync()
     {
-        if (_client is not null)
+        // Dispose all goal sessions
+        foreach (var (goalId, session) in _sessions)
         {
-            await _client.DisposeAsync();
-            _client = null;
+            try { await session.DisposeAsync(); }
+            catch { /* best-effort cleanup */ }
+        }
+        _sessions.Clear();
+
+        if (_copilotClient is not null)
+        {
+            await _copilotClient.StopAsync();
+            _copilotClient = null;
         }
     }
 }

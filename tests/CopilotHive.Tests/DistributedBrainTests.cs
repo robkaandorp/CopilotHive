@@ -126,83 +126,33 @@ public sealed class DistributedBrainTests
         Assert.Contains("Fix the bug", result);
     }
 
-    // ── BuildContextualPrompt (private static) ──────────────────────────
+    // ── BuildContextualPrompt was removed (per-goal sessions handle context natively) ──
+
+    // ── EnsureConnected fallback behavior ───────────────────────────────
+    // With per-goal sessions, AskAsync catches the InvalidOperationException
+    // and returns null, causing callers to use fallback logic instead of throwing.
 
     [Fact]
-    public void BuildContextualPrompt_EmptyConversation_ReturnsOriginalPrompt()
-    {
-        var method = typeof(DistributedBrain).GetMethod(
-            "BuildContextualPrompt",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
-
-        Assert.NotNull(method);
-
-        var pipeline = CreatePipeline("g-2", "Add logging");
-        var result = (string)method.Invoke(null, [pipeline, "Do something"])!;
-
-        Assert.Equal("Do something", result);
-    }
-
-    [Fact]
-    public void BuildContextualPrompt_WithHistory_IncludesContextAndGoalId()
-    {
-        var method = typeof(DistributedBrain).GetMethod(
-            "BuildContextualPrompt",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
-
-        Assert.NotNull(method);
-
-        var pipeline = CreatePipeline("goal-abc", "Refactor auth");
-        pipeline.Conversation.Add(new ConversationEntry("user", "First question"));
-        pipeline.Conversation.Add(new ConversationEntry("assistant", "First answer"));
-
-        var result = (string)method.Invoke(null, [pipeline, "Next question"])!;
-
-        Assert.Contains("goal-abc", result);
-        Assert.Contains("First question", result);
-        Assert.Contains("First answer", result);
-        Assert.Contains("Next question", result);
-    }
-
-    // ── Truncate (private static) ───────────────────────────────────────
-
-    [Theory]
-    [InlineData("hello", 10, "hello")]
-    [InlineData("hello world", 5, "hello...")]
-    [InlineData("", 5, "")]
-    public void Truncate_VariousInputs_ReturnsExpected(string input, int maxLength, string expected)
-    {
-        var method = typeof(DistributedBrain).GetMethod(
-            "Truncate",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
-
-        Assert.NotNull(method);
-
-        var result = (string)method.Invoke(null, [input, maxLength])!;
-
-        Assert.Equal(expected, result);
-    }
-
-    // ── EnsureConnected guard ───────────────────────────────────────────
-
-    [Fact]
-    public async Task PlanGoalAsync_WithoutConnect_ThrowsInvalidOperation()
+    public async Task PlanGoalAsync_WithoutConnect_ReturnsFallbackDecision()
     {
         var brain = new DistributedBrain(9999, NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-3", "Some goal");
 
-        await Assert.ThrowsAsync<InvalidOperationException>(
-            () => brain.PlanGoalAsync(pipeline));
+        var decision = await brain.PlanGoalAsync(pipeline);
+
+        Assert.Equal(OrchestratorActionType.SpawnCoder, decision.Action);
+        Assert.Contains("Default", decision.Reason);
     }
 
     [Fact]
-    public async Task CraftPromptAsync_WithoutConnect_ThrowsInvalidOperation()
+    public async Task CraftPromptAsync_WithoutConnect_ReturnsFallbackPrompt()
     {
         var brain = new DistributedBrain(9999, NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-4", "Some goal");
 
-        await Assert.ThrowsAsync<InvalidOperationException>(
-            () => brain.CraftPromptAsync(pipeline, "coder", null));
+        var prompt = await brain.CraftPromptAsync(pipeline, "coder", null);
+
+        Assert.Contains("Some goal", prompt);
     }
 
     [Fact]
