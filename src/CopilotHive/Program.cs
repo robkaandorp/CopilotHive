@@ -126,7 +126,12 @@ static async Task<int> RunServerAsync(string[] args)
     }
 
     app.MapGrpcService<HiveOrchestratorService>();
-    app.MapGet("/health", () => "ok");
+    var _checkCount = 0;
+    app.MapGet("/health", () =>
+    {
+        var count = Interlocked.Increment(ref _checkCount);
+        return Results.Ok($"Healthy (check #{count})");
+    });
 
     // ── Goals REST API ───────────────────────────────────────────────────────
     var goalsApi = app.MapGroup("/api/goals");
