@@ -1,123 +1,104 @@
-using System.Net.Http.Json;
-using System.Text.Json;
-using System.Text.Json.Serialization;
+using GitHub.Copilot.SDK;
 
 namespace CopilotHive.Worker;
 
 /// <summary>
-/// Communicates with the Copilot CLI running in headless mode via JSON-RPC over HTTP.
-/// The Copilot CLI is already running (started by entrypoint.sh); this class sends prompts to it.
+/// Communicates with the Copilot CLI running in headless mode via the GitHub.Copilot.SDK.
+/// The Copilot CLI is already running (started by entrypoint.sh); this class connects to it.
 /// </summary>
-public sealed class CopilotRunner(int port = 8000) : IDisposable
+public sealed class CopilotRunner : IAsyncDisposable
 {
-    private readonly HttpClient _httpClient = new()
-    {
-        BaseAddress = new Uri($"http://localhost:{port}"),
-        Timeout = TimeSpan.FromMinutes(10),
-    };
+    private readonly CopilotClient _client;
+    private CopilotSession? _session;
+    private readonly int _port;
 
-    private int _requestId;
+    public int MaxConnectRetries { get; init; } = 12;
+    public TimeSpan RetryDelay { get; init; } = TimeSpan.FromSeconds(5);
+
+    public CopilotRunner(int port = 8000)
+    {
+        _port = port;
+        _client = new CopilotClient(new CopilotClientOptions
+        {
+            CliUrl = $"localhost:{port}",
+            AutoStart = false,
+        });
+    }
+
+    public async Task ConnectAsync(CancellationToken ct = default)
+    {
+        await _client.StartAsync();
+        Exception? lastException = null;
+
+        for (var attempt = 1; attempt <= MaxConnectRetries; attempt++)
+        {
+            try
+            {
+                _session = await _client.CreateSessionAsync(new SessionConfig
+                {
+                    Streaming = false,
+                    OnPermissionRequest = PermissionHandler.ApproveAll,
+                });
+                Console.WriteLine($"[Copilot] Connected to Copilot CLI on port {_port} (attempt {attempt})");
+                return;
+            }
+            catch (Exception ex) when (attempt < MaxConnectRetries)
+            {
+                lastException = ex;
+                Console.WriteLine($"[Copilot] Connection attempt {attempt}/{MaxConnectRetries} failed: {ex.Message}");
+                await Task.Delay(RetryDelay, ct);
+            }
+        }
+
+        throw new CopilotRunnerException(
+            $"Failed to connect to Copilot CLI on port {_port} after {MaxConnectRetries} attempts: {lastException?.Message}");
+    }
 
     /// <summary>
     /// Send a prompt to the Copilot CLI and return the response text.
     /// </summary>
     public async Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
     {
-        var requestId = Interlocked.Increment(ref _requestId);
+        if (_session is null)
+            throw new InvalidOperationException("Not connected. Call ConnectAsync first.");
 
-        var payload = new JsonRpcRequest
+        Console.WriteLine($"[Copilot] Sending prompt ({prompt.Length} chars) to localhost:{_port}");
+
+        var done = new TaskCompletionSource<string>();
+        var response = "";
+
+        using var subscription = _session.On(evt =>
         {
-            Id = requestId,
-            Method = "sendMessage",
-            Params = new JsonRpcParams
+            switch (evt)
             {
-                Message = prompt,
-                WorkingDirectory = workDir,
-            },
-        };
+                case AssistantMessageEvent msg:
+                    response = msg.Data.Content;
+                    break;
+                case SessionIdleEvent:
+                    done.TrySetResult(response);
+                    break;
+                case SessionErrorEvent err:
+                    done.TrySetException(new CopilotRunnerException(err.Data.Message));
+                    break;
+            }
+        });
 
-        Console.WriteLine($"[Copilot] Sending prompt ({prompt.Length} chars) to localhost:{port}");
+        using var ctReg = ct.Register(() => done.TrySetCanceled());
 
-        using var response = await _httpClient.PostAsJsonAsync("/", payload, ct);
+        await _session.SendAsync(new MessageOptions { Prompt = prompt });
+        var result = await done.Task;
 
-        if (!response.IsSuccessStatusCode)
-        {
-            var errorBody = await response.Content.ReadAsStringAsync(ct);
-            throw new CopilotRunnerException(
-                $"Copilot returned HTTP {(int)response.StatusCode}: {errorBody}");
-        }
-
-        var result = await response.Content.ReadFromJsonAsync<JsonRpcResponse>(ct);
-
-        if (result?.Error is not null)
-        {
-            throw new CopilotRunnerException(
-                $"Copilot JSON-RPC error ({result.Error.Code}): {result.Error.Message}");
-        }
-
-        var responseText = result?.Result?.Content ?? "";
-        Console.WriteLine($"[Copilot] Received response ({responseText.Length} chars)");
-
-        return responseText;
+        Console.WriteLine($"[Copilot] Received response ({result.Length} chars)");
+        return result;
     }
 
-    public void Dispose() => _httpClient.Dispose();
+    public async ValueTask DisposeAsync()
+    {
+        if (_session is not null)
+            await _session.DisposeAsync();
+
+        await _client.StopAsync();
+    }
 }
 
 public sealed class CopilotRunnerException(string message) : Exception(message);
-
-// JSON-RPC request/response models
-
-internal sealed class JsonRpcRequest
-{
-    [JsonPropertyName("jsonrpc")]
-    public string JsonRpc { get; init; } = "2.0";
-
-    [JsonPropertyName("id")]
-    public int Id { get; init; }
-
-    [JsonPropertyName("method")]
-    public required string Method { get; init; }
-
-    [JsonPropertyName("params")]
-    public required JsonRpcParams Params { get; init; }
-}
-
-internal sealed class JsonRpcParams
-{
-    [JsonPropertyName("message")]
-    public required string Message { get; init; }
-
-    [JsonPropertyName("workingDirectory")]
-    public string? WorkingDirectory { get; init; }
-}
-
-internal sealed class JsonRpcResponse
-{
-    [JsonPropertyName("jsonrpc")]
-    public string? JsonRpc { get; init; }
-
-    [JsonPropertyName("id")]
-    public int Id { get; init; }
-
-    [JsonPropertyName("result")]
-    public JsonRpcResult? Result { get; init; }
-
-    [JsonPropertyName("error")]
-    public JsonRpcError? Error { get; init; }
-}
-
-internal sealed class JsonRpcResult
-{
-    [JsonPropertyName("content")]
-    public string? Content { get; init; }
-}
-
-internal sealed class JsonRpcError
-{
-    [JsonPropertyName("code")]
-    public int Code { get; init; }
-
-    [JsonPropertyName("message")]
-    public string? Message { get; init; }
-}

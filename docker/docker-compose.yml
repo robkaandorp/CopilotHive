@@ -9,7 +9,6 @@ services:
       - --serve
       - --port=5000
       - --config-repo=https://github.com/robkaandorp/CopilotHive-Config.git
-      - --goals-file=/app/state/goals.yaml
     ports:
       - "5000:5000"
       - "5001:5001"

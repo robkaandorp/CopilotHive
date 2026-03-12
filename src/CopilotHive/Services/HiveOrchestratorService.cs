@@ -61,7 +61,33 @@ public sealed class HiveOrchestratorService(
 
         try
         {
-            await foreach (var message in requestStream.ReadAllAsync(context.CancellationToken))
+            // Use a linked token so we can cancel the channel reader when the stream closes
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(context.CancellationToken);
+            var ct = cts.Token;
+
+            // Start a background task to push queued messages to the worker
+            ConnectedWorker? workerRef = null;
+            var channelTask = Task.Run(async () =>
+            {
+                try
+                {
+                    while (!ct.IsCancellationRequested)
+                    {
+                        if (workerRef is null)
+                        {
+                            await Task.Delay(100, ct);
+                            continue;
+                        }
+
+                        var msg = await workerRef.MessageChannel.Reader.ReadAsync(ct);
+                        await responseStream.WriteAsync(msg, ct);
+                    }
+                }
+                catch (OperationCanceledException) { }
+                catch (System.Threading.Channels.ChannelClosedException) { }
+            }, ct);
+
+            await foreach (var message in requestStream.ReadAllAsync(ct))
             {
                 workerId ??= message.WorkerId;
                 var worker = workerPool.GetWorker(message.WorkerId);
@@ -72,10 +98,12 @@ public sealed class HiveOrchestratorService(
                     continue;
                 }
 
+                workerRef = worker;
+
                 switch (message.PayloadCase)
                 {
                     case WorkerMessage.PayloadOneofCase.Ready:
-                        await HandleWorkerReady(worker, responseStream, context.CancellationToken);
+                        await HandleWorkerReady(worker, responseStream, ct);
                         break;
 
                     case WorkerMessage.PayloadOneofCase.Progress:
@@ -92,6 +120,9 @@ public sealed class HiveOrchestratorService(
                         break;
                 }
             }
+
+            await cts.CancelAsync();
+            try { await channelTask; } catch (OperationCanceledException) { }
         }
         catch (OperationCanceledException)
         {
@@ -124,6 +155,7 @@ public sealed class HiveOrchestratorService(
         workerPool.MarkIdle(worker.Id);
         logger.LogInformation("Worker {WorkerId} is ready (role={Role})", worker.Id, worker.Role);
 
+        // Check the task queue for matching work
         var task = taskQueue.TryDequeue(worker.Role);
         if (task is not null)
         {
@@ -131,13 +163,11 @@ public sealed class HiveOrchestratorService(
             workerPool.MarkBusy(worker.Id, task.TaskId);
             logger.LogInformation("Assigning task {TaskId} to worker {WorkerId}", task.TaskId, worker.Id);
 
-            await responseStream.WriteAsync(
+            // Push through MessageChannel so writes are serialized via the channel reader task
+            await worker.MessageChannel.Writer.WriteAsync(
                 new OrchestratorMessage { Assignment = task },
                 cancellationToken);
         }
-
-        // Also drain any queued orchestrator messages for this worker.
-        await DrainMessageChannel(worker, responseStream, cancellationToken);
     }
 
     private void HandleTaskProgress(ConnectedWorker worker, TaskProgress progress)
@@ -155,17 +185,4 @@ public sealed class HiveOrchestratorService(
         workerPool.MarkIdle(worker.Id);
     }
 
-    /// <summary>
-    /// Send any orchestrator-initiated messages that were enqueued for this worker.
-    /// </summary>
-    private static async Task DrainMessageChannel(
-        ConnectedWorker worker,
-        IServerStreamWriter<OrchestratorMessage> responseStream,
-        CancellationToken cancellationToken)
-    {
-        while (worker.MessageChannel.Reader.TryRead(out var msg))
-        {
-            await responseStream.WriteAsync(msg, cancellationToken);
-        }
-    }
 }

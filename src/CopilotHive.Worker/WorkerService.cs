@@ -22,6 +22,10 @@ public sealed class WorkerService(
     {
         var workerRole = ParseRole(role);
 
+        // Connect to the local Copilot CLI via SDK before registering with orchestrator
+        Console.WriteLine("[Worker] Connecting to local Copilot CLI...");
+        await _copilotRunner.ConnectAsync(ct);
+
         // Enable HTTP/2 over plaintext (required for gRPC without TLS in Docker network)
         using var channel = GrpcChannel.ForAddress(orchestratorUrl, new GrpcChannelOptions
         {

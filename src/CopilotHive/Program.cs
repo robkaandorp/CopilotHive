@@ -40,6 +40,7 @@ static async Task<int> RunServerAsync(string[] args)
     builder.Services.AddSingleton<WorkerPool>();
     builder.Services.AddSingleton<TaskQueue>();
     builder.Services.AddSingleton<ApiGoalSource>();
+    builder.Services.AddHostedService<GoalDispatcher>();
 
     if (!string.IsNullOrEmpty(configRepoUrl))
     {
@@ -50,6 +51,17 @@ static async Task<int> RunServerAsync(string[] args)
 
         builder.Services.AddSingleton(configRepo);
         builder.Services.AddSingleton(hiveConfigFile);
+
+        // If no explicit goals file, check config repo for goals.yaml
+        if (string.IsNullOrEmpty(goalsFile))
+        {
+            var configGoalsFile = Path.Combine(configRepo.LocalPath, "goals.yaml");
+            if (File.Exists(configGoalsFile))
+            {
+                goalsFile = configGoalsFile;
+                Console.WriteLine($"[Hive] Using goals file from config repo: {configGoalsFile}");
+            }
+        }
 
         Console.WriteLine($"[Hive] Config loaded: {hiveConfigFile.Repositories.Count} repo(s), " +
             $"{hiveConfigFile.Workers.Count} worker config(s)");

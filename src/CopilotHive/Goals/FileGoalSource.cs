@@ -99,7 +99,7 @@ public sealed class FileGoalSource : IGoalSource
         _ => GoalPriority.Normal,
     };
 
-    private static GoalStatus ParseStatus(string? value) => value?.ToLowerInvariant() switch
+    private static GoalStatus ParseStatus(string? value) => value?.ToLowerInvariant().Replace("_", "") switch
     {
         "inprogress" => GoalStatus.InProgress,
         "completed" => GoalStatus.Completed,
@@ -116,6 +116,7 @@ public sealed class FileGoalSource : IGoalSource
     internal sealed class GoalFileEntry
     {
         public string? Id { get; set; }
+        public string? Title { get; set; }
         public string? Description { get; set; }
         public string? Priority { get; set; }
         public string? Status { get; set; }
