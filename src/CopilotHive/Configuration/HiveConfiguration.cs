@@ -4,6 +4,7 @@ public sealed class HiveConfiguration
 {
     public required string Goal { get; init; }
     public string WorkspacePath { get; init; } = "./workspaces";
+    public string? SourcePath { get; init; }
     public string AgentsPath { get; init; } = "./agents";
     public string MetricsPath { get; init; } = "./metrics";
     public string DockerImage { get; init; } = "robkaandorp/copilot-acp-server:dev";

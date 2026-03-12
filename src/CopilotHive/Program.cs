@@ -3,6 +3,7 @@ using CopilotHive.Orchestration;
 
 var goal = args.FirstOrDefault(a => a.StartsWith("--goal="))?[7..];
 var workspace = args.FirstOrDefault(a => a.StartsWith("--workspace="))?[12..] ?? "./workspaces";
+var source = args.FirstOrDefault(a => a.StartsWith("--source="))?[9..];
 var maxIterations = int.TryParse(
     args.FirstOrDefault(a => a.StartsWith("--max-iterations="))?[17..], out var mi) ? mi : 10;
 var model = args.FirstOrDefault(a => a.StartsWith("--model="))?[8..] ?? "claude-opus-4.6";
@@ -17,6 +18,7 @@ if (string.IsNullOrEmpty(goal))
     Console.Error.WriteLine("Options:");
     Console.Error.WriteLine("  --goal=<text>            The objective for the hive to accomplish (required)");
     Console.Error.WriteLine("  --workspace=<path>       Workspace root directory (default: ./workspaces)");
+    Console.Error.WriteLine("  --source=<path>          Project source directory to seed workspace with");
     Console.Error.WriteLine("  --max-iterations=<n>     Maximum iteration count (default: 10)");
     Console.Error.WriteLine("  --model=<model>          Copilot model to use (default: claude-opus-4.6)");
     Console.Error.WriteLine();
@@ -51,6 +53,7 @@ var config = new HiveConfiguration
 {
     Goal = goal,
     WorkspacePath = workspace,
+    SourcePath = source,
     MaxIterations = maxIterations,
     Model = model,
     GitHubToken = ghToken,

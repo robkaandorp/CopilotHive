@@ -130,6 +130,43 @@ public class GitWorkspaceManagerTests : IDisposable
         Assert.Contains("new-file.txt", diff);
     }
 
+    [Fact]
+    public async Task InitBareRepo_WithSourcePath_SeedsFromSource()
+    {
+        // Arrange: create a fake source project
+        var sourceDir = Path.Combine(_tempDir, "_source");
+        Directory.CreateDirectory(sourceDir);
+        await File.WriteAllTextAsync(Path.Combine(sourceDir, "Program.cs"), "Console.WriteLine(\"Hello\");");
+        Directory.CreateDirectory(Path.Combine(sourceDir, "src"));
+        await File.WriteAllTextAsync(Path.Combine(sourceDir, "src", "Lib.cs"), "class Lib {}");
+        // Also create dirs that should be skipped
+        Directory.CreateDirectory(Path.Combine(sourceDir, ".git", "objects"));
+        await File.WriteAllTextAsync(Path.Combine(sourceDir, ".git", "HEAD"), "ref: refs/heads/main");
+        Directory.CreateDirectory(Path.Combine(sourceDir, "bin", "Debug"));
+        await File.WriteAllTextAsync(Path.Combine(sourceDir, "bin", "Debug", "app.dll"), "binary");
+
+        // Act
+        await _manager.InitBareRepoAsync(sourceDir);
+        var clonePath = await _manager.CreateWorkerCloneAsync("seeded-worker");
+
+        // Assert: source files are present
+        Assert.True(File.Exists(Path.Combine(clonePath, "Program.cs")));
+        Assert.True(File.Exists(Path.Combine(clonePath, "src", "Lib.cs")));
+        // .git internals and bin/ should NOT be in the seeded clone
+        Assert.False(Directory.Exists(Path.Combine(clonePath, "bin")));
+    }
+
+    [Fact]
+    public async Task InitBareRepo_WithNullSourcePath_CreatesEmptyCommit()
+    {
+        await _manager.InitBareRepoAsync(sourcePath: null);
+        var clonePath = await _manager.CreateWorkerCloneAsync("empty-check");
+
+        // Clone should exist but have no files (empty initial commit)
+        var files = Directory.GetFiles(clonePath).Where(f => !f.Contains(".git")).ToArray();
+        Assert.Empty(files);
+    }
+
     private static async Task RunGitInClone(string workingDir, params string[] args)
     {
         var psi = new System.Diagnostics.ProcessStartInfo("git")

@@ -42,7 +42,7 @@ public sealed class Orchestrator : IAsyncDisposable
         Console.WriteLine($"[Orchestrator] Goal: {_config.Goal}");
         Console.WriteLine($"[Orchestrator] Max iterations: {_config.MaxIterations}");
 
-        await _gitManager.InitBareRepoAsync(ct);
+        await _gitManager.InitBareRepoAsync(_config.SourcePath, ct);
 
         for (var iteration = 1; iteration <= _config.MaxIterations; iteration++)
         {

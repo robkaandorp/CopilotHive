@@ -15,21 +15,37 @@ public sealed class GitWorkspaceManager
 
     public string BareRepoPath => _bareRepoPath;
 
-    public async Task InitBareRepoAsync(CancellationToken ct = default)
+    /// <summary>
+    /// Initialise the bare repo. When <paramref name="sourcePath"/> is provided,
+    /// the initial commit is seeded with the contents of that directory (respecting
+    /// any .gitignore found there). Otherwise an empty initial commit is created.
+    /// </summary>
+    public async Task InitBareRepoAsync(string? sourcePath = null, CancellationToken ct = default)
     {
         Directory.CreateDirectory(_bareRepoPath);
 
         if (!Directory.Exists(Path.Combine(_bareRepoPath, "HEAD")))
         {
             await RunGitAsync(_bareRepoPath, ["init", "--bare", "--initial-branch=main"], ct);
-            // Create an initial commit so main branch exists
+
             var tempClone = Path.Combine(_workspacePath, "_init-temp");
             try
             {
                 await RunGitAsync(_workspacePath, ["clone", _bareRepoPath, "_init-temp"], ct);
                 await RunGitAsync(tempClone, ["config", "user.email", "copilothive@local"], ct);
                 await RunGitAsync(tempClone, ["config", "user.name", "CopilotHive"], ct);
-                await RunGitAsync(tempClone, ["commit", "--allow-empty", "-m", "Initial commit"], ct);
+
+                if (!string.IsNullOrEmpty(sourcePath) && Directory.Exists(sourcePath))
+                {
+                    CopyDirectoryContents(sourcePath, tempClone);
+                    await RunGitAsync(tempClone, ["add", "."], ct);
+                    await RunGitAsync(tempClone, ["commit", "-m", "Initial commit (seeded from source)"], ct);
+                }
+                else
+                {
+                    await RunGitAsync(tempClone, ["commit", "--allow-empty", "-m", "Initial commit"], ct);
+                }
+
                 await RunGitAsync(tempClone, ["push", "origin", "main"], ct);
             }
             finally
@@ -37,6 +53,49 @@ public sealed class GitWorkspaceManager
                 await ForceDeleteDirectoryAsync(tempClone);
             }
         }
+    }
+
+    /// <summary>
+    /// Recursively copy directory contents, skipping .git/ and common build artifacts.
+    /// The target directory's .gitignore (copied from source) handles the rest via git add.
+    /// </summary>
+    private static void CopyDirectoryContents(string sourceDir, string targetDir)
+    {
+        var source = new DirectoryInfo(sourceDir);
+
+        foreach (var dir in source.EnumerateDirectories("*", SearchOption.AllDirectories))
+        {
+            var relativePath = Path.GetRelativePath(sourceDir, dir.FullName);
+            if (ShouldSkipDirectory(relativePath))
+                continue;
+            Directory.CreateDirectory(Path.Combine(targetDir, relativePath));
+        }
+
+        foreach (var file in source.EnumerateFiles("*", SearchOption.AllDirectories))
+        {
+            var relativePath = Path.GetRelativePath(sourceDir, file.FullName);
+            var dirPart = Path.GetDirectoryName(relativePath) ?? "";
+            if (ShouldSkipDirectory(dirPart))
+                continue;
+
+            var destPath = Path.Combine(targetDir, relativePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+            file.CopyTo(destPath, overwrite: true);
+        }
+    }
+
+    private static bool ShouldSkipDirectory(string relativePath)
+    {
+        // Normalise to forward slashes for consistent matching
+        var normalized = relativePath.Replace('\\', '/');
+        var segments = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        foreach (var segment in segments)
+        {
+            if (segment is ".git" or "bin" or "obj" or "node_modules" or "workspaces")
+                return true;
+        }
+        return false;
     }
 
     public async Task<string> CreateWorkerCloneAsync(string workerName, CancellationToken ct = default)
