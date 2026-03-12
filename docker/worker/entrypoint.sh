@@ -36,7 +36,7 @@ if [[ -n "${COPILOT_MODEL}" ]]; then
 fi
 echo "============================================"
 
-# --- Build command ---
+# Build command (after model is printed)
 COPILOT_ARGS=(
     --add-dir /copilot-home
     --headless
@@ -45,6 +45,10 @@ COPILOT_ARGS=(
 
 if [[ "${COPILOT_RESUME}" == "true" ]]; then
     COPILOT_ARGS+=(--resume)
+fi
+
+if [[ -n "${COPILOT_MODEL}" ]]; then
+    COPILOT_ARGS+=(--model "$COPILOT_MODEL")
 fi
 
 echo "[entrypoint] Starting: copilot ${COPILOT_ARGS[*]}"

@@ -64,7 +64,7 @@ static async Task<int> RunServerAsync(string[] args)
     builder.WebHost.ConfigureKestrel(options =>
     {
         options.ListenAnyIP(port, listenOptions =>
-            listenOptions.Protocols = HttpProtocols.Http2);
+            listenOptions.Protocols = HttpProtocols.Http1AndHttp2);
     });
 
     var app = builder.Build();

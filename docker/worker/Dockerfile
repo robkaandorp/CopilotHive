@@ -42,6 +42,8 @@ RUN apt-get update && \
         fd-find \
         tree \
         file \
+        build-essential \
+        python3 \
     && mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
        | gpg --dearmor -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
@@ -51,7 +53,7 @@ RUN apt-get update && \
     && apt-get install -y --no-install-recommends gh nodejs \
     && npm install -g @github/copilot \
     && npm cache clean --force \
-    && apt-get purge -y --auto-remove gnupg \
+    && apt-get purge -y --auto-remove gnupg build-essential python3 \
     && rm -rf /var/lib/apt/lists/* /tmp/* /root/.npm /root/.cache
 
 # Create workspace and config directories

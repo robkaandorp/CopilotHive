@@ -26,6 +26,8 @@ services:
       - WORKER_ROLE=coder
       - GH_TOKEN
       - COPILOT_MODEL=claude-opus-4.6
+      - COPILOT_ALLOW_ALL=true
+      - COPILOT_AUTO_UPDATE=true
     depends_on:
       orchestrator:
         condition: service_healthy
@@ -43,6 +45,8 @@ services:
       - WORKER_ROLE=reviewer
       - GH_TOKEN
       - COPILOT_MODEL=gpt-5.3-codex
+      - COPILOT_ALLOW_ALL=true
+      - COPILOT_AUTO_UPDATE=true
     depends_on:
       orchestrator:
         condition: service_healthy
@@ -60,6 +64,8 @@ services:
       - WORKER_ROLE=tester
       - GH_TOKEN
       - COPILOT_MODEL=claude-sonnet-4.6
+      - COPILOT_ALLOW_ALL=true
+      - COPILOT_AUTO_UPDATE=true
     depends_on:
       orchestrator:
         condition: service_healthy
@@ -77,6 +83,8 @@ services:
       - WORKER_ROLE=improver
       - GH_TOKEN
       - COPILOT_MODEL=claude-sonnet-4.6
+      - COPILOT_ALLOW_ALL=true
+      - COPILOT_AUTO_UPDATE=true
     depends_on:
       orchestrator:
         condition: service_healthy
