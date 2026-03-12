@@ -12,6 +12,8 @@ public enum OrchestratorActionType
     SpawnCoder,
     SpawnReviewer,
     SpawnTester,
+    RequestChanges,
+    Retry,
     Merge,
     Done,
     Skip,

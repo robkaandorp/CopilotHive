@@ -25,18 +25,30 @@ RUN dotnet publish src/CopilotHive/CopilotHive.csproj \
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 
+# Install git, curl, Node.js, and Copilot CLI for the Brain
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl git && \
+    apt-get install -y --no-install-recommends curl git ca-certificates gnupg && \
+    mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+      | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+      > /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && \
+    apt-get install -y nodejs build-essential python3 libicu-dev && \
+    npm install -g @anthropic-ai/claude-code@latest || true && \
+    npm install -g @github/copilot && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY --from=build /app/publish .
 COPY agents/ /app/agents/
+COPY docker/orchestrator/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
-EXPOSE 5000
+EXPOSE 5000 5001 8100
 
-HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
-    CMD curl -f http://localhost:5000/health || exit 1
+HEALTHCHECK --interval=10s --timeout=5s --retries=5 --start-period=60s \
+    CMD curl -f http://localhost:5001/health || exit 1
 
-ENTRYPOINT ["dotnet", "CopilotHive.dll", "--serve", "--port=5000"]
+ENTRYPOINT ["/app/entrypoint.sh"]

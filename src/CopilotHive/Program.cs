@@ -40,7 +40,24 @@ static async Task<int> RunServerAsync(string[] args)
     builder.Services.AddSingleton<WorkerPool>();
     builder.Services.AddSingleton<TaskQueue>();
     builder.Services.AddSingleton<ApiGoalSource>();
-    builder.Services.AddHostedService<GoalDispatcher>();
+    builder.Services.AddSingleton<GoalPipelineManager>();
+    builder.Services.AddSingleton<TaskCompletionNotifier>();
+
+    // Brain: connect to Copilot CLI running alongside the orchestrator
+    var brainPort = int.TryParse(Environment.GetEnvironmentVariable("BRAIN_COPILOT_PORT"), out var bp) ? bp : 0;
+    if (brainPort > 0)
+    {
+        Console.WriteLine($"[Hive] Brain enabled — connecting to Copilot on port {brainPort}");
+        builder.Services.AddSingleton<IDistributedBrain>(sp =>
+            new DistributedBrain(brainPort, sp.GetRequiredService<ILogger<DistributedBrain>>()));
+    }
+    else
+    {
+        Console.WriteLine("[Hive] Brain disabled — running in mechanical mode (no BRAIN_COPILOT_PORT set)");
+    }
+
+    builder.Services.AddSingleton<GoalDispatcher>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<GoalDispatcher>());
 
     if (!string.IsNullOrEmpty(configRepoUrl))
     {
@@ -89,6 +106,15 @@ static async Task<int> RunServerAsync(string[] args)
     });
 
     var app = builder.Build();
+
+    // Wire up Brain and completion event
+    var brain = app.Services.GetService<IDistributedBrain>();
+    if (brain is not null)
+    {
+        Console.WriteLine("[Hive] Connecting Brain to Copilot…");
+        await brain.ConnectAsync();
+        Console.WriteLine("[Hive] Brain connected.");
+    }
 
     app.MapGrpcService<HiveOrchestratorService>();
     app.MapGet("/health", () => "ok");

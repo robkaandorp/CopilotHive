@@ -7,6 +7,8 @@ namespace CopilotHive.Services;
 public sealed class HiveOrchestratorService(
     WorkerPool workerPool,
     TaskQueue taskQueue,
+    GoalPipelineManager pipelineManager,
+    TaskCompletionNotifier completionNotifier,
     ILogger<HiveOrchestratorService> logger) : HiveOrchestrator.HiveOrchestratorBase
 {
     private const string OrchestratorVersion = "1.0.0";
@@ -183,6 +185,30 @@ public sealed class HiveOrchestratorService(
 
         taskQueue.MarkComplete(complete.TaskId);
         workerPool.MarkIdle(worker.Id);
+
+        // Update pipeline state
+        var pipeline = pipelineManager.GetByTaskId(complete.TaskId);
+        if (pipeline is not null)
+        {
+            pipeline.ClearActiveTask();
+            pipeline.RecordOutput(
+                worker.Role.ToString().ToLowerInvariant(),
+                pipeline.Iteration,
+                complete.Output);
+        }
+
+        // Notify GoalDispatcher asynchronously so it can ask the Brain what to do next
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await completionNotifier.NotifyAsync(complete);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Error in task completion handler for {TaskId}", complete.TaskId);
+            }
+        });
     }
 
 }

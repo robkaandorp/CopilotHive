@@ -59,6 +59,12 @@ public sealed class GoalManager
         await source.UpdateGoalStatusAsync(goalId, GoalStatus.Failed, ct);
     }
 
+    public async Task UpdateGoalStatusAsync(string goalId, GoalStatus status, CancellationToken ct = default)
+    {
+        var source = GetSourceForGoal(goalId);
+        await source.UpdateGoalStatusAsync(goalId, status, ct);
+    }
+
     private IGoalSource GetSourceForGoal(string goalId)
     {
         lock (_lock)
