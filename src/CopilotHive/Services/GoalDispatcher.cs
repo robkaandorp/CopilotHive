@@ -344,8 +344,8 @@ public sealed class GoalDispatcher : BackgroundService
                 var tempDir = Path.Combine(Path.GetTempPath(), $"hive-merge-{Guid.NewGuid():N}");
                 try
                 {
-                    await RunGitAsync($"clone --depth=50 {repo.Url} {tempDir}", ct);
-                    await RunGitAsync($"-C {tempDir} checkout {repo.DefaultBranch}", ct);
+                    await RunGitAsync($"clone --branch {repo.DefaultBranch} {repo.Url} {tempDir}", ct);
+                    await RunGitAsync($"-C {tempDir} fetch origin {pipeline.CoderBranch}", ct);
                     await RunGitAsync($"-C {tempDir} merge origin/{pipeline.CoderBranch} --no-edit", ct);
                     await RunGitAsync($"-C {tempDir} push origin {repo.DefaultBranch}", ct);
 
