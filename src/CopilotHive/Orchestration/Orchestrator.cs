@@ -662,9 +662,14 @@ public sealed class Orchestrator : IAsyncDisposable
                 metrics.CoveragePercent = cov;
             else if (TryParseField(trimmed, "verdict:", out var verdictVal))
                 metrics.Verdict = verdictVal;
-            // LLMs sometimes use "Status:" instead of "verdict:"
+            // LLMs use various labels for the verdict field
             else if (TryParseField(trimmed, "status:", out var statusVal))
                 metrics.Verdict = statusVal;
+            else if (TryParseField(trimmed, "conclusion:", out var conclusionVal))
+                metrics.Verdict = conclusionVal;
+            else if (TryParseField(trimmed, "result:", out var resultVal)
+                     && !int.TryParse(resultVal, out _)) // avoid matching "Results: 96"
+                metrics.Verdict = resultVal;
             else if (TryParseField(trimmed, "summary:", out var summaryVal))
                 metrics.TestReportSummary = summaryVal;
             else if (trimmed.StartsWith("issues:", StringComparison.OrdinalIgnoreCase))
@@ -685,6 +690,13 @@ public sealed class Orchestrator : IAsyncDisposable
                 metrics.PassedTests = op;
             else if (TryParseField(trimmed, "failed_tests:", out var oldFailed) && int.TryParse(oldFailed, out var of2))
                 metrics.FailedTests = of2;
+        }
+
+        // Fallback: infer verdict from test numbers when no explicit verdict was parsed
+        if (string.IsNullOrWhiteSpace(metrics.Verdict) && metrics.TotalTests > 0
+            && metrics.FailedTests == 0 && metrics.PassedTests == metrics.TotalTests)
+        {
+            metrics.Verdict = "PASS";
         }
     }
 

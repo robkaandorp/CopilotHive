@@ -200,4 +200,58 @@ public class ParseTestReportTests
         Assert.True(metrics.BuildSuccess);
         Assert.Equal("PASS", metrics.Verdict);
     }
+
+    [Fact]
+    public void ConclusionFieldAlias_MapsToVerdict()
+    {
+        const string report = """
+            TEST_REPORT
+            ===========
+            Total:     96
+            Passed:    96
+            Failed:      0
+            Conclusion: PASS — All tests green.
+            """;
+
+        var metrics = Parse(report);
+
+        Assert.Equal(96, metrics.TotalTests);
+        Assert.Equal(96, metrics.PassedTests);
+        Assert.True(Orchestrator.IsPassingVerdict(metrics.Verdict));
+    }
+
+    [Fact]
+    public void NoVerdictField_InferredFromTestNumbers()
+    {
+        const string report = """
+            TEST_REPORT
+            ===========
+            Total:     42
+            Passed:    42
+            Failed:      0
+            Duration:  2.7s
+            """;
+
+        var metrics = Parse(report);
+
+        Assert.Equal("PASS", metrics.Verdict);
+        Assert.Equal(42, metrics.TotalTests);
+    }
+
+    [Fact]
+    public void NoVerdictField_WithFailures_NoInference()
+    {
+        const string report = """
+            TEST_REPORT
+            ===========
+            Total:     42
+            Passed:    40
+            Failed:      2
+            """;
+
+        var metrics = Parse(report);
+
+        // Should NOT infer PASS when there are failures
+        Assert.Equal("", metrics.Verdict);
+    }
 }
