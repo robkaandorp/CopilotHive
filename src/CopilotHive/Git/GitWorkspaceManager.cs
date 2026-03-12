@@ -31,6 +31,9 @@ public sealed class GitWorkspaceManager
             var tempClone = Path.Combine(_workspacePath, "_init-temp");
             try
             {
+                if (Directory.Exists(tempClone))
+                    await ForceDeleteDirectoryAsync(tempClone);
+
                 await RunGitAsync(_workspacePath, ["clone", _bareRepoPath, "_init-temp"], ct);
                 await RunGitAsync(tempClone, ["config", "user.email", "copilothive@local"], ct);
                 await RunGitAsync(tempClone, ["config", "user.name", "CopilotHive"], ct);
@@ -217,9 +220,15 @@ public sealed class GitWorkspaceManager
         using var process = Process.Start(psi)
             ?? throw new InvalidOperationException("Failed to start git process");
 
-        var stdout = await process.StandardOutput.ReadToEndAsync(ct);
-        var stderr = await process.StandardError.ReadToEndAsync(ct);
+        // Read stdout and stderr concurrently to avoid deadlock when buffers fill
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
+        var stderrTask = process.StandardError.ReadToEndAsync(ct);
+
+        await Task.WhenAll(stdoutTask, stderrTask);
         await process.WaitForExitAsync(ct);
+
+        var stdout = stdoutTask.Result;
+        var stderr = stderrTask.Result;
 
         if (process.ExitCode != 0)
             throw new GitException(process.ExitCode, $"{stdout}\n{stderr}".Trim());
