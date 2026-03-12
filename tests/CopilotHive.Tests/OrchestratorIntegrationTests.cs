@@ -517,6 +517,24 @@ public class OrchestratorIntegrationTests : IDisposable
         Assert.Equal("", verdict);
     }
 
+    [Theory]
+    [InlineData("PASS", true)]
+    [InlineData("pass", true)]
+    [InlineData("Pass", true)]
+    [InlineData("FAIL", false)]
+    [InlineData("PARTIAL", false)]
+    [InlineData("", false)]
+    [InlineData("All tests passed, no failures or regressions.", true)]
+    [InlineData("All tests passed", true)]
+    [InlineData("Merge verified. No regressions. All 21 tests passed.", true)]
+    [InlineData("PASS with warnings", true)]
+    [InlineData("FAIL — 3 tests failed", false)]
+    [InlineData("Tests FAILED", false)]
+    public void IsPassingVerdict_CorrectlyClassifies(string verdict, bool expected)
+    {
+        Assert.Equal(expected, Orchestrator.IsPassingVerdict(verdict));
+    }
+
     public void Dispose()
     {
         for (var i = 0; i < 5; i++)

@@ -210,7 +210,7 @@ public sealed class Orchestrator : IAsyncDisposable
             ParseTestReport(testerResponse, metrics);
 
             // All tests pass AND runtime verified → done
-            if (metrics.Verdict.Equals("PASS", StringComparison.OrdinalIgnoreCase))
+            if (IsPassingVerdict(metrics.Verdict))
             {
                 Console.WriteLine("[Orchestrator] ✅ Tester verdict: PASS");
                 break;
@@ -253,7 +253,7 @@ public sealed class Orchestrator : IAsyncDisposable
         }
 
         // Phase 3: Merge if tester passed
-        if (metrics.Verdict.Equals("PASS", StringComparison.OrdinalIgnoreCase))
+        if (IsPassingVerdict(metrics.Verdict))
         {
             Console.WriteLine("[Orchestrator] Phase 3: Merging to main");
             var mergeClone = await _gitManager.CreateWorkerCloneAsync($"merge-{iteration}", ct);
@@ -329,7 +329,7 @@ public sealed class Orchestrator : IAsyncDisposable
         var verifyMetrics = new IterationMetrics { Iteration = iteration };
         ParseTestReport(verifyResponse, verifyMetrics);
 
-        if (verifyMetrics.Verdict.Equals("PASS", StringComparison.OrdinalIgnoreCase))
+        if (IsPassingVerdict(verifyMetrics.Verdict))
         {
             Console.WriteLine("[Orchestrator] ✅ Post-merge verification passed");
             // Update metrics with post-merge numbers (more authoritative)
@@ -395,7 +395,7 @@ public sealed class Orchestrator : IAsyncDisposable
 
         ParseTestReport(retestResponse, metrics);
 
-        if (!metrics.Verdict.Equals("PASS", StringComparison.OrdinalIgnoreCase))
+        if (!IsPassingVerdict(metrics.Verdict))
         {
             Console.WriteLine($"[Orchestrator] Post-merge fix still failing (verdict: {metrics.Verdict}) — will retry next iteration");
             return false;
@@ -696,6 +696,22 @@ public sealed class Orchestrator : IAsyncDisposable
             return true;
         }
         value = "";
+        return false;
+    }
+
+    /// <summary>
+    /// Determines whether a test verdict indicates success.
+    /// LLMs are creative with formatting — accepts "PASS", "ALL TESTS PASSED", etc.
+    /// </summary>
+    internal static bool IsPassingVerdict(string verdict)
+    {
+        if (string.IsNullOrWhiteSpace(verdict))
+            return false;
+
+        // Explicit PASS signal takes priority (handles "ALL 96 TESTS PASSED — no failures")
+        if (verdict.Contains("PASS", StringComparison.OrdinalIgnoreCase))
+            return true;
+
         return false;
     }
 
