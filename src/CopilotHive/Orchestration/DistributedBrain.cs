@@ -26,8 +26,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         - You interpret worker output to determine verdicts and extract metrics
         - You decide whether to retry, skip, or proceed to the next phase
 
-        IMPORTANT: Always respond with valid JSON matching the requested schema.
-        Do NOT wrap the JSON in markdown code fences. Return ONLY the JSON object.
+        CRITICAL RULES:
+        - Do NOT run any shell commands, tools, or file operations.
+        - Do NOT explore the filesystem, install packages, or execute code.
+        - You are a REASONING-ONLY agent. Analyze text input and produce JSON responses.
+        - Always respond with valid JSON matching the requested schema.
+        - Do NOT wrap the JSON in markdown code fences. Return ONLY the JSON object.
         """;
 
     public DistributedBrain(int port, ILogger<DistributedBrain> logger)
@@ -378,7 +382,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             }
         });
 
-        using var ctReg = ct.Register(() => done.TrySetCanceled());
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(TimeSpan.FromMinutes(3));
+        using var ctReg = cts.Token.Register(() => done.TrySetCanceled());
+
         await session.SendAsync(new MessageOptions { Prompt = prompt });
         return await done.Task;
     }

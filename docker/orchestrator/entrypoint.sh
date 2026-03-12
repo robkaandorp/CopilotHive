@@ -34,11 +34,14 @@ echo "============================================"
 
 # --- Launch Copilot headless for the Brain ---
 COPILOT_ARGS=(
-    --add-dir /app
+    --add-dir /tmp/brain-workspace
     --headless
     --port "$COPILOT_PORT"
     --model "$COPILOT_MODEL"
 )
+
+# Create an empty workspace so Copilot has nothing to explore
+mkdir -p /tmp/brain-workspace
 
 echo "[entrypoint] Starting: copilot ${COPILOT_ARGS[*]}"
 
