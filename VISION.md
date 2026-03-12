@@ -66,6 +66,65 @@ Docker containers (copilot-acp-server image, headless mode)
 - **Git push/pull between local repos is fast** — just file paths as remotes.
 - **Clean audit trail** — every change is on a branch, easy to review and rollback.
 
+## Testing Strategy
+
+### Coder vs Tester: Division of Responsibilities
+
+| Responsibility | Coder | Tester |
+|---|---|---|
+| **Unit tests** | ✅ Writes alongside code | Reviews for gaps |
+| **Integration tests** | — | ✅ Writes and runs |
+| **Build verification** | Ensures it compiles | ✅ Verifies in clean clone |
+| **Runtime testing** | — | ✅ Starts app, verifies behavior |
+| **Test plans** | — | ✅ Documents before testing |
+| **Test reports** | — | ✅ Structured findings report |
+| **Bug fixes** | ✅ Fixes reported issues | Documents, does NOT fix |
+
+### The Tester's Test Pyramid
+
+```
+                ┌───────────────┐
+                │   Runtime     │  ← Tester: Start the app, verify it works
+                │  Verification │
+                ├───────────────┤
+                │  Integration  │  ← Tester: Test component interactions
+                │    Tests      │
+                ├───────────────┤
+                │  Acceptance   │  ← Tester: Does it meet the goal?
+                │   Testing     │
+                ├───────────────┤
+                │  Unit Test    │  ← Tester: Review coverage, fill gaps
+                │   Review      │
+                └───────────────┘
+   ─────────────────────────────────────────
+                │  Unit Tests   │  ← Coder: Written alongside implementation
+                └───────────────┘
+```
+
+### Tester Workflow
+
+1. **Test Plan** — Create `TEST_PLAN.md` with scope, acceptance criteria, and test cases.
+2. **Build Verification** — Run the build. If it fails, stop immediately (verdict: FAIL).
+3. **Run Existing Tests** — Run all unit tests written by the coder. Record results.
+4. **Integration Tests** — Write tests verifying component interactions, commit them.
+5. **Runtime Verification** — Build and run the application. Check it starts, responds,
+   and produces correct output. For CLI tools: run with sample inputs. For APIs: hit
+   endpoints. For libraries: run example usage.
+6. **Test Report** — Structured report with verdict (PASS/PARTIAL/FAIL), metrics, and
+   issue list. The orchestrator parses this to decide: merge, retry, or escalate.
+
+### Feedback Loop
+
+```
+Orchestrator → Coder: "Write feature X with unit tests"
+Coder → Branch: implementation + unit tests
+Orchestrator → Tester: "Test the coder's work"
+Tester → Build → Run tests → Run app → Report
+  ├─ PASS → Orchestrator merges to main
+  ├─ PARTIAL → Orchestrator sends issues back to Coder, retry
+  └─ FAIL → Orchestrator sends report to Coder, retry (up to max retries)
+```
+
 ## Git Workflow
 
 ```

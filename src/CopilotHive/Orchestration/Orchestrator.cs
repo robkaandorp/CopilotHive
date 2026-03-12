@@ -56,7 +56,7 @@ public sealed class Orchestrator : IAsyncDisposable
 
             if (metrics.FailedTests == 0 && metrics.TotalTests > 0)
             {
-                Console.WriteLine($"[Orchestrator] ✅ All {metrics.TotalTests} tests passing. Iteration complete.");
+                Console.WriteLine($"[Orchestrator] ✅ All {metrics.TotalTests} tests passing — verdict: {metrics.Verdict}. Iteration complete.");
                 break;
             }
         }
@@ -101,30 +101,42 @@ public sealed class Orchestrator : IAsyncDisposable
                 $"""
                 You are testing code for this goal: {_config.Goal}
 
-                Review the code on the current branch. Write comprehensive tests.
-                Run the tests and report results in this exact format at the end:
+                This is iteration {iteration}. The coder's work is on branch coder/{branchName}.
 
-                METRICS:
-                total_tests: <number>
-                passed_tests: <number>
-                failed_tests: <number>
-                coverage_percent: <number>
+                Follow your full testing workflow:
+                1. Create a TEST_PLAN.md with scope, acceptance criteria, and test cases.
+                2. Build the project — if it fails, stop and report FAIL immediately.
+                3. Run all existing tests (unit tests written by the coder).
+                4. Write integration tests that verify components work together.
+                5. Run the application and verify it starts and works correctly.
+                6. Produce the TEST_REPORT block with your findings.
 
-                Commit your test files and push with: git push origin coder/{branchName}
+                Commit your test plan, integration tests, and test report on the branch.
+                Push with: git push origin coder/{branchName}
+
+                IMPORTANT: End your response with a TEST_REPORT block in the exact format
+                specified in your instructions.
                 """, ct);
-            Console.WriteLine($"[Tester] {Truncate(testerResponse, 200)}");
+            Console.WriteLine($"[Tester] {Truncate(testerResponse, 300)}");
 
-            ParseMetrics(testerResponse, metrics);
+            ParseTestReport(testerResponse, metrics);
 
-            // Tests pass → done with this phase
-            if (metrics.FailedTests == 0 && metrics.TotalTests > 0)
+            // All tests pass AND runtime verified → done
+            if (metrics.Verdict.Equals("PASS", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine("[Orchestrator] ✅ Tester verdict: PASS");
                 break;
+            }
 
             // Tests fail and we have retries left → send feedback to coder
             if (retry < _config.MaxRetriesPerTask)
             {
                 metrics.RetryCount++;
-                Console.WriteLine($"[Orchestrator] {metrics.FailedTests} test(s) failed — sending feedback to coder");
+                var issuesSummary = metrics.Issues.Count > 0
+                    ? "Issues found:\n- " + string.Join("\n- ", metrics.Issues)
+                    : "See tester report for details.";
+
+                Console.WriteLine($"[Orchestrator] Verdict: {metrics.Verdict} — sending feedback to coder");
 
                 // Push tester's test files so coder can see them
                 await _gitManager.PushBranchAsync(testerClone, $"coder/{branchName}", ct);
@@ -134,11 +146,15 @@ public sealed class Orchestrator : IAsyncDisposable
                 var fixResponse = await RunWorkerAsync(
                     WorkerRole.Coder, coderClone, "coder",
                     $"""
-                    The tester found {metrics.FailedTests} failing test(s). Here is the tester's report:
+                    The tester found issues with your code. Their verdict: {metrics.Verdict}
 
+                    {issuesSummary}
+
+                    Tester's full report:
                     {Truncate(testerResponse, 2000)}
 
-                    Fix the code so all tests pass. Commit and push with: git push origin coder/{branchName}
+                    Fix the code AND update your unit tests. Commit and push with:
+                    git push origin coder/{branchName}
                     """, ct);
                 Console.WriteLine($"[Coder:fix] {Truncate(fixResponse, 200)}");
 
@@ -146,8 +162,8 @@ public sealed class Orchestrator : IAsyncDisposable
             }
         }
 
-        // Phase 3: Merge if tests pass
-        if (metrics.FailedTests == 0 && metrics.TotalTests > 0)
+        // Phase 3: Merge if tester passed
+        if (metrics.Verdict.Equals("PASS", StringComparison.OrdinalIgnoreCase))
         {
             Console.WriteLine("[Orchestrator] Phase 3: Merging to main");
             var mergeClone = await _gitManager.CreateWorkerCloneAsync($"merge-{iteration}", ct);
@@ -188,21 +204,77 @@ public sealed class Orchestrator : IAsyncDisposable
         }
     }
 
-    private static void ParseMetrics(string response, IterationMetrics metrics)
+    private static void ParseTestReport(string response, IterationMetrics metrics)
     {
-        // Parse the structured metrics from the tester's response
+        var inReport = false;
+        var inIssues = false;
+
         foreach (var line in response.Split('\n'))
         {
             var trimmed = line.Trim();
-            if (trimmed.StartsWith("total_tests:") && int.TryParse(trimmed[12..].Trim(), out var total))
-                metrics.TotalTests = total;
-            else if (trimmed.StartsWith("passed_tests:") && int.TryParse(trimmed[13..].Trim(), out var passed))
-                metrics.PassedTests = passed;
-            else if (trimmed.StartsWith("failed_tests:") && int.TryParse(trimmed[13..].Trim(), out var failed))
-                metrics.FailedTests = failed;
-            else if (trimmed.StartsWith("coverage_percent:") && double.TryParse(trimmed[17..].Trim(), out var coverage))
-                metrics.CoveragePercent = coverage;
+
+            if (trimmed.StartsWith("TEST_REPORT:"))
+            {
+                inReport = true;
+                inIssues = false;
+                continue;
+            }
+
+            if (!inReport) continue;
+
+            // Issue list items (lines starting with "- ")
+            if (inIssues && trimmed.StartsWith("- "))
+            {
+                metrics.Issues.Add(trimmed[2..].Trim());
+                continue;
+            }
+
+            if (inIssues && !trimmed.StartsWith("- "))
+                inIssues = false;
+
+            if (TryParseField(trimmed, "build_success:", out var buildVal))
+                metrics.BuildSuccess = buildVal.Equals("true", StringComparison.OrdinalIgnoreCase);
+            else if (TryParseField(trimmed, "unit_tests_total:", out var utTotal) && int.TryParse(utTotal, out var t))
+                metrics.TotalTests = t;
+            else if (TryParseField(trimmed, "unit_tests_passed:", out var utPassed) && int.TryParse(utPassed, out var p))
+            {
+                metrics.PassedTests = p;
+                metrics.FailedTests = metrics.TotalTests - p;
+            }
+            else if (TryParseField(trimmed, "integration_tests_total:", out var itTotal) && int.TryParse(itTotal, out var it))
+                metrics.IntegrationTestsTotal = it;
+            else if (TryParseField(trimmed, "integration_tests_passed:", out var itPassed) && int.TryParse(itPassed, out var ip))
+                metrics.IntegrationTestsPassed = ip;
+            else if (TryParseField(trimmed, "runtime_verified:", out var rvVal))
+                metrics.RuntimeVerified = rvVal.Equals("true", StringComparison.OrdinalIgnoreCase);
+            else if (TryParseField(trimmed, "coverage_percent:", out var covVal) && double.TryParse(covVal, out var cov))
+                metrics.CoveragePercent = cov;
+            else if (TryParseField(trimmed, "verdict:", out var verdictVal))
+                metrics.Verdict = verdictVal;
+            else if (TryParseField(trimmed, "summary:", out var summaryVal))
+                metrics.TestReportSummary = summaryVal;
+            else if (trimmed == "issues:")
+                inIssues = true;
+
+            // Also support the old METRICS: format for backwards compatibility
+            else if (TryParseField(trimmed, "total_tests:", out var oldTotal) && int.TryParse(oldTotal, out var ot))
+                metrics.TotalTests = ot;
+            else if (TryParseField(trimmed, "passed_tests:", out var oldPassed) && int.TryParse(oldPassed, out var op))
+                metrics.PassedTests = op;
+            else if (TryParseField(trimmed, "failed_tests:", out var oldFailed) && int.TryParse(oldFailed, out var of2))
+                metrics.FailedTests = of2;
         }
+    }
+
+    private static bool TryParseField(string line, string prefix, out string value)
+    {
+        if (line.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            value = line[prefix.Length..].Trim();
+            return true;
+        }
+        value = "";
+        return false;
     }
 
     private static string Truncate(string text, int maxLength)
