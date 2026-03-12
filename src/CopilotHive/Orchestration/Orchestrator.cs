@@ -193,13 +193,23 @@ public sealed class Orchestrator : IAsyncDisposable
             var mergeClone = await _gitManager.CreateWorkerCloneAsync($"merge-{iteration}", ct);
             await _gitManager.PullBranchAsync(mergeClone, $"coder/{branchName}", ct);
 
-            var (success, output) = await _gitManager.MergeToMainAsync(
+            var (mergeSuccess, mergeOutput) = await _gitManager.MergeToMainAsync(
                 mergeClone, $"coder/{branchName}", ct);
 
-            if (!success)
+            if (!mergeSuccess)
             {
-                Console.WriteLine($"[Orchestrator] Merge conflict: {Truncate(output, 200)}");
-                // Future: delegate to merge worker
+                Console.WriteLine($"[Orchestrator] Merge conflict: {Truncate(mergeOutput, 200)}");
+                metrics.Issues.Add("Merge conflict: " + Truncate(mergeOutput, 200));
+            }
+            else
+            {
+                // Phase 3b: Post-merge verification
+                Console.WriteLine("[Orchestrator] Phase 3b: Post-merge verification");
+                var postMergeResult = await RunPostMergeVerificationAsync(
+                    iteration, branchName, mergeClone, coderClone, metrics, ct);
+
+                if (!postMergeResult)
+                    metrics.Issues.Add("Post-merge verification failed");
             }
         }
 
@@ -225,6 +235,121 @@ public sealed class Orchestrator : IAsyncDisposable
         {
             await _workerManager.StopWorkerAsync(worker.Id, ct);
         }
+    }
+
+    /// <summary>
+    /// Runs post-merge verification: tests main after merge, reverts + sends to coder if tests fail.
+    /// Returns true if main is in a good state (tests pass), false otherwise.
+    /// </summary>
+    private async Task<bool> RunPostMergeVerificationAsync(
+        int iteration, string branchName, string mergeClone, string coderClone,
+        IterationMetrics metrics, CancellationToken ct)
+    {
+        var verifyClone = await _gitManager.CreateWorkerCloneAsync($"verify-{iteration}", ct);
+
+        var verifyResponse = await RunWorkerAsync(
+            WorkerRole.Tester, verifyClone, "tester",
+            $"""
+            You are verifying the merged code on the main branch for this goal: {_config.Goal}
+
+            A merge was just completed to main. Run ALL tests on the main branch to verify
+            nothing was broken by the merge.
+            Follow your standard testing workflow and produce a TEST_REPORT block.
+            Do NOT run git push.
+            """, ct);
+        Console.WriteLine($"[Tester:verify] {Truncate(verifyResponse, 300)}");
+
+        var verifyMetrics = new IterationMetrics { Iteration = iteration };
+        ParseTestReport(verifyResponse, verifyMetrics);
+
+        if (verifyMetrics.Verdict.Equals("PASS", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("[Orchestrator] ✅ Post-merge verification passed");
+            // Update metrics with post-merge numbers (more authoritative)
+            if (verifyMetrics.TotalTests > 0) metrics.TotalTests = verifyMetrics.TotalTests;
+            if (verifyMetrics.PassedTests > 0) metrics.PassedTests = verifyMetrics.PassedTests;
+            metrics.FailedTests = verifyMetrics.FailedTests;
+            if (verifyMetrics.CoveragePercent > 0) metrics.CoveragePercent = verifyMetrics.CoveragePercent;
+            return true;
+        }
+
+        // Post-merge test failed — revert the merge
+        Console.WriteLine($"[Orchestrator] ⚠ Post-merge verification FAILED (verdict: {verifyMetrics.Verdict}) — reverting merge");
+        try
+        {
+            await _gitManager.RevertLastMergeAsync(mergeClone, ct);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Orchestrator] ⚠ Could not revert merge: {ex.Message}");
+        }
+
+        // Send failure feedback to coder
+        Console.WriteLine("[Orchestrator] Phase 3c: Coder fixing post-merge failures");
+        var issuesSummary = verifyMetrics.Issues.Count > 0
+            ? "Issues found after merge:\n- " + string.Join("\n- ", verifyMetrics.Issues)
+            : "See tester report for details.";
+
+        await _gitManager.PullBranchAsync(coderClone, $"coder/{branchName}", ct);
+        var fixResponse = await RunWorkerAsync(
+            WorkerRole.Coder, coderClone, "coder",
+            $"""
+            Your code PASSED testing on the feature branch but FAILED after merging to main.
+            This means the merge introduced issues (likely conflicts with existing code on main).
+
+            Tester verdict after merge: {verifyMetrics.Verdict}
+            {issuesSummary}
+
+            Tester's full report:
+            {Truncate(verifyResponse, 2000)}
+
+            Fix the code so it works correctly when merged with main.
+            Commit your changes. Do NOT run git push.
+            """, ct);
+        Console.WriteLine($"[Coder:postmerge-fix] {Truncate(fixResponse, 200)}");
+
+        await _gitManager.RepairRemoteAsync(coderClone, ct);
+        await _gitManager.PushBranchAsync(coderClone, $"coder/{branchName}", ct);
+
+        // Re-test the fix on the branch before re-merging
+        Console.WriteLine("[Orchestrator] Phase 3d: Re-testing after post-merge fix");
+        var retestClone = await _gitManager.CreateWorkerCloneAsync($"retest-{iteration}", ct);
+        await _gitManager.PullBranchAsync(retestClone, $"coder/{branchName}", ct);
+
+        var retestResponse = await RunWorkerAsync(
+            WorkerRole.Tester, retestClone, "tester",
+            $"""
+            You are re-testing code after a post-merge fix for this goal: {_config.Goal}
+            The coder fixed issues that appeared after merging to main.
+            Run ALL tests and produce a TEST_REPORT block.
+            Do NOT run git push.
+            """, ct);
+        Console.WriteLine($"[Tester:retest] {Truncate(retestResponse, 300)}");
+
+        ParseTestReport(retestResponse, metrics);
+
+        if (!metrics.Verdict.Equals("PASS", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine($"[Orchestrator] Post-merge fix still failing (verdict: {metrics.Verdict}) — will retry next iteration");
+            return false;
+        }
+
+        // Re-merge the fixed code
+        Console.WriteLine("[Orchestrator] ✅ Post-merge fix verified — re-merging to main");
+        var reMergeClone = await _gitManager.CreateWorkerCloneAsync($"remerge-{iteration}", ct);
+        await _gitManager.PullBranchAsync(reMergeClone, $"coder/{branchName}", ct);
+
+        var (remergeSuccess, remergeOutput) = await _gitManager.MergeToMainAsync(
+            reMergeClone, $"coder/{branchName}", ct);
+
+        if (!remergeSuccess)
+        {
+            Console.WriteLine($"[Orchestrator] Re-merge failed: {Truncate(remergeOutput, 200)}");
+            metrics.Issues.Add("Re-merge failed after post-merge fix");
+            return false;
+        }
+
+        return true;
     }
 
     private async Task RunImprovementPhaseAsync(IterationMetrics metrics, CancellationToken ct)

@@ -94,8 +94,8 @@ public class OrchestratorIntegrationTests : IDisposable
         await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
         await orchestrator.RunAsync();
 
-        // Coder(1) + Tester(1) = 2 worker spawns (merge uses git directly, no worker)
-        Assert.Equal(2, workerManager.SpawnHistory.Count);
+        // Coder(1) + Tester(1) + Post-merge verifier(1) = 3 worker spawns
+        Assert.Equal(3, workerManager.SpawnHistory.Count);
     }
 
     [Fact]
@@ -315,10 +315,94 @@ public class OrchestratorIntegrationTests : IDisposable
         await using var orchestrator = new Orchestrator(config, new FakeWorkerManager(), clientFactory);
         await orchestrator.RunAsync();
 
-        // Each worker gets its own client (coder + tester = 2)
-        Assert.Equal(2, clientFactory.CreatedClients.Count);
+        // Each worker gets its own client (coder + tester + post-merge verifier = 3)
+        Assert.Equal(3, clientFactory.CreatedClients.Count);
         Assert.All(clientFactory.CreatedClients, c => Assert.True(c.Connected));
         Assert.All(clientFactory.CreatedClients, c => Assert.True(c.Disposed));
+    }
+
+    [Fact]
+    public async Task PostMergeVerificationFail_RevertsAndSendsToCoderForFix()
+    {
+        var prompts = new List<string>();
+        var workerManager = new FakeWorkerManager();
+        var clientFactory = new FakeCopilotClientFactory(prompt =>
+        {
+            prompts.Add(prompt);
+
+            // Phase 1: Coder writes code
+            if (prompt.Contains("You are working on this goal"))
+                return "Code written and committed.";
+
+            // Phase 2: Pre-merge tester passes
+            if (prompt.Contains("You are testing code for this goal"))
+                return """
+                    TEST_REPORT:
+                    build_success: true
+                    unit_tests_total: 5
+                    unit_tests_passed: 5
+                    integration_tests_total: 0
+                    integration_tests_passed: 0
+                    runtime_verified: true
+                    coverage_percent: 80
+                    verdict: PASS
+                    summary: All tests pass.
+                    issues:
+                    """;
+
+            // Phase 3b: Post-merge verifier FAILS
+            if (prompt.Contains("verifying the merged code"))
+                return """
+                    TEST_REPORT:
+                    build_success: true
+                    unit_tests_total: 5
+                    unit_tests_passed: 3
+                    integration_tests_total: 0
+                    integration_tests_passed: 0
+                    runtime_verified: false
+                    coverage_percent: 60
+                    verdict: FAIL
+                    summary: Merge broke two tests.
+                    issues:
+                    - Conflicting method signature after merge
+                    """;
+
+            // Phase 3c: Coder fixes post-merge issue
+            if (prompt.Contains("FAILED after merging to main"))
+                return "Fixed the merge issues.";
+
+            // Phase 3d: Re-test passes
+            if (prompt.Contains("re-testing code after a post-merge fix"))
+                return """
+                    TEST_REPORT:
+                    build_success: true
+                    unit_tests_total: 5
+                    unit_tests_passed: 5
+                    integration_tests_total: 0
+                    integration_tests_passed: 0
+                    runtime_verified: true
+                    coverage_percent: 85
+                    verdict: PASS
+                    summary: All fixed.
+                    issues:
+                    """;
+
+            return "Unknown prompt.";
+        });
+
+        var config = CreateConfig();
+        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await orchestrator.RunAsync();
+
+        // Should have: coder + tester + post-merge-verify(fail) + coder-fix + retest + (implicit re-merge)
+        Assert.True(workerManager.SpawnHistory.Count >= 5,
+            $"Expected >= 5 workers, got {workerManager.SpawnHistory.Count}");
+
+        // Coder received post-merge failure feedback
+        Assert.Contains(prompts, p => p.Contains("FAILED after merging to main"));
+
+        // Re-test was triggered
+        Assert.Contains(prompts, p => p.Contains("re-testing code after a post-merge fix"));
     }
 
     public void Dispose()

@@ -167,6 +167,34 @@ public class GitWorkspaceManagerTests : IDisposable
         Assert.Empty(files);
     }
 
+    [Fact]
+    public async Task RevertLastMerge_UndoesMergeCommit()
+    {
+        await _manager.InitBareRepoAsync();
+
+        // Create and merge a feature branch
+        var clonePath = await _manager.CreateWorkerCloneAsync("revert-merger");
+        await _manager.CreateBranchAsync(clonePath, "feature/to-revert");
+        await File.WriteAllTextAsync(Path.Combine(clonePath, "feature.txt"), "will be reverted");
+        await RunGitInClone(clonePath, "add", ".");
+        await RunGitInClone(clonePath, "commit", "-m", "add feature to revert");
+        await _manager.PushBranchAsync(clonePath, "feature/to-revert");
+
+        var (success, _) = await _manager.MergeToMainAsync(clonePath, "feature/to-revert");
+        Assert.True(success);
+
+        // Verify file exists on main after merge
+        var verifyClone = await _manager.CreateWorkerCloneAsync("verify-merged");
+        Assert.True(File.Exists(Path.Combine(verifyClone, "feature.txt")));
+
+        // Revert the merge
+        await _manager.RevertLastMergeAsync(clonePath);
+
+        // Verify file is gone on main after revert
+        var postRevertClone = await _manager.CreateWorkerCloneAsync("verify-reverted");
+        Assert.False(File.Exists(Path.Combine(postRevertClone, "feature.txt")));
+    }
+
     private static async Task RunGitInClone(string workingDir, params string[] args)
     {
         var psi = new System.Diagnostics.ProcessStartInfo("git")

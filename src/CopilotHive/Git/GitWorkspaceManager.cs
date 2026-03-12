@@ -174,6 +174,17 @@ public sealed class GitWorkspaceManager
     }
 
     /// <summary>
+    /// Reverts the last merge commit on main and force-pushes to origin.
+    /// Used when post-merge verification fails.
+    /// </summary>
+    public async Task RevertLastMergeAsync(string clonePath, CancellationToken ct = default)
+    {
+        await RunGitAsync(clonePath, ["checkout", "main"], ct);
+        await RunGitAsync(clonePath, ["reset", "--hard", "HEAD~1"], ct);
+        await RunGitAsync(clonePath, ["push", "--force", "origin", "main"], ct);
+    }
+
+    /// <summary>
     /// Delete a directory with retries — on Windows, git processes may hold brief file locks.
     /// </summary>
     private static async Task ForceDeleteDirectoryAsync(string path, int maxRetries = 5)
