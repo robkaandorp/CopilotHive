@@ -1,5 +1,8 @@
 using CopilotHive.Worker;
 
+// Required for gRPC over plaintext HTTP/2 (no TLS in Docker network)
+AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
+
 var orchestratorUrl = Environment.GetEnvironmentVariable("ORCHESTRATOR_URL");
 if (string.IsNullOrWhiteSpace(orchestratorUrl))
 {

@@ -76,7 +76,7 @@ WORKER_ROLE="${WORKER_ROLE:-}"
 if [[ -n "${ORCHESTRATOR_URL}" && -n "${WORKER_ROLE}" ]]; then
     echo "[entrypoint] Waiting for Copilot to be ready on port ${COPILOT_PORT}..."
     for i in $(seq 1 30); do
-        if curl -sf "http://localhost:${COPILOT_PORT}" >/dev/null 2>&1; then
+        if bash -c "echo > /dev/tcp/localhost/${COPILOT_PORT}" 2>/dev/null; then
             echo "[entrypoint] Copilot is ready."
             break
         fi

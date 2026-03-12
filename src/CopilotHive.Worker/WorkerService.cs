@@ -22,7 +22,14 @@ public sealed class WorkerService(
     {
         var workerRole = ParseRole(role);
 
-        using var channel = GrpcChannel.ForAddress(orchestratorUrl);
+        // Enable HTTP/2 over plaintext (required for gRPC without TLS in Docker network)
+        using var channel = GrpcChannel.ForAddress(orchestratorUrl, new GrpcChannelOptions
+        {
+            HttpHandler = new SocketsHttpHandler
+            {
+                EnableMultipleHttp2Connections = true,
+            }
+        });
         var client = new HiveOrchestrator.HiveOrchestratorClient(channel);
 
         // 1. Register

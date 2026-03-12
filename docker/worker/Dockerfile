@@ -28,33 +28,22 @@ LABEL maintainer="CopilotHive" \
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install all apt packages (core, search/utils, GitHub CLI, Node.js) in a single layer
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        git \
-        curl \
-        wget \
-        jq \
-        openssh-client \
-        ca-certificates \
-        gnupg \
-        ripgrep \
-        fd-find \
-        tree \
-        file \
-        build-essential \
-        python3 \
+# Install system packages, GitHub CLI, Node.js, and Copilot CLI
+RUN apt-get update \
+    && apt-get install -y \
+        git curl wget jq openssh-client ca-certificates gnupg \
+        ripgrep fd-find tree file \
+        build-essential python3 \
+        libicu-dev \
     && mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
        | gpg --dearmor -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
        > /etc/apt/sources.list.d/github-cli.list \
     && curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
-    && apt-get install -y --no-install-recommends gh nodejs \
+    && apt-get install -y gh nodejs \
     && npm install -g @github/copilot \
-    && npm cache clean --force \
-    && apt-get purge -y --auto-remove gnupg build-essential python3 \
-    && rm -rf /var/lib/apt/lists/* /tmp/* /root/.npm /root/.cache
+    && rm -rf /var/lib/apt/lists/* /tmp/*
 
 # Create workspace and config directories
 RUN mkdir -p /copilot-home /opt/copilot-env/.github/skills

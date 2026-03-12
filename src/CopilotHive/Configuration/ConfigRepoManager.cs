@@ -44,12 +44,29 @@ public sealed class ConfigRepoManager
             var parent = Path.GetDirectoryName(_localPath)!;
             Directory.CreateDirectory(parent);
             var dirName = Path.GetFileName(_localPath);
-            await RunGitAsync(parent, ["clone", _configRepoUrl, dirName], ct);
+            var cloneUrl = InjectTokenIntoUrl(_configRepoUrl);
+            await RunGitAsync(parent, ["clone", cloneUrl, dirName], ct);
             await RunGitAsync(_localPath, ["config", "user.email", "copilothive@local"], ct);
             await RunGitAsync(_localPath, ["config", "user.name", "CopilotHive"], ct);
         }
 
         _cachedConfig = null;
+    }
+
+    /// <summary>
+    /// If GH_TOKEN is set and the URL is HTTPS GitHub, inject the token for auth.
+    /// </summary>
+    private static string InjectTokenIntoUrl(string url)
+    {
+        var token = Environment.GetEnvironmentVariable("GH_TOKEN")
+                 ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+        if (string.IsNullOrEmpty(token))
+            return url;
+
+        if (url.StartsWith("https://github.com/", StringComparison.OrdinalIgnoreCase))
+            return url.Replace("https://github.com/", $"https://x-access-token:{token}@github.com/");
+
+        return url;
     }
 
     /// <summary>

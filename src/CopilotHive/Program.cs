@@ -28,7 +28,7 @@ static async Task<int> RunServerAsync(string[] args)
         ?? "./config-repo";
 
     PrintBanner();
-    Console.WriteLine($"[Hive] Starting gRPC server on port {port}…");
+    Console.WriteLine($"[Hive] Starting gRPC server on port {port}, HTTP on port {port + 1}…");
 
     var builder = WebApplication.CreateBuilder(args);
 
@@ -63,8 +63,13 @@ static async Task<int> RunServerAsync(string[] args)
 
     builder.WebHost.ConfigureKestrel(options =>
     {
+        // HTTP/2 only for gRPC (required without TLS — prior knowledge mode)
         options.ListenAnyIP(port, listenOptions =>
-            listenOptions.Protocols = HttpProtocols.Http1AndHttp2);
+            listenOptions.Protocols = HttpProtocols.Http2);
+
+        // HTTP/1.1 for health checks and REST API
+        options.ListenAnyIP(port + 1, listenOptions =>
+            listenOptions.Protocols = HttpProtocols.Http1);
     });
 
     var app = builder.Build();
