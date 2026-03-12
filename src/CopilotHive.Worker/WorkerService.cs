@@ -99,6 +99,9 @@ public sealed class WorkerService(
                     var assignment = message.Assignment;
                     Console.WriteLine($"[Worker] Received task {assignment.TaskId}: {assignment.GoalDescription}");
 
+                    // Reset Copilot session to prevent context leakage between tasks
+                    await _copilotRunner.ResetSessionAsync(ct);
+
                     var executor = new TaskExecutor(_copilotRunner);
                     var result = await executor.ExecuteAsync(assignment, taskCts.Token);
 

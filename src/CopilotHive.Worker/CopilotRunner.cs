@@ -55,6 +55,26 @@ public sealed class CopilotRunner : IAsyncDisposable
     }
 
     /// <summary>
+    /// Dispose the current session and create a fresh one, ensuring no context leaks between tasks.
+    /// </summary>
+    public async Task ResetSessionAsync(CancellationToken ct = default)
+    {
+        if (_session is not null)
+        {
+            await _session.DisposeAsync();
+            _session = null;
+        }
+
+        _session = await _client.CreateSessionAsync(new SessionConfig
+        {
+            Streaming = false,
+            OnPermissionRequest = PermissionHandler.ApproveAll,
+        });
+
+        Console.WriteLine($"[Copilot] Session reset (localhost:{_port})");
+    }
+
+    /// <summary>
     /// Send a prompt to the Copilot CLI and return the response text.
     /// </summary>
     public async Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
