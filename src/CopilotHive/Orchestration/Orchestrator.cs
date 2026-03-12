@@ -218,7 +218,7 @@ public sealed class Orchestrator : IAsyncDisposable
         }
     }
 
-    private static void ParseTestReport(string response, IterationMetrics metrics)
+    internal static void ParseTestReport(string response, IterationMetrics metrics)
     {
         var inReport = false;
         var inIssues = false;
