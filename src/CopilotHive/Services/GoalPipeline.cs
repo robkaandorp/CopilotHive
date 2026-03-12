@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 using CopilotHive.Goals;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
-using CopilotHive.Shared.Grpc;
+using CopilotHive.Persistence;
 
 namespace CopilotHive.Services;
 
@@ -53,7 +53,7 @@ public sealed class GoalPipeline
     /// <summary>Per-goal conversation history for the Brain.</summary>
     public List<ConversationEntry> Conversation { get; } = [];
 
-    public DateTime CreatedAt { get; } = DateTime.UtcNow;
+    public DateTime CreatedAt { get; private init; } = DateTime.UtcNow;
     public DateTime? CompletedAt { get; private set; }
 
     public GoalPipeline(Goal goal, int maxRetries = 3)
@@ -62,6 +62,38 @@ public sealed class GoalPipeline
         GoalId = goal.Id;
         Description = goal.Description;
         MaxRetries = maxRetries;
+    }
+
+    /// <summary>Restore a pipeline from a persisted snapshot.</summary>
+    internal GoalPipeline(PipelineSnapshot snapshot)
+    {
+        Goal = snapshot.Goal;
+        GoalId = snapshot.GoalId;
+        Description = snapshot.Description;
+        Phase = snapshot.Phase;
+        Iteration = snapshot.Iteration;
+        ReviewRetries = snapshot.ReviewRetries;
+        TestRetries = snapshot.TestRetries;
+        MaxRetries = snapshot.MaxRetries;
+        ActiveTaskId = snapshot.ActiveTaskId;
+        CoderBranch = snapshot.CoderBranch;
+        CreatedAt = snapshot.CreatedAt;
+        CompletedAt = snapshot.CompletedAt;
+
+        foreach (var (key, value) in snapshot.PhaseOutputs)
+            PhaseOutputs[key] = value;
+
+        Metrics.BuildSuccess = snapshot.Metrics.BuildSuccess;
+        Metrics.TotalTests = snapshot.Metrics.TotalTests;
+        Metrics.PassedTests = snapshot.Metrics.PassedTests;
+        Metrics.FailedTests = snapshot.Metrics.FailedTests;
+        Metrics.CoveragePercent = snapshot.Metrics.CoveragePercent;
+        Metrics.IntegrationTestsTotal = snapshot.Metrics.IntegrationTestsTotal;
+        Metrics.IntegrationTestsPassed = snapshot.Metrics.IntegrationTestsPassed;
+        Metrics.RuntimeVerified = snapshot.Metrics.RuntimeVerified;
+
+        foreach (var entry in snapshot.Conversation)
+            Conversation.Add(entry);
     }
 
     /// <summary>Advance to the next phase.</summary>

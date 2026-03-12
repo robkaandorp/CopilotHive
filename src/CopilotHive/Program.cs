@@ -1,6 +1,7 @@
 using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
 using CopilotHive.Services;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 
@@ -40,8 +41,16 @@ static async Task<int> RunServerAsync(string[] args)
     builder.Services.AddSingleton<WorkerPool>();
     builder.Services.AddSingleton<TaskQueue>();
     builder.Services.AddSingleton<ApiGoalSource>();
-    builder.Services.AddSingleton<GoalPipelineManager>();
     builder.Services.AddSingleton<TaskCompletionNotifier>();
+
+    // Persistence: SQLite store for pipeline state (survives restarts)
+    var stateDir = Environment.GetEnvironmentVariable("STATE_DIR") ?? "/app/state";
+    var dbPath = Path.Combine(stateDir, "copilothive.db");
+    builder.Services.AddSingleton(sp =>
+        new PipelineStore(dbPath, sp.GetRequiredService<ILogger<PipelineStore>>()));
+
+    builder.Services.AddSingleton(sp =>
+        new GoalPipelineManager(sp.GetRequiredService<PipelineStore>()));
 
     // Brain: connect to Copilot CLI running alongside the orchestrator
     var brainPort = int.TryParse(Environment.GetEnvironmentVariable("BRAIN_COPILOT_PORT"), out var bp) ? bp : 0;

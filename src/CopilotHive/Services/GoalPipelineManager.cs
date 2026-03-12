@@ -1,15 +1,23 @@
 using System.Collections.Concurrent;
 using CopilotHive.Goals;
+using CopilotHive.Persistence;
 
 namespace CopilotHive.Services;
 
 /// <summary>
 /// Singleton that holds all active goal pipelines and provides lookup by goalId or taskId.
+/// Persists pipeline state to SQLite via <see cref="PipelineStore"/>.
 /// </summary>
 public sealed class GoalPipelineManager
 {
     private readonly ConcurrentDictionary<string, GoalPipeline> _pipelines = new();
     private readonly ConcurrentDictionary<string, string> _taskToGoal = new();
+    private readonly PipelineStore? _store;
+
+    public GoalPipelineManager(PipelineStore? store = null)
+    {
+        _store = store;
+    }
 
     /// <summary>Create and register a new pipeline for a goal.</summary>
     public GoalPipeline CreatePipeline(Goal goal, int maxRetries = 3)
@@ -17,6 +25,8 @@ public sealed class GoalPipelineManager
         var pipeline = new GoalPipeline(goal, maxRetries);
         if (!_pipelines.TryAdd(goal.Id, pipeline))
             throw new InvalidOperationException($"Pipeline already exists for goal '{goal.Id}'");
+
+        _store?.SavePipeline(pipeline);
         return pipeline;
     }
 
@@ -32,7 +42,14 @@ public sealed class GoalPipelineManager
     public void RegisterTask(string taskId, string goalId)
     {
         _taskToGoal[taskId] = goalId;
+        _store?.SaveTaskMapping(taskId, goalId);
     }
+
+    /// <summary>Persist the current state of a pipeline (call after state mutations).</summary>
+    public void PersistState(GoalPipeline pipeline) => _store?.SavePipelineState(pipeline);
+
+    /// <summary>Persist the full pipeline including conversation.</summary>
+    public void PersistFull(GoalPipeline pipeline) => _store?.SavePipeline(pipeline);
 
     /// <summary>Get all active (non-completed) pipelines.</summary>
     public IReadOnlyList<GoalPipeline> GetActivePipelines() =>
@@ -45,16 +62,38 @@ public sealed class GoalPipelineManager
     public IReadOnlyList<GoalPipeline> GetAllPipelines() =>
         _pipelines.Values.ToList().AsReadOnly();
 
-    /// <summary>Remove a completed pipeline to free memory.</summary>
+    /// <summary>Remove a completed pipeline to free memory and clean up storage.</summary>
     public bool RemovePipeline(string goalId)
     {
-        if (_pipelines.TryRemove(goalId, out var pipeline))
+        if (_pipelines.TryRemove(goalId, out _))
         {
-            // Clean up task mappings for this pipeline
             foreach (var key in _taskToGoal.Where(kv => kv.Value == goalId).Select(kv => kv.Key).ToList())
                 _taskToGoal.TryRemove(key, out _);
+            _store?.RemovePipeline(goalId);
             return true;
         }
         return false;
+    }
+
+    /// <summary>Restore pipelines from persistent store (called once at startup).</summary>
+    public List<GoalPipeline> RestoreFromStore()
+    {
+        if (_store is null) return [];
+
+        var snapshots = _store.LoadActivePipelines();
+        var restored = new List<GoalPipeline>();
+
+        foreach (var snap in snapshots)
+        {
+            var pipeline = new GoalPipeline(snap);
+            if (_pipelines.TryAdd(snap.GoalId, pipeline))
+            {
+                foreach (var (taskId, goalId) in snap.TaskMappings)
+                    _taskToGoal[taskId] = goalId;
+                restored.Add(pipeline);
+            }
+        }
+
+        return restored;
     }
 }

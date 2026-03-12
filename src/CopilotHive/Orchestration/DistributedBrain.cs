@@ -114,6 +114,62 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Re-creates a session and replays persisted conversation history into it.
+    /// Used on restart to restore Brain context for active goals.
+    /// </summary>
+    public async Task ReprimeSessionAsync(GoalPipeline pipeline, CancellationToken ct)
+    {
+        EnsureConnected();
+
+        // Remove any stale session
+        if (_sessions.TryRemove(pipeline.GoalId, out var stale))
+            await stale.DisposeAsync();
+
+        var session = await _copilotClient!.CreateSessionAsync(new SessionConfig
+        {
+            Streaming = false,
+            OnPermissionRequest = PermissionHandler.ApproveAll,
+        });
+
+        // Replay the conversation: alternate user/assistant messages
+        var entries = pipeline.Conversation;
+        if (entries.Count > 0)
+        {
+            // Send the system prompt + summary of prior conversation as a single priming message
+            var summary = string.Join("\n\n", entries.Select(e => $"[{e.Role}]: {e.Content}"));
+            await SendToSessionAsync(session, $"""
+                {SystemPrompt}
+
+                You are resuming work on goal '{pipeline.GoalId}':
+                {pipeline.Description}
+
+                Here is the conversation so far (summarized from {entries.Count} messages):
+                {Truncate(summary, 8000)}
+
+                Continue from where we left off. The current phase is {pipeline.Phase},
+                iteration {pipeline.Iteration}. Acknowledge briefly and await instructions.
+                """, ct);
+        }
+        else
+        {
+            // No conversation — just prime with system prompt
+            await SendToSessionAsync(session, $"""
+                {SystemPrompt}
+
+                You are resuming work on goal '{pipeline.GoalId}':
+                {pipeline.Description}
+
+                This is a resumed session. Current phase: {pipeline.Phase}, iteration {pipeline.Iteration}.
+                Acknowledge briefly and await instructions.
+                """, ct);
+        }
+
+        _sessions[pipeline.GoalId] = session;
+        _logger.LogInformation("Re-primed Copilot session for goal {GoalId} with {Count} conversation entries",
+            pipeline.GoalId, entries.Count);
+    }
+
     public async Task<OrchestratorDecision> PlanGoalAsync(GoalPipeline pipeline, CancellationToken ct = default)
     {
         var metricsContext = pipeline.Iteration > 1

@@ -53,6 +53,9 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogInformation("GoalDispatcher started — polling for goals every {Interval}s (Brain: {BrainEnabled})",
             PollInterval.TotalSeconds, _brain is not null ? "enabled" : "disabled");
 
+        // Restore any in-flight pipelines from the persistence store
+        await RestoreActivePipelinesAsync(stoppingToken);
+
         // Give workers time to connect before dispatching
         await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
 
@@ -95,7 +98,6 @@ public sealed class GoalDispatcher : BackgroundService
 
         if (_brain is null)
         {
-            // Without Brain: just mark done after coding phase
             await MarkGoalCompleted(pipeline, ct);
             return;
         }
@@ -109,6 +111,8 @@ public sealed class GoalDispatcher : BackgroundService
             _logger.LogError(ex, "Error driving pipeline {GoalId} to next phase", pipeline.GoalId);
             await MarkGoalFailed(pipeline, ex.Message, ct);
         }
+
+        _pipelineManager.PersistFull(pipeline);
     }
 
     private async Task DriveNextPhaseAsync(GoalPipeline pipeline, TaskComplete complete, CancellationToken ct)
@@ -347,6 +351,49 @@ public sealed class GoalDispatcher : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Restore active pipelines from the persistence store on startup.
+    /// Re-primes Brain sessions and marks goals as dispatched.
+    /// </summary>
+    private async Task RestoreActivePipelinesAsync(CancellationToken ct)
+    {
+        var restored = _pipelineManager.RestoreFromStore();
+        if (restored.Count == 0)
+            return;
+
+        _logger.LogInformation("Restoring {Count} active pipeline(s) from persistence store", restored.Count);
+
+        foreach (var pipeline in restored)
+        {
+            _dispatchedGoals.TryAdd(pipeline.GoalId, true);
+
+            // Re-prime Brain session with conversation history
+            if (_brain is DistributedBrain brain && pipeline.Conversation.Count > 0)
+            {
+                try
+                {
+                    await brain.ReprimeSessionAsync(pipeline, ct);
+                    _logger.LogInformation("Re-primed Brain session for goal {GoalId} ({ConvCount} entries)",
+                        pipeline.GoalId, pipeline.Conversation.Count);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to re-prime Brain session for goal {GoalId}", pipeline.GoalId);
+                }
+            }
+
+            // If the pipeline was mid-task (has ActiveTaskId), re-enqueue the task for reassignment
+            if (pipeline.ActiveTaskId is not null && pipeline.Phase is not (GoalPhase.Done or GoalPhase.Failed))
+            {
+                _logger.LogInformation("Pipeline {GoalId} was mid-task ({TaskId}) — will await worker reconnection",
+                    pipeline.GoalId, pipeline.ActiveTaskId);
+            }
+        }
+
+        _logger.LogInformation("Restored {Count} pipeline(s): {GoalIds}",
+            restored.Count, string.Join(", ", restored.Select(p => p.GoalId)));
+    }
+
     private async Task DispatchNextGoalAsync(CancellationToken ct)
     {
         var goal = await _goalManager.GetNextGoalAsync(ct);
@@ -381,6 +428,8 @@ public sealed class GoalDispatcher : BackgroundService
             pipeline.AdvanceTo(GoalPhase.Coding);
             await DispatchToRole(pipeline, WorkerRole.Coder, BuildCoderPrompt(goal), ct);
         }
+
+        _pipelineManager.PersistFull(pipeline);
     }
 
     private List<TargetRepository> ResolveRepositories(Goal goal)
