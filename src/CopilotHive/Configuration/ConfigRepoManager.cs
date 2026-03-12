@@ -1,0 +1,159 @@
+using System.Diagnostics;
+using YamlDotNet.Serialization;
+using YamlDotNet.Serialization.NamingConventions;
+
+namespace CopilotHive.Configuration;
+
+/// <summary>
+/// Manages the configuration repository: clones/pulls the repo, reads hive-config.yaml
+/// and per-role AGENTS.md files, and commits AGENTS.md updates back.
+/// </summary>
+public sealed class ConfigRepoManager
+{
+    private readonly string _configRepoUrl;
+    private readonly string _localPath;
+    private HiveConfigFile? _cachedConfig;
+
+    private static readonly IDeserializer YamlDeserializer = new DeserializerBuilder()
+        .WithNamingConvention(UnderscoredNamingConvention.Instance)
+        .IgnoreUnmatchedProperties()
+        .Build();
+
+    public ConfigRepoManager(string configRepoUrl, string localPath)
+    {
+        _configRepoUrl = configRepoUrl;
+        _localPath = Path.GetFullPath(localPath);
+    }
+
+    /// <summary>
+    /// The local filesystem path where the config repo is cloned.
+    /// </summary>
+    public string LocalPath => _localPath;
+
+    /// <summary>
+    /// Clones the config repo, or pulls latest if already cloned.
+    /// </summary>
+    public async Task SyncRepoAsync(CancellationToken ct = default)
+    {
+        if (Directory.Exists(Path.Combine(_localPath, ".git")))
+        {
+            await RunGitAsync(_localPath, ["pull", "--ff-only"], ct);
+        }
+        else
+        {
+            var parent = Path.GetDirectoryName(_localPath)!;
+            Directory.CreateDirectory(parent);
+            var dirName = Path.GetFileName(_localPath);
+            await RunGitAsync(parent, ["clone", _configRepoUrl, dirName], ct);
+            await RunGitAsync(_localPath, ["config", "user.email", "copilothive@local"], ct);
+            await RunGitAsync(_localPath, ["config", "user.name", "CopilotHive"], ct);
+        }
+
+        _cachedConfig = null;
+    }
+
+    /// <summary>
+    /// Loads and parses hive-config.yaml from the config repo root.
+    /// </summary>
+    public async Task<HiveConfigFile> LoadConfigAsync(CancellationToken ct = default)
+    {
+        if (_cachedConfig is not null)
+            return _cachedConfig;
+
+        var configPath = Path.Combine(_localPath, "hive-config.yaml");
+        if (!File.Exists(configPath))
+            throw new FileNotFoundException("Config file not found in config repo.", configPath);
+
+        var yaml = await File.ReadAllTextAsync(configPath, ct);
+        _cachedConfig = ParseConfig(yaml);
+        return _cachedConfig;
+    }
+
+    /// <summary>
+    /// Parses a YAML string into a <see cref="HiveConfigFile"/>.
+    /// </summary>
+    internal static HiveConfigFile ParseConfig(string yaml)
+    {
+        return YamlDeserializer.Deserialize<HiveConfigFile>(yaml) ?? new HiveConfigFile();
+    }
+
+    /// <summary>
+    /// Loads a per-role AGENTS.md file from the config repo (agents/{role}.agents.md).
+    /// Returns null if the file does not exist.
+    /// </summary>
+    public async Task<string?> LoadAgentsMdAsync(string role, CancellationToken ct = default)
+    {
+        var agentsPath = Path.Combine(_localPath, "agents", $"{role.ToLowerInvariant()}.agents.md");
+        if (!File.Exists(agentsPath))
+            return null;
+
+        return await File.ReadAllTextAsync(agentsPath, ct);
+    }
+
+    /// <summary>
+    /// Checks whether a repository URL is in the allowed list.
+    /// Compares normalized URLs (trimmed, case-insensitive, trailing-slash-insensitive).
+    /// </summary>
+    public bool IsRepositoryAllowed(string repoUrl)
+    {
+        if (_cachedConfig is null)
+            return false;
+
+        var normalized = NormalizeUrl(repoUrl);
+        return _cachedConfig.Repositories.Exists(r => NormalizeUrl(r.Url) == normalized);
+    }
+
+    /// <summary>
+    /// Commits and pushes an updated AGENTS.md for a specific role back to the config repo.
+    /// </summary>
+    public async Task CommitAgentsUpdateAsync(string role, string content, CancellationToken ct = default)
+    {
+        var agentsDir = Path.Combine(_localPath, "agents");
+        Directory.CreateDirectory(agentsDir);
+
+        var filePath = Path.Combine(agentsDir, $"{role.ToLowerInvariant()}.agents.md");
+        await File.WriteAllTextAsync(filePath, content, ct);
+
+        await RunGitAsync(_localPath, ["add", filePath], ct);
+        await RunGitAsync(_localPath,
+            ["commit", "-m", $"Update {role} AGENTS.md"], ct);
+        await RunGitAsync(_localPath, ["push", "origin", "HEAD"], ct);
+    }
+
+    private static string NormalizeUrl(string url)
+    {
+        return url.Trim().TrimEnd('/').ToLowerInvariant();
+    }
+
+    private static async Task<string> RunGitAsync(string workingDir, string[] args, CancellationToken ct)
+    {
+        var psi = new ProcessStartInfo("git")
+        {
+            WorkingDirectory = workingDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
+
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to start git process");
+
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
+        var stderrTask = process.StandardError.ReadToEndAsync(ct);
+
+        await Task.WhenAll(stdoutTask, stderrTask);
+        await process.WaitForExitAsync(ct);
+
+        var stdout = stdoutTask.Result;
+        var stderr = stderrTask.Result;
+
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"git exited with code {process.ExitCode}: {stdout}\n{stderr}".Trim());
+
+        return stdout.Trim();
+    }
+}

@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
@@ -21,6 +22,11 @@ static async Task<int> RunServerAsync(string[] args)
     if (portArg is not null && int.TryParse(portArg["--port=".Length..], out var p))
         port = p;
 
+    var goalsFile = args.FirstOrDefault(a => a.StartsWith("--goals-file="))?["--goals-file=".Length..];
+    var configRepoUrl = args.FirstOrDefault(a => a.StartsWith("--config-repo="))?["--config-repo=".Length..];
+    var configRepoPath = args.FirstOrDefault(a => a.StartsWith("--config-repo-path="))?["--config-repo-path=".Length..]
+        ?? "./config-repo";
+
     PrintBanner();
     Console.WriteLine($"[Hive] Starting gRPC server on port {port}…");
 
@@ -29,6 +35,31 @@ static async Task<int> RunServerAsync(string[] args)
     builder.Services.AddGrpc();
     builder.Services.AddSingleton<WorkerPool>();
     builder.Services.AddSingleton<TaskQueue>();
+    builder.Services.AddSingleton<ApiGoalSource>();
+
+    if (!string.IsNullOrEmpty(configRepoUrl))
+    {
+        Console.WriteLine($"[Hive] Syncing config repo from {configRepoUrl}…");
+        var configRepo = new ConfigRepoManager(configRepoUrl, configRepoPath);
+        await configRepo.SyncRepoAsync();
+        var hiveConfigFile = await configRepo.LoadConfigAsync();
+
+        builder.Services.AddSingleton(configRepo);
+        builder.Services.AddSingleton(hiveConfigFile);
+
+        Console.WriteLine($"[Hive] Config loaded: {hiveConfigFile.Repositories.Count} repo(s), " +
+            $"{hiveConfigFile.Workers.Count} worker config(s)");
+    }
+    builder.Services.AddSingleton(sp =>
+    {
+        var manager = new GoalManager();
+        manager.AddSource(sp.GetRequiredService<ApiGoalSource>());
+
+        if (!string.IsNullOrEmpty(goalsFile))
+            manager.AddSource(new FileGoalSource(goalsFile));
+
+        return manager;
+    });
 
     builder.WebHost.ConfigureKestrel(options =>
     {
@@ -40,6 +71,46 @@ static async Task<int> RunServerAsync(string[] args)
 
     app.MapGrpcService<HiveOrchestratorService>();
     app.MapGet("/health", () => "ok");
+
+    // ── Goals REST API ───────────────────────────────────────────────────────
+    var goalsApi = app.MapGroup("/api/goals");
+
+    goalsApi.MapGet("/", (ApiGoalSource source) => Results.Ok(source.GetAllGoals()));
+
+    goalsApi.MapPost("/", (Goal goal, ApiGoalSource source) =>
+    {
+        try
+        {
+            var created = source.AddGoal(goal);
+            return Results.Created($"/api/goals/{created.Id}", created);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Results.Conflict(new { error = ex.Message });
+        }
+    });
+
+    goalsApi.MapPatch("/{id}/status", async (string id, GoalStatusUpdate update, GoalManager manager) =>
+    {
+        try
+        {
+            var status = Enum.Parse<GoalStatus>(update.Status, ignoreCase: true);
+            var source = manager.Sources.FirstOrDefault(s => s.Name == "api") as ApiGoalSource;
+            if (source is null)
+                return Results.Problem("API goal source not configured.");
+
+            await source.UpdateGoalStatusAsync(id, status);
+            return Results.Ok(source.GetGoal(id));
+        }
+        catch (KeyNotFoundException)
+        {
+            return Results.NotFound(new { error = $"Goal '{id}' not found." });
+        }
+        catch (ArgumentException)
+        {
+            return Results.BadRequest(new { error = $"Invalid status '{update.Status}'." });
+        }
+    });
 
     await app.RunAsync();
     return 0;
@@ -156,3 +227,5 @@ static void PrintBanner()
                              ╚═╝  ╚═╝╚═╝  ╚═══╝  ╚══════╝
         """);
 }
+
+record GoalStatusUpdate(string Status);

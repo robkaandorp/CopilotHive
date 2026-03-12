@@ -1,3 +1,25 @@
+# ── Build stage: compile CopilotHive.Worker ───────────────────────────────────
+FROM mcr.microsoft.com/dotnet/sdk:10.0-preview AS build
+
+WORKDIR /src
+
+COPY CopilotHive.slnx ./
+COPY src/CopilotHive/CopilotHive.csproj src/CopilotHive/
+COPY src/CopilotHive.Shared/CopilotHive.Shared.csproj src/CopilotHive.Shared/
+COPY src/CopilotHive.Worker/CopilotHive.Worker.csproj src/CopilotHive.Worker/
+COPY tests/CopilotHive.Tests/CopilotHive.Tests.csproj tests/CopilotHive.Tests/
+
+RUN dotnet restore src/CopilotHive.Worker/CopilotHive.Worker.csproj
+
+COPY src/ src/
+
+RUN dotnet publish src/CopilotHive.Worker/CopilotHive.Worker.csproj \
+    -c Release \
+    -r linux-x64 \
+    --self-contained \
+    -o /worker/publish
+
+# ── Runtime stage: slim worker with Copilot CLI + Worker binary ───────────────
 FROM ubuntu:24.04
 
 LABEL maintainer="CopilotHive" \
@@ -35,12 +57,15 @@ RUN apt-get update && \
 # Create workspace and config directories
 RUN mkdir -p /copilot-home /opt/copilot-env/.github/skills
 
+# Copy Worker binary from build stage
+COPY --from=build /worker/publish /opt/worker/
+
 # Copy agent configuration
-COPY worker-agents.md /opt/copilot-env/AGENTS.md
-COPY skills/ /opt/copilot-env/.github/skills/
+COPY docker/worker/worker-agents.md /opt/copilot-env/AGENTS.md
+COPY docker/worker/skills/ /opt/copilot-env/.github/skills/
 
 # Copy and set entrypoint (sed strips Windows line endings)
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY docker/worker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 # Environment variables

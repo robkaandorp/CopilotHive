@@ -1,0 +1,92 @@
+services:
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: docker/orchestrator/Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - GH_TOKEN
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    volumes:
+      - orchestrator-state:/app/state
+    networks:
+      - hive
+
+  coder:
+    build:
+      context: ..
+      dockerfile: docker/worker/Dockerfile
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:5000
+      - WORKER_ROLE=coder
+      - GH_TOKEN
+      - COPILOT_MODEL=claude-opus-4.6
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+    networks:
+      - hive
+
+  reviewer:
+    build:
+      context: ..
+      dockerfile: docker/worker/Dockerfile
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:5000
+      - WORKER_ROLE=reviewer
+      - GH_TOKEN
+      - COPILOT_MODEL=gpt-5.3-codex
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+    networks:
+      - hive
+
+  tester:
+    build:
+      context: ..
+      dockerfile: docker/worker/Dockerfile
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:5000
+      - WORKER_ROLE=tester
+      - GH_TOKEN
+      - COPILOT_MODEL=claude-sonnet-4.6
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+    networks:
+      - hive
+
+  improver:
+    build:
+      context: ..
+      dockerfile: docker/worker/Dockerfile
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:5000
+      - WORKER_ROLE=improver
+      - GH_TOKEN
+      - COPILOT_MODEL=claude-sonnet-4.6
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+    networks:
+      - hive
+
+volumes:
+  orchestrator-state:
+
+networks:
+  hive:

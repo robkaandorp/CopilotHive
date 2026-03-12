@@ -1,0 +1,13 @@
+**/.git
+**/bin
+**/obj
+**/node_modules
+**/.vs
+**/.vscode
+**/TestResults
+docker/
+metrics/
+workspaces/
+*.md
+!agents/*.md
+!VISION.md
