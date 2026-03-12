@@ -1,0 +1,5 @@
+# Normalize line endings in the repository (LF in objects, native on checkout)
+* text=auto
+
+# Force LF for shell scripts even on Windows
+*.sh text eol=lf

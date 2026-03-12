@@ -34,6 +34,7 @@ public sealed class GitWorkspaceManager
                 await RunGitAsync(_workspacePath, ["clone", _bareRepoPath, "_init-temp"], ct);
                 await RunGitAsync(tempClone, ["config", "user.email", "copilothive@local"], ct);
                 await RunGitAsync(tempClone, ["config", "user.name", "CopilotHive"], ct);
+                await RunGitAsync(tempClone, ["config", "core.autocrlf", "input"], ct);
 
                 if (!string.IsNullOrEmpty(sourcePath) && Directory.Exists(sourcePath))
                 {
@@ -110,6 +111,8 @@ public sealed class GitWorkspaceManager
         // Configure git user so commits work in isolated clones
         await RunGitAsync(clonePath, ["config", "user.email", "copilothive@local"], ct);
         await RunGitAsync(clonePath, ["config", "user.name", "CopilotHive"], ct);
+        // Normalize line endings: workers run in Linux containers, so never commit CRLF
+        await RunGitAsync(clonePath, ["config", "core.autocrlf", "input"], ct);
 
         return clonePath;
     }
