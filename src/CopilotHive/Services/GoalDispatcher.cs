@@ -303,6 +303,12 @@ public sealed class GoalDispatcher : BackgroundService
             prompt: prompt,
             branchAction: branchAction);
 
+        // Non-coder roles reuse the coder's branch (all work on the same feature branch)
+        if (branchAction == BranchAction.Checkout && pipeline.CoderBranch is not null && task.BranchInfo is not null)
+        {
+            task.BranchInfo.FeatureBranch = pipeline.CoderBranch;
+        }
+
         pipeline.SetActiveTask(task.TaskId, task.BranchInfo?.FeatureBranch);
         _pipelineManager.RegisterTask(task.TaskId, pipeline.GoalId);
 

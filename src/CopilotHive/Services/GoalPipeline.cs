@@ -114,7 +114,9 @@ public sealed class GoalPipeline
         lock (_lock)
         {
             ActiveTaskId = taskId;
-            if (branch is not null)
+            // Only set CoderBranch on first assignment (the coder's branch).
+            // Subsequent phases reuse the same branch for merging.
+            if (branch is not null && CoderBranch is null)
                 CoderBranch = branch;
         }
     }
