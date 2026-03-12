@@ -63,7 +63,7 @@ public sealed class Orchestrator : IAsyncDisposable
                 if (_metricsTracker.HasRegressed(metrics))
                 {
                     Console.WriteLine("[Orchestrator] ⚠ REGRESSION DETECTED — rolling back AGENTS.md");
-                    foreach (var role in new[] { "coder", "tester", "orchestrator", "improver" })
+                    foreach (var role in new[] { "coder", "reviewer", "tester", "orchestrator", "improver" })
                         _agentsManager.RollbackAgentsMd(role);
                 }
             }
@@ -107,6 +107,71 @@ public sealed class Orchestrator : IAsyncDisposable
 
         await _gitManager.RepairRemoteAsync(coderClone, ct);
         await _gitManager.PushBranchAsync(coderClone, $"coder/{branchName}", ct);
+
+        // Phase 1.5: Code Review → Fix loop
+        for (var reviewRetry = 0; reviewRetry <= _config.MaxRetriesPerTask; reviewRetry++)
+        {
+            var reviewPhase = reviewRetry == 0
+                ? "Phase 1.5: Code Review"
+                : $"Phase 1.5: Review retry {reviewRetry}/{_config.MaxRetriesPerTask}";
+            Console.WriteLine($"[Orchestrator] {reviewPhase}");
+
+            var reviewClone = await _gitManager.CreateWorkerCloneAsync(
+                $"reviewer-{iteration}-{reviewRetry}", ct);
+            await _gitManager.PullBranchAsync(reviewClone, $"coder/{branchName}", ct);
+
+            var reviewResponse = await RunWorkerAsync(
+                WorkerRole.Reviewer, reviewClone, "reviewer",
+                $"""
+                You are reviewing code changes for this goal: {_config.Goal}
+
+                This is iteration {iteration}. The coder's work is on branch coder/{branchName}.
+                Review the diff against main and produce a REVIEW_REPORT block.
+                Do NOT modify any code. Do NOT run git push.
+                """, ct);
+            Console.WriteLine($"[Reviewer] {Truncate(reviewResponse, 300)}");
+
+            var reviewVerdict = ParseReviewReport(reviewResponse, metrics);
+
+            if (reviewVerdict.Equals("APPROVE", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine("[Orchestrator] ✅ Reviewer verdict: APPROVE");
+                break;
+            }
+
+            // Review requested changes — send feedback to coder
+            if (reviewRetry < _config.MaxRetriesPerTask)
+            {
+                var reviewIssues = metrics.ReviewIssues.Count > 0
+                    ? "Review issues:\n- " + string.Join("\n- ", metrics.ReviewIssues)
+                    : "See reviewer report for details.";
+
+                Console.WriteLine($"[Orchestrator] Reviewer verdict: {reviewVerdict} — sending feedback to coder");
+
+                await _gitManager.PullBranchAsync(coderClone, $"coder/{branchName}", ct);
+                var fixResponse = await RunWorkerAsync(
+                    WorkerRole.Coder, coderClone, "coder",
+                    $"""
+                    The code reviewer found issues with your code. Their verdict: {reviewVerdict}
+
+                    {reviewIssues}
+
+                    Reviewer's full report:
+                    {Truncate(reviewResponse, 2000)}
+
+                    Fix the issues and commit your changes.
+                    Do NOT run git push — the orchestrator handles that.
+                    """, ct);
+                Console.WriteLine($"[Coder:review-fix] {Truncate(fixResponse, 200)}");
+
+                await _gitManager.RepairRemoteAsync(coderClone, ct);
+                await _gitManager.PushBranchAsync(coderClone, $"coder/{branchName}", ct);
+            }
+            else
+            {
+                Console.WriteLine($"[Orchestrator] Reviewer still requesting changes after {reviewRetry} retries — proceeding to testing");
+            }
+        }
 
         // Phase 2: Test → Fix loop (up to MaxRetriesPerTask attempts)
         string testerResponse = "";
@@ -356,7 +421,7 @@ public sealed class Orchestrator : IAsyncDisposable
     {
         Console.WriteLine("[Orchestrator] Phase 4: Self-Improvement");
 
-        var rolesToImprove = new[] { "coder", "tester", "orchestrator", "improver" };
+        var rolesToImprove = new[] { "coder", "reviewer", "tester", "orchestrator", "improver" };
         var currentAgentsMd = new Dictionary<string, string>();
         foreach (var role in rolesToImprove)
         {
@@ -495,6 +560,54 @@ public sealed class Orchestrator : IAsyncDisposable
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Parses the reviewer's response to extract the review verdict and issues.
+    /// Returns the verdict string (APPROVE or REQUEST_CHANGES).
+    /// </summary>
+    internal static string ParseReviewReport(string response, IterationMetrics metrics)
+    {
+        var inReport = false;
+        var inIssues = false;
+        var verdict = "";
+
+        foreach (var line in response.Split('\n'))
+        {
+            var trimmed = line.Trim();
+
+            if (trimmed.StartsWith("REVIEW_REPORT", StringComparison.OrdinalIgnoreCase))
+            {
+                inReport = true;
+                inIssues = false;
+                continue;
+            }
+
+            if (!inReport) continue;
+
+            if (inIssues && trimmed.StartsWith("- "))
+            {
+                metrics.ReviewIssues.Add(trimmed[2..].Trim());
+                continue;
+            }
+
+            if (inIssues && !trimmed.StartsWith("- "))
+                inIssues = false;
+
+            if (TryParseField(trimmed, "verdict:", out var verdictVal))
+                verdict = verdictVal;
+            else if (TryParseField(trimmed, "issues_count:", out var countVal)
+                     && int.TryParse(countVal, out var count))
+                metrics.ReviewIssuesFound = count;
+            else if (TryParseField(trimmed, "critical_issues:", out var critVal)
+                     && int.TryParse(critVal, out var crit))
+                metrics.ReviewIssuesFound = Math.Max(metrics.ReviewIssuesFound, crit);
+            else if (trimmed.StartsWith("issues:", StringComparison.OrdinalIgnoreCase))
+                inIssues = true;
+        }
+
+        metrics.ReviewVerdict = verdict;
+        return verdict;
     }
 
     internal static void ParseTestReport(string response, IterationMetrics metrics)

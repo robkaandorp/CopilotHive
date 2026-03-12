@@ -18,6 +18,7 @@ public class OrchestratorIntegrationTests : IDisposable
         Directory.CreateDirectory(agentsDir);
         File.WriteAllText(Path.Combine(agentsDir, "coder.agents.md"), "# Coder\nYou write code.");
         File.WriteAllText(Path.Combine(agentsDir, "tester.agents.md"), "# Tester\nYou test code.");
+        File.WriteAllText(Path.Combine(agentsDir, "reviewer.agents.md"), "# Reviewer\nYou review code.");
     }
 
     private HiveConfiguration CreateConfig(int maxIterations = 1, int maxRetries = 0) => new()
@@ -31,6 +32,29 @@ public class OrchestratorIntegrationTests : IDisposable
         GitHubToken = "fake-token",
     };
 
+    private const string ApproveReview = """
+        REVIEW_REPORT:
+        verdict: APPROVE
+        issues_count: 0
+        critical_issues: 0
+        summary: Code looks good.
+        issues:
+        """;
+
+    private const string PassingTestReport = """
+        TEST_REPORT:
+        build_success: true
+        unit_tests_total: 5
+        unit_tests_passed: 5
+        integration_tests_total: 1
+        integration_tests_passed: 1
+        runtime_verified: true
+        coverage_percent: 85
+        verdict: PASS
+        summary: All tests pass.
+        issues:
+        """;
+
     [Fact]
     public async Task FullIteration_CoderThenTester_SpawnsCorrectRoles()
     {
@@ -39,30 +63,17 @@ public class OrchestratorIntegrationTests : IDisposable
         {
             if (prompt.Contains("You are working on this goal"))
                 return "I wrote the code and unit tests. All committed.";
-
-            return """
-                Build succeeded. Tests run.
-
-                TEST_REPORT:
-                build_success: true
-                unit_tests_total: 5
-                unit_tests_passed: 5
-                integration_tests_total: 2
-                integration_tests_passed: 2
-                runtime_verified: true
-                coverage_percent: 85
-                verdict: PASS
-                summary: All tests pass, application starts correctly.
-                issues:
-                """;
+            if (prompt.Contains("reviewing code changes"))
+                return ApproveReview;
+            return PassingTestReport;
         });
 
         var config = CreateConfig();
         await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
         await orchestrator.RunAsync();
 
-        // Verify both coder and tester were spawned
         Assert.Contains(workerManager.SpawnHistory, s => s.Role == WorkerRole.Coder);
+        Assert.Contains(workerManager.SpawnHistory, s => s.Role == WorkerRole.Reviewer);
         Assert.Contains(workerManager.SpawnHistory, s => s.Role == WorkerRole.Tester);
     }
 
@@ -74,46 +85,36 @@ public class OrchestratorIntegrationTests : IDisposable
         {
             if (prompt.Contains("You are working on this goal"))
                 return "Code written and committed.";
-
-            return """
-                TEST_REPORT:
-                build_success: true
-                unit_tests_total: 3
-                unit_tests_passed: 3
-                integration_tests_total: 1
-                integration_tests_passed: 1
-                runtime_verified: true
-                coverage_percent: 90
-                verdict: PASS
-                summary: Everything passes.
-                issues:
-                """;
+            if (prompt.Contains("reviewing code changes"))
+                return ApproveReview;
+            return PassingTestReport;
         });
 
         var config = CreateConfig();
         await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
         await orchestrator.RunAsync();
 
-        // Coder(1) + Tester(1) + Post-merge verifier(1) = 3 worker spawns
-        Assert.Equal(3, workerManager.SpawnHistory.Count);
+        // Coder(1) + Reviewer(1) + Tester(1) + Post-merge verifier(1) = 4 worker spawns
+        Assert.Equal(4, workerManager.SpawnHistory.Count);
     }
 
     [Fact]
     public async Task FailingTests_TriggersRetryLoop()
     {
-        var callCount = 0;
+        var testCallCount = 0;
         var workerManager = new FakeWorkerManager();
         var clientFactory = new FakeCopilotClientFactory(prompt =>
         {
             if (prompt.Contains("You are working on this goal"))
                 return "Code written.";
-
-            if (prompt.Contains("tester found issues"))
+            if (prompt.Contains("reviewing code changes"))
+                return ApproveReview;
+            if (prompt.Contains("tester found issues") || prompt.Contains("reviewer found issues"))
                 return "Fixed the bugs.";
 
-            callCount++;
+            testCallCount++;
             // First test run fails, second passes
-            if (callCount <= 1)
+            if (testCallCount <= 1)
                 return """
                     TEST_REPORT:
                     build_success: true
@@ -130,46 +131,27 @@ public class OrchestratorIntegrationTests : IDisposable
                     - Missing error handling in FileReader
                     """;
 
-            return """
-                TEST_REPORT:
-                build_success: true
-                unit_tests_total: 5
-                unit_tests_passed: 5
-                integration_tests_total: 1
-                integration_tests_passed: 1
-                runtime_verified: true
-                coverage_percent: 82
-                verdict: PASS
-                summary: All issues resolved.
-                issues:
-                """;
+            return PassingTestReport;
         });
 
         var config = CreateConfig(maxRetries: 2);
         await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
         await orchestrator.RunAsync();
 
-        // Should have: coder + tester(fail) + coder(fix) + tester(pass) + merge
-        Assert.True(workerManager.SpawnHistory.Count >= 4);
+        // Should have: coder + reviewer + tester(fail) + coder(fix) + tester(pass) + post-merge-verify
+        Assert.True(workerManager.SpawnHistory.Count >= 5);
     }
 
     [Fact]
     public async Task WorkersAreStoppedAfterUse()
     {
         var workerManager = new FakeWorkerManager();
-        var clientFactory = new FakeCopilotClientFactory(_ => """
-            TEST_REPORT:
-            build_success: true
-            unit_tests_total: 1
-            unit_tests_passed: 1
-            integration_tests_total: 0
-            integration_tests_passed: 0
-            runtime_verified: true
-            coverage_percent: 100
-            verdict: PASS
-            summary: Done.
-            issues:
-            """);
+        var clientFactory = new FakeCopilotClientFactory(prompt =>
+        {
+            if (prompt.Contains("reviewing code changes"))
+                return ApproveReview;
+            return PassingTestReport;
+        });
 
         var config = CreateConfig();
         await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
@@ -188,6 +170,8 @@ public class OrchestratorIntegrationTests : IDisposable
         {
             if (prompt.Contains("You are working on this goal"))
                 return "Code done.";
+            if (prompt.Contains("reviewing code changes"))
+                return ApproveReview;
 
             return """
                 Some preamble text here.
@@ -238,20 +222,9 @@ public class OrchestratorIntegrationTests : IDisposable
                 iterationCount++;
                 return $"Iteration {iterationCount} code.";
             }
-
-            return """
-                TEST_REPORT:
-                build_success: true
-                unit_tests_total: 3
-                unit_tests_passed: 3
-                integration_tests_total: 0
-                integration_tests_passed: 0
-                runtime_verified: true
-                coverage_percent: 90
-                verdict: PASS
-                summary: All good.
-                issues:
-                """;
+            if (prompt.Contains("reviewing code changes"))
+                return ApproveReview;
+            return PassingTestReport;
         });
 
         var config = CreateConfig(maxIterations: 5);
@@ -270,6 +243,8 @@ public class OrchestratorIntegrationTests : IDisposable
         {
             if (prompt.Contains("You are working on this goal"))
                 return "Done.";
+            if (prompt.Contains("reviewing code changes"))
+                return ApproveReview;
 
             // Old format without TEST_REPORT block
             return """
@@ -297,26 +272,19 @@ public class OrchestratorIntegrationTests : IDisposable
     [Fact]
     public async Task ClientFactory_CreatesClientPerWorker()
     {
-        var clientFactory = new FakeCopilotClientFactory(_ => """
-            TEST_REPORT:
-            build_success: true
-            unit_tests_total: 1
-            unit_tests_passed: 1
-            integration_tests_total: 0
-            integration_tests_passed: 0
-            runtime_verified: true
-            coverage_percent: 100
-            verdict: PASS
-            summary: Pass.
-            issues:
-            """);
+        var clientFactory = new FakeCopilotClientFactory(prompt =>
+        {
+            if (prompt.Contains("reviewing code changes"))
+                return ApproveReview;
+            return PassingTestReport;
+        });
 
         var config = CreateConfig();
         await using var orchestrator = new Orchestrator(config, new FakeWorkerManager(), clientFactory);
         await orchestrator.RunAsync();
 
-        // Each worker gets its own client (coder + tester + post-merge verifier = 3)
-        Assert.Equal(3, clientFactory.CreatedClients.Count);
+        // Each worker gets its own client (coder + reviewer + tester + post-merge verifier = 4)
+        Assert.Equal(4, clientFactory.CreatedClients.Count);
         Assert.All(clientFactory.CreatedClients, c => Assert.True(c.Connected));
         Assert.All(clientFactory.CreatedClients, c => Assert.True(c.Disposed));
     }
@@ -333,6 +301,10 @@ public class OrchestratorIntegrationTests : IDisposable
             // Phase 1: Coder writes code
             if (prompt.Contains("You are working on this goal"))
                 return "Code written and committed.";
+
+            // Phase 1.5: Reviewer approves
+            if (prompt.Contains("reviewing code changes"))
+                return ApproveReview;
 
             // Phase 2: Pre-merge tester passes
             if (prompt.Contains("You are testing code for this goal"))
@@ -403,6 +375,107 @@ public class OrchestratorIntegrationTests : IDisposable
 
         // Re-test was triggered
         Assert.Contains(prompts, p => p.Contains("re-testing code after a post-merge fix"));
+    }
+
+    [Fact]
+    public async Task ReviewRequestsChanges_SendsFeedbackToCoder()
+    {
+        var prompts = new List<string>();
+        var reviewCallCount = 0;
+        var workerManager = new FakeWorkerManager();
+        var clientFactory = new FakeCopilotClientFactory(prompt =>
+        {
+            prompts.Add(prompt);
+
+            if (prompt.Contains("You are working on this goal"))
+                return "Code written.";
+
+            if (prompt.Contains("reviewing code changes"))
+            {
+                reviewCallCount++;
+                // First review rejects, second approves
+                if (reviewCallCount <= 1)
+                    return """
+                        REVIEW_REPORT:
+                        verdict: REQUEST_CHANGES
+                        issues_count: 2
+                        critical_issues: 1
+                        summary: Found a null reference bug and missing validation.
+                        issues:
+                        - [CRITICAL] Null reference in ParseConfig when config file missing
+                        - [MAJOR] No input validation on user-supplied paths
+                        """;
+                return ApproveReview;
+            }
+
+            // Coder fixes review issues
+            if (prompt.Contains("reviewer found issues"))
+                return "Fixed the review issues.";
+
+            return PassingTestReport;
+        });
+
+        var config = CreateConfig(maxRetries: 1);
+        await using var orchestrator = new Orchestrator(config, workerManager, clientFactory);
+        await orchestrator.RunAsync();
+
+        // Coder received review feedback
+        Assert.Contains(prompts, p => p.Contains("reviewer found issues"));
+
+        // Reviewer was spawned at least twice (initial + re-review)
+        Assert.True(workerManager.SpawnHistory.Count(s => s.Role == WorkerRole.Reviewer) >= 2);
+    }
+
+    [Fact]
+    public void ParseReviewReport_ExtractsApproveVerdict()
+    {
+        var metrics = new CopilotHive.Metrics.IterationMetrics();
+        var verdict = Orchestrator.ParseReviewReport("""
+            Some analysis text...
+
+            REVIEW_REPORT:
+            verdict: APPROVE
+            issues_count: 0
+            critical_issues: 0
+            summary: Code looks good, well-structured.
+            issues:
+            """, metrics);
+
+        Assert.Equal("APPROVE", verdict);
+        Assert.Equal("APPROVE", metrics.ReviewVerdict);
+        Assert.Equal(0, metrics.ReviewIssuesFound);
+        Assert.Empty(metrics.ReviewIssues);
+    }
+
+    [Fact]
+    public void ParseReviewReport_ExtractsRequestChangesWithIssues()
+    {
+        var metrics = new CopilotHive.Metrics.IterationMetrics();
+        var verdict = Orchestrator.ParseReviewReport("""
+            REVIEW_REPORT:
+            verdict: REQUEST_CHANGES
+            issues_count: 3
+            critical_issues: 1
+            summary: Several issues found.
+            issues:
+            - [CRITICAL] SQL injection vulnerability
+            - [MAJOR] Missing error handling
+            - [MINOR] Inconsistent naming
+            """, metrics);
+
+        Assert.Equal("REQUEST_CHANGES", verdict);
+        Assert.Equal(3, metrics.ReviewIssuesFound);
+        Assert.Equal(3, metrics.ReviewIssues.Count);
+        Assert.Contains(metrics.ReviewIssues, i => i.Contains("SQL injection"));
+    }
+
+    [Fact]
+    public void ParseReviewReport_EmptyResponse_ReturnsEmptyVerdict()
+    {
+        var metrics = new CopilotHive.Metrics.IterationMetrics();
+        var verdict = Orchestrator.ParseReviewReport("No review report here.", metrics);
+
+        Assert.Equal("", verdict);
     }
 
     public void Dispose()

@@ -31,6 +31,8 @@ public sealed class IterationMetrics
     public List<string> Issues { get; set; } = [];
 
     public int ReviewIssuesFound { get; set; }
+    public List<string> ReviewIssues { get; set; } = [];
+    public string ReviewVerdict { get; set; } = "";
     public int RetryCount { get; set; }
     public Dictionary<string, string> AgentsMdVersions { get; set; } = [];
     public Dictionary<string, object> Custom { get; set; } = [];
