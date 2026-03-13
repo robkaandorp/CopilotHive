@@ -17,6 +17,7 @@ namespace CopilotHive.Services;
 public sealed class GoalDispatcher : BackgroundService
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan AgentsSyncInterval = TimeSpan.FromSeconds(60);
 
     private readonly GoalManager _goalManager;
     private readonly GoalPipelineManager _pipelineManager;
@@ -26,12 +27,14 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly ImprovementAnalyzer? _improvementAnalyzer;
     private readonly AgentsManager? _agentsManager;
     private readonly MetricsTracker? _metricsTracker;
+    private readonly ConfigRepoManager? _configRepo;
     private readonly ILogger<GoalDispatcher> _logger;
     private readonly HiveConfigFile? _config;
 
     private readonly BranchCoordinator _branchCoordinator = new();
     private readonly TaskBuilder _taskBuilder = new(new BranchCoordinator());
     private readonly ConcurrentDictionary<string, bool> _dispatchedGoals = new();
+    private DateTime _lastAgentsSync = DateTime.MinValue;
 
     public GoalDispatcher(
         GoalManager goalManager,
@@ -44,7 +47,8 @@ public sealed class GoalDispatcher : BackgroundService
         HiveConfigFile? config = null,
         MetricsTracker? metricsTracker = null,
         AgentsManager? agentsManager = null,
-        ImprovementAnalyzer? improvementAnalyzer = null)
+        ImprovementAnalyzer? improvementAnalyzer = null,
+        ConfigRepoManager? configRepo = null)
     {
         _goalManager = goalManager;
         _pipelineManager = pipelineManager;
@@ -56,6 +60,7 @@ public sealed class GoalDispatcher : BackgroundService
         _metricsTracker = metricsTracker;
         _logger = logger;
         _config = config;
+        _configRepo = configRepo;
 
         completionNotifier.OnTaskCompleted += complete => HandleTaskCompletionAsync(complete);
     }
@@ -68,6 +73,9 @@ public sealed class GoalDispatcher : BackgroundService
         // Restore any in-flight pipelines from the persistence store
         await RestoreActivePipelinesAsync(stoppingToken);
 
+        // Sync agents from config repo at startup
+        await SyncAgentsFromConfigRepoAsync(stoppingToken);
+
         // Give workers time to connect before dispatching
         await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
 
@@ -75,6 +83,11 @@ public sealed class GoalDispatcher : BackgroundService
         {
             try
             {
+                if (DateTime.UtcNow - _lastAgentsSync > AgentsSyncInterval)
+                {
+                    await SyncAgentsFromConfigRepoAsync(stoppingToken);
+                }
+
                 await DispatchNextGoalAsync(stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -607,6 +620,39 @@ public sealed class GoalDispatcher : BackgroundService
                 _logger.LogWarning(ex, "Failed to send AGENTS.md update to worker {WorkerId}", worker.Id);
             }
         }
+    }
+
+    /// <summary>
+    /// Pulls the latest config repo and broadcasts any AGENTS.md changes to connected workers.
+    /// Best-effort: failures are logged but do not block the main dispatch loop.
+    /// </summary>
+    private async Task SyncAgentsFromConfigRepoAsync(CancellationToken ct)
+    {
+        if (_configRepo is null || _agentsManager is null) return;
+
+        try
+        {
+            await _configRepo.SyncRepoAsync(ct);
+
+            foreach (var role in new[] { "coder", "tester", "reviewer", "improver", "orchestrator" })
+            {
+                var repoContent = await _configRepo.LoadAgentsMdAsync(role, ct);
+                if (string.IsNullOrEmpty(repoContent)) continue;
+
+                var currentContent = _agentsManager.GetAgentsMd(role);
+                if (repoContent == currentContent) continue;
+
+                _agentsManager.UpdateAgentsMd(role, repoContent);
+                await BroadcastAgentsUpdateAsync(role, repoContent, ct);
+                _logger.LogInformation("Synced {Role} AGENTS.md from config repo (changed)", role);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to sync agents from config repo");
+        }
+
+        _lastAgentsSync = DateTime.UtcNow;
     }
 
     /// <summary>
