@@ -713,7 +713,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         foreach (var (goalId, session) in _sessions)
         {
             try { await session.DisposeAsync(); }
-            catch { /* best-effort cleanup */ }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to dispose Copilot session for goal {GoalId}", goalId); }
         }
         _sessions.Clear();
 

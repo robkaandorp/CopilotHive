@@ -398,7 +398,7 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
         if (_worker is not null)
         {
             try { await _workerManager.StopWorkerAsync(_worker.Id); }
-            catch { /* Container may already be stopped */ }
+            catch (Exception ex) { Console.WriteLine($"[Brain] Failed to stop orchestrator worker: {ex.Message}"); }
             _worker = null;
         }
     }

@@ -131,7 +131,7 @@ public static class ProtocolJson
         {
             return JsonSerializer.Deserialize<T>(response.Trim(), Options);
         }
-        catch { }
+        catch (JsonException ex) { Console.WriteLine($"[Protocol] Direct JSON parse failed, trying extraction: {ex.Message}"); }
 
         // Try extracting from markdown code block
         var jsonStart = response.IndexOf('{');
@@ -143,7 +143,7 @@ public static class ProtocolJson
                 var json = response[jsonStart..(jsonEnd + 1)];
                 return JsonSerializer.Deserialize<T>(json, Options);
             }
-            catch { }
+            catch (JsonException ex) { Console.WriteLine($"[Protocol] Extracted JSON parse failed: {ex.Message}"); }
         }
 
         return null;

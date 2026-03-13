@@ -96,11 +96,7 @@ public sealed class PipelineStore : IAsyncDisposable
                 SaveConversationCore(pipeline, tx);
                 tx.Commit();
             }
-            catch
-            {
-                tx.Rollback();
-                throw;
-            }
+            catch (Exception ex) { _logger.LogError(ex, "Failed to save pipeline for goal {GoalId}", pipeline.GoalId); tx.Rollback(); throw; }
         }
     }
 
@@ -115,11 +111,7 @@ public sealed class PipelineStore : IAsyncDisposable
                 UpsertPipelineCore(pipeline, tx);
                 tx.Commit();
             }
-            catch
-            {
-                tx.Rollback();
-                throw;
-            }
+            catch (Exception ex) { _logger.LogError(ex, "Failed to save pipeline state for goal {GoalId}", pipeline.GoalId); tx.Rollback(); throw; }
         }
     }
 
@@ -166,11 +158,7 @@ public sealed class PipelineStore : IAsyncDisposable
                 Execute("DELETE FROM pipelines WHERE goal_id = @id", tx, ("@id", goalId));
                 tx.Commit();
             }
-            catch
-            {
-                tx.Rollback();
-                throw;
-            }
+            catch (Exception ex) { _logger.LogError(ex, "Failed to remove pipeline for goal {GoalId}", goalId); tx.Rollback(); throw; }
         }
     }
 
