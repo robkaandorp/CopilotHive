@@ -14,6 +14,10 @@ public sealed class GoalPipelineManager
     private readonly ConcurrentDictionary<string, string> _taskToGoal = new();
     private readonly PipelineStore? _store;
 
+    /// <summary>
+    /// Initialises a new <see cref="GoalPipelineManager"/>.
+    /// </summary>
+    /// <param name="store">Optional persistence store; when provided, pipeline state is saved to SQLite.</param>
     public GoalPipelineManager(PipelineStore? store = null)
     {
         _store = store;

@@ -11,13 +11,21 @@ namespace CopilotHive.Services;
 /// </summary>
 public enum GoalPhase
 {
+    /// <summary>Initial phase: the brain is planning the iteration.</summary>
     Planning,
+    /// <summary>The coder worker is implementing the goal.</summary>
     Coding,
+    /// <summary>The reviewer worker is reviewing the coder's changes.</summary>
     Review,
+    /// <summary>The tester worker is running and writing tests.</summary>
     Testing,
+    /// <summary>The improver worker is improving AGENTS.md files.</summary>
     Improve,
+    /// <summary>The feature branch is being merged to main.</summary>
     Merging,
+    /// <summary>The goal has been completed successfully.</summary>
     Done,
+    /// <summary>The goal has failed and will not be retried.</summary>
     Failed,
 }
 
@@ -75,14 +83,22 @@ public sealed class GoalPipeline
 {
     private readonly object _lock = new();
 
+    /// <summary>Unique identifier of the goal this pipeline is tracking.</summary>
     public string GoalId { get; }
+    /// <summary>Human-readable description of the goal.</summary>
     public string Description { get; }
+    /// <summary>The goal this pipeline is working toward.</summary>
     public Goal Goal { get; }
 
+    /// <summary>Current phase the pipeline is executing.</summary>
     public GoalPhase Phase { get; private set; } = GoalPhase.Planning;
+    /// <summary>One-based iteration counter; increments each time the pipeline loops.</summary>
     public int Iteration { get; private set; } = 1;
+    /// <summary>Number of times the review phase has been retried in the current iteration.</summary>
     public int ReviewRetries { get; private set; }
+    /// <summary>Number of times the test phase has been retried in the current iteration.</summary>
     public int TestRetries { get; private set; }
+    /// <summary>Maximum number of task-level retries allowed.</summary>
     public int MaxRetries { get; init; } = 3;
 
     /// <summary>Brain-determined plan for the current iteration, or null if no plan set.</summary>
@@ -103,9 +119,16 @@ public sealed class GoalPipeline
     /// <summary>Per-goal conversation history for the Brain.</summary>
     public List<ConversationEntry> Conversation { get; } = [];
 
+    /// <summary>UTC timestamp when this pipeline was created.</summary>
     public DateTime CreatedAt { get; private init; } = DateTime.UtcNow;
+    /// <summary>UTC timestamp when this pipeline completed (Done or Failed), or <c>null</c> if still active.</summary>
     public DateTime? CompletedAt { get; private set; }
 
+    /// <summary>
+    /// Creates a new pipeline for the specified goal.
+    /// </summary>
+    /// <param name="goal">The goal to track.</param>
+    /// <param name="maxRetries">Maximum task-level retries allowed.</param>
     public GoalPipeline(Goal goal, int maxRetries = 3)
     {
         Goal = goal;

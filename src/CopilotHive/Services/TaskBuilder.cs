@@ -4,11 +4,22 @@ using CopilotHive.Shared.Grpc;
 
 namespace CopilotHive.Services;
 
+/// <summary>
+/// Constructs <see cref="TaskAssignment"/> proto messages from goal and branch information.
+/// </summary>
 public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
 {
     /// <summary>
     /// Builds a <see cref="TaskAssignment"/> proto message for a multi-repo goal.
     /// </summary>
+    /// <param name="goalId">Unique identifier of the goal.</param>
+    /// <param name="goalDescription">Human-readable description of the goal.</param>
+    /// <param name="role">Worker role that will execute the task.</param>
+    /// <param name="iteration">Current iteration number.</param>
+    /// <param name="repositories">Repositories the worker should operate on.</param>
+    /// <param name="prompt">The prompt to send to the worker.</param>
+    /// <param name="branchAction">Git branch action to perform (create, checkout, etc.).</param>
+    /// <returns>A fully constructed <see cref="TaskAssignment"/>.</returns>
     public TaskAssignment Build(
         string goalId,
         string goalDescription,

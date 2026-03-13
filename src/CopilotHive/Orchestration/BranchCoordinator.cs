@@ -3,6 +3,9 @@ using CopilotHive.Shared.Grpc;
 
 namespace CopilotHive.Orchestration;
 
+/// <summary>
+/// Generates consistent feature branch names and tracks which branches have been created per goal.
+/// </summary>
 public sealed class BranchCoordinator
 {
     private readonly ConcurrentDictionary<string, List<(string Repo, string Branch)>> _branchesByGoal = new();

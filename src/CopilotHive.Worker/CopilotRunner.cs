@@ -13,9 +13,15 @@ public sealed class CopilotRunner : IAsyncDisposable
     private readonly int _port;
     private CustomAgentConfig? _customAgent;
 
+    /// <summary>Maximum number of connection attempts before giving up.</summary>
     public int MaxConnectRetries { get; init; } = 12;
+    /// <summary>Delay between consecutive connection attempts.</summary>
     public TimeSpan RetryDelay { get; init; } = TimeSpan.FromSeconds(5);
 
+    /// <summary>
+    /// Initialises a new <see cref="CopilotRunner"/> connecting on the given <paramref name="port"/>.
+    /// </summary>
+    /// <param name="port">The TCP port the Copilot CLI headless server is listening on.</param>
     public CopilotRunner(int port = 8000)
     {
         _port = port;
@@ -50,6 +56,10 @@ public sealed class CopilotRunner : IAsyncDisposable
         CustomAgents = _customAgent is not null ? [_customAgent] : [],
     };
 
+    /// <summary>
+    /// Connects to the Copilot CLI, retrying up to <see cref="MaxConnectRetries"/> times.
+    /// </summary>
+    /// <param name="ct">Cancellation token.</param>
     public async Task ConnectAsync(CancellationToken ct = default)
     {
         await _client.StartAsync();
@@ -130,6 +140,7 @@ public sealed class CopilotRunner : IAsyncDisposable
         return result;
     }
 
+    /// <summary>Disposes the active Copilot session and stops the underlying client.</summary>
     public async ValueTask DisposeAsync()
     {
         if (_session is not null)
@@ -139,4 +150,5 @@ public sealed class CopilotRunner : IAsyncDisposable
     }
 }
 
+/// <summary>Represents an error raised by <see cref="CopilotRunner"/>.</summary>
 public sealed class CopilotRunnerException(string message) : Exception(message);

@@ -3,25 +3,44 @@ using YamlDotNet.Serialization.NamingConventions;
 
 namespace CopilotHive.Goals;
 
+/// <summary>
+/// Goal source that reads and persists goals from a YAML file on disk.
+/// </summary>
 public sealed class FileGoalSource : IGoalSource
 {
     private readonly string _filePath;
     private readonly SemaphoreSlim _lock = new(1, 1);
 
+    /// <summary>
+    /// Initialises a new <see cref="FileGoalSource"/> backed by the specified YAML file.
+    /// </summary>
+    /// <param name="filePath">Path to the YAML goals file.</param>
     public FileGoalSource(string filePath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
         _filePath = filePath;
     }
 
+    /// <summary>Unique name identifying this goal source.</summary>
     public string Name => "file";
 
+    /// <summary>
+    /// Reads the YAML file and returns all goals with <see cref="GoalStatus.Pending"/> status.
+    /// </summary>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>Read-only list of pending goals.</returns>
     public async Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default)
     {
         var goals = await ReadGoalsAsync(ct);
         return goals.Where(g => g.Status == GoalStatus.Pending).ToList().AsReadOnly();
     }
 
+    /// <summary>
+    /// Updates the status of a goal in the backing YAML file. Thread-safe.
+    /// </summary>
+    /// <param name="goalId">Identifier of the goal to update.</param>
+    /// <param name="status">New status to apply.</param>
+    /// <param name="ct">Cancellation token.</param>
     public async Task UpdateGoalStatusAsync(string goalId, GoalStatus status, CancellationToken ct = default)
     {
         await _lock.WaitAsync(ct);

@@ -306,4 +306,6 @@ static void PrintBanner()
         """);
 }
 
+/// <summary>Request body for updating the status of a goal via the HTTP API.</summary>
+/// <param name="Status">New status string (e.g. "completed", "failed").</param>
 record GoalStatusUpdate(string Status);

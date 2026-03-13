@@ -12,9 +12,16 @@ public sealed class CopilotWorkerClient : ICopilotWorkerClient
     private CopilotSession? _session;
     private readonly int _port;
 
+    /// <summary>Maximum number of connection attempts before throwing.</summary>
     public int MaxConnectRetries { get; init; } = 12;
+    /// <summary>Delay between consecutive connection attempts.</summary>
     public TimeSpan RetryDelay { get; init; } = TimeSpan.FromSeconds(5);
 
+    /// <summary>
+    /// Initialises a new <see cref="CopilotWorkerClient"/> that connects to the given port.
+    /// </summary>
+    /// <param name="port">TCP port of the worker's Copilot CLI.</param>
+    /// <param name="gitHubToken">Optional GitHub token (unused; the headless server manages its own auth).</param>
     public CopilotWorkerClient(int port, string? gitHubToken = null)
     {
         _port = port;
@@ -26,6 +33,10 @@ public sealed class CopilotWorkerClient : ICopilotWorkerClient
         });
     }
 
+    /// <summary>
+    /// Connects to the worker's Copilot CLI, retrying up to <see cref="MaxConnectRetries"/> times.
+    /// </summary>
+    /// <param name="ct">Cancellation token.</param>
     public async Task ConnectAsync(CancellationToken ct = default)
     {
         // Wait for the container to boot before first connection attempt
@@ -91,6 +102,7 @@ public sealed class CopilotWorkerClient : ICopilotWorkerClient
         return await done.Task;
     }
 
+    /// <summary>Disposes the active Copilot session and stops the underlying client.</summary>
     public async ValueTask DisposeAsync()
     {
         if (_session is not null)
@@ -100,4 +112,5 @@ public sealed class CopilotWorkerClient : ICopilotWorkerClient
     }
 }
 
+/// <summary>Represents an error raised by <see cref="CopilotWorkerClient"/>.</summary>
 public sealed class CopilotWorkerException(string message) : Exception(message);

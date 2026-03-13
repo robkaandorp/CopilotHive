@@ -12,6 +12,13 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner)
 {
     private const string WorkRoot = "/copilot-home";
 
+    /// <summary>
+    /// Executes the full lifecycle of a task assignment: cloning repos, branching,
+    /// running Copilot, collecting results, and pushing changes.
+    /// </summary>
+    /// <param name="assignment">The task assignment containing prompt, repos, and branch info.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>A <see cref="TaskComplete"/> with status, output, and git metrics.</returns>
     public async Task<TaskComplete> ExecuteAsync(TaskAssignment assignment, CancellationToken ct)
     {
         var stopwatch = Stopwatch.StartNew();

@@ -3,11 +3,19 @@ using CopilotHive.Shared.Grpc;
 
 namespace CopilotHive.Services;
 
+/// <summary>
+/// Thread-safe queue of pending and active task assignments.
+/// Supports role-based dequeue so workers only receive tasks matching their role.
+/// </summary>
 public sealed class TaskQueue
 {
     private readonly ConcurrentQueue<TaskAssignment> _pending = new();
     private readonly ConcurrentDictionary<string, TaskAssignment> _active = new();
 
+    /// <summary>
+    /// Adds a task to the pending queue.
+    /// </summary>
+    /// <param name="task">The task assignment to enqueue.</param>
     public void Enqueue(TaskAssignment task) => _pending.Enqueue(task);
 
     /// <summary>
@@ -40,14 +48,28 @@ public sealed class TaskQueue
         return null;
     }
 
+    /// <summary>
+    /// Records that a task is now being handled by the specified worker.
+    /// </summary>
+    /// <param name="taskId">Identifier of the task to mark as active.</param>
+    /// <param name="workerId">Identifier of the worker that accepted the task.</param>
     public void MarkActive(string taskId, string workerId)
     {
         if (_active.TryGetValue(taskId, out var task))
             task.Metadata["assigned_worker"] = workerId;
     }
 
+    /// <summary>
+    /// Removes a task from the active dictionary when it has been completed.
+    /// </summary>
+    /// <param name="taskId">Identifier of the task to remove.</param>
     public void MarkComplete(string taskId) => _active.TryRemove(taskId, out _);
 
+    /// <summary>
+    /// Looks up a currently active task by its identifier.
+    /// </summary>
+    /// <param name="taskId">Identifier of the task to retrieve.</param>
+    /// <returns>The active task, or <c>null</c> if not found.</returns>
     public TaskAssignment? GetActiveTask(string taskId) =>
         _active.GetValueOrDefault(taskId);
 

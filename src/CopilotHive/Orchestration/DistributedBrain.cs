@@ -49,6 +49,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Kind = PermissionRequestResultKind.DeniedByRules,
         });
 
+    /// <summary>
+    /// Initialises a new <see cref="DistributedBrain"/> that connects to the Copilot CLI on the given port.
+    /// </summary>
+    /// <param name="port">TCP port the Copilot CLI is listening on.</param>
+    /// <param name="logger">Logger instance.</param>
+    /// <param name="metricsTracker">Optional tracker used to include historical metrics in prompts.</param>
+    /// <param name="agentsManager">Optional manager used to load the orchestrator's AGENTS.md.</param>
     public DistributedBrain(int port, ILogger<DistributedBrain> logger,
         MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null)
     {
@@ -70,6 +77,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         };
     }
 
+    /// <summary>
+    /// Connects to the Copilot CLI, retrying up to 20 times with a 5-second backoff.
+    /// </summary>
+    /// <param name="ct">Cancellation token.</param>
     public async Task ConnectAsync(CancellationToken ct = default)
     {
         _copilotClient = new CopilotClient(new CopilotClientOptions
@@ -208,6 +219,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             pipeline.GoalId, entries.Count);
     }
 
+    /// <summary>
+    /// Asks the Brain to plan the best approach for executing the given goal pipeline.
+    /// </summary>
+    /// <param name="pipeline">Current goal pipeline state.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>An <see cref="OrchestratorDecision"/> containing the recommended first action.</returns>
     public async Task<OrchestratorDecision> PlanGoalAsync(GoalPipeline pipeline, CancellationToken ct = default)
     {
         var metricsContext = pipeline.Iteration > 1
@@ -253,6 +270,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         };
     }
 
+    /// <summary>
+    /// Asks the Brain to plan which phases should run during the current iteration.
+    /// </summary>
+    /// <param name="pipeline">Current goal pipeline state.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>An <see cref="IterationPlan"/> with the ordered list of phases to execute.</returns>
     public async Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default)
     {
         var metricsContext = pipeline.Iteration > 1
@@ -382,6 +405,14 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         public string? Reason { get; init; }
     }
 
+    /// <summary>
+    /// Asks the Brain to craft a prompt for the specified worker role.
+    /// </summary>
+    /// <param name="pipeline">Current goal pipeline state.</param>
+    /// <param name="workerRole">Role of the worker the prompt will be sent to.</param>
+    /// <param name="additionalContext">Optional extra context to include in the prompt.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The crafted prompt string.</returns>
     public async Task<string> CraftPromptAsync(
         GoalPipeline pipeline, string workerRole, string? additionalContext, CancellationToken ct = default)
     {
@@ -414,6 +445,14 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         return decision?.Prompt ?? GetFallbackPrompt(workerRole, pipeline);
     }
 
+    /// <summary>
+    /// Asks the Brain to interpret the output of a worker and return a verdict.
+    /// </summary>
+    /// <param name="pipeline">Current goal pipeline state.</param>
+    /// <param name="workerRole">Role of the worker that produced the output.</param>
+    /// <param name="workerOutput">Raw text output from the worker.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>An <see cref="OrchestratorDecision"/> with the extracted verdict and metrics.</returns>
     public async Task<OrchestratorDecision> InterpretOutputAsync(
         GoalPipeline pipeline, string workerRole, string workerOutput, CancellationToken ct = default)
     {
@@ -472,6 +511,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             };
     }
 
+    /// <summary>
+    /// Asks the Brain what the next step should be given the current pipeline phase and context.
+    /// </summary>
+    /// <param name="pipeline">Current goal pipeline state.</param>
+    /// <param name="context">Textual context describing the current situation.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>An <see cref="OrchestratorDecision"/> with the recommended next action.</returns>
     public async Task<OrchestratorDecision> DecideNextStepAsync(
         GoalPipeline pipeline, string context, CancellationToken ct = default)
     {
@@ -498,6 +544,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             };
     }
 
+    /// <summary>
+    /// Informs the Brain of something that happened so it can maintain conversation context.
+    /// </summary>
+    /// <param name="pipeline">Current goal pipeline state.</param>
+    /// <param name="information">Human-readable status update to pass to the Brain.</param>
+    /// <param name="ct">Cancellation token.</param>
     public async Task InformAsync(GoalPipeline pipeline, string information, CancellationToken ct = default)
     {
         var session = await GetOrCreateSessionAsync(pipeline, ct);
@@ -647,6 +699,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     internal static string Truncate(string text, int maxLength) =>
         text.Length <= maxLength ? text : text[..maxLength] + "...";
 
+    /// <summary>Disposes all active Copilot sessions and stops the underlying client.</summary>
     public async ValueTask DisposeAsync()
     {
         // Dispose all goal sessions

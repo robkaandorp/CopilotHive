@@ -2,17 +2,25 @@ using System.Diagnostics;
 
 namespace CopilotHive.Git;
 
+/// <summary>
+/// Manages a bare git repository and per-worker shallow clones inside a shared workspace directory.
+/// </summary>
 public sealed class GitWorkspaceManager
 {
     private readonly string _workspacePath;
     private readonly string _bareRepoPath;
 
+    /// <summary>
+    /// Initialises a new <see cref="GitWorkspaceManager"/> for the given workspace root.
+    /// </summary>
+    /// <param name="workspacePath">Root directory under which all repos and clones are created.</param>
     public GitWorkspaceManager(string workspacePath)
     {
         _workspacePath = Path.GetFullPath(workspacePath);
         _bareRepoPath = Path.Combine(_workspacePath, "origin");
     }
 
+    /// <summary>Absolute path to the bare repository that acts as the shared origin.</summary>
     public string BareRepoPath => _bareRepoPath;
 
     /// <summary>
@@ -102,6 +110,13 @@ public sealed class GitWorkspaceManager
         return false;
     }
 
+    /// <summary>
+    /// Creates an isolated clone of the bare repo for the specified worker.
+    /// Deletes any pre-existing clone at the same path first.
+    /// </summary>
+    /// <param name="workerName">Unique name used to derive the clone directory path.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>Absolute path to the newly created clone.</returns>
     public async Task<string> CreateWorkerCloneAsync(string workerName, CancellationToken ct = default)
     {
         var clonePath = Path.Combine(_workspacePath, workerName);
@@ -120,6 +135,12 @@ public sealed class GitWorkspaceManager
         return clonePath;
     }
 
+    /// <summary>
+    /// Creates and checks out a new branch in the specified clone.
+    /// </summary>
+    /// <param name="clonePath">Path to the worker's local clone.</param>
+    /// <param name="branchName">Name of the new branch to create.</param>
+    /// <param name="ct">Cancellation token.</param>
     public async Task CreateBranchAsync(string clonePath, string branchName, CancellationToken ct = default)
     {
         await RunGitAsync(clonePath, ["checkout", "-b", branchName], ct);
@@ -135,11 +156,23 @@ public sealed class GitWorkspaceManager
         await RunGitAsync(clonePath, ["remote", "set-url", "origin", _bareRepoPath], ct);
     }
 
+    /// <summary>
+    /// Force-pushes the specified branch from the clone to the bare repo origin.
+    /// </summary>
+    /// <param name="clonePath">Path to the worker's local clone.</param>
+    /// <param name="branchName">Name of the branch to push.</param>
+    /// <param name="ct">Cancellation token.</param>
     public async Task PushBranchAsync(string clonePath, string branchName, CancellationToken ct = default)
     {
         await RunGitAsync(clonePath, ["push", "origin", branchName, "--force"], ct);
     }
 
+    /// <summary>
+    /// Pulls the latest commits for the specified branch from origin into the clone.
+    /// </summary>
+    /// <param name="clonePath">Path to the worker's local clone.</param>
+    /// <param name="branchName">Name of the branch to pull.</param>
+    /// <param name="ct">Cancellation token.</param>
     public async Task PullBranchAsync(string clonePath, string branchName, CancellationToken ct = default)
     {
         await RunGitAsync(clonePath, ["fetch", "origin"], ct);
@@ -147,6 +180,17 @@ public sealed class GitWorkspaceManager
         await RunGitAsync(clonePath, ["pull", "origin", branchName], ct);
     }
 
+    /// <summary>
+    /// Merges the specified branch into main and pushes the result to origin.
+    /// Aborts the merge automatically if a conflict occurs.
+    /// </summary>
+    /// <param name="clonePath">Path to the worker's local clone.</param>
+    /// <param name="branchName">Name of the feature branch to merge.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>
+    /// A tuple where <c>Success</c> indicates whether the merge succeeded
+    /// and <c>Output</c> contains the git output or conflict details.
+    /// </returns>
     public async Task<(bool Success, string Output)> MergeToMainAsync(
         string clonePath,
         string branchName,
@@ -168,6 +212,13 @@ public sealed class GitWorkspaceManager
         }
     }
 
+    /// <summary>
+    /// Returns the diff between the current HEAD of the clone and the specified base branch.
+    /// </summary>
+    /// <param name="clonePath">Path to the worker's local clone.</param>
+    /// <param name="baseBranch">Branch to diff against (defaults to "main").</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The unified diff as a string.</returns>
     public async Task<string> GetDiffAsync(string clonePath, string baseBranch = "main", CancellationToken ct = default)
     {
         return await RunGitAsync(clonePath, ["diff", baseBranch], ct);
@@ -248,9 +299,12 @@ public sealed class GitWorkspaceManager
     }
 }
 
+/// <summary>Exception thrown when a git command exits with a non-zero exit code.</summary>
 public sealed class GitException(int exitCode, string output)
     : Exception($"git exited with code {exitCode}: {output}")
 {
+    /// <summary>The exit code returned by the git process.</summary>
     public int ExitCode => exitCode;
+    /// <summary>Combined stdout and stderr output from the git process.</summary>
     public string Output => output;
 }

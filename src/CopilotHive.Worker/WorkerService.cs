@@ -18,6 +18,11 @@ public sealed class WorkerService(
 
     private readonly CopilotRunner _copilotRunner = new(copilotPort);
 
+    /// <summary>
+    /// Runs the full worker lifecycle: connects to Copilot, registers with the orchestrator,
+    /// opens a bidirectional gRPC stream, and processes task assignments until cancelled.
+    /// </summary>
+    /// <param name="ct">Cancellation token that stops the worker.</param>
     public async Task RunAsync(CancellationToken ct)
     {
         var workerRole = ParseRole(role);

@@ -1,10 +1,18 @@
 namespace CopilotHive.Agents;
 
+/// <summary>
+/// Manages per-role AGENTS.md files on the local filesystem, including versioned history and rollback.
+/// </summary>
 public sealed class AgentsManager
 {
     private readonly string _agentsPath;
     private readonly string _historyPath;
 
+    /// <summary>
+    /// Initialises a new <see cref="AgentsManager"/> rooted at the given path.
+    /// Creates the history directory if it does not already exist.
+    /// </summary>
+    /// <param name="agentsPath">Root directory where AGENTS.md files are stored.</param>
     public AgentsManager(string agentsPath)
     {
         _agentsPath = Path.GetFullPath(agentsPath);
@@ -12,17 +20,33 @@ public sealed class AgentsManager
         Directory.CreateDirectory(_historyPath);
     }
 
+    /// <summary>
+    /// Returns the full path to the AGENTS.md file for the given role.
+    /// </summary>
+    /// <param name="role">Worker role name (e.g. "coder").</param>
+    /// <returns>Absolute file path for the role's AGENTS.md.</returns>
     public string GetAgentsMdPath(string role)
     {
         return Path.Combine(_agentsPath, $"{role}.agents.md");
     }
 
+    /// <summary>
+    /// Reads and returns the AGENTS.md content for the specified role.
+    /// Returns an empty string when the file does not exist.
+    /// </summary>
+    /// <param name="role">Worker role name.</param>
+    /// <returns>File contents, or empty string if not found.</returns>
     public string GetAgentsMd(string role)
     {
         var path = GetAgentsMdPath(role);
         return File.Exists(path) ? File.ReadAllText(path) : string.Empty;
     }
 
+    /// <summary>
+    /// Archives the current AGENTS.md and overwrites it with the new content.
+    /// </summary>
+    /// <param name="role">Worker role name.</param>
+    /// <param name="newContent">New AGENTS.md content to write.</param>
     public void UpdateAgentsMd(string role, string newContent)
     {
         // Archive current version before overwriting
@@ -36,6 +60,11 @@ public sealed class AgentsManager
         Console.WriteLine($"[Agents] Updated AGENTS.md for {role}");
     }
 
+    /// <summary>
+    /// Rolls back the AGENTS.md for the given role to the most recent archived version.
+    /// </summary>
+    /// <param name="role">Worker role name.</param>
+    /// <returns><c>true</c> if a rollback was performed; <c>false</c> if no history exists.</returns>
     public bool RollbackAgentsMd(string role)
     {
         var versions = GetVersionFiles(role);
@@ -51,6 +80,11 @@ public sealed class AgentsManager
         return true;
     }
 
+    /// <summary>
+    /// Returns the filenames of all archived versions for the given role, in chronological order.
+    /// </summary>
+    /// <param name="role">Worker role name.</param>
+    /// <returns>Array of version filenames (e.g. <c>v001.agents.md</c>).</returns>
     public string[] GetHistory(string role)
     {
         return GetVersionFiles(role)
