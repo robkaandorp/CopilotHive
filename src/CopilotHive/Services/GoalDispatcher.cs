@@ -345,6 +345,17 @@ public sealed class GoalDispatcher : BackgroundService
             pipeline.SetPlan(IterationPlan.Default(shouldImprove));
         }
 
+        // Enforce always_improve: inject Improve phase before Merging if Brain omitted it
+        var alwaysImproveConfig = _config?.Orchestrator?.AlwaysImprove ?? false;
+        if (alwaysImproveConfig && !pipeline.Plan!.Phases.Contains(GoalPhase.Improve))
+        {
+            var mergingIndex = pipeline.Plan.Phases.IndexOf(GoalPhase.Merging);
+            if (mergingIndex >= 0)
+                pipeline.Plan.Phases.Insert(mergingIndex, GoalPhase.Improve);
+            else
+                pipeline.Plan.Phases.Add(GoalPhase.Improve);
+        }
+
         var plan = pipeline.Plan!;
 
         // Sync plan position to the current pipeline phase
