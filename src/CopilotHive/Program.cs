@@ -74,7 +74,8 @@ static async Task<int> RunServerAsync(string[] args)
         Console.WriteLine($"[Hive] Brain enabled — connecting to Copilot on port {brainPort}");
         builder.Services.AddSingleton<IDistributedBrain>(sp =>
             new DistributedBrain(brainPort, sp.GetRequiredService<ILogger<DistributedBrain>>(),
-                sp.GetRequiredService<MetricsTracker>()));
+                sp.GetRequiredService<MetricsTracker>(),
+                sp.GetService<AgentsManager>()));
     }
     else
     {

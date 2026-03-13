@@ -11,6 +11,7 @@ public sealed class CopilotRunner : IAsyncDisposable
     private readonly CopilotClient _client;
     private CopilotSession? _session;
     private readonly int _port;
+    private CustomAgentConfig? _customAgent;
 
     public int MaxConnectRetries { get; init; } = 12;
     public TimeSpan RetryDelay { get; init; } = TimeSpan.FromSeconds(5);
@@ -25,6 +26,30 @@ public sealed class CopilotRunner : IAsyncDisposable
         });
     }
 
+    /// <summary>
+    /// Sets the custom agent configuration for this worker's role.
+    /// Applied on the next session creation (ConnectAsync or ResetSessionAsync).
+    /// </summary>
+    public void SetCustomAgent(string role, string agentsMdContent)
+    {
+        _customAgent = new CustomAgentConfig
+        {
+            Name = role,
+            DisplayName = $"CopilotHive {char.ToUpperInvariant(role[0])}{role[1..]}",
+            Description = $"CopilotHive worker agent for the {role} role",
+            Prompt = agentsMdContent,
+            Tools = null, // all tools available for workers
+        };
+        Console.WriteLine($"[Copilot] Custom agent set for role '{role}' ({agentsMdContent.Length} chars)");
+    }
+
+    private SessionConfig BuildSessionConfig() => new()
+    {
+        Streaming = false,
+        OnPermissionRequest = PermissionHandler.ApproveAll,
+        CustomAgents = _customAgent is not null ? [_customAgent] : [],
+    };
+
     public async Task ConnectAsync(CancellationToken ct = default)
     {
         await _client.StartAsync();
@@ -34,11 +59,7 @@ public sealed class CopilotRunner : IAsyncDisposable
         {
             try
             {
-                _session = await _client.CreateSessionAsync(new SessionConfig
-                {
-                    Streaming = false,
-                    OnPermissionRequest = PermissionHandler.ApproveAll,
-                });
+                _session = await _client.CreateSessionAsync(BuildSessionConfig());
                 Console.WriteLine($"[Copilot] Connected to Copilot CLI on port {_port} (attempt {attempt})");
                 return;
             }
@@ -56,6 +77,7 @@ public sealed class CopilotRunner : IAsyncDisposable
 
     /// <summary>
     /// Dispose the current session and create a fresh one, ensuring no context leaks between tasks.
+    /// The new session picks up the latest CustomAgent configuration.
     /// </summary>
     public async Task ResetSessionAsync(CancellationToken ct = default)
     {
@@ -65,13 +87,9 @@ public sealed class CopilotRunner : IAsyncDisposable
             _session = null;
         }
 
-        _session = await _client.CreateSessionAsync(new SessionConfig
-        {
-            Streaming = false,
-            OnPermissionRequest = PermissionHandler.ApproveAll,
-        });
+        _session = await _client.CreateSessionAsync(BuildSessionConfig());
 
-        Console.WriteLine($"[Copilot] Session reset (localhost:{_port})");
+        Console.WriteLine($"[Copilot] Session reset (localhost:{_port}, agent={_customAgent?.Name ?? "none"})");
     }
 
     /// <summary>

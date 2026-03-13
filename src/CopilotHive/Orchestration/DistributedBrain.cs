@@ -20,6 +20,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private CopilotClient? _copilotClient;
     private readonly ConcurrentDictionary<string, CopilotSession> _sessions = new();
 
+    private readonly CustomAgentConfig _orchestratorAgent;
+
     private const string SystemPrompt = """
         You are the CopilotHive Orchestrator Brain — a product owner and project manager
         for a distributed multi-agent software development system. You make ALL tactical decisions:
@@ -47,11 +49,25 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Kind = PermissionRequestResultKind.DeniedByRules,
         });
 
-    public DistributedBrain(int port, ILogger<DistributedBrain> logger, MetricsTracker? metricsTracker = null)
+    public DistributedBrain(int port, ILogger<DistributedBrain> logger,
+        MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null)
     {
         _port = port;
         _logger = logger;
         _metricsTracker = metricsTracker;
+
+        // Build the orchestrator custom agent with no tools (reasoning-only)
+        var orchestratorInstructions = agentsManager?.GetAgentsMd("orchestrator") ?? "";
+        _orchestratorAgent = new CustomAgentConfig
+        {
+            Name = "orchestrator",
+            DisplayName = "CopilotHive Orchestrator",
+            Description = "LLM-powered product owner and project manager — reasoning only, no tools",
+            Prompt = string.IsNullOrWhiteSpace(orchestratorInstructions)
+                ? SystemPrompt
+                : $"{SystemPrompt}\n\n{orchestratorInstructions}",
+            Tools = [], // no tools — pure reasoning agent
+        };
     }
 
     public async Task ConnectAsync(CancellationToken ct = default)
@@ -99,6 +115,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             Streaming = false,
             OnPermissionRequest = DenyAllPermissions,
+            CustomAgents = [_orchestratorAgent],
+            AvailableTools = [], // no tools for the orchestrator
         });
 
         if (_sessions.TryAdd(pipeline.GoalId, session))
@@ -148,6 +166,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             Streaming = false,
             OnPermissionRequest = DenyAllPermissions,
+            CustomAgents = [_orchestratorAgent],
+            AvailableTools = [], // no tools for the orchestrator
         });
 
         // Replay the conversation: alternate user/assistant messages

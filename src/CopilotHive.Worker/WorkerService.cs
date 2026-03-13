@@ -126,8 +126,8 @@ public sealed class WorkerService(
 
                 case OrchestratorMessage.PayloadOneofCase.UpdateAgents:
                     var update = message.UpdateAgents;
-                    Console.WriteLine($"[Worker] Updating AGENTS.md for role: {update.Role}");
-                    await UpdateAgentsMdAsync(update, ct);
+                    Console.WriteLine($"[Worker] Updating custom agent for role: {update.Role}");
+                    _copilotRunner.SetCustomAgent(update.Role, update.AgentsMdContent);
                     break;
 
                 case OrchestratorMessage.PayloadOneofCase.None:
@@ -176,18 +176,6 @@ public sealed class WorkerService(
                 Console.Error.WriteLine($"[Worker] Heartbeat failed: {ex.Message}");
             }
         }
-    }
-
-    private static async Task UpdateAgentsMdAsync(UpdateAgents update, CancellationToken ct)
-    {
-        // Write to /copilot-home (WORKDIR) so Copilot discovers it alongside
-        // the generic worker-agents.md in /opt/copilot-env (additive, not overwriting)
-        var copilotHome = Environment.GetEnvironmentVariable("COPILOT_HOME") ?? "/copilot-home";
-        var filePath = Path.Combine(copilotHome, "AGENTS.md");
-
-        await File.WriteAllTextAsync(filePath, update.AgentsMdContent, ct);
-
-        Console.WriteLine($"[Worker] Role-specific AGENTS.md updated: {filePath} (role={update.Role})");
     }
 
     private static WorkerRole ParseRole(string role) => role.ToLowerInvariant() switch
