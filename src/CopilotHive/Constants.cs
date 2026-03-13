@@ -30,4 +30,9 @@ internal static class Constants
     // Config defaults
     public const int    DefaultMaxIterations = 10;
     public const string DefaultModel         = "claude-opus-4.6";
+
+    /// <summary>Default model for reviewer role.</summary>
+    public const string DefaultReviewerModel    = "gpt-5.3-codex";
+    /// <summary>Default model for tester, improver and orchestrator roles.</summary>
+    public const string DefaultWorkerModel      = "claude-sonnet-4.6";
 }

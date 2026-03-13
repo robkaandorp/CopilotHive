@@ -57,10 +57,10 @@ public sealed class HiveConfiguration
     public string GetModelForRole(string agentRole) => agentRole.ToLowerInvariant() switch
     {
         "coder" => CoderModel ?? Model,
-        "reviewer" => ReviewerModel ?? "gpt-5.3-codex",
-        "tester" => TesterModel ?? "claude-sonnet-4.6",
-        "improver" => ImproverModel ?? "claude-sonnet-4.6",
-        "orchestrator" => OrchestratorModel ?? "claude-sonnet-4.6",
+        "reviewer" => ReviewerModel ?? Constants.DefaultReviewerModel,
+        "tester" => TesterModel ?? Constants.DefaultWorkerModel,
+        "improver" => ImproverModel ?? Constants.DefaultWorkerModel,
+        "orchestrator" => OrchestratorModel ?? Constants.DefaultWorkerModel,
         _ => Model,
     };
 }

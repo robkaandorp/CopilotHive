@@ -24,7 +24,7 @@ public sealed class GoalPipelineManager
     }
 
     /// <summary>Create and register a new pipeline for a goal.</summary>
-    public GoalPipeline CreatePipeline(Goal goal, int maxRetries = 3)
+    public GoalPipeline CreatePipeline(Goal goal, int maxRetries = Constants.DefaultMaxRetriesPerTask)
     {
         var pipeline = new GoalPipeline(goal, maxRetries);
         if (!_pipelines.TryAdd(goal.Id, pipeline))

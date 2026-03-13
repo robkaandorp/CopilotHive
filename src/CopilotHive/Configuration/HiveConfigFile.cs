@@ -43,11 +43,11 @@ public sealed class WorkerConfig
 public sealed class OrchestratorConfig
 {
     /// <summary>Model used by the orchestrator LLM.</summary>
-    public string Model { get; set; } = "claude-sonnet-4.6";
+    public string Model { get; set; } = Constants.DefaultWorkerModel;
     /// <summary>Maximum number of goal iterations before giving up.</summary>
-    public int MaxIterations { get; set; } = 10;
+    public int MaxIterations { get; set; } = Constants.DefaultMaxIterations;
     /// <summary>Maximum number of retries per individual task.</summary>
-    public int MaxRetriesPerTask { get; set; } = 3;
+    public int MaxRetriesPerTask { get; set; } = Constants.DefaultMaxRetriesPerTask;
     /// <summary>When <c>true</c>, the improver runs after every iteration even on success.</summary>
     public bool AlwaysImprove { get; set; }
     /// <summary>When <c>true</c>, enables verbose logging of prompts, worker output, and Brain reasoning.</summary>

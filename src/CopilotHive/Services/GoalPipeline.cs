@@ -99,7 +99,7 @@ public sealed class GoalPipeline
     /// <summary>Number of times the test phase has been retried in the current iteration.</summary>
     public int TestRetries { get; private set; }
     /// <summary>Maximum number of task-level retries allowed.</summary>
-    public int MaxRetries { get; init; } = 3;
+    public int MaxRetries { get; init; } = Constants.DefaultMaxRetriesPerTask;
 
     /// <summary>Brain-determined plan for the current iteration, or null if no plan set.</summary>
     public IterationPlan? Plan { get; private set; }
@@ -129,7 +129,7 @@ public sealed class GoalPipeline
     /// </summary>
     /// <param name="goal">The goal to track.</param>
     /// <param name="maxRetries">Maximum task-level retries allowed.</param>
-    public GoalPipeline(Goal goal, int maxRetries = 3)
+    public GoalPipeline(Goal goal, int maxRetries = Constants.DefaultMaxRetriesPerTask)
     {
         Goal = goal;
         GoalId = goal.Id;
