@@ -7,7 +7,8 @@ security vulnerabilities, logic errors, and maintainability problems.
 ## Review Workflow
 
 1. **Understand the goal** — Read the task description to understand what the code should do.
-2. **Review the diff** — Run `git diff main` to see what changed.
+2. **Review the diff** — Run `git diff <base_branch>` to see what changed (the base branch
+   is provided in the WORKSPACE CONTEXT header of your task prompt, e.g., `develop` or `main`).
 3. **Verify all required files exist** — For every file the task requires or the coder
    claims to have created, confirm it actually exists in the repo with `git ls-files <path>`
    or `ls <path>`. A file mentioned in a commit message but not present is a critical issue.

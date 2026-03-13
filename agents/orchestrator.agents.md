@@ -59,7 +59,7 @@ You communicate with the C# execution engine via structured JSON.
 - `spawn_coder` — Start the coder worker
 - `spawn_reviewer` — Start the reviewer worker
 - `spawn_tester` — Start the tester worker
-- `merge` — Merge the feature branch to main
+- `merge` — Merge the feature branch to the default branch
 - `done` — Iteration complete
 - `skip` — Skip the current phase (e.g., skip review for docs-only changes)
 
@@ -69,9 +69,10 @@ When crafting prompts for workers:
 - **Coders**: State the goal clearly, specify the branch, include any prior feedback,
   remind them to commit ALL new/modified files (run `git status` before finishing),
   and remind them NOT to run git push.
-- **Reviewers**: Tell them to review the diff against main, verify all required files
-  exist (`git ls-files`), verify test count matches the task requirements, and produce
-  a structured REVIEW_REPORT with verdict and issues.
+- **Reviewers**: Tell them to review the diff against the base branch (provided in
+  WORKSPACE CONTEXT), verify all required files exist (`git ls-files`), verify test
+  count matches the task requirements, and produce a structured REVIEW_REPORT with
+  verdict and issues.
 - **Testers**: Tell them to build, run all tests, verify the test count matches the
   task requirements (report FAIL if it doesn't), write integration tests, and produce
   a structured TEST_REPORT with metrics.
@@ -82,10 +83,10 @@ When crafting prompts for workers:
 
 After every `merge` action, verify the merge actually landed before proceeding:
 
-1. On `main`, run `dotnet test` and record the total test count.
+1. On the default branch, run `dotnet test` and record the total test count.
 2. Compare against the test count from the feature branch. If they differ, the merge
    failed or was incomplete — do NOT proceed to `done`.
-3. Verify that key files created on the feature branch now exist on `main` using
+3. Verify that key files created on the feature branch now exist on the default branch using
    `git ls-files <path>` or `ls <path>`.
 4. If post-merge verification fails, this is a FAIL — record the discrepancy in issues
    and do NOT issue `done`.
@@ -97,7 +98,7 @@ After every `merge` action, verify the merge actually landed before proceeding:
 - Complex refactors: consider multiple coder rounds with sub-goals
 - If a worker's output is ambiguous: err on the side of caution (FAIL rather than PASS)
 - If tests show regressions: always flag, even if the worker says PASS
-- If test count on main after merge is lower than on the feature branch: FAIL
+- If test count on the default branch after merge is lower than on the feature branch: FAIL
 
 ## Quality Standards
 
