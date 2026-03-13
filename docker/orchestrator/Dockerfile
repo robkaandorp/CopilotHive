@@ -5,6 +5,7 @@ WORKDIR /src
 
 # Copy solution and project files first for layer caching
 COPY CopilotHive.slnx ./
+COPY Directory.Build.props ./
 COPY src/CopilotHive/CopilotHive.csproj src/CopilotHive/
 COPY src/CopilotHive.Shared/CopilotHive.Shared.csproj src/CopilotHive.Shared/
 COPY src/CopilotHive.Worker/CopilotHive.Worker.csproj src/CopilotHive.Worker/
