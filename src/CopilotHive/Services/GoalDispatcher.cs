@@ -578,9 +578,74 @@ public sealed class GoalDispatcher : BackgroundService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Merge failed for pipeline {GoalId}", pipeline.GoalId);
-            await MarkGoalFailed(pipeline, $"Merge failed: {ex.Message}", ct);
+            _logger.LogWarning(ex, "Merge failed for goal {GoalId} — checking if retryable", pipeline.GoalId);
+            await HandleMergeFailureAsync(pipeline, ex.Message, ct);
         }
+    }
+
+    /// <summary>
+    /// When a merge fails (typically due to conflicts), send the goal back to the coder
+    /// to rebase the feature branch onto the latest base branch. The full pipeline
+    /// (Coding → Review → Testing → Merging) then runs again.
+    /// </summary>
+    private async Task HandleMergeFailureAsync(GoalPipeline pipeline, string errorMessage, CancellationToken ct)
+    {
+        // Use the review retry counter to limit total merge-conflict retries
+        if (!pipeline.IncrementReviewRetry())
+        {
+            await MarkGoalFailed(pipeline, $"Merge failed after max retries: {errorMessage}", ct);
+            return;
+        }
+
+        _logger.LogInformation(
+            "Merge conflict for goal {GoalId} — sending back to Coder for rebase (retry {Retry}/{Max})",
+            pipeline.GoalId, pipeline.ReviewRetries, pipeline.MaxRetries);
+
+        pipeline.IncrementIteration();
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipeline.ClearPlan();
+
+        var repos = ResolveRepositories(pipeline.Goal);
+        var defaultBranch = repos.FirstOrDefault()?.DefaultBranch ?? "main";
+
+        var rebaseContext = $"""
+            Merge conflict: the feature branch could not be merged into {defaultBranch}.
+            Error: {errorMessage}
+
+            Your task: rebase the feature branch onto the latest {defaultBranch} and resolve all conflicts.
+            The goal of the original changes was: {pipeline.Description}
+
+            Steps:
+            1. Run `git fetch origin`
+            2. Run `git rebase origin/{defaultBranch}`
+            3. Resolve any merge conflicts — keep the intent of the original changes
+            4. Run `dotnet build` and `dotnet test` to verify everything works
+            5. Commit the resolved changes
+            """;
+
+        // Re-plan with full pipeline so the rebase goes through review and testing
+        if (_brain is not null)
+        {
+            try
+            {
+                var newPlan = await _brain.PlanIterationAsync(pipeline, ct);
+                ValidatePlan(newPlan);
+                pipeline.SetPlan(newPlan);
+            }
+            catch
+            {
+                pipeline.SetPlan(IterationPlan.Default());
+            }
+        }
+        else
+        {
+            pipeline.SetPlan(IterationPlan.Default());
+        }
+
+        var fixPrompt = _brain is not null
+            ? await _brain.CraftPromptAsync(pipeline, "coder", rebaseContext, ct)
+            : rebaseContext;
+        await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
     }
 
     private static async Task RunGitAsync(string arguments, CancellationToken ct)
