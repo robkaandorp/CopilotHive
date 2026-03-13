@@ -19,6 +19,11 @@ public sealed class ConfigRepoManager
         .IgnoreUnmatchedProperties()
         .Build();
 
+    /// <summary>
+    /// Initialises a new <see cref="ConfigRepoManager"/>.
+    /// </summary>
+    /// <param name="configRepoUrl">URL of the remote configuration repository.</param>
+    /// <param name="localPath">Local path where the config repo will be cloned.</param>
     public ConfigRepoManager(string configRepoUrl, string localPath)
     {
         _configRepoUrl = configRepoUrl;

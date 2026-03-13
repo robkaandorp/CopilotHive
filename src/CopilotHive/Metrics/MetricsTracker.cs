@@ -2,6 +2,9 @@ using System.Text.Json;
 
 namespace CopilotHive.Metrics;
 
+/// <summary>
+/// Loads, records, and compares per-iteration metrics, persisting each entry as a JSON file.
+/// </summary>
 public sealed class MetricsTracker
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -13,6 +16,10 @@ public sealed class MetricsTracker
     private readonly string _metricsPath;
     private readonly List<IterationMetrics> _history = [];
 
+    /// <summary>
+    /// Initialises a new <see cref="MetricsTracker"/> and loads any previously saved metrics from disk.
+    /// </summary>
+    /// <param name="metricsPath">Directory where iteration JSON files are stored.</param>
     public MetricsTracker(string metricsPath)
     {
         _metricsPath = Path.GetFullPath(metricsPath);
@@ -20,9 +27,15 @@ public sealed class MetricsTracker
         LoadHistory();
     }
 
+    /// <summary>All recorded iteration metrics in chronological order.</summary>
     public IReadOnlyList<IterationMetrics> History => _history;
+    /// <summary>The most recently recorded metrics, or <c>null</c> if no iterations have been recorded yet.</summary>
     public IterationMetrics? Latest => _history.Count > 0 ? _history[^1] : null;
 
+    /// <summary>
+    /// Appends the given metrics to the in-memory history and writes a JSON file to disk.
+    /// </summary>
+    /// <param name="metrics">Metrics to record for the current iteration.</param>
     public void RecordIteration(IterationMetrics metrics)
     {
         _history.Add(metrics);
@@ -37,6 +50,11 @@ public sealed class MetricsTracker
             $"{metrics.CoveragePercent:F1}% coverage");
     }
 
+    /// <summary>
+    /// Compares the given metrics with the previous iteration, if one exists.
+    /// </summary>
+    /// <param name="current">The current iteration's metrics.</param>
+    /// <returns>A <see cref="MetricsComparison"/>, or <c>null</c> when fewer than two iterations have been recorded.</returns>
     public MetricsComparison? CompareWithPrevious(IterationMetrics current)
     {
         if (_history.Count < 2)
@@ -53,6 +71,11 @@ public sealed class MetricsTracker
         };
     }
 
+    /// <summary>
+    /// Returns <c>true</c> when coverage or pass-rate has regressed relative to the previous iteration.
+    /// </summary>
+    /// <param name="current">The current iteration's metrics to evaluate.</param>
+    /// <returns><c>true</c> if regression is detected; otherwise <c>false</c>.</returns>
     public bool HasRegressed(IterationMetrics current)
     {
         var comparison = CompareWithPrevious(current);
@@ -81,14 +104,23 @@ public sealed class MetricsTracker
     }
 }
 
+/// <summary>
+/// Holds the result of comparing two consecutive iteration metrics.
+/// </summary>
 public sealed class MetricsComparison
 {
+    /// <summary>Metrics from the previous iteration.</summary>
     public required IterationMetrics Previous { get; init; }
+    /// <summary>Metrics from the current iteration.</summary>
     public required IterationMetrics Current { get; init; }
+    /// <summary>Change in coverage percentage (positive = improved).</summary>
     public double CoverageDelta { get; init; }
+    /// <summary>Change in the total test count (positive = more tests).</summary>
     public int TestCountDelta { get; init; }
+    /// <summary>Change in pass rate (positive = improved).</summary>
     public double PassRateDelta { get; init; }
 
+    /// <summary>Returns a human-readable summary of coverage, test count, and pass-rate deltas.</summary>
     public override string ToString() =>
         $"Coverage: {CoverageDelta:+0.0;-0.0}%, Tests: {TestCountDelta:+0;-0}, PassRate: {PassRateDelta:+0.00;-0.00}";
 }

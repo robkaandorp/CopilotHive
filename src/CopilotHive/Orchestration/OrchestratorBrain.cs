@@ -76,6 +76,14 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
         Do NOT wrap the JSON in markdown code fences. Return ONLY the JSON object.
         """;
 
+    /// <summary>
+    /// Initialises a new <see cref="OrchestratorBrain"/> that will spawn a dedicated orchestrator worker container.
+    /// </summary>
+    /// <param name="config">Hive configuration providing model and port settings.</param>
+    /// <param name="workerManager">Manager used to spawn and stop the orchestrator container.</param>
+    /// <param name="clientFactory">Factory used to connect to the orchestrator container.</param>
+    /// <param name="workspacePath">Path passed to the spawned orchestrator container as its workspace.</param>
+    /// <param name="agentsMdPath">Path to the orchestrator's AGENTS.md file.</param>
     public OrchestratorBrain(
         HiveConfiguration config,
         IWorkerManager workerManager,
@@ -90,6 +98,10 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
         _agentsMdPath = agentsMdPath;
     }
 
+    /// <summary>
+    /// Starts the orchestrator container and establishes a Copilot session primed with the system prompt.
+    /// </summary>
+    /// <param name="ct">Cancellation token.</param>
     public async Task StartAsync(CancellationToken ct = default)
     {
         if (_worker is not null) return;
@@ -109,6 +121,14 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
         _conversation.Add(new ConversationEntry("assistant", primeResponse));
     }
 
+    /// <summary>
+    /// Asks the brain to plan which phases are needed for the specified iteration.
+    /// </summary>
+    /// <param name="iteration">One-based iteration number.</param>
+    /// <param name="goal">Natural-language goal description.</param>
+    /// <param name="previousMetrics">Metrics from the previous iteration, or <c>null</c> for the first iteration.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>An <see cref="OrchestratorDecision"/> with the recommended first action.</returns>
     public async Task<OrchestratorDecision> PlanIterationAsync(
         int iteration, string goal, IterationMetrics? previousMetrics, CancellationToken ct = default)
     {
@@ -152,6 +172,16 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
             };
     }
 
+    /// <summary>
+    /// Asks the brain to craft a task prompt for the specified worker role.
+    /// </summary>
+    /// <param name="workerRole">Role of the target worker (e.g. "coder").</param>
+    /// <param name="goal">Natural-language goal description.</param>
+    /// <param name="iteration">Current iteration number.</param>
+    /// <param name="branchName">Feature branch the worker should operate on.</param>
+    /// <param name="additionalContext">Optional extra context to include.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The crafted prompt string.</returns>
     public async Task<string> CraftPromptAsync(
         string workerRole, string goal, int iteration, string branchName,
         string? additionalContext, CancellationToken ct = default)
@@ -182,6 +212,13 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
         return decision?.Prompt ?? GetFallbackPrompt(workerRole, goal, iteration, branchName);
     }
 
+    /// <summary>
+    /// Asks the brain to interpret raw worker output and produce a structured verdict.
+    /// </summary>
+    /// <param name="workerRole">Role of the worker that produced the output.</param>
+    /// <param name="workerOutput">Raw text output from the worker.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>An <see cref="OrchestratorDecision"/> containing the extracted verdict.</returns>
     public async Task<OrchestratorDecision> InterpretOutputAsync(
         string workerRole, string workerOutput, CancellationToken ct = default)
     {
@@ -245,6 +282,13 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
         };
     }
 
+    /// <summary>
+    /// Asks the brain what the next action should be given the current phase and context.
+    /// </summary>
+    /// <param name="currentPhase">Name of the current pipeline phase.</param>
+    /// <param name="context">Textual context describing the current situation.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>An <see cref="OrchestratorDecision"/> with the recommended next action.</returns>
     public async Task<OrchestratorDecision> DecideNextStepAsync(
         string currentPhase, string context, CancellationToken ct = default)
     {
@@ -270,6 +314,11 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
             };
     }
 
+    /// <summary>
+    /// Informs the brain of an event so it can maintain context continuity.
+    /// </summary>
+    /// <param name="information">Human-readable status update.</param>
+    /// <param name="ct">Cancellation token.</param>
     public async Task InformAsync(string information, CancellationToken ct = default)
     {
         EnsureStarted();
@@ -337,6 +386,7 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
     private static string Truncate(string text, int maxLength) =>
         text.Length <= maxLength ? text : text[..maxLength] + "...";
 
+    /// <summary>Stops the orchestrator worker container and disposes the Copilot client.</summary>
     public async ValueTask DisposeAsync()
     {
         if (_client is not null)

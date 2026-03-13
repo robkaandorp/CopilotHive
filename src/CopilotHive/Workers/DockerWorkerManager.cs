@@ -4,6 +4,9 @@ using CopilotHive.Configuration;
 
 namespace CopilotHive.Workers;
 
+/// <summary>
+/// Manages the lifecycle of worker containers using the Docker daemon.
+/// </summary>
 public sealed class DockerWorkerManager : IWorkerManager
 {
     private readonly DockerClient _docker;
@@ -12,6 +15,10 @@ public sealed class DockerWorkerManager : IWorkerManager
     private readonly string _sessionId = Guid.NewGuid().ToString("N")[..8];
     private int _nextPort;
 
+    /// <summary>
+    /// Initialises a new <see cref="DockerWorkerManager"/> using the default local Docker daemon.
+    /// </summary>
+    /// <param name="config">Configuration providing the Docker image, base port, and credentials.</param>
     public DockerWorkerManager(HiveConfiguration config)
     {
         _config = config;
@@ -19,6 +26,7 @@ public sealed class DockerWorkerManager : IWorkerManager
         _docker = new DockerClientConfiguration().CreateClient();
     }
 
+    /// <summary>Read-only view of all currently tracked worker containers keyed by worker ID.</summary>
     public IReadOnlyDictionary<string, WorkerInfo> Workers => _workers;
 
     /// <summary>
@@ -50,6 +58,15 @@ public sealed class DockerWorkerManager : IWorkerManager
         }
     }
 
+    /// <summary>
+    /// Spawns a new Docker container for the specified worker role and waits for it to start.
+    /// </summary>
+    /// <param name="role">Worker role (coder, reviewer, tester, etc.).</param>
+    /// <param name="clonePath">Host path to the worker's git clone, mounted into the container.</param>
+    /// <param name="agentsMdPath">Host path to the AGENTS.md directory, mounted into the container.</param>
+    /// <param name="model">Model identifier passed to the Copilot CLI inside the container.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>A <see cref="WorkerInfo"/> describing the spawned container.</returns>
     public async Task<WorkerInfo> SpawnWorkerAsync(
         WorkerRole role,
         string clonePath,
@@ -110,6 +127,11 @@ public sealed class DockerWorkerManager : IWorkerManager
         return worker;
     }
 
+    /// <summary>
+    /// Stops and removes the Docker container for the specified worker.
+    /// </summary>
+    /// <param name="workerId">Identifier of the worker to stop.</param>
+    /// <param name="ct">Cancellation token.</param>
     public async Task StopWorkerAsync(string workerId, CancellationToken ct = default)
     {
         if (!_workers.TryGetValue(workerId, out var worker))
@@ -143,6 +165,10 @@ public sealed class DockerWorkerManager : IWorkerManager
         Console.WriteLine($"[Hive] Stopped worker: {workerId}");
     }
 
+    /// <summary>
+    /// Stops and removes all currently tracked worker containers.
+    /// </summary>
+    /// <param name="ct">Cancellation token.</param>
     public async Task StopAllWorkersAsync(CancellationToken ct = default)
     {
         foreach (var id in _workers.Keys.ToList())
@@ -151,6 +177,7 @@ public sealed class DockerWorkerManager : IWorkerManager
         }
     }
 
+    /// <summary>Stops all workers and disposes the Docker client.</summary>
     public async ValueTask DisposeAsync()
     {
         await StopAllWorkersAsync();

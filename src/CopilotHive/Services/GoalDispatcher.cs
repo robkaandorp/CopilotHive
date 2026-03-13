@@ -36,6 +36,21 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly ConcurrentDictionary<string, bool> _dispatchedGoals = new();
     private DateTime _lastAgentsSync = DateTime.MinValue;
 
+    /// <summary>
+    /// Initialises a new <see cref="GoalDispatcher"/> with required and optional dependencies.
+    /// </summary>
+    /// <param name="goalManager">Source of pending goals.</param>
+    /// <param name="pipelineManager">Tracks active goal pipelines.</param>
+    /// <param name="taskQueue">Queue used to dispatch task assignments to workers.</param>
+    /// <param name="workerPool">Registry of currently connected workers.</param>
+    /// <param name="completionNotifier">Bridge that delivers task completion events to this dispatcher.</param>
+    /// <param name="logger">Logger instance.</param>
+    /// <param name="brain">Optional LLM brain for intelligent prompt crafting.</param>
+    /// <param name="config">Optional hive configuration from the config repo.</param>
+    /// <param name="metricsTracker">Optional metrics tracker for the improvement cycle.</param>
+    /// <param name="agentsManager">Optional manager for per-role AGENTS.md files.</param>
+    /// <param name="improvementAnalyzer">Optional analyzer that decides when to run the improver.</param>
+    /// <param name="configRepo">Optional config repo manager for syncing AGENTS.md files.</param>
     public GoalDispatcher(
         GoalManager goalManager,
         GoalPipelineManager pipelineManager,
@@ -65,6 +80,7 @@ public sealed class GoalDispatcher : BackgroundService
         completionNotifier.OnTaskCompleted += complete => HandleTaskCompletionAsync(complete);
     }
 
+    /// <inheritdoc/>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("GoalDispatcher started — polling for goals every {Interval}s (Brain: {BrainEnabled})",

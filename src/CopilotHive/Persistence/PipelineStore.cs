@@ -25,6 +25,11 @@ public sealed class PipelineStore : IAsyncDisposable
         WriteIndented = false,
     };
 
+    /// <summary>
+    /// Initialises a new <see cref="PipelineStore"/>, opening or creating the SQLite database at the given path.
+    /// </summary>
+    /// <param name="dbPath">Full path to the SQLite database file.</param>
+    /// <param name="logger">Logger instance.</param>
     public PipelineStore(string dbPath, ILogger<PipelineStore> logger)
     {
         _logger = logger;
@@ -306,6 +311,7 @@ public sealed class PipelineStore : IAsyncDisposable
         cmd.ExecuteNonQuery();
     }
 
+    /// <summary>Closes and disposes the underlying SQLite connection.</summary>
     public async ValueTask DisposeAsync()
     {
         await _db.DisposeAsync();
@@ -317,21 +323,38 @@ public sealed class PipelineStore : IAsyncDisposable
 /// </summary>
 public sealed class PipelineSnapshot
 {
+    /// <summary>Unique identifier of the goal this pipeline tracks.</summary>
     public required string GoalId { get; init; }
+    /// <summary>Human-readable description of the goal.</summary>
     public required string Description { get; init; }
+    /// <summary>The goal this pipeline is working toward.</summary>
     public required Goal Goal { get; init; }
+    /// <summary>Current phase of the pipeline at the time it was persisted.</summary>
     public GoalPhase Phase { get; init; }
+    /// <summary>Current iteration number.</summary>
     public int Iteration { get; init; }
+    /// <summary>Number of review retries consumed so far.</summary>
     public int ReviewRetries { get; init; }
+    /// <summary>Number of test retries consumed so far.</summary>
     public int TestRetries { get; init; }
+    /// <summary>Maximum retries allowed per task.</summary>
     public int MaxRetries { get; init; }
+    /// <summary>Task ID currently assigned to a worker, or <c>null</c> when idle.</summary>
     public string? ActiveTaskId { get; init; }
+    /// <summary>Feature branch created by the coder, or <c>null</c> if coding has not started.</summary>
     public string? CoderBranch { get; init; }
+    /// <summary>Brain-determined iteration plan, or <c>null</c> if not yet planned.</summary>
     public IterationPlan? Plan { get; init; }
+    /// <summary>Accumulated output from each completed phase.</summary>
     public Dictionary<string, string> PhaseOutputs { get; init; } = [];
+    /// <summary>Metrics captured during this iteration.</summary>
     public IterationMetrics Metrics { get; init; } = new() { Iteration = 1 };
+    /// <summary>UTC timestamp when the pipeline was created.</summary>
     public DateTime CreatedAt { get; init; }
+    /// <summary>UTC timestamp when the pipeline completed, or <c>null</c> if still active.</summary>
     public DateTime? CompletedAt { get; init; }
+    /// <summary>Conversation history for the Brain session associated with this pipeline.</summary>
     public List<ConversationEntry> Conversation { get; init; } = [];
+    /// <summary>List of (TaskId, GoalId) pairs for task-to-goal resolution.</summary>
     public List<(string TaskId, string GoalId)> TaskMappings { get; set; } = [];
 }

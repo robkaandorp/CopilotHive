@@ -9,6 +9,10 @@ using CopilotHive.Workers;
 
 namespace CopilotHive.Orchestration;
 
+/// <summary>
+/// Drives the full multi-agent orchestration loop: spawning workers, tracking iterations,
+/// running the improvement cycle, and managing the git workspace.
+/// </summary>
 public sealed class Orchestrator : IAsyncDisposable
 {
     private readonly HiveConfiguration _config;
@@ -20,6 +24,10 @@ public sealed class Orchestrator : IAsyncDisposable
     private readonly ImprovementAnalyzer _improvementAnalyzer = new();
     private readonly IOrchestratorBrain _brain;
 
+    /// <summary>
+    /// Initialises the orchestrator with default Docker worker manager and Copilot client factory.
+    /// </summary>
+    /// <param name="config">Configuration for this orchestration session.</param>
     public Orchestrator(HiveConfiguration config)
         : this(config,
                new DockerWorkerManager(config),
@@ -27,6 +35,12 @@ public sealed class Orchestrator : IAsyncDisposable
     {
     }
 
+    /// <summary>
+    /// Initialises the orchestrator with custom worker manager and client factory.
+    /// </summary>
+    /// <param name="config">Configuration for this orchestration session.</param>
+    /// <param name="workerManager">Manager used to spawn and stop worker containers.</param>
+    /// <param name="clientFactory">Factory used to create Copilot client connections.</param>
     public Orchestrator(
         HiveConfiguration config,
         IWorkerManager workerManager,
@@ -35,6 +49,13 @@ public sealed class Orchestrator : IAsyncDisposable
     {
     }
 
+    /// <summary>
+    /// Initialises the orchestrator with a custom brain for testing or alternative LLM backends.
+    /// </summary>
+    /// <param name="config">Configuration for this orchestration session.</param>
+    /// <param name="workerManager">Manager used to spawn and stop worker containers.</param>
+    /// <param name="clientFactory">Factory used to create Copilot client connections.</param>
+    /// <param name="brain">Optional brain override; defaults to <see cref="OrchestratorBrain"/> when <c>null</c>.</param>
     public Orchestrator(
         HiveConfiguration config,
         IWorkerManager workerManager,
@@ -53,6 +74,11 @@ public sealed class Orchestrator : IAsyncDisposable
             new AgentsManager(config.AgentsPath).GetAgentsMdPath("orchestrator"));
     }
 
+    /// <summary>
+    /// Runs the full multi-agent orchestration loop until the goal is achieved,
+    /// the maximum number of iterations is reached, or cancellation is requested.
+    /// </summary>
+    /// <param name="ct">Cancellation token.</param>
     public async Task RunAsync(CancellationToken ct = default)
     {
         Console.WriteLine($"[Orchestrator] Goal: {_config.Goal}");
@@ -801,6 +827,7 @@ public sealed class Orchestrator : IAsyncDisposable
         return text[..maxLength] + "...";
     }
 
+    /// <summary>Stops the orchestrator brain and all managed worker containers.</summary>
     public async ValueTask DisposeAsync()
     {
         await _brain.DisposeAsync();

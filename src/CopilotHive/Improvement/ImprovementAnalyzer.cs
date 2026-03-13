@@ -5,6 +5,9 @@ namespace CopilotHive.Improvement;
 /// <summary>
 /// Request to improve one role's AGENTS.md.
 /// </summary>
+/// <param name="Role">The worker role whose AGENTS.md should be improved.</param>
+/// <param name="CurrentAgentsMd">The current AGENTS.md content before improvement.</param>
+/// <param name="Prompt">The prompt to send to the improver worker.</param>
 public sealed record ImprovementRequest(string Role, string CurrentAgentsMd, string Prompt);
 
 /// <summary>
@@ -40,6 +43,10 @@ public sealed class ImprovementAnalyzer
     /// <summary>
     /// Builds improvement requests for the given roles based on iteration outcomes.
     /// </summary>
+    /// <param name="current">Metrics from the iteration just completed.</param>
+    /// <param name="history">Full metric history used to detect recurring patterns.</param>
+    /// <param name="currentAgentsMd">Current AGENTS.md content keyed by role name.</param>
+    /// <returns>One <see cref="ImprovementRequest"/> per role in <paramref name="currentAgentsMd"/>.</returns>
     public IReadOnlyList<ImprovementRequest> BuildRequests(
         IterationMetrics current,
         IReadOnlyList<IterationMetrics> history,

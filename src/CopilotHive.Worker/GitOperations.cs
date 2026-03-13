@@ -9,6 +9,12 @@ namespace CopilotHive.Worker;
 /// </summary>
 public static class GitOperations
 {
+    /// <summary>
+    /// Clones a remote repository into the specified target directory.
+    /// </summary>
+    /// <param name="url">Remote URL of the repository to clone.</param>
+    /// <param name="targetDir">Local path where the repository will be cloned.</param>
+    /// <param name="ct">Cancellation token.</param>
     public static async Task CloneRepositoryAsync(string url, string targetDir, CancellationToken ct)
     {
         await RunGitCommandAsync(
@@ -17,11 +23,24 @@ public static class GitOperations
             ct);
     }
 
+    /// <summary>
+    /// Checks out an existing branch in the specified repository directory.
+    /// </summary>
+    /// <param name="repoDir">Path to the local git repository.</param>
+    /// <param name="branch">Name of the branch to check out.</param>
+    /// <param name="ct">Cancellation token.</param>
     public static async Task CheckoutBranchAsync(string repoDir, string branch, CancellationToken ct)
     {
         await RunGitCommandAsync(repoDir, $"checkout {branch}", ct);
     }
 
+    /// <summary>
+    /// Creates a new branch from the given base branch.
+    /// </summary>
+    /// <param name="repoDir">Path to the local git repository.</param>
+    /// <param name="branchName">Name of the new branch to create.</param>
+    /// <param name="baseBranch">The branch to base the new branch on.</param>
+    /// <param name="ct">Cancellation token.</param>
     public static async Task CreateBranchAsync(
         string repoDir, string branchName, string baseBranch, CancellationToken ct)
     {
@@ -29,11 +48,23 @@ public static class GitOperations
         await RunGitCommandAsync(repoDir, $"checkout -b {branchName}", ct);
     }
 
+    /// <summary>
+    /// Force-pushes the specified branch to the remote origin.
+    /// </summary>
+    /// <param name="repoDir">Path to the local git repository.</param>
+    /// <param name="branch">Name of the branch to push.</param>
+    /// <param name="ct">Cancellation token.</param>
     public static async Task PushBranchAsync(string repoDir, string branch, CancellationToken ct)
     {
         await RunGitCommandAsync(repoDir, $"push origin {branch} --force", ct);
     }
 
+    /// <summary>
+    /// Retrieves current git status information for the repository at the given path.
+    /// </summary>
+    /// <param name="repoDir">Path to the local git repository.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>A <see cref="GitStatus"/> containing branch, commit, and diff statistics.</returns>
     public static async Task<GitStatus> GetGitStatusAsync(string repoDir, CancellationToken ct)
     {
         var status = new GitStatus();

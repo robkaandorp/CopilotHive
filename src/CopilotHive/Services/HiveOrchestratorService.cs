@@ -5,6 +5,9 @@ using CopilotHive.Shared.Grpc;
 
 namespace CopilotHive.Services;
 
+/// <summary>
+/// gRPC service implementation for worker registration, bidirectional task streaming, and heartbeats.
+/// </summary>
 public sealed class HiveOrchestratorService(
     WorkerPool workerPool,
     TaskQueue taskQueue,
@@ -15,6 +18,12 @@ public sealed class HiveOrchestratorService(
 {
     private const string OrchestratorVersion = "1.0.0";
 
+    /// <summary>
+    /// Registers a worker with the orchestrator and assigns it an ID.
+    /// </summary>
+    /// <param name="request">Registration request containing the worker's role and capabilities.</param>
+    /// <param name="context">Server call context.</param>
+    /// <returns>A <see cref="RegisterResponse"/> indicating whether registration was accepted.</returns>
     public override Task<RegisterResponse> Register(RegisterRequest request, ServerCallContext context)
     {
         var workerId = string.IsNullOrWhiteSpace(request.WorkerId)
@@ -56,6 +65,13 @@ public sealed class HiveOrchestratorService(
         }
     }
 
+    /// <summary>
+    /// Opens a bidirectional streaming RPC through which the orchestrator sends task assignments
+    /// and the worker reports progress and completion.
+    /// </summary>
+    /// <param name="requestStream">Stream of messages from the worker.</param>
+    /// <param name="responseStream">Stream used to send messages to the worker.</param>
+    /// <param name="context">Server call context.</param>
     public override async Task WorkStream(
         IAsyncStreamReader<WorkerMessage> requestStream,
         IServerStreamWriter<OrchestratorMessage> responseStream,
@@ -142,6 +158,12 @@ public sealed class HiveOrchestratorService(
         }
     }
 
+    /// <summary>
+    /// Receives a heartbeat from a worker and updates its last-seen timestamp.
+    /// </summary>
+    /// <param name="request">Heartbeat request containing the worker's current status.</param>
+    /// <param name="context">Server call context.</param>
+    /// <returns>An acknowledged <see cref="HeartbeatResponse"/>.</returns>
     public override Task<HeartbeatResponse> Heartbeat(HeartbeatRequest request, ServerCallContext context)
     {
         workerPool.UpdateHeartbeat(request.WorkerId);

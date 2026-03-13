@@ -2,12 +2,21 @@ using System.Collections.Concurrent;
 
 namespace CopilotHive.Goals;
 
+/// <summary>
+/// In-memory goal source backed by a concurrent dictionary; used by the HTTP API to inject goals at runtime.
+/// </summary>
 public sealed class ApiGoalSource : IGoalSource
 {
     private readonly ConcurrentDictionary<string, Goal> _goals = new();
 
+    /// <summary>Unique name identifying this goal source.</summary>
     public string Name => "api";
 
+    /// <summary>
+    /// Returns all goals whose status is <see cref="GoalStatus.Pending"/>.
+    /// </summary>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>Read-only list of pending goals.</returns>
     public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default)
     {
         IReadOnlyList<Goal> pending = _goals.Values
@@ -18,6 +27,12 @@ public sealed class ApiGoalSource : IGoalSource
         return Task.FromResult(pending);
     }
 
+    /// <summary>
+    /// Updates the status of a goal already held by this source.
+    /// </summary>
+    /// <param name="goalId">Identifier of the goal to update.</param>
+    /// <param name="status">New status to apply.</param>
+    /// <param name="ct">Cancellation token.</param>
     public Task UpdateGoalStatusAsync(string goalId, GoalStatus status, CancellationToken ct = default)
     {
         if (!_goals.TryGetValue(goalId, out var goal))
@@ -27,6 +42,11 @@ public sealed class ApiGoalSource : IGoalSource
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Adds a new goal to this source. Throws if a goal with the same ID already exists.
+    /// </summary>
+    /// <param name="goal">The goal to add.</param>
+    /// <returns>The same goal that was added.</returns>
     public Goal AddGoal(Goal goal)
     {
         if (!_goals.TryAdd(goal.Id, goal))
@@ -35,9 +55,15 @@ public sealed class ApiGoalSource : IGoalSource
         return goal;
     }
 
+    /// <summary>Returns a read-only snapshot of all goals regardless of status.</summary>
     public IReadOnlyList<Goal> GetAllGoals() =>
         _goals.Values.ToList().AsReadOnly();
 
+    /// <summary>
+    /// Looks up a single goal by its identifier.
+    /// </summary>
+    /// <param name="id">Goal identifier.</param>
+    /// <returns>The matching goal, or <c>null</c> if not found.</returns>
     public Goal? GetGoal(string id) =>
         _goals.GetValueOrDefault(id);
 }
