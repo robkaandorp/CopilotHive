@@ -183,7 +183,8 @@ public sealed class GoalDispatcher : BackgroundService
 
             case OrchestratorActionType.Merge:
                 // Enforce remaining phases before merge
-                var mergeEnforced = await EnforceRemainingPhasesAsync(pipeline, ct);
+                var mergeEnforced = await EnforceRemainingPhasesAsync(pipeline, ct,
+                    interpretation.Verdict ?? interpretation.ReviewVerdict, interpretation.Reason);
                 if (!mergeEnforced)
                 {
                     pipeline.AdvanceTo(GoalPhase.Merging);
@@ -194,7 +195,8 @@ public sealed class GoalDispatcher : BackgroundService
             case OrchestratorActionType.Done:
             case OrchestratorActionType.Skip:
                 // Enforce minimum pipeline phases before allowing completion
-                var enforced = await EnforceRemainingPhasesAsync(pipeline, ct);
+                var enforced = await EnforceRemainingPhasesAsync(pipeline, ct,
+                    interpretation.Verdict ?? interpretation.ReviewVerdict, interpretation.Reason);
                 if (!enforced)
                     await MarkGoalCompleted(pipeline, ct);
                 break;
@@ -220,19 +222,48 @@ public sealed class GoalDispatcher : BackgroundService
     /// <summary>
     /// When the Brain says "Done" too early, enforce any remaining mandatory pipeline phases.
     /// Returns true if a phase was dispatched (i.e., don't mark complete yet).
-    /// Minimum phases: Coding → Testing → Review → Improve (if always_improve) → Merge.
+    /// Phase order: Coding → Review → Testing → Improve (if always_improve) → Merge.
+    /// If Review or Testing had a FAIL verdict, loop back to Coding instead of advancing.
     /// </summary>
-    private async Task<bool> EnforceRemainingPhasesAsync(GoalPipeline pipeline, CancellationToken ct)
+    private async Task<bool> EnforceRemainingPhasesAsync(
+        GoalPipeline pipeline, CancellationToken ct, string? verdict = null, string? reason = null)
     {
         var alwaysImprove = _config?.Orchestrator?.AlwaysImprove ?? false;
 
-        // Determine the next mandatory phase based on what's been completed
+        // If Review or Testing failed, loop back to Coding for another attempt
+        if (verdict is "FAIL" && pipeline.Phase is GoalPhase.Review or GoalPhase.Testing)
+        {
+            var isReview = pipeline.Phase == GoalPhase.Review;
+            var canRetry = isReview ? pipeline.IncrementReviewRetry() : pipeline.IncrementTestRetry();
+            if (!canRetry)
+            {
+                await MarkGoalFailed(pipeline,
+                    $"Exceeded max {(isReview ? "review" : "test")} retries", ct);
+                return true;
+            }
+
+            _logger.LogInformation(
+                "{Phase} failed for goal {GoalId} — sending back to Coder (reason: {Reason})",
+                pipeline.Phase, pipeline.GoalId, reason ?? "unspecified");
+
+            pipeline.IncrementIteration();
+            pipeline.AdvanceTo(GoalPhase.Coding);
+            var feedbackKind = isReview ? "Reviewer feedback" : "Test failures";
+            var fixPrompt = _brain is not null
+                ? await _brain.CraftPromptAsync(pipeline, "coder",
+                    $"{feedbackKind}:\n{reason ?? "See previous output."}", ct)
+                : $"Fix issues for: {pipeline.Description}. {feedbackKind}:\n{reason}";
+            await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
+            return true;
+        }
+
+        // Determine the next mandatory phase (Coding → Review → Testing → [Improve] → Merging)
         var nextPhase = pipeline.Phase switch
         {
-            GoalPhase.Coding => GoalPhase.Testing,
-            GoalPhase.Testing => GoalPhase.Review,
-            GoalPhase.Review when alwaysImprove => GoalPhase.Improve,
-            GoalPhase.Review => GoalPhase.Merging,
+            GoalPhase.Coding => GoalPhase.Review,
+            GoalPhase.Review => GoalPhase.Testing,
+            GoalPhase.Testing when alwaysImprove => GoalPhase.Improve,
+            GoalPhase.Testing => GoalPhase.Merging,
             GoalPhase.Improve => GoalPhase.Merging,
             _ => (GoalPhase?)null,
         };
@@ -246,14 +277,6 @@ public sealed class GoalDispatcher : BackgroundService
 
         switch (nextPhase)
         {
-            case GoalPhase.Testing:
-                pipeline.AdvanceTo(GoalPhase.Testing);
-                var testPrompt = _brain is not null
-                    ? await _brain.CraftPromptAsync(pipeline, "tester", null, ct)
-                    : $"Run the existing tests and verify the changes for: {pipeline.Description}";
-                await DispatchToRole(pipeline, WorkerRole.Tester, testPrompt, ct);
-                return true;
-
             case GoalPhase.Review:
                 pipeline.AdvanceTo(GoalPhase.Review);
                 var reviewPrompt = _brain is not null
@@ -262,13 +285,23 @@ public sealed class GoalDispatcher : BackgroundService
                 await DispatchToRole(pipeline, WorkerRole.Reviewer, reviewPrompt, ct);
                 return true;
 
+            case GoalPhase.Testing:
+                pipeline.AdvanceTo(GoalPhase.Testing);
+                var testPrompt = _brain is not null
+                    ? await _brain.CraftPromptAsync(pipeline, "tester", null, ct)
+                    : $"Run the existing tests and verify the changes for: {pipeline.Description}";
+                await DispatchToRole(pipeline, WorkerRole.Tester, testPrompt, ct);
+                return true;
+
             case GoalPhase.Improve:
                 pipeline.AdvanceTo(GoalPhase.Improve);
                 _logger.LogInformation("Dispatching Improver for goal {GoalId} (always_improve=true)", pipeline.GoalId);
                 var improvePrompt = _brain is not null
                     ? await _brain.CraftPromptAsync(pipeline, "improver",
-                        "Review is complete. Suggest and apply improvements to code quality, naming, docs, or test coverage.", ct)
-                    : $"Improve the code for: {pipeline.Description}";
+                        "The goal is complete. Analyze the iteration and update ONLY the *.agents.md files "
+                        + "to improve instructions for future iterations. Do NOT modify any source code or tests.", ct)
+                    : "Analyze the iteration and update the *.agents.md files to improve instructions for future iterations. "
+                      + "Do NOT modify any source code or tests.";
                 await DispatchToRole(pipeline, WorkerRole.Improver, improvePrompt, ct);
                 return true;
 
