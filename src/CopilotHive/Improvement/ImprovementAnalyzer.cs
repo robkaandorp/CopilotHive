@@ -57,6 +57,31 @@ public sealed class ImprovementAnalyzer
         return requests;
     }
 
+    internal string BuildAnalysis(
+        IterationMetrics current,
+        IReadOnlyList<IterationMetrics> history,
+        IReadOnlyDictionary<string, string> agentsMd)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append(BuildAnalysis(current, history));
+
+        if (agentsMd.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("## Current AGENTS.md Files");
+            foreach (var (role, content) in agentsMd)
+            {
+                sb.AppendLine($"### {role}.agents.md");
+                sb.AppendLine("```");
+                sb.AppendLine(content.TrimEnd());
+                sb.AppendLine("```");
+                sb.AppendLine();
+            }
+        }
+
+        return sb.ToString();
+    }
+
     internal string BuildAnalysis(IterationMetrics current, IReadOnlyList<IterationMetrics> history)
     {
         var sb = new System.Text.StringBuilder();

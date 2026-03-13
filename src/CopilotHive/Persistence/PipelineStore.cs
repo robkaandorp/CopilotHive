@@ -327,6 +327,7 @@ public sealed class PipelineSnapshot
     public int MaxRetries { get; init; }
     public string? ActiveTaskId { get; init; }
     public string? CoderBranch { get; init; }
+    public IterationPlan? Plan { get; init; }
     public Dictionary<string, string> PhaseOutputs { get; init; } = [];
     public IterationMetrics Metrics { get; init; } = new() { Iteration = 1 };
     public DateTime CreatedAt { get; init; }

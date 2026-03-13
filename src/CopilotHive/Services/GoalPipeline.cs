@@ -22,6 +22,52 @@ public enum GoalPhase
 }
 
 /// <summary>
+/// Brain-determined workflow plan for a single iteration.
+/// </summary>
+public sealed class IterationPlan
+{
+    /// <summary>Ordered list of phases the Brain wants to execute this iteration.</summary>
+    public List<GoalPhase> Phases { get; init; } = [];
+
+    /// <summary>Per-phase instructions/context from the Brain.</summary>
+    public Dictionary<GoalPhase, string> PhaseInstructions { get; init; } = [];
+
+    /// <summary>Brain's reasoning for this plan.</summary>
+    public string? Reason { get; init; }
+
+    /// <summary>Index of the current phase being executed.</summary>
+    public int CurrentPhaseIndex { get; set; }
+
+    /// <summary>The current phase in the plan, or null if plan is complete.</summary>
+    public GoalPhase? CurrentPhase => CurrentPhaseIndex < Phases.Count ? Phases[CurrentPhaseIndex] : null;
+
+    /// <summary>The next phase in the plan after the current one, or null if none.</summary>
+    public GoalPhase? NextPhase => CurrentPhaseIndex + 1 < Phases.Count ? Phases[CurrentPhaseIndex + 1] : null;
+
+    /// <summary>Whether all planned phases have been executed.</summary>
+    public bool IsComplete => CurrentPhaseIndex >= Phases.Count;
+
+    /// <summary>Advance to the next phase. Returns the new current phase or null if complete.</summary>
+    public GoalPhase? Advance()
+    {
+        if (!IsComplete) CurrentPhaseIndex++;
+        return CurrentPhase;
+    }
+
+    /// <summary>
+    /// Creates a default plan with the standard phase order.
+    /// Used as fallback when the Brain doesn't provide a plan.
+    /// </summary>
+    public static IterationPlan Default(bool includeImprove = false)
+    {
+        var phases = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Review, GoalPhase.Testing };
+        if (includeImprove) phases.Add(GoalPhase.Improve);
+        phases.Add(GoalPhase.Merging);
+        return new IterationPlan { Phases = phases, Reason = "Default plan" };
+    }
+}
+
+/// <summary>
 /// Tracks a single goal's progress through the multi-phase pipeline.
 /// Thread-safe: state mutations are guarded by a lock.
 /// </summary>
@@ -38,6 +84,9 @@ public sealed class GoalPipeline
     public int ReviewRetries { get; private set; }
     public int TestRetries { get; private set; }
     public int MaxRetries { get; init; } = 3;
+
+    /// <summary>Brain-determined plan for the current iteration, or null if no plan set.</summary>
+    public IterationPlan? Plan { get; private set; }
 
     /// <summary>The active task ID currently assigned to a worker (null when idle).</summary>
     public string? ActiveTaskId { get; private set; }
@@ -78,6 +127,7 @@ public sealed class GoalPipeline
         MaxRetries = snapshot.MaxRetries;
         ActiveTaskId = snapshot.ActiveTaskId;
         CoderBranch = snapshot.CoderBranch;
+        Plan = snapshot.Plan;
         CreatedAt = snapshot.CreatedAt;
         CompletedAt = snapshot.CompletedAt;
 
@@ -127,6 +177,25 @@ public sealed class GoalPipeline
         lock (_lock)
         {
             ActiveTaskId = null;
+        }
+    }
+
+    /// <summary>Set the iteration plan from the Brain, resetting to the first phase.</summary>
+    public void SetPlan(IterationPlan plan)
+    {
+        lock (_lock)
+        {
+            plan.CurrentPhaseIndex = 0;
+            Plan = plan;
+        }
+    }
+
+    /// <summary>Clear the iteration plan (e.g., after a failure loop-back to Coding).</summary>
+    public void ClearPlan()
+    {
+        lock (_lock)
+        {
+            Plan = null;
         }
     }
 

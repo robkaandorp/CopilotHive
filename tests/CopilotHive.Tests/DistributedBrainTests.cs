@@ -243,12 +243,14 @@ file sealed class FakeDistributedBrain : IDistributedBrain
 {
     public bool Connected { get; private set; }
     public int PlanCalls { get; private set; }
+    public int PlanIterationCalls { get; private set; }
     public int CraftCalls { get; private set; }
     public int InterpretCalls { get; private set; }
     public int DecideCalls { get; private set; }
     public List<string> Informations { get; } = [];
 
     public Func<GoalPipeline, OrchestratorDecision>? PlanGoalOverride { get; set; }
+    public Func<GoalPipeline, IterationPlan>? PlanIterationOverride { get; set; }
     public Func<GoalPipeline, string, string?, string>? CraftPromptOverride { get; set; }
     public Func<GoalPipeline, string, string, OrchestratorDecision>? InterpretOutputOverride { get; set; }
     public Func<GoalPipeline, string, OrchestratorDecision>? DecideNextStepOverride { get; set; }
@@ -265,6 +267,13 @@ file sealed class FakeDistributedBrain : IDistributedBrain
         var decision = PlanGoalOverride?.Invoke(pipeline)
             ?? new OrchestratorDecision { Action = OrchestratorActionType.SpawnCoder, Reason = "Default plan" };
         return Task.FromResult(decision);
+    }
+
+    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default)
+    {
+        PlanIterationCalls++;
+        var plan = PlanIterationOverride?.Invoke(pipeline) ?? IterationPlan.Default();
+        return Task.FromResult(plan);
     }
 
     public Task<string> CraftPromptAsync(

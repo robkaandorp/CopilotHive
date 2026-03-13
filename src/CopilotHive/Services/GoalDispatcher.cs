@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using CopilotHive.Agents;
 using CopilotHive.Configuration;
 using CopilotHive.Goals;
+using CopilotHive.Improvement;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Shared.Grpc;
@@ -22,6 +23,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly TaskQueue _taskQueue;
     private readonly WorkerPool _workerPool;
     private readonly IDistributedBrain? _brain;
+    private readonly ImprovementAnalyzer? _improvementAnalyzer;
     private readonly AgentsManager? _agentsManager;
     private readonly MetricsTracker? _metricsTracker;
     private readonly ILogger<GoalDispatcher> _logger;
@@ -41,13 +43,15 @@ public sealed class GoalDispatcher : BackgroundService
         IDistributedBrain? brain = null,
         HiveConfigFile? config = null,
         MetricsTracker? metricsTracker = null,
-        AgentsManager? agentsManager = null)
+        AgentsManager? agentsManager = null,
+        ImprovementAnalyzer? improvementAnalyzer = null)
     {
         _goalManager = goalManager;
         _pipelineManager = pipelineManager;
         _taskQueue = taskQueue;
         _workerPool = workerPool;
         _brain = brain;
+        _improvementAnalyzer = improvementAnalyzer;
         _agentsManager = agentsManager;
         _metricsTracker = metricsTracker;
         _logger = logger;
@@ -236,14 +240,12 @@ public sealed class GoalDispatcher : BackgroundService
     /// <summary>
     /// When the Brain says "Done" too early, enforce any remaining mandatory pipeline phases.
     /// Returns true if a phase was dispatched (i.e., don't mark complete yet).
-    /// Phase order: Coding → Review → Testing → Improve (if always_improve) → Merge.
+    /// Phase order is determined by the pipeline's IterationPlan (from Brain or default fallback).
     /// If Review or Testing had a FAIL verdict, loop back to Coding instead of advancing.
     /// </summary>
     private async Task<bool> EnforceRemainingPhasesAsync(
         GoalPipeline pipeline, CancellationToken ct, string? verdict = null, string? reason = null)
     {
-        var alwaysImprove = _config?.Orchestrator?.AlwaysImprove ?? false;
-
         // If Review or Testing failed, loop back to Coding for another attempt
         if (verdict is "FAIL" && pipeline.Phase is GoalPhase.Review or GoalPhase.Testing)
         {
@@ -262,6 +264,32 @@ public sealed class GoalDispatcher : BackgroundService
 
             pipeline.IncrementIteration();
             pipeline.AdvanceTo(GoalPhase.Coding);
+            pipeline.ClearPlan();
+
+            // Re-plan iteration with failure context so the Brain can adjust strategy
+            if (_brain is not null)
+            {
+                try
+                {
+                    var newPlan = await _brain.PlanIterationAsync(pipeline, ct);
+                    ValidatePlan(newPlan);
+                    pipeline.SetPlan(newPlan);
+                    _logger.LogInformation(
+                        "Re-planned iteration {Iteration} for goal {GoalId} after {Phase} failure: {Reason}",
+                        pipeline.Iteration, pipeline.GoalId, pipeline.Phase, newPlan.Reason);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to re-plan iteration for goal {GoalId}, using default plan",
+                        pipeline.GoalId);
+                    pipeline.SetPlan(IterationPlan.Default());
+                }
+            }
+            else
+            {
+                pipeline.SetPlan(IterationPlan.Default());
+            }
+
             var feedbackKind = isReview ? "Reviewer feedback" : "Test failures";
             var fixPrompt = _brain is not null
                 ? await _brain.CraftPromptAsync(pipeline, "coder",
@@ -271,16 +299,24 @@ public sealed class GoalDispatcher : BackgroundService
             return true;
         }
 
-        // Determine the next mandatory phase (Coding → Review → Testing → [Improve] → Merging)
-        var nextPhase = pipeline.Phase switch
+        // Ensure we have an iteration plan — create default fallback if missing
+        if (pipeline.Plan is null)
         {
-            GoalPhase.Coding => GoalPhase.Review,
-            GoalPhase.Review => GoalPhase.Testing,
-            GoalPhase.Testing when alwaysImprove => GoalPhase.Improve,
-            GoalPhase.Testing => GoalPhase.Merging,
-            GoalPhase.Improve => GoalPhase.Merging,
-            _ => (GoalPhase?)null,
-        };
+            var alwaysImprove = _config?.Orchestrator?.AlwaysImprove ?? false;
+            var shouldImprove = alwaysImprove || (_improvementAnalyzer?.ShouldImprove(pipeline.Metrics) ?? false);
+            pipeline.SetPlan(IterationPlan.Default(shouldImprove));
+        }
+
+        var plan = pipeline.Plan!;
+
+        // Sync plan position to the current pipeline phase
+        while (plan.CurrentPhase is not null && plan.CurrentPhase != pipeline.Phase)
+        {
+            plan.Advance();
+        }
+
+        // Advance past the current phase to get the next one
+        var nextPhase = plan.Advance();
 
         if (nextPhase is null)
             return false;
@@ -289,49 +325,103 @@ public sealed class GoalDispatcher : BackgroundService
             "Enforcing pipeline phase {Phase} for goal {GoalId} (Brain wanted Done at {CurrentPhase})",
             nextPhase, pipeline.GoalId, pipeline.Phase);
 
-        switch (nextPhase)
+        // Get phase-specific instructions from the plan (if any)
+        plan.PhaseInstructions.TryGetValue(nextPhase.Value, out var phaseInstructions);
+
+        await DispatchPhaseAsync(pipeline, nextPhase.Value, phaseInstructions, ct);
+        return true;
+    }
+
+    /// <summary>Dispatch a specific pipeline phase to the appropriate worker.</summary>
+    private async Task DispatchPhaseAsync(
+        GoalPipeline pipeline, GoalPhase phase, string? phaseInstructions, CancellationToken ct)
+    {
+        switch (phase)
         {
             case GoalPhase.Review:
                 pipeline.AdvanceTo(GoalPhase.Review);
                 var reviewPrompt = _brain is not null
-                    ? await _brain.CraftPromptAsync(pipeline, "reviewer", null, ct)
+                    ? await _brain.CraftPromptAsync(pipeline, "reviewer", phaseInstructions, ct)
                     : $"Review the code changes for: {pipeline.Description}";
                 await DispatchToRole(pipeline, WorkerRole.Reviewer, reviewPrompt, ct);
-                return true;
+                break;
 
             case GoalPhase.Testing:
                 pipeline.AdvanceTo(GoalPhase.Testing);
                 var testPrompt = _brain is not null
-                    ? await _brain.CraftPromptAsync(pipeline, "tester", null, ct)
+                    ? await _brain.CraftPromptAsync(pipeline, "tester", phaseInstructions, ct)
                     : $"Run the existing tests and verify the changes for: {pipeline.Description}";
                 await DispatchToRole(pipeline, WorkerRole.Tester, testPrompt, ct);
-                return true;
+                break;
 
             case GoalPhase.Improve:
                 pipeline.AdvanceTo(GoalPhase.Improve);
-                _logger.LogInformation("Dispatching Improver for goal {GoalId} (always_improve=true)", pipeline.GoalId);
-                const string improveConstraint =
-                    "The goal is complete. Analyze the iteration and update ONLY the *.agents.md files "
-                    + "to improve instructions for future iterations. "
-                    + "Do NOT modify any source code, tests, or configuration files. "
-                    + "Do NOT run git add, git commit, or git push. "
-                    + "Return your AGENTS.md recommendations in the response text only.";
+                _logger.LogInformation("Dispatching Improver for goal {GoalId}", pipeline.GoalId);
+
+                var analysis = "";
+                if (_improvementAnalyzer is not null && _agentsManager is not null && _metricsTracker is not null)
+                {
+                    var agentsMd = new Dictionary<string, string>();
+                    foreach (var role in new[] { "coder", "tester", "reviewer", "improver" })
+                    {
+                        var content = _agentsManager.GetAgentsMd(role);
+                        if (!string.IsNullOrEmpty(content)) agentsMd[role] = content;
+                    }
+                    analysis = _improvementAnalyzer.BuildAnalysis(pipeline.Metrics, _metricsTracker.History, agentsMd);
+                }
+
+                var improveContext = "Analyze the iteration and update ONLY the *.agents.md files.\n\n" + analysis + "\n\n"
+                    + "Output format: === IMPROVED {role}.agents.md === ... === END {role}.agents.md === "
+                    + "for changed roles. === UNCHANGED {role}.agents.md === for unchanged roles. "
+                    + "Do NOT modify any source code or tests.";
+                if (!string.IsNullOrEmpty(phaseInstructions))
+                    improveContext = phaseInstructions + "\n\n" + improveContext;
+
                 var improvePrompt = _brain is not null
-                    ? await _brain.CraftPromptAsync(pipeline, "improver", improveConstraint, ct)
-                    : "Analyze the iteration and update the *.agents.md files to improve instructions for future iterations. "
-                      + "Do NOT modify any source code, tests, or configuration files. "
-                      + "Do NOT run git add, git commit, or git push. "
-                      + "Return your AGENTS.md recommendations in the response text only.";
+                    ? await _brain.CraftPromptAsync(pipeline, "improver", improveContext, ct)
+                    : "Update the *.agents.md files based on iteration results.\n\n" + analysis;
                 await DispatchToRole(pipeline, WorkerRole.Improver, improvePrompt, ct);
-                return true;
+                break;
 
             case GoalPhase.Merging:
                 pipeline.AdvanceTo(GoalPhase.Merging);
                 await PerformMergeAsync(pipeline, ct);
-                return true;
+                break;
+
+            default:
+                _logger.LogWarning("Unexpected phase {Phase} in plan for goal {GoalId} — skipping",
+                    phase, pipeline.GoalId);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Validates an IterationPlan to ensure safety invariants:
+    /// must contain Coding, at least one of Review or Testing, and end with Merging.
+    /// Missing phases are inserted in the correct position.
+    /// </summary>
+    internal static IterationPlan ValidatePlan(IterationPlan plan)
+    {
+        var phases = plan.Phases;
+
+        // Must contain Coding
+        if (!phases.Contains(GoalPhase.Coding))
+        {
+            phases.Insert(0, GoalPhase.Coding);
         }
 
-        return false;
+        // Must contain at least one of Review or Testing
+        if (!phases.Contains(GoalPhase.Review) && !phases.Contains(GoalPhase.Testing))
+        {
+            var codingIndex = phases.IndexOf(GoalPhase.Coding);
+            phases.Insert(codingIndex + 1, GoalPhase.Review);
+        }
+
+        // Must end with Merging — remove any misplaced Merging entries, then ensure it's last
+        phases.RemoveAll(p => p == GoalPhase.Merging);
+        phases.Add(GoalPhase.Merging);
+
+        return plan;
     }
 
     private async Task DispatchToRole(GoalPipeline pipeline, WorkerRole role, string? prompt, CancellationToken ct)
@@ -495,6 +585,45 @@ public sealed class GoalDispatcher : BackgroundService
         PopulateAgentsMdVersions(pipeline);
         _metricsTracker?.RecordIteration(pipeline.Metrics);
 
+        // Check for regression after recording metrics
+        if (_metricsTracker is not null && _agentsManager is not null)
+        {
+            if (_metricsTracker.HasRegressed(pipeline.Metrics))
+            {
+                _logger.LogWarning("⚠️ REGRESSION DETECTED for goal {GoalId} — rolling back AGENTS.md", pipeline.GoalId);
+
+                // Only rollback roles whose AGENTS.md version changed this iteration
+                var modifiedRoles = GetModifiedRoles(pipeline.Metrics);
+                if (modifiedRoles.Count == 0)
+                {
+                    _logger.LogInformation("No AGENTS.md files were modified this iteration — nothing to rollback");
+                }
+
+                foreach (var role in modifiedRoles)
+                {
+                    try
+                    {
+                        _agentsManager.RollbackAgentsMd(role);
+                        _logger.LogInformation("Rolled back {Role} AGENTS.md", role);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to rollback {Role} AGENTS.md", role);
+                    }
+                }
+            }
+            else
+            {
+                var comparison = _metricsTracker.CompareWithPrevious(pipeline.Metrics);
+                if (comparison is not null)
+                {
+                    _logger.LogInformation(
+                        "Metrics comparison for {GoalId}: CoverageDelta={CovDelta:+0.0;-0.0}%, PassRateDelta={PRDelta:+0.00;-0.00}",
+                        pipeline.GoalId, comparison.CoverageDelta, comparison.PassRateDelta);
+                }
+            }
+        }
+
         _logger.LogInformation(
             "🎉 Goal {GoalId} completed! Iterations={Iterations}, Duration={Duration:F1}min, " +
             "Tests={Passed}/{Total}, Coverage={Coverage:F1}%",
@@ -541,6 +670,33 @@ public sealed class GoalDispatcher : BackgroundService
                 pipeline.Metrics.AgentsMdVersions[role] = $"v{history.Length:D3}";
             }
         }
+    }
+
+    /// <summary>
+    /// Determines which roles had their AGENTS.md modified this iteration by comparing
+    /// current versions against the previous iteration's recorded versions.
+    /// </summary>
+    private List<string> GetModifiedRoles(IterationMetrics current)
+    {
+        var modified = new List<string>();
+        var history = _metricsTracker!.History;
+
+        // Need at least 2 entries: previous + current (just recorded)
+        if (history.Count < 2)
+            return modified;
+
+        var previous = history[^2];
+
+        foreach (var (role, currentVersion) in current.AgentsMdVersions)
+        {
+            if (!previous.AgentsMdVersions.TryGetValue(role, out var previousVersion)
+                || currentVersion != previousVersion)
+            {
+                modified.Add(role);
+            }
+        }
+
+        return modified;
     }
 
     /// <summary>
@@ -603,8 +759,23 @@ public sealed class GoalDispatcher : BackgroundService
         if (_brain is not null)
         {
             // Brain-powered: ask the Brain to plan the goal
-            var plan = await _brain.PlanGoalAsync(pipeline, ct);
-            var firstRole = plan.Action switch
+            var goalPlan = await _brain.PlanGoalAsync(pipeline, ct);
+
+            // Get the iteration plan from the Brain
+            IterationPlan iterationPlan;
+            try
+            {
+                iterationPlan = await _brain.PlanIterationAsync(pipeline, ct);
+                iterationPlan = ValidatePlan(iterationPlan);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Brain failed to plan iteration for {GoalId}, using default plan", pipeline.GoalId);
+                iterationPlan = IterationPlan.Default();
+            }
+            pipeline.SetPlan(iterationPlan);
+
+            var firstRole = goalPlan.Action switch
             {
                 OrchestratorActionType.SpawnReviewer => WorkerRole.Reviewer,
                 OrchestratorActionType.SpawnTester => WorkerRole.Tester,
@@ -612,11 +783,12 @@ public sealed class GoalDispatcher : BackgroundService
             };
 
             pipeline.AdvanceTo(firstRole == WorkerRole.Coder ? GoalPhase.Coding : GoalPhase.Review);
-            await DispatchToRole(pipeline, firstRole, plan.Prompt, ct);
+            await DispatchToRole(pipeline, firstRole, goalPlan.Prompt, ct);
         }
         else
         {
-            // Mechanical fallback: just dispatch to coder
+            // Mechanical fallback: just dispatch to coder with default plan
+            pipeline.SetPlan(IterationPlan.Default());
             pipeline.AdvanceTo(GoalPhase.Coding);
             await DispatchToRole(pipeline, WorkerRole.Coder, BuildCoderPrompt(goal), ct);
         }

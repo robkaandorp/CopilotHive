@@ -1,5 +1,8 @@
+using CopilotHive.Agents;
 using CopilotHive.Configuration;
 using CopilotHive.Goals;
+using CopilotHive.Improvement;
+using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
@@ -42,12 +45,24 @@ static async Task<int> RunServerAsync(string[] args)
     builder.Services.AddSingleton<TaskQueue>();
     builder.Services.AddSingleton<ApiGoalSource>();
     builder.Services.AddSingleton<TaskCompletionNotifier>();
+    builder.Services.AddSingleton<ImprovementAnalyzer>();
+
+    // Agents: AGENTS.md versioning and rollback
+    var agentsDir = Environment.GetEnvironmentVariable("AGENTS_DIR") ?? Path.Combine(AppContext.BaseDirectory, "agents");
+    if (!Directory.Exists(agentsDir))
+        agentsDir = Path.Combine(Directory.GetCurrentDirectory(), "agents");
+    builder.Services.AddSingleton(new AgentsManager(agentsDir));
 
     // Persistence: SQLite store for pipeline state (survives restarts)
     var stateDir = Environment.GetEnvironmentVariable("STATE_DIR") ?? "/app/state";
     var dbPath = Path.Combine(stateDir, "copilothive.db");
     builder.Services.AddSingleton(sp =>
         new PipelineStore(dbPath, sp.GetRequiredService<ILogger<PipelineStore>>()));
+
+    // Metrics: per-iteration metrics persistence
+    var metricsDir = Path.Combine(stateDir, "metrics");
+    Directory.CreateDirectory(metricsDir);
+    builder.Services.AddSingleton(new MetricsTracker(metricsDir));
 
     builder.Services.AddSingleton(sp =>
         new GoalPipelineManager(sp.GetRequiredService<PipelineStore>()));
@@ -58,7 +73,8 @@ static async Task<int> RunServerAsync(string[] args)
     {
         Console.WriteLine($"[Hive] Brain enabled — connecting to Copilot on port {brainPort}");
         builder.Services.AddSingleton<IDistributedBrain>(sp =>
-            new DistributedBrain(brainPort, sp.GetRequiredService<ILogger<DistributedBrain>>()));
+            new DistributedBrain(brainPort, sp.GetRequiredService<ILogger<DistributedBrain>>(),
+                sp.GetRequiredService<MetricsTracker>()));
     }
     else
     {

@@ -5,7 +5,7 @@ namespace CopilotHive.Metrics;
 
 public sealed class IterationMetrics
 {
-    public int Iteration { get; init; }
+    public int Iteration { get; set; }
     public DateTime Timestamp { get; init; } = DateTime.UtcNow;
     public TimeSpan Duration { get; set; }
 

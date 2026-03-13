@@ -19,6 +19,13 @@ public interface IDistributedBrain
     Task<OrchestratorDecision> PlanGoalAsync(GoalPipeline pipeline, CancellationToken ct = default);
 
     /// <summary>
+    /// Plan the workflow phases for the current iteration. Called at the start of each
+    /// iteration (new goal or after failure loop-back). Returns an IterationPlan with
+    /// the ordered phase sequence and per-phase instructions.
+    /// </summary>
+    Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default);
+
+    /// <summary>
     /// Craft a context-aware prompt for a specific worker role.
     /// Uses the pipeline's accumulated state and conversation history.
     /// </summary>

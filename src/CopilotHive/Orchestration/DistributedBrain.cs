@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
+using System.Text;
 using CopilotHive.Copilot;
+using CopilotHive.Metrics;
 using CopilotHive.Services;
 using GitHub.Copilot.SDK;
 
@@ -14,6 +16,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 {
     private readonly int _port;
     private readonly ILogger<DistributedBrain> _logger;
+    private readonly MetricsTracker? _metricsTracker;
     private CopilotClient? _copilotClient;
     private readonly ConcurrentDictionary<string, CopilotSession> _sessions = new();
 
@@ -44,10 +47,11 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Kind = PermissionRequestResultKind.DeniedByRules,
         });
 
-    public DistributedBrain(int port, ILogger<DistributedBrain> logger)
+    public DistributedBrain(int port, ILogger<DistributedBrain> logger, MetricsTracker? metricsTracker = null)
     {
         _port = port;
         _logger = logger;
+        _metricsTracker = metricsTracker;
     }
 
     public async Task ConnectAsync(CancellationToken ct = default)
@@ -197,11 +201,14 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
               """
             : "This is the first iteration — no previous metrics.";
 
+        var historyContext = BuildMetricsHistoryContext();
+
         var prompt = $$"""
             Plan the workflow for this goal:
             {{pipeline.Description}}
 
             {{metricsContext}}
+            {{historyContext}}
 
             Decide which phase to start with. Consider:
             - Is this a documentation-only change? (just coder, maybe skip review)
@@ -226,9 +233,140 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         };
     }
 
+    public async Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default)
+    {
+        var metricsContext = pipeline.Iteration > 1
+            ? $"""
+              Previous iteration metrics:
+              - Tests: {pipeline.Metrics.PassedTests}/{pipeline.Metrics.TotalTests} passed
+              - Coverage: {pipeline.Metrics.CoveragePercent}%
+              - Review retries: {pipeline.ReviewRetries}
+              - Test retries: {pipeline.TestRetries}
+              - Issues: {string.Join(", ", pipeline.Metrics.Issues)}
+              """
+            : "This is the first iteration — no previous metrics.";
+
+        var historyContext = BuildMetricsHistoryContext();
+
+        var failureContext = pipeline.Phase == GoalPhase.Failed || pipeline.TestRetries > 0 || pipeline.ReviewRetries > 0
+            ? $"""
+              Failure context:
+              - Current phase: {pipeline.Phase}
+              - Review retries so far: {pipeline.ReviewRetries}
+              - Test retries so far: {pipeline.TestRetries}
+              This is a retry — consider which phases need re-running and which can be skipped.
+              """
+            : "";
+
+        var conversationSummary = pipeline.Conversation.Count > 0
+            ? $"Conversation history ({pipeline.Conversation.Count} messages): " +
+              Truncate(string.Join(" | ", pipeline.Conversation.Select(e => $"[{e.Role}] {e.Content}")), 2000)
+            : "";
+
+        var prompt = $$"""
+            Plan the workflow for iteration {{pipeline.Iteration}} of goal: {{pipeline.Description}}
+
+            {{metricsContext}}
+            {{historyContext}}
+            {{failureContext}}
+            {{conversationSummary}}
+
+            Decide the ordered phases for this iteration. Consider:
+            - Is this a doc-only change? (maybe skip review)
+            - Is this a retry after failure? (what phases need re-running)
+            - What does the metrics history suggest?
+
+            Available phases: coding, review, testing, improve, merging
+
+            Respond with JSON:
+            {
+              "phases": ["coding", "review", "testing", "merging"],
+              "phase_instructions": {
+                "coding": "specific instructions for the coder...",
+                "review": "focus review on..."
+              },
+              "reason": "why this plan"
+            }
+            """;
+
+        try
+        {
+            var session = await GetOrCreateSessionAsync(pipeline, ct);
+            var response = await SendToSessionAsync(session, prompt, ct);
+
+            pipeline.Conversation.Add(new ConversationEntry("user", Truncate(prompt, 500)));
+            pipeline.Conversation.Add(new ConversationEntry("assistant", Truncate(response, 500)));
+
+            var dto = ProtocolJson.ParseFromLlmResponse<IterationPlanDto>(response);
+            if (dto?.Phases is { Count: > 0 })
+            {
+                var plan = MapIterationPlan(dto);
+                if (plan.Phases.Count > 0)
+                {
+                    _logger.LogInformation(
+                        "Brain planned iteration {Iteration} for goal {GoalId}: [{Phases}] — {Reason}",
+                        pipeline.Iteration, pipeline.GoalId,
+                        string.Join(", ", plan.Phases), plan.Reason ?? "no reason");
+                    return plan;
+                }
+            }
+
+            _logger.LogWarning("Failed to parse iteration plan from Brain response: {Response}",
+                Truncate(response, 200));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Brain iteration planning failed for goal {GoalId}", pipeline.GoalId);
+            pipeline.Conversation.Add(new ConversationEntry("system", $"Error: {ex.Message}"));
+        }
+
+        _logger.LogInformation("Using default iteration plan for goal {GoalId}", pipeline.GoalId);
+        return IterationPlan.Default();
+    }
+
+    private static IterationPlan MapIterationPlan(IterationPlanDto dto)
+    {
+        var phases = new List<GoalPhase>();
+        foreach (var name in dto.Phases)
+        {
+            if (Enum.TryParse<GoalPhase>(name, ignoreCase: true, out var phase)
+                && phase is not (GoalPhase.Planning or GoalPhase.Done or GoalPhase.Failed))
+            {
+                phases.Add(phase);
+            }
+        }
+
+        var instructions = new Dictionary<GoalPhase, string>();
+        if (dto.PhaseInstructions is not null)
+        {
+            foreach (var (key, value) in dto.PhaseInstructions)
+            {
+                if (Enum.TryParse<GoalPhase>(key, ignoreCase: true, out var phase) && value is not null)
+                    instructions[phase] = value;
+            }
+        }
+
+        return new IterationPlan
+        {
+            Phases = phases,
+            PhaseInstructions = instructions,
+            Reason = dto.Reason,
+        };
+    }
+
+    /// <summary>DTO for deserializing the Brain's iteration plan JSON response.</summary>
+    private sealed record IterationPlanDto
+    {
+        public List<string> Phases { get; init; } = [];
+        public Dictionary<string, string>? PhaseInstructions { get; init; }
+        public string? Reason { get; init; }
+    }
+
     public async Task<string> CraftPromptAsync(
         GoalPipeline pipeline, string workerRole, string? additionalContext, CancellationToken ct = default)
     {
+        var historyContext = BuildMetricsHistoryContext(3);
+
         var prompt = $$"""
             Craft a prompt for the {{workerRole}} worker.
 
@@ -236,6 +374,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Iteration: {{pipeline.Iteration}}
             Branch: {{pipeline.CoderBranch ?? "TBD"}}
             {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
+            {{(historyContext.Length > 0 ? $"\n{historyContext}" : "")}}
 
             Rules for the prompt you craft:
             - For coders: tell them the goal, the branch to work on, remind them to commit changes and NOT run git push
@@ -428,6 +567,56 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 """,
             _ => $"Work on this goal: {pipeline.Description}",
         };
+
+    /// <summary>
+    /// Builds a concise metrics history summary from the last N iterations for inclusion in prompts.
+    /// </summary>
+    private string BuildMetricsHistoryContext(int maxIterations = 5)
+    {
+        if (_metricsTracker is null || _metricsTracker.History.Count == 0)
+            return "";
+
+        var history = _metricsTracker.History;
+        var recent = history.Skip(Math.Max(0, history.Count - maxIterations)).ToList();
+        var sb = new StringBuilder();
+
+        sb.AppendLine("Metrics History (last " + recent.Count + " iterations):");
+        foreach (var m in recent)
+        {
+            var issues = m.Issues.Count > 0 ? $", issues: [{string.Join(", ", m.Issues)}]" : "";
+            sb.AppendLine($"  - Iteration {m.Iteration}: {m.Verdict}, " +
+                $"{m.PassedTests}/{m.TotalTests} tests, {m.CoveragePercent:F1}% coverage{issues}");
+        }
+
+        // Trend analysis across the window
+        if (recent.Count >= 2)
+        {
+            var first = recent[0];
+            var last = recent[^1];
+            var coverageDelta = last.CoveragePercent - first.CoveragePercent;
+            var testDelta = last.TotalTests - first.TotalTests;
+
+            var coverageTrend = coverageDelta switch
+            {
+                > 1.0 => $"improving (+{coverageDelta:F1}% over {recent.Count} iterations)",
+                < -1.0 => $"degrading ({coverageDelta:F1}% over {recent.Count} iterations)",
+                _ => "stable",
+            };
+
+            sb.AppendLine($"Trend: Coverage {coverageTrend}, " +
+                $"test count {(testDelta > 0 ? "growing" : testDelta < 0 ? "shrinking" : "stable")}");
+        }
+
+        // Delta vs immediately previous iteration
+        if (history.Count >= 2)
+        {
+            var comparison = _metricsTracker.CompareWithPrevious(history[^1]);
+            if (comparison is not null)
+                sb.AppendLine($"Delta vs previous: {comparison}");
+        }
+
+        return sb.ToString();
+    }
 
     private void EnsureConnected()
     {
