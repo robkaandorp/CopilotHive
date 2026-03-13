@@ -25,6 +25,8 @@ public sealed class HiveConfiguration
     public int BasePort { get; init; } = 8001;
     /// <summary>When <c>true</c>, the improver phase runs after every iteration even on success.</summary>
     public bool AlwaysImprove { get; init; }
+    /// <summary>When <c>true</c>, enables verbose logging of prompts, worker output, and Brain reasoning.</summary>
+    public bool VerboseLogging { get; init; }
     /// <summary>GitHub personal access token used to authenticate Docker container spawns and git operations.</summary>
     public required string GitHubToken { get; init; }
 

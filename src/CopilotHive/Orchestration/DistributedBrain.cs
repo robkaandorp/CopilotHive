@@ -562,7 +562,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         try
         {
             var session = await GetOrCreateSessionAsync(pipeline, ct);
+
+            _logger.LogDebug("Brain prompt for {GoalId}:\n{Prompt}", pipeline.GoalId, Truncate(prompt, 4000));
+
             var response = await SendToSessionAsync(session, prompt, ct);
+
+            _logger.LogDebug("Brain response for {GoalId}:\n{Response}", pipeline.GoalId, Truncate(response, 4000));
 
             // Keep audit log in the pipeline for debugging
             pipeline.Conversation.Add(new ConversationEntry("user", Truncate(prompt, 500)));

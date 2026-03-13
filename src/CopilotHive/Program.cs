@@ -36,9 +36,10 @@ static async Task<int> RunServerAsync(string[] args)
 
     var builder = WebApplication.CreateBuilder(args);
 
-    // Suppress noisy health-check request logs
+    // Suppress noisy health-check request logs and framework noise
     builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning);
     builder.Logging.AddFilter("Microsoft.AspNetCore.Routing.EndpointMiddleware", LogLevel.Warning);
+    builder.Logging.AddFilter("Microsoft.AspNetCore.Http.Result", LogLevel.Warning);
 
     builder.Services.AddGrpc();
     builder.Services.AddSingleton<WorkerPool>();
@@ -108,6 +109,16 @@ static async Task<int> RunServerAsync(string[] args)
 
         Console.WriteLine($"[Hive] Config loaded: {hiveConfigFile.Repositories.Count} repo(s), " +
             $"{hiveConfigFile.Workers.Count} worker config(s)");
+
+        // Enable debug logging if verbose_logging is set in config
+        if (hiveConfigFile.Orchestrator.VerboseLogging)
+        {
+            builder.Logging.SetMinimumLevel(LogLevel.Debug);
+            // Keep framework noise suppressed even in verbose mode
+            builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
+            builder.Logging.AddFilter("Grpc", LogLevel.Warning);
+            Console.WriteLine("[Hive] Verbose logging enabled (Debug level)");
+        }
     }
     builder.Services.AddSingleton(sp =>
     {

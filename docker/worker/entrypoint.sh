@@ -19,9 +19,15 @@ trap shutdown SIGTERM SIGINT
 
 # --- Configuration ---
 COPILOT_PORT="${COPILOT_PORT:-8000}"
-COPILOT_LOG_LEVEL="${COPILOT_LOG_LEVEL:-info}"
+COPILOT_LOG_LEVEL="${COPILOT_LOG_LEVEL:-warn}"
 COPILOT_RESUME="${COPILOT_RESUME:-false}"
 COPILOT_MODEL="${COPILOT_MODEL:-}"
+VERBOSE_LOGGING="${VERBOSE_LOGGING:-false}"
+
+# If verbose logging is enabled, default copilot to info level
+if [[ "${VERBOSE_LOGGING}" == "true" && "${COPILOT_LOG_LEVEL}" == "warn" ]]; then
+    COPILOT_LOG_LEVEL="info"
+fi
 
 # --- Startup info ---
 echo "============================================"
@@ -59,15 +65,17 @@ COPILOT_PID=$!
 
 echo "[entrypoint] Copilot started with PID ${COPILOT_PID}"
 
-# --- Tail logs to stdout if the log directory exists ---
-(
-    sleep 2
-    LOG_DIR="${HOME}/.copilot/logs"
-    if [[ -d "${LOG_DIR}" ]]; then
-        echo "[entrypoint] Tailing Copilot logs from ${LOG_DIR}"
-        tail -F "${LOG_DIR}"/*.log 2>/dev/null || true
-    fi
-) &
+# --- Tail logs to stdout only in verbose mode ---
+if [[ "${VERBOSE_LOGGING}" == "true" ]]; then
+    (
+        sleep 2
+        LOG_DIR="${HOME}/.copilot/logs"
+        if [[ -d "${LOG_DIR}" ]]; then
+            echo "[entrypoint] Tailing Copilot logs from ${LOG_DIR}"
+            tail -F "${LOG_DIR}"/*.log 2>/dev/null || true
+        fi
+    ) &
+fi
 
 # --- Start CopilotHive Worker client (connects to orchestrator) ---
 ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-}"

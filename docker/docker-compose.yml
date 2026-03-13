@@ -33,6 +33,7 @@ services:
       - ORCHESTRATOR_URL=http://orchestrator:5000
       - WORKER_ROLE=coder
       - GH_TOKEN
+      - VERBOSE_LOGGING
       - COPILOT_MODEL=claude-sonnet-4.6
       - COPILOT_ALLOW_ALL=true
       - COPILOT_AUTO_UPDATE=true
@@ -52,6 +53,7 @@ services:
       - ORCHESTRATOR_URL=http://orchestrator:5000
       - WORKER_ROLE=reviewer
       - GH_TOKEN
+      - VERBOSE_LOGGING
       - COPILOT_MODEL=claude-sonnet-4.6
       - COPILOT_ALLOW_ALL=true
       - COPILOT_AUTO_UPDATE=true
@@ -71,6 +73,7 @@ services:
       - ORCHESTRATOR_URL=http://orchestrator:5000
       - WORKER_ROLE=tester
       - GH_TOKEN
+      - VERBOSE_LOGGING
       - COPILOT_MODEL=claude-sonnet-4.6
       - COPILOT_ALLOW_ALL=true
       - COPILOT_AUTO_UPDATE=true
@@ -90,6 +93,7 @@ services:
       - ORCHESTRATOR_URL=http://orchestrator:5000
       - WORKER_ROLE=improver
       - GH_TOKEN
+      - VERBOSE_LOGGING
       - COPILOT_MODEL=claude-sonnet-4.6
       - COPILOT_ALLOW_ALL=true
       - COPILOT_AUTO_UPDATE=true

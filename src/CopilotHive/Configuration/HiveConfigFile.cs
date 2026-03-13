@@ -50,4 +50,6 @@ public sealed class OrchestratorConfig
     public int MaxRetriesPerTask { get; set; } = 3;
     /// <summary>When <c>true</c>, the improver runs after every iteration even on success.</summary>
     public bool AlwaysImprove { get; set; }
+    /// <summary>When <c>true</c>, enables verbose logging of prompts, worker output, and Brain reasoning.</summary>
+    public bool VerboseLogging { get; set; }
 }

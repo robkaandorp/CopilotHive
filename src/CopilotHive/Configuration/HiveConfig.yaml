@@ -27,3 +27,4 @@ orchestrator:
   max_iterations: 10
   max_retries_per_task: 3
   always_improve: true
+  verbose_logging: false

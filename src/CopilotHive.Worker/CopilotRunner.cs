@@ -12,6 +12,7 @@ public sealed class CopilotRunner : IAsyncDisposable
     private CopilotSession? _session;
     private readonly int _port;
     private CustomAgentConfig? _customAgent;
+    private readonly WorkerLogger _log = new("Copilot");
 
     /// <summary>Maximum number of connection attempts before giving up.</summary>
     public int MaxConnectRetries { get; init; } = 12;
@@ -47,6 +48,7 @@ public sealed class CopilotRunner : IAsyncDisposable
             Tools = null, // all tools available for workers
         };
         Console.WriteLine($"[Copilot] Custom agent set for role '{role}' ({agentsMdContent.Length} chars)");
+        _log.Debug($"Agent prompt:\n{agentsMdContent}");
     }
 
     private SessionConfig BuildSessionConfig() => new()
@@ -71,6 +73,7 @@ public sealed class CopilotRunner : IAsyncDisposable
             {
                 _session = await _client.CreateSessionAsync(BuildSessionConfig());
                 Console.WriteLine($"[Copilot] Connected to Copilot CLI on port {_port} (attempt {attempt})");
+                _log.Debug($"Session config: streaming={false}, customAgents={(_customAgent?.Name ?? "none")}");
                 return;
             }
             catch (Exception ex) when (attempt < MaxConnectRetries)
@@ -110,7 +113,8 @@ public sealed class CopilotRunner : IAsyncDisposable
         if (_session is null)
             throw new InvalidOperationException("Not connected. Call ConnectAsync first.");
 
-        Console.WriteLine($"[Copilot] Sending prompt ({prompt.Length} chars) to localhost:{_port}");
+        _log.Info($"Sending prompt ({prompt.Length} chars) to localhost:{_port}");
+        _log.LogBlock("PROMPT TO MODEL", prompt);
 
         var done = new TaskCompletionSource<string>();
         var response = "";
@@ -136,7 +140,8 @@ public sealed class CopilotRunner : IAsyncDisposable
         await _session.SendAsync(new MessageOptions { Prompt = prompt });
         var result = await done.Task;
 
-        Console.WriteLine($"[Copilot] Received response ({result.Length} chars)");
+        _log.Info($"Received response ({result.Length} chars)");
+        _log.LogBlock("MODEL RESPONSE", result);
         return result;
     }
 

@@ -158,6 +158,14 @@ public sealed class GoalDispatcher : BackgroundService
 
     private async Task DriveNextPhaseAsync(GoalPipeline pipeline, TaskComplete complete, CancellationToken ct)
     {
+        // Log the raw worker output BEFORE Brain interpretation — critical for debugging
+        var outputPreview = complete.Output.Length > 2000
+            ? complete.Output[..2000] + $"... ({complete.Output.Length} chars total)"
+            : complete.Output;
+        _logger.LogInformation(
+            "Worker output for {GoalId} (phase={Phase}):\n{Output}",
+            pipeline.GoalId, pipeline.Phase, outputPreview);
+
         // Ask the Brain to interpret the worker output
         var interpretation = await _brain!.InterpretOutputAsync(
             pipeline,
@@ -463,6 +471,13 @@ public sealed class GoalDispatcher : BackgroundService
         }
 
         prompt ??= $"Work on: {pipeline.Description}";
+
+        // Log the prompt being sent to the worker
+        var promptPreview = prompt.Length > 1500
+            ? prompt[..1500] + $"... ({prompt.Length} chars total)"
+            : prompt;
+        _logger.LogDebug("Prompt for {Role} (goal={GoalId}):\n{Prompt}",
+            role, pipeline.GoalId, promptPreview);
 
         var branchAction = pipeline.CoderBranch is null ? BranchAction.Create : BranchAction.Checkout;
         var repositories = ResolveRepositories(pipeline.Goal);

@@ -17,6 +17,7 @@ public sealed class WorkerService(
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(30);
 
     private readonly CopilotRunner _copilotRunner = new(copilotPort);
+    private readonly WorkerLogger _log = new("Worker");
 
     /// <summary>
     /// Runs the full worker lifecycle: connects to Copilot, registers with the orchestrator,
@@ -28,7 +29,7 @@ public sealed class WorkerService(
         var workerRole = ParseRole(role);
 
         // Connect to the local Copilot CLI via SDK before registering with orchestrator
-        Console.WriteLine("[Worker] Connecting to local Copilot CLI...");
+        _log.Info("Connecting to local Copilot CLI...");
         await _copilotRunner.ConnectAsync(ct);
 
         // Enable HTTP/2 over plaintext (required for gRPC without TLS in Docker network)
@@ -53,7 +54,7 @@ public sealed class WorkerService(
 
         if (!registerResponse.Accepted)
         {
-            Console.Error.WriteLine("[Worker] Registration rejected by orchestrator.");
+            _log.Error("Registration rejected by orchestrator.");
             return;
         }
 
@@ -61,7 +62,7 @@ public sealed class WorkerService(
             ? workerId
             : registerResponse.AssignedWorkerId;
 
-        Console.WriteLine($"[Worker] Registered as {assignedId} (orchestrator v{registerResponse.OrchestratorVersion})");
+        _log.Info($"Registered as {assignedId} (orchestrator v{registerResponse.OrchestratorVersion})");
 
         // 2. Start heartbeat background task
         using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -102,7 +103,7 @@ public sealed class WorkerService(
                     taskCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
                     var assignment = message.Assignment;
-                    Console.WriteLine($"[Worker] Received task {assignment.TaskId}: {assignment.GoalDescription}");
+                    _log.Info($"Received task {assignment.TaskId}: {assignment.GoalDescription}");
 
                     // Reset Copilot session to prevent context leakage between tasks
                     await _copilotRunner.ResetSessionAsync(ct);
@@ -116,7 +117,7 @@ public sealed class WorkerService(
                         Complete = result,
                     }, ct);
 
-                    Console.WriteLine($"[Worker] Task {assignment.TaskId} completed ({result.Status})");
+                    _log.Info($"Task {assignment.TaskId} completed ({result.Status})");
 
                     // Signal ready for next task
                     await SendWorkerReady(stream, assignedId, ct);
@@ -124,14 +125,14 @@ public sealed class WorkerService(
 
                 case OrchestratorMessage.PayloadOneofCase.Cancel:
                     var cancel = message.Cancel;
-                    Console.WriteLine($"[Worker] Cancel requested for task {cancel.TaskId}: {cancel.Reason}");
+                    _log.Info($"Cancel requested for task {cancel.TaskId}: {cancel.Reason}");
                     await taskCts?.CancelAsync()!;
                     await SendWorkerReady(stream, assignedId, ct);
                     break;
 
                 case OrchestratorMessage.PayloadOneofCase.UpdateAgents:
                     var update = message.UpdateAgents;
-                    Console.WriteLine($"[Worker] Updating custom agent for role: {update.Role}");
+                    _log.Info($"Updating custom agent for role: {update.Role}");
                     _copilotRunner.SetCustomAgent(update.Role, update.AgentsMdContent);
                     break;
 
@@ -153,8 +154,6 @@ public sealed class WorkerService(
             WorkerId = assignedId,
             Ready = new WorkerReady(),
         }, ct);
-
-        Console.WriteLine("[Worker] Ready for tasks.");
     }
 
     private static async Task RunHeartbeatAsync(

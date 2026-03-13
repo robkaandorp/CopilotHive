@@ -11,6 +11,7 @@ namespace CopilotHive.Worker;
 public sealed class TaskExecutor(CopilotRunner copilotRunner)
 {
     private const string WorkRoot = "/copilot-home";
+    private readonly WorkerLogger _log = new("Task");
 
     /// <summary>
     /// Executes the full lifecycle of a task assignment: cloning repos, branching,
@@ -48,12 +49,12 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner)
                             var baseBranch = string.IsNullOrEmpty(branchInfo.BaseBranch)
                                 ? repo.DefaultBranch
                                 : branchInfo.BaseBranch;
-                            Console.WriteLine($"[Task] Creating branch {branchInfo.FeatureBranch} from {baseBranch}");
+                            _log.Info($"Creating branch {branchInfo.FeatureBranch} from {baseBranch}");
                             await GitOperations.CreateBranchAsync(targetDir, branchInfo.FeatureBranch, baseBranch, ct);
                             break;
 
                         case BranchAction.Checkout:
-                            Console.WriteLine($"[Task] Checking out branch {branchInfo.FeatureBranch}");
+                            _log.Info($"Checking out branch {branchInfo.FeatureBranch}");
                             await GitOperations.CheckoutBranchAsync(targetDir, branchInfo.FeatureBranch, ct);
                             break;
 
@@ -101,7 +102,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner)
             var enrichedPrompt = string.Join("\n", contextLines) + assignment.Prompt;
 
             // Send prompt to Copilot
-            Console.WriteLine($"[Task] Sending prompt to Copilot ({enrichedPrompt.Length} chars)");
+            _log.Info($"Sending prompt to Copilot ({enrichedPrompt.Length} chars)");
             var copilotOutput = await copilotRunner.SendPromptAsync(enrichedPrompt, primaryWorkDir, ct);
 
             // Collect git status from each repo and push changes
@@ -120,11 +121,11 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner)
                     {
                         await GitOperations.PushBranchAsync(dir, bi.FeatureBranch, ct);
                         status.Pushed = true;
-                        Console.WriteLine($"[Task] Pushed {bi.FeatureBranch} for {repo.Name}");
+                        _log.Info($"Pushed {bi.FeatureBranch} for {repo.Name}");
                     }
                     catch (Exception ex)
                     {
-                        Console.Error.WriteLine($"[Task] Push failed for {repo.Name}: {ex.Message}");
+                        _log.Error($"Push failed for {repo.Name}: {ex.Message}");
                         status.Pushed = false;
                     }
                 }
