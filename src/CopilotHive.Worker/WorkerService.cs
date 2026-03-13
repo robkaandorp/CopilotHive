@@ -180,13 +180,14 @@ public sealed class WorkerService(
 
     private static async Task UpdateAgentsMdAsync(UpdateAgents update, CancellationToken ct)
     {
-        var agentsDir = Path.Combine(AppContext.BaseDirectory, "agents");
-        Directory.CreateDirectory(agentsDir);
+        // Write to /copilot-home (WORKDIR) so Copilot discovers it alongside
+        // the generic worker-agents.md in /opt/copilot-env (additive, not overwriting)
+        var copilotHome = Environment.GetEnvironmentVariable("COPILOT_HOME") ?? "/copilot-home";
+        var filePath = Path.Combine(copilotHome, "AGENTS.md");
 
-        var filePath = Path.Combine(agentsDir, $"{update.Role}.agents.md");
         await File.WriteAllTextAsync(filePath, update.AgentsMdContent, ct);
 
-        Console.WriteLine($"[Worker] AGENTS.md updated: {filePath}");
+        Console.WriteLine($"[Worker] Role-specific AGENTS.md updated: {filePath} (role={update.Role})");
     }
 
     private static WorkerRole ParseRole(string role) => role.ToLowerInvariant() switch

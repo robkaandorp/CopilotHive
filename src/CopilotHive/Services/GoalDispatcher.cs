@@ -143,6 +143,7 @@ public sealed class GoalDispatcher : BackgroundService
         if (pipeline.Phase == GoalPhase.Improve)
         {
             WarnIfImproverPushedCode(pipeline.GoalId, complete.Output);
+            await ApplyAgentsUpdatesAsync(pipeline.GoalId, complete.Output, ct);
         }
 
         // Update metrics if available
@@ -541,6 +542,70 @@ public sealed class GoalDispatcher : BackgroundService
         {
             var stderr = await process.StandardError.ReadToEndAsync(ct);
             throw new InvalidOperationException($"git {arguments} failed: {stderr}");
+        }
+    }
+
+    /// <summary>
+    /// Parses the Improver's output for AGENTS.md updates, validates and writes them to disk,
+    /// then broadcasts the new content to all connected workers of the matching role.
+    /// </summary>
+    private async Task ApplyAgentsUpdatesAsync(string goalId, string improverOutput, CancellationToken ct)
+    {
+        if (_agentsManager is null)
+            return;
+
+        var improvements = Orchestrator.ParseImproverResponse(improverOutput);
+        if (improvements.Count == 0)
+        {
+            _logger.LogInformation("No AGENTS.md improvements parsed from Improver output for goal {GoalId}", goalId);
+            return;
+        }
+
+        foreach (var (role, newContent) in improvements)
+        {
+            var currentContent = _agentsManager.GetAgentsMd(role);
+            if (!string.IsNullOrEmpty(currentContent)
+                && !Orchestrator.ValidateImprovement(currentContent, newContent, role))
+            {
+                continue;
+            }
+
+            _agentsManager.UpdateAgentsMd(role, newContent);
+            _logger.LogInformation("Applied AGENTS.md update for {Role} (goal {GoalId})", role, goalId);
+
+            await BroadcastAgentsUpdateAsync(role, newContent, ct);
+        }
+    }
+
+    /// <summary>
+    /// Sends an UpdateAgents message to all connected workers whose role matches the given role string.
+    /// Best-effort: failures are logged but do not block the pipeline.
+    /// </summary>
+    private async Task BroadcastAgentsUpdateAsync(string role, string content, CancellationToken ct)
+    {
+        var workers = _workerPool.GetAllWorkers()
+            .Where(w => w.Role.ToString().Equals(role, StringComparison.OrdinalIgnoreCase));
+
+        var message = new OrchestratorMessage
+        {
+            UpdateAgents = new UpdateAgents
+            {
+                AgentsMdContent = content,
+                Role = role,
+            }
+        };
+
+        foreach (var worker in workers)
+        {
+            try
+            {
+                await worker.MessageChannel.Writer.WriteAsync(message, ct);
+                _logger.LogInformation("Sent updated AGENTS.md to worker {WorkerId} (role={Role})", worker.Id, role);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to send AGENTS.md update to worker {WorkerId}", worker.Id);
+            }
         }
     }
 

@@ -1,5 +1,6 @@
 using Grpc.Core;
 using Microsoft.Extensions.Logging;
+using CopilotHive.Agents;
 using CopilotHive.Shared.Grpc;
 
 namespace CopilotHive.Services;
@@ -9,7 +10,8 @@ public sealed class HiveOrchestratorService(
     TaskQueue taskQueue,
     GoalPipelineManager pipelineManager,
     TaskCompletionNotifier completionNotifier,
-    ILogger<HiveOrchestratorService> logger) : HiveOrchestrator.HiveOrchestratorBase
+    ILogger<HiveOrchestratorService> logger,
+    AgentsManager? agentsManager = null) : HiveOrchestrator.HiveOrchestratorBase
 {
     private const string OrchestratorVersion = "1.0.0";
 
@@ -156,6 +158,34 @@ public sealed class HiveOrchestratorService(
     {
         workerPool.MarkIdle(worker.Id);
         logger.LogInformation("Worker {WorkerId} is ready (role={Role})", worker.Id, worker.Role);
+
+        // Send current agents.md for this worker's role (if available)
+        if (agentsManager is not null)
+        {
+            var roleName = worker.Role.ToString().ToLowerInvariant();
+            var agentsContent = agentsManager.GetAgentsMd(roleName);
+            if (!string.IsNullOrEmpty(agentsContent))
+            {
+                try
+                {
+                    await worker.MessageChannel.Writer.WriteAsync(
+                        new OrchestratorMessage
+                        {
+                            UpdateAgents = new UpdateAgents
+                            {
+                                AgentsMdContent = agentsContent,
+                                Role = roleName,
+                            }
+                        },
+                        cancellationToken);
+                    logger.LogInformation("Sent initial AGENTS.md to worker {WorkerId} (role={Role})", worker.Id, roleName);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Failed to send initial AGENTS.md to worker {WorkerId}", worker.Id);
+                }
+            }
+        }
 
         // Check the task queue for matching work
         var task = taskQueue.TryDequeue(worker.Role);
