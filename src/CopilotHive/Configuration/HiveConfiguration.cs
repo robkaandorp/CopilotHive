@@ -18,11 +18,11 @@ public sealed class HiveConfiguration
     /// <summary>Docker image used to spawn worker containers.</summary>
     public string DockerImage { get; init; } = "robkaandorp/copilot-acp-server:dev";
     /// <summary>Maximum number of goal iterations before the session terminates.</summary>
-    public int MaxIterations { get; init; } = 10;
+    public int MaxIterations { get; init; } = Constants.DefaultMaxIterations;
     /// <summary>Maximum number of task-level retries before a goal is failed.</summary>
-    public int MaxRetriesPerTask { get; init; } = 3;
+    public int MaxRetriesPerTask { get; init; } = Constants.DefaultMaxRetriesPerTask;
     /// <summary>Starting TCP port for worker containers; each additional worker increments by one.</summary>
-    public int BasePort { get; init; } = 8001;
+    public int BasePort { get; init; } = Constants.DefaultAgentPort;
     /// <summary>When <c>true</c>, the improver phase runs after every iteration even on success.</summary>
     public bool AlwaysImprove { get; init; }
     /// <summary>When <c>true</c>, enables verbose logging of prompts, worker output, and Brain reasoning.</summary>
@@ -31,7 +31,7 @@ public sealed class HiveConfiguration
     public required string GitHubToken { get; init; }
 
     /// <summary>Fallback model when no role-specific model is set.</summary>
-    public string Model { get; init; } = "claude-opus-4.6";
+    public string Model { get; init; } = Constants.DefaultModel;
 
     /// <summary>Model for the coder role (default: claude-opus-4.6).</summary>
     public string? CoderModel { get; init; }

@@ -169,14 +169,14 @@ public sealed class Orchestrator : IAsyncDisposable
             "coder", _config.Goal, iteration, branchName, additionalContext: null, ct);
         var coderResponse = await RunWorkerAsync(
             WorkerRole.Coder, coderClone, "coder", coderPrompt, ct);
-        Console.WriteLine($"[Coder] {Truncate(coderResponse, 200)}");
+        Console.WriteLine($"[Coder] {Truncate(coderResponse, Constants.TruncationShort)}");
 
         await _gitManager.RepairRemoteAsync(coderClone, ct);
         await _gitManager.PushBranchAsync(coderClone, $"coder/{branchName}", ct);
 
         // Inform brain of coder result
         await _brain.InformAsync(
-            $"Coder completed. Output summary: {Truncate(coderResponse, 500)}", ct);
+            $"Coder completed. Output summary: {Truncate(coderResponse, Constants.TruncationMedium)}", ct);
 
         // Phase 1.5: Code Review — brain decides verdict and crafts feedback
         for (var reviewRetry = 0; reviewRetry <= _config.MaxRetriesPerTask; reviewRetry++)
@@ -191,7 +191,7 @@ public sealed class Orchestrator : IAsyncDisposable
             {
                 var skipDecision = await _brain.DecideNextStepAsync(
                     "pre_review",
-                    $"The coder has finished. Should we review this change or skip directly to testing?\nCoder output: {Truncate(coderResponse, 500)}",
+                    $"The coder has finished. Should we review this change or skip directly to testing?\nCoder output: {Truncate(coderResponse, Constants.TruncationMedium)}",
                     ct);
                 if (skipDecision.Action == OrchestratorActionType.Skip)
                 {
@@ -211,7 +211,7 @@ public sealed class Orchestrator : IAsyncDisposable
                 "reviewer", _config.Goal, iteration, branchName, reviewContext, ct);
             var reviewResponse = await RunWorkerAsync(
                 WorkerRole.Reviewer, reviewClone, "reviewer", reviewPrompt, ct);
-            Console.WriteLine($"[Reviewer] {Truncate(reviewResponse, 300)}");
+            Console.WriteLine($"[Reviewer] {Truncate(reviewResponse, Constants.TruncationBrief)}");
 
             // Brain interprets the review output
             var reviewDecision = await _brain.InterpretOutputAsync("reviewer", reviewResponse, ct);
@@ -244,7 +244,7 @@ public sealed class Orchestrator : IAsyncDisposable
                     The reviewer requested changes.
                     Review verdict: {reviewVerdict}
                     Issues: {string.Join("; ", reviewDecision.Issues ?? metrics.ReviewIssues)}
-                    Full review: {Truncate(reviewResponse, 2000)}
+                    Full review: {Truncate(reviewResponse, Constants.TruncationLong)}
                     """;
                 var fixPrompt = await _brain.CraftPromptAsync(
                     "coder", _config.Goal, iteration, branchName, fixContext, ct);
@@ -252,13 +252,13 @@ public sealed class Orchestrator : IAsyncDisposable
                 await _gitManager.PullBranchAsync(coderClone, $"coder/{branchName}", ct);
                 var fixResponse = await RunWorkerAsync(
                     WorkerRole.Coder, coderClone, "coder", fixPrompt, ct);
-                Console.WriteLine($"[Coder:review-fix] {Truncate(fixResponse, 200)}");
+                Console.WriteLine($"[Coder:review-fix] {Truncate(fixResponse, Constants.TruncationShort)}");
 
                 await _gitManager.RepairRemoteAsync(coderClone, ct);
                 await _gitManager.PushBranchAsync(coderClone, $"coder/{branchName}", ct);
 
                 await _brain.InformAsync(
-                    $"Coder addressed review feedback. Output: {Truncate(fixResponse, 300)}", ct);
+                    $"Coder addressed review feedback. Output: {Truncate(fixResponse, Constants.TruncationBrief)}", ct);
             }
             else
             {
@@ -283,7 +283,7 @@ public sealed class Orchestrator : IAsyncDisposable
                 "tester", _config.Goal, iteration, branchName, testContext, ct);
             testerResponse = await RunWorkerAsync(
                 WorkerRole.Tester, testerClone, "tester", testerPrompt, ct);
-            Console.WriteLine($"[Tester] {Truncate(testerResponse, 300)}");
+            Console.WriteLine($"[Tester] {Truncate(testerResponse, Constants.TruncationBrief)}");
 
             // Brain interprets test output
             var testDecision = await _brain.InterpretOutputAsync("tester", testerResponse, ct);
@@ -312,7 +312,7 @@ public sealed class Orchestrator : IAsyncDisposable
                     The tester found issues.
                     Verdict: {metrics.Verdict}
                     Issues: {string.Join("; ", testDecision.Issues ?? metrics.Issues)}
-                    Full report: {Truncate(testerResponse, 2000)}
+                    Full report: {Truncate(testerResponse, Constants.TruncationLong)}
                     """;
                 var fixPrompt = await _brain.CraftPromptAsync(
                     "coder", _config.Goal, iteration, branchName, fixContext, ct);
@@ -325,7 +325,7 @@ public sealed class Orchestrator : IAsyncDisposable
                 await _gitManager.PullBranchAsync(coderClone, $"coder/{branchName}", ct);
                 var fixResponse = await RunWorkerAsync(
                     WorkerRole.Coder, coderClone, "coder", fixPrompt, ct);
-                Console.WriteLine($"[Coder:fix] {Truncate(fixResponse, 200)}");
+                Console.WriteLine($"[Coder:fix] {Truncate(fixResponse, Constants.TruncationShort)}");
 
                 await _gitManager.RepairRemoteAsync(coderClone, ct);
                 await _gitManager.PushBranchAsync(coderClone, $"coder/{branchName}", ct);
@@ -344,8 +344,8 @@ public sealed class Orchestrator : IAsyncDisposable
 
             if (!mergeSuccess)
             {
-                Console.WriteLine($"[Orchestrator] Merge conflict: {Truncate(mergeOutput, 200)}");
-                metrics.Issues.Add("Merge conflict: " + Truncate(mergeOutput, 200));
+                Console.WriteLine($"[Orchestrator] Merge conflict: {Truncate(mergeOutput, Constants.TruncationShort)}");
+                metrics.Issues.Add("Merge conflict: " + Truncate(mergeOutput, Constants.TruncationShort));
             }
             else
             {
@@ -422,7 +422,7 @@ public sealed class Orchestrator : IAsyncDisposable
             ct);
         var verifyResponse = await RunWorkerAsync(
             WorkerRole.Tester, verifyClone, "tester", verifyPrompt, ct);
-        Console.WriteLine($"[Tester:verify] {Truncate(verifyResponse, 300)}");
+        Console.WriteLine($"[Tester:verify] {Truncate(verifyResponse, Constants.TruncationBrief)}");
 
         var verifyMetrics = new IterationMetrics { Iteration = iteration };
         ParseTestReport(verifyResponse, verifyMetrics);
@@ -459,7 +459,7 @@ public sealed class Orchestrator : IAsyncDisposable
             Code PASSED on the feature branch but FAILED after merging to main.
             Tester verdict after merge: {verifyMetrics.Verdict}
             Issues: {string.Join("; ", verifyMetrics.Issues)}
-            Full report: {Truncate(verifyResponse, 2000)}
+            Full report: {Truncate(verifyResponse, Constants.TruncationLong)}
             """;
 
         var fixPrompt = await _brain.CraftPromptAsync(
@@ -468,7 +468,7 @@ public sealed class Orchestrator : IAsyncDisposable
         await _gitManager.PullBranchAsync(coderClone, $"coder/{branchName}", ct);
         var fixResponse = await RunWorkerAsync(
             WorkerRole.Coder, coderClone, "coder", fixPrompt, ct);
-        Console.WriteLine($"[Coder:postmerge-fix] {Truncate(fixResponse, 200)}");
+        Console.WriteLine($"[Coder:postmerge-fix] {Truncate(fixResponse, Constants.TruncationShort)}");
 
         await _gitManager.RepairRemoteAsync(coderClone, ct);
         await _gitManager.PushBranchAsync(coderClone, $"coder/{branchName}", ct);
@@ -483,7 +483,7 @@ public sealed class Orchestrator : IAsyncDisposable
             "This is a RE-TEST after a post-merge fix. The coder fixed issues that appeared after merging to main. Run ALL tests.", ct);
         var retestResponse = await RunWorkerAsync(
             WorkerRole.Tester, retestClone, "tester", retestPrompt, ct);
-        Console.WriteLine($"[Tester:retest] {Truncate(retestResponse, 300)}");
+        Console.WriteLine($"[Tester:retest] {Truncate(retestResponse, Constants.TruncationBrief)}");
 
         ParseTestReport(retestResponse, metrics);
         var retestDecision = await _brain.InterpretOutputAsync("tester", retestResponse, ct);
@@ -505,7 +505,7 @@ public sealed class Orchestrator : IAsyncDisposable
 
         if (!remergeSuccess)
         {
-            Console.WriteLine($"[Orchestrator] Re-merge failed: {Truncate(remergeOutput, 200)}");
+            Console.WriteLine($"[Orchestrator] Re-merge failed: {Truncate(remergeOutput, Constants.TruncationShort)}");
             metrics.Issues.Add("Re-merge failed after post-merge fix");
             return false;
         }

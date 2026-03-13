@@ -255,7 +255,7 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
             Interpret this {{workerRole}}'s output and extract structured data.
 
             === {{workerRole.ToUpperInvariant()}} OUTPUT (truncated) ===
-            {{Truncate(workerOutput, 6000)}}
+            {{Truncate(workerOutput, Constants.TruncationVeryLong)}}
             === END OUTPUT ===
 
             Analyze the output carefully:
@@ -325,7 +325,7 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
         var response = await _client!.SendTaskAsync(
             $"[STATUS UPDATE] {information}\n\nAcknowledge briefly.", ct);
         _conversation.Add(new ConversationEntry("system", information));
-        _conversation.Add(new ConversationEntry("assistant", Truncate(response, 200)));
+        _conversation.Add(new ConversationEntry("assistant", Truncate(response, Constants.TruncationShort)));
     }
 
     private async Task<T?> AskAsync<T>(string prompt, CancellationToken ct) where T : class
@@ -337,11 +337,11 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
         try
         {
             var response = await _client!.SendTaskAsync(prompt, ct);
-            _conversation.Add(new ConversationEntry("assistant", Truncate(response, 500)));
+            _conversation.Add(new ConversationEntry("assistant", Truncate(response, Constants.TruncationMedium)));
 
             var parsed = ProtocolJson.ParseFromLlmResponse<T>(response);
             if (parsed is null)
-                Console.WriteLine($"[Brain] ⚠ Failed to parse JSON from LLM response: {Truncate(response, 200)}");
+                Console.WriteLine($"[Brain] ⚠ Failed to parse JSON from LLM response: {Truncate(response, Constants.TruncationShort)}");
 
             return parsed;
         }

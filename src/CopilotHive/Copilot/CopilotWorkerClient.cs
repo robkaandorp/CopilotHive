@@ -13,9 +13,9 @@ public sealed class CopilotWorkerClient : ICopilotWorkerClient
     private readonly int _port;
 
     /// <summary>Maximum number of connection attempts before throwing.</summary>
-    public int MaxConnectRetries { get; init; } = 12;
+    public int MaxConnectRetries { get; init; } = Constants.CopilotRunnerMaxRetries;
     /// <summary>Delay between consecutive connection attempts.</summary>
-    public TimeSpan RetryDelay { get; init; } = TimeSpan.FromSeconds(5);
+    public TimeSpan RetryDelay { get; init; } = TimeSpan.FromSeconds(Constants.RetryDelaySeconds);
 
     /// <summary>
     /// Initialises a new <see cref="CopilotWorkerClient"/> that connects to the given port.
@@ -40,7 +40,7 @@ public sealed class CopilotWorkerClient : ICopilotWorkerClient
     public async Task ConnectAsync(CancellationToken ct = default)
     {
         // Wait for the container to boot before first connection attempt
-        await Task.Delay(TimeSpan.FromSeconds(10), ct);
+        await Task.Delay(TimeSpan.FromSeconds(Constants.WorkerBootDelaySeconds), ct);
 
         await _client.StartAsync();
         Exception? lastException = null;

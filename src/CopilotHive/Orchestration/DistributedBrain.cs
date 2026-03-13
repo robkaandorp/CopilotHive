@@ -78,7 +78,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
-    /// Connects to the Copilot CLI, retrying up to 20 times with a 5-second backoff.
+    /// Connects to the Copilot CLI, retrying up to <see cref="Constants.DistributedBrainMaxRetries"/> times with a 5-second backoff.
     /// </summary>
     /// <param name="ct">Cancellation token.</param>
     public async Task ConnectAsync(CancellationToken ct = default)
@@ -91,7 +91,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         // Retry connection to Copilot CLI
         Exception? lastException = null;
-        for (var attempt = 1; attempt <= 20; attempt++)
+        for (var attempt = 1; attempt <= Constants.DistributedBrainMaxRetries; attempt++)
         {
             try
             {
@@ -99,16 +99,16 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 _logger.LogInformation("Brain connected to Copilot on port {Port} (attempt {Attempt})", _port, attempt);
                 return;
             }
-            catch (Exception ex) when (attempt < 20)
+            catch (Exception ex) when (attempt < Constants.DistributedBrainMaxRetries)
             {
                 lastException = ex;
-                _logger.LogDebug("Brain connection attempt {Attempt}/20 failed: {Message}", attempt, ex.Message);
-                await Task.Delay(TimeSpan.FromSeconds(5), ct);
+                _logger.LogDebug("Brain connection attempt {Attempt}/{Max} failed: {Message}", attempt, Constants.DistributedBrainMaxRetries, ex.Message);
+                await Task.Delay(TimeSpan.FromSeconds(Constants.RetryDelaySeconds), ct);
             }
         }
 
         throw new InvalidOperationException(
-            $"Brain failed to connect to Copilot on port {_port} after 20 attempts: {lastException?.Message}");
+            $"Brain failed to connect to Copilot on port {_port} after {Constants.DistributedBrainMaxRetries} attempts: {lastException?.Message}");
     }
 
     /// <summary>
@@ -194,7 +194,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 {pipeline.Description}
 
                 Here is the conversation so far (summarized from {entries.Count} messages):
-                {Truncate(summary, 8000)}
+                {Truncate(summary, Constants.TruncationFull)}
 
                 Continue from where we left off. The current phase is {pipeline.Phase},
                 iteration {pipeline.Iteration}. Acknowledge briefly and await instructions.
@@ -303,7 +303,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         var conversationSummary = pipeline.Conversation.Count > 0
             ? $"Conversation history ({pipeline.Conversation.Count} messages): " +
-              Truncate(string.Join(" | ", pipeline.Conversation.Select(e => $"[{e.Role}] {e.Content}")), 2000)
+              Truncate(string.Join(" | ", pipeline.Conversation.Select(e => $"[{e.Role}] {e.Content}")), Constants.TruncationLong)
             : "";
 
         var prompt = $$"""
@@ -337,8 +337,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             var session = await GetOrCreateSessionAsync(pipeline, ct);
             var response = await SendToSessionAsync(session, prompt, ct);
 
-            pipeline.Conversation.Add(new ConversationEntry("user", Truncate(prompt, 500)));
-            pipeline.Conversation.Add(new ConversationEntry("assistant", Truncate(response, 500)));
+            pipeline.Conversation.Add(new ConversationEntry("user", Truncate(prompt, Constants.TruncationMedium)));
+            pipeline.Conversation.Add(new ConversationEntry("assistant", Truncate(response, Constants.TruncationMedium)));
 
             var dto = ProtocolJson.ParseFromLlmResponse<IterationPlanDto>(response);
             if (dto?.Phases is { Count: > 0 })
@@ -355,7 +355,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             }
 
             _logger.LogWarning("Failed to parse iteration plan from Brain response: {Response}",
-                Truncate(response, 200));
+                Truncate(response, Constants.TruncationShort));
         }
         catch (Exception ex)
         {
@@ -491,7 +491,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Interpret this {{workerRole}}'s output and extract structured data.
 
             === {{workerRole.ToUpperInvariant()}} OUTPUT (truncated) ===
-            {{Truncate(workerOutput, 6000)}}
+            {{Truncate(workerOutput, Constants.TruncationVeryLong)}}
             === END OUTPUT ===
 
             Analyze the output carefully:
@@ -565,19 +565,19 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             var session = await GetOrCreateSessionAsync(pipeline, ct);
 
-            _logger.LogDebug("Brain prompt for {GoalId}:\n{Prompt}", pipeline.GoalId, Truncate(prompt, 4000));
+            _logger.LogDebug("Brain prompt for {GoalId}:\n{Prompt}", pipeline.GoalId, Truncate(prompt, Constants.TruncationVerbose));
 
             var response = await SendToSessionAsync(session, prompt, ct);
 
-            _logger.LogDebug("Brain response for {GoalId}:\n{Response}", pipeline.GoalId, Truncate(response, 4000));
+            _logger.LogDebug("Brain response for {GoalId}:\n{Response}", pipeline.GoalId, Truncate(response, Constants.TruncationVerbose));
 
             // Keep audit log in the pipeline for debugging
-            pipeline.Conversation.Add(new ConversationEntry("user", Truncate(prompt, 500)));
-            pipeline.Conversation.Add(new ConversationEntry("assistant", Truncate(response, 500)));
+            pipeline.Conversation.Add(new ConversationEntry("user", Truncate(prompt, Constants.TruncationMedium)));
+            pipeline.Conversation.Add(new ConversationEntry("assistant", Truncate(response, Constants.TruncationMedium)));
 
             var parsed = ProtocolJson.ParseFromLlmResponse<OrchestratorDecision>(response);
             if (parsed is null)
-                _logger.LogWarning("Failed to parse Brain JSON response: {Response}", Truncate(response, 200));
+                _logger.LogWarning("Failed to parse Brain JSON response: {Response}", Truncate(response, Constants.TruncationShort));
 
             return parsed;
         }
@@ -611,7 +611,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         });
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(TimeSpan.FromMinutes(3));
+        cts.CancelAfter(TimeSpan.FromMinutes(Constants.TaskTimeoutMinutes));
         using var ctReg = cts.Token.Register(() => done.TrySetCanceled());
 
         await session.SendAsync(new MessageOptions { Prompt = prompt });

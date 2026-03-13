@@ -1,3 +1,4 @@
+using CopilotHive;
 using CopilotHive.Agents;
 using CopilotHive.Configuration;
 using CopilotHive.Goals;
@@ -21,7 +22,7 @@ return await RunCliAsync(args);
 
 static async Task<int> RunServerAsync(string[] args)
 {
-    var port = 5000;
+    var port = Constants.DefaultHttpPort;
     var portArg = args.FirstOrDefault(a => a.StartsWith("--port="));
     if (portArg is not null && int.TryParse(portArg["--port=".Length..], out var p))
         port = p;
