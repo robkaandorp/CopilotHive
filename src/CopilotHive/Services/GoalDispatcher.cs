@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using CopilotHive.Agents;
 using CopilotHive.Configuration;
 using CopilotHive.Goals;
+using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Shared.Grpc;
 
@@ -20,6 +22,8 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly TaskQueue _taskQueue;
     private readonly WorkerPool _workerPool;
     private readonly IDistributedBrain? _brain;
+    private readonly AgentsManager? _agentsManager;
+    private readonly MetricsTracker? _metricsTracker;
     private readonly ILogger<GoalDispatcher> _logger;
     private readonly HiveConfigFile? _config;
 
@@ -35,13 +39,17 @@ public sealed class GoalDispatcher : BackgroundService
         TaskCompletionNotifier completionNotifier,
         ILogger<GoalDispatcher> logger,
         IDistributedBrain? brain = null,
-        HiveConfigFile? config = null)
+        HiveConfigFile? config = null,
+        MetricsTracker? metricsTracker = null,
+        AgentsManager? agentsManager = null)
     {
         _goalManager = goalManager;
         _pipelineManager = pipelineManager;
         _taskQueue = taskQueue;
         _workerPool = workerPool;
         _brain = brain;
+        _agentsManager = agentsManager;
+        _metricsTracker = metricsTracker;
         _logger = logger;
         _config = config;
 
@@ -126,6 +134,12 @@ public sealed class GoalDispatcher : BackgroundService
 
         _logger.LogInformation("Brain interpretation for {GoalId}: Action={Action}, Verdict={Verdict}",
             pipeline.GoalId, interpretation.Action, interpretation.Verdict ?? interpretation.ReviewVerdict);
+
+        // Validate that the Improver did not push source code changes
+        if (pipeline.Phase == GoalPhase.Improve)
+        {
+            WarnIfImproverPushedCode(pipeline.GoalId, complete.Output);
+        }
 
         // Update metrics if available
         if (interpretation.TestMetrics is not null)
@@ -296,12 +310,18 @@ public sealed class GoalDispatcher : BackgroundService
             case GoalPhase.Improve:
                 pipeline.AdvanceTo(GoalPhase.Improve);
                 _logger.LogInformation("Dispatching Improver for goal {GoalId} (always_improve=true)", pipeline.GoalId);
+                const string improveConstraint =
+                    "The goal is complete. Analyze the iteration and update ONLY the *.agents.md files "
+                    + "to improve instructions for future iterations. "
+                    + "Do NOT modify any source code, tests, or configuration files. "
+                    + "Do NOT run git add, git commit, or git push. "
+                    + "Return your AGENTS.md recommendations in the response text only.";
                 var improvePrompt = _brain is not null
-                    ? await _brain.CraftPromptAsync(pipeline, "improver",
-                        "The goal is complete. Analyze the iteration and update ONLY the *.agents.md files "
-                        + "to improve instructions for future iterations. Do NOT modify any source code or tests.", ct)
+                    ? await _brain.CraftPromptAsync(pipeline, "improver", improveConstraint, ct)
                     : "Analyze the iteration and update the *.agents.md files to improve instructions for future iterations. "
-                      + "Do NOT modify any source code or tests.";
+                      + "Do NOT modify any source code, tests, or configuration files. "
+                      + "Do NOT run git add, git commit, or git push. "
+                      + "Return your AGENTS.md recommendations in the response text only.";
                 await DispatchToRole(pipeline, WorkerRole.Improver, improvePrompt, ct);
                 return true;
 
@@ -340,6 +360,13 @@ public sealed class GoalDispatcher : BackgroundService
         if (branchAction == BranchAction.Checkout && pipeline.CoderBranch is not null && task.BranchInfo is not null)
         {
             task.BranchInfo.FeatureBranch = pipeline.CoderBranch;
+        }
+
+        // Improver operates read-only: it can see the feature branch but must not push.
+        // Downgrade the action to Unspecified so the worker runtime skips push operations.
+        if (role == WorkerRole.Improver && task.BranchInfo is not null)
+        {
+            task.BranchInfo.Action = BranchAction.Unspecified;
         }
 
         pipeline.SetActiveTask(task.TaskId, task.BranchInfo?.FeatureBranch);
@@ -427,6 +454,31 @@ public sealed class GoalDispatcher : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Defense-in-depth: scan the Improver's output for evidence of git push/commit
+    /// operations. The Improver should only return AGENTS.md recommendations in its
+    /// response text — any source-code pushes are ignored by the pipeline, but we
+    /// log a warning so operators can investigate.
+    /// </summary>
+    private void WarnIfImproverPushedCode(string goalId, string output)
+    {
+        if (string.IsNullOrEmpty(output))
+            return;
+
+        ReadOnlySpan<string> suspiciousPatterns = ["git push", "git commit", "git add"];
+        foreach (var pattern in suspiciousPatterns)
+        {
+            if (output.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning(
+                    "Improver for goal {GoalId} output contains '{Pattern}' — " +
+                    "source code modifications from the Improver are not applied. " +
+                    "Only *.agents.md changes parsed from the response text are used.",
+                    goalId, pattern);
+            }
+        }
+    }
+
     private async Task MarkGoalCompleted(GoalPipeline pipeline, CancellationToken ct)
     {
         pipeline.AdvanceTo(GoalPhase.Done);
@@ -434,13 +486,19 @@ public sealed class GoalDispatcher : BackgroundService
         await CleanupBrainSessionAsync(pipeline.GoalId);
 
         var duration = pipeline.CompletedAt.HasValue
-            ? (pipeline.CompletedAt.Value - pipeline.CreatedAt).TotalMinutes
-            : 0;
+            ? pipeline.CompletedAt.Value - pipeline.CreatedAt
+            : TimeSpan.Zero;
+
+        pipeline.Metrics.Iteration = pipeline.Iteration;
+        pipeline.Metrics.Duration = duration;
+        pipeline.Metrics.Verdict = "PASS";
+        PopulateAgentsMdVersions(pipeline);
+        _metricsTracker?.RecordIteration(pipeline.Metrics);
 
         _logger.LogInformation(
             "🎉 Goal {GoalId} completed! Iterations={Iterations}, Duration={Duration:F1}min, " +
             "Tests={Passed}/{Total}, Coverage={Coverage:F1}%",
-            pipeline.GoalId, pipeline.Iteration, duration,
+            pipeline.GoalId, pipeline.Iteration, duration.TotalMinutes,
             pipeline.Metrics.PassedTests, pipeline.Metrics.TotalTests,
             pipeline.Metrics.CoveragePercent);
     }
@@ -450,6 +508,17 @@ public sealed class GoalDispatcher : BackgroundService
         pipeline.AdvanceTo(GoalPhase.Failed);
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Failed, ct);
         await CleanupBrainSessionAsync(pipeline.GoalId);
+
+        var duration = pipeline.CompletedAt.HasValue
+            ? pipeline.CompletedAt.Value - pipeline.CreatedAt
+            : TimeSpan.Zero;
+
+        pipeline.Metrics.Iteration = pipeline.Iteration;
+        pipeline.Metrics.Duration = duration;
+        pipeline.Metrics.Verdict = "FAIL";
+        PopulateAgentsMdVersions(pipeline);
+        _metricsTracker?.RecordIteration(pipeline.Metrics);
+
         _logger.LogWarning("Goal {GoalId} failed: {Reason}", pipeline.GoalId, reason);
     }
 
@@ -459,6 +528,18 @@ public sealed class GoalDispatcher : BackgroundService
         {
             try { await brain.CleanupGoalSessionAsync(goalId); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to cleanup Brain session for goal {GoalId}", goalId); }
+        }
+    }
+
+    private void PopulateAgentsMdVersions(GoalPipeline pipeline)
+    {
+        if (_agentsManager is not null)
+        {
+            foreach (var role in new[] { "coder", "tester", "reviewer", "improver", "orchestrator" })
+            {
+                var history = _agentsManager.GetHistory(role);
+                pipeline.Metrics.AgentsMdVersions[role] = $"v{history.Length:D3}";
+            }
         }
     }
 
