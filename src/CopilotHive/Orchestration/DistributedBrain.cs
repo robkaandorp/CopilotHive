@@ -428,8 +428,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {{(historyContext.Length > 0 ? $"\n{historyContext}" : "")}}
 
             Rules for the prompt you craft:
-            - For coders: tell them the goal, the branch to work on, remind them to commit changes and NOT run git push
-            - For reviewers: tell them to review the diff on the branch against the base branch, produce a REVIEW_REPORT
+            - CRITICAL: The branch name is EXACTLY "{{pipeline.CoderBranch ?? "TBD"}}" — do NOT invent or change it
+            - The worker infrastructure handles branch creation, checkout, and pushing — do NOT tell workers to create branches or push
+            - For coders: tell them the goal, remind them to commit changes. Do NOT include git branch or git push commands.
+            - For reviewers: tell them to review the diff on branch "{{pipeline.CoderBranch ?? "TBD"}}" against the base branch, produce a REVIEW_REPORT
             - For testers: tell them to build, run tests, write integration tests, produce a TEST_REPORT
             - Include any context from previous phases that would help the worker
 
