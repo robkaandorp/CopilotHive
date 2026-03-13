@@ -24,7 +24,7 @@ var capabilities = Environment.GetEnvironmentVariable("WORKER_CAPABILITIES")
     ?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
     ?? [];
 
-var copilotPort = int.TryParse(Environment.GetEnvironmentVariable("COPILOT_PORT"), out var p) ? p : 8000;
+var copilotPort = int.TryParse(Environment.GetEnvironmentVariable("COPILOT_PORT"), out var p) ? p : WorkerConstants.DefaultAgentPort;
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) =>

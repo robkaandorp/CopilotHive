@@ -85,7 +85,7 @@ public sealed class DockerWorkerManager : IWorkerManager
                 Env =
                 [
                     "COPILOT_MODE=headless",
-                    $"COPILOT_PORT=8000",
+                    $"COPILOT_PORT={Constants.DefaultAgentPort}",
                     $"GH_TOKEN={_config.GitHubToken}",
                     $"COPILOT_MODEL={model}",
                     "COPILOT_ALLOW_ALL=true",
@@ -93,7 +93,7 @@ public sealed class DockerWorkerManager : IWorkerManager
                 ],
                 ExposedPorts = new Dictionary<string, EmptyStruct>
                 {
-                    ["8000/tcp"] = default,
+                    [$"{Constants.DefaultAgentPort}/tcp"] = default,
                 },
                 HostConfig = new HostConfig
                 {
@@ -104,7 +104,7 @@ public sealed class DockerWorkerManager : IWorkerManager
                     ],
                     PortBindings = new Dictionary<string, IList<PortBinding>>
                     {
-                        ["8000/tcp"] = [new PortBinding { HostPort = port.ToString() }],
+                        [$"{Constants.DefaultAgentPort}/tcp"] = [new PortBinding { HostPort = port.ToString() }],
                     },
                 },
             },

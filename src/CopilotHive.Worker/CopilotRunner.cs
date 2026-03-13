@@ -15,15 +15,15 @@ public sealed class CopilotRunner : IAsyncDisposable
     private readonly WorkerLogger _log = new("Copilot");
 
     /// <summary>Maximum number of connection attempts before giving up.</summary>
-    public int MaxConnectRetries { get; init; } = 12;
+    public int MaxConnectRetries { get; init; } = WorkerConstants.MaxConnectRetries;
     /// <summary>Delay between consecutive connection attempts.</summary>
-    public TimeSpan RetryDelay { get; init; } = TimeSpan.FromSeconds(5);
+    public TimeSpan RetryDelay { get; init; } = WorkerConstants.RetryDelay;
 
     /// <summary>
     /// Initialises a new <see cref="CopilotRunner"/> connecting on the given <paramref name="port"/>.
     /// </summary>
     /// <param name="port">The TCP port the Copilot CLI headless server is listening on.</param>
-    public CopilotRunner(int port = 8000)
+    public CopilotRunner(int port = WorkerConstants.DefaultAgentPort)
     {
         _port = port;
         _client = new CopilotClient(new CopilotClientOptions
