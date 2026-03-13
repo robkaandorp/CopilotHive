@@ -212,8 +212,8 @@ static async Task<int> RunCliAsync(string[] args)
     var workspace = args.FirstOrDefault(a => a.StartsWith("--workspace="))?[12..] ?? "./workspaces";
     var source = args.FirstOrDefault(a => a.StartsWith("--source="))?[9..];
     var maxIterations = int.TryParse(
-        args.FirstOrDefault(a => a.StartsWith("--max-iterations="))?[17..], out var mi) ? mi : 10;
-    var model = args.FirstOrDefault(a => a.StartsWith("--model="))?[8..] ?? "claude-opus-4.6";
+        args.FirstOrDefault(a => a.StartsWith("--max-iterations="))?[17..], out var mi) ? mi : Constants.DefaultMaxIterations;
+    var model = args.FirstOrDefault(a => a.StartsWith("--model="))?[8..] ?? Constants.DefaultModel;
     var coderModel = args.FirstOrDefault(a => a.StartsWith("--coder-model="))?[14..];
     var reviewerModel = args.FirstOrDefault(a => a.StartsWith("--reviewer-model="))?[17..];
     var testerModel = args.FirstOrDefault(a => a.StartsWith("--tester-model="))?[15..];
@@ -234,8 +234,8 @@ static async Task<int> RunCliAsync(string[] args)
         Console.Error.WriteLine("  --goal=<text>            The objective for the hive to accomplish (required)");
         Console.Error.WriteLine("  --workspace=<path>       Workspace root directory (default: ./workspaces)");
         Console.Error.WriteLine("  --source=<path>          Project source directory to seed workspace with");
-        Console.Error.WriteLine("  --max-iterations=<n>     Maximum iteration count (default: 10)");
-        Console.Error.WriteLine("  --model=<model>          Fallback model for all roles (default: claude-opus-4.6)");
+        Console.Error.WriteLine($"  --max-iterations=<n>     Maximum iteration count (default: {Constants.DefaultMaxIterations})");
+        Console.Error.WriteLine($"  --model=<model>          Fallback model for all roles (default: {Constants.DefaultModel})");
         Console.Error.WriteLine("  --coder-model=<model>    Model for coder role (default: claude-opus-4.6)");
         Console.Error.WriteLine("  --reviewer-model=<model> Model for reviewer role (default: gpt-5.3-codex)");
         Console.Error.WriteLine("  --tester-model=<model>   Model for tester role (default: claude-sonnet-4.6)");

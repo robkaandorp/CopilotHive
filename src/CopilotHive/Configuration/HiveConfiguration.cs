@@ -22,7 +22,7 @@ public sealed class HiveConfiguration
     /// <summary>Maximum number of task-level retries before a goal is failed.</summary>
     public int MaxRetriesPerTask { get; init; } = Constants.DefaultMaxRetriesPerTask;
     /// <summary>Starting TCP port for worker containers; each additional worker increments by one.</summary>
-    public int BasePort { get; init; } = Constants.DefaultAgentPort;
+    public int BasePort { get; init; } = Constants.DefaultBasePort;
     /// <summary>When <c>true</c>, the improver phase runs after every iteration even on success.</summary>
     public bool AlwaysImprove { get; init; }
     /// <summary>When <c>true</c>, enables verbose logging of prompts, worker output, and Brain reasoning.</summary>

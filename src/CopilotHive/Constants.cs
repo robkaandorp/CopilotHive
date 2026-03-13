@@ -16,6 +16,7 @@ internal static class Constants
     // Ports
     public const int DefaultHttpPort  = 5000;
     public const int DefaultAgentPort = 8000;
+    public const int DefaultBasePort  = 8001;
 
     // Truncation lengths
     public const int TruncationShort    = 200;
