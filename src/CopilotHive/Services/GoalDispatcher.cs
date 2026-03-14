@@ -219,11 +219,12 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogInformation("Brain interpretation for {GoalId}: Action={Action}, Verdict={Verdict}",
             pipeline.GoalId, interpretation.Action, interpretation.Verdict ?? interpretation.ReviewVerdict);
 
-        // Validate that the Improver did not push source code changes
+        // After Improver: sync config repo to pick up the changes it pushed directly
         if (pipeline.Phase == GoalPhase.Improve)
         {
-            WarnIfImproverPushedCode(pipeline.GoalId, complete.Output);
-            await ApplyAgentsUpdatesAsync(pipeline.GoalId, complete.Output, ct);
+            _logger.LogInformation("Improver completed for goal {GoalId} — syncing config repo for updated agents.md files",
+                pipeline.GoalId);
+            await SyncAgentsFromConfigRepoAsync(ct);
         }
 
         // Update metrics if available from Brain interpretation
@@ -475,6 +476,9 @@ public sealed class GoalDispatcher : BackgroundService
                 pipeline.AdvanceTo(GoalPhase.Improve);
                 _logger.LogInformation("Dispatching Improver for goal {GoalId}", pipeline.GoalId);
 
+                // Pull the config repo to ensure the improver container starts with the latest agents.md files
+                await SyncAgentsFromConfigRepoAsync(ct);
+
                 var analysis = "";
                 if (_improvementAnalyzer is not null && _agentsManager is not null && _metricsTracker is not null)
                 {
@@ -487,10 +491,11 @@ public sealed class GoalDispatcher : BackgroundService
                     analysis = _improvementAnalyzer.BuildAnalysis(pipeline.Metrics, _metricsTracker.History, agentsMd);
                 }
 
-                var improveContext = "Analyze the iteration and update ONLY the *.agents.md files.\n\n" + analysis + "\n\n"
-                    + "Output format: === IMPROVED {role}.agents.md === ... === END {role}.agents.md === "
-                    + "for changed roles. === UNCHANGED {role}.agents.md === for unchanged roles. "
-                    + "Do NOT modify any source code or tests.";
+                var improveContext = "Analyze the iteration and update the *.agents.md files directly.\n\n" + analysis + "\n\n"
+                    + "You have access to the agents/ folder containing *.agents.md files. "
+                    + "Read, edit, and save the files directly using the file tools. "
+                    + "Only modify files that need changes based on the evidence. "
+                    + "Do NOT modify any source code or tests — only *.agents.md files.";
                 if (!string.IsNullOrEmpty(phaseInstructions))
                     improveContext = phaseInstructions + "\n\n" + improveContext;
 

@@ -42,12 +42,34 @@ if [[ -n "${COPILOT_MODEL}" ]]; then
 fi
 echo "============================================"
 
+# --- Config repo clone for improver role ---
+CONFIG_REPO_DIR="/config-repo"
+CONFIG_AGENTS_DIR="${CONFIG_REPO_DIR}/agents"
+
+if [[ "${WORKER_ROLE:-}" == "improver" && -n "${CONFIG_REPO_URL:-}" ]]; then
+    echo "[entrypoint] Improver role: cloning config repo..."
+    CONFIG_CLONE_URL="${CONFIG_REPO_URL}"
+    if [[ -n "${GH_TOKEN:-}" && "${CONFIG_CLONE_URL}" == https://github.com/* ]]; then
+        CONFIG_CLONE_URL="${CONFIG_CLONE_URL/https:\/\/github.com\//https://x-access-token:${GH_TOKEN}@github.com/}"
+    fi
+    git clone "${CONFIG_CLONE_URL}" "${CONFIG_REPO_DIR}"
+    git -C "${CONFIG_REPO_DIR}" config user.email "copilothive-improver@local"
+    git -C "${CONFIG_REPO_DIR}" config user.name "CopilotHive Improver"
+    echo "[entrypoint] Config repo cloned to ${CONFIG_REPO_DIR}"
+fi
+
 # Build command (after model is printed)
 COPILOT_ARGS=(
     --add-dir /copilot-home
     --headless
     --port "$COPILOT_PORT"
 )
+
+# Improver: also add the config repo agents subfolder so Copilot can edit *.agents.md
+if [[ "${WORKER_ROLE:-}" == "improver" && -d "${CONFIG_AGENTS_DIR}" ]]; then
+    COPILOT_ARGS+=(--add-dir "${CONFIG_AGENTS_DIR}")
+    echo "[entrypoint] Added --add-dir ${CONFIG_AGENTS_DIR} for improver"
+fi
 
 if [[ "${COPILOT_RESUME}" == "true" ]]; then
     COPILOT_ARGS+=(--resume)

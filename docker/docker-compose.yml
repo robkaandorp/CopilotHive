@@ -97,6 +97,7 @@ services:
       - COPILOT_MODEL=claude-sonnet-4.6
       - COPILOT_ALLOW_ALL=true
       - COPILOT_AUTO_UPDATE=true
+      - CONFIG_REPO_URL=https://github.com/robkaandorp/CopilotHive-Config.git
     depends_on:
       orchestrator:
         condition: service_healthy

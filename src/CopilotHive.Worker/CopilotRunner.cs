@@ -71,12 +71,9 @@ public sealed class CopilotRunner : IAsyncDisposable
 
     private SessionConfig BuildSessionConfig()
     {
-        var isImprover = _role == "improver";
         var config = new SessionConfig
         {
-            // Improver is pure text-in/text-out with DenyAllPermissions;
-            // streaming can cause hangs when the model tries tools that all get denied.
-            Streaming = !isImprover,
+            Streaming = true,
             OnPermissionRequest = GetPermissionHandlerForRole(_role),
             CustomAgents = _customAgent is not null ? [_customAgent] : [],
         };
@@ -98,8 +95,7 @@ public sealed class CopilotRunner : IAsyncDisposable
         var tools = new List<AIFunction>();
 
         // Only register orchestrator tools for roles that have a bridge
-        // and are not the improver (which has DenyAll permissions)
-        if (_toolBridge is null || _role == "improver")
+        if (_toolBridge is null)
             return tools;
 
         tools.Add(AIFunctionFactory.Create(
@@ -133,20 +129,25 @@ public sealed class CopilotRunner : IAsyncDisposable
     /// <summary>Returns the tool whitelist for a given role. Null means all tools.</summary>
     internal static List<string>? GetToolsForRole(string? role) => role switch
     {
-        // Improver is text-in/text-out only — restrict to no tools.
-        // Using a non-existent tool name as a whitelist effectively blocks all tools
-        // without hitting the SDK TypeError that an empty list causes.
-        "improver" => ["none"],
-        _ => null,              // coder, tester, reviewer get all tools
+        _ => null,  // all roles get full tool access (permissions control what's allowed)
     };
 
     /// <summary>Returns the permission handler appropriate for the role.</summary>
     internal static PermissionRequestHandler GetPermissionHandlerForRole(string? role) => role switch
     {
-        "improver" => DenyAllPermissions,
+        "improver" => ImproverPermissions,
         "reviewer" => ReviewerPermissions,
         _ => PermissionHandler.ApproveAll,  // coder, tester
     };
+
+    /// <summary>Improver: can read and write *.agents.md files but cannot execute shell commands.</summary>
+    private static readonly PermissionRequestHandler ImproverPermissions =
+        (request, _) => Task.FromResult(new PermissionRequestResult
+        {
+            Kind = request.Kind is "shell" or "command"
+                ? PermissionRequestResultKind.DeniedByRules
+                : PermissionRequestResultKind.Approved,
+        });
 
     private static readonly PermissionRequestHandler DenyAllPermissions =
         (_, _) => Task.FromResult(new PermissionRequestResult

@@ -11,6 +11,8 @@ namespace CopilotHive.Worker;
 public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? toolBridge = null)
 {
     private const string WorkRoot = "/copilot-home";
+    private const string ConfigRepoDir = "/config-repo";
+    private const string ConfigAgentsDir = "/config-repo/agents";
     private readonly WorkerLogger _log = new("Task");
 
     /// <summary>
@@ -32,8 +34,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
         {
             var isImprover = assignment.Role == WorkerRole.Improver;
 
-            // Clone each repository (skip for improver — it's a pure text-in/text-out role
-            // that receives all context in the prompt and must not access source code)
+            // Clone each repository (skip for improver — it works on the config repo agents folder)
             var repoDirectories = new List<(RepositoryInfo Repo, string Dir)>();
 
             if (!isImprover)
@@ -79,13 +80,15 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
             }
             else
             {
-                _log.Info("Improver role: skipping git clone (pure text-in/text-out)");
+                // Improver: pull latest config repo to get freshest agents.md files
+                await PullConfigRepoAsync(ct);
             }
 
-            // Determine working directory for Copilot (first repo, or WorkRoot for improver)
-            var primaryWorkDir = repoDirectories.Count > 0
-                ? repoDirectories[0].Dir
-                : WorkRoot;
+            // Determine working directory for Copilot
+            // Improver works in the config-repo/agents folder; others in the first cloned repo
+            var primaryWorkDir = isImprover
+                ? ConfigAgentsDir
+                : (repoDirectories.Count > 0 ? repoDirectories[0].Dir : WorkRoot);
 
             // Build context header with branch and repo info for the Copilot agent
             var contextLines = new List<string>
@@ -99,6 +102,12 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
                 var (primaryRepo, _) = repoDirectories[0];
                 contextLines.Add($"Repository: {primaryRepo.Name}");
                 contextLines.Add($"Default branch: {primaryRepo.DefaultBranch}");
+            }
+
+            if (isImprover)
+            {
+                contextLines.Add($"Working directory: {ConfigAgentsDir}");
+                contextLines.Add("Files: *.agents.md (edit these directly)");
             }
 
             if (assignment.BranchInfo is { } bi2)
@@ -119,10 +128,15 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
             _log.Info($"Sending prompt to Copilot ({enrichedPrompt.Length} chars)");
             var copilotOutput = await copilotRunner.SendPromptAsync(enrichedPrompt, primaryWorkDir, ct);
 
-            // Collect git status from each repo and push changes (skip for improver)
+            // Collect git status from each repo and push changes
             GitStatus? aggregatedStatus = null;
 
-            if (!isImprover)
+            if (isImprover)
+            {
+                // Improver: commit and push changes to the config repo agents folder
+                aggregatedStatus = await CommitAndPushConfigRepoAsync(ct);
+            }
+            else
             {
                 var isReviewer = assignment.Role == WorkerRole.Reviewer;
 
@@ -195,5 +209,94 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
                 },
             };
         }
+    }
+
+    /// <summary>
+    /// Pulls the latest changes from the config repo so the improver works on fresh agents.md files.
+    /// The config repo is cloned at container startup by entrypoint.sh.
+    /// </summary>
+    private async Task PullConfigRepoAsync(CancellationToken ct)
+    {
+        if (!Directory.Exists(Path.Combine(ConfigRepoDir, ".git")))
+        {
+            _log.Info("Config repo not found — improver will work without it");
+            return;
+        }
+
+        _log.Info("Pulling latest config repo for improver...");
+        var (exitCode, stdout, stderr) = await GitOperations.RunGitCommandAsync(
+            ConfigRepoDir, "pull --ff-only", ct);
+
+        if (exitCode == 0)
+            _log.Info($"Config repo up to date: {stdout.Trim()}");
+        else
+            _log.Error($"Config repo pull failed (exit {exitCode}): {stderr.Trim()}");
+    }
+
+    /// <summary>
+    /// Commits and pushes any changes the improver made to *.agents.md files in the config repo.
+    /// Only stages files in the agents/ subfolder to prevent accidental changes elsewhere.
+    /// </summary>
+    private async Task<GitStatus> CommitAndPushConfigRepoAsync(CancellationToken ct)
+    {
+        var status = new GitStatus();
+
+        if (!Directory.Exists(Path.Combine(ConfigRepoDir, ".git")))
+            return status;
+
+        // Only stage agents/*.agents.md — defense-in-depth to prevent touching other files
+        var (addExit, _, addErr) = await GitOperations.RunGitCommandAsync(
+            ConfigRepoDir, "add agents/*.agents.md", ct);
+        if (addExit != 0)
+        {
+            _log.Error($"git add failed: {addErr.Trim()}");
+            return status;
+        }
+
+        // Check if there are staged changes
+        var (diffExit, diffOut, _) = await GitOperations.RunGitCommandAsync(
+            ConfigRepoDir, "diff --cached --name-only", ct);
+        if (diffExit != 0 || string.IsNullOrWhiteSpace(diffOut))
+        {
+            _log.Info("No agents.md changes to commit");
+            return status;
+        }
+
+        var changedFiles = diffOut.Trim().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        status.FilesChanged = changedFiles.Length;
+        _log.Info($"Improver changed {changedFiles.Length} file(s): {string.Join(", ", changedFiles)}");
+
+        // Commit
+        var (commitExit, commitOut, commitErr) = await GitOperations.RunGitCommandAsync(
+            ConfigRepoDir, "commit -m \"Improve agents.md files (automated by CopilotHive Improver)\"", ct);
+        if (commitExit != 0)
+        {
+            _log.Error($"git commit failed: {commitErr.Trim()}");
+            return status;
+        }
+
+        status.LastCommitMessage = "Improve agents.md files (automated by CopilotHive Improver)";
+        _log.Info($"Committed: {commitOut.Trim()}");
+
+        // Push
+        try
+        {
+            var (pushExit, _, pushErr) = await GitOperations.RunGitCommandAsync(
+                ConfigRepoDir, "push origin HEAD", ct);
+            if (pushExit != 0)
+            {
+                _log.Error($"git push failed: {pushErr.Trim()}");
+                return status;
+            }
+
+            status.Pushed = true;
+            _log.Info("Pushed config repo changes");
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"Push failed: {ex.Message}");
+        }
+
+        return status;
     }
 }
