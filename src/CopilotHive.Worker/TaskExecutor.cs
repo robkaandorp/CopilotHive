@@ -26,49 +26,59 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner)
 
         try
         {
-            // Clone each repository
+            var isImprover = assignment.Role == WorkerRole.Improver;
+
+            // Clone each repository (skip for improver — it's a pure text-in/text-out role
+            // that receives all context in the prompt and must not access source code)
             var repoDirectories = new List<(RepositoryInfo Repo, string Dir)>();
 
-            foreach (var repo in assignment.Repositories)
+            if (!isImprover)
             {
-                var targetDir = Path.Combine(WorkRoot, repo.Name);
-
-                // Clean up any previous clone
-                if (Directory.Exists(targetDir))
-                    await GitOperations.ForceDeleteDirectoryAsync(targetDir);
-
-                Console.WriteLine($"[Task] Cloning {repo.Name} from {repo.Url}");
-                await GitOperations.CloneRepositoryAsync(repo.Url, targetDir, ct);
-
-                // Handle branch operations
-                if (assignment.BranchInfo is { } branchInfo && !string.IsNullOrEmpty(branchInfo.FeatureBranch))
+                foreach (var repo in assignment.Repositories)
                 {
-                    switch (branchInfo.Action)
+                    var targetDir = Path.Combine(WorkRoot, repo.Name);
+
+                    // Clean up any previous clone
+                    if (Directory.Exists(targetDir))
+                        await GitOperations.ForceDeleteDirectoryAsync(targetDir);
+
+                    Console.WriteLine($"[Task] Cloning {repo.Name} from {repo.Url}");
+                    await GitOperations.CloneRepositoryAsync(repo.Url, targetDir, ct);
+
+                    // Handle branch operations
+                    if (assignment.BranchInfo is { } branchInfo && !string.IsNullOrEmpty(branchInfo.FeatureBranch))
                     {
-                        case BranchAction.Create:
-                            var baseBranch = string.IsNullOrEmpty(branchInfo.BaseBranch)
-                                ? repo.DefaultBranch
-                                : branchInfo.BaseBranch;
-                            _log.Info($"Creating branch {branchInfo.FeatureBranch} from {baseBranch}");
-                            await GitOperations.CreateBranchAsync(targetDir, branchInfo.FeatureBranch, baseBranch, ct);
-                            break;
+                        switch (branchInfo.Action)
+                        {
+                            case BranchAction.Create:
+                                var baseBranch = string.IsNullOrEmpty(branchInfo.BaseBranch)
+                                    ? repo.DefaultBranch
+                                    : branchInfo.BaseBranch;
+                                _log.Info($"Creating branch {branchInfo.FeatureBranch} from {baseBranch}");
+                                await GitOperations.CreateBranchAsync(targetDir, branchInfo.FeatureBranch, baseBranch, ct);
+                                break;
 
-                        case BranchAction.Checkout:
-                            _log.Info($"Checking out branch {branchInfo.FeatureBranch}");
-                            await GitOperations.CheckoutBranchAsync(targetDir, branchInfo.FeatureBranch, ct);
-                            break;
+                            case BranchAction.Checkout:
+                                _log.Info($"Checking out branch {branchInfo.FeatureBranch}");
+                                await GitOperations.CheckoutBranchAsync(targetDir, branchInfo.FeatureBranch, ct);
+                                break;
 
-                        case BranchAction.Merge:
-                        case BranchAction.Unspecified:
-                        default:
-                            break;
+                            case BranchAction.Merge:
+                            case BranchAction.Unspecified:
+                            default:
+                                break;
+                        }
                     }
-                }
 
-                repoDirectories.Add((repo, targetDir));
+                    repoDirectories.Add((repo, targetDir));
+                }
+            }
+            else
+            {
+                _log.Info("Improver role: skipping git clone (pure text-in/text-out)");
             }
 
-            // Determine working directory for Copilot (first repo)
+            // Determine working directory for Copilot (first repo, or WorkRoot for improver)
             var primaryWorkDir = repoDirectories.Count > 0
                 ? repoDirectories[0].Dir
                 : WorkRoot;
@@ -105,33 +115,36 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner)
             _log.Info($"Sending prompt to Copilot ({enrichedPrompt.Length} chars)");
             var copilotOutput = await copilotRunner.SendPromptAsync(enrichedPrompt, primaryWorkDir, ct);
 
-            // Collect git status from each repo and push changes
+            // Collect git status from each repo and push changes (skip for improver)
             GitStatus? aggregatedStatus = null;
 
-            foreach (var (repo, dir) in repoDirectories)
+            if (!isImprover)
             {
-                var status = await GitOperations.GetGitStatusAsync(dir, ct);
-
-                // Push if there are changes and we have a feature branch
-                if (assignment.BranchInfo is { } bi
-                    && !string.IsNullOrEmpty(bi.FeatureBranch)
-                    && status.FilesChanged > 0)
+                foreach (var (repo, dir) in repoDirectories)
                 {
-                    try
-                    {
-                        await GitOperations.PushBranchAsync(dir, bi.FeatureBranch, ct);
-                        status.Pushed = true;
-                        _log.Info($"Pushed {bi.FeatureBranch} for {repo.Name}");
-                    }
-                    catch (Exception ex)
-                    {
-                        _log.Error($"Push failed for {repo.Name}: {ex.Message}");
-                        status.Pushed = false;
-                    }
-                }
+                    var status = await GitOperations.GetGitStatusAsync(dir, ct);
 
-                // Use first repo's status as the aggregate
-                aggregatedStatus ??= status;
+                    // Push if there are changes and we have a feature branch
+                    if (assignment.BranchInfo is { } bi
+                        && !string.IsNullOrEmpty(bi.FeatureBranch)
+                        && status.FilesChanged > 0)
+                    {
+                        try
+                        {
+                            await GitOperations.PushBranchAsync(dir, bi.FeatureBranch, ct);
+                            status.Pushed = true;
+                            _log.Info($"Pushed {bi.FeatureBranch} for {repo.Name}");
+                        }
+                        catch (Exception ex)
+                        {
+                            _log.Error($"Push failed for {repo.Name}: {ex.Message}");
+                            status.Pushed = false;
+                        }
+                    }
+
+                    // Use first repo's status as the aggregate
+                    aggregatedStatus ??= status;
+                }
             }
 
             stopwatch.Stop();
