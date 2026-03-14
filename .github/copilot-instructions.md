@@ -62,3 +62,8 @@ dotnet test CopilotHive.slnx
 - The orchestrator communicates via `CopilotClient` from `GitHub.Copilot.SDK`
 - Git operations shell out to `git` CLI (not LibGit2Sharp) for simplicity
 - The coder↔tester feedback loop retries up to `MaxRetriesPerTask` times
+
+## Working Principles
+
+- **Do not make assumptions, always verify.** Check actual state (logs, databases,
+  git status, running processes) before drawing conclusions or making changes.
