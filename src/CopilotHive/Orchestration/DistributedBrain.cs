@@ -520,7 +520,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             Analyze the output carefully:
             - Did the worker succeed or fail at its task?
-            - For testers: did all tests pass? What are the numbers?
+            - For testers: did all tests pass? What are the numbers? You MUST populate the test_metrics object with actual numbers from the output — look for test counts in tables, summaries, or dotnet test output.
             - For reviewers: did they approve or request changes? What issues?
             - Extract any specific issues mentioned
 

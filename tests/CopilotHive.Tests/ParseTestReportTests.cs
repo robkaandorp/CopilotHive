@@ -328,4 +328,48 @@ public class FallbackParseTestMetricsTests
 
         Assert.Equal(0, metrics.TotalTests);
     }
+
+    [Fact]
+    public void MarkdownTable_ExtractsMetrics()
+    {
+        const string output = """
+            ## TEST_REPORT
+
+            **Branch:** `copilothive/some-branch`
+
+            ### Build Result
+            | Metric | Count |
+            |--------|-------|
+            | Errors | 0 |
+            | Warnings | 0 |
+
+            ### Test Result
+            | Metric | Count |
+            |--------|-------|
+            | Total | 273 |
+            | Passed | 273 |
+            | Failed | 0 |
+            | Skipped | 0 |
+
+            ### Overall Verdict: PASS
+            """;
+
+        var metrics = Parse(output);
+
+        Assert.Equal(273, metrics.TotalTests);
+        Assert.Equal(273, metrics.PassedTests);
+        Assert.Equal(0, metrics.FailedTests);
+        Assert.True(metrics.BuildSuccess);
+    }
+
+    [Fact]
+    public void BuildSucceeded_SetsBuildSuccess()
+    {
+        const string output = "Build succeeded.\nPassed!  - Failed:     0, Passed:   42, Skipped:     0, Total:   42";
+
+        var metrics = Parse(output);
+
+        Assert.True(metrics.BuildSuccess);
+        Assert.Equal(42, metrics.TotalTests);
+    }
 }

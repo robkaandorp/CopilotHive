@@ -117,7 +117,7 @@ public class ImprovementAnalyzerTests
         Assert.Contains("Iteration: 3", prompt);
         Assert.Contains("Verdict: FAIL", prompt);
         Assert.Contains("7/10", prompt);
-        Assert.Contains("Retry count: 2", prompt);
+        Assert.Contains("Total retries: 2", prompt);
         Assert.Contains("NullReferenceException in Parser", prompt);
     }
 

@@ -53,8 +53,21 @@ public sealed class IterationMetrics
     public List<string> ReviewIssues { get; set; } = [];
     /// <summary>Reviewer's verdict string (e.g. "APPROVED", "CHANGES_REQUESTED").</summary>
     public string ReviewVerdict { get; set; } = "";
-    /// <summary>Number of task retries consumed during this iteration.</summary>
+    /// <summary>Number of task retries consumed during this iteration (review + test retries).</summary>
     public int RetryCount { get; set; }
+    /// <summary>Number of review-phase retries specifically.</summary>
+    public int ReviewRetryCount { get; set; }
+    /// <summary>Number of test-phase retries specifically.</summary>
+    public int TestRetryCount { get; set; }
+
+    /// <summary>Wall-clock duration of each pipeline phase, keyed by phase name (e.g. "Coding", "Review").</summary>
+    public Dictionary<string, TimeSpan> PhaseDurations { get; set; } = [];
+
+    /// <summary>Prompt tokens consumed during this iteration (0 until SDK exposes token metrics).</summary>
+    public int PromptTokens { get; set; }
+    /// <summary>Completion tokens consumed during this iteration (0 until SDK exposes token metrics).</summary>
+    public int CompletionTokens { get; set; }
+
     /// <summary>Version identifiers of the AGENTS.md files active during this iteration, keyed by role.</summary>
     public Dictionary<string, string> AgentsMdVersions { get; set; } = [];
     /// <summary>Arbitrary custom key/value metrics recorded by workers.</summary>

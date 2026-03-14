@@ -96,14 +96,34 @@ public sealed class ImprovementAnalyzer
         sb.AppendLine("## Current Iteration Results");
         sb.AppendLine($"- Iteration: {current.Iteration}");
         sb.AppendLine($"- Verdict: {current.Verdict}");
-        sb.AppendLine($"- Retry count: {current.RetryCount}");
+        sb.AppendLine($"- Duration: {current.Duration.TotalMinutes:F1} minutes");
+        sb.AppendLine($"- Total retries: {current.RetryCount} (review: {current.ReviewRetryCount}, test: {current.TestRetryCount})");
         sb.AppendLine($"- Build success: {current.BuildSuccess}");
         sb.AppendLine($"- Unit tests: {current.PassedTests}/{current.TotalTests} passed");
         sb.AppendLine($"- Integration tests: {current.IntegrationTestsPassed}/{current.IntegrationTestsTotal} passed");
         sb.AppendLine($"- Coverage: {current.CoveragePercent:F1}%");
 
+        if (!string.IsNullOrEmpty(current.ReviewVerdict))
+            sb.AppendLine($"- Review verdict: {current.ReviewVerdict} ({current.ReviewIssuesFound} issues found)");
+
+        if (current.PhaseDurations.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("## Phase Durations");
+            foreach (var (phase, duration) in current.PhaseDurations)
+                sb.AppendLine($"- {phase}: {duration.TotalMinutes:F1} min");
+        }
+
         if (!string.IsNullOrEmpty(current.TestReportSummary))
             sb.AppendLine($"- Summary: {current.TestReportSummary}");
+
+        if (current.ReviewIssues.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("## Review Issues Found");
+            foreach (var issue in current.ReviewIssues)
+                sb.AppendLine($"- {issue}");
+        }
 
         if (current.Issues.Count > 0)
         {
@@ -122,8 +142,9 @@ public sealed class ImprovementAnalyzer
             {
                 sb.AppendLine($"- Iteration {h.Iteration}: {h.Verdict} | " +
                     $"{h.PassedTests}/{h.TotalTests} tests | " +
-                    $"{h.RetryCount} retries | " +
-                    $"{h.CoveragePercent:F1}% coverage");
+                    $"{h.RetryCount} retries (review: {h.ReviewRetryCount}, test: {h.TestRetryCount}) | " +
+                    $"{h.CoveragePercent:F1}% coverage | " +
+                    $"{h.Duration.TotalMinutes:F1} min");
             }
 
             // Identify recurring issues

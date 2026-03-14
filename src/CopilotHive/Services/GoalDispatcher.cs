@@ -234,6 +234,7 @@ public sealed class GoalDispatcher : BackgroundService
             pipeline.Metrics.PassedTests = interpretation.TestMetrics.PassedTests ?? 0;
             pipeline.Metrics.FailedTests = interpretation.TestMetrics.FailedTests ?? 0;
             pipeline.Metrics.CoveragePercent = interpretation.TestMetrics.CoveragePercent ?? 0;
+            pipeline.Metrics.BuildSuccess = interpretation.TestMetrics.BuildSuccess ?? false;
         }
 
         // Fallback: if this is the Testing phase and Brain didn't extract metrics,
@@ -246,6 +247,18 @@ public sealed class GoalDispatcher : BackgroundService
                     "Fallback metrics parsed for {GoalId}: {Passed}/{Total} passed, {Failed} failed",
                     pipeline.GoalId, pipeline.Metrics.PassedTests, pipeline.Metrics.TotalTests, pipeline.Metrics.FailedTests);
         }
+
+        // Populate review metrics when the reviewer phase completes
+        if (pipeline.Phase == GoalPhase.Review)
+        {
+            pipeline.Metrics.ReviewVerdict = interpretation.ReviewVerdict ?? "";
+            if (interpretation.Issues is { Count: > 0 })
+            {
+                pipeline.Metrics.ReviewIssuesFound += interpretation.Issues.Count;
+                pipeline.Metrics.ReviewIssues.AddRange(interpretation.Issues);
+            }
+        }
+
         if (interpretation.Issues is not null)
             pipeline.Metrics.Issues.AddRange(interpretation.Issues);
 
@@ -765,38 +778,6 @@ public sealed class GoalDispatcher : BackgroundService
     }
 
     /// <summary>
-    /// Parses the Improver's output for AGENTS.md updates, validates and writes them to disk,
-    /// then broadcasts the new content to all connected workers of the matching role.
-    /// </summary>
-    private async Task ApplyAgentsUpdatesAsync(string goalId, string improverOutput, CancellationToken ct)
-    {
-        if (_agentsManager is null)
-            return;
-
-        var improvements = Orchestrator.ParseImproverResponse(improverOutput);
-        if (improvements.Count == 0)
-        {
-            _logger.LogInformation("No AGENTS.md improvements parsed from Improver output for goal {GoalId}", goalId);
-            return;
-        }
-
-        foreach (var (role, newContent) in improvements)
-        {
-            var currentContent = _agentsManager.GetAgentsMd(role);
-            if (!string.IsNullOrEmpty(currentContent)
-                && !Orchestrator.ValidateImprovement(currentContent, newContent, role))
-            {
-                continue;
-            }
-
-            _agentsManager.UpdateAgentsMd(role, newContent);
-            _logger.LogInformation("Applied AGENTS.md update for {Role} (goal {GoalId})", role, goalId);
-
-            await BroadcastAgentsUpdateAsync(role, newContent, ct);
-        }
-    }
-
-    /// <summary>
     /// Sends an UpdateAgents message to all connected workers whose role matches the given role string.
     /// Best-effort: failures are logged but do not block the pipeline.
     /// </summary>
@@ -862,31 +843,6 @@ public sealed class GoalDispatcher : BackgroundService
     }
 
     /// <summary>
-    /// Defense-in-depth: scan the Improver's output for evidence of git push/commit
-    /// operations. The Improver should only return AGENTS.md recommendations in its
-    /// response text — any source-code pushes are ignored by the pipeline, but we
-    /// log a warning so operators can investigate.
-    /// </summary>
-    private void WarnIfImproverPushedCode(string goalId, string output)
-    {
-        if (string.IsNullOrEmpty(output))
-            return;
-
-        ReadOnlySpan<string> suspiciousPatterns = ["git push", "git commit", "git add"];
-        foreach (var pattern in suspiciousPatterns)
-        {
-            if (output.Contains(pattern, StringComparison.OrdinalIgnoreCase))
-            {
-                _logger.LogWarning(
-                    "Improver for goal {GoalId} output contains '{Pattern}' — " +
-                    "source code modifications from the Improver are not applied. " +
-                    "Only *.agents.md changes parsed from the response text are used.",
-                    goalId, pattern);
-            }
-        }
-    }
-
-    /// <summary>
     /// Collects all review issues from past Brain interpretations in the pipeline's conversation history.
     /// Returns a deduplicated summary the Brain can use to ensure the coder fixes everything.
     /// </summary>
@@ -933,7 +889,7 @@ public sealed class GoalDispatcher : BackgroundService
 
     /// <summary>
     /// Fallback metric extraction from raw worker output when the Brain doesn't return test_metrics.
-    /// Parses common patterns like "Passed: 268", "Failed: 0", "Total: 268" from dotnet test output.
+    /// Parses common patterns including dotnet test summaries, markdown tables, and key-value lines.
     /// </summary>
     internal static void FallbackParseTestMetrics(string output, IterationMetrics metrics)
     {
@@ -951,13 +907,34 @@ public sealed class GoalDispatcher : BackgroundService
             metrics.FailedTests = int.Parse(dotnetMatch.Groups[1].Value);
             metrics.PassedTests = int.Parse(dotnetMatch.Groups[2].Value);
             metrics.TotalTests = int.Parse(dotnetMatch.Groups[4].Value);
+            FallbackParseBuildSuccess(output, metrics);
             return;
         }
 
-        // TEST_REPORT style fields (used by Orchestrator.ParseTestReport)
+        // Markdown table format: "| Total | 273 |" or "| Passed | 273 |"
         foreach (var line in output.Split('\n'))
         {
             var trimmed = line.Trim();
+
+            // Match markdown table rows like "| Total | 273 |"
+            var mdMatch = System.Text.RegularExpressions.Regex.Match(
+                trimmed, @"^\|\s*(\w+)\s*\|\s*(\d+)\s*\|");
+            if (mdMatch.Success)
+            {
+                var key = mdMatch.Groups[1].Value;
+                var val = int.Parse(mdMatch.Groups[2].Value);
+                if (key.Equals("Total", StringComparison.OrdinalIgnoreCase))
+                    metrics.TotalTests = val;
+                else if (key.Equals("Passed", StringComparison.OrdinalIgnoreCase))
+                    metrics.PassedTests = val;
+                else if (key.Equals("Failed", StringComparison.OrdinalIgnoreCase))
+                    metrics.FailedTests = val;
+                else if (key.Equals("Errors", StringComparison.OrdinalIgnoreCase))
+                    metrics.BuildSuccess = val == 0;
+                continue;
+            }
+
+            // Key-value line format: "total_tests: 273"
             if (trimmed.StartsWith("unit_tests_total:", StringComparison.OrdinalIgnoreCase)
                 || trimmed.StartsWith("total_tests:", StringComparison.OrdinalIgnoreCase)
                 || trimmed.StartsWith("total:", StringComparison.OrdinalIgnoreCase))
@@ -979,6 +956,18 @@ public sealed class GoalDispatcher : BackgroundService
                     metrics.FailedTests = f;
             }
         }
+
+        FallbackParseBuildSuccess(output, metrics);
+    }
+
+    /// <summary>
+    /// Extracts build success from raw worker output by looking for common build result patterns.
+    /// </summary>
+    private static void FallbackParseBuildSuccess(string output, IterationMetrics metrics)
+    {
+        if (output.Contains("Build succeeded", StringComparison.OrdinalIgnoreCase)
+            || System.Text.RegularExpressions.Regex.IsMatch(output, @"\|\s*Errors\s*\|\s*0\s*\|"))
+            metrics.BuildSuccess = true;
     }
 
     private async Task MarkGoalCompleted(GoalPipeline pipeline, CancellationToken ct)
@@ -1001,6 +990,9 @@ public sealed class GoalDispatcher : BackgroundService
         pipeline.Metrics.Iteration = pipeline.Iteration;
         pipeline.Metrics.Duration = duration;
         pipeline.Metrics.Verdict = "PASS";
+        pipeline.Metrics.RetryCount = pipeline.ReviewRetries + pipeline.TestRetries;
+        pipeline.Metrics.ReviewRetryCount = pipeline.ReviewRetries;
+        pipeline.Metrics.TestRetryCount = pipeline.TestRetries;
         PopulateAgentsMdVersions(pipeline);
         _metricsTracker?.RecordIteration(pipeline.Metrics);
 
@@ -1072,6 +1064,9 @@ public sealed class GoalDispatcher : BackgroundService
         pipeline.Metrics.Iteration = pipeline.Iteration;
         pipeline.Metrics.Duration = duration;
         pipeline.Metrics.Verdict = "FAIL";
+        pipeline.Metrics.RetryCount = pipeline.ReviewRetries + pipeline.TestRetries;
+        pipeline.Metrics.ReviewRetryCount = pipeline.ReviewRetries;
+        pipeline.Metrics.TestRetryCount = pipeline.TestRetries;
         PopulateAgentsMdVersions(pipeline);
         _metricsTracker?.RecordIteration(pipeline.Metrics);
 

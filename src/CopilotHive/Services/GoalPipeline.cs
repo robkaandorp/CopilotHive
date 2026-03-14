@@ -121,6 +121,9 @@ public sealed class GoalPipeline
     /// <summary>Per-goal conversation history for the Brain.</summary>
     public List<ConversationEntry> Conversation { get; } = [];
 
+    /// <summary>UTC timestamp when the current phase started (for phase duration tracking).</summary>
+    public DateTime? PhaseStartedAt { get; private set; }
+
     /// <summary>UTC timestamp when this pipeline was created.</summary>
     public DateTime CreatedAt { get; private init; } = DateTime.UtcNow;
     /// <summary>UTC timestamp when this pipeline completed (Done or Failed), or <c>null</c> if still active.</summary>
@@ -175,12 +178,25 @@ public sealed class GoalPipeline
             Conversation.Add(entry);
     }
 
-    /// <summary>Advance to the next phase.</summary>
+    /// <summary>Advance to the next phase, recording timing for the previous phase.</summary>
     public void AdvanceTo(GoalPhase phase)
     {
         lock (_lock)
         {
+            // Record duration of the phase that just ended
+            if (PhaseStartedAt.HasValue && Phase != GoalPhase.Planning)
+            {
+                var phaseName = Phase.ToString();
+                var elapsed = DateTime.UtcNow - PhaseStartedAt.Value;
+                // Accumulate: the same phase can repeat across retries
+                if (Metrics.PhaseDurations.TryGetValue(phaseName, out var existing))
+                    Metrics.PhaseDurations[phaseName] = existing + elapsed;
+                else
+                    Metrics.PhaseDurations[phaseName] = elapsed;
+            }
+
             Phase = phase;
+            PhaseStartedAt = DateTime.UtcNow;
             if (phase is GoalPhase.Done or GoalPhase.Failed)
                 CompletedAt = DateTime.UtcNow;
         }
