@@ -24,9 +24,9 @@ public sealed class GoalPipelineManager
     }
 
     /// <summary>Create and register a new pipeline for a goal.</summary>
-    public GoalPipeline CreatePipeline(Goal goal, int maxRetries = Constants.DefaultMaxRetriesPerTask)
+    public GoalPipeline CreatePipeline(Goal goal, int maxRetries = Constants.DefaultMaxRetriesPerTask, int maxIterations = Constants.DefaultMaxIterations)
     {
-        var pipeline = new GoalPipeline(goal, maxRetries);
+        var pipeline = new GoalPipeline(goal, maxRetries, maxIterations);
         if (!_pipelines.TryAdd(goal.Id, pipeline))
             throw new InvalidOperationException($"Pipeline already exists for goal '{goal.Id}'");
 

@@ -217,7 +217,11 @@ public sealed class GoalDispatcher : BackgroundService
                     await MarkGoalFailed(pipeline, "Exceeded max review retries", ct);
                     return;
                 }
-                pipeline.IncrementIteration();
+                if (!pipeline.IncrementIteration())
+                {
+                    await MarkGoalFailed(pipeline, "Exceeded max iterations", ct);
+                    return;
+                }
                 pipeline.AdvanceTo(GoalPhase.Coding);
                 var fixPrompt = await _brain.CraftPromptAsync(pipeline, "coder",
                     $"Reviewer feedback:\n{interpretation.Reason}", ct);
@@ -230,7 +234,11 @@ public sealed class GoalDispatcher : BackgroundService
                     await MarkGoalFailed(pipeline, "Exceeded max test retries", ct);
                     return;
                 }
-                pipeline.IncrementIteration();
+                if (!pipeline.IncrementIteration())
+                {
+                    await MarkGoalFailed(pipeline, "Exceeded max iterations", ct);
+                    return;
+                }
                 pipeline.AdvanceTo(GoalPhase.Coding);
                 var retryPrompt = await _brain.CraftPromptAsync(pipeline, "coder",
                     $"Test failures:\n{interpretation.Reason}", ct);
@@ -300,7 +308,11 @@ public sealed class GoalDispatcher : BackgroundService
                 "{Phase} failed for goal {GoalId} — sending back to Coder (reason: {Reason})",
                 pipeline.Phase, pipeline.GoalId, reason ?? "unspecified");
 
-            pipeline.IncrementIteration();
+            if (!pipeline.IncrementIteration())
+            {
+                await MarkGoalFailed(pipeline, "Exceeded max iterations", ct);
+                return true;
+            }
             pipeline.AdvanceTo(GoalPhase.Coding);
             pipeline.ClearPlan();
 
@@ -613,7 +625,11 @@ public sealed class GoalDispatcher : BackgroundService
             "Merge conflict for goal {GoalId} — sending back to Coder for rebase (retry {Retry}/{Max})",
             pipeline.GoalId, pipeline.ReviewRetries, pipeline.MaxRetries);
 
-        pipeline.IncrementIteration();
+        if (!pipeline.IncrementIteration())
+        {
+            await MarkGoalFailed(pipeline, "Exceeded max iterations during merge conflict resolution", ct);
+            return;
+        }
         pipeline.AdvanceTo(GoalPhase.Coding);
         pipeline.ClearPlan();
 
@@ -984,7 +1000,9 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogInformation("Dispatching goal '{GoalId}': {Description}", goal.Id, goal.Description);
 
         // Create a pipeline for this goal
-        var pipeline = _pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        var maxRetries = _config?.Orchestrator?.MaxRetriesPerTask ?? Constants.DefaultMaxRetriesPerTask;
+        var maxIterations = _config?.Orchestrator?.MaxIterations ?? Constants.DefaultMaxIterations;
+        var pipeline = _pipelineManager.CreatePipeline(goal, maxRetries, maxIterations);
 
         if (_brain is not null)
         {

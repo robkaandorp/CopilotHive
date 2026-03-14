@@ -100,6 +100,8 @@ public sealed class GoalPipeline
     public int TestRetries { get; private set; }
     /// <summary>Maximum number of task-level retries allowed.</summary>
     public int MaxRetries { get; init; } = Constants.DefaultMaxRetriesPerTask;
+    /// <summary>Maximum number of iterations allowed before the goal is failed.</summary>
+    public int MaxIterations { get; init; } = Constants.DefaultMaxIterations;
 
     /// <summary>Brain-determined plan for the current iteration, or null if no plan set.</summary>
     public IterationPlan? Plan { get; private set; }
@@ -129,12 +131,14 @@ public sealed class GoalPipeline
     /// </summary>
     /// <param name="goal">The goal to track.</param>
     /// <param name="maxRetries">Maximum task-level retries allowed.</param>
-    public GoalPipeline(Goal goal, int maxRetries = Constants.DefaultMaxRetriesPerTask)
+    /// <param name="maxIterations">Maximum iterations before the goal is failed.</param>
+    public GoalPipeline(Goal goal, int maxRetries = Constants.DefaultMaxRetriesPerTask, int maxIterations = Constants.DefaultMaxIterations)
     {
         Goal = goal;
         GoalId = goal.Id;
         Description = goal.Description;
         MaxRetries = maxRetries;
+        MaxIterations = maxIterations;
     }
 
     /// <summary>Restore a pipeline from a persisted snapshot.</summary>
@@ -148,6 +152,7 @@ public sealed class GoalPipeline
         ReviewRetries = snapshot.ReviewRetries;
         TestRetries = snapshot.TestRetries;
         MaxRetries = snapshot.MaxRetries;
+        MaxIterations = snapshot.MaxIterations;
         ActiveTaskId = snapshot.ActiveTaskId;
         CoderBranch = snapshot.CoderBranch;
         Plan = snapshot.Plan;
@@ -248,12 +253,15 @@ public sealed class GoalPipeline
         }
     }
 
-    /// <summary>Increment the iteration counter (used when coder re-runs after feedback).</summary>
-    public void IncrementIteration()
+    /// <summary>
+    /// Increment the iteration counter. Returns <c>false</c> when the maximum has been reached.
+    /// </summary>
+    public bool IncrementIteration()
     {
         lock (_lock)
         {
             Iteration++;
+            return Iteration <= MaxIterations;
         }
     }
 
