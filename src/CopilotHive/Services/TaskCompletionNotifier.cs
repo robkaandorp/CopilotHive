@@ -31,21 +31,25 @@ public sealed class TaskCompletionNotifier
 
     /// <summary>
     /// Fires the <see cref="OnTaskCompleted"/> event with the given
-    /// completion message, awaiting all registered handlers.
+    /// completion message.
     /// </summary>
     /// <param name="complete">
     /// The task completion message received from the worker via gRPC. Must
     /// not be <see langword="null"/>.
     /// </param>
     /// <returns>
-    /// A <see cref="Task"/> that completes once the subscribed handler (if
-    /// any) has finished processing the notification. If no handler is
-    /// subscribed the returned task completes immediately.
+    /// A <see cref="Task"/> that represents the completion of the last
+    /// delegate in the invocation chain. Because <see cref="OnTaskCompleted"/>
+    /// is a multicast delegate, all subscribers are invoked, but only the
+    /// <see cref="Task"/> returned by the final subscriber is awaited. If no
+    /// handler is subscribed the returned task completes immediately.
     /// </returns>
     /// <remarks>
-    /// Only a single handler delegate is supported by the underlying event
-    /// pattern. If multiple listeners are required, the handler itself is
-    /// responsible for fan-out.
+    /// <see cref="OnTaskCompleted"/> supports multiple subscribers via
+    /// multicast delegate semantics. All registered subscribers are invoked
+    /// in subscription order; however, only the <see cref="Task"/> returned
+    /// by the last subscriber in the invocation chain is awaited. Earlier
+    /// subscribers' returned tasks are not observed by this method.
     /// </remarks>
     public async Task NotifyAsync(TaskComplete complete)
     {
