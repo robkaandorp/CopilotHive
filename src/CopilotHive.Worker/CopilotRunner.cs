@@ -65,7 +65,7 @@ public sealed class CopilotRunner : IAsyncDisposable
             Prompt = agentsMdContent,
             Tools = GetToolsForRole(role),
         };
-        Console.WriteLine($"[Copilot] Custom agent set for role '{role}' ({agentsMdContent.Length} chars, tools={(_customAgent.Tools is null ? "all" : $"[{string.Join(",", _customAgent.Tools)}]")})");
+        _log.Info($"Custom agent set for role '{role}' ({agentsMdContent.Length} chars, tools={(_customAgent.Tools is null ? "all" : $"[{string.Join(",", _customAgent.Tools)}]")})");
         _log.Debug($"Agent prompt:\n{agentsMdContent}");
     }
 
@@ -177,14 +177,14 @@ public sealed class CopilotRunner : IAsyncDisposable
             try
             {
                 _session = await _client.CreateSessionAsync(BuildSessionConfig());
-                Console.WriteLine($"[Copilot] Connected to Copilot CLI on port {_port} (attempt {attempt})");
+                _log.Info($"Connected to Copilot CLI on port {_port} (attempt {attempt})");
                 _log.Debug($"Session config: streaming={false}, customAgents={(_customAgent?.Name ?? "none")}");
                 return;
             }
             catch (Exception ex) when (attempt < MaxConnectRetries)
             {
                 lastException = ex;
-                Console.WriteLine($"[Copilot] Connection attempt {attempt}/{MaxConnectRetries} failed: {ex.Message}");
+                _log.Error($"Connection attempt {attempt}/{MaxConnectRetries} failed: {ex.Message}");
                 await Task.Delay(RetryDelay, ct);
             }
         }
@@ -214,7 +214,7 @@ public sealed class CopilotRunner : IAsyncDisposable
         _session = await _client.CreateSessionAsync(config);
 
         var modelInfo = string.IsNullOrEmpty(model) ? "default" : model;
-        Console.WriteLine($"[Copilot] Session reset (localhost:{_port}, agent={_customAgent?.Name ?? "none"}, model={modelInfo})");
+        _log.Info($"Session reset (localhost:{_port}, agent={_customAgent?.Name ?? "none"}, model={modelInfo})");
     }
 
     /// <summary>
