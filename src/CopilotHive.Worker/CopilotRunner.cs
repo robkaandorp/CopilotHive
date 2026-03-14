@@ -133,9 +133,10 @@ public sealed class CopilotRunner : IAsyncDisposable
     /// <summary>Returns the tool whitelist for a given role. Null means all tools.</summary>
     internal static List<string>? GetToolsForRole(string? role) => role switch
     {
-        // Improver uses DenyAllPermissions — keep Tools=null to avoid SDK TypeError
-        // when the internal tool enumeration encounters an empty list.
-        "improver" => null,
+        // Improver is text-in/text-out only — restrict to no tools.
+        // Using a non-existent tool name as a whitelist effectively blocks all tools
+        // without hitting the SDK TypeError that an empty list causes.
+        "improver" => ["none"],
         _ => null,              // coder, tester, reviewer get all tools
     };
 
