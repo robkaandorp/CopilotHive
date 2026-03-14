@@ -3,6 +3,19 @@ using CopilotHive.Shared.Grpc;
 
 namespace CopilotHive.Services;
 
+/// <summary>Aggregate statistics about the worker pool at a point in time.</summary>
+public sealed record WorkerPoolStats
+{
+    /// <summary>Total number of registered workers.</summary>
+    public required int TotalWorkers { get; init; }
+    /// <summary>Number of workers currently executing a task.</summary>
+    public required int BusyWorkers { get; init; }
+    /// <summary>Number of workers that are idle and available for tasks.</summary>
+    public required int IdleWorkers { get; init; }
+    /// <summary>Count of workers grouped by their role string.</summary>
+    public required IReadOnlyDictionary<string, int> WorkersByRole { get; init; }
+}
+
 /// <summary>
 /// Thread-safe registry of currently connected workers. Supports registration,
 /// lookup, heartbeat tracking, and busy/idle state management.
@@ -112,5 +125,70 @@ public sealed class WorkerPool
             worker.IsBusy = false;
             worker.CurrentTaskId = null;
         }
+    }
+
+    /// <summary>
+    /// Returns workers whose last heartbeat exceeds the given timeout (i.e., stale).
+    /// </summary>
+    /// <param name="timeout">Maximum acceptable time since the last heartbeat.</param>
+    /// <returns>A read-only list of stale <see cref="ConnectedWorker"/> instances.</returns>
+    public IReadOnlyList<ConnectedWorker> GetStaleWorkers(TimeSpan timeout)
+    {
+        var now = DateTime.UtcNow;
+        return _workers.Values
+            .Where(w => now - w.LastHeartbeat > timeout)
+            .ToList()
+            .AsReadOnly();
+    }
+
+    /// <summary>Returns aggregate statistics about the worker pool.</summary>
+    /// <returns>A <see cref="WorkerPoolStats"/> snapshot.</returns>
+    public WorkerPoolStats GetWorkerStats()
+    {
+        var workers = _workers.Values.ToList();
+        var workersByRole = workers
+            .GroupBy(w => w.Role.ToString())
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        return new WorkerPoolStats
+        {
+            TotalWorkers = workers.Count,
+            BusyWorkers = workers.Count(w => w.IsBusy),
+            IdleWorkers = workers.Count(w => !w.IsBusy),
+            WorkersByRole = workersByRole,
+        };
+    }
+
+    /// <summary>
+    /// Removes stale workers from the pool and returns them.
+    /// </summary>
+    /// <param name="timeout">Maximum acceptable time since the last heartbeat.</param>
+    /// <returns>A read-only list of the removed <see cref="ConnectedWorker"/> instances.</returns>
+    public IReadOnlyList<ConnectedWorker> PurgeStaleWorkers(TimeSpan timeout)
+    {
+        // Snapshot now once so all staleness decisions are made against a consistent point in time.
+        var now = DateTime.UtcNow;
+        var removed = new List<ConnectedWorker>();
+
+        foreach (var key in _workers.Keys.ToList())
+        {
+            if (_workers.TryRemove(key, out var worker))
+            {
+                if (now - worker.LastHeartbeat > timeout)
+                {
+                    // Worker was stale at snapshot time — complete its channel and record it.
+                    worker.MessageChannel.Writer.TryComplete();
+                    removed.Add(worker);
+                }
+                else
+                {
+                    // Worker was fresh at snapshot time (heartbeat may have arrived between
+                    // the staleness pre-check and TryRemove). Put it back to avoid a spurious purge.
+                    _workers.TryAdd(key, worker);
+                }
+            }
+        }
+
+        return removed.AsReadOnly();
     }
 }
