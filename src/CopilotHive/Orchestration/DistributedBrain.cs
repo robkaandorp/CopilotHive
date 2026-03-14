@@ -113,6 +113,24 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
+    /// Builds the standard SessionConfig for Brain sessions with InfiniteSessions enabled
+    /// to prevent context window exhaustion on complex goals.
+    /// </summary>
+    private SessionConfig BuildBrainSessionConfig() => new()
+    {
+        Streaming = false,
+        OnPermissionRequest = DenyAllPermissions,
+        CustomAgents = [_orchestratorAgent],
+        AvailableTools = [], // no tools for the orchestrator — pure reasoning
+        InfiniteSessions = new InfiniteSessionConfig
+        {
+            Enabled = true,
+            BackgroundCompactionThreshold = 0.80,
+            BufferExhaustionThreshold = 0.95,
+        },
+    };
+
+    /// <summary>
     /// Gets or creates a dedicated Copilot session for a goal.
     /// Each session maintains its own conversation history natively.
     /// </summary>
@@ -123,13 +141,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         if (_sessions.TryGetValue(pipeline.GoalId, out var existing))
             return existing;
 
-        var session = await _copilotClient!.CreateSessionAsync(new SessionConfig
-        {
-            Streaming = false,
-            OnPermissionRequest = DenyAllPermissions,
-            CustomAgents = [_orchestratorAgent],
-            AvailableTools = [], // no tools for the orchestrator
-        });
+        var session = await _copilotClient!.CreateSessionAsync(BuildBrainSessionConfig());
 
         if (_sessions.TryAdd(pipeline.GoalId, session))
         {
@@ -179,13 +191,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         if (_sessions.TryRemove(pipeline.GoalId, out var stale))
             await stale.DisposeAsync();
 
-        var session = await _copilotClient!.CreateSessionAsync(new SessionConfig
-        {
-            Streaming = false,
-            OnPermissionRequest = DenyAllPermissions,
-            CustomAgents = [_orchestratorAgent],
-            AvailableTools = [], // no tools for the orchestrator
-        });
+        var session = await _copilotClient!.CreateSessionAsync(BuildBrainSessionConfig());
 
         // Replay the conversation: alternate user/assistant messages
         var entries = pipeline.Conversation;

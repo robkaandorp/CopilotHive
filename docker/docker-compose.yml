@@ -22,6 +22,7 @@ services:
       start_period: 60s
     volumes:
       - orchestrator-state:/app/state
+      - copilot-sessions:/root/.copilot
     networks:
       - hive
 
@@ -108,6 +109,7 @@ services:
 
 volumes:
   orchestrator-state:
+  copilot-sessions:
 
 networks:
   hive:

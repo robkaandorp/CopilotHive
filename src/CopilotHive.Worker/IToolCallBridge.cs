@@ -2,7 +2,7 @@ namespace CopilotHive.Worker;
 
 /// <summary>
 /// Abstraction for worker→orchestrator tool calls during task execution.
-/// The Copilot model calls custom tools (e.g., ask_orchestrator) whose callbacks
+/// The SDK's OnUserInputRequest handler and custom tools (e.g., report_progress)
 /// use this bridge to send requests via gRPC and await orchestrator responses.
 /// </summary>
 public interface IToolCallBridge

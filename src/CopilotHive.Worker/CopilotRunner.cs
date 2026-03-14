@@ -83,12 +83,30 @@ public sealed class CopilotRunner : IAsyncDisposable
         if (tools.Count > 0)
             config.Tools = tools;
 
+        // Enable the native ask_user tool: when the model calls ask_user, forward
+        // the question to the orchestrator's Brain via gRPC and return the answer.
+        if (_toolBridge is not null)
+        {
+            config.OnUserInputRequest = async (request, _) =>
+            {
+                var taskId = _currentTaskId ?? "unknown";
+                var question = request.Question ?? "";
+                if (request.Choices is { Count: > 0 })
+                    question += $"\nChoices: {string.Join(", ", request.Choices)}";
+
+                _log.Info($"ask_user: '{question[..Math.Min(question.Length, 100)]}...'");
+                var answer = await _toolBridge.AskOrchestratorAsync(taskId, question, CancellationToken.None);
+                return new UserInputResponse { Answer = answer };
+            };
+        }
+
         return config;
     }
 
     /// <summary>
     /// Builds custom AIFunction tools that the Copilot model can call.
     /// These tools bridge back to the orchestrator via gRPC.
+    /// Note: ask_orchestrator is replaced by the native OnUserInputRequest handler (ask_user tool).
     /// </summary>
     private List<AIFunction> BuildCustomTools()
     {
@@ -97,18 +115,6 @@ public sealed class CopilotRunner : IAsyncDisposable
         // Only register orchestrator tools for roles that have a bridge
         if (_toolBridge is null)
             return tools;
-
-        tools.Add(AIFunctionFactory.Create(
-            async ([Description("The question to ask the orchestrator")] string question) =>
-            {
-                var taskId = _currentTaskId ?? "unknown";
-                _log.Info($"Tool call: ask_orchestrator('{question[..Math.Min(question.Length, 80)]}...')");
-                var answer = await _toolBridge.AskOrchestratorAsync(taskId, question, CancellationToken.None);
-                return answer;
-            },
-            "ask_orchestrator",
-            "Ask the orchestrator a question about the task, architecture, or codebase. " +
-            "Use this when you need clarification before making changes."));
 
         tools.Add(AIFunctionFactory.Create(
             async ([Description("Current status")] string status,
