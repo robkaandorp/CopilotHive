@@ -278,4 +278,135 @@ public class ImprovementAnalyzerTests
 
         Assert.True(Orchestrator.ValidateImprovement(original, improved, "coder"));
     }
+
+    // -------------------------------------------------------------------------
+    // AnalyzeRole / GetRolePriorities
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void AnalyzeRole_SingleRoleAttribution_ReviewerSignals()
+    {
+        var current = new IterationMetrics
+        {
+            Verdict = "FAIL",
+            ReviewIssuesFound = 3,
+            ReviewRetryCount = 1,
+            BuildSuccess = true,
+            FailedTests = 0,
+            TestRetryCount = 0,
+        };
+        var history = new List<IterationMetrics>();
+
+        var reviewer = _analyzer.AnalyzeRole("reviewer", current, history);
+        var coder = _analyzer.AnalyzeRole("coder", current, history);
+        var tester = _analyzer.AnalyzeRole("tester", current, history);
+
+        Assert.True(reviewer.ConfidenceScore >= 50);
+        Assert.True(reviewer.ShouldImprove);
+        Assert.True(coder.ConfidenceScore < 50);
+        Assert.True(tester.ConfidenceScore < 50);
+    }
+
+    [Fact]
+    public void AnalyzeRole_MultiRoleAttribution_ReviewerAndTesterSignals()
+    {
+        var current = new IterationMetrics
+        {
+            Verdict = "FAIL",
+            ReviewIssuesFound = 2,
+            ReviewRetryCount = 1,
+            FailedTests = 4,
+            TestRetryCount = 2,
+            BuildSuccess = true,
+        };
+        var history = new List<IterationMetrics>();
+
+        var reviewer = _analyzer.AnalyzeRole("reviewer", current, history);
+        var tester = _analyzer.AnalyzeRole("tester", current, history);
+        var coder = _analyzer.AnalyzeRole("coder", current, history);
+
+        Assert.True(reviewer.ConfidenceScore >= 50);
+        Assert.True(tester.ConfidenceScore >= 50);
+        Assert.True(coder.ConfidenceScore < 50);
+    }
+
+    [Fact]
+    public void AnalyzeRole_EmptyHistory_OnlyCurrentSignalsAffectScore()
+    {
+        var current = new IterationMetrics
+        {
+            ReviewIssuesFound = 1,
+            ReviewRetryCount = 1,
+            BuildSuccess = true,
+        };
+
+        var withHistory = _analyzer.AnalyzeRole("reviewer", current, new List<IterationMetrics>
+        {
+            new() { ReviewIssuesFound = 1, ReviewRetryCount = 1 },
+            new() { ReviewIssuesFound = 2, ReviewRetryCount = 1 },
+        });
+        var withoutHistory = _analyzer.AnalyzeRole("reviewer", current, new List<IterationMetrics>());
+
+        // Without history only current signals (50 pts); with history score should be higher
+        Assert.Equal(50, withoutHistory.ConfidenceScore);
+        Assert.True(withHistory.ConfidenceScore > withoutHistory.ConfidenceScore);
+    }
+
+    [Fact]
+    public void AnalyzeRole_NoIssues_AllRolesScoreZeroAndShouldNotImprove()
+    {
+        var current = new IterationMetrics
+        {
+            Verdict = "PASS",
+            BuildSuccess = true,
+            FailedTests = 0,
+            TestRetryCount = 0,
+            ReviewIssuesFound = 0,
+            ReviewRetryCount = 0,
+        };
+        var history = new List<IterationMetrics>();
+
+        foreach (var role in new[] { "coder", "reviewer", "tester" })
+        {
+            var rec = _analyzer.AnalyzeRole(role, current, history);
+            Assert.Equal(0, rec.ConfidenceScore);
+            Assert.False(rec.ShouldImprove);
+        }
+    }
+
+    [Fact]
+    public void AnalyzeRole_RecurringIssuesIncreaseConfidence()
+    {
+        var current = new IterationMetrics { FailedTests = 2, TestRetryCount = 1, BuildSuccess = true };
+        var historicalIteration = new IterationMetrics { FailedTests = 3, TestRetryCount = 1 };
+        var history = new List<IterationMetrics> { historicalIteration, historicalIteration };
+
+        var withHistory = _analyzer.AnalyzeRole("tester", current, history);
+        var withoutHistory = _analyzer.AnalyzeRole("tester", current, new List<IterationMetrics>());
+
+        Assert.True(withHistory.ConfidenceScore > withoutHistory.ConfidenceScore);
+    }
+
+    [Fact]
+    public void GetRolePriorities_ReturnsSortedByConfidenceDescendingThenAlphabetical()
+    {
+        var current = new IterationMetrics
+        {
+            ReviewIssuesFound = 2,
+            ReviewRetryCount = 1,
+            BuildSuccess = true,
+        };
+
+        var priorities = _analyzer.GetRolePriorities(current, new List<IterationMetrics>());
+
+        Assert.Equal(3, priorities.Count);
+        // reviewer should be first (highest score)
+        Assert.Equal("reviewer", priorities[0].Role);
+        // remaining two should be in alphabetical order (coder before tester, both at 0)
+        Assert.Equal("coder", priorities[1].Role);
+        Assert.Equal("tester", priorities[2].Role);
+        // descending order check
+        Assert.True(priorities[0].ConfidenceScore >= priorities[1].ConfidenceScore);
+        Assert.True(priorities[1].ConfidenceScore >= priorities[2].ConfidenceScore);
+    }
 }
