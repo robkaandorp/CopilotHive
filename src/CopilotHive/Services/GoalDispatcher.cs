@@ -283,8 +283,16 @@ public sealed class GoalDispatcher : BackgroundService
                     return;
                 }
                 pipeline.AdvanceTo(GoalPhase.Coding);
-                var fixPrompt = await _brain.CraftPromptAsync(pipeline, "coder",
-                    $"Reviewer feedback:\n{interpretation.Reason}", ct);
+
+                // Build cumulative context: include ALL review issues found so far,
+                // not just the latest round, so the coder addresses everything at once.
+                var allIssues = BuildAccumulatedReviewIssues(pipeline);
+                var fixContext = $"Latest reviewer feedback:\n{interpretation.Reason}"
+                    + (allIssues.Length > 0
+                        ? $"\n\nAccumulated issues from all review rounds (fix ALL of these):\n{allIssues}"
+                        : "");
+
+                var fixPrompt = await _brain.CraftPromptAsync(pipeline, "coder", fixContext, ct);
                 await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
                 break;
 
@@ -876,6 +884,51 @@ public sealed class GoalDispatcher : BackgroundService
                     goalId, pattern);
             }
         }
+    }
+
+    /// <summary>
+    /// Collects all review issues from past Brain interpretations in the pipeline's conversation history.
+    /// Returns a deduplicated summary the Brain can use to ensure the coder fixes everything.
+    /// </summary>
+    private static string BuildAccumulatedReviewIssues(GoalPipeline pipeline)
+    {
+        var allIssues = new List<string>();
+        var round = 0;
+
+        foreach (var entry in pipeline.Conversation)
+        {
+            if (entry.Role != "assistant")
+                continue;
+
+            // Look for review interpretation responses containing REQUEST_CHANGES
+            var content = entry.Content;
+            if (!content.Contains("REQUEST_CHANGES", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            round++;
+
+            // Extract individual issue strings from the "issues" JSON array
+            var issueStart = content.IndexOf("\"issues\"", StringComparison.Ordinal);
+            if (issueStart < 0)
+                continue;
+
+            var arrayStart = content.IndexOf('[', issueStart);
+            var arrayEnd = content.IndexOf(']', arrayStart > 0 ? arrayStart : issueStart);
+            if (arrayStart < 0 || arrayEnd < 0)
+                continue;
+
+            var arrayContent = content[(arrayStart + 1)..arrayEnd];
+            foreach (var part in arrayContent.Split('"'))
+            {
+                var trimmed = part.Trim().Trim(',').Trim();
+                if (trimmed.Length > 10)
+                    allIssues.Add($"[Round {round}] {trimmed}");
+            }
+        }
+
+        return allIssues.Count > 0
+            ? string.Join("\n", allIssues)
+            : "";
     }
 
     /// <summary>

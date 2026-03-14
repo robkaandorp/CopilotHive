@@ -25,6 +25,18 @@ security vulnerabilities, logic errors, and maintainability problems.
 Building and testing is the tester's job. Your review is purely static analysis of the diff
 and source files.
 
+## Scope
+
+**Your review must be scoped to the original goal.** The task prompt describes what
+the coder was asked to do. Evaluate whether the coder's changes correctly and
+completely address that specific goal.
+
+- **In scope**: Issues that directly relate to the goal (missing changes, incorrect
+  implementation, bugs introduced by the changes, broken contracts).
+- **Out of scope**: Pre-existing issues in the codebase that are unrelated to the goal.
+  You may note these as [MINOR] observations, but they must NOT cause a REQUEST_CHANGES
+  verdict on their own. The orchestrator may create separate goals for them later.
+
 ## What NOT to Review
 
 - Style and formatting (trust the linter/formatter)

@@ -108,7 +108,7 @@ public class ConfigRepoManagerTests : IDisposable
         Assert.Equal("main", config.Repositories[0].DefaultBranch);
         Assert.Equal("claude-sonnet-4.6", config.Orchestrator.Model);
         Assert.Equal(20, config.Orchestrator.MaxIterations);
-        Assert.Equal(3, config.Orchestrator.MaxRetriesPerTask); // default
+        Assert.Equal(3, config.Orchestrator.MaxRetriesPerTask);
     }
 
     [Fact]
