@@ -63,7 +63,9 @@ public sealed class CopilotRunner : IAsyncDisposable
     /// <summary>Returns the tool whitelist for a given role. Null means all tools.</summary>
     internal static List<string>? GetToolsForRole(string? role) => role switch
     {
-        "improver" => [],       // pure text-in/text-out — no tools
+        // Improver uses DenyAllPermissions — keep Tools=null to avoid SDK TypeError
+        // when the internal tool enumeration encounters an empty list.
+        "improver" => null,
         _ => null,              // coder, tester, reviewer get all tools
     };
 
@@ -81,7 +83,7 @@ public sealed class CopilotRunner : IAsyncDisposable
             Kind = PermissionRequestResultKind.DeniedByRules,
         });
 
-    /// <summary>Reviewer can read files and run shell commands (git diff, dotnet build/test) but cannot write files.</summary>
+    /// <summary>Reviewer: static analysis only — can read files and run commands (git diff) but cannot write files.</summary>
     private static readonly PermissionRequestHandler ReviewerPermissions =
         (request, _) => Task.FromResult(new PermissionRequestResult
         {

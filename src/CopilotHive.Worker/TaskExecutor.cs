@@ -120,14 +120,18 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner)
 
             if (!isImprover)
             {
+                var isReviewer = assignment.Role == WorkerRole.Reviewer;
+
                 foreach (var (repo, dir) in repoDirectories)
                 {
                     var status = await GitOperations.GetGitStatusAsync(dir, ct);
 
-                    // Push if there are changes and we have a feature branch
+                    // Push if there are changes, we have a feature branch, and the role is allowed to push.
+                    // Reviewer is read-only — it must never push changes to the coder's branch.
                     if (assignment.BranchInfo is { } bi
                         && !string.IsNullOrEmpty(bi.FeatureBranch)
-                        && status.FilesChanged > 0)
+                        && status.FilesChanged > 0
+                        && !isReviewer)
                     {
                         try
                         {

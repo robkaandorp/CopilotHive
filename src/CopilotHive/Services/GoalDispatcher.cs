@@ -158,6 +158,32 @@ public sealed class GoalDispatcher : BackgroundService
 
     private async Task DriveNextPhaseAsync(GoalPipeline pipeline, TaskComplete complete, CancellationToken ct)
     {
+        // No-op detection: if the coder returned without making any file changes,
+        // skip Brain interpretation and immediately retry with a stronger prompt.
+        if (pipeline.Phase == GoalPhase.Coding && (complete.GitStatus?.FilesChanged ?? 0) == 0)
+        {
+            _logger.LogWarning(
+                "No-op detected: Coder for {GoalId} returned with 0 files changed — retrying with stronger prompt",
+                pipeline.GoalId);
+
+            if (!pipeline.IncrementIteration())
+            {
+                await MarkGoalFailed(pipeline, "Coder produced no file changes after max iterations (no-op)", ct);
+                return;
+            }
+
+            var noOpContext =
+                "CRITICAL: Your previous attempt produced ZERO file changes. " +
+                "You MUST edit files and commit them with git. " +
+                "Do NOT just describe or discuss changes — actually make them. " +
+                "Verify your work with 'git status' and 'git log --oneline -3' before finishing.\n\n" +
+                $"Previous coder output (for context):\n{(complete.Output.Length > 500 ? complete.Output[..500] + "..." : complete.Output)}";
+
+            var retryPrompt = await _brain!.CraftPromptAsync(pipeline, "coder", noOpContext, ct);
+            await DispatchToRole(pipeline, WorkerRole.Coder, retryPrompt, ct);
+            return;
+        }
+
         // Log the raw worker output BEFORE Brain interpretation — critical for debugging
         var outputPreview = complete.Output.Length > 2000
             ? complete.Output[..2000] + $"... ({complete.Output.Length} chars total)"
