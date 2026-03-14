@@ -696,22 +696,7 @@ public sealed class Orchestrator : IAsyncDisposable
         var reportLines = new List<string>();
         var inReport = false;
 
-        foreach (var line in response.Split('\n'))
-        {
-            var trimmed = line.Trim();
-            // Both TEST_REPORT: and METRICS: start the report section
-            // Also handle TEST_REPORT without colon (LLMs are creative with formatting)
-            if (trimmed.StartsWith("TEST_REPORT") || trimmed.StartsWith("METRICS:"))
-            {
-                inReport = true;
-                reportLines.Clear();
-                continue;
-            }
-            if (inReport)
-                reportLines.Add(line);
-        }
-
-        ParseReportFields(reportLines, new Dictionary<string, Action<string>>
+        var fieldHandlers = new Dictionary<string, Action<string>>
         {
             ["-"]                        = value => metrics.Issues.Add(value),
             ["build_success:"]           = value => metrics.BuildSuccess = value.Equals("true", StringComparison.OrdinalIgnoreCase),
@@ -735,7 +720,30 @@ public sealed class Orchestrator : IAsyncDisposable
             ["total_tests:"]             = value => { if (int.TryParse(value, out var ot)) metrics.TotalTests = ot; },
             ["passed_tests:"]            = value => { if (int.TryParse(value, out var op)) metrics.PassedTests = op; },
             ["failed_tests:"]            = value => { if (int.TryParse(value, out var of2)) metrics.FailedTests = of2; },
-        });
+        };
+
+        foreach (var line in response.Split('\n'))
+        {
+            var trimmed = line.Trim();
+            // Both TEST_REPORT: and METRICS: start the report section
+            // Also handle TEST_REPORT without colon (LLMs are creative with formatting)
+            if (trimmed.StartsWith("TEST_REPORT") || trimmed.StartsWith("METRICS:"))
+            {
+                // Parse lines accumulated so far so that already-seen field values are
+                // written to metrics and inIssues resets naturally for the new segment.
+                if (inReport && reportLines.Count > 0)
+                {
+                    ParseReportFields(reportLines, fieldHandlers);
+                    reportLines.Clear();
+                }
+                inReport = true;
+                continue;
+            }
+            if (inReport)
+                reportLines.Add(line);
+        }
+
+        ParseReportFields(reportLines, fieldHandlers);
 
         // Fallback: infer verdict from test numbers when no explicit verdict was parsed
         if (string.IsNullOrWhiteSpace(metrics.Verdict) && metrics.TotalTests > 0
