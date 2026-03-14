@@ -15,6 +15,8 @@ public enum OrchestratorActionType
     SpawnReviewer,
     /// <summary>Spawn a tester worker to run and write tests.</summary>
     SpawnTester,
+    /// <summary>Spawn the improver worker to suggest AGENTS.md changes.</summary>
+    SpawnImprover,
     /// <summary>Send the code back to the coder with change requests.</summary>
     RequestChanges,
     /// <summary>Retry the current phase from the beginning.</summary>

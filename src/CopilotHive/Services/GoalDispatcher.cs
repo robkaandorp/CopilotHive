@@ -265,6 +265,11 @@ public sealed class GoalDispatcher : BackgroundService
                 await DispatchToRole(pipeline, WorkerRole.Tester, interpretation.Prompt, ct);
                 break;
 
+            case OrchestratorActionType.SpawnImprover:
+                pipeline.AdvanceTo(GoalPhase.Improve);
+                await DispatchToRole(pipeline, WorkerRole.Improver, interpretation.Prompt, ct);
+                break;
+
             case OrchestratorActionType.RequestChanges:
                 if (!pipeline.IncrementReviewRetry())
                 {
@@ -1174,6 +1179,7 @@ public sealed class GoalDispatcher : BackgroundService
             {
                 OrchestratorActionType.SpawnReviewer => WorkerRole.Reviewer,
                 OrchestratorActionType.SpawnTester => WorkerRole.Tester,
+                OrchestratorActionType.SpawnImprover => WorkerRole.Improver,
                 _ => WorkerRole.Coder,
             };
 
