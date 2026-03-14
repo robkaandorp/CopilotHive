@@ -303,7 +303,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         var conversationSummary = pipeline.Conversation.Count > 0
             ? $"Conversation history ({pipeline.Conversation.Count} messages): " +
-              Truncate(string.Join(" | ", pipeline.Conversation.Select(e => $"[{e.Role}] {e.Content}")), Constants.TruncationLong)
+              Truncate(string.Join(" | ", pipeline.Conversation.Select(e => $"[{e.Role}] {e.Content}")), Constants.TruncationConversationSummary)
             : "";
 
         var prompt = $$"""
@@ -337,8 +337,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             var session = await GetOrCreateSessionAsync(pipeline, ct);
             var response = await SendToSessionAsync(session, prompt, ct);
 
-            pipeline.Conversation.Add(new ConversationEntry("user", Truncate(prompt, Constants.TruncationMedium)));
-            pipeline.Conversation.Add(new ConversationEntry("assistant", Truncate(response, Constants.TruncationMedium)));
+            pipeline.Conversation.Add(new ConversationEntry("user", prompt));
+            pipeline.Conversation.Add(new ConversationEntry("assistant", response));
 
             var dto = ProtocolJson.ParseFromLlmResponse<IterationPlanDto>(response);
             if (dto?.Phases is { Count: > 0 })
@@ -572,8 +572,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _logger.LogDebug("Brain response for {GoalId}:\n{Response}", pipeline.GoalId, Truncate(response, Constants.TruncationVerbose));
 
             // Keep audit log in the pipeline for debugging
-            pipeline.Conversation.Add(new ConversationEntry("user", Truncate(prompt, Constants.TruncationMedium)));
-            pipeline.Conversation.Add(new ConversationEntry("assistant", Truncate(response, Constants.TruncationMedium)));
+            pipeline.Conversation.Add(new ConversationEntry("user", prompt));
+            pipeline.Conversation.Add(new ConversationEntry("assistant", response));
 
             var parsed = ProtocolJson.ParseFromLlmResponse<OrchestratorDecision>(response);
             if (parsed is null)

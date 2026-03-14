@@ -17,3 +17,4 @@ agents/history/
 
 ## Secrets
 .env
+copilothive-smoketest.db

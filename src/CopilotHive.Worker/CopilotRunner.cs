@@ -12,6 +12,7 @@ public sealed class CopilotRunner : IAsyncDisposable
     private CopilotSession? _session;
     private readonly int _port;
     private CustomAgentConfig? _customAgent;
+    private string? _role;
     private readonly WorkerLogger _log = new("Copilot");
 
     /// <summary>Maximum number of connection attempts before giving up.</summary>
@@ -39,24 +40,55 @@ public sealed class CopilotRunner : IAsyncDisposable
     /// </summary>
     public void SetCustomAgent(string role, string agentsMdContent)
     {
+        _role = role;
         _customAgent = new CustomAgentConfig
         {
             Name = role,
             DisplayName = $"CopilotHive {char.ToUpperInvariant(role[0])}{role[1..]}",
             Description = $"CopilotHive worker agent for the {role} role",
             Prompt = agentsMdContent,
-            Tools = null, // all tools available for workers
+            Tools = GetToolsForRole(role),
         };
-        Console.WriteLine($"[Copilot] Custom agent set for role '{role}' ({agentsMdContent.Length} chars)");
+        Console.WriteLine($"[Copilot] Custom agent set for role '{role}' ({agentsMdContent.Length} chars, tools={(_customAgent.Tools is null ? "all" : $"[{string.Join(",", _customAgent.Tools)}]")})");
         _log.Debug($"Agent prompt:\n{agentsMdContent}");
     }
 
     private SessionConfig BuildSessionConfig() => new()
     {
         Streaming = false,
-        OnPermissionRequest = PermissionHandler.ApproveAll,
+        OnPermissionRequest = GetPermissionHandlerForRole(_role),
         CustomAgents = _customAgent is not null ? [_customAgent] : [],
     };
+
+    /// <summary>Returns the tool whitelist for a given role. Null means all tools.</summary>
+    internal static List<string>? GetToolsForRole(string? role) => role switch
+    {
+        "improver" => [],       // pure text-in/text-out — no tools
+        _ => null,              // coder, tester, reviewer get all tools
+    };
+
+    /// <summary>Returns the permission handler appropriate for the role.</summary>
+    internal static PermissionRequestHandler GetPermissionHandlerForRole(string? role) => role switch
+    {
+        "improver" => DenyAllPermissions,
+        "reviewer" => ReviewerPermissions,
+        _ => PermissionHandler.ApproveAll,  // coder, tester
+    };
+
+    private static readonly PermissionRequestHandler DenyAllPermissions =
+        (_, _) => Task.FromResult(new PermissionRequestResult
+        {
+            Kind = PermissionRequestResultKind.DeniedByRules,
+        });
+
+    /// <summary>Reviewer can read files and run shell commands (git diff, dotnet build/test) but cannot write files.</summary>
+    private static readonly PermissionRequestHandler ReviewerPermissions =
+        (request, _) => Task.FromResult(new PermissionRequestResult
+        {
+            Kind = request.Kind == "write"
+                ? PermissionRequestResultKind.DeniedByRules
+                : PermissionRequestResultKind.Approved,
+        });
 
     /// <summary>
     /// Connects to the Copilot CLI, retrying up to <see cref="MaxConnectRetries"/> times.

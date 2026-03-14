@@ -23,6 +23,7 @@ internal static class Constants
     public const int TruncationBrief    = 300;
     public const int TruncationMedium   = 500;
     public const int TruncationLong     = 2000;
+    public const int TruncationConversationSummary = 2000;
     public const int TruncationVerbose  = 4000;
     public const int TruncationVeryLong = 6000;
     public const int TruncationFull     = 8000;
