@@ -3,6 +3,20 @@ using CopilotHive.Metrics;
 namespace CopilotHive.Improvement;
 
 /// <summary>
+/// Recommendation for whether a specific role should be improved, with a confidence score and reasons.
+/// </summary>
+/// <param name="Role">The worker role name.</param>
+/// <param name="ShouldImprove">Whether improvement is recommended (ConfidenceScore >= 50).</param>
+/// <param name="ConfidenceScore">Score in [0, 100] indicating how strongly improvement is warranted.</param>
+/// <param name="Reasons">Human-readable explanations for the score.</param>
+public record RoleImprovementRecommendation(
+    string Role,
+    bool ShouldImprove,
+    int ConfidenceScore,
+    List<string> Reasons
+);
+
+/// <summary>
 /// Request to improve one role's AGENTS.md.
 /// </summary>
 /// <param name="Role">The worker role whose AGENTS.md should be improved.</param>
@@ -165,6 +179,89 @@ public sealed class ImprovementAnalyzer
         }
 
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Analyses metrics for a specific role and returns a confidence-scored recommendation.
+    /// </summary>
+    public RoleImprovementRecommendation AnalyzeRole(
+        string role,
+        IterationMetrics current,
+        IReadOnlyList<IterationMetrics> history)
+    {
+        // Define signals as: (predicate, current-reason factory, history signal description)
+        List<(Func<IterationMetrics, bool> HasSignal, Func<IterationMetrics, string> CurrentReason, string HistorySignalName)>? signals =
+            role.ToLowerInvariant() switch
+            {
+                "reviewer" =>
+                [
+                    (m => m.ReviewIssuesFound > 0,
+                     m => $"Current iteration had {m.ReviewIssuesFound} review issues",
+                     "review issues"),
+                    (m => m.ReviewRetryCount > 0,
+                     m => $"Current iteration had {m.ReviewRetryCount} review retries",
+                     "review retries"),
+                ],
+                "tester" =>
+                [
+                    (m => m.FailedTests > 0,
+                     m => $"Current iteration had {m.FailedTests} test failures",
+                     "test failures"),
+                    (m => m.TestRetryCount > 0,
+                     m => $"Current iteration had {m.TestRetryCount} test retries",
+                     "test retries"),
+                ],
+                "coder" =>
+                [
+                    (m => m.Issues.Count > 0,
+                     m => $"Current iteration had {m.Issues.Count} code issues",
+                     "code issues"),
+                    (m => !m.BuildSuccess,
+                     _ => "Current iteration had a build failure",
+                     "build failures"),
+                ],
+                _ => null,
+            };
+
+        if (signals is null)
+            return new RoleImprovementRecommendation(role, false, 0, []);
+
+        var reasons = new List<string>();
+        int score = 0;
+
+        foreach (var (hasSignal, currentReason, historySignalName) in signals)
+        {
+            if (hasSignal(current))
+            {
+                score += 25;
+                reasons.Add(currentReason(current));
+            }
+
+            int historicalCount = history.Count(hasSignal);
+            if (historicalCount > 0)
+            {
+                score += historicalCount * 10;
+                reasons.Add($"{historicalCount} of {history.Count} historical iterations had {historySignalName}");
+            }
+        }
+
+        score = Math.Clamp(score, 0, 100);
+        return new RoleImprovementRecommendation(role, score >= 50, score, reasons);
+    }
+
+    /// <summary>
+    /// Returns improvement recommendations for all roles, sorted by ConfidenceScore descending
+    /// (ties broken alphabetically by Role).
+    /// </summary>
+    public IReadOnlyList<RoleImprovementRecommendation> GetRolePriorities(
+        IterationMetrics current,
+        IReadOnlyList<IterationMetrics> history)
+    {
+        return new[] { "coder", "reviewer", "tester" }
+            .Select(role => AnalyzeRole(role, current, history))
+            .OrderByDescending(r => r.ConfidenceScore)
+            .ThenBy(r => r.Role)
+            .ToList();
     }
 
     private static string BuildPromptForRole(string role, string agentsMd, string analysis)
