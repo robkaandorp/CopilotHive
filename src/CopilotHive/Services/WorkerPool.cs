@@ -166,17 +166,25 @@ public sealed class WorkerPool
     /// <returns>A read-only list of the removed <see cref="ConnectedWorker"/> instances.</returns>
     public IReadOnlyList<ConnectedWorker> PurgeStaleWorkers(TimeSpan timeout)
     {
+        // Snapshot now once so all staleness decisions are made against a consistent point in time.
         var now = DateTime.UtcNow;
         var removed = new List<ConnectedWorker>();
 
-        foreach (var kvp in _workers)
+        foreach (var key in _workers.Keys.ToList())
         {
-            if (now - kvp.Value.LastHeartbeat > timeout)
+            if (_workers.TryRemove(key, out var worker))
             {
-                if (_workers.TryRemove(kvp.Key, out var worker))
+                if (now - worker.LastHeartbeat > timeout)
                 {
+                    // Worker was stale at snapshot time — complete its channel and record it.
                     worker.MessageChannel.Writer.TryComplete();
                     removed.Add(worker);
+                }
+                else
+                {
+                    // Worker was fresh at snapshot time (heartbeat may have arrived between
+                    // the staleness pre-check and TryRemove). Put it back to avoid a spurious purge.
+                    _workers.TryAdd(key, worker);
                 }
             }
         }

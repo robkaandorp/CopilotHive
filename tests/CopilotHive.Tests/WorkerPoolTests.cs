@@ -53,14 +53,17 @@ public sealed class WorkerPoolTests
 
     #endregion
 
-    #region GetStaleWorkers — exactly at boundary (not stale)
+    #region GetStaleWorkers — just under boundary (not stale)
 
     [Fact]
-    public void GetStaleWorkers_HeartbeatExactlyAtTimeout_NotConsideredStale()
+    public void GetStaleWorkers_HeartbeatJustUnderTimeout_NotConsideredStale()
     {
         var pool = CreatePool();
         var timeout = TimeSpan.FromMinutes(1);
         // LastHeartbeat is 1 second fresher than the timeout boundary — clearly not stale.
+        // Note: a test for the exact boundary (now - timeout == LastHeartbeat) is omitted because
+        // DateTime.UtcNow advances between the heartbeat assignment and the GetStaleWorkers call,
+        // making a reliable exact-equality assertion impossible without a controlled time source.
         var withinBoundary = DateTime.UtcNow - timeout + TimeSpan.FromSeconds(1);
         RegisterWithHeartbeat(pool, "w1", WorkerRole.Coder, withinBoundary);
 
