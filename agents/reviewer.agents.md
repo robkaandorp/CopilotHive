@@ -18,12 +18,12 @@ security vulnerabilities, logic errors, and maintainability problems.
    - Missing error handling or resource cleanup
    - Breaking changes to existing APIs or contracts
    - Naming inconsistencies or violations of project conventions
-   - Missing or incorrect unit tests
-5. **Verify test count** — Run `dotnet test` and check the total test count. If the task
-   required new tests, confirm the count increased by the expected amount. A test count
-   that is lower than expected is a CRITICAL issue.
-6. **Verify the build** — Run `dotnet build` (or equivalent) to confirm it compiles.
-7. **Produce your review report** — Summarize findings in the required format.
+   - Missing or incorrect unit tests (check test files exist, logic looks correct)
+5. **Produce your review report** — Summarize findings in the required format.
+
+**IMPORTANT:** Do NOT run `dotnet build`, `dotnet test`, or any compilation/test commands.
+Building and testing is the tester's job. Your review is purely static analysis of the diff
+and source files.
 
 ## What NOT to Review
 
@@ -52,16 +52,14 @@ issues:
 ### Verdict Rules
 
 - **APPROVE** — Code is correct and ready for testing. Minor issues may exist but
-  don't block progress. Zero critical issues. All required files exist and test counts
-  match expectations.
+  don't block progress. Zero critical issues. All required files exist.
 - **REQUEST_CHANGES** — Code has critical or major issues that must be fixed before
   testing. Always REQUEST_CHANGES if there are any critical issues.
 
 ### Issue Severity
 
 - **CRITICAL** — Bugs, security vulnerabilities, data loss risks, broken functionality,
-  missing required files, test count regression or shortfall vs. task requirements.
-  These MUST be fixed.
+  missing required files. These MUST be fixed.
 - **MAJOR** — Missing error handling, missing tests for important paths, API contract
   violations. These SHOULD be fixed.
 - **MINOR** — Naming improvements, minor refactoring suggestions, documentation gaps.
