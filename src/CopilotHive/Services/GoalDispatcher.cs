@@ -995,6 +995,7 @@ public sealed class GoalDispatcher : BackgroundService
         pipeline.Metrics.TestRetryCount = pipeline.TestRetries;
         PopulateAgentsMdVersions(pipeline);
         _metricsTracker?.RecordIteration(pipeline.Metrics);
+        await CommitMetricsToConfigRepoAsync(pipeline, ct);
 
         // Check for regression after recording metrics
         if (_metricsTracker is not null && _agentsManager is not null)
@@ -1069,6 +1070,7 @@ public sealed class GoalDispatcher : BackgroundService
         pipeline.Metrics.TestRetryCount = pipeline.TestRetries;
         PopulateAgentsMdVersions(pipeline);
         _metricsTracker?.RecordIteration(pipeline.Metrics);
+        await CommitMetricsToConfigRepoAsync(pipeline, ct);
 
         _logger.LogWarning("Goal {GoalId} failed: {Reason}", pipeline.GoalId, reason);
     }
@@ -1103,6 +1105,39 @@ public sealed class GoalDispatcher : BackgroundService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to commit goals.yaml update to config repo");
+        }
+    }
+
+    /// <summary>
+    /// Persists iteration metrics to the config repo as a JSON file under metrics/{goalId}.json.
+    /// This creates a durable, version-controlled metrics history that survives container restarts
+    /// and feeds the self-improvement loop.
+    /// </summary>
+    private async Task CommitMetricsToConfigRepoAsync(GoalPipeline pipeline, CancellationToken ct)
+    {
+        if (_configRepo is null)
+            return;
+
+        try
+        {
+            var metricsDir = Path.Combine(_configRepo.LocalPath, "metrics");
+            Directory.CreateDirectory(metricsDir);
+
+            var metricsPath = Path.Combine(metricsDir, $"{pipeline.GoalId}.json");
+            var json = System.Text.Json.JsonSerializer.Serialize(pipeline.Metrics, new System.Text.Json.JsonSerializerOptions
+            {
+                WriteIndented = true,
+                PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase,
+            });
+            await File.WriteAllTextAsync(metricsPath, json, ct);
+
+            await _configRepo.CommitFileAsync(metricsPath,
+                $"Metrics for goal '{pipeline.GoalId}' ({pipeline.Metrics.Verdict})", ct);
+            _logger.LogInformation("Committed metrics for {GoalId} to config repo", pipeline.GoalId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to commit metrics for {GoalId} to config repo", pipeline.GoalId);
         }
     }
 
