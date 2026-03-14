@@ -1,5 +1,6 @@
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
+using CopilotHive.Services;
 
 namespace CopilotHive.Tests;
 
@@ -253,5 +254,78 @@ public class ParseTestReportTests
 
         // Should NOT infer PASS when there are failures
         Assert.Equal("", metrics.Verdict);
+    }
+}
+
+public class FallbackParseTestMetricsTests
+{
+    private static IterationMetrics Parse(string output)
+    {
+        var metrics = new IterationMetrics();
+        GoalDispatcher.FallbackParseTestMetrics(output, metrics);
+        return metrics;
+    }
+
+    [Fact]
+    public void DotnetTestOutput_ExtractsMetrics()
+    {
+        const string output = """
+            I ran the tests and here are the results:
+            
+            Passed!  - Failed:     0, Passed:   268, Skipped:     0, Total:   268, Duration: 46 s - CopilotHive.Tests.dll (net10.0)
+            """;
+
+        var metrics = Parse(output);
+
+        Assert.Equal(268, metrics.TotalTests);
+        Assert.Equal(268, metrics.PassedTests);
+        Assert.Equal(0, metrics.FailedTests);
+    }
+
+    [Fact]
+    public void DotnetTestOutput_WithFailures()
+    {
+        const string output = "Failed!  - Failed:     3, Passed:   265, Skipped:     0, Total:   268";
+
+        var metrics = Parse(output);
+
+        Assert.Equal(268, metrics.TotalTests);
+        Assert.Equal(265, metrics.PassedTests);
+        Assert.Equal(3, metrics.FailedTests);
+    }
+
+    [Fact]
+    public void TestReportFields_Parsed()
+    {
+        const string output = """
+            total_tests: 42
+            passed_tests: 40
+            failed_tests: 2
+            """;
+
+        var metrics = Parse(output);
+
+        Assert.Equal(42, metrics.TotalTests);
+        Assert.Equal(40, metrics.PassedTests);
+        Assert.Equal(2, metrics.FailedTests);
+    }
+
+    [Fact]
+    public void EmptyInput_LeavesDefaults()
+    {
+        var metrics = Parse("");
+
+        Assert.Equal(0, metrics.TotalTests);
+        Assert.Equal(0, metrics.PassedTests);
+        Assert.Equal(0, metrics.FailedTests);
+    }
+
+    [Fact]
+    public void NullInput_LeavesDefaults()
+    {
+        var metrics = new IterationMetrics();
+        GoalDispatcher.FallbackParseTestMetrics(null!, metrics);
+
+        Assert.Equal(0, metrics.TotalTests);
     }
 }

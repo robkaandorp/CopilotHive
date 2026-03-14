@@ -209,13 +209,24 @@ public sealed class GoalDispatcher : BackgroundService
             await ApplyAgentsUpdatesAsync(pipeline.GoalId, complete.Output, ct);
         }
 
-        // Update metrics if available
+        // Update metrics if available from Brain interpretation
         if (interpretation.TestMetrics is not null)
         {
             pipeline.Metrics.TotalTests = interpretation.TestMetrics.TotalTests ?? 0;
             pipeline.Metrics.PassedTests = interpretation.TestMetrics.PassedTests ?? 0;
             pipeline.Metrics.FailedTests = interpretation.TestMetrics.FailedTests ?? 0;
             pipeline.Metrics.CoveragePercent = interpretation.TestMetrics.CoveragePercent ?? 0;
+        }
+
+        // Fallback: if this is the Testing phase and Brain didn't extract metrics,
+        // parse the raw worker output for test result patterns (e.g. "Passed: 268")
+        if (pipeline.Phase == GoalPhase.Testing && pipeline.Metrics.TotalTests == 0)
+        {
+            FallbackParseTestMetrics(complete.Output, pipeline.Metrics);
+            if (pipeline.Metrics.TotalTests > 0)
+                _logger.LogInformation(
+                    "Fallback metrics parsed for {GoalId}: {Passed}/{Total} passed, {Failed} failed",
+                    pipeline.GoalId, pipeline.Metrics.PassedTests, pipeline.Metrics.TotalTests, pipeline.Metrics.FailedTests);
         }
         if (interpretation.Issues is not null)
             pipeline.Metrics.Issues.AddRange(interpretation.Issues);
@@ -292,19 +303,16 @@ public sealed class GoalDispatcher : BackgroundService
                 break;
 
             default:
-                // Ask the Brain explicitly for next step
-                var decision = await _brain.DecideNextStepAsync(
-                    pipeline, pipeline.BuildContextSummary(), ct);
-                _logger.LogInformation("Brain decided: {Action} for {GoalId}", decision.Action, pipeline.GoalId);
+                _logger.LogWarning(
+                    "Unrecognized Brain action '{Action}' for {GoalId} (phase={Phase}) — enforcing remaining phases",
+                    interpretation.Action, pipeline.GoalId, pipeline.Phase);
 
-                // Recurse with the decision as a synthetic completion
-                var synthetic = new TaskComplete
-                {
-                    TaskId = complete.TaskId,
-                    Status = complete.Status,
-                    Output = decision.Reason ?? "",
-                };
-                await DriveNextPhaseAsync(pipeline, synthetic, ct);
+                // Instead of recursing, enforce remaining pipeline phases or complete
+                var defaultEnforced = await EnforceRemainingPhasesAsync(pipeline, ct,
+                    interpretation.Verdict ?? interpretation.ReviewVerdict ?? "UNKNOWN",
+                    interpretation.Reason ?? $"Unrecognized action: {interpretation.Action}");
+                if (!defaultEnforced)
+                    await MarkGoalCompleted(pipeline, ct);
                 break;
         }
     }
@@ -837,6 +845,56 @@ public sealed class GoalDispatcher : BackgroundService
                     "source code modifications from the Improver are not applied. " +
                     "Only *.agents.md changes parsed from the response text are used.",
                     goalId, pattern);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Fallback metric extraction from raw worker output when the Brain doesn't return test_metrics.
+    /// Parses common patterns like "Passed: 268", "Failed: 0", "Total: 268" from dotnet test output.
+    /// </summary>
+    internal static void FallbackParseTestMetrics(string output, IterationMetrics metrics)
+    {
+        if (string.IsNullOrEmpty(output))
+            return;
+
+        // dotnet test summary: "Passed!  - Failed:     0, Passed:   268, Skipped:     0, Total:   268"
+        var dotnetMatch = System.Text.RegularExpressions.Regex.Match(
+            output,
+            @"Failed:\s*(\d+),\s*Passed:\s*(\d+),\s*Skipped:\s*(\d+),\s*Total:\s*(\d+)",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        if (dotnetMatch.Success)
+        {
+            metrics.FailedTests = int.Parse(dotnetMatch.Groups[1].Value);
+            metrics.PassedTests = int.Parse(dotnetMatch.Groups[2].Value);
+            metrics.TotalTests = int.Parse(dotnetMatch.Groups[4].Value);
+            return;
+        }
+
+        // TEST_REPORT style fields (used by Orchestrator.ParseTestReport)
+        foreach (var line in output.Split('\n'))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("unit_tests_total:", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("total_tests:", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("total:", StringComparison.OrdinalIgnoreCase))
+            {
+                if (int.TryParse(trimmed[(trimmed.IndexOf(':') + 1)..].Trim(), out var t))
+                    metrics.TotalTests = t;
+            }
+            else if (trimmed.StartsWith("unit_tests_passed:", StringComparison.OrdinalIgnoreCase)
+                     || trimmed.StartsWith("passed_tests:", StringComparison.OrdinalIgnoreCase)
+                     || trimmed.StartsWith("passed:", StringComparison.OrdinalIgnoreCase))
+            {
+                if (int.TryParse(trimmed[(trimmed.IndexOf(':') + 1)..].Trim(), out var p))
+                    metrics.PassedTests = p;
+            }
+            else if (trimmed.StartsWith("failed_tests:", StringComparison.OrdinalIgnoreCase)
+                     || trimmed.StartsWith("failed:", StringComparison.OrdinalIgnoreCase))
+            {
+                if (int.TryParse(trimmed[(trimmed.IndexOf(':') + 1)..].Trim(), out var f))
+                    metrics.FailedTests = f;
             }
         }
     }

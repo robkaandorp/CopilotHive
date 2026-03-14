@@ -479,6 +479,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                   "issues": ["<issue1>", "<issue2>"]
                 }
                 """,
+            "improve" => """
+                {
+                  "verdict": "PASS or FAIL",
+                  "issues": ["<issue1>", "<issue2>"]
+                }
+                """,
             _ => """
                 {
                   "verdict": "PASS or FAIL or COMPLETE",
@@ -487,8 +493,17 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 """,
         };
 
+        var modeInstruction = workerRole.ToLowerInvariant() == "improve"
+            ? """
+              IMPORTANT: You are in INTERPRETATION mode, NOT prompt-crafting mode.
+              Do NOT return an "action" or "prompt" field. Do NOT suggest spawning any worker.
+              Your ONLY job is to analyze the output below and return a verdict.
+
+              """
+            : "";
+
         var prompt = $$"""
-            Interpret this {{workerRole}}'s output and extract structured data.
+            {{modeInstruction}}Interpret this {{workerRole}}'s output and extract structured data.
 
             === {{workerRole.ToUpperInvariant()}} OUTPUT (truncated) ===
             {{Truncate(workerOutput, Constants.TruncationVeryLong)}}
@@ -500,7 +515,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - For reviewers: did they approve or request changes? What issues?
             - Extract any specific issues mentioned
 
-            Respond with JSON:
+            Respond ONLY with this JSON (no other fields):
             {{schema}}
             """;
 
