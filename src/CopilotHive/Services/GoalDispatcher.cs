@@ -632,6 +632,8 @@ public sealed class GoalDispatcher : BackgroundService
                 try
                 {
                     await RunGitAsync($"clone --branch {repo.DefaultBranch} {repo.Url} {tempDir}", ct);
+                    await RunGitAsync($"-C {tempDir} config user.email copilothive@local", ct);
+                    await RunGitAsync($"-C {tempDir} config user.name CopilotHive", ct);
                     await RunGitAsync($"-C {tempDir} fetch origin {pipeline.CoderBranch}", ct);
                     await RunGitAsync($"-C {tempDir} merge origin/{pipeline.CoderBranch} --no-edit", ct);
                     await RunGitAsync($"-C {tempDir} push origin {repo.DefaultBranch}", ct);
