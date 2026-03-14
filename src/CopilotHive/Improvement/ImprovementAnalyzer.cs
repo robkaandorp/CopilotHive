@@ -75,7 +75,7 @@ public sealed class ImprovementAnalyzer
         if (agentsMd.Count > 0)
         {
             sb.AppendLine();
-            sb.AppendLine("## Current AGENTS.md Files");
+            sb.AppendLine("## Current AGENTS.md Files (also available as files in your working directory)");
             foreach (var (role, content) in agentsMd)
             {
                 sb.AppendLine($"### {role}.agents.md");
