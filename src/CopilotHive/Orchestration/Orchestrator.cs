@@ -664,43 +664,28 @@ public sealed class Orchestrator : IAsyncDisposable
     /// </summary>
     internal static string ParseReviewReport(string response, IterationMetrics metrics)
     {
-        var inReport = false;
-        var inIssues = false;
         var verdict = "";
+        var reportLines = new List<string>();
+        var inReport = false;
 
         foreach (var line in response.Split('\n'))
         {
-            var trimmed = line.Trim();
-
-            if (trimmed.StartsWith("REVIEW_REPORT", StringComparison.OrdinalIgnoreCase))
+            if (!inReport)
             {
-                inReport = true;
-                inIssues = false;
+                if (line.Trim().StartsWith("REVIEW_REPORT", StringComparison.OrdinalIgnoreCase))
+                    inReport = true;
                 continue;
             }
-
-            if (!inReport) continue;
-
-            if (inIssues && trimmed.StartsWith("- "))
-            {
-                metrics.ReviewIssues.Add(trimmed[2..].Trim());
-                continue;
-            }
-
-            if (inIssues && !trimmed.StartsWith("- "))
-                inIssues = false;
-
-            if (TryParseField(trimmed, "verdict:", out var verdictVal))
-                verdict = verdictVal;
-            else if (TryParseField(trimmed, "issues_count:", out var countVal)
-                     && int.TryParse(countVal, out var count))
-                metrics.ReviewIssuesFound = count;
-            else if (TryParseField(trimmed, "critical_issues:", out var critVal)
-                     && int.TryParse(critVal, out var crit))
-                metrics.ReviewIssuesFound = Math.Max(metrics.ReviewIssuesFound, crit);
-            else if (trimmed.StartsWith("issues:", StringComparison.OrdinalIgnoreCase))
-                inIssues = true;
+            reportLines.Add(line);
         }
+
+        ParseReportFields(reportLines, new Dictionary<string, Action<string>>
+        {
+            ["-"]                = value => metrics.ReviewIssues.Add(value),
+            ["verdict:"]         = value => verdict = value,
+            ["issues_count:"]    = value => { if (int.TryParse(value, out var c)) metrics.ReviewIssuesFound = c; },
+            ["critical_issues:"] = value => { if (int.TryParse(value, out var c)) metrics.ReviewIssuesFound = Math.Max(metrics.ReviewIssuesFound, c); },
+        });
 
         metrics.ReviewVerdict = verdict;
         return verdict;
@@ -708,89 +693,98 @@ public sealed class Orchestrator : IAsyncDisposable
 
     internal static void ParseTestReport(string response, IterationMetrics metrics)
     {
+        var reportLines = new List<string>();
         var inReport = false;
-        var inIssues = false;
 
         foreach (var line in response.Split('\n'))
         {
             var trimmed = line.Trim();
-
             // Both TEST_REPORT: and METRICS: start the report section
             // Also handle TEST_REPORT without colon (LLMs are creative with formatting)
             if (trimmed.StartsWith("TEST_REPORT") || trimmed.StartsWith("METRICS:"))
             {
                 inReport = true;
-                inIssues = false;
+                reportLines.Clear();
                 continue;
             }
-
-            if (!inReport) continue;
-
-            // Issue list items (lines starting with "- ")
-            if (inIssues && trimmed.StartsWith("- "))
-            {
-                metrics.Issues.Add(trimmed[2..].Trim());
-                continue;
-            }
-
-            if (inIssues && !trimmed.StartsWith("- "))
-                inIssues = false;
-
-            if (TryParseField(trimmed, "build_success:", out var buildVal))
-                metrics.BuildSuccess = buildVal.Equals("true", StringComparison.OrdinalIgnoreCase);
-            else if (TryParseField(trimmed, "unit_tests_total:", out var utTotal) && int.TryParse(utTotal, out var t))
-                metrics.TotalTests = t;
-            else if (TryParseField(trimmed, "unit_tests_passed:", out var utPassed) && int.TryParse(utPassed, out var p))
-            {
-                metrics.PassedTests = p;
-                metrics.FailedTests = metrics.TotalTests - p;
-            }
-            else if (TryParseField(trimmed, "integration_tests_total:", out var itTotal) && int.TryParse(itTotal, out var it))
-                metrics.IntegrationTestsTotal = it;
-            else if (TryParseField(trimmed, "integration_tests_passed:", out var itPassed) && int.TryParse(itPassed, out var ip))
-                metrics.IntegrationTestsPassed = ip;
-            else if (TryParseField(trimmed, "runtime_verified:", out var rvVal))
-                metrics.RuntimeVerified = rvVal.Equals("true", StringComparison.OrdinalIgnoreCase);
-            else if (TryParseField(trimmed, "coverage_percent:", out var covVal)
-                     && double.TryParse(covVal, System.Globalization.CultureInfo.InvariantCulture, out var cov))
-                metrics.CoveragePercent = cov;
-            else if (TryParseField(trimmed, "verdict:", out var verdictVal))
-                metrics.Verdict = verdictVal;
-            // LLMs use various labels for the verdict field
-            else if (TryParseField(trimmed, "status:", out var statusVal))
-                metrics.Verdict = statusVal;
-            else if (TryParseField(trimmed, "conclusion:", out var conclusionVal))
-                metrics.Verdict = conclusionVal;
-            else if (TryParseField(trimmed, "result:", out var resultVal)
-                     && !int.TryParse(resultVal, out _)) // avoid matching "Results: 96"
-                metrics.Verdict = resultVal;
-            else if (TryParseField(trimmed, "summary:", out var summaryVal))
-                metrics.TestReportSummary = summaryVal;
-            else if (trimmed.StartsWith("issues:", StringComparison.OrdinalIgnoreCase))
-                inIssues = true;
-
-            // Short-form aliases (LLMs abbreviate)
-            else if (TryParseField(trimmed, "total:", out var shortTotal) && int.TryParse(shortTotal, out var st))
-                metrics.TotalTests = st;
-            else if (TryParseField(trimmed, "passed:", out var shortPassed) && int.TryParse(shortPassed, out var sp))
-                metrics.PassedTests = sp;
-            else if (TryParseField(trimmed, "failed:", out var shortFailed) && int.TryParse(shortFailed, out var sf))
-                metrics.FailedTests = sf;
-
-            // Also support the old METRICS: format for backwards compatibility
-            else if (TryParseField(trimmed, "total_tests:", out var oldTotal) && int.TryParse(oldTotal, out var ot))
-                metrics.TotalTests = ot;
-            else if (TryParseField(trimmed, "passed_tests:", out var oldPassed) && int.TryParse(oldPassed, out var op))
-                metrics.PassedTests = op;
-            else if (TryParseField(trimmed, "failed_tests:", out var oldFailed) && int.TryParse(oldFailed, out var of2))
-                metrics.FailedTests = of2;
+            if (inReport)
+                reportLines.Add(line);
         }
+
+        ParseReportFields(reportLines, new Dictionary<string, Action<string>>
+        {
+            ["-"]                        = value => metrics.Issues.Add(value),
+            ["build_success:"]           = value => metrics.BuildSuccess = value.Equals("true", StringComparison.OrdinalIgnoreCase),
+            ["unit_tests_total:"]        = value => { if (int.TryParse(value, out var t)) metrics.TotalTests = t; },
+            ["unit_tests_passed:"]       = value => { if (int.TryParse(value, out var p)) { metrics.PassedTests = p; metrics.FailedTests = metrics.TotalTests - p; } },
+            ["integration_tests_total:"] = value => { if (int.TryParse(value, out var it)) metrics.IntegrationTestsTotal = it; },
+            ["integration_tests_passed:"]= value => { if (int.TryParse(value, out var ip)) metrics.IntegrationTestsPassed = ip; },
+            ["runtime_verified:"]        = value => metrics.RuntimeVerified = value.Equals("true", StringComparison.OrdinalIgnoreCase),
+            ["coverage_percent:"]        = value => { if (double.TryParse(value, System.Globalization.CultureInfo.InvariantCulture, out var cov)) metrics.CoveragePercent = cov; },
+            ["verdict:"]                 = value => metrics.Verdict = value,
+            // LLMs use various labels for the verdict field
+            ["status:"]                  = value => metrics.Verdict = value,
+            ["conclusion:"]              = value => metrics.Verdict = value,
+            ["result:"]                  = value => { if (!int.TryParse(value, out _)) metrics.Verdict = value; }, // avoid matching "Results: 96"
+            ["summary:"]                 = value => metrics.TestReportSummary = value,
+            // Short-form aliases (LLMs abbreviate)
+            ["total:"]                   = value => { if (int.TryParse(value, out var st)) metrics.TotalTests = st; },
+            ["passed:"]                  = value => { if (int.TryParse(value, out var sp)) metrics.PassedTests = sp; },
+            ["failed:"]                  = value => { if (int.TryParse(value, out var sf)) metrics.FailedTests = sf; },
+            // Old METRICS: format for backwards compatibility
+            ["total_tests:"]             = value => { if (int.TryParse(value, out var ot)) metrics.TotalTests = ot; },
+            ["passed_tests:"]            = value => { if (int.TryParse(value, out var op)) metrics.PassedTests = op; },
+            ["failed_tests:"]            = value => { if (int.TryParse(value, out var of2)) metrics.FailedTests = of2; },
+        });
 
         // Fallback: infer verdict from test numbers when no explicit verdict was parsed
         if (string.IsNullOrWhiteSpace(metrics.Verdict) && metrics.TotalTests > 0
             && metrics.FailedTests == 0 && metrics.PassedTests == metrics.TotalTests)
         {
             metrics.Verdict = "PASS";
+        }
+    }
+
+    /// <summary>
+    /// Iterates <paramref name="lines"/> and dispatches each recognized "key: value" field to the
+    /// corresponding handler in <paramref name="fieldHandlers"/>. The special key <c>"-"</c> handles
+    /// bullet-list items that appear after an <c>issues:</c> trigger line.
+    /// </summary>
+    private static void ParseReportFields(
+        IEnumerable<string> lines,
+        Dictionary<string, Action<string>> fieldHandlers)
+    {
+        var inIssues = false;
+
+        foreach (var line in lines)
+        {
+            var trimmed = line.Trim();
+
+            if (inIssues && trimmed.StartsWith("- "))
+            {
+                if (fieldHandlers.TryGetValue("-", out var issueHandler))
+                    issueHandler(trimmed[2..].Trim());
+                continue;
+            }
+
+            if (inIssues && !trimmed.StartsWith("- "))
+                inIssues = false;
+
+            if (trimmed.StartsWith("issues:", StringComparison.OrdinalIgnoreCase))
+            {
+                inIssues = true;
+                continue;
+            }
+
+            foreach (var (key, handler) in fieldHandlers)
+            {
+                if (key == "-") continue;
+                if (TryParseField(trimmed, key, out var val))
+                {
+                    handler(val);
+                    break;
+                }
+            }
         }
     }
 
