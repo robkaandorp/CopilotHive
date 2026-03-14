@@ -71,9 +71,12 @@ public sealed class CopilotRunner : IAsyncDisposable
 
     private SessionConfig BuildSessionConfig()
     {
+        var isImprover = _role == "improver";
         var config = new SessionConfig
         {
-            Streaming = true,
+            // Improver is pure text-in/text-out with DenyAllPermissions;
+            // streaming can cause hangs when the model tries tools that all get denied.
+            Streaming = !isImprover,
             OnPermissionRequest = GetPermissionHandlerForRole(_role),
             CustomAgents = _customAgent is not null ? [_customAgent] : [],
         };
