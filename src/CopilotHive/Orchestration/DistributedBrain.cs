@@ -81,6 +81,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// Connects to the Copilot CLI, retrying up to <see cref="Constants.DistributedBrainMaxRetries"/> times with a 5-second backoff.
     /// </summary>
     /// <param name="ct">Cancellation token.</param>
+    /// <returns>A task that represents the asynchronous operation.</returns>
     public async Task ConnectAsync(CancellationToken ct = default)
     {
         _copilotClient = new CopilotClient(new CopilotClientOptions
@@ -153,6 +154,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     /// <summary>Removes and disposes the session for a completed/failed goal.</summary>
     /// <param name="goalId">Identifier of the goal whose session should be removed.</param>
+    /// <returns>A task that represents the asynchronous operation.</returns>
     public async Task CleanupGoalSessionAsync(string goalId)
     {
         if (_sessions.TryRemove(goalId, out var session))
@@ -168,6 +170,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// </summary>
     /// <param name="pipeline">The goal pipeline whose session should be re-primed.</param>
     /// <param name="ct">Cancellation token.</param>
+    /// <returns>A task that represents the asynchronous operation.</returns>
     public async Task ReprimeSessionAsync(GoalPipeline pipeline, CancellationToken ct)
     {
         EnsureConnected();
@@ -403,8 +406,11 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <summary>DTO for deserializing the Brain's iteration plan JSON response.</summary>
     private sealed record IterationPlanDto
     {
+        /// <summary>Ordered list of phase names the Brain wants to execute this iteration.</summary>
         public List<string> Phases { get; init; } = [];
+        /// <summary>Per-phase instructions keyed by phase name, providing context for each phase.</summary>
         public Dictionary<string, string>? PhaseInstructions { get; init; }
+        /// <summary>The Brain's reasoning for choosing this iteration plan.</summary>
         public string? Reason { get; init; }
     }
 
@@ -570,6 +576,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <param name="pipeline">Current goal pipeline state.</param>
     /// <param name="information">Human-readable status update to pass to the Brain.</param>
     /// <param name="ct">Cancellation token.</param>
+    /// <returns>A task that represents the asynchronous operation.</returns>
     public async Task InformAsync(GoalPipeline pipeline, string information, CancellationToken ct = default)
     {
         var session = await GetOrCreateSessionAsync(pipeline, ct);
@@ -725,6 +732,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         text.Length <= maxLength ? text : text[..maxLength] + "...";
 
     /// <summary>Disposes all active Copilot sessions and stops the underlying client.</summary>
+    /// <returns>A value task that represents the asynchronous dispose operation.</returns>
     public async ValueTask DisposeAsync()
     {
         // Dispose all goal sessions

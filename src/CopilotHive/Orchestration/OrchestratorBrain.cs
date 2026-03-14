@@ -13,6 +13,7 @@ public interface IOrchestratorBrain : IAsyncDisposable
 {
     /// <summary>Start the persistent orchestrator container.</summary>
     /// <param name="ct">Cancellation token.</param>
+    /// <returns>A task that represents the asynchronous operation.</returns>
     Task StartAsync(CancellationToken ct = default);
 
     /// <summary>
@@ -66,6 +67,7 @@ public interface IOrchestratorBrain : IAsyncDisposable
     /// </summary>
     /// <param name="information">Human-readable status update to pass to the orchestrator.</param>
     /// <param name="ct">Cancellation token.</param>
+    /// <returns>A task that represents the asynchronous operation.</returns>
     Task InformAsync(string information, CancellationToken ct = default);
 }
 
@@ -125,6 +127,7 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
     /// Starts the orchestrator container and establishes a Copilot session primed with the system prompt.
     /// </summary>
     /// <param name="ct">Cancellation token.</param>
+    /// <returns>A task that represents the asynchronous operation.</returns>
     public async Task StartAsync(CancellationToken ct = default)
     {
         if (_worker is not null) return;
@@ -342,6 +345,7 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
     /// </summary>
     /// <param name="information">Human-readable status update.</param>
     /// <param name="ct">Cancellation token.</param>
+    /// <returns>A task that represents the asynchronous operation.</returns>
     public async Task InformAsync(string information, CancellationToken ct = default)
     {
         EnsureStarted();
@@ -410,6 +414,7 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
         text.Length <= maxLength ? text : text[..maxLength] + "...";
 
     /// <summary>Stops the orchestrator worker container and disposes the Copilot client.</summary>
+    /// <returns>A value task that represents the asynchronous dispose operation.</returns>
     public async ValueTask DisposeAsync()
     {
         if (_client is not null)
