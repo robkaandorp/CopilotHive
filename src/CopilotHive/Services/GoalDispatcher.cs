@@ -81,6 +81,23 @@ public sealed class GoalDispatcher : BackgroundService
     }
 
     /// <inheritdoc/>
+    /// <summary>
+    /// Handles a question from a worker tool call by routing it to the Brain.
+    /// Returns the Brain's response as a string.
+    /// </summary>
+    public async Task<string> AskBrainAsync(GoalPipeline pipeline, string question, CancellationToken ct)
+    {
+        if (_brain is null)
+            return "Brain is not available. Please proceed with your best judgment.";
+
+        _logger.LogInformation("Worker asks Brain: {Question}", question);
+        var decision = await _brain.DecideNextStepAsync(pipeline, $"A worker asks: {question}", ct);
+        var answer = decision.Prompt ?? decision.Action.ToString();
+        _logger.LogInformation("Brain answers: {Answer}", answer[..Math.Min(answer.Length, 200)]);
+        return answer;
+    }
+
+    /// <inheritdoc/>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("GoalDispatcher started — polling for goals every {Interval}s (Brain: {BrainEnabled})",

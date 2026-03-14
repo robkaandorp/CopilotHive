@@ -8,7 +8,7 @@ namespace CopilotHive.Worker;
 /// Orchestrates the full lifecycle of a single task assignment:
 /// clone repos, handle branches, run Copilot, collect results.
 /// </summary>
-public sealed class TaskExecutor(CopilotRunner copilotRunner)
+public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? toolBridge = null)
 {
     private const string WorkRoot = "/copilot-home";
     private readonly WorkerLogger _log = new("Task");
@@ -23,6 +23,10 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner)
     public async Task<TaskComplete> ExecuteAsync(TaskAssignment assignment, CancellationToken ct)
     {
         var stopwatch = Stopwatch.StartNew();
+
+        // Wire tool bridge and task context into CopilotRunner
+        copilotRunner.SetToolBridge(toolBridge);
+        copilotRunner.SetCurrentTaskId(assignment.TaskId);
 
         try
         {

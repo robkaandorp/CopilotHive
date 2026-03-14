@@ -13,6 +13,7 @@ public sealed class HiveOrchestratorService(
     TaskQueue taskQueue,
     GoalPipelineManager pipelineManager,
     TaskCompletionNotifier completionNotifier,
+    GoalDispatcher goalDispatcher,
     ILogger<HiveOrchestratorService> logger,
     AgentsManager? agentsManager = null) : HiveOrchestrator.HiveOrchestratorBase
 {
@@ -134,6 +135,10 @@ public sealed class HiveOrchestratorService(
                         HandleTaskComplete(worker, message.Complete);
                         break;
 
+                    case WorkerMessage.PayloadOneofCase.ToolRequest:
+                        _ = HandleToolCallRequestAsync(worker, message.ToolRequest, ct);
+                        break;
+
                     default:
                         logger.LogWarning("Unknown payload type from worker {WorkerId}: {Case}",
                             message.WorkerId, message.PayloadCase);
@@ -228,6 +233,77 @@ public sealed class HiveOrchestratorService(
     {
         logger.LogInformation("Task {TaskId} progress from {WorkerId}: {Status} ({Percent:F0}%) — {Message}",
             progress.TaskId, worker.Id, progress.Status, progress.ProgressPercent, progress.Message);
+    }
+
+    private async Task HandleToolCallRequestAsync(ConnectedWorker worker, ToolCallRequest request, CancellationToken ct)
+    {
+        logger.LogInformation("Tool call '{Tool}' from {WorkerId} (task={TaskId})",
+            request.ToolName, worker.Id, request.TaskId);
+
+        try
+        {
+            string resultJson;
+
+            switch (request.ToolName)
+            {
+                case "ask_orchestrator":
+                    var pipeline = pipelineManager.GetByTaskId(request.TaskId);
+                    if (pipeline is null)
+                    {
+                        resultJson = System.Text.Json.JsonSerializer.Serialize(
+                            new { answer = "No active pipeline found for this task." });
+                        break;
+                    }
+
+                    // Parse question from arguments
+                    var args = System.Text.Json.JsonDocument.Parse(request.ArgumentsJson);
+                    var question = args.RootElement.GetProperty("question").GetString() ?? "";
+
+                    logger.LogInformation("Worker {WorkerId} asks: {Question}", worker.Id, question);
+
+                    // Route to GoalDispatcher's Brain for an answer
+                    var answer = await goalDispatcher.AskBrainAsync(pipeline, question, ct);
+                    resultJson = System.Text.Json.JsonSerializer.Serialize(new { answer });
+                    break;
+
+                case "report_progress":
+                    var progressArgs = System.Text.Json.JsonDocument.Parse(request.ArgumentsJson);
+                    var status = progressArgs.RootElement.GetProperty("status").GetString() ?? "";
+                    var details = progressArgs.RootElement.GetProperty("details").GetString() ?? "";
+                    logger.LogInformation("Progress from {WorkerId}: [{Status}] {Details}",
+                        worker.Id, status, details);
+                    resultJson = System.Text.Json.JsonSerializer.Serialize(new { acknowledged = true });
+                    break;
+
+                default:
+                    resultJson = System.Text.Json.JsonSerializer.Serialize(
+                        new { error = $"Unknown tool: {request.ToolName}" });
+                    break;
+            }
+
+            await worker.MessageChannel.Writer.WriteAsync(new OrchestratorMessage
+            {
+                ToolResponse = new ToolCallResponse
+                {
+                    RequestId = request.RequestId,
+                    ResultJson = resultJson,
+                    Success = true,
+                },
+            }, ct);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Tool call '{Tool}' failed for {WorkerId}", request.ToolName, worker.Id);
+            await worker.MessageChannel.Writer.WriteAsync(new OrchestratorMessage
+            {
+                ToolResponse = new ToolCallResponse
+                {
+                    RequestId = request.RequestId,
+                    Success = false,
+                    Error = ex.Message,
+                },
+            }, ct);
+        }
     }
 
     private void HandleTaskComplete(ConnectedWorker worker, TaskComplete complete)

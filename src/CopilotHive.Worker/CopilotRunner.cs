@@ -1,4 +1,6 @@
+using System.ComponentModel;
 using GitHub.Copilot.SDK;
+using Microsoft.Extensions.AI;
 
 namespace CopilotHive.Worker;
 
@@ -14,6 +16,10 @@ public sealed class CopilotRunner : IAsyncDisposable
     private CustomAgentConfig? _customAgent;
     private string? _role;
     private readonly WorkerLogger _log = new("Copilot");
+
+    // Tool call bridge for custom tools — set before creating a session
+    private IToolCallBridge? _toolBridge;
+    private string? _currentTaskId;
 
     /// <summary>Maximum number of connection attempts before giving up.</summary>
     public int MaxConnectRetries { get; init; } = WorkerConstants.MaxConnectRetries;
@@ -35,6 +41,16 @@ public sealed class CopilotRunner : IAsyncDisposable
     }
 
     /// <summary>
+    /// Sets the tool call bridge for custom tools. Must be called before session creation.
+    /// </summary>
+    public void SetToolBridge(IToolCallBridge? bridge) => _toolBridge = bridge;
+
+    /// <summary>
+    /// Sets the current task ID for tool call context.
+    /// </summary>
+    public void SetCurrentTaskId(string? taskId) => _currentTaskId = taskId;
+
+    /// <summary>
     /// Sets the custom agent configuration for this worker's role.
     /// Applied on the next session creation (ConnectAsync or ResetSessionAsync).
     /// </summary>
@@ -53,12 +69,63 @@ public sealed class CopilotRunner : IAsyncDisposable
         _log.Debug($"Agent prompt:\n{agentsMdContent}");
     }
 
-    private SessionConfig BuildSessionConfig() => new()
+    private SessionConfig BuildSessionConfig()
     {
-        Streaming = false,
-        OnPermissionRequest = GetPermissionHandlerForRole(_role),
-        CustomAgents = _customAgent is not null ? [_customAgent] : [],
-    };
+        var config = new SessionConfig
+        {
+            Streaming = true,
+            OnPermissionRequest = GetPermissionHandlerForRole(_role),
+            CustomAgents = _customAgent is not null ? [_customAgent] : [],
+        };
+
+        // Register custom AIFunction tools for roles that have a tool bridge
+        var tools = BuildCustomTools();
+        if (tools.Count > 0)
+            config.Tools = tools;
+
+        return config;
+    }
+
+    /// <summary>
+    /// Builds custom AIFunction tools that the Copilot model can call.
+    /// These tools bridge back to the orchestrator via gRPC.
+    /// </summary>
+    private List<AIFunction> BuildCustomTools()
+    {
+        var tools = new List<AIFunction>();
+
+        // Only register orchestrator tools for roles that have a bridge
+        // and are not the improver (which has DenyAll permissions)
+        if (_toolBridge is null || _role == "improver")
+            return tools;
+
+        tools.Add(AIFunctionFactory.Create(
+            async ([Description("The question to ask the orchestrator")] string question) =>
+            {
+                var taskId = _currentTaskId ?? "unknown";
+                _log.Info($"Tool call: ask_orchestrator('{question[..Math.Min(question.Length, 80)]}...')");
+                var answer = await _toolBridge.AskOrchestratorAsync(taskId, question, CancellationToken.None);
+                return answer;
+            },
+            "ask_orchestrator",
+            "Ask the orchestrator a question about the task, architecture, or codebase. " +
+            "Use this when you need clarification before making changes."));
+
+        tools.Add(AIFunctionFactory.Create(
+            async ([Description("Current status")] string status,
+                   [Description("Details about what you're doing")] string details) =>
+            {
+                var taskId = _currentTaskId ?? "unknown";
+                _log.Info($"Tool call: report_progress('{status}')");
+                await _toolBridge.ReportProgressAsync(taskId, status, details, CancellationToken.None);
+                return "Progress reported.";
+            },
+            "report_progress",
+            "Report your current progress to the orchestrator. " +
+            "Call this periodically to show what you're working on."));
+
+        return tools;
+    }
 
     /// <summary>Returns the tool whitelist for a given role. Null means all tools.</summary>
     internal static List<string>? GetToolsForRole(string? role) => role switch
@@ -148,6 +215,7 @@ public sealed class CopilotRunner : IAsyncDisposable
 
     /// <summary>
     /// Send a prompt to the Copilot CLI and return the response text.
+    /// With streaming enabled, captures tool execution events and intent updates.
     /// </summary>
     public async Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
     {
@@ -172,6 +240,14 @@ public sealed class CopilotRunner : IAsyncDisposable
                     break;
                 case SessionErrorEvent err:
                     done.TrySetException(new CopilotRunnerException(err.Data.Message));
+                    break;
+                // Streaming events for observability
+                case AssistantMessageDeltaEvent:
+                    // Incremental response text — we capture the final in AssistantMessageEvent
+                    break;
+                default:
+                    // Log unhandled event types at debug level for discovery
+                    _log.Debug($"SDK event: {evt.GetType().Name}");
                     break;
             }
         });

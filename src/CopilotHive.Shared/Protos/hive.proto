@@ -49,6 +49,7 @@ message WorkerMessage {
     TaskProgress progress = 2;
     TaskComplete complete = 3;
     WorkerReady ready = 4;
+    ToolCallRequest tool_request = 5;
   }
 }
 
@@ -58,6 +59,7 @@ message OrchestratorMessage {
     TaskAssignment assignment = 2;
     CancelTask cancel = 3;
     UpdateAgents update_agents = 4;
+    ToolCallResponse tool_response = 5;
   }
 }
 
@@ -166,4 +168,22 @@ message HeartbeatRequest {
 
 message HeartbeatResponse {
   bool acknowledged = 1;
+}
+
+// === Tool Calls (worker↔orchestrator mid-task communication) ===
+
+// Worker asks the orchestrator to execute a tool (e.g., ask_orchestrator, report_progress)
+message ToolCallRequest {
+  string request_id = 1;       // Unique correlation ID for this call
+  string task_id = 2;          // The task this call belongs to
+  string tool_name = 3;        // e.g., "ask_orchestrator", "report_progress"
+  string arguments_json = 4;   // JSON-encoded arguments
+}
+
+// Orchestrator returns the result of a tool call
+message ToolCallResponse {
+  string request_id = 1;       // Matches the ToolCallRequest.request_id
+  string result_json = 2;      // JSON-encoded result
+  bool success = 3;
+  string error = 4;            // Error message if success=false
 }
