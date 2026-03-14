@@ -90,9 +90,11 @@ public sealed class CopilotRunner : IAsyncDisposable
 
     /// <summary>
     /// Dispose the current session and create a fresh one, ensuring no context leaks between tasks.
-    /// The new session picks up the latest CustomAgent configuration.
+    /// The new session picks up the latest CustomAgent configuration and optionally switches to a new model.
     /// </summary>
-    public async Task ResetSessionAsync(CancellationToken ct = default)
+    /// <param name="model">Optional model ID to use for the new session. If empty/null, uses the default.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task ResetSessionAsync(string? model = null, CancellationToken ct = default)
     {
         if (_session is not null)
         {
@@ -100,9 +102,14 @@ public sealed class CopilotRunner : IAsyncDisposable
             _session = null;
         }
 
-        _session = await _client.CreateSessionAsync(BuildSessionConfig());
+        var config = BuildSessionConfig();
+        if (!string.IsNullOrEmpty(model))
+            config.Model = model;
 
-        Console.WriteLine($"[Copilot] Session reset (localhost:{_port}, agent={_customAgent?.Name ?? "none"})");
+        _session = await _client.CreateSessionAsync(config);
+
+        var modelInfo = string.IsNullOrEmpty(model) ? "default" : model;
+        Console.WriteLine($"[Copilot] Session reset (localhost:{_port}, agent={_customAgent?.Name ?? "none"}, model={modelInfo})");
     }
 
     /// <summary>

@@ -13,6 +13,15 @@ public sealed class HiveConfigFile
     public Dictionary<string, WorkerConfig> Workers { get; set; } = [];
     /// <summary>Orchestrator-level configuration.</summary>
     public OrchestratorConfig Orchestrator { get; set; } = new();
+
+    /// <summary>
+    /// Resolves the model to use for a given role.
+    /// Returns the per-role override if configured, otherwise the orchestrator's default model.
+    /// </summary>
+    public string GetModelForRole(string roleName) =>
+        Workers.TryGetValue(roleName.ToLowerInvariant(), out var wc) && !string.IsNullOrEmpty(wc.Model)
+            ? wc.Model
+            : Orchestrator.Model;
 }
 
 /// <summary>

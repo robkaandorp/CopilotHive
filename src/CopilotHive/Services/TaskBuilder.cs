@@ -19,6 +19,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
     /// <param name="repositories">Repositories the worker should operate on.</param>
     /// <param name="prompt">The prompt to send to the worker.</param>
     /// <param name="branchAction">Git branch action to perform (create, checkout, etc.).</param>
+    /// <param name="model">Optional model ID for this task (e.g., "claude-sonnet-4.6").</param>
     /// <returns>A fully constructed <see cref="TaskAssignment"/>.</returns>
     public TaskAssignment Build(
         string goalId,
@@ -27,7 +28,8 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
         int iteration,
         IEnumerable<TargetRepository> repositories,
         string prompt,
-        BranchAction branchAction)
+        BranchAction branchAction,
+        string? model = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(goalId);
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
@@ -56,6 +58,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
             Prompt = prompt,
             BranchInfo = branchInfo,
             Role = role,
+            Model = model ?? "",
         };
 
         foreach (var repo in repoList)

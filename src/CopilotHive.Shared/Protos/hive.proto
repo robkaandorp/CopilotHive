@@ -72,6 +72,7 @@ message TaskAssignment {
   BranchInfo branch_info = 6;
   WorkerRole role = 7;
   map<string, string> metadata = 8;  // Additional context
+  string model = 9;               // Model ID for this task (e.g., "claude-sonnet-4.6")
 }
 
 message RepositoryInfo {

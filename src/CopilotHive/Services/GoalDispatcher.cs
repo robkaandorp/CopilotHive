@@ -493,6 +493,17 @@ public sealed class GoalDispatcher : BackgroundService
         var branchAction = pipeline.CoderBranch is null ? BranchAction.Create : BranchAction.Checkout;
         var repositories = ResolveRepositories(pipeline.Goal);
 
+        // Resolve per-role model from config
+        var roleName = role switch
+        {
+            WorkerRole.Coder => "coder",
+            WorkerRole.Reviewer => "reviewer",
+            WorkerRole.Tester => "tester",
+            WorkerRole.Improver => "improver",
+            _ => "coder",
+        };
+        var model = _config?.GetModelForRole(roleName);
+
         var task = _taskBuilder.Build(
             goalId: pipeline.GoalId,
             goalDescription: pipeline.Description,
@@ -500,7 +511,8 @@ public sealed class GoalDispatcher : BackgroundService
             iteration: pipeline.Iteration,
             repositories: repositories,
             prompt: prompt,
-            branchAction: branchAction);
+            branchAction: branchAction,
+            model: model);
 
         // Non-coder roles reuse the coder's branch (all work on the same feature branch)
         if (branchAction == BranchAction.Checkout && pipeline.CoderBranch is not null && task.BranchInfo is not null)
