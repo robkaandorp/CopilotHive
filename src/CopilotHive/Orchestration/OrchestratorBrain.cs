@@ -12,18 +12,31 @@ namespace CopilotHive.Orchestration;
 public interface IOrchestratorBrain : IAsyncDisposable
 {
     /// <summary>Start the persistent orchestrator container.</summary>
+    /// <param name="ct">Cancellation token.</param>
     Task StartAsync(CancellationToken ct = default);
 
     /// <summary>
     /// Ask the orchestrator to plan which phases are needed for this goal.
     /// Returns a list of planned actions in order.
     /// </summary>
+    /// <param name="iteration">One-based iteration number.</param>
+    /// <param name="goal">Natural-language goal description.</param>
+    /// <param name="previousMetrics">Metrics from the previous iteration, or <c>null</c> for the first iteration.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>An <see cref="OrchestratorDecision"/> with the recommended first action.</returns>
     Task<OrchestratorDecision> PlanIterationAsync(
         int iteration, string goal, IterationMetrics? previousMetrics, CancellationToken ct = default);
 
     /// <summary>
     /// Ask the orchestrator to craft a prompt for a specific worker role.
     /// </summary>
+    /// <param name="workerRole">Role of the target worker (e.g. "coder", "reviewer", "tester").</param>
+    /// <param name="goal">Natural-language goal description.</param>
+    /// <param name="iteration">Current iteration number.</param>
+    /// <param name="branchName">Feature branch the worker should operate on.</param>
+    /// <param name="additionalContext">Optional extra context to include in the crafted prompt.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The crafted prompt string to send to the worker.</returns>
     Task<string> CraftPromptAsync(
         string workerRole, string goal, int iteration, string branchName,
         string? additionalContext, CancellationToken ct = default);
@@ -31,18 +44,28 @@ public interface IOrchestratorBrain : IAsyncDisposable
     /// <summary>
     /// Ask the orchestrator to interpret worker output and determine the verdict.
     /// </summary>
+    /// <param name="workerRole">Role of the worker that produced the output (e.g. "tester", "reviewer").</param>
+    /// <param name="workerOutput">Raw text output from the worker.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>An <see cref="OrchestratorDecision"/> containing the extracted verdict and any issues.</returns>
     Task<OrchestratorDecision> InterpretOutputAsync(
         string workerRole, string workerOutput, CancellationToken ct = default);
 
     /// <summary>
     /// Ask the orchestrator what to do next, given the current state.
     /// </summary>
+    /// <param name="currentPhase">Name of the current pipeline phase.</param>
+    /// <param name="context">Textual context describing the current situation.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>An <see cref="OrchestratorDecision"/> with the recommended next action.</returns>
     Task<OrchestratorDecision> DecideNextStepAsync(
         string currentPhase, string context, CancellationToken ct = default);
 
     /// <summary>
     /// Inform the orchestrator about something that happened (for context continuity).
     /// </summary>
+    /// <param name="information">Human-readable status update to pass to the orchestrator.</param>
+    /// <param name="ct">Cancellation token.</param>
     Task InformAsync(string information, CancellationToken ct = default);
 }
 

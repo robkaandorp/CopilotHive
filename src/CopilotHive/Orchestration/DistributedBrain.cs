@@ -152,6 +152,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>Removes and disposes the session for a completed/failed goal.</summary>
+    /// <param name="goalId">Identifier of the goal whose session should be removed.</param>
     public async Task CleanupGoalSessionAsync(string goalId)
     {
         if (_sessions.TryRemove(goalId, out var session))
@@ -165,6 +166,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// Re-creates a session and replays persisted conversation history into it.
     /// Used on restart to restore Brain context for active goals.
     /// </summary>
+    /// <param name="pipeline">The goal pipeline whose session should be re-primed.</param>
+    /// <param name="ct">Cancellation token.</param>
     public async Task ReprimeSessionAsync(GoalPipeline pipeline, CancellationToken ct)
     {
         EnsureConnected();
