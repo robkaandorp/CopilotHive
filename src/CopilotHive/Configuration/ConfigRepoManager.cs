@@ -142,6 +142,17 @@ public sealed class ConfigRepoManager
         await RunGitAsync(_localPath, ["push", "origin", "HEAD"], ct);
     }
 
+    /// <summary>
+    /// Commits and pushes a single file that has already been written to disk.
+    /// Used to persist goals.yaml status updates back to the config repo.
+    /// </summary>
+    public async Task CommitFileAsync(string filePath, string commitMessage, CancellationToken ct = default)
+    {
+        await RunGitAsync(_localPath, ["add", filePath], ct);
+        await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
+        await RunGitAsync(_localPath, ["push", "origin", "HEAD"], ct);
+    }
+
     private static string NormalizeUrl(string url)
     {
         return url.Trim().TrimEnd('/').ToLowerInvariant();

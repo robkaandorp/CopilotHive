@@ -19,6 +19,14 @@ public sealed class Goal
     public Dictionary<string, string> Metadata { get; init; } = [];
     /// <summary>UTC timestamp when the goal was created.</summary>
     public DateTime CreatedAt { get; init; } = DateTime.UtcNow;
+    /// <summary>UTC timestamp when the goal was picked up for processing, or <c>null</c> if not yet started.</summary>
+    public DateTime? StartedAt { get; set; }
+    /// <summary>UTC timestamp when the goal finished (completed or failed), or <c>null</c> if still active.</summary>
+    public DateTime? CompletedAt { get; set; }
+    /// <summary>Number of iterations it took to complete or fail the goal, or <c>null</c> if not yet finished.</summary>
+    public int? Iterations { get; set; }
+    /// <summary>Reason the goal failed, or <c>null</c> for non-failed goals.</summary>
+    public string? FailureReason { get; set; }
 }
 
 /// <summary>Scheduling priority levels for goals.</summary>

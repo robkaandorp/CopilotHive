@@ -818,7 +818,14 @@ public sealed class GoalDispatcher : BackgroundService
     private async Task MarkGoalCompleted(GoalPipeline pipeline, CancellationToken ct)
     {
         pipeline.AdvanceTo(GoalPhase.Done);
-        await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Completed, ct);
+
+        var completedMeta = new GoalUpdateMetadata
+        {
+            CompletedAt = pipeline.CompletedAt ?? DateTime.UtcNow,
+            Iterations = pipeline.Iteration,
+        };
+        await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Completed, completedMeta, ct);
+        await CommitGoalsToConfigRepoAsync($"Goal '{pipeline.GoalId}' completed", ct);
         await CleanupBrainSessionAsync(pipeline.GoalId);
 
         var duration = pipeline.CompletedAt.HasValue
@@ -881,7 +888,15 @@ public sealed class GoalDispatcher : BackgroundService
     private async Task MarkGoalFailed(GoalPipeline pipeline, string reason, CancellationToken ct)
     {
         pipeline.AdvanceTo(GoalPhase.Failed);
-        await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Failed, ct);
+
+        var failedMeta = new GoalUpdateMetadata
+        {
+            CompletedAt = pipeline.CompletedAt ?? DateTime.UtcNow,
+            Iterations = pipeline.Iteration,
+            FailureReason = reason,
+        };
+        await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Failed, failedMeta, ct);
+        await CommitGoalsToConfigRepoAsync($"Goal '{pipeline.GoalId}' failed: {reason}", ct);
         await CleanupBrainSessionAsync(pipeline.GoalId);
 
         var duration = pipeline.CompletedAt.HasValue
@@ -903,6 +918,30 @@ public sealed class GoalDispatcher : BackgroundService
         {
             try { await brain.CleanupGoalSessionAsync(goalId); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to cleanup Brain session for goal {GoalId}", goalId); }
+        }
+    }
+
+    /// <summary>
+    /// Commits and pushes the updated goals.yaml back to the config repo so external
+    /// observers can see goal progress.
+    /// </summary>
+    private async Task CommitGoalsToConfigRepoAsync(string commitMessage, CancellationToken ct)
+    {
+        if (_configRepo is null)
+            return;
+
+        var goalsPath = Path.Combine(_configRepo.LocalPath, "goals.yaml");
+        if (!File.Exists(goalsPath))
+            return;
+
+        try
+        {
+            await _configRepo.CommitFileAsync(goalsPath, commitMessage, ct);
+            _logger.LogInformation("Committed goals.yaml update: {Message}", commitMessage);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to commit goals.yaml update to config repo");
         }
     }
 
@@ -998,6 +1037,11 @@ public sealed class GoalDispatcher : BackgroundService
             return;
 
         _logger.LogInformation("Dispatching goal '{GoalId}': {Description}", goal.Id, goal.Description);
+
+        // Mark goal as in_progress with started_at timestamp
+        var startedMeta = new GoalUpdateMetadata { StartedAt = DateTime.UtcNow };
+        await _goalManager.UpdateGoalStatusAsync(goal.Id, GoalStatus.InProgress, startedMeta, ct);
+        await CommitGoalsToConfigRepoAsync($"Goal '{goal.Id}' started", ct);
 
         // Create a pipeline for this goal
         var maxRetries = _config?.Orchestrator?.MaxRetriesPerTask ?? Constants.DefaultMaxRetriesPerTask;

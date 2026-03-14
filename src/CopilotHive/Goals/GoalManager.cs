@@ -66,23 +66,28 @@ public sealed class GoalManager
     /// Marks the specified goal as <see cref="GoalStatus.Completed"/> in its source.
     /// </summary>
     /// <param name="goalId">Identifier of the goal to complete.</param>
+    /// <param name="metadata">Optional metadata (timestamps, iterations).</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task CompleteGoalAsync(string goalId, CancellationToken ct = default)
+    public async Task CompleteGoalAsync(string goalId, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
     {
         var source = GetSourceForGoal(goalId);
-        await source.UpdateGoalStatusAsync(goalId, GoalStatus.Completed, ct);
+        await source.UpdateGoalStatusAsync(goalId, GoalStatus.Completed, metadata, ct);
     }
 
     /// <summary>
     /// Marks the specified goal as <see cref="GoalStatus.Failed"/> in its source.
     /// </summary>
     /// <param name="goalId">Identifier of the goal to fail.</param>
-    /// <param name="reason">Human-readable reason for the failure (logged only).</param>
+    /// <param name="reason">Human-readable reason for the failure.</param>
+    /// <param name="metadata">Optional additional metadata.</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task FailGoalAsync(string goalId, string reason, CancellationToken ct = default)
+    public async Task FailGoalAsync(string goalId, string reason, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
     {
+        var enriched = metadata is not null
+            ? metadata with { FailureReason = reason }
+            : new GoalUpdateMetadata { FailureReason = reason };
         var source = GetSourceForGoal(goalId);
-        await source.UpdateGoalStatusAsync(goalId, GoalStatus.Failed, ct);
+        await source.UpdateGoalStatusAsync(goalId, GoalStatus.Failed, enriched, ct);
     }
 
     /// <summary>
@@ -90,11 +95,12 @@ public sealed class GoalManager
     /// </summary>
     /// <param name="goalId">Identifier of the goal to update.</param>
     /// <param name="status">The new status to apply.</param>
+    /// <param name="metadata">Optional metadata (timestamps, iterations, failure reason).</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task UpdateGoalStatusAsync(string goalId, GoalStatus status, CancellationToken ct = default)
+    public async Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
     {
         var source = GetSourceForGoal(goalId);
-        await source.UpdateGoalStatusAsync(goalId, status, ct);
+        await source.UpdateGoalStatusAsync(goalId, status, metadata, ct);
     }
 
     private IGoalSource GetSourceForGoal(string goalId)

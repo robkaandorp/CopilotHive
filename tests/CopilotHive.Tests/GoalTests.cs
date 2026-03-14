@@ -269,4 +269,263 @@ public sealed class GoalTests : IDisposable
         Assert.NotNull(next);
         Assert.Equal("higher", next.Id);
     }
+
+    // ── Goal filtering (skip completed/failed) ──────────────────────────────
+
+    [Fact]
+    public async Task FileGoalSource_GetPending_SkipsCompletedGoals()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: done-goal
+                description: "Already done"
+                status: completed
+              - id: pending-goal
+                description: "Still pending"
+                status: pending
+            """);
+
+        var source = new FileGoalSource(path);
+        var pending = await source.GetPendingGoalsAsync();
+
+        Assert.Single(pending);
+        Assert.Equal("pending-goal", pending[0].Id);
+    }
+
+    [Fact]
+    public async Task FileGoalSource_GetPending_SkipsFailedGoals()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: failed-goal
+                description: "Already failed"
+                status: failed
+                failure_reason: "tests never passed"
+              - id: new-goal
+                description: "Fresh goal"
+            """);
+
+        var source = new FileGoalSource(path);
+        var pending = await source.GetPendingGoalsAsync();
+
+        Assert.Single(pending);
+        Assert.Equal("new-goal", pending[0].Id);
+    }
+
+    [Fact]
+    public async Task FileGoalSource_GetPending_SkipsInProgressGoals()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: active-goal
+                description: "Currently running"
+                status: in_progress
+              - id: waiting-goal
+                description: "Not started"
+                status: pending
+            """);
+
+        var source = new FileGoalSource(path);
+        var pending = await source.GetPendingGoalsAsync();
+
+        Assert.Single(pending);
+        Assert.Equal("waiting-goal", pending[0].Id);
+    }
+
+    // ── YAML round-trip (serialize → deserialize preserves status fields) ────
+
+    [Fact]
+    public async Task FileGoalSource_RoundTrip_PreservesStatusFields()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: round-trip-goal
+                description: "Test round-trip"
+                priority: high
+                repositories:
+                  - my-repo
+            """);
+
+        var source = new FileGoalSource(path);
+
+        // Simulate goal being picked up (in_progress with started_at)
+        var startedAt = new DateTime(2025, 6, 15, 10, 30, 0, DateTimeKind.Utc);
+        await source.UpdateGoalStatusAsync("round-trip-goal", GoalStatus.InProgress,
+            new GoalUpdateMetadata { StartedAt = startedAt });
+
+        // Re-read and verify
+        var source2 = new FileGoalSource(path);
+        var goals = await source2.ReadGoalsAsync();
+
+        Assert.Single(goals);
+        var goal = goals[0];
+        Assert.Equal("round-trip-goal", goal.Id);
+        Assert.Equal(GoalStatus.InProgress, goal.Status);
+        Assert.Equal(startedAt, goal.StartedAt);
+        Assert.Null(goal.CompletedAt);
+        Assert.Null(goal.Iterations);
+        Assert.Null(goal.FailureReason);
+    }
+
+    [Fact]
+    public async Task FileGoalSource_RoundTrip_PreservesCompletionFields()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: completed-goal
+                description: "Will complete"
+                priority: normal
+            """);
+
+        var source = new FileGoalSource(path);
+
+        var startedAt = new DateTime(2025, 6, 15, 10, 0, 0, DateTimeKind.Utc);
+        var completedAt = new DateTime(2025, 6, 15, 11, 30, 0, DateTimeKind.Utc);
+
+        // Set in-progress
+        await source.UpdateGoalStatusAsync("completed-goal", GoalStatus.InProgress,
+            new GoalUpdateMetadata { StartedAt = startedAt });
+
+        // Set completed
+        await source.UpdateGoalStatusAsync("completed-goal", GoalStatus.Completed,
+            new GoalUpdateMetadata { CompletedAt = completedAt, Iterations = 3 });
+
+        // Re-read from file
+        var source2 = new FileGoalSource(path);
+        var goals = await source2.ReadGoalsAsync();
+
+        Assert.Single(goals);
+        var goal = goals[0];
+        Assert.Equal(GoalStatus.Completed, goal.Status);
+        Assert.Equal(startedAt, goal.StartedAt);
+        Assert.Equal(completedAt, goal.CompletedAt);
+        Assert.Equal(3, goal.Iterations);
+        Assert.Null(goal.FailureReason);
+    }
+
+    [Fact]
+    public async Task FileGoalSource_RoundTrip_PreservesFailureFields()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: failing-goal
+                description: "Will fail"
+            """);
+
+        var source = new FileGoalSource(path);
+
+        await source.UpdateGoalStatusAsync("failing-goal", GoalStatus.Failed,
+            new GoalUpdateMetadata
+            {
+                CompletedAt = new DateTime(2025, 6, 15, 12, 0, 0, DateTimeKind.Utc),
+                Iterations = 5,
+                FailureReason = "Exceeded max test retries",
+            });
+
+        // Re-read from file
+        var source2 = new FileGoalSource(path);
+        var goals = await source2.ReadGoalsAsync();
+
+        Assert.Single(goals);
+        var goal = goals[0];
+        Assert.Equal(GoalStatus.Failed, goal.Status);
+        Assert.Equal(5, goal.Iterations);
+        Assert.Equal("Exceeded max test retries", goal.FailureReason);
+    }
+
+    [Fact]
+    public async Task FileGoalSource_RoundTrip_MultipleGoalsMixedStatus()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: goal-a
+                description: "First goal"
+                priority: critical
+              - id: goal-b
+                description: "Second goal"
+                priority: high
+              - id: goal-c
+                description: "Third goal"
+                priority: normal
+            """);
+
+        var source = new FileGoalSource(path);
+
+        // Complete goal-a
+        await source.UpdateGoalStatusAsync("goal-a", GoalStatus.Completed,
+            new GoalUpdateMetadata { CompletedAt = DateTime.UtcNow, Iterations = 2 });
+
+        // Fail goal-b
+        await source.UpdateGoalStatusAsync("goal-b", GoalStatus.Failed,
+            new GoalUpdateMetadata { FailureReason = "merge conflict" });
+
+        // goal-c stays pending
+
+        // Re-read — only pending goals returned by GetPendingGoalsAsync
+        var source2 = new FileGoalSource(path);
+        var pending = await source2.GetPendingGoalsAsync();
+        Assert.Single(pending);
+        Assert.Equal("goal-c", pending[0].Id);
+
+        // But all goals are in the file
+        var all = await source2.ReadGoalsAsync();
+        Assert.Equal(3, all.Count);
+    }
+
+    [Fact]
+    public async Task FileGoalSource_ReadGoals_ParsesExistingStatusFields()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: pre-existing
+                description: "Already has status fields"
+                status: completed
+                started_at: "2025-06-15T10:00:00Z"
+                completed_at: "2025-06-15T11:30:00Z"
+                iterations: 4
+              - id: pre-failed
+                description: "Previously failed"
+                status: failed
+                failure_reason: "timeout exceeded"
+                iterations: 7
+            """);
+
+        var source = new FileGoalSource(path);
+        var goals = await source.ReadGoalsAsync();
+
+        Assert.Equal(2, goals.Count);
+
+        var completed = goals[0];
+        Assert.Equal(GoalStatus.Completed, completed.Status);
+        Assert.Equal(new DateTime(2025, 6, 15, 10, 0, 0, DateTimeKind.Utc), completed.StartedAt);
+        Assert.Equal(new DateTime(2025, 6, 15, 11, 30, 0, DateTimeKind.Utc), completed.CompletedAt);
+        Assert.Equal(4, completed.Iterations);
+
+        var failed = goals[1];
+        Assert.Equal(GoalStatus.Failed, failed.Status);
+        Assert.Equal("timeout exceeded", failed.FailureReason);
+        Assert.Equal(7, failed.Iterations);
+    }
+
+    [Fact]
+    public async Task FileGoalSource_NullStatusFields_OmittedFromYaml()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: clean-goal
+                description: "No extra fields"
+            """);
+
+        var source = new FileGoalSource(path);
+        // Re-write via update to force serialization
+        await source.UpdateGoalStatusAsync("clean-goal", GoalStatus.Pending);
+
+        var yaml = await File.ReadAllTextAsync(path);
+
+        // Null fields should not appear in the output
+        Assert.DoesNotContain("started_at", yaml);
+        Assert.DoesNotContain("completed_at", yaml);
+        Assert.DoesNotContain("iterations", yaml);
+        Assert.DoesNotContain("failure_reason", yaml);
+    }
 }

@@ -1,6 +1,21 @@
 namespace CopilotHive.Goals;
 
 /// <summary>
+/// Optional metadata passed alongside a goal status update.
+/// </summary>
+public sealed record GoalUpdateMetadata
+{
+    /// <summary>UTC timestamp when the goal was started.</summary>
+    public DateTime? StartedAt { get; init; }
+    /// <summary>UTC timestamp when the goal completed or failed.</summary>
+    public DateTime? CompletedAt { get; init; }
+    /// <summary>Total iterations used.</summary>
+    public int? Iterations { get; init; }
+    /// <summary>Failure reason (only for failed goals).</summary>
+    public string? FailureReason { get; init; }
+}
+
+/// <summary>
 /// Abstraction over a backing store that provides pending goals and accepts status updates.
 /// </summary>
 public interface IGoalSource
@@ -20,6 +35,7 @@ public interface IGoalSource
     /// </summary>
     /// <param name="goalId">Identifier of the goal to update.</param>
     /// <param name="status">New status value.</param>
+    /// <param name="metadata">Optional metadata (timestamps, iterations, failure reason).</param>
     /// <param name="ct">Cancellation token.</param>
-    Task UpdateGoalStatusAsync(string goalId, GoalStatus status, CancellationToken ct = default);
+    Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default);
 }

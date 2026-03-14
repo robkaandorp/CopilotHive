@@ -40,8 +40,9 @@ public sealed class FileGoalSource : IGoalSource
     /// </summary>
     /// <param name="goalId">Identifier of the goal to update.</param>
     /// <param name="status">New status to apply.</param>
+    /// <param name="metadata">Optional metadata (timestamps, iterations, failure reason).</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task UpdateGoalStatusAsync(string goalId, GoalStatus status, CancellationToken ct = default)
+    public async Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
     {
         await _lock.WaitAsync(ct);
         try
@@ -50,6 +51,19 @@ public sealed class FileGoalSource : IGoalSource
             var goal = goals.FirstOrDefault(g => g.Id == goalId)
                 ?? throw new KeyNotFoundException($"Goal '{goalId}' not found in file source.");
             goal.Status = status;
+
+            if (metadata is not null)
+            {
+                if (metadata.StartedAt.HasValue)
+                    goal.StartedAt = metadata.StartedAt.Value;
+                if (metadata.CompletedAt.HasValue)
+                    goal.CompletedAt = metadata.CompletedAt.Value;
+                if (metadata.Iterations.HasValue)
+                    goal.Iterations = metadata.Iterations.Value;
+                if (metadata.FailureReason is not null)
+                    goal.FailureReason = metadata.FailureReason;
+            }
+
             await WriteGoalsAsync(goals, ct);
         }
         finally
@@ -88,13 +102,18 @@ public sealed class FileGoalSource : IGoalSource
                 Id = g.Id,
                 Description = g.Description,
                 Priority = g.Priority.ToString().ToLowerInvariant(),
-                Status = g.Status.ToString().ToLowerInvariant(),
+                Status = FormatStatus(g.Status),
                 Repositories = g.RepositoryNames,
+                Started_at = g.StartedAt?.ToString("o"),
+                Completed_at = g.CompletedAt?.ToString("o"),
+                Iterations = g.Iterations,
+                Failure_reason = g.FailureReason,
             }).ToList(),
         };
 
         var serializer = new SerializerBuilder()
             .WithNamingConvention(UnderscoredNamingConvention.Instance)
+            .ConfigureDefaultValuesHandling(DefaultValuesHandling.OmitNull)
             .Build();
 
         var yaml = serializer.Serialize(doc);
@@ -108,6 +127,10 @@ public sealed class FileGoalSource : IGoalSource
         Priority = ParsePriority(entry.Priority),
         Status = ParseStatus(entry.Status),
         RepositoryNames = entry.Repositories ?? [],
+        StartedAt = ParseTimestamp(entry.Started_at),
+        CompletedAt = ParseTimestamp(entry.Completed_at),
+        Iterations = entry.Iterations,
+        FailureReason = entry.Failure_reason,
     };
 
     private static GoalPriority ParsePriority(string? value) => value?.ToLowerInvariant() switch
@@ -127,6 +150,17 @@ public sealed class FileGoalSource : IGoalSource
         _ => GoalStatus.Pending,
     };
 
+    private static string FormatStatus(GoalStatus status) => status switch
+    {
+        GoalStatus.InProgress => "in_progress",
+        _ => status.ToString().ToLowerInvariant(),
+    };
+
+    private static DateTime? ParseTimestamp(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null
+        : DateTime.TryParse(value, null, System.Globalization.DateTimeStyles.RoundtripKind, out var dt) ? dt
+        : null;
+
     internal sealed class GoalFileDocument
     {
         public List<GoalFileEntry> Goals { get; set; } = [];
@@ -140,5 +174,9 @@ public sealed class FileGoalSource : IGoalSource
         public string? Priority { get; set; }
         public string? Status { get; set; }
         public List<string>? Repositories { get; set; }
+        public string? Started_at { get; set; }
+        public string? Completed_at { get; set; }
+        public int? Iterations { get; set; }
+        public string? Failure_reason { get; set; }
     }
 }

@@ -32,13 +32,27 @@ public sealed class ApiGoalSource : IGoalSource
     /// </summary>
     /// <param name="goalId">Identifier of the goal to update.</param>
     /// <param name="status">New status to apply.</param>
+    /// <param name="metadata">Optional metadata (timestamps, iterations, failure reason).</param>
     /// <param name="ct">Cancellation token.</param>
-    public Task UpdateGoalStatusAsync(string goalId, GoalStatus status, CancellationToken ct = default)
+    public Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
     {
         if (!_goals.TryGetValue(goalId, out var goal))
             throw new KeyNotFoundException($"Goal '{goalId}' not found in API source.");
 
         goal.Status = status;
+
+        if (metadata is not null)
+        {
+            if (metadata.StartedAt.HasValue)
+                goal.StartedAt = metadata.StartedAt.Value;
+            if (metadata.CompletedAt.HasValue)
+                goal.CompletedAt = metadata.CompletedAt.Value;
+            if (metadata.Iterations.HasValue)
+                goal.Iterations = metadata.Iterations.Value;
+            if (metadata.FailureReason is not null)
+                goal.FailureReason = metadata.FailureReason;
+        }
+
         return Task.CompletedTask;
     }
 
