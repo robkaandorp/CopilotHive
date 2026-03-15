@@ -14,8 +14,8 @@ public sealed class CopilotRunner : IAsyncDisposable
     private CopilotClient? _client;
     private CopilotSession? _session;
     private readonly int _port;
+    private readonly string _role;
     private CustomAgentConfig? _customAgent;
-    private string? _role;
     private readonly WorkerLogger _log = new("Copilot");
 
     // Tool call bridge for custom tools — set before creating a session
@@ -30,9 +30,11 @@ public sealed class CopilotRunner : IAsyncDisposable
     /// <summary>
     /// Initialises a new <see cref="CopilotRunner"/> connecting on the given <paramref name="port"/>.
     /// </summary>
+    /// <param name="role">The worker role (e.g. "coder"), known at process startup from WORKER_ROLE.</param>
     /// <param name="port">The TCP port the Copilot CLI headless server is listening on.</param>
-    public CopilotRunner(int port = WorkerConstants.DefaultAgentPort)
+    public CopilotRunner(string role, int port = WorkerConstants.DefaultAgentPort)
     {
+        _role = role;
         _port = port;
     }
 
@@ -52,7 +54,6 @@ public sealed class CopilotRunner : IAsyncDisposable
     /// </summary>
     public void SetCustomAgent(string role, string agentsMdContent)
     {
-        _role = role;
         _customAgent = new CustomAgentConfig
         {
             Name = role,
@@ -73,9 +74,9 @@ public sealed class CopilotRunner : IAsyncDisposable
             AutoStart = false,
             Telemetry = new TelemetryConfig
             {
-                FilePath = $"/app/state/otel-{_role ?? "worker"}.jsonl",
+                FilePath = $"/app/state/otel-{_role}.jsonl",
                 ExporterType = "file",
-                SourceName = $"copilothive-worker-{_role ?? "worker"}",
+                SourceName = $"copilothive-worker-{_role}",
                 CaptureContent = true
             }
         });
@@ -257,7 +258,7 @@ public sealed class CopilotRunner : IAsyncDisposable
                     response = msg.Data.Content;
                     break;
                 case AssistantUsageEvent usage:
-                    FileTracer.WriteUsage(usage.Data, $"/app/state/traces-{_role ?? "worker"}.jsonl", _role);
+                    FileTracer.WriteUsage(usage.Data, $"/app/state/traces-{_role}.jsonl", _role);
                     break;
                 case SessionIdleEvent:
                     done.TrySetResult(response);
