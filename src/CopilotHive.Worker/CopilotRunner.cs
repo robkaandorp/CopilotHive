@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using CopilotHive.Worker.Telemetry;
 using GitHub.Copilot.SDK;
 using Microsoft.Extensions.AI;
 
@@ -245,6 +246,9 @@ public sealed class CopilotRunner : IAsyncDisposable
             {
                 case AssistantMessageEvent msg:
                     response = msg.Data.Content;
+                    break;
+                case AssistantUsageEvent usage:
+                    FileTracer.WriteUsage(usage.Data, $"/app/state/traces-{_role ?? "worker"}.jsonl", _role);
                     break;
                 case SessionIdleEvent:
                     done.TrySetResult(response);

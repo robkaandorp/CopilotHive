@@ -1,3 +1,4 @@
+using CopilotHive.Telemetry;
 using GitHub.Copilot.SDK;
 
 namespace CopilotHive.Copilot;
@@ -86,6 +87,9 @@ public sealed class CopilotWorkerClient : ICopilotWorkerClient
             {
                 case AssistantMessageEvent msg:
                     response = msg.Data.Content;
+                    break;
+                case AssistantUsageEvent usage:
+                    FileTracer.WriteUsage(usage.Data, "/app/state/traces-orchestrator.jsonl", "orchestrator");
                     break;
                 case SessionIdleEvent:
                     done.TrySetResult(response);

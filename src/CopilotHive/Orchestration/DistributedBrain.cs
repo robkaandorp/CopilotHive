@@ -3,6 +3,7 @@ using System.Text;
 using CopilotHive.Copilot;
 using CopilotHive.Metrics;
 using CopilotHive.Services;
+using CopilotHive.Telemetry;
 using GitHub.Copilot.SDK;
 
 namespace CopilotHive.Orchestration;
@@ -631,6 +632,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {
                 case AssistantMessageEvent msg:
                     response = msg.Data.Content;
+                    break;
+                case AssistantUsageEvent usage:
+                    FileTracer.WriteUsage(usage.Data, "/app/state/traces-brain.jsonl", "brain");
                     break;
                 case SessionIdleEvent:
                     done.TrySetResult(response);
