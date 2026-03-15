@@ -106,5 +106,4 @@ After every `merge` action, verify the merge actually landed before proceeding:
 - Coverage should improve or stay stable each iteration
 - Prefer simple, readable solutions over clever ones
 - When interpreting output, extract exact numbers — don't approximate
-- Test count must never decrease across iterations unless tests were explicitly removed
-  as part of the task
+- Test count must never decrease unless tests were explicitly removed as part of the task

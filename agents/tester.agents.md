@@ -44,8 +44,16 @@ What must be true for this to pass.
 
 Run the project build. This is the first gate — if it doesn't compile, stop here.
 
+First, locate the solution file (the project may use `.slnx` instead of `.sln`):
+
 ```bash
-dotnet build  # or the project's build command
+find . -name '*.slnx' -o -name '*.sln' | head -3
+```
+
+Then build using the discovered file:
+
+```bash
+dotnet build  # or: dotnet build <path-to-solution-file>
 ```
 
 ### Phase 3: Run Existing Tests
