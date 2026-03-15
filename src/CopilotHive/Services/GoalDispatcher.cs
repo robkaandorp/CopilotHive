@@ -944,88 +944,25 @@ public sealed class GoalDispatcher : BackgroundService
 
     /// <summary>
     /// Fallback metric extraction from raw worker output when the Brain doesn't return test_metrics.
-    /// Parses common patterns including dotnet test summaries, markdown tables, and key-value lines.
+    /// Delegates to <see cref="DistributedBrain.FallbackParseTestMetrics"/> for the actual parsing
+    /// and maps the result onto the mutable <paramref name="metrics"/> object.
     /// </summary>
     internal static void FallbackParseTestMetrics(string output, IterationMetrics metrics)
     {
-        if (string.IsNullOrEmpty(output))
+        var extracted = DistributedBrain.FallbackParseTestMetrics(output);
+        if (extracted is null)
             return;
 
-        // dotnet test summary: "Passed!  - Failed:     0, Passed:   268, Skipped:     0, Total:   268"
-        var dotnetMatch = System.Text.RegularExpressions.Regex.Match(
-            output,
-            @"Failed:\s*(\d+),\s*Passed:\s*(\d+),\s*Skipped:\s*(\d+),\s*Total:\s*(\d+)",
-            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-
-        if (dotnetMatch.Success)
-        {
-            metrics.FailedTests = int.Parse(dotnetMatch.Groups[1].Value);
-            metrics.PassedTests = int.Parse(dotnetMatch.Groups[2].Value);
-            metrics.TotalTests = int.Parse(dotnetMatch.Groups[4].Value);
-            FallbackParseBuildSuccess(output, metrics);
-            return;
-        }
-
-        // Markdown table format: "| Total | 273 |" or "| Passed | 273 |"
-        foreach (var line in output.Split('\n'))
-        {
-            var trimmed = line.Trim();
-
-            // Match markdown table rows like "| Total | 273 |"
-            var mdMatch = System.Text.RegularExpressions.Regex.Match(
-                trimmed, @"^\|\s*(\w+)\s*\|\s*(\d+)\s*\|");
-            if (mdMatch.Success)
-            {
-                var key = mdMatch.Groups[1].Value;
-                var val = int.Parse(mdMatch.Groups[2].Value);
-                if (key.Equals("Total", StringComparison.OrdinalIgnoreCase))
-                    metrics.TotalTests = Math.Max(metrics.TotalTests, val);
-                else if (key.Equals("Passed", StringComparison.OrdinalIgnoreCase))
-                    metrics.PassedTests = Math.Max(metrics.PassedTests, val);
-                else if (key.Equals("Failed", StringComparison.OrdinalIgnoreCase))
-                    metrics.FailedTests = Math.Max(metrics.FailedTests, val);
-                else if (key.Equals("Errors", StringComparison.OrdinalIgnoreCase))
-                    metrics.BuildSuccess = val == 0;
-                continue;
-            }
-
-            // Key-value line format: "total_tests: 273"
-            if (trimmed.StartsWith("unit_tests_total:", StringComparison.OrdinalIgnoreCase)
-                || trimmed.StartsWith("total_tests:", StringComparison.OrdinalIgnoreCase)
-                || trimmed.StartsWith("total:", StringComparison.OrdinalIgnoreCase))
-            {
-                if (int.TryParse(trimmed[(trimmed.IndexOf(':') + 1)..].Trim(), out var t))
-                    metrics.TotalTests = Math.Max(metrics.TotalTests, t);
-            }
-            else if (trimmed.StartsWith("unit_tests_passed:", StringComparison.OrdinalIgnoreCase)
-                     || trimmed.StartsWith("passed_tests:", StringComparison.OrdinalIgnoreCase)
-                     || trimmed.StartsWith("passed:", StringComparison.OrdinalIgnoreCase))
-            {
-                if (int.TryParse(trimmed[(trimmed.IndexOf(':') + 1)..].Trim(), out var p))
-                    metrics.PassedTests = Math.Max(metrics.PassedTests, p);
-            }
-            else if (trimmed.StartsWith("failed_tests:", StringComparison.OrdinalIgnoreCase)
-                     || trimmed.StartsWith("failed:", StringComparison.OrdinalIgnoreCase))
-            {
-                if (int.TryParse(trimmed[(trimmed.IndexOf(':') + 1)..].Trim(), out var f))
-                    metrics.FailedTests = Math.Max(metrics.FailedTests, f);
-            }
-        }
-
-        FallbackParseBuildSuccess(output, metrics);
-    }
-
-    /// <summary>
-    /// Extracts build success from raw worker output by looking for common build result patterns.
-    /// </summary>
-    private static void FallbackParseBuildSuccess(string output, IterationMetrics metrics)
-    {
-        if (output.Contains("Build succeeded", StringComparison.OrdinalIgnoreCase)
-            || System.Text.RegularExpressions.Regex.IsMatch(output, @"\|\s*Errors\s*\|\s*0\s*\|")
-            || System.Text.RegularExpressions.Regex.IsMatch(output, @"✅\s*\*{0,2}Succeeded\*{0,2}", System.Text.RegularExpressions.RegexOptions.IgnoreCase)
-            || System.Text.RegularExpressions.Regex.IsMatch(output, @"Build(?:\s+(?:Status|Result))?\s*:\s*(?:✅\s*)?PASS", System.Text.RegularExpressions.RegexOptions.IgnoreCase)
-            || System.Text.RegularExpressions.Regex.IsMatch(output, @"\b0\s+error(?:s|\(s\))", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+        if (extracted.TotalTests.HasValue)
+            metrics.TotalTests = Math.Max(metrics.TotalTests, extracted.TotalTests.Value);
+        if (extracted.PassedTests.HasValue)
+            metrics.PassedTests = Math.Max(metrics.PassedTests, extracted.PassedTests.Value);
+        if (extracted.FailedTests.HasValue)
+            metrics.FailedTests = Math.Max(metrics.FailedTests, extracted.FailedTests.Value);
+        if (extracted.BuildSuccess is true)
             metrics.BuildSuccess = true;
+        if (extracted.CoveragePercent.HasValue)
+            metrics.CoveragePercent = Math.Max(metrics.CoveragePercent, extracted.CoveragePercent.Value);
     }
 
     private async Task MarkGoalCompleted(GoalPipeline pipeline, CancellationToken ct)
