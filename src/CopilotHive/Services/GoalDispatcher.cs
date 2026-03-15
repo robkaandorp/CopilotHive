@@ -670,7 +670,58 @@ public sealed class GoalDispatcher : BackgroundService
                     await RunGitAsync($"-C {tempDir} config user.email copilothive@local", ct);
                     await RunGitAsync($"-C {tempDir} config user.name CopilotHive", ct);
                     await RunGitAsync($"-C {tempDir} fetch origin {pipeline.CoderBranch}", ct);
-                    await RunGitAsync($"-C {tempDir} merge origin/{pipeline.CoderBranch} --no-edit", ct);
+
+                    try
+                    {
+                        await RunGitAsync($"-C {tempDir} merge origin/{pipeline.CoderBranch} --no-edit", ct);
+                    }
+                    catch (Exception mergeEx)
+                    {
+                        // Merge failed — attempt automatic rebase before falling back to coder
+                        _logger.LogInformation(
+                            "Merge conflict for {GoalId} — attempting automatic rebase of {Branch} onto {Base}",
+                            pipeline.GoalId, pipeline.CoderBranch, repo.DefaultBranch);
+
+                        // Abort the failed merge, then try rebase in a fresh clone of the feature branch
+                        await RunGitAsync($"-C {tempDir} merge --abort", ct);
+
+                        var rebaseDir = Path.Combine(Path.GetTempPath(), $"hive-rebase-{Guid.NewGuid():N}");
+                        try
+                        {
+                            await RunGitAsync($"clone --branch {pipeline.CoderBranch} {repo.Url} {rebaseDir}", ct);
+                            await RunGitAsync($"-C {rebaseDir} config user.email copilothive@local", ct);
+                            await RunGitAsync($"-C {rebaseDir} config user.name CopilotHive", ct);
+                            await RunGitAsync($"-C {rebaseDir} fetch origin {repo.DefaultBranch}", ct);
+                            await RunGitAsync($"-C {rebaseDir} rebase origin/{repo.DefaultBranch}", ct);
+
+                            // Rebase succeeded — force-push the rebased branch and retry merge
+                            await RunGitAsync($"-C {rebaseDir} push origin {pipeline.CoderBranch} --force-with-lease", ct);
+                            _logger.LogInformation("Auto-rebase succeeded for {GoalId} — retrying merge", pipeline.GoalId);
+
+                            // Retry merge in the original temp dir
+                            await RunGitAsync($"-C {tempDir} fetch origin {pipeline.CoderBranch}", ct);
+                            await RunGitAsync($"-C {tempDir} merge origin/{pipeline.CoderBranch} --no-edit", ct);
+                        }
+                        catch (Exception rebaseEx)
+                        {
+                            // Auto-rebase failed — abort and fall through to coder-based resolution
+                            _logger.LogWarning(
+                                "Auto-rebase failed for {GoalId} — falling back to coder: {Error}",
+                                pipeline.GoalId, rebaseEx.Message);
+                            try { await RunGitAsync($"-C {rebaseDir} rebase --abort", ct); } catch { }
+                            throw new InvalidOperationException(
+                                $"Merge conflict (auto-rebase failed): {mergeEx.Message}", mergeEx);
+                        }
+                        finally
+                        {
+                            if (Directory.Exists(rebaseDir))
+                            {
+                                try { Directory.Delete(rebaseDir, true); }
+                                catch { /* Best effort cleanup */ }
+                            }
+                        }
+                    }
+
                     await RunGitAsync($"-C {tempDir} push origin {repo.DefaultBranch}", ct);
 
                     _logger.LogInformation("Merged {Branch} into {Base} for {Repo}",
@@ -1326,15 +1377,19 @@ public sealed class GoalDispatcher : BackgroundService
     private static string BuildCoderPrompt(Goal goal)
     {
         return $"""
-            You are a coder working on a software project. Your task:
+            You are a coder. Implement the following task by USING YOUR TOOLS to edit files NOW.
 
-            {goal.Description}
+            Task: {goal.Description}
 
-            Instructions:
-            - Make the necessary code changes to accomplish this goal.
-            - Follow existing code conventions and style.
-            - Commit your changes with a clear, descriptive commit message.
-            - Only make changes directly related to the goal.
+            Do NOT describe or plan changes — actually make them:
+            1. Read the relevant source files
+            2. Edit them using your file editing tools
+            3. Run `dotnet build` and fix any errors
+            4. Run `dotnet test` and fix any failures
+            5. Run `git add` + `git commit` with a descriptive message
+            6. Verify with `git diff HEAD origin/<base-branch>` that you have a non-empty diff
+
+            A response that only describes changes without calling tools is a FAILURE.
             """;
     }
 
