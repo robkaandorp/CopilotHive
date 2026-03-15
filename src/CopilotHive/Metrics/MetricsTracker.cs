@@ -82,6 +82,13 @@ public sealed class MetricsTracker
         if (comparison is null)
             return false;
 
+        // If current extraction produced no test data, skip the test regression check entirely
+        if (current.TotalTests == 0)
+        {
+            Console.WriteLine("Test metrics not extracted (TotalTests=0); skipping test regression check");
+            return comparison.CoverageDelta < -1.0;
+        }
+
         // Regression: coverage dropped OR pass rate dropped
         return comparison.CoverageDelta < -1.0 || comparison.PassRateDelta < -0.05;
     }

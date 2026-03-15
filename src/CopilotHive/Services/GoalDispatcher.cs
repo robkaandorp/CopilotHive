@@ -1007,6 +1007,9 @@ public sealed class GoalDispatcher : BackgroundService
         // Check for regression after recording metrics
         if (_metricsTracker is not null && _agentsManager is not null)
         {
+            if (pipeline.Metrics.TotalTests == 0)
+                _logger.LogWarning("Test metrics not extracted (TotalTests=0); regression check will skip test comparison.");
+
             if (_metricsTracker.HasRegressed(pipeline.Metrics))
             {
                 _logger.LogWarning("⚠️ REGRESSION DETECTED for goal {GoalId} — rolling back AGENTS.md", pipeline.GoalId);
