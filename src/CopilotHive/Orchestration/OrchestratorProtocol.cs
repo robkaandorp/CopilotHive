@@ -84,6 +84,10 @@ public sealed record ExtractedTestMetrics
     [JsonPropertyName("failed_tests")]
     public int? FailedTests { get; init; }
 
+    /// <summary>Number of tests that were skipped.</summary>
+    [JsonPropertyName("skipped_tests")]
+    public int? SkippedTests { get; init; }
+
     /// <summary>Code coverage percentage.</summary>
     [JsonPropertyName("coverage_percent")]
     public double? CoveragePercent { get; init; }

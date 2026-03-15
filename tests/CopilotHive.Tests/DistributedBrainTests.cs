@@ -355,6 +355,90 @@ public sealed class DistributedBrainTests
         Assert.Null(result.TestMetrics);
     }
 
+    // ── New: xUnit / fallback-merge Tests ────────────────────────────────
+
+    [Fact]
+    public void FallbackParseTestMetrics_XUnitRunnerFormat_ExtractsCorrectCounts()
+    {
+        // Real xUnit runner output with extra spaces
+        var output = "Passed!  - Failed:     0, Passed:   322, Skipped:     0, Total:   322, Duration: 3s";
+
+        var result = DistributedBrain.FallbackParseTestMetrics(output);
+
+        Assert.NotNull(result);
+        Assert.Equal(322, result.PassedTests);
+        Assert.Equal(322, result.TotalTests);
+        Assert.Equal(0,   result.FailedTests ?? -1);
+        Assert.Equal(0,   result.SkippedTests ?? -1);
+    }
+
+    [Fact]
+    public void FallbackParseTestMetrics_StandardDotnetFormat_ExtractsCorrectCounts()
+    {
+        var output = "Failed: 0, Passed: 322, Skipped: 0, Total: 322, Duration: 2s";
+
+        var result = DistributedBrain.FallbackParseTestMetrics(output);
+
+        Assert.NotNull(result);
+        Assert.Equal(322, result.PassedTests);
+        Assert.Equal(322, result.TotalTests);
+    }
+
+    /// <summary>Core bug: Brain extracted TotalTests but not PassedTests → fallback PassedTests used.</summary>
+    [Fact]
+    public void ApplyTestMetricsFallback_BrainPassedZeroFallbackNonZero_FallbackPassedUsed()
+    {
+        var logger = NullLogger<DistributedBrain>.Instance;
+        var decision = new OrchestratorDecision
+        {
+            TestMetrics = new ExtractedTestMetrics { TotalTests = 331, PassedTests = 0 },
+        };
+        var testerOutput = "Passed!  - Failed:     9, Passed:   322, Skipped:     0, Total:   331";
+
+        var result = DistributedBrain.ApplyTestMetricsFallback(
+            decision, "tester", testerOutput, logger);
+
+        Assert.NotNull(result.TestMetrics);
+        Assert.Equal(322, result.TestMetrics.PassedTests);
+        Assert.Equal(331, result.TestMetrics.TotalTests);
+    }
+
+    /// <summary>Both Brain and fallback have PassedTests=0 → keep 0.</summary>
+    [Fact]
+    public void ApplyTestMetricsFallback_BrainPassedZeroFallbackZero_KeepsZero()
+    {
+        var logger = NullLogger<DistributedBrain>.Instance;
+        var decision = new OrchestratorDecision
+        {
+            TestMetrics = new ExtractedTestMetrics { TotalTests = 10, PassedTests = 0 },
+        };
+        var testerOutput = "Failed: 10, Passed: 0, Skipped: 0, Total: 10";
+
+        var result = DistributedBrain.ApplyTestMetricsFallback(
+            decision, "tester", testerOutput, logger);
+
+        Assert.NotNull(result.TestMetrics);
+        Assert.Equal(0, result.TestMetrics.PassedTests ?? -1);
+    }
+
+    /// <summary>Brain has PassedTests=5 → Brain wins even if fallback has 322.</summary>
+    [Fact]
+    public void ApplyTestMetricsFallback_BrainPassedNonZero_BrainPassedWins()
+    {
+        var logger = NullLogger<DistributedBrain>.Instance;
+        var decision = new OrchestratorDecision
+        {
+            TestMetrics = new ExtractedTestMetrics { TotalTests = 5, PassedTests = 5 },
+        };
+        var testerOutput = "Passed!  - Failed:     0, Passed:   322, Skipped:     0, Total:   322";
+
+        var result = DistributedBrain.ApplyTestMetricsFallback(
+            decision, "tester", testerOutput, logger);
+
+        Assert.NotNull(result.TestMetrics);
+        Assert.Equal(5, result.TestMetrics.PassedTests);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────
 
     private static GoalPipeline CreatePipeline(string goalId, string description) =>

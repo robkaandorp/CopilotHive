@@ -681,7 +681,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         if (!workerRole.Equals("tester", StringComparison.OrdinalIgnoreCase))
             return decision;
 
-        if ((decision.TestMetrics?.TotalTests ?? 0) > 0)
+        if ((decision.TestMetrics?.TotalTests ?? 0) > 0 &&
+            (decision.TestMetrics?.PassedTests ?? 0) > 0)
             return decision; // Brain extracted valid metrics — nothing to do
 
         var fallback = FallbackParseTestMetrics(rawOutput);
@@ -695,9 +696,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         var existing = decision.TestMetrics;
         var merged = new ExtractedTestMetrics
         {
-            TotalTests    = (existing?.TotalTests ?? 0) > 0  ? existing!.TotalTests  : fallback.TotalTests,
-            PassedTests   = (existing?.PassedTests ?? 0) > 0 ? existing!.PassedTests : fallback.PassedTests,
-            FailedTests   = existing?.FailedTests   ?? fallback.FailedTests,
+            PassedTests  = (existing?.PassedTests  ?? 0) > 0 ? existing!.PassedTests  : fallback.PassedTests,
+            TotalTests   = (existing?.TotalTests   ?? 0) > 0 ? existing!.TotalTests   : fallback.TotalTests,
+            FailedTests  = (existing?.FailedTests  ?? 0) > 0 ? existing!.FailedTests  : fallback.FailedTests,
+            SkippedTests = (existing?.SkippedTests ?? 0) > 0 ? existing!.SkippedTests : fallback.SkippedTests,
             BuildSuccess  = existing?.BuildSuccess  ?? fallback.BuildSuccess,
             CoveragePercent = existing?.CoveragePercent ?? fallback.CoveragePercent,
         };
@@ -716,22 +718,39 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         if (string.IsNullOrEmpty(output))
             return null;
 
-        int? total = null, passed = null, failed = null;
+        int? total = null, passed = null, failed = null, skipped = null;
         bool? buildSuccess = null;
 
-        // dotnet test summary (full): "Passed! - Failed: 0, Passed: 268, Skipped: 0, Total: 268"
-        var dotnetMatch = Regex.Match(
-            output,
-            @"Failed:\s*(\d+),\s*Passed:\s*(\d+),\s*Skipped:\s*(\d+),\s*Total:\s*(\d+)",
+        // xUnit runner summary: "Passed!  - Failed:     0, Passed:   322, Skipped:     0, Total:   322"
+        var xunitMatch = Regex.Match(output,
+            @"Passed!\s*-\s*Failed:\s+(\d+),\s*Passed:\s+(\d+),\s*Skipped:\s+(\d+),\s*Total:\s+(\d+)",
             RegexOptions.IgnoreCase);
+        if (xunitMatch.Success)
+        {
+            failed  = int.Parse(xunitMatch.Groups[1].Value);
+            passed  = int.Parse(xunitMatch.Groups[2].Value);
+            skipped = int.Parse(xunitMatch.Groups[3].Value);
+            total   = int.Parse(xunitMatch.Groups[4].Value);
+        }
 
-        if (dotnetMatch.Success)
+        // dotnet test summary (full): "Passed! - Failed: 0, Passed: 268, Skipped: 0, Total: 268"
+        Match? dotnetMatch = null;
+        if (!xunitMatch.Success)
+        {
+            dotnetMatch = Regex.Match(
+                output,
+                @"Failed:\s+(\d+),\s*Passed:\s+(\d+),\s*Skipped:\s+(\d+),\s*Total:\s+(\d+)",
+                RegexOptions.IgnoreCase);
+        }
+
+        if (dotnetMatch is { Success: true })
         {
             failed  = int.Parse(dotnetMatch.Groups[1].Value);
             passed  = int.Parse(dotnetMatch.Groups[2].Value);
+            skipped = int.Parse(dotnetMatch.Groups[3].Value);
             total   = int.Parse(dotnetMatch.Groups[4].Value);
         }
-        else
+        else if (!xunitMatch.Success)
         {
             // Short summary: "Passed: 8, Failed: 0, Total: 8" (comma-separated, no Skipped field)
             // Use [ \t] (not \s) to avoid spanning multiple lines
@@ -817,6 +836,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             TotalTests   = total,
             PassedTests  = passed,
             FailedTests  = failed,
+            SkippedTests = skipped,
             BuildSuccess = buildSuccess,
         };
     }
