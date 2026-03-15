@@ -447,7 +447,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Rules for the prompt you craft:
             - CRITICAL: The branch name is EXACTLY "{{pipeline.CoderBranch ?? "TBD"}}" — do NOT invent or change it
             - The worker infrastructure handles branch creation, checkout, and pushing — do NOT tell workers to create branches or push
-            - For coders: Tell them to USE THEIR TOOLS to edit files immediately — not to describe or plan changes. They MUST call file editing tools, run the build, run tests, then git add + git commit. A response with only text is a failure. Do NOT include git branch or git push commands.
+            - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, build, test, and commit. Do NOT include git branch or git push commands.
             - For reviewers: tell them to review the diff on branch "{{pipeline.CoderBranch ?? "TBD"}}" against the base branch, produce a REVIEW_REPORT
             - For testers: tell them to build, run tests, write integration tests, produce a TEST_REPORT
             - Include any context from previous phases that would help the worker
