@@ -442,4 +442,34 @@ public class FallbackParseTestMetricsTests
         var result = Parse("1 Error(s)");
         Assert.False(result.BuildSuccess);
     }
+
+    [Fact]
+    public void FallbackParse_MultiplePassedValues_KeepsLargest()
+    {
+        const string output = "Passed: 19\nFailed: 1\nTotal: 20\n\nPassed: 294\nFailed: 2\nTotal: 296";
+        var metrics = Parse(output);
+        Assert.Equal(294, metrics.PassedTests);
+        Assert.Equal(296, metrics.TotalTests);
+        Assert.Equal(2, metrics.FailedTests);
+    }
+
+    [Fact]
+    public void FallbackParse_MultiplePassedValues_MarkdownTable_KeepsLargest()
+    {
+        const string output = "| Passed | 19 |\n| Failed | 1 |\n| Total | 20 |\n\n| Passed | 294 |\n| Failed | 2 |\n| Total | 296 |";
+        var metrics = Parse(output);
+        Assert.Equal(294, metrics.PassedTests);
+        Assert.Equal(296, metrics.TotalTests);
+        Assert.Equal(2, metrics.FailedTests);
+    }
+
+    [Fact]
+    public void FallbackParse_FirstOccurrenceLarger_KeepsFirst()
+    {
+        const string output = "Passed: 294\nFailed: 2\nTotal: 296\n\nPassed: 19\nFailed: 1\nTotal: 20";
+        var metrics = Parse(output);
+        Assert.Equal(294, metrics.PassedTests);
+        Assert.Equal(296, metrics.TotalTests);
+        Assert.Equal(2, metrics.FailedTests);
+    }
 }

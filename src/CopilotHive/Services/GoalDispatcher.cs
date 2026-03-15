@@ -928,11 +928,11 @@ public sealed class GoalDispatcher : BackgroundService
                 var key = mdMatch.Groups[1].Value;
                 var val = int.Parse(mdMatch.Groups[2].Value);
                 if (key.Equals("Total", StringComparison.OrdinalIgnoreCase))
-                    metrics.TotalTests = val;
+                    metrics.TotalTests = Math.Max(metrics.TotalTests, val);
                 else if (key.Equals("Passed", StringComparison.OrdinalIgnoreCase))
-                    metrics.PassedTests = val;
+                    metrics.PassedTests = Math.Max(metrics.PassedTests, val);
                 else if (key.Equals("Failed", StringComparison.OrdinalIgnoreCase))
-                    metrics.FailedTests = val;
+                    metrics.FailedTests = Math.Max(metrics.FailedTests, val);
                 else if (key.Equals("Errors", StringComparison.OrdinalIgnoreCase))
                     metrics.BuildSuccess = val == 0;
                 continue;
@@ -944,20 +944,20 @@ public sealed class GoalDispatcher : BackgroundService
                 || trimmed.StartsWith("total:", StringComparison.OrdinalIgnoreCase))
             {
                 if (int.TryParse(trimmed[(trimmed.IndexOf(':') + 1)..].Trim(), out var t))
-                    metrics.TotalTests = t;
+                    metrics.TotalTests = Math.Max(metrics.TotalTests, t);
             }
             else if (trimmed.StartsWith("unit_tests_passed:", StringComparison.OrdinalIgnoreCase)
                      || trimmed.StartsWith("passed_tests:", StringComparison.OrdinalIgnoreCase)
                      || trimmed.StartsWith("passed:", StringComparison.OrdinalIgnoreCase))
             {
                 if (int.TryParse(trimmed[(trimmed.IndexOf(':') + 1)..].Trim(), out var p))
-                    metrics.PassedTests = p;
+                    metrics.PassedTests = Math.Max(metrics.PassedTests, p);
             }
             else if (trimmed.StartsWith("failed_tests:", StringComparison.OrdinalIgnoreCase)
                      || trimmed.StartsWith("failed:", StringComparison.OrdinalIgnoreCase))
             {
                 if (int.TryParse(trimmed[(trimmed.IndexOf(':') + 1)..].Trim(), out var f))
-                    metrics.FailedTests = f;
+                    metrics.FailedTests = Math.Max(metrics.FailedTests, f);
             }
         }
 
