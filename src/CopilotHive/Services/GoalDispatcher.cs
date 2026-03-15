@@ -251,7 +251,11 @@ public sealed class GoalDispatcher : BackgroundService
         // Populate review metrics when the reviewer phase completes
         if (pipeline.Phase == GoalPhase.Review)
         {
-            pipeline.Metrics.ReviewVerdict = interpretation.ReviewVerdict ?? "";
+            pipeline.Metrics.ReviewVerdict = interpretation.Verdict == "FAIL"
+                ? "REQUEST_CHANGES"
+                : interpretation.Verdict == "PASS"
+                    ? "APPROVE"
+                    : interpretation.ReviewVerdict ?? "";
             if (interpretation.Issues is { Count: > 0 })
             {
                 pipeline.Metrics.ReviewIssuesFound += interpretation.Issues.Count;
