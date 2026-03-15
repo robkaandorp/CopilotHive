@@ -1377,19 +1377,19 @@ public sealed class GoalDispatcher : BackgroundService
     private static string BuildCoderPrompt(Goal goal)
     {
         return $"""
-            You are a coder. Implement the following task by USING YOUR TOOLS to edit files NOW.
+            You are a coder. Implement the following task. Start by reading the relevant source files, then make your code changes, build, test, and commit.
 
             Task: {goal.Description}
 
             Do NOT describe or plan changes — actually make them:
             1. Read the relevant source files
-            2. Edit them using your file editing tools
+            2. Edit the files
             3. Run `dotnet build` and fix any errors
             4. Run `dotnet test` and fix any failures
             5. Run `git add` + `git commit` with a descriptive message
             6. Verify with `git diff HEAD origin/<base-branch>` that you have a non-empty diff
 
-            A response that only describes changes without calling tools is a FAILURE.
+            A response that only describes changes without actually editing files is a FAILURE.
             """;
     }
 
