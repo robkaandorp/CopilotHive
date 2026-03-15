@@ -11,7 +11,7 @@ namespace CopilotHive.Worker;
 /// </summary>
 public sealed class CopilotRunner : IAsyncDisposable
 {
-    private readonly CopilotClient _client;
+    private CopilotClient? _client;
     private CopilotSession? _session;
     private readonly int _port;
     private CustomAgentConfig? _customAgent;
@@ -34,18 +34,6 @@ public sealed class CopilotRunner : IAsyncDisposable
     public CopilotRunner(int port = WorkerConstants.DefaultAgentPort)
     {
         _port = port;
-        _client = new CopilotClient(new CopilotClientOptionsWithTelemetry
-        {
-            CliUrl = $"localhost:{port}",
-            AutoStart = false,
-            Telemetry = new TelemetryConfig
-            {
-                FilePath = $"/app/state/otel-{_role ?? "worker"}.jsonl",
-                ExporterType = "file",
-                SourceName = $"copilothive-worker-{_role ?? "worker"}",
-                CaptureContent = true
-            }
-        });
     }
 
     /// <summary>
@@ -79,6 +67,19 @@ public sealed class CopilotRunner : IAsyncDisposable
 
     private SessionConfig BuildSessionConfig()
     {
+        _client ??= new CopilotClient(new CopilotClientOptionsWithTelemetry
+        {
+            CliUrl = $"localhost:{_port}",
+            AutoStart = false,
+            Telemetry = new TelemetryConfig
+            {
+                FilePath = $"/app/state/otel-{_role ?? "worker"}.jsonl",
+                ExporterType = "file",
+                SourceName = $"copilothive-worker-{_role ?? "worker"}",
+                CaptureContent = true
+            }
+        });
+
         var config = new SessionConfig
         {
             Streaming = true,
@@ -184,14 +185,15 @@ public sealed class CopilotRunner : IAsyncDisposable
     /// <param name="ct">Cancellation token.</param>
     public async Task ConnectAsync(CancellationToken ct = default)
     {
-        await _client.StartAsync();
+        var sessionConfig = BuildSessionConfig();
+        await _client!.StartAsync();
         Exception? lastException = null;
 
         for (var attempt = 1; attempt <= MaxConnectRetries; attempt++)
         {
             try
             {
-                _session = await _client.CreateSessionAsync(BuildSessionConfig());
+                _session = await _client.CreateSessionAsync(sessionConfig);
                 _log.Info($"Connected to Copilot CLI on port {_port} (attempt {attempt})");
                 _log.Debug($"Session config: streaming={false}, customAgents={(_customAgent?.Name ?? "none")}");
                 return;
@@ -226,7 +228,7 @@ public sealed class CopilotRunner : IAsyncDisposable
         if (!string.IsNullOrEmpty(model))
             config.Model = model;
 
-        _session = await _client.CreateSessionAsync(config);
+        _session = await _client!.CreateSessionAsync(config);
 
         var modelInfo = string.IsNullOrEmpty(model) ? "default" : model;
         _log.Info($"Session reset (localhost:{_port}, agent={_customAgent?.Name ?? "none"}, model={modelInfo})");
@@ -290,7 +292,8 @@ public sealed class CopilotRunner : IAsyncDisposable
         if (_session is not null)
             await _session.DisposeAsync();
 
-        await _client.StopAsync();
+        if (_client is not null)
+            await _client.StopAsync();
     }
 }
 

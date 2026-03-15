@@ -5,6 +5,5 @@
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
-    <CopilotSkipCliDownload>true</CopilotSkipCliDownload>
   </PropertyGroup>
 </Project>

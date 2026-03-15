@@ -61,4 +61,18 @@ public class TelemetryConfigTests
         Assert.Equal("copilothive-brain", options.Telemetry.SourceName);
         Assert.True(options.Telemetry.CaptureContent);
     }
+
+    [Fact]
+    public void TelemetryConfig_DefaultConstructor_AllowsPropertyAssignment()
+    {
+        var config = new TelemetryConfig();
+        config.FilePath = "/some/path.jsonl";
+        config.ExporterType = "file";
+        config.SourceName = "test-source";
+        config.CaptureContent = false;
+        Assert.Equal("/some/path.jsonl", config.FilePath);
+        Assert.Equal("file", config.ExporterType);
+        Assert.Equal("test-source", config.SourceName);
+        Assert.False(config.CaptureContent);
+    }
 }
