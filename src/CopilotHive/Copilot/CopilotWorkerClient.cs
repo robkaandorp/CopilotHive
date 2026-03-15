@@ -27,10 +27,17 @@ public sealed class CopilotWorkerClient : ICopilotWorkerClient
     {
         _port = port;
         // Don't pass GitHubToken — the external headless server manages its own auth
-        _client = new CopilotClient(new CopilotClientOptions
+        _client = new CopilotClient(new CopilotClientOptionsWithTelemetry
         {
             CliUrl = $"localhost:{port}",
             AutoStart = false,
+            Telemetry = new TelemetryConfig
+            {
+                FilePath = "/app/state/otel-orchestrator.jsonl",
+                ExporterType = "file",
+                SourceName = "copilothive-orchestrator",
+                CaptureContent = true
+            }
         });
     }
 

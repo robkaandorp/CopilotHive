@@ -19,7 +19,7 @@ public sealed class WorkerService(
 {
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(30);
 
-    private readonly CopilotRunner _copilotRunner = new(copilotPort);
+    private readonly CopilotRunner _copilotRunner = new(role, copilotPort);
     private readonly WorkerLogger _log = new("Worker");
 
     // Pending tool calls awaiting orchestrator responses, keyed by request_id

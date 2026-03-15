@@ -11,11 +11,11 @@ namespace CopilotHive.Worker;
 /// </summary>
 public sealed class CopilotRunner : IAsyncDisposable
 {
-    private readonly CopilotClient _client;
+    private CopilotClient? _client;
     private CopilotSession? _session;
     private readonly int _port;
+    private readonly string _role;
     private CustomAgentConfig? _customAgent;
-    private string? _role;
     private readonly WorkerLogger _log = new("Copilot");
 
     // Tool call bridge for custom tools — set before creating a session
@@ -30,15 +30,12 @@ public sealed class CopilotRunner : IAsyncDisposable
     /// <summary>
     /// Initialises a new <see cref="CopilotRunner"/> connecting on the given <paramref name="port"/>.
     /// </summary>
+    /// <param name="role">The worker role (e.g. "coder"), known at process startup from WORKER_ROLE.</param>
     /// <param name="port">The TCP port the Copilot CLI headless server is listening on.</param>
-    public CopilotRunner(int port = WorkerConstants.DefaultAgentPort)
+    public CopilotRunner(string role, int port = WorkerConstants.DefaultAgentPort)
     {
+        _role = role;
         _port = port;
-        _client = new CopilotClient(new CopilotClientOptions
-        {
-            CliUrl = $"localhost:{port}",
-            AutoStart = false,
-        });
     }
 
     /// <summary>
@@ -57,7 +54,6 @@ public sealed class CopilotRunner : IAsyncDisposable
     /// </summary>
     public void SetCustomAgent(string role, string agentsMdContent)
     {
-        _role = role;
         _customAgent = new CustomAgentConfig
         {
             Name = role,
@@ -72,6 +68,19 @@ public sealed class CopilotRunner : IAsyncDisposable
 
     private SessionConfig BuildSessionConfig()
     {
+        _client ??= new CopilotClient(new CopilotClientOptionsWithTelemetry
+        {
+            CliUrl = $"localhost:{_port}",
+            AutoStart = false,
+            Telemetry = new TelemetryConfig
+            {
+                FilePath = $"/app/state/otel-{_role}.jsonl",
+                ExporterType = "file",
+                SourceName = $"copilothive-worker-{_role}",
+                CaptureContent = true
+            }
+        });
+
         var config = new SessionConfig
         {
             Streaming = true,
@@ -177,14 +186,15 @@ public sealed class CopilotRunner : IAsyncDisposable
     /// <param name="ct">Cancellation token.</param>
     public async Task ConnectAsync(CancellationToken ct = default)
     {
-        await _client.StartAsync();
+        var sessionConfig = BuildSessionConfig();
+        await _client!.StartAsync();
         Exception? lastException = null;
 
         for (var attempt = 1; attempt <= MaxConnectRetries; attempt++)
         {
             try
             {
-                _session = await _client.CreateSessionAsync(BuildSessionConfig());
+                _session = await _client.CreateSessionAsync(sessionConfig);
                 _log.Info($"Connected to Copilot CLI on port {_port} (attempt {attempt})");
                 _log.Debug($"Session config: streaming={false}, customAgents={(_customAgent?.Name ?? "none")}");
                 return;
@@ -219,7 +229,7 @@ public sealed class CopilotRunner : IAsyncDisposable
         if (!string.IsNullOrEmpty(model))
             config.Model = model;
 
-        _session = await _client.CreateSessionAsync(config);
+        _session = await _client!.CreateSessionAsync(config);
 
         var modelInfo = string.IsNullOrEmpty(model) ? "default" : model;
         _log.Info($"Session reset (localhost:{_port}, agent={_customAgent?.Name ?? "none"}, model={modelInfo})");
@@ -248,7 +258,7 @@ public sealed class CopilotRunner : IAsyncDisposable
                     response = msg.Data.Content;
                     break;
                 case AssistantUsageEvent usage:
-                    FileTracer.WriteUsage(usage.Data, $"/app/state/traces-{_role ?? "worker"}.jsonl", _role);
+                    FileTracer.WriteUsage(usage.Data, $"/app/state/traces-{_role}.jsonl", _role);
                     break;
                 case SessionIdleEvent:
                     done.TrySetResult(response);
@@ -283,7 +293,8 @@ public sealed class CopilotRunner : IAsyncDisposable
         if (_session is not null)
             await _session.DisposeAsync();
 
-        await _client.StopAsync();
+        if (_client is not null)
+            await _client.StopAsync();
     }
 }
 

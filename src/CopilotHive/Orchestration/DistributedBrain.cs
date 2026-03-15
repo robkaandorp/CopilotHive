@@ -86,10 +86,17 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <returns>A task that represents the asynchronous operation.</returns>
     public async Task ConnectAsync(CancellationToken ct = default)
     {
-        _copilotClient = new CopilotClient(new CopilotClientOptions
+        _copilotClient = new CopilotClient(new CopilotClientOptionsWithTelemetry
         {
             CliUrl = $"localhost:{_port}",
             AutoStart = false,
+            Telemetry = new TelemetryConfig
+            {
+                FilePath = "/app/state/otel-brain.jsonl",
+                ExporterType = "file",
+                SourceName = "copilothive-brain",
+                CaptureContent = true
+            }
         });
 
         // Retry connection to Copilot CLI
