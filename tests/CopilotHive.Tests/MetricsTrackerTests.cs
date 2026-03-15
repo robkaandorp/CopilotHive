@@ -152,6 +152,57 @@ public class MetricsTrackerTests : IDisposable
     }
 
     [Fact]
+    public void HasRegressed_ReturnsFalse_WhenCurrentTotalTestsIsZero_PreviousNonZero()
+    {
+        _tracker.RecordIteration(new IterationMetrics
+        {
+            Iteration = 1, TotalTests = 10, PassedTests = 10, CoveragePercent = 80.0,
+        });
+
+        var m2 = new IterationMetrics
+        {
+            Iteration = 2, TotalTests = 0, PassedTests = 0, CoveragePercent = 80.0,
+        };
+        _tracker.RecordIteration(m2);
+
+        Assert.False(_tracker.HasRegressed(m2));
+    }
+
+    [Fact]
+    public void HasRegressed_ReturnsTrue_WhenMoreFailuresThanPrevious()
+    {
+        _tracker.RecordIteration(new IterationMetrics
+        {
+            Iteration = 1, TotalTests = 10, PassedTests = 9, CoveragePercent = 80.0,
+        });
+
+        var m2 = new IterationMetrics
+        {
+            Iteration = 2, TotalTests = 10, PassedTests = 6, CoveragePercent = 80.0,
+        };
+        _tracker.RecordIteration(m2);
+
+        Assert.True(_tracker.HasRegressed(m2));
+    }
+
+    [Fact]
+    public void HasRegressed_ReturnsFalse_WhenBothCurrentAndPreviousTotalTestsAreZero()
+    {
+        _tracker.RecordIteration(new IterationMetrics
+        {
+            Iteration = 1, TotalTests = 0, PassedTests = 0, CoveragePercent = 80.0,
+        });
+
+        var m2 = new IterationMetrics
+        {
+            Iteration = 2, TotalTests = 0, PassedTests = 0, CoveragePercent = 80.0,
+        };
+        _tracker.RecordIteration(m2);
+
+        Assert.False(_tracker.HasRegressed(m2));
+    }
+
+    [Fact]
     public void LoadsHistory_FromExistingFiles()
     {
         // Record some data with the first tracker
