@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text;
+using System.Text.RegularExpressions;
 using CopilotHive.Copilot;
 using CopilotHive.Metrics;
 using CopilotHive.Services;
@@ -518,9 +519,22 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
               """
             : "";
 
+        var testerInstruction = workerRole.Equals("tester", StringComparison.OrdinalIgnoreCase)
+            ? """
+
+              CRITICAL TESTER INSTRUCTIONS:
+              For tester output: You MUST extract test counts from the output. Look for patterns like
+              'Passed: N, Failed: N, Total: N' or 'Passed! - Failed: 0, Passed: 322, Skipped: 0, Total: 322'
+              or 'X passed, Y failed' or 'Tests run: N'. The `total_tests` and `passed_tests` fields inside
+              `test_metrics` are REQUIRED when the worker phase is Testing — do NOT leave them null or zero
+              if the output contains numeric results.
+
+              """
+            : "";
+
         var prompt = $$"""
             {{modeInstruction}}Interpret this {{workerRole}}'s output and extract structured data.
-
+            {{testerInstruction}}
             === {{workerRole.ToUpperInvariant()}} OUTPUT (truncated) ===
             {{Truncate(workerOutput, Constants.TruncationVeryLong)}}
             === END OUTPUT ===
@@ -535,13 +549,15 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {{schema}}
             """;
 
-        return await AskAsync(pipeline, prompt, ct)
+        var result = await AskAsync(pipeline, prompt, ct)
             ?? new OrchestratorDecision
             {
                 Action = OrchestratorActionType.Done,
                 Verdict = "UNKNOWN",
                 Reason = "Failed to interpret output",
             };
+
+        return ApplyTestMetricsFallback(result, workerRole, workerOutput, _logger);
     }
 
     /// <summary>
@@ -651,6 +667,158 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         await session.SendAsync(new MessageOptions { Prompt = prompt });
         return await done.Task;
+    }
+
+    /// <summary>
+    /// Applies fallback test metrics parsing when the Brain failed to extract metrics for tester output.
+    /// If the worker role is "tester" and the Brain returned null or zero test counts, parses the raw
+    /// output with <see cref="FallbackParseTestMetrics"/> and merges the result into the decision.
+    /// Brain values take priority unless they are null or zero, in which case fallback values win.
+    /// </summary>
+    internal static OrchestratorDecision ApplyTestMetricsFallback(
+        OrchestratorDecision decision, string workerRole, string rawOutput, ILogger logger)
+    {
+        if (!workerRole.Equals("tester", StringComparison.OrdinalIgnoreCase))
+            return decision;
+
+        if ((decision.TestMetrics?.TotalTests ?? 0) > 0)
+            return decision; // Brain extracted valid metrics — nothing to do
+
+        var fallback = FallbackParseTestMetrics(rawOutput);
+        if (fallback is null)
+            return decision; // Fallback found nothing — nothing to do
+
+        logger.LogWarning(
+            "Brain failed to extract test_metrics for tester phase, running fallback parser.");
+
+        // Merge: Brain values win when non-null and non-zero; fallback fills the gaps
+        var existing = decision.TestMetrics;
+        var merged = new ExtractedTestMetrics
+        {
+            TotalTests    = (existing?.TotalTests ?? 0) > 0  ? existing!.TotalTests  : fallback.TotalTests,
+            PassedTests   = (existing?.PassedTests ?? 0) > 0 ? existing!.PassedTests : fallback.PassedTests,
+            FailedTests   = existing?.FailedTests   ?? fallback.FailedTests,
+            BuildSuccess  = existing?.BuildSuccess  ?? fallback.BuildSuccess,
+            CoveragePercent = existing?.CoveragePercent ?? fallback.CoveragePercent,
+        };
+
+        return decision with { TestMetrics = merged };
+    }
+
+    /// <summary>
+    /// Parses raw worker output for common dotnet test result patterns and returns
+    /// a populated <see cref="ExtractedTestMetrics"/> object.
+    /// Returns <c>null</c> if no recognisable test counts are found.
+    /// Also called by <see cref="GoalDispatcher.FallbackParseTestMetrics"/> to keep the logic DRY.
+    /// </summary>
+    internal static ExtractedTestMetrics? FallbackParseTestMetrics(string output)
+    {
+        if (string.IsNullOrEmpty(output))
+            return null;
+
+        int? total = null, passed = null, failed = null;
+        bool? buildSuccess = null;
+
+        // dotnet test summary (full): "Passed! - Failed: 0, Passed: 268, Skipped: 0, Total: 268"
+        var dotnetMatch = Regex.Match(
+            output,
+            @"Failed:\s*(\d+),\s*Passed:\s*(\d+),\s*Skipped:\s*(\d+),\s*Total:\s*(\d+)",
+            RegexOptions.IgnoreCase);
+
+        if (dotnetMatch.Success)
+        {
+            failed  = int.Parse(dotnetMatch.Groups[1].Value);
+            passed  = int.Parse(dotnetMatch.Groups[2].Value);
+            total   = int.Parse(dotnetMatch.Groups[4].Value);
+        }
+        else
+        {
+            // Short summary: "Passed: 8, Failed: 0, Total: 8" (comma-separated, no Skipped field)
+            // Use [ \t] (not \s) to avoid spanning multiple lines
+            var shortMatch = Regex.Match(
+                output,
+                @"Passed:[ \t]*(\d+)[ \t]*,[ \t]*Failed:[ \t]*(\d+)[ \t]*,[ \t]*Total:[ \t]*(\d+)",
+                RegexOptions.IgnoreCase);
+
+            if (shortMatch.Success)
+            {
+                passed  = int.Parse(shortMatch.Groups[1].Value);
+                failed  = int.Parse(shortMatch.Groups[2].Value);
+                total   = int.Parse(shortMatch.Groups[3].Value);
+            }
+        }
+
+        if (total is null)
+        {
+            // Markdown table rows and key-value lines
+            int mdTotal = 0, mdPassed = 0, mdFailed = 0;
+            foreach (var line in output.Split('\n'))
+            {
+                var trimmed = line.Trim();
+
+                var mdMatch = Regex.Match(trimmed, @"^\|\s*(\w+)\s*\|\s*(\d+)\s*\|");
+                if (mdMatch.Success)
+                {
+                    var key = mdMatch.Groups[1].Value;
+                    var val = int.Parse(mdMatch.Groups[2].Value);
+                    if (key.Equals("Total",  StringComparison.OrdinalIgnoreCase)) mdTotal  = Math.Max(mdTotal,  val);
+                    else if (key.Equals("Passed",  StringComparison.OrdinalIgnoreCase)) mdPassed = Math.Max(mdPassed, val);
+                    else if (key.Equals("Failed",  StringComparison.OrdinalIgnoreCase)) mdFailed = Math.Max(mdFailed, val);
+                    else if (key.Equals("Errors",  StringComparison.OrdinalIgnoreCase)) buildSuccess = val == 0;
+                    continue;
+                }
+
+                // Key-value line format: "total_tests: 273"
+                if (trimmed.StartsWith("unit_tests_total:",  StringComparison.OrdinalIgnoreCase)
+                    || trimmed.StartsWith("total_tests:",    StringComparison.OrdinalIgnoreCase)
+                    || trimmed.StartsWith("total:",          StringComparison.OrdinalIgnoreCase))
+                {
+                    if (int.TryParse(trimmed[(trimmed.IndexOf(':') + 1)..].Trim(), out var t))
+                        mdTotal = Math.Max(mdTotal, t);
+                }
+                else if (trimmed.StartsWith("unit_tests_passed:", StringComparison.OrdinalIgnoreCase)
+                         || trimmed.StartsWith("passed_tests:",    StringComparison.OrdinalIgnoreCase)
+                         || trimmed.StartsWith("passed:",          StringComparison.OrdinalIgnoreCase))
+                {
+                    if (int.TryParse(trimmed[(trimmed.IndexOf(':') + 1)..].Trim(), out var p))
+                        mdPassed = Math.Max(mdPassed, p);
+                }
+                else if (trimmed.StartsWith("failed_tests:", StringComparison.OrdinalIgnoreCase)
+                         || trimmed.StartsWith("failed:",     StringComparison.OrdinalIgnoreCase))
+                {
+                    if (int.TryParse(trimmed[(trimmed.IndexOf(':') + 1)..].Trim(), out var f))
+                        mdFailed = Math.Max(mdFailed, f);
+                }
+            }
+
+            if (mdTotal > 0)  total  = mdTotal;
+            if (mdPassed > 0) passed = mdPassed;
+            if (mdFailed > 0) failed = mdFailed;
+        }
+
+        // Parse build success from common patterns
+        if (!buildSuccess.HasValue)
+        {
+            buildSuccess =
+                output.Contains("Build succeeded", StringComparison.OrdinalIgnoreCase)
+                || Regex.IsMatch(output, @"\|\s*Errors\s*\|\s*0\s*\|")
+                || Regex.IsMatch(output, @"✅\s*\*{0,2}Succeeded\*{0,2}", RegexOptions.IgnoreCase)
+                || Regex.IsMatch(output, @"Build(?:\s+(?:Status|Result))?\s*:\s*(?:✅\s*)?PASS", RegexOptions.IgnoreCase)
+                || Regex.IsMatch(output, @"\b0\s+error(?:s|\(s\))", RegexOptions.IgnoreCase)
+                ? true
+                : (bool?)null;
+        }
+
+        if (total is null && passed is null && failed is null && buildSuccess is null)
+            return null;
+
+        return new ExtractedTestMetrics
+        {
+            TotalTests   = total,
+            PassedTests  = passed,
+            FailedTests  = failed,
+            BuildSuccess = buildSuccess,
+        };
     }
 
     internal static string GetFallbackPrompt(string role, GoalPipeline pipeline) =>

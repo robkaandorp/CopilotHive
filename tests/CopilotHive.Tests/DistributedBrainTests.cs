@@ -229,6 +229,132 @@ public sealed class DistributedBrainTests
         Assert.Equal("merge complete", fake.Informations[0]);
     }
 
+    // ── FallbackParseTestMetrics / ApplyTestMetricsFallback Tests ────────
+
+    [Fact]
+    public void FallbackParseTestMetrics_DotnetTestSummary_ExtractsCorrectCounts()
+    {
+        var output = "Passed!  - Failed:     0, Passed:   268, Skipped:     0, Total:   268";
+
+        var metrics = DistributedBrain.FallbackParseTestMetrics(output);
+
+        Assert.NotNull(metrics);
+        Assert.Equal(268, metrics.TotalTests);
+        Assert.Equal(268, metrics.PassedTests);
+        Assert.Equal(0,   metrics.FailedTests ?? -1); // 0 was explicitly in the output
+    }
+
+    [Fact]
+    public void FallbackParseTestMetrics_EmptyString_ReturnsNull()
+    {
+        var metrics = DistributedBrain.FallbackParseTestMetrics("");
+        Assert.Null(metrics);
+    }
+
+    [Fact]
+    public void FallbackParseTestMetrics_NoPatterns_ReturnsNull()
+    {
+        var metrics = DistributedBrain.FallbackParseTestMetrics("No test output here.");
+        Assert.Null(metrics);
+    }
+
+    [Fact]
+    public void FallbackParseTestMetrics_KeyValueLines_ExtractsCorrectCounts()
+    {
+        var output = "total: 8\npassed: 8\nfailed: 0";
+
+        var metrics = DistributedBrain.FallbackParseTestMetrics(output);
+
+        Assert.NotNull(metrics);
+        Assert.Equal(8, metrics.TotalTests);
+        Assert.Equal(8, metrics.PassedTests);
+    }
+
+    /// <summary>Test A — Brain returns valid test_metrics → those values are used.</summary>
+    [Fact]
+    public void ApplyTestMetricsFallback_BrainReturnsValidMetrics_BrainValuesUsed()
+    {
+        var logger = NullLogger<DistributedBrain>.Instance;
+        var decision = new OrchestratorDecision
+        {
+            TestMetrics = new ExtractedTestMetrics { TotalTests = 10, PassedTests = 9, FailedTests = 1 },
+        };
+
+        var result = DistributedBrain.ApplyTestMetricsFallback(
+            decision, "tester", "Passed: 5, Failed: 0, Total: 5", logger);
+
+        Assert.Equal(10, result.TestMetrics!.TotalTests);
+        Assert.Equal(9,  result.TestMetrics.PassedTests);
+        Assert.Equal(1,  result.TestMetrics.FailedTests);
+    }
+
+    /// <summary>Test B — Brain returns null test_metrics for tester phase → fallback kicks in.</summary>
+    [Fact]
+    public void ApplyTestMetricsFallback_BrainReturnsNullMetrics_FallbackUsed()
+    {
+        var logger = NullLogger<DistributedBrain>.Instance;
+        var decision = new OrchestratorDecision { TestMetrics = null };
+        var rawOutput = "Passed: 8, Failed: 0, Total: 8";
+
+        var result = DistributedBrain.ApplyTestMetricsFallback(
+            decision, "tester", rawOutput, logger);
+
+        Assert.NotNull(result.TestMetrics);
+        Assert.Equal(8, result.TestMetrics.TotalTests);
+        Assert.Equal(8, result.TestMetrics.PassedTests);
+        Assert.Equal(0, result.TestMetrics.FailedTests ?? -1); // 0 was explicitly in the output
+    }
+
+    /// <summary>Test C — Brain values take priority unless Brain values are 0.</summary>
+    [Fact]
+    public void ApplyTestMetricsFallback_BrainNonZero_BrainWins()
+    {
+        var logger = NullLogger<DistributedBrain>.Instance;
+        var decision = new OrchestratorDecision
+        {
+            TestMetrics = new ExtractedTestMetrics { TotalTests = 5, PassedTests = 5 },
+        };
+        // Raw output has 10 — Brain's 5 should win
+        var rawOutput = "total: 10\npassed: 10";
+
+        var result = DistributedBrain.ApplyTestMetricsFallback(
+            decision, "tester", rawOutput, logger);
+
+        Assert.Equal(5, result.TestMetrics!.TotalTests);
+        Assert.Equal(5, result.TestMetrics.PassedTests);
+    }
+
+    /// <summary>Test C (variant) — Brain returns total_tests: 0 → fallback wins.</summary>
+    [Fact]
+    public void ApplyTestMetricsFallback_BrainReturnsZeroTotal_FallbackWins()
+    {
+        var logger = NullLogger<DistributedBrain>.Instance;
+        var decision = new OrchestratorDecision
+        {
+            TestMetrics = new ExtractedTestMetrics { TotalTests = 0, PassedTests = 0 },
+        };
+        var rawOutput = "total: 8\npassed: 8";
+
+        var result = DistributedBrain.ApplyTestMetricsFallback(
+            decision, "tester", rawOutput, logger);
+
+        Assert.Equal(8, result.TestMetrics!.TotalTests);
+        Assert.Equal(8, result.TestMetrics.PassedTests);
+    }
+
+    [Fact]
+    public void ApplyTestMetricsFallback_NonTesterRole_NoChange()
+    {
+        var logger = NullLogger<DistributedBrain>.Instance;
+        var decision = new OrchestratorDecision { TestMetrics = null };
+        var rawOutput = "total: 8\npassed: 8";
+
+        var result = DistributedBrain.ApplyTestMetricsFallback(
+            decision, "coder", rawOutput, logger);
+
+        Assert.Null(result.TestMetrics);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────
 
     private static GoalPipeline CreatePipeline(string goalId, string description) =>
