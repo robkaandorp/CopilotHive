@@ -34,10 +34,17 @@ public sealed class CopilotRunner : IAsyncDisposable
     public CopilotRunner(int port = WorkerConstants.DefaultAgentPort)
     {
         _port = port;
-        _client = new CopilotClient(new CopilotClientOptions
+        _client = new CopilotClient(new CopilotClientOptionsWithTelemetry
         {
             CliUrl = $"localhost:{port}",
             AutoStart = false,
+            Telemetry = new TelemetryConfig
+            {
+                FilePath = $"/app/state/otel-{_role ?? "worker"}.jsonl",
+                ExporterType = "file",
+                SourceName = $"copilothive-worker-{_role ?? "worker"}",
+                CaptureContent = true
+            }
         });
     }
 
