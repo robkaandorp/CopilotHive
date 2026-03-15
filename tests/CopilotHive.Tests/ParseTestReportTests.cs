@@ -372,4 +372,74 @@ public class FallbackParseTestMetricsTests
         Assert.True(metrics.BuildSuccess);
         Assert.Equal(42, metrics.TotalTests);
     }
+
+    [Fact]
+    public void FallbackParseBuildSuccess_EmojiSucceeded_ReturnsTrue()
+    {
+        var result = Parse("✅ Succeeded");
+        Assert.True(result.BuildSuccess);
+    }
+
+    [Fact]
+    public void FallbackParseBuildSuccess_BuildStatusEmojiSucceeded_ReturnsTrue()
+    {
+        var result = Parse("Build Status: ✅ Succeeded");
+        Assert.True(result.BuildSuccess);
+    }
+
+    [Fact]
+    public void FallbackParseBuildSuccess_BuildResultPass_ReturnsTrue()
+    {
+        var result = Parse("Build Result: PASS");
+        Assert.True(result.BuildSuccess);
+    }
+
+    [Fact]
+    public void FallbackParseBuildSuccess_BuildColonPass_ReturnsTrue()
+    {
+        var result = Parse("Build: PASS");
+        Assert.True(result.BuildSuccess);
+    }
+
+    [Fact]
+    public void FallbackParseBuildSuccess_EmojiBoldSucceeded_ReturnsTrue()
+    {
+        var result = Parse("✅ **Succeeded**");
+        Assert.True(result.BuildSuccess);
+    }
+
+    [Fact]
+    public void FallbackParseBuildSuccess_ZeroErrorParens_ReturnsTrue()
+    {
+        var result = Parse("0 Error(s)");
+        Assert.True(result.BuildSuccess);
+    }
+
+    [Fact]
+    public void FallbackParseBuildSuccess_ZeroErrorsPlain_ReturnsTrue()
+    {
+        var result = Parse("0 errors");
+        Assert.True(result.BuildSuccess);
+    }
+
+    [Fact]
+    public void FallbackParseBuildSuccess_LowercaseBuildPass_ReturnsTrue()
+    {
+        var result = Parse("build: pass");
+        Assert.True(result.BuildSuccess);
+    }
+
+    [Fact]
+    public void FallbackParseBuildSuccess_BuildFailed_ReturnsFalse()
+    {
+        var result = Parse("Build FAILED");
+        Assert.False(result.BuildSuccess);
+    }
+
+    [Fact]
+    public void FallbackParseBuildSuccess_OneErrorParens_ReturnsFalse()
+    {
+        var result = Parse("1 Error(s)");
+        Assert.False(result.BuildSuccess);
+    }
 }

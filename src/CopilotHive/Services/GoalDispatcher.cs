@@ -966,7 +966,10 @@ public sealed class GoalDispatcher : BackgroundService
     private static void FallbackParseBuildSuccess(string output, IterationMetrics metrics)
     {
         if (output.Contains("Build succeeded", StringComparison.OrdinalIgnoreCase)
-            || System.Text.RegularExpressions.Regex.IsMatch(output, @"\|\s*Errors\s*\|\s*0\s*\|"))
+            || System.Text.RegularExpressions.Regex.IsMatch(output, @"\|\s*Errors\s*\|\s*0\s*\|")
+            || System.Text.RegularExpressions.Regex.IsMatch(output, @"✅\s*\*{0,2}Succeeded\*{0,2}", System.Text.RegularExpressions.RegexOptions.IgnoreCase)
+            || System.Text.RegularExpressions.Regex.IsMatch(output, @"Build(?:\s+(?:Status|Result))?\s*:\s*(?:✅\s*)?PASS", System.Text.RegularExpressions.RegexOptions.IgnoreCase)
+            || System.Text.RegularExpressions.Regex.IsMatch(output, @"\b0\s+error(?:s|\(s\))", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
             metrics.BuildSuccess = true;
     }
 
