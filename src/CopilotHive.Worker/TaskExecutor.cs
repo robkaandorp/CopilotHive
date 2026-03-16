@@ -278,9 +278,14 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
         status.LastCommitMessage = "Improve agents.md files (automated by CopilotHive Improver)";
         _log.Info($"Committed: {commitOut.Trim()}");
 
-        // Push
+        // Pull (rebase on top of any orchestrator commits) then push
         try
         {
+            var (pullExit, _, pullErr) = await GitOperations.RunGitCommandAsync(
+                ConfigRepoDir, "pull --rebase", ct);
+            if (pullExit != 0)
+                _log.Error($"git pull --rebase failed: {pullErr.Trim()}");
+
             var (pushExit, _, pushErr) = await GitOperations.RunGitCommandAsync(
                 ConfigRepoDir, "push origin HEAD", ct);
             if (pushExit != 0)

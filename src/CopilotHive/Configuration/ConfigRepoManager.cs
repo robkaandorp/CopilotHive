@@ -150,6 +150,7 @@ public sealed class ConfigRepoManager
     {
         await RunGitAsync(_localPath, ["add", filePath], ct);
         await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
+        await RunGitAsync(_localPath, ["pull", "--rebase"], ct);
         await RunGitAsync(_localPath, ["push", "origin", "HEAD"], ct);
     }
 
