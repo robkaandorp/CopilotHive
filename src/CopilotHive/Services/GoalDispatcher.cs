@@ -699,6 +699,8 @@ public sealed class GoalDispatcher : BackgroundService
             if (premiumModel is not null)
                 model = premiumModel;
         }
+        _logger.LogDebug("Model for {Role}: {Model} (tier={Tier}, configLoaded={ConfigLoaded})",
+            roleName, model ?? "(null)", pipeline.LatestModelTier, _config is not null);
 
         var task = _taskBuilder.Build(
             goalId: pipeline.GoalId,

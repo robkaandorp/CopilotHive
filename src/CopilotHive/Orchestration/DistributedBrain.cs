@@ -479,10 +479,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
               "action": "spawn_{{workerRole}}",
               "prompt": "<the complete prompt to send to the worker>",
               "reason": "<why you crafted the prompt this way>",
-              "model_tier": "standard or premium"
+              "model_tier": "standard or premium — default is standard; only use premium after a FAILED attempt"
             }
 
-            You may specify a model tier in your response. Add a 'model_tier' field with value 'standard' or 'premium'. Use 'premium' for complex tasks, retry situations, or when previous attempts failed. Default is 'standard'.
+            You may specify a model tier in your response. Add a 'model_tier' field with value 'standard' or 'premium'. Default is 'standard'. Only use 'premium' when: (1) a previous attempt FAILED and needs a stronger model, or (2) the task requires fixing complex bugs found in review. Do NOT use premium for first attempts or routine tasks — standard models are capable enough.
             """;
 
         var decision = await AskAsync(pipeline, prompt, ct);
