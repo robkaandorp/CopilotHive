@@ -19,8 +19,9 @@ public sealed class WorkerService(
 {
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(30);
 
-    private readonly CopilotRunner _copilotRunner = new(role, copilotPort);
+    private readonly CopilotRunner _copilotRunner = new(copilotPort);
     private readonly WorkerLogger _log = new("Worker");
+    private readonly string _fixedRole = role;
 
     // Pending tool calls awaiting orchestrator responses, keyed by request_id
     private readonly ConcurrentDictionary<string, TaskCompletionSource<ToolCallResponse>> _pendingToolCalls = new();
@@ -36,7 +37,7 @@ public sealed class WorkerService(
     /// <param name="ct">Cancellation token that stops the worker.</param>
     public async Task RunAsync(CancellationToken ct)
     {
-        var workerRole = ParseRole(role);
+        var workerRole = ParseRole(_fixedRole);
 
         // Connect to the local Copilot CLI via SDK before registering with orchestrator
         _log.Info("Connecting to local Copilot CLI...");
@@ -283,7 +284,7 @@ public sealed class WorkerService(
         "reviewer" => WorkerRole.Reviewer,
         "tester" => WorkerRole.Tester,
         "improver" => WorkerRole.Improver,
-        _ => throw new ArgumentException($"Unknown worker role: {role}. Must be coder/reviewer/tester/improver."),
+        _ => WorkerRole.Unspecified,
     };
 
     private static async IAsyncEnumerable<T> ReadMessages<T>(

@@ -721,14 +721,52 @@ public sealed class GoalDispatcher : BackgroundService
         if (idleWorker is not null)
         {
             var queuedTask = _taskQueue.TryDequeue(role);
+            if (queuedTask is null && idleWorker.IsGeneric)
+                queuedTask = _taskQueue.TryDequeue(WorkerRole.Unspecified);
+
             if (queuedTask is not null)
             {
+                // For generic workers, set their role and send agents.md
+                if (idleWorker.IsGeneric)
+                {
+                    idleWorker.Role = queuedTask.Role;
+                    var taskRoleName = queuedTask.Role.ToString().ToLowerInvariant();
+                    _logger.LogInformation("Generic worker {WorkerId} assigned role {Role} for task {TaskId}",
+                        idleWorker.Id, taskRoleName, queuedTask.TaskId);
+                    await SendAgentsMdToWorkerAsync(idleWorker, taskRoleName, ct);
+                }
+
                 _taskQueue.Activate(queuedTask, idleWorker.Id);
                 _workerPool.MarkBusy(idleWorker.Id, queuedTask.TaskId);
                 await idleWorker.MessageChannel.Writer.WriteAsync(
                     new OrchestratorMessage { Assignment = queuedTask }, ct);
                 _logger.LogInformation("Task {TaskId} pushed to worker {WorkerId}", queuedTask.TaskId, idleWorker.Id);
             }
+        }
+    }
+
+    private async Task SendAgentsMdToWorkerAsync(ConnectedWorker worker, string roleName, CancellationToken ct)
+    {
+        if (_agentsManager is null) return;
+        var content = _agentsManager.GetAgentsMd(roleName);
+        if (string.IsNullOrEmpty(content)) return;
+
+        try
+        {
+            await worker.MessageChannel.Writer.WriteAsync(
+                new OrchestratorMessage
+                {
+                    UpdateAgents = new UpdateAgents
+                    {
+                        AgentsMdContent = content,
+                        Role = roleName,
+                    }
+                }, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send AGENTS.md to worker {WorkerId} for role {Role}",
+                worker.Id, roleName);
         }
     }
 

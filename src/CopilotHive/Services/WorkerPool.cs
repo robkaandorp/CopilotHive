@@ -39,6 +39,7 @@ public sealed class WorkerPool
             Id = id,
             Role = role,
             Capabilities = capabilities,
+            IsGeneric = role == WorkerRole.Unspecified,
         };
 
         if (!_workers.TryAdd(id, worker))
@@ -62,20 +63,27 @@ public sealed class WorkerPool
     }
 
     /// <summary>
-    /// Returns the first idle worker with the specified role, or <c>null</c> when none is available.
+    /// Returns the first idle worker matching the specified role. Falls back to any idle
+    /// generic (unspecified) worker when no exact role match is available.
     /// </summary>
-    /// <param name="role">The required worker role.</param>
+    /// <param name="role">The preferred worker role.</param>
     /// <returns>An idle <see cref="ConnectedWorker"/>, or <c>null</c>.</returns>
     public ConnectedWorker? GetIdleWorker(WorkerRole role)
     {
+        ConnectedWorker? genericFallback = null;
         foreach (var kvp in _workers)
         {
             var w = kvp.Value;
-            if (w.Role == role && !w.IsBusy)
+            if (w.IsBusy) continue;
+
+            if (w.Role == role)
                 return w;
+
+            if (w.Role == WorkerRole.Unspecified && genericFallback is null)
+                genericFallback = w;
         }
 
-        return null;
+        return genericFallback;
     }
 
     /// <summary>Returns a read-only snapshot of all currently registered workers.</summary>
@@ -124,6 +132,8 @@ public sealed class WorkerPool
         {
             worker.IsBusy = false;
             worker.CurrentTaskId = null;
+            if (worker.IsGeneric)
+                worker.Role = WorkerRole.Unspecified;
         }
     }
 

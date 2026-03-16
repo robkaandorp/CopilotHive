@@ -14,7 +14,7 @@ public sealed class CopilotRunner : IAsyncDisposable
     private CopilotClient? _client;
     private CopilotSession? _session;
     private readonly int _port;
-    private readonly string _role;
+    private string _currentRole = "worker";
     private CustomAgentConfig? _customAgent;
     private readonly WorkerLogger _log = new("Copilot");
 
@@ -30,11 +30,9 @@ public sealed class CopilotRunner : IAsyncDisposable
     /// <summary>
     /// Initialises a new <see cref="CopilotRunner"/> connecting on the given <paramref name="port"/>.
     /// </summary>
-    /// <param name="role">The worker role (e.g. "coder"), known at process startup from WORKER_ROLE.</param>
     /// <param name="port">The TCP port the Copilot CLI headless server is listening on.</param>
-    public CopilotRunner(string role, int port = WorkerConstants.DefaultAgentPort)
+    public CopilotRunner(int port = WorkerConstants.DefaultAgentPort)
     {
-        _role = role;
         _port = port;
     }
 
@@ -49,11 +47,12 @@ public sealed class CopilotRunner : IAsyncDisposable
     public void SetCurrentTaskId(string? taskId) => _currentTaskId = taskId;
 
     /// <summary>
-    /// Sets the custom agent configuration for this worker's role.
-    /// Applied on the next session creation (ConnectAsync or ResetSessionAsync).
+    /// Sets the custom agent configuration for the specified role.
+    /// Updates the current role label used for telemetry and permissions.
     /// </summary>
     public void SetCustomAgent(string role, string agentsMdContent)
     {
+        _currentRole = role;
         _customAgent = new CustomAgentConfig
         {
             Name = role,
@@ -75,9 +74,9 @@ public sealed class CopilotRunner : IAsyncDisposable
             AutoStart = false,
             Telemetry = new TelemetryConfig
             {
-                FilePath = $"/app/state/otel-{_role}.jsonl",
+                FilePath = $"/app/state/otel-{_currentRole}.jsonl",
                 ExporterType = "file",
-                SourceName = $"copilothive-worker-{_role}",
+                SourceName = $"copilothive-worker-{_currentRole}",
                 CaptureContent = true
             }
         });
@@ -85,7 +84,7 @@ public sealed class CopilotRunner : IAsyncDisposable
         var config = new SessionConfig
         {
             Streaming = true,
-            OnPermissionRequest = GetPermissionHandlerForRole(_role),
+            OnPermissionRequest = GetPermissionHandlerForRole(_currentRole),
             CustomAgents = _customAgent is not null ? [_customAgent] : [],
         };
 
@@ -281,7 +280,7 @@ public sealed class CopilotRunner : IAsyncDisposable
                     response = msg.Data.Content;
                     break;
                 case AssistantUsageEvent usage:
-                    FileTracer.WriteUsage(usage.Data, $"/app/state/traces-{_role}.jsonl", _role);
+                    FileTracer.WriteUsage(usage.Data, $"/app/state/traces-{_currentRole}.jsonl", _currentRole);
                     break;
                 case SessionIdleEvent:
                     done.TrySetResult(response);

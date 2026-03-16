@@ -10,12 +10,7 @@ if (string.IsNullOrWhiteSpace(orchestratorUrl))
     return 1;
 }
 
-var roleStr = Environment.GetEnvironmentVariable("WORKER_ROLE");
-if (string.IsNullOrWhiteSpace(roleStr))
-{
-    Console.Error.WriteLine("WORKER_ROLE environment variable is required (coder/reviewer/tester/improver).");
-    return 1;
-}
+var roleStr = Environment.GetEnvironmentVariable("WORKER_ROLE") ?? "";
 
 var workerId = Environment.GetEnvironmentVariable("WORKER_ID")
     ?? Guid.NewGuid().ToString("N")[..12];
@@ -35,7 +30,8 @@ Console.CancelKeyPress += (_, e) =>
 
 AppDomain.CurrentDomain.ProcessExit += (_, _) => cts.Cancel();
 
-Console.WriteLine($"[Worker] Starting worker {workerId} (role={roleStr})");
+var modeLabel = string.IsNullOrEmpty(roleStr) ? "generic" : roleStr;
+Console.WriteLine($"[Worker] Starting worker {workerId} (mode={modeLabel})");
 Console.WriteLine($"[Worker] Orchestrator: {orchestratorUrl}");
 
 var service = new WorkerService(

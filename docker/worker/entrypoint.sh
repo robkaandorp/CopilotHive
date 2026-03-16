@@ -42,19 +42,19 @@ if [[ -n "${COPILOT_MODEL}" ]]; then
 fi
 echo "============================================"
 
-# --- Config repo clone for improver role ---
+# --- Config repo clone (needed for improver tasks on any generic worker) ---
 CONFIG_REPO_DIR="/config-repo"
 CONFIG_AGENTS_DIR="${CONFIG_REPO_DIR}/agents"
 
-if [[ "${WORKER_ROLE:-}" == "improver" && -n "${CONFIG_REPO_URL:-}" ]]; then
-    echo "[entrypoint] Improver role: cloning config repo..."
+if [[ -n "${CONFIG_REPO_URL:-}" ]]; then
+    echo "[entrypoint] Cloning config repo..."
     CONFIG_CLONE_URL="${CONFIG_REPO_URL}"
     if [[ -n "${GH_TOKEN:-}" && "${CONFIG_CLONE_URL}" == https://github.com/* ]]; then
         CONFIG_CLONE_URL="${CONFIG_CLONE_URL/https:\/\/github.com\//https://x-access-token:${GH_TOKEN}@github.com/}"
     fi
     git clone "${CONFIG_CLONE_URL}" "${CONFIG_REPO_DIR}"
-    git -C "${CONFIG_REPO_DIR}" config user.email "copilothive-improver@local"
-    git -C "${CONFIG_REPO_DIR}" config user.name "CopilotHive Improver"
+    git -C "${CONFIG_REPO_DIR}" config user.email "copilothive-worker@local"
+    git -C "${CONFIG_REPO_DIR}" config user.name "CopilotHive Worker"
     echo "[entrypoint] Config repo cloned to ${CONFIG_REPO_DIR}"
 fi
 
@@ -65,10 +65,10 @@ COPILOT_ARGS=(
     --port "$COPILOT_PORT"
 )
 
-# Improver: also add the config repo agents subfolder so Copilot can edit *.agents.md
-if [[ "${WORKER_ROLE:-}" == "improver" && -d "${CONFIG_AGENTS_DIR}" ]]; then
+# Add config repo agents subfolder so Copilot can edit *.agents.md when acting as improver
+if [[ -d "${CONFIG_AGENTS_DIR}" ]]; then
     COPILOT_ARGS+=(--add-dir "${CONFIG_AGENTS_DIR}")
-    echo "[entrypoint] Added --add-dir ${CONFIG_AGENTS_DIR} for improver"
+    echo "[entrypoint] Added --add-dir ${CONFIG_AGENTS_DIR}"
 fi
 
 if [[ "${COPILOT_RESUME}" == "true" ]]; then
@@ -103,7 +103,7 @@ fi
 ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-}"
 WORKER_ROLE="${WORKER_ROLE:-}"
 
-if [[ -n "${ORCHESTRATOR_URL}" && -n "${WORKER_ROLE}" ]]; then
+if [[ -n "${ORCHESTRATOR_URL}" ]]; then
     echo "[entrypoint] Waiting for Copilot to be ready on port ${COPILOT_PORT}..."
     for i in $(seq 1 30); do
         if bash -c "echo > /dev/tcp/localhost/${COPILOT_PORT}" 2>/dev/null; then
@@ -117,7 +117,8 @@ if [[ -n "${ORCHESTRATOR_URL}" && -n "${WORKER_ROLE}" ]]; then
         sleep 1
     done
 
-    echo "[entrypoint] Starting CopilotHive Worker (role=${WORKER_ROLE}, orchestrator=${ORCHESTRATOR_URL})"
+    WORKER_MODE="${WORKER_ROLE:-generic}"
+    echo "[entrypoint] Starting CopilotHive Worker (mode=${WORKER_MODE}, orchestrator=${ORCHESTRATOR_URL})"
     /opt/worker/CopilotHive.Worker &
     WORKER_PID=$!
     echo "[entrypoint] Worker started with PID ${WORKER_PID}"

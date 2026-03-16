@@ -33,13 +33,7 @@ public sealed class HiveOrchestratorService(
 
         if (request.Role == WorkerRole.Unspecified)
         {
-            logger.LogWarning("Registration rejected — role unspecified (worker: {WorkerId})", workerId);
-            return Task.FromResult(new RegisterResponse
-            {
-                Accepted = false,
-                OrchestratorVersion = OrchestratorVersion,
-                AssignedWorkerId = workerId,
-            });
+            logger.LogInformation("Registering generic worker: {WorkerId} (no fixed role)", workerId);
         }
 
         try
@@ -184,48 +178,63 @@ public sealed class HiveOrchestratorService(
         CancellationToken cancellationToken)
     {
         workerPool.MarkIdle(worker.Id);
-        logger.LogInformation("Worker {WorkerId} is ready (role={Role})", worker.Id, worker.Role);
+        var isGeneric = worker.Role == WorkerRole.Unspecified;
+        logger.LogInformation("Worker {WorkerId} is ready (role={Role}, generic={IsGeneric})",
+            worker.Id, worker.Role, isGeneric);
 
-        // Send current agents.md for this worker's role (if available)
-        if (agentsManager is not null)
+        // For fixed-role workers, send their role's agents.md on ready
+        if (!isGeneric && agentsManager is not null)
         {
-            var roleName = worker.Role.ToString().ToLowerInvariant();
-            var agentsContent = agentsManager.GetAgentsMd(roleName);
-            if (!string.IsNullOrEmpty(agentsContent))
-            {
-                try
-                {
-                    await worker.MessageChannel.Writer.WriteAsync(
-                        new OrchestratorMessage
-                        {
-                            UpdateAgents = new UpdateAgents
-                            {
-                                AgentsMdContent = agentsContent,
-                                Role = roleName,
-                            }
-                        },
-                        cancellationToken);
-                    logger.LogInformation("Sent initial AGENTS.md to worker {WorkerId} (role={Role})", worker.Id, roleName);
-                }
-                catch (Exception ex)
-                {
-                    logger.LogWarning(ex, "Failed to send initial AGENTS.md to worker {WorkerId}", worker.Id);
-                }
-            }
+            await SendAgentsMdAsync(worker, worker.Role.ToString().ToLowerInvariant(), cancellationToken);
         }
 
-        // Check the task queue for matching work
+        // Dequeue a matching task — generic workers accept any role
         var task = taskQueue.TryDequeue(worker.Role);
         if (task is not null)
         {
+            // For generic workers, set the role from the task and send agents.md
+            if (isGeneric)
+            {
+                var taskRoleName = task.Role.ToString().ToLowerInvariant();
+                worker.Role = task.Role;
+                logger.LogInformation("Generic worker {WorkerId} assigned role {Role} for task {TaskId}",
+                    worker.Id, taskRoleName, task.TaskId);
+
+                if (agentsManager is not null)
+                    await SendAgentsMdAsync(worker, taskRoleName, cancellationToken);
+            }
+
             taskQueue.Activate(task, worker.Id);
             workerPool.MarkBusy(worker.Id, task.TaskId);
             logger.LogInformation("Assigning task {TaskId} to worker {WorkerId}", task.TaskId, worker.Id);
 
-            // Push through MessageChannel so writes are serialized via the channel reader task
             await worker.MessageChannel.Writer.WriteAsync(
                 new OrchestratorMessage { Assignment = task },
                 cancellationToken);
+        }
+    }
+
+    private async Task SendAgentsMdAsync(ConnectedWorker worker, string roleName, CancellationToken ct)
+    {
+        var agentsContent = agentsManager?.GetAgentsMd(roleName);
+        if (string.IsNullOrEmpty(agentsContent)) return;
+
+        try
+        {
+            await worker.MessageChannel.Writer.WriteAsync(
+                new OrchestratorMessage
+                {
+                    UpdateAgents = new UpdateAgents
+                    {
+                        AgentsMdContent = agentsContent,
+                        Role = roleName,
+                    }
+                }, ct);
+            logger.LogInformation("Sent AGENTS.md to worker {WorkerId} (role={Role})", worker.Id, roleName);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to send AGENTS.md to worker {WorkerId}", worker.Id);
         }
     }
 

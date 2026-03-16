@@ -34,6 +34,9 @@ public sealed class TaskQueue
     /// </summary>
     public TaskAssignment? TryDequeue(WorkerRole role)
     {
+        if (role == WorkerRole.Unspecified)
+            return TryDequeueAny();
+
         // Drain and re-enqueue non-matching items (bounded by queue size).
         var skipped = new List<TaskAssignment>();
 
@@ -56,6 +59,14 @@ public sealed class TaskQueue
             _pending.Enqueue(s);
 
         return null;
+    }
+
+    /// <summary>
+    /// Dequeue the next pending task regardless of role. Used by generic workers.
+    /// </summary>
+    public TaskAssignment? TryDequeueAny()
+    {
+        return _pending.TryDequeue(out var task) ? task : null;
     }
 
     /// <summary>
