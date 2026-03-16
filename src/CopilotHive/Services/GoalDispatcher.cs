@@ -641,9 +641,9 @@ public sealed class GoalDispatcher : BackgroundService
         {
             var preservedTier = pipeline.LatestModelTier;
             prompt = await _brain.CraftPromptAsync(pipeline, role.ToString().ToLowerInvariant(), null, ct);
-            // Restore the preserved tier so a prior "premium" decision is never overwritten by CraftPromptAsync.
-            if (preservedTier == "premium")
-                pipeline.LatestModelTier = preservedTier;
+            // Always restore the preserved tier — CraftPromptAsync is only used for prompt text,
+            // and must never influence model_tier.
+            pipeline.LatestModelTier = preservedTier;
         }
 
         prompt ??= $"Work on: {pipeline.Description}";

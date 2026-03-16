@@ -231,7 +231,8 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
             {
               "action": "spawn_{{workerRole}}",
               "prompt": "<the complete prompt to send to the worker>",
-              "reason": "<why you crafted the prompt this way>"
+              "reason": "<why you crafted the prompt this way>",
+              "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
             }
             """;
 
