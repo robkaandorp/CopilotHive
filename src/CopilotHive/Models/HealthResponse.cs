@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace CopilotHive.Models;
 
 /// <summary>
@@ -31,4 +33,11 @@ public sealed class HealthResponse
 
     /// <summary>Monotonically increasing counter of how many times <c>/health</c> has been called.</summary>
     public int CheckNumber { get; init; }
+
+    /// <summary>
+    /// Live worker pool statistics including per-worker details.
+    /// Nested under <c>worker_pool</c> to keep the top-level response clean.
+    /// </summary>
+    [JsonPropertyName("worker_pool")]
+    public WorkerPoolStatsDto? WorkerPool { get; init; }
 }

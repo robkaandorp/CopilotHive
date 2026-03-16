@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using CopilotHive.Models;
 using CopilotHive.Shared.Grpc;
 
 namespace CopilotHive.Services;
@@ -166,6 +167,31 @@ public sealed class WorkerPool
             BusyWorkers = workers.Count(w => w.IsBusy),
             IdleWorkers = workers.Count(w => !w.IsBusy),
             WorkersByRole = workersByRole,
+        };
+    }
+
+    /// <summary>
+    /// Returns detailed worker pool statistics including per-worker information,
+    /// suitable for the <c>/health</c> endpoint response.
+    /// </summary>
+    /// <returns>A <see cref="WorkerPoolStatsDto"/> snapshot with worker details.</returns>
+    public WorkerPoolStatsDto GetDetailedStats()
+    {
+        var workers = _workers.Values.ToList();
+        return new WorkerPoolStatsDto
+        {
+            TotalWorkers = workers.Count,
+            IdleWorkers = workers.Count(w => !w.IsBusy),
+            BusyWorkers = workers.Count(w => w.IsBusy),
+            GenericWorkers = workers.Count(w => w.IsGeneric),
+            Workers = workers.Select(w => new WorkerInfoDto
+            {
+                Id = w.Id,
+                Role = w.Role == WorkerRole.Unspecified ? null : w.Role.ToString(),
+                IsBusy = w.IsBusy,
+                IsGeneric = w.IsGeneric,
+                CurrentTaskId = w.CurrentTaskId,
+            }).ToList(),
         };
     }
 

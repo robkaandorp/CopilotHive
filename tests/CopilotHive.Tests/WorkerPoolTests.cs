@@ -1,3 +1,4 @@
+using CopilotHive.Models;
 using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
 
@@ -258,6 +259,59 @@ public sealed class WorkerPoolTests
 
         Assert.Single(stats.WorkersByRole);
         Assert.Equal(2, stats.WorkersByRole[WorkerRole.Tester.ToString()]);
+    }
+
+    #endregion
+
+    // ── GetDetailedStats ──────────────────────────────────────────────────────
+
+    #region GetDetailedStats — empty pool
+
+    [Fact]
+    public void GetDetailedStats_EmptyPool_ReturnsZeroCounts()
+    {
+        var pool = CreatePool();
+
+        var stats = pool.GetDetailedStats();
+
+        Assert.Equal(0, stats.TotalWorkers);
+        Assert.Equal(0, stats.BusyWorkers);
+        Assert.Equal(0, stats.IdleWorkers);
+        Assert.Equal(0, stats.GenericWorkers);
+        Assert.Empty(stats.Workers);
+    }
+
+    #endregion
+
+    #region GetDetailedStats — mixed workers
+
+    [Fact]
+    public void GetDetailedStats_MixedWorkers_CorrectCountsAndEntries()
+    {
+        var pool = CreatePool();
+        pool.RegisterWorker("c1", WorkerRole.Coder, []);
+        pool.RegisterWorker("g1", WorkerRole.Unspecified, []);
+        pool.MarkBusy("c1", "task-1");
+
+        var stats = pool.GetDetailedStats();
+
+        Assert.Equal(2, stats.TotalWorkers);
+        Assert.Equal(1, stats.BusyWorkers);
+        Assert.Equal(1, stats.IdleWorkers);
+        Assert.Equal(1, stats.GenericWorkers);
+        Assert.Equal(2, stats.Workers.Count);
+
+        var coder = stats.Workers.First(w => w.Id == "c1");
+        Assert.Equal("Coder", coder.Role);
+        Assert.True(coder.IsBusy);
+        Assert.False(coder.IsGeneric);
+        Assert.Equal("task-1", coder.CurrentTaskId);
+
+        var generic = stats.Workers.First(w => w.Id == "g1");
+        Assert.Null(generic.Role);
+        Assert.False(generic.IsBusy);
+        Assert.True(generic.IsGeneric);
+        Assert.Null(generic.CurrentTaskId);
     }
 
     #endregion
