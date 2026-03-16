@@ -61,6 +61,10 @@ public sealed record OrchestratorDecision
     /// <summary>List of issues identified by the brain.</summary>
     [JsonPropertyName("issues")]
     public List<string>? Issues { get; init; }
+
+    /// <summary>Model tier requested by the Brain ('standard' or 'premium'). Defaults to 'standard'.</summary>
+    [JsonPropertyName("model_tier")]
+    public string? ModelTier { get; init; }
 }
 
 /// <summary>

@@ -640,7 +640,7 @@ public sealed class GoalDispatcher : BackgroundService
         var branchAction = pipeline.CoderBranch is null ? BranchAction.Create : BranchAction.Checkout;
         var repositories = ResolveRepositories(pipeline.Goal);
 
-        // Resolve per-role model from config
+        // Resolve per-role model from config; upgrade to premium when the Brain requested it
         var roleName = role switch
         {
             WorkerRole.Coder => "coder",
@@ -650,6 +650,12 @@ public sealed class GoalDispatcher : BackgroundService
             _ => "coder",
         };
         var model = _config?.GetModelForRole(roleName);
+        if (pipeline.LatestModelTier == "premium" && _config is not null)
+        {
+            var premiumModel = _config.GetPremiumModelForRole(roleName);
+            if (premiumModel is not null)
+                model = premiumModel;
+        }
 
         var task = _taskBuilder.Build(
             goalId: pipeline.GoalId,

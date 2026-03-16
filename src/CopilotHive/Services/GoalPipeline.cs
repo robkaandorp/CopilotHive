@@ -133,6 +133,9 @@ public sealed class GoalPipeline
     /// <summary>UTC timestamp when this pipeline completed (Done or Failed), or <c>null</c> if still active.</summary>
     public DateTime? CompletedAt { get; private set; }
 
+    /// <summary>Model tier requested by the Brain for the most recently dispatched task ('standard' or 'premium').</summary>
+    public string LatestModelTier { get; set; } = "standard";
+
     /// <summary>
     /// Creates a new pipeline for the specified goal.
     /// </summary>
