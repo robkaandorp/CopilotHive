@@ -26,8 +26,8 @@ As CopilotHive scales, the orchestration layer will evolve to support generic wo
 
 ## Roadmap
 
-### Generic Worker Pool
-Replace fixed-role containers with N generic workers that switch roles per task via `SelectAsync`. Each task already does a fresh clone, so isolation is free. This removes the one-container-per-role constraint and enables dynamic scaling based on pipeline load.
+### Generic Worker Pool ✅
+Workers register without a fixed role and dynamically accept any role (coder, tester, reviewer, improver) per task. The orchestrator sends role-specific agents.md before each assignment. Docker Compose uses a single `worker` service with configurable replicas. This removes the one-container-per-role constraint and enables scaling based on pipeline load.
 
 ### Pluggable Model Providers
 Per-role model selection is already implemented via `goals.yaml`. The next step is a provider abstraction layer so non-Copilot backends (OpenAI, Anthropic, Azure OpenAI, local models via Ollama) can be swapped in without code changes.

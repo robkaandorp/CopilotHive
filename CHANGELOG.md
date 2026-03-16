@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7] — Generic Worker Pool & Pipeline Reorder
+
+### Added
+- Generic worker pool — workers register without a fixed role and accept any role per task
+- Workers dynamically receive role-specific agents.md before each task assignment
+- `WORKER_REPLICAS` env var to configure number of generic workers (default: 4)
+- `IsGeneric` flag on ConnectedWorker for pool identity tracking
+- `TryDequeueAny()` on TaskQueue for role-agnostic task dispatch
+- Premium model tier for coder and tester (claude-opus-4.6)
+- Code coverage collection via Coverlet — CoveragePercent now populated with real values
+- Coverage parsing in FallbackParseTestMetrics (Coverlet text table + key-value formats)
+- model_tier propagation to all Brain methods (InterpretOutputAsync, PlanGoalAsync, DecideNextStepAsync)
+- First-non-null-wins logic for model_tier via ApplyModelTierIfNotSet helper
+- Streaming model output deltas to worker console (AssistantMessageDeltaEvent)
+
+### Changed
+- Pipeline phase order: Coding → Testing → Review (was Coding → Review → Testing)
+  - Reviewer now gets test results and can review tester-written tests
+- docker-compose: single `worker` service with replicas replaces 4 fixed-role services
+- entrypoint.sh: all workers clone config repo at startup (any may act as improver)
+- WORKER_ROLE env var is now optional (empty = generic pool worker)
+- GoalDispatcher uses ApplyModelTierIfNotSet instead of unconditional tier overwrite
+
+### Removed
+- Legacy CLI-mode orchestrator code (2,922 lines)
+- Unused metrics/ folder
+
 ## [0.6] — Server Architecture & DistributedBrain
 
 ### Added

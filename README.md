@@ -2,11 +2,11 @@
 
 # CopilotHive
 
-CopilotHive is a **self-improving multi-agent orchestration system** powered by the **GitHub Copilot SDK**. Specialized worker agents — coder, tester, reviewer, and improver — collaborate autonomously inside Docker containers to implement software goals without human intervention.
+CopilotHive is a **self-improving multi-agent orchestration system** powered by the **GitHub Copilot SDK**. A pool of generic worker agents collaborate autonomously inside Docker containers — dynamically taking on roles (coder, tester, reviewer, improver) per task — to implement software goals without human intervention.
 
 ## Architecture
 
-The Orchestrator Brain (an LLM-powered decision engine) receives goals and dispatches work to specialized agents. Each agent runs in an isolated Docker container and reports results back to the Brain.
+The Orchestrator Brain (an LLM-powered decision engine) receives goals and dispatches work to a pool of generic workers. Each worker runs in an isolated Docker container and accepts any role (coder, tester, reviewer, improver) per task.
 
 ```
                     ┌─────────────────┐
@@ -17,23 +17,24 @@ The Orchestrator Brain (an LLM-powered decision engine) receives goals and dispa
                              │ gRPC
           ┌──────────┬───────┼───────┬──────────┐
           │          │       │       │          │
-   ┌──────▼──────┐ ┌─▼────────▼─┐ ┌──▼───────┐ ┌▼──────────┐
-   │    Coder   │ │  Reviewer  │ │  Tester  │ │ Improver  │
+   ┌──────▼──────┐ ┌─▼──────────┐ ┌──▼───────┐ ┌▼──────────┐
+   │  Worker 1  │ │  Worker 2  │ │ Worker 3 │ │ Worker 4  │
    │  (Docker)  │ │  (Docker)  │ │ (Docker) │ │ (Docker)  │
    └────────────┘ └────────────┘ └──────────┘ └───────────┘
+        any role       any role      any role      any role
 ```
 
 ## How It Works
 
 Goals flow through a structured pipeline:
 
-**Coding → Review → Testing → Merge → Improve**
+**Coding → Testing → Review → Merge → Improve**
 
-1. **Coding**: The coder agent implements the goal on a feature branch.
-2. **Review**: The reviewer agent inspects the diff and produces a structured report.
-3. **Testing**: The tester agent builds the project and runs all tests.
+1. **Coding**: A worker (assigned the coder role) implements the goal on a feature branch.
+2. **Testing**: A worker (assigned the tester role) builds the project and runs all tests.
+3. **Review**: A worker (assigned the reviewer role) inspects the diff and test results.
 4. **Merge**: The Brain decides when quality is sufficient and merges the branch.
-5. **Improve**: The improver agent updates `agents.md` based on accumulated metrics.
+5. **Improve**: A worker (assigned the improver role) updates `agents.md` based on metrics.
 
 If testing or review fails, the pipeline retries the coding step (up to a configured limit).
 

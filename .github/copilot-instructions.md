@@ -3,9 +3,10 @@
 ## Project Overview
 
 CopilotHive is a self-improving multi-agent orchestration system. A C# orchestrator
-(the "Product Owner") spawns Docker containers running GitHub Copilot in headless mode,
-each with a specialized role (coder, tester, reviewer). Workers communicate via the
-Copilot .NET SDK over JSON-RPC and operate on isolated git clones.
+(the "Product Owner") manages a pool of generic Docker containers running GitHub Copilot
+in headless mode. Workers dynamically accept any role (coder, tester, reviewer, improver)
+per task. They communicate via the Copilot .NET SDK over JSON-RPC and operate on isolated
+git clones.
 
 ## Technology Stack
 
@@ -25,10 +26,10 @@ CopilotHive/
 │   ├── Copilot/CopilotWorkerClient.cs # SDK wrapper with retry logic
 │   ├── Git/GitWorkspaceManager.cs    # Bare repo, clones, branching, merging
 │   ├── Metrics/                      # Per-iteration metrics tracking
-│   ├── Orchestration/Orchestrator.cs # Main loop: coder → tester → merge
+│   ├── Orchestration/Orchestrator.cs # Main loop: coder → tester → reviewer → merge
 │   ├── Workers/DockerWorkerManager.cs # Docker container lifecycle
 │   └── Program.cs                    # CLI entrypoint
-├── tests/CopilotHive.Tests/         # xUnit tests (26 tests)
+├── tests/CopilotHive.Tests/         # xUnit tests (366+ tests)
 ├── agents/                           # AGENTS.md templates per role
 │   ├── orchestrator.agents.md
 │   ├── coder.agents.md
@@ -49,8 +50,7 @@ dotnet test CopilotHive.slnx
   are enforced in code, never in AGENTS.md.
 - **Strategy in AGENTS.md** — Delegation heuristics, priorities, and communication style
   are self-modifiable by the orchestrator, one update per iteration max.
-- **Separate git clones per worker** — Each worker gets its own clone for full isolation.
-  A bare repo acts as the local "remote".
+- **Separate git clones per worker** — Each task gets its own clone for full isolation.
 - **Metrics-driven improvement** — Every iteration records metrics. Regressions trigger
   automatic rollback of AGENTS.md changes.
 - **No `Directory.Delete` without retry** — On Windows, use `ForceDeleteDirectoryAsync`
@@ -58,7 +58,7 @@ dotnet test CopilotHive.slnx
 
 ## Key Design Patterns
 
-- Workers are Docker containers using the `copilot-acp-server` image in headless mode
+- Workers are generic Docker containers that accept any role per task via dynamic agent selection
 - The orchestrator communicates via `CopilotClient` from `GitHub.Copilot.SDK`
 - Git operations shell out to `git` CLI (not LibGit2Sharp) for simplicity
 - The coder↔tester feedback loop retries up to `MaxRetriesPerTask` times

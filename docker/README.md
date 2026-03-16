@@ -17,13 +17,12 @@ docker compose up --build
 
 This starts:
 
-| Service        | Role       | Model              |
-|---------------|------------|---------------------|
-| `orchestrator` | gRPC server | —                  |
-| `coder`        | Code writer | claude-opus-4.6    |
-| `reviewer`     | Code review | gpt-5.3-codex     |
-| `tester`       | Test runner | claude-sonnet-4.6  |
-| `improver`     | Self-improve| claude-sonnet-4.6  |
+| Service        | Description              | Replicas |
+|---------------|--------------------------|----------|
+| `orchestrator` | gRPC server + health API | 1        |
+| `worker`       | Generic pool worker      | 4 (configurable via `WORKER_REPLICAS`) |
+
+Workers register without a fixed role and accept any role (coder, tester, reviewer, improver) per task.
 
 ## Architecture
 
@@ -53,10 +52,16 @@ streaming, and execute them using the local Copilot CLI running in headless mode
 
 ## Scaling Workers
 
-Scale any role horizontally:
+Adjust the number of generic workers:
 
 ```bash
-docker compose up --scale coder=3 --scale tester=2 --build
+WORKER_REPLICAS=6 docker compose up --build
+```
+
+Or use `--scale`:
+
+```bash
+docker compose up --scale worker=6 --build
 ```
 
 ## Docker Swarm Deployment
@@ -70,7 +75,7 @@ docker stack deploy -c docker-compose.yml copilothive
 Scale services in Swarm:
 
 ```bash
-docker service scale copilothive_coder=5 copilothive_tester=3
+docker service scale copilothive_worker=8
 ```
 
 ## Environment Variables
@@ -86,8 +91,9 @@ docker service scale copilothive_coder=5 copilothive_tester=3
 | Variable           | Default            | Description                                |
 |-------------------|--------------------|--------------------------------------------|
 | `ORCHESTRATOR_URL` | —                  | gRPC URL of the orchestrator               |
-| `WORKER_ROLE`      | —                  | Worker role: `coder`, `reviewer`, `tester`, `improver` |
-| `COPILOT_MODEL`    | —                  | AI model to use for this worker            |
+| `WORKER_ROLE`      | (empty = generic)  | Optional fixed role; empty means generic pool worker |
+| `COPILOT_MODEL`    | —                  | Default AI model (overridden per task by orchestrator) |
+| `CONFIG_REPO_URL`  | —                  | Config repo URL (needed for improver tasks) |
 | `COPILOT_PORT`     | `8000`             | Port for headless Copilot CLI              |
 | `COPILOT_LOG_LEVEL`| `info`             | Copilot CLI log level                      |
 | `COPILOT_RESUME`   | `false`            | Resume previous Copilot session            |
@@ -130,9 +136,9 @@ docker compose exec orchestrator curl http://localhost:5000/health
 
 **Worker not connecting:**
 ```bash
-docker compose logs coder
+docker compose logs worker
 # Verify the orchestrator is reachable from the worker network
-docker compose exec coder curl http://orchestrator:5000/health
+docker compose exec worker curl http://orchestrator:5000/health
 ```
 
 **Rebuild from scratch:**
