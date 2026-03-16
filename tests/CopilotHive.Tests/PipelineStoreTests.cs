@@ -3,6 +3,7 @@ using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests;
@@ -357,8 +358,7 @@ public sealed class GoalPipelineSnapshotRestorationTests
     }
 }
 
-public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable
-{
+public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable{
     private readonly PipelineStore _store;
     private readonly GoalPipelineManager _manager;
 
@@ -467,5 +467,179 @@ public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable
 
         Assert.Single(restored);
         Assert.Equal("g-active", restored[0].GoalId);
+    }
+}
+
+/// <summary>
+/// Tests that PipelineStore automatically migrates an older SQLite schema when opened.
+/// </summary>
+public sealed class PipelineStoreSchemaMigrationTests
+{
+    private static Goal CreateGoal(string id = "goal-1") =>
+        new() { Id = id, Description = "Migration test goal", RepositoryNames = ["test-repo"] };
+
+    /// <summary>
+    /// Creates a named in-memory SQLite database with the old (incomplete) schema and returns
+    /// the shared-cache connection string so PipelineStore can open the same instance.
+    /// The seeder connection is stored in a field to prevent the named DB from being disposed.
+    /// </summary>
+    private (SqliteConnection Seeder, SqliteConnection Client) CreateOldSchemaConnections()
+    {
+        var name = $"migration-test-{Guid.NewGuid():N}";
+        var connStr = $"Data Source={name};Mode=Memory;Cache=Shared";
+
+        // Seeder keeps the named in-memory DB alive for the test's lifetime.
+        var seeder = new SqliteConnection(connStr);
+        seeder.Open();
+
+        using var cmd = seeder.CreateCommand();
+        // Old schema: missing max_iterations, improver_retries, phase_outputs, metrics_json, completed_at
+        cmd.CommandText = """
+            CREATE TABLE pipelines (
+                goal_id        TEXT PRIMARY KEY,
+                description    TEXT NOT NULL,
+                goal_json      TEXT NOT NULL,
+                phase          TEXT NOT NULL DEFAULT 'Planning',
+                iteration      INTEGER NOT NULL DEFAULT 1,
+                review_retries INTEGER NOT NULL DEFAULT 0,
+                test_retries   INTEGER NOT NULL DEFAULT 0,
+                max_retries    INTEGER NOT NULL DEFAULT 3,
+                active_task_id TEXT,
+                coder_branch   TEXT,
+                created_at     TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS conversation_entries (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                goal_id TEXT NOT NULL,
+                seq     INTEGER NOT NULL,
+                role    TEXT NOT NULL,
+                content TEXT NOT NULL,
+                FOREIGN KEY (goal_id) REFERENCES pipelines(goal_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversation_goal ON conversation_entries(goal_id, seq);
+            CREATE TABLE IF NOT EXISTS task_mappings (
+                task_id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL
+            );
+            """;
+        cmd.ExecuteNonQuery();
+
+        // A second connection to the same named DB — handed to PipelineStore.
+        var client = new SqliteConnection(connStr);
+        client.Open();
+
+        return (seeder, client);
+    }
+
+    [Fact]
+    public async Task MigrateSchema_WhenColumnsAreMissing_StartsWithoutError()
+    {
+        var (seeder, client) = CreateOldSchemaConnections();
+        await using (seeder)
+        {
+            var store = new PipelineStore(client, NullLogger<PipelineStore>.Instance);
+            await store.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task MigrateSchema_WhenColumnsAreMissing_AddsAllExpectedColumns()
+    {
+        var (seeder, client) = CreateOldSchemaConnections();
+        await using (seeder)
+        await using (var store = new PipelineStore(client, NullLogger<PipelineStore>.Instance))
+        {
+            // Inspect via the seeder connection after migration.
+            using var cmd = seeder.CreateCommand();
+            cmd.CommandText = "SELECT name FROM pragma_table_info('pipelines')";
+            using var reader = cmd.ExecuteReader();
+            var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while (reader.Read())
+                columns.Add(reader.GetString(0));
+
+            Assert.Contains("max_iterations", columns);
+            Assert.Contains("improver_retries", columns);
+            Assert.Contains("phase_outputs", columns);
+            Assert.Contains("metrics_json", columns);
+            Assert.Contains("completed_at", columns);
+        }
+    }
+
+    [Fact]
+    public async Task MigrateSchema_CalledTwice_IsIdempotent()
+    {
+        var name = $"migration-test-{Guid.NewGuid():N}";
+        var connStr = $"Data Source={name};Mode=Memory;Cache=Shared";
+
+        var seeder = new SqliteConnection(connStr);
+        seeder.Open();
+        using var seedCmd = seeder.CreateCommand();
+        seedCmd.CommandText = """
+            CREATE TABLE pipelines (
+                goal_id TEXT PRIMARY KEY, description TEXT NOT NULL, goal_json TEXT NOT NULL,
+                phase TEXT NOT NULL DEFAULT 'Planning', iteration INTEGER NOT NULL DEFAULT 1,
+                review_retries INTEGER NOT NULL DEFAULT 0, test_retries INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 3, active_task_id TEXT, coder_branch TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS conversation_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, goal_id TEXT NOT NULL, seq INTEGER NOT NULL,
+                role TEXT NOT NULL, content TEXT NOT NULL,
+                FOREIGN KEY (goal_id) REFERENCES pipelines(goal_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversation_goal ON conversation_entries(goal_id, seq);
+            CREATE TABLE IF NOT EXISTS task_mappings (task_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL);
+            """;
+        seedCmd.ExecuteNonQuery();
+
+        await using (seeder)
+        {
+            // First migration pass.
+            var c1 = new SqliteConnection(connStr);
+            c1.Open();
+            await using (var first = new PipelineStore(c1, NullLogger<PipelineStore>.Instance)) { }
+
+            // Second migration pass on the already-migrated schema — must not throw.
+            var c2 = new SqliteConnection(connStr);
+            c2.Open();
+            await using (var second = new PipelineStore(c2, NullLogger<PipelineStore>.Instance)) { }
+
+            // Verify no duplicate columns.
+            using var cmd = seeder.CreateCommand();
+            cmd.CommandText = "SELECT name FROM pragma_table_info('pipelines')";
+            using var reader = cmd.ExecuteReader();
+            var columns = new List<string>();
+            while (reader.Read())
+                columns.Add(reader.GetString(0).ToLowerInvariant());
+
+            Assert.Equal(columns.Distinct().Count(), columns.Count);
+        }
+    }
+
+    [Fact]
+    public async Task MigrateSchema_AfterMigration_CanPersistAndReloadPipeline()
+    {
+        var (seeder, client) = CreateOldSchemaConnections();
+        await using (seeder)
+        await using (var store = new PipelineStore(client, NullLogger<PipelineStore>.Instance))
+        {
+            var pipeline = new GoalPipeline(CreateGoal("mg-1"));
+            pipeline.AdvanceTo(GoalPhase.Coding);
+            pipeline.IncrementIteration();
+            pipeline.IncrementReviewRetry();
+            pipeline.Metrics.TotalTests = 7;
+            pipeline.Metrics.PassedTests = 7;
+
+            store.SavePipeline(pipeline);
+            var snapshots = store.LoadActivePipelines();
+
+            var snap = Assert.Single(snapshots);
+            Assert.Equal("mg-1", snap.GoalId);
+            Assert.Equal(GoalPhase.Coding, snap.Phase);
+            Assert.Equal(2, snap.Iteration);
+            Assert.Equal(1, snap.ReviewRetries);
+            Assert.Equal(7, snap.Metrics.TotalTests);
+            Assert.Equal(7, snap.Metrics.PassedTests);
+        }
     }
 }

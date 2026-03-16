@@ -27,8 +27,9 @@ public sealed class PipelineStore : IAsyncDisposable
 
     /// <summary>
     /// Initialises a new <see cref="PipelineStore"/>, opening or creating the SQLite database at the given path.
+    /// Pass <c>:memory:</c> for a transient in-memory database.
     /// </summary>
-    /// <param name="dbPath">Full path to the SQLite database file.</param>
+    /// <param name="dbPath">Full path to the SQLite database file, or <c>:memory:</c>.</param>
     /// <param name="logger">Logger instance.</param>
     public PipelineStore(string dbPath, ILogger<PipelineStore> logger)
     {
@@ -41,6 +42,21 @@ public sealed class PipelineStore : IAsyncDisposable
         _db.Open();
         InitializeSchema();
         _logger.LogInformation("PipelineStore initialized at {DbPath}", dbPath);
+    }
+
+    /// <summary>
+    /// Initialises a new <see cref="PipelineStore"/> using an already-open <see cref="SqliteConnection"/>.
+    /// Intended for testing scenarios that require a pre-configured connection (e.g., shared-cache
+    /// named in-memory databases with an existing schema).
+    /// </summary>
+    /// <param name="connection">An open SQLite connection. The store takes ownership and will dispose it.</param>
+    /// <param name="logger">Logger instance.</param>
+    internal PipelineStore(SqliteConnection connection, ILogger<PipelineStore> logger)
+    {
+        _logger = logger;
+        _db = connection;
+        InitializeSchema();
+        _logger.LogInformation("PipelineStore initialized with existing connection");
     }
 
     private void InitializeSchema()
@@ -89,18 +105,54 @@ public sealed class PipelineStore : IAsyncDisposable
         MigrateSchema();
     }
 
+    // Columns that must exist in the pipelines table, keyed by name.
+    // Entries here cover columns added after the initial schema so older databases
+    // are automatically brought up to date on startup.
+    private static readonly (string Table, string Column, string Definition)[] SchemaColumns =
+    [
+        ("pipelines", "max_iterations",   "INTEGER NOT NULL DEFAULT 10"),
+        ("pipelines", "improver_retries", "INTEGER NOT NULL DEFAULT 0"),
+        ("pipelines", "phase_outputs",    "TEXT NOT NULL DEFAULT '{}'"),
+        ("pipelines", "metrics_json",     "TEXT NOT NULL DEFAULT '{}'"),
+        ("pipelines", "active_task_id",   "TEXT"),
+        ("pipelines", "coder_branch",     "TEXT"),
+        ("pipelines", "completed_at",     "TEXT"),
+    ];
+
+    /// <summary>
+    /// Ensures all expected columns exist in the database, adding any that are missing.
+    /// Safe to call repeatedly (idempotent): a column that already exists is left untouched.
+    /// </summary>
     private void MigrateSchema()
     {
-        try
+        foreach (var (table, column, definition) in SchemaColumns)
         {
+            var existingColumns = GetColumnNames(table);
+
+            if (existingColumns.Contains(column, StringComparer.OrdinalIgnoreCase))
+            {
+                _logger.LogDebug("Migration: column {Col} already exists in {Table}", column, table);
+                continue;
+            }
+
             using var cmd = _db.CreateCommand();
-            cmd.CommandText = "ALTER TABLE pipelines ADD COLUMN max_iterations INTEGER NOT NULL DEFAULT 10";
+            cmd.CommandText = $"ALTER TABLE {table} ADD COLUMN {column} {definition}";
             cmd.ExecuteNonQuery();
+            _logger.LogInformation("Migration: added column {Col} to {Table}", column, table);
         }
-        catch (Microsoft.Data.Sqlite.SqliteException)
-        {
-            // Column already exists — ignore
-        }
+    }
+
+    /// <summary>Returns the set of column names for the given table using PRAGMA table_info.</summary>
+    private HashSet<string> GetColumnNames(string table)
+    {
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = $"SELECT name FROM pragma_table_info('{table}')";
+        using var reader = cmd.ExecuteReader();
+
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        while (reader.Read())
+            names.Add(reader.GetString(0));
+        return names;
     }
 
     /// <summary>Insert or replace the full pipeline state.</summary>
