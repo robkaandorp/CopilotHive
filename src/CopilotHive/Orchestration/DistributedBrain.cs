@@ -297,6 +297,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             """;
 
         var decision = await AskAsync(pipeline, prompt, ct);
+        ApplyModelTierIfNotSet(pipeline, decision?.ModelTier);
         return decision ?? new OrchestratorDecision
         {
             Action = OrchestratorActionType.SpawnCoder,
@@ -484,7 +485,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             """;
 
         var decision = await AskAsync(pipeline, prompt, ct);
-        pipeline.LatestModelTier = decision?.ModelTier?.ToLowerInvariant() is "premium" ? "premium" : "standard";
+        ApplyModelTierIfNotSet(pipeline, decision?.ModelTier);
         return decision?.Prompt ?? GetFallbackPrompt(workerRole, pipeline);
     }
 
@@ -585,6 +586,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 Reason = "Failed to interpret output",
             };
 
+        ApplyModelTierIfNotSet(pipeline, result.ModelTier);
         return ApplyTestMetricsFallback(result, workerRole, workerOutput, _logger);
     }
 
@@ -614,7 +616,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             }
             """;
 
-        return await AskAsync(pipeline, prompt, ct)
+        var decision = await AskAsync(pipeline, prompt, ct);
+        ApplyModelTierIfNotSet(pipeline, decision?.ModelTier);
+        return decision
             ?? new OrchestratorDecision
             {
                 Action = OrchestratorActionType.Done,
@@ -696,6 +700,21 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         await session.SendAsync(new MessageOptions { Prompt = prompt });
         return await done.Task;
+    }
+
+    /// <summary>
+    /// Applies the first-non-null wins rule for model tier: sets <see cref="GoalPipeline.LatestModelTier"/>
+    /// only when it has not been explicitly set yet (empty string) and <paramref name="modelTier"/> is non-null.
+    /// Normalises the value to <c>"premium"</c> or <c>"standard"</c>.
+    /// </summary>
+    /// <param name="pipeline">The current goal pipeline whose tier may be updated.</param>
+    /// <param name="modelTier">The model tier string returned by the Brain LLM, or <c>null</c> if absent.</param>
+    public static void ApplyModelTierIfNotSet(GoalPipeline pipeline, string? modelTier)
+    {
+        if (!string.IsNullOrEmpty(pipeline.LatestModelTier) || modelTier is null)
+            return;
+
+        pipeline.LatestModelTier = modelTier.ToLowerInvariant() == "premium" ? "premium" : "standard";
     }
 
     /// <summary>

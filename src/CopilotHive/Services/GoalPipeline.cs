@@ -133,8 +133,12 @@ public sealed class GoalPipeline
     /// <summary>UTC timestamp when this pipeline completed (Done or Failed), or <c>null</c> if still active.</summary>
     public DateTime? CompletedAt { get; private set; }
 
-    /// <summary>Model tier requested by the Brain for the most recently dispatched task ('standard' or 'premium').</summary>
-    public string LatestModelTier { get; set; } = "standard";
+    /// <summary>
+    /// Model tier requested by the Brain for the most recently dispatched task ('standard' or 'premium').
+    /// Empty string means no tier has been explicitly set yet — the first Brain method that returns a
+    /// non-null model_tier will populate this (first non-null wins).
+    /// </summary>
+    public string LatestModelTier { get; set; } = "";
 
     /// <summary>
     /// Creates a new pipeline for the specified goal.
