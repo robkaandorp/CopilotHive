@@ -150,8 +150,8 @@ public sealed class ConfigRepoManager
     {
         await RunGitAsync(_localPath, ["add", filePath], ct);
         await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
-        await RunGitAsync(_localPath, ["pull", "--rebase"], ct);
-        await RunGitAsync(_localPath, ["push", "origin", "HEAD"], ct);
+        await RunGitAsync(_localPath, ["pull", "--no-rebase"], ct);
+        await RunGitAsync(_localPath, ["push"], ct);
     }
 
     private static string NormalizeUrl(string url)

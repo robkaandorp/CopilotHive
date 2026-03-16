@@ -278,16 +278,20 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
         status.LastCommitMessage = "Improve agents.md files (automated by CopilotHive Improver)";
         _log.Info($"Committed: {commitOut.Trim()}");
 
-        // Pull (rebase on top of any orchestrator commits) then push
+        // Pull (merge orchestrator's goals/metrics commits) then push
         try
         {
-            var (pullExit, _, pullErr) = await GitOperations.RunGitCommandAsync(
-                ConfigRepoDir, "pull --rebase", ct);
+            var (pullExit, pullOut, pullErr) = await GitOperations.RunGitCommandAsync(
+                ConfigRepoDir, "pull --no-rebase", ct);
             if (pullExit != 0)
-                _log.Error($"git pull --rebase failed: {pullErr.Trim()}");
+            {
+                _log.Error($"git pull failed: {pullErr.Trim()}");
+                // Abort any in-progress merge and try force-pushing our commit
+                await GitOperations.RunGitCommandAsync(ConfigRepoDir, "merge --abort", ct);
+            }
 
             var (pushExit, _, pushErr) = await GitOperations.RunGitCommandAsync(
-                ConfigRepoDir, "push origin HEAD", ct);
+                ConfigRepoDir, "push", ct);
             if (pushExit != 0)
             {
                 _log.Error($"git push failed: {pushErr.Trim()}");
