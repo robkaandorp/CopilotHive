@@ -634,10 +634,16 @@ public sealed class GoalDispatcher : BackgroundService
 
     private async Task DispatchToRole(GoalPipeline pipeline, WorkerRole role, string? prompt, CancellationToken ct)
     {
-        // If no prompt provided (Brain might have returned null), craft one
+        // If no prompt provided (Brain might have returned null), craft one.
+        // Preserve the current model tier first — CraftPromptAsync may reset it to "standard",
+        // silently losing a "premium" tier that was set by a prior Brain decision.
         if (string.IsNullOrWhiteSpace(prompt) && _brain is not null)
         {
+            var preservedTier = pipeline.LatestModelTier;
             prompt = await _brain.CraftPromptAsync(pipeline, role.ToString().ToLowerInvariant(), null, ct);
+            // Restore the preserved tier so a prior "premium" decision is never overwritten by CraftPromptAsync.
+            if (preservedTier == "premium")
+                pipeline.LatestModelTier = preservedTier;
         }
 
         prompt ??= $"Work on: {pipeline.Description}";

@@ -62,6 +62,77 @@ public class PremiumModelSelectionTests
         Assert.Equal("premium-coder", config.GetPremiumModelForRole("Coder"));
     }
 
+    // ── Brain model_tier propagation ─────────────────────────────────────
+
+    [Fact]
+    public async Task PlanGoalAsync_WhenBrainReturnsPremiumTier_ModelTierIsPremium()
+    {
+        // Arrange: a brain whose PlanGoalAsync returns model_tier="premium"
+        var brain = new PlanGoalPremiumBrain();
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Complex feature" };
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
+
+        // Act: call PlanGoalAsync and apply the same propagation the dispatcher performs
+        var decision = await brain.PlanGoalAsync(pipeline);
+        pipeline.LatestModelTier = decision.ModelTier == "premium" ? "premium" : "standard";
+
+        // Assert: both the decision object and the pipeline reflect the premium tier
+        Assert.Equal("premium", decision.ModelTier);
+        Assert.Equal("premium", pipeline.LatestModelTier);
+    }
+
+    [Fact]
+    public async Task DecideNextStepAsync_WhenBrainReturnsPremiumTier_ModelTierIsPremium()
+    {
+        // Arrange: a brain whose DecideNextStepAsync returns model_tier="premium"
+        var brain = new DecideNextStepPremiumBrain();
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Complex next step" };
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
+
+        // Act
+        var decision = await brain.DecideNextStepAsync(pipeline, "What should we do next?");
+
+        // Assert: the returned decision carries the premium tier
+        Assert.Equal("premium", decision.ModelTier);
+    }
+
+    [Fact]
+    public async Task DispatchToRole_WhenPromptIsNull_CraftPromptDoesNotOverwritePremiumTier()
+    {
+        // Arrange: first decision sets premium tier with a null prompt; CraftPromptAsync returns standard.
+        // Without the Bug-2 fix, the premium tier would be silently replaced by "standard".
+        var brain = new NullPromptPremiumInterpretBrain();
+        var capturedModel = (string?)null;
+
+        var hiveConfigFile = new HiveConfigFile
+        {
+            Workers =
+            {
+                ["coder"] = new WorkerConfig
+                {
+                    Model = "standard-coder-model",
+                    PremiumModel = "premium-coder-model",
+                },
+            },
+        };
+
+        var (dispatcher, _, taskId, taskQueue) = CreateDispatcher(GoalPhase.Coding, brain, hiveConfigFile);
+        taskQueue.OnEnqueue = t => capturedModel = t.Model;
+
+        // Act: simulate the coder completing — InterpretOutputAsync returns premium+null prompt,
+        //       then DispatchToRole falls back to CraftPromptAsync which would return standard.
+        await dispatcher.HandleTaskCompletionAsync(new Shared.Grpc.TaskComplete
+        {
+            TaskId = taskId,
+            Status = Shared.Grpc.TaskStatus.Completed,
+            Output = "Coding complete.",
+            GitStatus = new Shared.Grpc.GitStatus { FilesChanged = 3 }, // avoid no-op detection
+        });
+
+        // Assert: the premium tier set by InterpretOutputAsync must survive the CraftPrompt fallback.
+        Assert.Equal("premium-coder-model", capturedModel);
+    }
+
     // ── GoalDispatcher premium model selection ───────────────────────────
 
     [Fact]
@@ -216,5 +287,128 @@ file sealed class PremiumFakeGoalSource : IGoalSource
 
     public Task UpdateGoalStatusAsync(
         string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
+        Task.CompletedTask;
+}
+
+/// <summary>
+/// Brain stub whose <see cref="PlanGoalAsync"/> returns <c>model_tier = "premium"</c>.
+/// </summary>
+file sealed class PlanGoalPremiumBrain : IDistributedBrain
+{
+    public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<OrchestratorDecision> PlanGoalAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult(new OrchestratorDecision
+        {
+            Action = OrchestratorActionType.SpawnCoder,
+            Prompt = "Implement the complex feature",
+            ModelTier = "premium",
+        });
+
+    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult(IterationPlan.Default());
+
+    public Task<string> CraftPromptAsync(
+        GoalPipeline pipeline, string workerRole, string? additionalContext = null, CancellationToken ct = default)
+    {
+        pipeline.LatestModelTier = "standard";
+        return Task.FromResult($"Work on {pipeline.Description} as {workerRole}");
+    }
+
+    public Task<OrchestratorDecision> InterpretOutputAsync(
+        GoalPipeline pipeline, string workerRole, string workerOutput, CancellationToken ct = default) =>
+        Task.FromResult(new OrchestratorDecision { Action = OrchestratorActionType.Done, Verdict = "PASS" });
+
+    public Task<OrchestratorDecision> DecideNextStepAsync(
+        GoalPipeline pipeline, string context, CancellationToken ct = default) =>
+        Task.FromResult(new OrchestratorDecision { Action = OrchestratorActionType.Done });
+
+    public Task InformAsync(GoalPipeline pipeline, string information, CancellationToken ct = default) =>
+        Task.CompletedTask;
+}
+
+/// <summary>
+/// Brain stub whose <see cref="DecideNextStepAsync"/> returns <c>model_tier = "premium"</c>.
+/// </summary>
+file sealed class DecideNextStepPremiumBrain : IDistributedBrain
+{
+    public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<OrchestratorDecision> PlanGoalAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult(new OrchestratorDecision { Action = OrchestratorActionType.SpawnCoder });
+
+    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult(IterationPlan.Default());
+
+    public Task<string> CraftPromptAsync(
+        GoalPipeline pipeline, string workerRole, string? additionalContext = null, CancellationToken ct = default)
+    {
+        pipeline.LatestModelTier = "standard";
+        return Task.FromResult($"Work on {pipeline.Description} as {workerRole}");
+    }
+
+    public Task<OrchestratorDecision> InterpretOutputAsync(
+        GoalPipeline pipeline, string workerRole, string workerOutput, CancellationToken ct = default) =>
+        Task.FromResult(new OrchestratorDecision { Action = OrchestratorActionType.Done, Verdict = "PASS" });
+
+    public Task<OrchestratorDecision> DecideNextStepAsync(
+        GoalPipeline pipeline, string context, CancellationToken ct = default) =>
+        Task.FromResult(new OrchestratorDecision
+        {
+            Action = OrchestratorActionType.SpawnCoder,
+            Prompt = "Implement the next step",
+            ModelTier = "premium",
+        });
+
+    public Task InformAsync(GoalPipeline pipeline, string information, CancellationToken ct = default) =>
+        Task.CompletedTask;
+}
+
+/// <summary>
+/// Brain stub that returns <c>model_tier = "premium"</c> with a <c>null</c> prompt from
+/// <see cref="InterpretOutputAsync"/>, then returns <c>model_tier = "standard"</c> from
+/// <see cref="CraftPromptAsync"/>. Used to verify Bug 2: the premium tier must survive
+/// the CraftPromptAsync fallback inside <c>DispatchToRole</c>.
+/// </summary>
+file sealed class NullPromptPremiumInterpretBrain : IDistributedBrain
+{
+    public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<OrchestratorDecision> PlanGoalAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult(new OrchestratorDecision { Action = OrchestratorActionType.SpawnCoder });
+
+    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult(IterationPlan.Default());
+
+    /// <summary>
+    /// Mimics a Brain that decides to spawn another coder with premium tier but leaves the prompt
+    /// to be crafted by the fallback path — this is the scenario that triggers Bug 2.
+    /// </summary>
+    public Task<OrchestratorDecision> InterpretOutputAsync(
+        GoalPipeline pipeline, string workerRole, string workerOutput, CancellationToken ct = default) =>
+        Task.FromResult(new OrchestratorDecision
+        {
+            Action = OrchestratorActionType.SpawnCoder,
+            Prompt = null,   // null prompt → DispatchToRole will call CraftPromptAsync
+            ModelTier = "premium",
+        });
+
+    /// <summary>
+    /// Returns a valid prompt but sets model tier to "standard" — simulating a Brain that
+    /// does not escalate on the craft-prompt call. Without the Bug-2 fix this would silently
+    /// overwrite the "premium" tier from the earlier InterpretOutputAsync decision.
+    /// </summary>
+    public Task<string> CraftPromptAsync(
+        GoalPipeline pipeline, string workerRole, string? additionalContext = null, CancellationToken ct = default)
+    {
+        pipeline.LatestModelTier = "standard";
+        return Task.FromResult($"Retry: work on {pipeline.Description} as {workerRole}");
+    }
+
+    public Task<OrchestratorDecision> DecideNextStepAsync(
+        GoalPipeline pipeline, string context, CancellationToken ct = default) =>
+        Task.FromResult(new OrchestratorDecision { Action = OrchestratorActionType.Done });
+
+    public Task InformAsync(GoalPipeline pipeline, string information, CancellationToken ct = default) =>
         Task.CompletedTask;
 }

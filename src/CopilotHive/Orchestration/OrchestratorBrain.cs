@@ -184,7 +184,8 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
             {
               "action": "spawn_coder",
               "prompt": "<the prompt you want to send to the first worker>",
-              "reason": "<why you chose this plan>"
+              "reason": "<why you chose this plan>",
+              "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
             }
 
             Valid actions: spawn_coder, spawn_reviewer, spawn_tester, done, skip
@@ -328,7 +329,8 @@ public sealed class OrchestratorBrain : IOrchestratorBrain
             {
               "action": "<next action: spawn_coder, spawn_reviewer, spawn_tester, merge, done, skip>",
               "prompt": "<prompt for the worker, if spawning one>",
-              "reason": "<why this is the right next step>"
+              "reason": "<why this is the right next step>",
+              "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
             }
             """;
 
