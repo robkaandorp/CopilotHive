@@ -274,6 +274,10 @@ public sealed class CopilotRunner : IAsyncDisposable
 
         using var subscription = _session.On(evt =>
         {
+            // Trace every SDK event to stdout so Docker logs capture them immediately
+            Console.WriteLine($"[SDK] {evt.GetType().Name}");
+            Console.Out.Flush();
+
             switch (evt)
             {
                 case AssistantMessageEvent msg:
@@ -304,13 +308,10 @@ public sealed class CopilotRunner : IAsyncDisposable
                 case SubagentDeselectedEvent:
                     _log.Info("↩ Agent deselected, returning to parent");
                     break;
-                // Streaming events for observability
+                // Streaming deltas for live progress
                 case AssistantMessageDeltaEvent delta:
                     Console.Write(delta.Data.DeltaContent);
-                    break;
-                default:
-                    // Log unhandled event types at debug level for discovery
-                    _log.Debug($"SDK event: {evt.GetType().Name}");
+                    Console.Out.Flush();
                     break;
             }
         });

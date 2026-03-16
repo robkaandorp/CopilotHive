@@ -284,6 +284,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - Is this a documentation-only change? (coder for edits, skip testing, docwriter updates docs)
             - Is this a code change? (needs coder → tester → docwriter → reviewer → merge)
             - Is there context from previous iterations?
+            IMPORTANT: Always include the docwriting phase for any change — the doc-writer updates
+            the CHANGELOG, README, and XML doc comments. Even internal services need changelog entries.
 
             Respond with JSON:
             {
@@ -353,6 +355,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - Is this a documentation-only change? (coder edits, then docwriter — may skip testing)
             - Is this a retry after failure? (what phases need re-running)
             - What does the metrics history suggest?
+            IMPORTANT: Always include the docwriting phase — the doc-writer updates the CHANGELOG,
+            README, and XML doc comments. Even internal changes need changelog entries.
 
             Available phases: coding, testing, docwriting, review, improve, merging
 
@@ -685,6 +689,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         using var subscription = session.On(evt =>
         {
+            Console.WriteLine($"[Brain-SDK] {evt.GetType().Name}");
+            Console.Out.Flush();
+
             switch (evt)
             {
                 case AssistantMessageEvent msg:
