@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6] — Server Architecture & DistributedBrain
+
+### Added
+- Server-only architecture — gRPC server + HTTP health endpoint (removed CLI mode entirely)
+- DistributedBrain — LLM-powered orchestrator Brain using GitHub Copilot SDK JSON-RPC
+- GoalDispatcher — pipeline state machine with phase sequencing (Coding → Review → Testing → Merge → Improve)
+- SQLite persistence (PipelineStore) with automatic schema migration
+- Config repo integration — external CopilotHive-Config repo for agents.md and goals.yaml
+- AgentsManager — agents.md versioning, rollback on regression
+- ConfigRepoManager — config repo sync and checkout
+- Premium model tier selection — Brain can escalate to premium models for complex tasks
+- Duplicate goal completion guards — prevent late task callbacks from re-triggering completion
+- Orchestrator agent pre-selection via RPC (ensures correct custom agent is active)
+- Native SDK telemetry with TelemetryConfig on CopilotClientOptions
+- Telemetry aggregation — summarized metrics injected into improver context
+- Agents.md size enforcement — 4000-character limit with improver retry loop
+- Auto-rebase with pre-improver SHA tracking
+- Less prescriptive goal philosophy — goals describe WHAT not HOW
+- Comprehensive test suite: 333 xUnit tests
+
+### Changed
+- Orchestrator now runs exclusively in server mode (removed --serve flag)
+- Brain prompts instruct workers to discover HOW, not prescribe exact file/method changes
+- Improver receives richer context: iteration outcomes, retry counts, specific issues
+
+### Removed
+- Legacy CLI-mode orchestrator (OrchestratorBrain, Orchestrator.cs)
+- Legacy Copilot client abstractions (CopilotWorkerClient, ICopilotWorkerClient, CopilotClientFactory)
+- 53 legacy tests removed (333 remain)
+
 ## [0.5] — Improver Role & Observability
 
 ### Added
