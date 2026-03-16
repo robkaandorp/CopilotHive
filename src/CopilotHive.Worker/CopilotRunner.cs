@@ -274,25 +274,28 @@ public sealed class CopilotRunner : IAsyncDisposable
 
         using var subscription = _session.On(evt =>
         {
-            // Trace every SDK event to stdout so Docker logs capture them immediately
-            Console.WriteLine($"[SDK] {evt.GetType().Name}");
-            Console.Out.Flush();
-
             switch (evt)
             {
                 case AssistantMessageEvent msg:
                     response = msg.Data.Content;
+                    Console.WriteLine($"[SDK] AssistantMessage ({response.Length} chars)");
+                    Console.Out.Flush();
                     break;
                 case AssistantUsageEvent usage:
+                    Console.WriteLine($"[SDK] Usage: model={usage.Data.Model} in={usage.Data.InputTokens} out={usage.Data.OutputTokens} cost={usage.Data.Cost:F4} duration={usage.Data.Duration:F0}ms");
+                    Console.Out.Flush();
                     FileTracer.WriteUsage(usage.Data, $"/app/state/traces-{_currentRole}.jsonl", _currentRole);
                     break;
                 case SessionIdleEvent:
+                    Console.WriteLine("[SDK] SessionIdle");
+                    Console.Out.Flush();
                     done.TrySetResult(response);
                     break;
                 case SessionErrorEvent err:
+                    Console.WriteLine($"[SDK] SessionError: {err.Data.Message}");
+                    Console.Out.Flush();
                     done.TrySetException(new CopilotRunnerException(err.Data.Message));
                     break;
-                // Sub-agent lifecycle events
                 case SubagentSelectedEvent selected:
                     _log.Info($"🎯 Agent selected: {selected.Data.AgentDisplayName} (tools: {(selected.Data.Tools is { Length: > 0 } t ? string.Join(", ", t) : "all")})");
                     break;
@@ -308,9 +311,14 @@ public sealed class CopilotRunner : IAsyncDisposable
                 case SubagentDeselectedEvent:
                     _log.Info("↩ Agent deselected, returning to parent");
                     break;
-                // Streaming deltas for live progress
                 case AssistantMessageDeltaEvent delta:
-                    Console.Write(delta.Data.DeltaContent);
+                    var content = delta.Data.DeltaContent;
+                    Console.Write(content);
+                    if (content.Contains('\n'))
+                        Console.Out.Flush();
+                    break;
+                default:
+                    Console.WriteLine($"[SDK] {evt.GetType().Name}");
                     Console.Out.Flush();
                     break;
             }

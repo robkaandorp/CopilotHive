@@ -689,22 +689,31 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         using var subscription = session.On(evt =>
         {
-            Console.WriteLine($"[Brain-SDK] {evt.GetType().Name}");
-            Console.Out.Flush();
-
             switch (evt)
             {
                 case AssistantMessageEvent msg:
                     response = msg.Data.Content;
+                    Console.WriteLine($"[Brain-SDK] AssistantMessage ({response.Length} chars)");
+                    Console.Out.Flush();
                     break;
                 case AssistantUsageEvent usage:
+                    Console.WriteLine($"[Brain-SDK] Usage: model={usage.Data.Model} in={usage.Data.InputTokens} out={usage.Data.OutputTokens} cost={usage.Data.Cost:F4} duration={usage.Data.Duration:F0}ms");
+                    Console.Out.Flush();
                     FileTracer.WriteUsage(usage.Data, "/app/state/traces-brain.jsonl", "brain");
                     break;
                 case SessionIdleEvent:
+                    Console.WriteLine("[Brain-SDK] SessionIdle");
+                    Console.Out.Flush();
                     done.TrySetResult(response);
                     break;
                 case SessionErrorEvent err:
+                    Console.WriteLine($"[Brain-SDK] SessionError: {err.Data.Message}");
+                    Console.Out.Flush();
                     done.TrySetException(new InvalidOperationException(err.Data.Message));
+                    break;
+                default:
+                    Console.WriteLine($"[Brain-SDK] {evt.GetType().Name}");
+                    Console.Out.Flush();
                     break;
             }
         });
