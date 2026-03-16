@@ -311,13 +311,32 @@ public sealed class CopilotRunner : IAsyncDisposable
                 case SubagentDeselectedEvent:
                     _log.Info("↩ Agent deselected, returning to parent");
                     break;
+                // Content deltas — write text and flush on newlines
                 case AssistantMessageDeltaEvent delta:
-                    var content = delta.Data.DeltaContent;
-                    Console.Write(content);
-                    if (content.Contains('\n'))
+                    Console.Write(delta.Data.DeltaContent);
+                    if (delta.Data.DeltaContent.Contains('\n'))
                         Console.Out.Flush();
                     break;
+                case AssistantStreamingDeltaEvent streamDelta:
+                    var streamText = streamDelta.Data.ToString() ?? "";
+                    Console.Write(streamText);
+                    if (streamText.Contains('\n'))
+                        Console.Out.Flush();
+                    break;
+                // Muted events — no output needed
+                case AssistantReasoningDeltaEvent:
+                case AssistantTurnStartEvent:
+                case AssistantTurnEndEvent:
+                case SessionUsageInfoEvent:
+                case PendingMessagesModifiedEvent:
+                case UserMessageEvent:
+                case PermissionRequestedEvent:
+                case PermissionCompletedEvent:
+                case ToolExecutionStartEvent:
+                case ToolExecutionCompleteEvent:
+                    break;
                 default:
+                    // Log unknown event types for discovery
                     Console.WriteLine($"[SDK] {evt.GetType().Name}");
                     Console.Out.Flush();
                     break;

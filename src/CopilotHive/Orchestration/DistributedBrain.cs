@@ -711,6 +711,14 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     Console.Out.Flush();
                     done.TrySetException(new InvalidOperationException(err.Data.Message));
                     break;
+                // Muted — Brain doesn't stream, these are just noise
+                case AssistantTurnStartEvent:
+                case AssistantTurnEndEvent:
+                case AssistantReasoningEvent:
+                case SessionUsageInfoEvent:
+                case PendingMessagesModifiedEvent:
+                case UserMessageEvent:
+                    break;
                 default:
                     Console.WriteLine($"[Brain-SDK] {evt.GetType().Name}");
                     Console.Out.Flush();
