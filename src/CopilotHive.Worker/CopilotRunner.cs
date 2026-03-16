@@ -317,14 +317,10 @@ public sealed class CopilotRunner : IAsyncDisposable
                     if (delta.Data.DeltaContent.Contains('\n'))
                         Console.Out.Flush();
                     break;
-                case AssistantStreamingDeltaEvent streamDelta:
-                    var streamText = streamDelta.Data.ToString() ?? "";
-                    Console.Write(streamText);
-                    if (streamText.Contains('\n'))
-                        Console.Out.Flush();
-                    break;
                 // Muted events — no output needed
+                case AssistantStreamingDeltaEvent:
                 case AssistantReasoningDeltaEvent:
+                case AssistantReasoningEvent:
                 case AssistantTurnStartEvent:
                 case AssistantTurnEndEvent:
                 case SessionUsageInfoEvent:

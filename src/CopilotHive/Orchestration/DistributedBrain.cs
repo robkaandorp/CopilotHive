@@ -718,6 +718,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 case SessionUsageInfoEvent:
                 case PendingMessagesModifiedEvent:
                 case UserMessageEvent:
+                case SubagentSelectedEvent:
+                case SessionInfoEvent:
                     break;
                 default:
                     Console.WriteLine($"[Brain-SDK] {evt.GetType().Name}");
