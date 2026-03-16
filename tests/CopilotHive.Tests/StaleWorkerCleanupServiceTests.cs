@@ -28,17 +28,17 @@ public sealed class StaleWorkerCleanupServiceTests
     // ── (a) No stale workers → nothing removed ────────────────────────────────
 
     [Fact]
-    public async Task RunCleanupCycle_NoStaleWorkers_RemoveWorkerNotCalled()
+    public async Task RunCleanupCycle_NoStaleWorkers_PurgeCalledWithEmptyResult()
     {
         var poolMock = new Mock<IWorkerPool>();
         poolMock
-            .Setup(p => p.GetStaleWorkers(It.IsAny<TimeSpan>()))
+            .Setup(p => p.PurgeStaleWorkers(It.IsAny<TimeSpan>()))
             .Returns([]);
 
         var svc = CreateService(poolMock.Object);
         await svc.RunCleanupCycleAsync();
 
-        poolMock.Verify(p => p.RemoveWorker(It.IsAny<string>()), Times.Never);
+        poolMock.Verify(p => p.PurgeStaleWorkers(It.IsAny<TimeSpan>()), Times.Once);
     }
 
     // ── (b) One stale worker → removed and warning logged ─────────────────────
@@ -49,16 +49,15 @@ public sealed class StaleWorkerCleanupServiceTests
         var staleWorker = MakeWorker("worker-1");
         var poolMock = new Mock<IWorkerPool>();
         poolMock
-            .Setup(p => p.GetStaleWorkers(It.IsAny<TimeSpan>()))
+            .Setup(p => p.PurgeStaleWorkers(It.IsAny<TimeSpan>()))
             .Returns([staleWorker]);
-        poolMock.Setup(p => p.RemoveWorker("worker-1")).Returns(true);
 
         var loggerMock = new Mock<ILogger<StaleWorkerCleanupService>>();
 
         var svc = CreateService(poolMock.Object, loggerMock.Object);
         await svc.RunCleanupCycleAsync();
 
-        poolMock.Verify(p => p.RemoveWorker("worker-1"), Times.Once);
+        poolMock.Verify(p => p.PurgeStaleWorkers(It.IsAny<TimeSpan>()), Times.Once);
         loggerMock.Verify(
             l => l.Log(
                 LogLevel.Warning,
@@ -83,36 +82,91 @@ public sealed class StaleWorkerCleanupServiceTests
 
         var poolMock = new Mock<IWorkerPool>();
         poolMock
-            .Setup(p => p.GetStaleWorkers(It.IsAny<TimeSpan>()))
+            .Setup(p => p.PurgeStaleWorkers(It.IsAny<TimeSpan>()))
             .Returns(workers);
-        poolMock.Setup(p => p.RemoveWorker(It.IsAny<string>())).Returns(true);
 
-        var svc = CreateService(poolMock.Object);
+        var loggerMock = new Mock<ILogger<StaleWorkerCleanupService>>();
+        var svc = CreateService(poolMock.Object, loggerMock.Object);
         await svc.RunCleanupCycleAsync();
 
-        poolMock.Verify(p => p.RemoveWorker("worker-a"), Times.Once);
-        poolMock.Verify(p => p.RemoveWorker("worker-b"), Times.Once);
-        poolMock.Verify(p => p.RemoveWorker("worker-c"), Times.Once);
-        poolMock.Verify(p => p.RemoveWorker(It.IsAny<string>()), Times.Exactly(3));
+        poolMock.Verify(p => p.PurgeStaleWorkers(It.IsAny<TimeSpan>()), Times.Once);
+        loggerMock.Verify(
+            l => l.Log(
+                LogLevel.Warning,
+                It.IsAny<EventId>(),
+                It.IsAny<It.IsAnyType>(),
+                It.IsAny<Exception?>(),
+                It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
+            Times.Exactly(3));
     }
 
-    // ── (d) GetStaleWorkers called with the correct timeout ───────────────────
+    // ── (d) PurgeStaleWorkers called with the correct timeout ─────────────────
 
     [Fact]
-    public async Task RunCleanupCycle_CallsGetStaleWorkers_WithCorrectTimeout()
+    public async Task RunCleanupCycle_CallsPurgeStaleWorkers_WithCorrectTimeout()
     {
         var expectedTimeout = TimeSpan.FromMinutes(StaleWorkerCleanupService.StaleTimeoutMinutes);
 
         var poolMock = new Mock<IWorkerPool>();
         poolMock
-            .Setup(p => p.GetStaleWorkers(expectedTimeout))
+            .Setup(p => p.PurgeStaleWorkers(expectedTimeout))
             .Returns([])
             .Verifiable();
 
         var svc = CreateService(poolMock.Object);
         await svc.RunCleanupCycleAsync();
 
-        poolMock.Verify(p => p.GetStaleWorkers(expectedTimeout), Times.Once);
+        poolMock.Verify(p => p.PurgeStaleWorkers(expectedTimeout), Times.Once);
+    }
+
+    // ── (e) Exception from cleanup cycle is caught and logged, not rethrown ───
+
+    [Fact]
+    public async Task ExecuteAsync_WhenCleanupThrows_ExceptionCaughtAndErrorLogged()
+    {
+        var poolMock = new Mock<IWorkerPool>();
+        var loggerMock = new Mock<ILogger<StaleWorkerCleanupService>>();
+
+        // Track whether the error log has been emitted so we can wait for it deterministically.
+        var errorLoggedTcs = new TaskCompletionSource();
+        loggerMock
+            .Setup(l => l.Log(
+                LogLevel.Error,
+                It.IsAny<EventId>(),
+                It.IsAny<It.IsAnyType>(),
+                It.IsAny<Exception?>(),
+                It.IsAny<Func<It.IsAnyType, Exception?, string>>()))
+            .Callback(() => errorLoggedTcs.TrySetResult());
+
+        var callCount = 0;
+        poolMock
+            .Setup(p => p.PurgeStaleWorkers(It.IsAny<TimeSpan>()))
+            .Returns(() =>
+            {
+                if (Interlocked.Increment(ref callCount) == 1)
+                    throw new InvalidOperationException("pool error");
+                return new List<ConnectedWorker>().AsReadOnly();
+            });
+
+        var svc = CreateService(poolMock.Object, loggerMock.Object);
+        // Zero delay so each loop iteration runs without a 60-second wait.
+        svc.CleanupDelay = TimeSpan.Zero;
+
+        await svc.StartAsync(CancellationToken.None);
+
+        // Wait (up to 5 s) for the error to be logged; this ensures no timing flakiness.
+        await errorLoggedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await svc.StopAsync(CancellationToken.None);
+
+        loggerMock.Verify(
+            l => l.Log(
+                LogLevel.Error,
+                It.IsAny<EventId>(),
+                It.IsAny<It.IsAnyType>(),
+                It.Is<Exception?>(ex => ex != null && ex.Message == "pool error"),
+                It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
+            Times.AtLeastOnce);
     }
 
     // ── StaleTimeoutMinutes and CleanupIntervalSeconds constants ──────────────
@@ -138,6 +192,6 @@ public sealed class StaleWorkerCleanupServiceTests
         await svc.StartAsync(cts.Token);
         await svc.StopAsync(CancellationToken.None);
 
-        poolMock.Verify(p => p.GetStaleWorkers(It.IsAny<TimeSpan>()), Times.Never);
+        poolMock.Verify(p => p.PurgeStaleWorkers(It.IsAny<TimeSpan>()), Times.Never);
     }
 }
