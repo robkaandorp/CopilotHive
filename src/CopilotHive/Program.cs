@@ -170,6 +170,7 @@ static async Task<int> RunServerAsync(string[] args)
             Version = _version,
             ServerTime = DateTime.UtcNow,
             CheckNumber = count,
+            WorkerPool = workerPool.GetDetailedStats(),
         });
     });
 
