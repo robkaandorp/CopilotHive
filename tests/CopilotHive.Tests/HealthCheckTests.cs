@@ -1,106 +1,60 @@
-using System.Net;
-using System.Reflection;
 using System.Text.Json;
-using CopilotHive.Goals;
-using CopilotHive.Models;
-using CopilotHive.Services;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.TestHost;
-using Microsoft.Extensions.DependencyInjection;
 
 namespace CopilotHive.Tests;
 
 /// <summary>
-/// Integration tests for the /health endpoint introduced in Program.cs.
-/// Verifies that each request increments the check counter in a thread-safe manner
-/// and that the response body is valid JSON containing all required fields.
+/// Integration tests for the <c>checkNumber</c> field on <c>GET /health</c>.
+/// Verifies that the counter increments by exactly 1 with each successive request,
+/// exercising the thread-safe <c>Interlocked.Increment</c> logic in
+/// <c>Program.cs</c> via the real application.
 /// </summary>
-public class HealthCheckTests : IAsyncLifetime
+public class HealthCheckTests : IClassFixture<HiveTestFactory>
 {
-    private WebApplication? _app;
-    private HttpClient? _client;
+    private readonly HiveTestFactory _factory;
 
-    public async Task InitializeAsync()
+    /// <summary>Receives the shared factory fixture for this test class.</summary>
+    /// <param name="factory">The shared <see cref="HiveTestFactory"/> for this test class.</param>
+    public HealthCheckTests(HiveTestFactory factory)
     {
-        var builder = WebApplication.CreateBuilder();
-        builder.WebHost.UseTestServer();
-        builder.Services.AddSingleton<ApiGoalSource>();
-        builder.Services.AddSingleton<WorkerPool>();
+        _factory = factory;
+    }
 
-        _app = builder.Build();
+    /// <summary>Sends GET /health and returns the <c>checkNumber</c> value.</summary>
+    /// <returns>The <c>checkNumber</c> integer from the response body.</returns>
+    private async Task<int> GetCheckNumberAsync()
+    {
+        using var client = _factory.CreateClient();
+        var response = await client.GetAsync("/health");
+        response.EnsureSuccessStatusCode();
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        return doc.RootElement.GetProperty("checkNumber").GetInt32();
+    }
 
-        // Mirror the implementation from Program.cs RunServerAsync
-        var serverStartTime = DateTime.UtcNow;
-        var checkCount = 0;
-        var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown";
+    [Fact]
+    public async Task HealthEndpoint_CheckNumber_IsPositive()
+    {
+        var count = await GetCheckNumberAsync();
+        Assert.True(count >= 1, "checkNumber must be >= 1 after at least one request");
+    }
 
-        _app.MapGet("/health", (ApiGoalSource goalSource, WorkerPool workerPool) =>
+    [Fact]
+    public async Task HealthEndpoint_SequentialCalls_IncrementCheckNumberByOne()
+    {
+        var first = await GetCheckNumberAsync();
+        var second = await GetCheckNumberAsync();
+        Assert.Equal(first + 1, second);
+    }
+
+    [Fact]
+    public async Task HealthEndpoint_MultipleCalls_IncrementCheckNumberMonotonically()
+    {
+        int? prev = null;
+        for (var i = 0; i < 5; i++)
         {
-            var count = Interlocked.Increment(ref checkCount);
-            var uptime = DateTime.UtcNow - serverStartTime;
-            var goals = goalSource.GetAllGoals();
-            return Results.Ok(new HealthResponse
-            {
-                Status = "Healthy",
-                Uptime = uptime.Days > 0
-                    ? $"{uptime.Days}d {uptime.Hours}h {uptime.Minutes}m"
-                    : uptime.Hours > 0
-                        ? $"{uptime.Hours}h {uptime.Minutes}m"
-                        : $"{uptime.Minutes}m {uptime.Seconds}s",
-                UptimeSpan = uptime,
-                ActiveGoals = goals.Count(g => g.Status is GoalStatus.Pending or GoalStatus.InProgress),
-                CompletedGoals = goals.Count(g => g.Status == GoalStatus.Completed),
-                ConnectedWorkers = workerPool.GetAllWorkers().Count,
-                Version = version,
-                ServerTime = DateTime.UtcNow,
-                CheckNumber = count,
-            });
-        });
-
-        await _app.StartAsync();
-        _client = _app.GetTestClient();
-    }
-
-    public async Task DisposeAsync()
-    {
-        _client?.Dispose();
-        if (_app is not null)
-            await _app.StopAsync();
-    }
-
-    [Fact]
-    public async Task HealthEndpoint_FirstCall_ReturnsCheckNumber1()
-    {
-        var response = await _client!.GetAsync("/health");
-
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-        Assert.Equal(1, doc.RootElement.GetProperty("checkNumber").GetInt32());
-    }
-
-    [Fact]
-    public async Task HealthEndpoint_SecondCall_ReturnsCheckNumber2()
-    {
-        await _client!.GetAsync("/health");
-
-        var response = await _client.GetAsync("/health");
-
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-        Assert.Equal(2, doc.RootElement.GetProperty("checkNumber").GetInt32());
-    }
-
-    [Fact]
-    public async Task HealthEndpoint_SequentialCalls_IncrementCheckNumberMonotonically()
-    {
-        for (var i = 1; i <= 5; i++)
-        {
-            var response = await _client!.GetAsync("/health");
-
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-            Assert.Equal(i, doc.RootElement.GetProperty("checkNumber").GetInt32());
+            var count = await GetCheckNumberAsync();
+            if (prev.HasValue)
+                Assert.Equal(prev + 1, count);
+            prev = count;
         }
     }
 }

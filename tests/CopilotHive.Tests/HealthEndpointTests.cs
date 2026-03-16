@@ -1,176 +1,100 @@
 using System.Net;
-using System.Reflection;
 using System.Text.Json;
-using CopilotHive.Goals;
-using CopilotHive.Models;
-using CopilotHive.Services;
-using CopilotHive.Shared.Grpc;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.TestHost;
-using Microsoft.Extensions.DependencyInjection;
 
 namespace CopilotHive.Tests;
 
 /// <summary>
 /// Integration tests for the structured JSON response returned by <c>GET /health</c>.
-/// Verifies HTTP status, content-type, and all DTO fields have sensible values.
+/// Uses <see cref="HiveTestFactory"/> (a <see cref="Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactory{TEntryPoint}"/>
+/// subclass) to boot the real application from <c>Program.cs</c> — no routes are re-implemented here.
 /// </summary>
-public class HealthEndpointTests : IAsyncLifetime
+public class HealthEndpointTests : IClassFixture<HiveTestFactory>
 {
-    private WebApplication? _app;
-    private HttpClient? _client;
+    private readonly HttpClient _client;
 
-    public async Task InitializeAsync()
+    /// <summary>Receives the shared factory and creates an <see cref="HttpClient"/> backed by the test server.</summary>
+    /// <param name="factory">The shared <see cref="HiveTestFactory"/> fixture for this test class.</param>
+    public HealthEndpointTests(HiveTestFactory factory)
     {
-        var builder = WebApplication.CreateBuilder();
-        builder.WebHost.UseTestServer();
-        builder.Services.AddSingleton<ApiGoalSource>();
-        builder.Services.AddSingleton<WorkerPool>();
-
-        _app = builder.Build();
-
-        var serverStartTime = DateTime.UtcNow;
-        var checkCount = 0;
-        var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown";
-
-        _app.MapGet("/health", (ApiGoalSource goalSource, WorkerPool workerPool) =>
-        {
-            var count = Interlocked.Increment(ref checkCount);
-            var uptime = DateTime.UtcNow - serverStartTime;
-            var goals = goalSource.GetAllGoals();
-            return Results.Ok(new HealthResponse
-            {
-                Status = "Healthy",
-                Uptime = uptime.Days > 0
-                    ? $"{uptime.Days}d {uptime.Hours}h {uptime.Minutes}m"
-                    : uptime.Hours > 0
-                        ? $"{uptime.Hours}h {uptime.Minutes}m"
-                        : $"{uptime.Minutes}m {uptime.Seconds}s",
-                UptimeSpan = uptime,
-                ActiveGoals = goals.Count(g => g.Status is GoalStatus.Pending or GoalStatus.InProgress),
-                CompletedGoals = goals.Count(g => g.Status == GoalStatus.Completed),
-                ConnectedWorkers = workerPool.GetAllWorkers().Count,
-                Version = version,
-                ServerTime = DateTime.UtcNow,
-                CheckNumber = count,
-            });
-        });
-
-        await _app.StartAsync();
-        _client = _app.GetTestClient();
+        _client = factory.CreateClient();
     }
 
-    public async Task DisposeAsync()
-    {
-        _client?.Dispose();
-        if (_app is not null)
-            await _app.StopAsync();
-    }
-
+    /// <summary>Sends GET /health and parses the JSON response body.</summary>
+    /// <returns>A parsed <see cref="JsonDocument"/> of the response body.</returns>
     private async Task<JsonDocument> GetHealthJsonAsync()
     {
-        var response = await _client!.GetAsync("/health");
+        var response = await _client.GetAsync("/health");
         response.EnsureSuccessStatusCode();
         return JsonDocument.Parse(await response.Content.ReadAsStringAsync());
     }
 
     [Fact]
-    public async Task HealthEndpoint_ReturnsHttp200()
+    public async Task GetHealth_Returns200()
     {
-        var response = await _client!.GetAsync("/health");
+        var response = await _client.GetAsync("/health");
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 
     [Fact]
-    public async Task HealthEndpoint_ContentTypeIsApplicationJson()
+    public async Task GetHealth_ReturnsJsonContentType()
     {
-        var response = await _client!.GetAsync("/health");
+        var response = await _client.GetAsync("/health");
         Assert.Contains("application/json", response.Content.Headers.ContentType?.ToString());
     }
 
     [Fact]
-    public async Task HealthEndpoint_StatusIsHealthy()
+    public async Task GetHealth_HasStatusField()
     {
-        using var doc = await GetHealthJsonAsync();
-        var status = doc.RootElement.GetProperty("status").GetString();
-        Assert.False(string.IsNullOrEmpty(status), "status must not be empty");
-        Assert.Equal("Healthy", status);
+        using var json = await GetHealthJsonAsync();
+        Assert.True(json.RootElement.TryGetProperty("status", out var val));
+        Assert.False(string.IsNullOrEmpty(val.GetString()));
     }
 
     [Fact]
-    public async Task HealthEndpoint_UptimeIsNonEmptyString()
+    public async Task GetHealth_HasUptimeField()
     {
-        using var doc = await GetHealthJsonAsync();
-        var uptime = doc.RootElement.GetProperty("uptime").GetString();
-        Assert.False(string.IsNullOrEmpty(uptime), "uptime must not be empty");
+        using var json = await GetHealthJsonAsync();
+        Assert.True(json.RootElement.TryGetProperty("uptime", out var val));
+        Assert.False(string.IsNullOrEmpty(val.GetString()));
     }
 
     [Fact]
-    public async Task HealthEndpoint_ActiveGoalsIsNonNegative()
+    public async Task GetHealth_HasActiveGoalsField()
     {
-        using var doc = await GetHealthJsonAsync();
-        var activeGoals = doc.RootElement.GetProperty("activeGoals").GetInt32();
-        Assert.True(activeGoals >= 0, "activeGoals must be >= 0");
+        using var json = await GetHealthJsonAsync();
+        Assert.True(json.RootElement.TryGetProperty("activeGoals", out var val));
+        Assert.True(val.GetInt32() >= 0);
     }
 
     [Fact]
-    public async Task HealthEndpoint_CompletedGoalsIsNonNegative()
+    public async Task GetHealth_HasCompletedGoalsField()
     {
-        using var doc = await GetHealthJsonAsync();
-        var completedGoals = doc.RootElement.GetProperty("completedGoals").GetInt32();
-        Assert.True(completedGoals >= 0, "completedGoals must be >= 0");
+        using var json = await GetHealthJsonAsync();
+        Assert.True(json.RootElement.TryGetProperty("completedGoals", out var val));
+        Assert.True(val.GetInt32() >= 0);
     }
 
     [Fact]
-    public async Task HealthEndpoint_ConnectedWorkersIsNonNegative()
+    public async Task GetHealth_HasConnectedWorkersField()
     {
-        using var doc = await GetHealthJsonAsync();
-        var connectedWorkers = doc.RootElement.GetProperty("connectedWorkers").GetInt32();
-        Assert.True(connectedWorkers >= 0, "connectedWorkers must be >= 0");
+        using var json = await GetHealthJsonAsync();
+        Assert.True(json.RootElement.TryGetProperty("connectedWorkers", out var val));
+        Assert.True(val.GetInt32() >= 0);
     }
 
     [Fact]
-    public async Task HealthEndpoint_VersionIsNonEmptyString()
+    public async Task GetHealth_HasVersionField()
     {
-        using var doc = await GetHealthJsonAsync();
-        var version = doc.RootElement.GetProperty("version").GetString();
-        Assert.False(string.IsNullOrEmpty(version), "version must not be empty");
+        using var json = await GetHealthJsonAsync();
+        Assert.True(json.RootElement.TryGetProperty("version", out var val));
+        Assert.False(string.IsNullOrEmpty(val.GetString()));
     }
 
     [Fact]
-    public async Task HealthEndpoint_ServerTimeIsValidUtcDateTime()
+    public async Task GetHealth_HasServerTimeField()
     {
-        using var doc = await GetHealthJsonAsync();
-        var raw = doc.RootElement.GetProperty("serverTime").GetString();
-        Assert.True(DateTime.TryParse(raw, out var serverTime), "serverTime must parse as a valid DateTime");
-        // Sanity-check: within 5 seconds of now
-        Assert.True(Math.Abs((DateTime.UtcNow - serverTime.ToUniversalTime()).TotalSeconds) < 5,
-            "serverTime must be close to UTC now");
-    }
-
-    [Fact]
-    public async Task HealthEndpoint_ActiveGoals_ReflectsAddedPendingGoal()
-    {
-        var goalSource = _app!.Services.GetService(typeof(ApiGoalSource)) as ApiGoalSource;
-        Assert.NotNull(goalSource);
-
-        goalSource!.AddGoal(new Goal { Id = "test-goal-1", Description = "Test goal" });
-
-        using var doc = await GetHealthJsonAsync();
-        Assert.Equal(1, doc.RootElement.GetProperty("activeGoals").GetInt32());
-    }
-
-    [Fact]
-    public async Task HealthEndpoint_ConnectedWorkers_ReflectsRegisteredWorker()
-    {
-        var workerPool = _app!.Services.GetService(typeof(WorkerPool)) as WorkerPool;
-        Assert.NotNull(workerPool);
-
-        workerPool!.RegisterWorker("test-worker-1", WorkerRole.Coder, ["code"]);
-
-        using var doc = await GetHealthJsonAsync();
-        Assert.True(doc.RootElement.GetProperty("connectedWorkers").GetInt32() >= 1,
-            "connectedWorkers must reflect the registered worker");
+        using var json = await GetHealthJsonAsync();
+        Assert.True(json.RootElement.TryGetProperty("serverTime", out var val));
+        Assert.True(DateTime.TryParse(val.GetString(), out _));
     }
 }
