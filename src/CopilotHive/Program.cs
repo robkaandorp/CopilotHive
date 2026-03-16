@@ -1,9 +1,11 @@
+using System.Reflection;
 using CopilotHive;
 using CopilotHive.Agents;
 using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Improvement;
 using CopilotHive.Metrics;
+using CopilotHive.Models;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
@@ -149,11 +151,26 @@ static async Task<int> RunServerAsync(string[] args)
     }
 
     app.MapGrpcService<HiveOrchestratorService>();
+    var _serverStartTime = DateTime.UtcNow;
     var _checkCount = 0;
-    app.MapGet("/health", () =>
+    var _version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown";
+    app.MapGet("/health", (ApiGoalSource goalSource, WorkerPool workerPool) =>
     {
         var count = Interlocked.Increment(ref _checkCount);
-        return Results.Ok($"Healthy (check #{count})");
+        var uptime = DateTime.UtcNow - _serverStartTime;
+        var goals = goalSource.GetAllGoals();
+        return Results.Ok(new HealthResponse
+        {
+            Status = "Healthy",
+            Uptime = FormatUptime(uptime),
+            UptimeSpan = uptime,
+            ActiveGoals = goals.Count(g => g.Status is GoalStatus.Pending or GoalStatus.InProgress),
+            CompletedGoals = goals.Count(g => g.Status == GoalStatus.Completed),
+            ConnectedWorkers = workerPool.GetAllWorkers().Count,
+            Version = _version,
+            ServerTime = DateTime.UtcNow,
+            CheckNumber = count,
+        });
     });
 
     // ── Goals REST API ───────────────────────────────────────────────────────
@@ -219,6 +236,19 @@ static void PrintBanner()
         """);
 }
 
+// Formats uptime as a human-readable string, e.g. "2d 3h 14m", "5h 2m", or "45m 3s".
+static string FormatUptime(TimeSpan ts) =>
+    ts.Days > 0
+        ? $"{ts.Days}d {ts.Hours}h {ts.Minutes}m"
+        : ts.Hours > 0
+            ? $"{ts.Hours}h {ts.Minutes}m"
+            : $"{ts.Minutes}m {ts.Seconds}s";
+
 /// <summary>Request body for updating the status of a goal via the HTTP API.</summary>
 /// <param name="Status">New status string (e.g. "completed", "failed").</param>
 record GoalStatusUpdate(string Status);
+
+// Marker class required by WebApplicationFactory<T> in integration tests.
+#pragma warning disable CS1591
+public partial class Program { }
+#pragma warning restore CS1591
