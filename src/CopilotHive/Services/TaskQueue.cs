@@ -16,7 +16,17 @@ public sealed class TaskQueue
     /// Adds a task to the pending queue.
     /// </summary>
     /// <param name="task">The task assignment to enqueue.</param>
-    public void Enqueue(TaskAssignment task) => _pending.Enqueue(task);
+    public void Enqueue(TaskAssignment task)
+    {
+        _pending.Enqueue(task);
+        OnEnqueue?.Invoke(task);
+    }
+
+    /// <summary>
+    /// Optional callback invoked synchronously after each enqueue.
+    /// Intended for test hooks that need to observe or react to dispatched tasks.
+    /// </summary>
+    public Action<TaskAssignment>? OnEnqueue { get; set; }
 
     /// <summary>
     /// Dequeue a pending task that matches the requested worker role.

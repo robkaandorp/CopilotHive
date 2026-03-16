@@ -156,6 +156,7 @@ public sealed class GoalPipeline
         Iteration = snapshot.Iteration;
         ReviewRetries = snapshot.ReviewRetries;
         TestRetries = snapshot.TestRetries;
+        ImproverRetries = snapshot.ImproverRetries;
         MaxRetries = snapshot.MaxRetries;
         MaxIterations = snapshot.MaxIterations;
         ActiveTaskId = snapshot.ActiveTaskId;

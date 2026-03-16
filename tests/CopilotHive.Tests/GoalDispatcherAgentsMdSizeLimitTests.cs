@@ -26,12 +26,14 @@ public sealed class GoalDispatcherAgentsMdSizeLimitTests : IDisposable
     [Fact]
     public async Task AgentsMdUnderLimit_NoRetry()
     {
+        // Arrange: file is under the 4000-char limit
         var shortContent = new string('x', 3999);
         var (configRepo, _) = CreateTempAgentsRepo("improver", shortContent);
 
         var brain = new FakeImproverBrain();
-        var (dispatcher, pipeline, taskId, _) = CreateImproverDispatcher(brain, configRepo);
+        var (dispatcher, pipeline, taskId, taskQueue) = CreateImproverDispatcher(brain, configRepo);
 
+        // Act
         await dispatcher.HandleTaskCompletionAsync(new TaskComplete
         {
             TaskId = taskId,
@@ -39,18 +41,28 @@ public sealed class GoalDispatcherAgentsMdSizeLimitTests : IDisposable
             Output = "Improved agents.md files.",
         });
 
+        // Assert: no retry increments and no retry dispatch
         Assert.Equal(0, pipeline.ImproverRetries);
+        // Strict: the improver was NOT re-dispatched (initial invocation only)
+        Assert.Null(taskQueue.TryDequeue(WorkerRole.Improver));
     }
 
     [Fact]
     public async Task AgentsMdOverLimit_TriggersRetryPrompt()
     {
+        // Arrange: file exceeds limit on first read; simulated improver shrinks it on retry
         var longContent = new string('x', 4001);
-        var (configRepo, _) = CreateTempAgentsRepo("improver", longContent);
+        var (configRepo, tempDir) = CreateTempAgentsRepo("improver", longContent);
+        var agentsMdPath = Path.Combine(tempDir, "agents", "improver.agents.md");
 
         var brain = new FakeImproverBrain();
         var (dispatcher, pipeline, taskId, taskQueue) = CreateImproverDispatcher(brain, configRepo);
 
+        // When the retry task is dispatched, simulate the improver condensing the file
+        taskQueue.OnEnqueue = _ =>
+            File.WriteAllText(agentsMdPath, new string('x', 3999));
+
+        // Act
         await dispatcher.HandleTaskCompletionAsync(new TaskComplete
         {
             TaskId = taskId,
@@ -58,18 +70,23 @@ public sealed class GoalDispatcherAgentsMdSizeLimitTests : IDisposable
             Output = "Improved agents.md files.",
         });
 
+        // Assert: exactly one retry
         Assert.Equal(1, pipeline.ImproverRetries);
 
-        // Verify the improver was re-dispatched with a prompt that names the role and char count
+        // Strict: exactly one retry task was dispatched — verify prompt content
         var retryTask = taskQueue.TryDequeue(WorkerRole.Improver);
         Assert.NotNull(retryTask);
         Assert.Contains("4001", retryTask.Prompt);
         Assert.Contains("improver", retryTask.Prompt);
+
+        // Strict: no second retry (would indicate the while loop didn't exit correctly)
+        Assert.Null(taskQueue.TryDequeue(WorkerRole.Improver));
     }
 
     [Fact]
     public async Task AgentsMdOverLimitAfter3Retries_DiscardsChanges()
     {
+        // Arrange: file always exceeds limit; 3 prior retries already consumed
         var longContent = new string('x', 4001);
         var (configRepo, _) = CreateTempAgentsRepo("improver", longContent);
 
@@ -77,11 +94,12 @@ public sealed class GoalDispatcherAgentsMdSizeLimitTests : IDisposable
         var brain = new FakeImproverBrain();
         var (dispatcher, pipeline, taskId, taskQueue) = CreateImproverDispatcher(brain, configRepo, logger);
 
-        // Simulate 3 prior improver retries already consumed
+        // Simulate 3 prior improver retries already consumed (pipeline has been here before)
         pipeline.IncrementImproverRetry();
         pipeline.IncrementImproverRetry();
         pipeline.IncrementImproverRetry();
 
+        // Act
         await dispatcher.HandleTaskCompletionAsync(new TaskComplete
         {
             TaskId = taskId,
@@ -89,13 +107,14 @@ public sealed class GoalDispatcherAgentsMdSizeLimitTests : IDisposable
             Output = "Improved agents.md files.",
         });
 
-        // Retries should not have increased beyond 3
+        // Assert: retry count did not increase beyond 3
         Assert.Equal(3, pipeline.ImproverRetries);
 
-        // Improver should NOT have been re-dispatched
+        // Strict: improver was NOT re-dispatched (while condition false; retries exhausted)
         Assert.Null(taskQueue.TryDequeue(WorkerRole.Improver));
 
-        // A warning about discarding changes should have been logged
+        // A "Discarding" warning must have been logged (restore was attempted)
+        Assert.Contains(logger.Warnings, w => w.Contains("Discarding"));
         Assert.Contains(logger.Warnings, w => w.Contains("still exceeds") && w.Contains("improver"));
     }
 

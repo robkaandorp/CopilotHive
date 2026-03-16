@@ -36,6 +36,10 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly ConcurrentDictionary<string, bool> _dispatchedGoals = new();
     private DateTime _lastAgentsSync = DateTime.MinValue;
 
+    // SHA of the config repo HEAD captured just before the improver is dispatched.
+    // Used to restore agents.md to the pre-improver state if all retries are exhausted.
+    private string? _preImproverSha;
+
     /// <summary>
     /// Initialises a new <see cref="GoalDispatcher"/> with required and optional dependencies.
     /// </summary>
@@ -226,7 +230,8 @@ public sealed class GoalDispatcher : BackgroundService
                 pipeline.GoalId);
             await SyncAgentsFromConfigRepoAsync(ct);
 
-            // Validate agents.md file sizes; re-dispatch improver if any exceed the 4000 char limit
+            // Validate agents.md file sizes; re-dispatch improver inline if any exceed the 4000 char limit.
+            // The while loop retries up to 3 times per file and is self-contained — no early return.
             if (_configRepo is not null)
             {
                 const int MaxAgentsMdChars = 4000;
@@ -238,24 +243,26 @@ public sealed class GoalDispatcher : BackgroundService
                     if (!File.Exists(agentsMdPath)) continue;
 
                     var content = await File.ReadAllTextAsync(agentsMdPath, ct);
-                    if (content.Length <= MaxAgentsMdChars) continue;
-
-                    if (pipeline.ImproverRetries < MaxImproverRetries)
+                    while (content.Length > MaxAgentsMdChars && pipeline.ImproverRetries < MaxImproverRetries)
                     {
                         pipeline.IncrementImproverRetry();
                         _logger.LogWarning(
-                            "agents.md for role '{Role}' is {Count} characters, exceeding the 4000 char limit. Retrying improver (attempt {Attempt}/{Max}).",
-                            role, content.Length, pipeline.ImproverRetries, MaxImproverRetries);
+                            "agents.md for '{Role}' is {Count} chars, exceeds 4000 limit. Retry {Attempt}/3.",
+                            role, content.Length, pipeline.ImproverRetries);
 
                         var retryPrompt = $"Your updated {role}.agents.md is {content.Length} characters, which exceeds the 4000 character limit. The Copilot CLI will discard content beyond this limit. Please condense the file to under 4000 characters while keeping the most impactful rules. Remove verbose examples, merge similar rules, and use concise language.";
                         await DispatchToRole(pipeline, WorkerRole.Improver, retryPrompt, ct);
-                        return;
+                        await SyncAgentsFromConfigRepoAsync(ct);
+                        content = await File.ReadAllTextAsync(agentsMdPath, ct);
                     }
 
-                    _logger.LogWarning(
-                        "agents.md for role '{Role}' still exceeds 4000 chars after {Max} retries. Discarding improver changes.",
-                        role, MaxImproverRetries);
-                    await RestoreAgentsMdFromGitAsync(role, ct);
+                    if (content.Length > MaxAgentsMdChars)
+                    {
+                        _logger.LogWarning(
+                            "agents.md for '{Role}' still exceeds 4000 chars after 3 retries. Discarding improver changes.",
+                            role);
+                        await RestoreAgentsMdFromGitAsync(role, _preImproverSha, ct);
+                    }
                 }
             }
         }
@@ -536,6 +543,10 @@ public sealed class GoalDispatcher : BackgroundService
 
                 // Pull the config repo to ensure the improver container starts with the latest agents.md files
                 await SyncAgentsFromConfigRepoAsync(ct);
+
+                // Capture HEAD SHA before any improver changes so we can restore if all retries fail
+                if (_configRepo is not null)
+                    _preImproverSha = await GetCurrentCommitShaAsync(_configRepo.LocalPath, ct);
 
                 var analysis = "";
                 if (_improvementAnalyzer is not null && _agentsManager is not null && _metricsTracker is not null)
@@ -865,11 +876,12 @@ public sealed class GoalDispatcher : BackgroundService
         }
     }
 
-    private async Task RestoreAgentsMdFromGitAsync(string role, CancellationToken ct)
+    private async Task RestoreAgentsMdFromGitAsync(string role, string? sha, CancellationToken ct)
     {
         if (_configRepo is null) return;
 
-        var psi = new System.Diagnostics.ProcessStartInfo("git", $"checkout HEAD~1 -- agents/{role}.agents.md")
+        var gitRef = string.IsNullOrWhiteSpace(sha) ? "HEAD~1" : sha;
+        var psi = new System.Diagnostics.ProcessStartInfo("git", $"checkout {gitRef} -- agents/{role}.agents.md")
         {
             WorkingDirectory = _configRepo.LocalPath,
             RedirectStandardOutput = true,
@@ -883,6 +895,20 @@ public sealed class GoalDispatcher : BackgroundService
             var stderr = await process.StandardError.ReadToEndAsync(ct);
             _logger.LogWarning("Failed to restore {Role} agents.md from git: {Error}", role, stderr);
         }
+    }
+
+    private async Task<string> GetCurrentCommitShaAsync(string repoPath, CancellationToken ct)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo("git", $"-C {repoPath} rev-parse HEAD")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        using var process = System.Diagnostics.Process.Start(psi)!;
+        var stdout = await process.StandardOutput.ReadToEndAsync(ct);
+        await process.WaitForExitAsync(ct);
+        return stdout.Trim();
     }
 
     /// <summary>
