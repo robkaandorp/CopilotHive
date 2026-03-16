@@ -5,25 +5,19 @@ namespace CopilotHive.Services;
 
 /// <summary>
 /// Hosted background service that periodically scans the worker pool for stale workers
-/// (workers whose heartbeat has not been received within <see cref="StaleTimeoutMinutes"/>
+/// (workers whose heartbeat has not been received within <see cref="CleanupDefaults.StaleTimeoutMinutes"/>
 /// minutes) and removes them.
 /// </summary>
 public sealed class StaleWorkerCleanupService : BackgroundService
 {
-    /// <summary>How often (in seconds) the cleanup pass runs.</summary>
-    public const int CleanupIntervalSeconds = 60;
-
-    /// <summary>Maximum minutes a worker may be silent before being considered stale.</summary>
-    public const int StaleTimeoutMinutes = 2;
-
     private readonly IWorkerPool _workerPool;
     private readonly ILogger<StaleWorkerCleanupService> _logger;
 
     /// <summary>
-    /// Delay between cleanup passes. Defaults to <see cref="CleanupIntervalSeconds"/>.
+    /// Delay between cleanup passes. Defaults to <see cref="CleanupDefaults.CleanupIntervalSeconds"/>.
     /// Settable internally to enable fast-cycle testing without waiting 60 s.
     /// </summary>
-    internal TimeSpan CleanupDelay { get; set; } = TimeSpan.FromSeconds(CleanupIntervalSeconds);
+    internal TimeSpan CleanupDelay { get; set; } = TimeSpan.FromSeconds(CleanupDefaults.CleanupIntervalSeconds);
 
     /// <summary>
     /// Initialises the service with the worker pool and a logger.
@@ -39,9 +33,9 @@ public sealed class StaleWorkerCleanupService : BackgroundService
     }
 
     /// <summary>
-    /// Runs a cleanup loop that waits <see cref="CleanupIntervalSeconds"/> seconds between
+    /// Runs a cleanup loop that waits <see cref="CleanupDefaults.CleanupIntervalSeconds"/> seconds between
     /// passes. On each pass it finds and removes all workers that have not sent a heartbeat
-    /// within <see cref="StaleTimeoutMinutes"/> minutes, logging a warning per eviction.
+    /// within <see cref="CleanupDefaults.StaleTimeoutMinutes"/> minutes, logging a warning per eviction.
     /// The loop exits when <paramref name="stoppingToken"/> is cancelled.
     /// </summary>
     /// <param name="stoppingToken">Token that signals the host is stopping.</param>
@@ -74,7 +68,7 @@ public sealed class StaleWorkerCleanupService : BackgroundService
     /// <returns>A <see cref="Task"/> that completes when the pass is finished.</returns>
     internal Task RunCleanupCycleAsync()
     {
-        var removed = _workerPool.PurgeStaleWorkers(TimeSpan.FromMinutes(StaleTimeoutMinutes));
+        var removed = _workerPool.PurgeStaleWorkers(TimeSpan.FromMinutes(CleanupDefaults.StaleTimeoutMinutes));
 
         foreach (var worker in removed)
             _logger.LogWarning("Removing stale worker {WorkerId}", worker.Id);

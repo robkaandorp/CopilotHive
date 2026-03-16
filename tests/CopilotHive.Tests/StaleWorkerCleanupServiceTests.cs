@@ -105,7 +105,7 @@ public sealed class StaleWorkerCleanupServiceTests
     [Fact]
     public async Task RunCleanupCycle_CallsPurgeStaleWorkers_WithCorrectTimeout()
     {
-        var expectedTimeout = TimeSpan.FromMinutes(StaleWorkerCleanupService.StaleTimeoutMinutes);
+        var expectedTimeout = TimeSpan.FromMinutes(CleanupDefaults.StaleTimeoutMinutes);
 
         var poolMock = new Mock<IWorkerPool>();
         poolMock
@@ -174,8 +174,8 @@ public sealed class StaleWorkerCleanupServiceTests
     [Fact]
     public void Constants_HaveExpectedValues()
     {
-        Assert.Equal(60, StaleWorkerCleanupService.CleanupIntervalSeconds);
-        Assert.Equal(2, StaleWorkerCleanupService.StaleTimeoutMinutes);
+        Assert.Equal(60, CleanupDefaults.CleanupIntervalSeconds);
+        Assert.Equal(2, CleanupDefaults.StaleTimeoutMinutes);
     }
 
     // ── Cancellation: service stops cleanly when token cancelled before delay ─
