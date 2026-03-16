@@ -20,6 +20,12 @@ public sealed class StaleWorkerCleanupService : BackgroundService
     private readonly ILogger<StaleWorkerCleanupService> _logger;
 
     /// <summary>
+    /// Delay between cleanup passes. Defaults to <see cref="CleanupIntervalSeconds"/>.
+    /// Settable internally to enable fast-cycle testing without waiting 60 s.
+    /// </summary>
+    internal TimeSpan CleanupDelay { get; set; } = TimeSpan.FromSeconds(CleanupIntervalSeconds);
+
+    /// <summary>
     /// Initialises the service with the worker pool and a logger.
     /// </summary>
     /// <param name="workerPool">The pool from which stale workers are removed.</param>
@@ -46,32 +52,32 @@ public sealed class StaleWorkerCleanupService : BackgroundService
         {
             try
             {
-                await Task.Delay(TimeSpan.FromSeconds(CleanupIntervalSeconds), stoppingToken);
+                await Task.Delay(CleanupDelay, stoppingToken);
+                await RunCleanupCycleAsync();
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
                 // Host is stopping — exit cleanly.
                 break;
             }
-
-            await RunCleanupCycleAsync();
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Cleanup cycle failed");
+            }
         }
     }
 
     /// <summary>
-    /// Performs a single cleanup pass: queries for stale workers, removes each one,
-    /// and logs a warning for each eviction.
+    /// Performs a single cleanup pass: atomically purges all stale workers and
+    /// logs a warning for each eviction.
     /// </summary>
     /// <returns>A <see cref="Task"/> that completes when the pass is finished.</returns>
     internal Task RunCleanupCycleAsync()
     {
-        var staleWorkers = _workerPool.GetStaleWorkers(TimeSpan.FromMinutes(StaleTimeoutMinutes));
+        var removed = _workerPool.PurgeStaleWorkers(TimeSpan.FromMinutes(StaleTimeoutMinutes));
 
-        foreach (var worker in staleWorkers)
-        {
-            _workerPool.RemoveWorker(worker.Id);
+        foreach (var worker in removed)
             _logger.LogWarning("Removing stale worker {WorkerId}", worker.Id);
-        }
 
         return Task.CompletedTask;
     }
