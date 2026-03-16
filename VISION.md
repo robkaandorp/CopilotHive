@@ -33,7 +33,7 @@ Replace fixed-role containers with N generic workers that switch roles per task 
 Per-role model selection is already implemented via `goals.yaml`. The next step is a provider abstraction layer so non-Copilot backends (OpenAI, Anthropic, Azure OpenAI, local models via Ollama) can be swapped in without code changes.
 
 ### Observability Dashboard
-A real-time web dashboard will surface pipeline state, per-goal metrics, worker health, and historical trends. The `metrics/` telemetry data will feed a live UI, enabling operators to monitor and intervene without reading log files.
+A real-time web dashboard will surface pipeline state, per-goal metrics, worker health, and historical trends. Telemetry data will feed a live UI, enabling operators to monitor and intervene without reading log files.
 
 ### Analyst Role
 A new `analyst` worker will perform static analysis, dependency audits, and codebase health assessment. The Analyst will run asynchronously alongside the main pipeline and feed findings into the Brain's decision context, enabling proactive quality enforcement beyond reactive review.

@@ -96,7 +96,6 @@ goals:
 | `tests/` | 333 xUnit tests |
 | `agents/` | Default agent templates (overridden by config repo at runtime) |
 | `docker/` | Dockerfiles and container configuration |
-| `metrics/` | File-based telemetry output |
 
 ## Current Features
 
@@ -110,7 +109,7 @@ goals:
 - **Auto-rebase on merge conflicts** — the pipeline automatically rebases and retries
 - **Fallback metrics parsing** — robust parsing handles varied worker output formats
 - **Duplicate goal completion guards** — prevents re-processing of already-completed goals
-- **File-based telemetry** — metrics and run data persisted to the `metrics/` directory
+- **Telemetry** — per-run metrics aggregated and fed into the improver
 
 ## Contributing
 
