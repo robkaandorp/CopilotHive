@@ -36,10 +36,6 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly ConcurrentDictionary<string, bool> _dispatchedGoals = new();
     private DateTime _lastAgentsSync = DateTime.MinValue;
 
-    // SHA of the config repo HEAD captured just before the improver is dispatched.
-    // Used to restore agents.md to the pre-improver state if all retries are exhausted.
-    private string? _preImproverSha;
-
     /// <summary>
     /// Initialises a new <see cref="GoalDispatcher"/> with required and optional dependencies.
     /// </summary>
@@ -261,7 +257,7 @@ public sealed class GoalDispatcher : BackgroundService
                         _logger.LogWarning(
                             "agents.md for '{Role}' still exceeds 4000 chars after 3 retries. Discarding improver changes.",
                             role);
-                        await RestoreAgentsMdFromGitAsync(role, _preImproverSha, ct);
+                        await RestoreAgentsMdFromGitAsync(role, pipeline.PreImproverSha, ct);
                     }
                 }
             }
@@ -546,7 +542,7 @@ public sealed class GoalDispatcher : BackgroundService
 
                 // Capture HEAD SHA before any improver changes so we can restore if all retries fail
                 if (_configRepo is not null)
-                    _preImproverSha = await GetCurrentCommitShaAsync(_configRepo.LocalPath, ct);
+                    pipeline.PreImproverSha = await GetCurrentCommitShaAsync(_configRepo.LocalPath, ct);
 
                 var analysis = "";
                 if (_improvementAnalyzer is not null && _agentsManager is not null && _metricsTracker is not null)
@@ -898,11 +894,13 @@ public sealed class GoalDispatcher : BackgroundService
             UseShellExecute = false,
         };
         using var process = System.Diagnostics.Process.Start(psi)!;
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
+        var stderrTask = process.StandardError.ReadToEndAsync(ct);
+        await Task.WhenAll(stdoutTask, stderrTask);
         await process.WaitForExitAsync(ct);
         if (process.ExitCode != 0)
         {
-            var stderr = await process.StandardError.ReadToEndAsync(ct);
-            _logger.LogWarning("Failed to restore {Role} agents.md from git: {Error}", role, stderr);
+            _logger.LogWarning("Failed to restore {Role} agents.md from git: {Error}", role, await stderrTask);
         }
     }
 
