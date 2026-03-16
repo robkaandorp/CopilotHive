@@ -281,7 +281,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {{historyContext}}
 
             Decide which phase to start with. Consider:
-            - Is this a documentation-only change? (just coder, maybe skip review)
+            - Is this a documentation-only change? (coder for edits, skip testing, docwriter updates docs)
             - Is this a code change? (needs coder → tester → docwriter → reviewer → merge)
             - Is there context from previous iterations?
 
@@ -290,10 +290,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
               "action": "spawn_coder",
               "prompt": "<the prompt you want to send to the first worker>",
               "reason": "<why you chose this plan>",
-              "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
+              "model_tier": "standard or premium — default is standard; only use premium after a FAILED attempt"
             }
 
-            Valid actions: spawn_coder, spawn_reviewer, spawn_tester, done, skip
+            Valid actions: spawn_coder, spawn_reviewer, spawn_tester, spawn_doc_writer, done, skip
             """;
 
         var decision = await AskAsync(pipeline, prompt, ct);
@@ -350,7 +350,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {{conversationSummary}}
 
             Decide the ordered phases for this iteration. Consider:
-            - Is this a doc-only change? (maybe skip review)
+            - Is this a documentation-only change? (coder edits, then docwriter — may skip testing)
             - Is this a retry after failure? (what phases need re-running)
             - What does the metrics history suggest?
 
