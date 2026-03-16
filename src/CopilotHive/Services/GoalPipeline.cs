@@ -19,6 +19,8 @@ public enum GoalPhase
     Review,
     /// <summary>The tester worker is running and writing tests.</summary>
     Testing,
+    /// <summary>The doc-writer worker is updating documentation.</summary>
+    DocWriting,
     /// <summary>The improver worker is improving AGENTS.md files.</summary>
     Improve,
     /// <summary>The feature branch is being merged to main.</summary>
@@ -68,7 +70,7 @@ public sealed class IterationPlan
     /// </summary>
     public static IterationPlan Default(bool includeImprove = false)
     {
-        var phases = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review };
+        var phases = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.DocWriting, GoalPhase.Review };
         if (includeImprove) phases.Add(GoalPhase.Improve);
         phases.Add(GoalPhase.Merging);
         return new IterationPlan { Phases = phases, Reason = "Default plan" };

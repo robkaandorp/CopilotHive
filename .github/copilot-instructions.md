@@ -4,9 +4,9 @@
 
 CopilotHive is a self-improving multi-agent orchestration system. A C# orchestrator
 (the "Product Owner") manages a pool of generic Docker containers running GitHub Copilot
-in headless mode. Workers dynamically accept any role (coder, tester, reviewer, improver)
-per task. They communicate via the Copilot .NET SDK over JSON-RPC and operate on isolated
-git clones.
+in headless mode. Workers dynamically accept any role (coder, tester, doc-writer, reviewer,
+improver) per task. They communicate via the Copilot .NET SDK over JSON-RPC and operate on
+isolated git clones.
 
 ## Technology Stack
 
@@ -26,7 +26,7 @@ CopilotHive/
 │   ├── Copilot/CopilotWorkerClient.cs # SDK wrapper with retry logic
 │   ├── Git/GitWorkspaceManager.cs    # Bare repo, clones, branching, merging
 │   ├── Metrics/                      # Per-iteration metrics tracking
-│   ├── Orchestration/Orchestrator.cs # Main loop: coder → tester → reviewer → merge
+│   ├── Orchestration/Orchestrator.cs # Main loop: coder → tester → docwriter → reviewer → merge
 │   ├── Workers/DockerWorkerManager.cs # Docker container lifecycle
 │   └── Program.cs                    # CLI entrypoint
 ├── tests/CopilotHive.Tests/         # xUnit tests (366+ tests)

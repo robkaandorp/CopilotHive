@@ -45,6 +45,9 @@ public sealed class HiveConfiguration
     /// <summary>Model for the improver role (default: claude-sonnet-4.6).</summary>
     public string? ImproverModel { get; init; }
 
+    /// <summary>Model for the doc-writer role (default: claude-haiku-4.5).</summary>
+    public string? DocWriterModel { get; init; }
+
     /// <summary>Model for the orchestrator's output interpretation (default: claude-sonnet-4.6).</summary>
     public string? OrchestratorModel { get; init; }
 
@@ -60,6 +63,9 @@ public sealed class HiveConfiguration
     /// <summary>Premium model for the improver role, used when the Brain selects the 'premium' tier.</summary>
     public string? PremiumImproverModel { get; init; }
 
+    /// <summary>Premium model for the doc-writer role, used when the Brain selects the 'premium' tier.</summary>
+    public string? PremiumDocWriterModel { get; init; }
+
     /// <summary>
     /// Resolves the model to use for a given agent role.
     /// Falls back to <see cref="Model"/> when no role-specific override is set.
@@ -72,6 +78,7 @@ public sealed class HiveConfiguration
         "reviewer" => ReviewerModel ?? Constants.DefaultReviewerModel,
         "tester" => TesterModel ?? Constants.DefaultWorkerModel,
         "improver" => ImproverModel ?? Constants.DefaultWorkerModel,
+        "docwriter" => DocWriterModel ?? Constants.DefaultDocWriterModel,
         "orchestrator" => OrchestratorModel ?? Constants.DefaultWorkerModel,
         _ => Model,
     };
@@ -87,6 +94,7 @@ public sealed class HiveConfiguration
         "reviewer" => PremiumReviewerModel,
         "tester" => PremiumTesterModel,
         "improver" => PremiumImproverModel,
+        "docwriter" => PremiumDocWriterModel,
         _ => null,
     };
 }

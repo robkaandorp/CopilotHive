@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8] — Doc Writer Role
+
+### Added
+- Doc-writer pipeline phase (between Testing and Review) for automatic documentation updates
+- `docwriter.agents.md` — instructions for updating README, CHANGELOG, XML doc comments
+- `GoalPhase.DocWriting` and `OrchestratorActionType.SpawnDocWriter`
+- `WORKER_ROLE_DOCS_WRITER` in gRPC proto (value 5)
+- Default model: claude-haiku-4.5 (fast/cheap); premium: claude-sonnet-4.6
+- Brain prompts include docwriting in available phases and example plans
+- Improver now reviews docwriter.agents.md alongside other agent files
+
+### Changed
+- Default pipeline order: Coding → Testing → DocWriting → Review → Improve → Merge
+- Brain CraftPromptAsync includes docwriter guidance
+- Agents.md size validation covers docwriter role
+
 ## [0.7] — Generic Worker Pool & Pipeline Reorder
 
 ### Added

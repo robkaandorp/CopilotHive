@@ -17,6 +17,8 @@ public enum OrchestratorActionType
     SpawnTester,
     /// <summary>Spawn the improver worker to suggest AGENTS.md changes.</summary>
     SpawnImprover,
+    /// <summary>Spawn the doc-writer worker to update documentation.</summary>
+    SpawnDocWriter,
     /// <summary>Send the code back to the coder with change requests.</summary>
     RequestChanges,
     /// <summary>Retry the current phase from the beginning.</summary>

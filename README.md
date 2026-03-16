@@ -2,11 +2,11 @@
 
 # CopilotHive
 
-CopilotHive is a **self-improving multi-agent orchestration system** powered by the **GitHub Copilot SDK**. A pool of generic worker agents collaborate autonomously inside Docker containers — dynamically taking on roles (coder, tester, reviewer, improver) per task — to implement software goals without human intervention.
+CopilotHive is a **self-improving multi-agent orchestration system** powered by the **GitHub Copilot SDK**. A pool of generic worker agents collaborate autonomously inside Docker containers — dynamically taking on roles (coder, tester, doc-writer, reviewer, improver) per task — to implement software goals without human intervention.
 
 ## Architecture
 
-The Orchestrator Brain (an LLM-powered decision engine) receives goals and dispatches work to a pool of generic workers. Each worker runs in an isolated Docker container and accepts any role (coder, tester, reviewer, improver) per task.
+The Orchestrator Brain (an LLM-powered decision engine) receives goals and dispatches work to a pool of generic workers. Each worker runs in an isolated Docker container and accepts any role (coder, tester, doc-writer, reviewer, improver) per task.
 
 ```
                     ┌─────────────────┐
@@ -28,13 +28,14 @@ The Orchestrator Brain (an LLM-powered decision engine) receives goals and dispa
 
 Goals flow through a structured pipeline:
 
-**Coding → Testing → Review → Merge → Improve**
+**Coding → Testing → Doc Writing → Review → Merge → Improve**
 
 1. **Coding**: A worker (assigned the coder role) implements the goal on a feature branch.
 2. **Testing**: A worker (assigned the tester role) builds the project and runs all tests.
-3. **Review**: A worker (assigned the reviewer role) inspects the diff and test results.
-4. **Merge**: The Brain decides when quality is sufficient and merges the branch.
-5. **Improve**: A worker (assigned the improver role) updates `agents.md` based on metrics.
+3. **Doc Writing**: A worker (assigned the doc-writer role) updates documentation to reflect the changes.
+4. **Review**: A worker (assigned the reviewer role) inspects the diff, tests, and documentation.
+5. **Merge**: The Brain decides when quality is sufficient and merges the branch.
+6. **Improve**: A worker (assigned the improver role) updates `agents.md` based on metrics.
 
 If testing or review fails, the pipeline retries the coding step (up to a configured limit).
 

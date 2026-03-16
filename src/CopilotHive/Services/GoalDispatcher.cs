@@ -242,7 +242,7 @@ public sealed class GoalDispatcher : BackgroundService
                 const int MaxAgentsMdChars = 4000;
                 const int MaxImproverRetries = 3;
 
-                foreach (var role in new[] { "coder", "tester", "reviewer", "improver", "orchestrator" })
+                foreach (var role in new[] { "coder", "tester", "reviewer", "improver", "orchestrator", "docwriter" })
                 {
                     var agentsMdPath = Path.Combine(_configRepo.LocalPath, "agents", $"{role}.agents.md");
                     if (!File.Exists(agentsMdPath)) continue;
@@ -334,6 +334,11 @@ public sealed class GoalDispatcher : BackgroundService
             case OrchestratorActionType.SpawnImprover:
                 pipeline.AdvanceTo(GoalPhase.Improve);
                 await DispatchToRole(pipeline, WorkerRole.Improver, interpretation.Prompt, ct);
+                break;
+
+            case OrchestratorActionType.SpawnDocWriter:
+                pipeline.AdvanceTo(GoalPhase.DocWriting);
+                await DispatchToRole(pipeline, WorkerRole.DocsWriter, interpretation.Prompt, ct);
                 break;
 
             case OrchestratorActionType.RequestChanges:
@@ -545,6 +550,14 @@ public sealed class GoalDispatcher : BackgroundService
                 await DispatchToRole(pipeline, WorkerRole.Tester, testPrompt, ct);
                 break;
 
+            case GoalPhase.DocWriting:
+                pipeline.AdvanceTo(GoalPhase.DocWriting);
+                var docPrompt = _brain is not null
+                    ? await _brain.CraftPromptAsync(pipeline, "docwriter", phaseInstructions, ct)
+                    : $"Update documentation for the changes made to: {pipeline.Description}";
+                await DispatchToRole(pipeline, WorkerRole.DocsWriter, docPrompt, ct);
+                break;
+
             case GoalPhase.Improve:
                 pipeline.AdvanceTo(GoalPhase.Improve);
                 _logger.LogInformation("Dispatching Improver for goal {GoalId}", pipeline.GoalId);
@@ -560,7 +573,7 @@ public sealed class GoalDispatcher : BackgroundService
                 if (_improvementAnalyzer is not null && _agentsManager is not null && _metricsTracker is not null)
                 {
                     var agentsMd = new Dictionary<string, string>();
-                    foreach (var role in new[] { "coder", "tester", "reviewer", "improver" })
+                    foreach (var role in new[] { "coder", "tester", "reviewer", "improver", "docwriter" })
                     {
                         var content = _agentsManager.GetAgentsMd(role);
                         if (!string.IsNullOrEmpty(content)) agentsMd[role] = content;
@@ -676,6 +689,7 @@ public sealed class GoalDispatcher : BackgroundService
             WorkerRole.Reviewer => "reviewer",
             WorkerRole.Tester => "tester",
             WorkerRole.Improver => "improver",
+            WorkerRole.DocsWriter => "docwriter",
             _ => "coder",
         };
         var model = _config?.GetModelForRole(roleName);

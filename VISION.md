@@ -38,8 +38,8 @@ A real-time web dashboard will surface pipeline state, per-goal metrics, worker 
 ### Analyst Role
 A new `analyst` worker will perform static analysis, dependency audits, and codebase health assessment. The Analyst will run asynchronously alongside the main pipeline and feed findings into the Brain's decision context, enabling proactive quality enforcement beyond reactive review.
 
-### Documentation Writer Role
-A `doc-writer` worker will auto-update changelogs, READMEs, and API docs after code changes land. It runs post-merge, diffing the before/after state to produce accurate, contextual documentation updates.
+### ✅ Documentation Writer Role
+A `doc-writer` worker auto-updates changelogs, READMEs, and XML doc comments after code changes. It runs as a pipeline phase between Testing and Review, using claude-haiku-4.5 (fast/cheap) by default. The reviewer validates doc quality alongside code quality.
 
 ## Parked / Exploratory
 

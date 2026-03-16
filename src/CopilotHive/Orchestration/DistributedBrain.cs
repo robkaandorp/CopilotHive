@@ -282,7 +282,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             Decide which phase to start with. Consider:
             - Is this a documentation-only change? (just coder, maybe skip review)
-            - Is this a code change? (needs coder → tester → reviewer → merge)
+            - Is this a code change? (needs coder → tester → docwriter → reviewer → merge)
             - Is there context from previous iterations?
 
             Respond with JSON:
@@ -354,11 +354,11 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - Is this a retry after failure? (what phases need re-running)
             - What does the metrics history suggest?
 
-            Available phases: coding, testing, review, improve, merging
+            Available phases: coding, testing, docwriting, review, improve, merging
 
             Respond with JSON:
             {
-              "phases": ["coding", "testing", "review", "merging"],
+              "phases": ["coding", "testing", "docwriting", "review", "merging"],
               "phase_instructions": {
                 "coding": "specific instructions for the coder...",
                 "review": "focus review on..."
@@ -471,6 +471,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, build, test, and commit. Do NOT include git branch or git push commands.
             - For reviewers: tell them to review the diff on branch "{{pipeline.CoderBranch ?? "TBD"}}" against the base branch, produce a REVIEW_REPORT
             - For testers: tell them to build, run tests with coverage (`dotnet test /p:CollectCoverage=true /p:CoverletOutputFormat=text`), write integration tests, produce a TEST_REPORT
+            - For docwriters: tell them to update README, CHANGELOG, and XML doc comments based on the code changes on the branch, build to verify, and commit. Produce a DOC_REPORT.
             - Include any context from previous phases that would help the worker
 
             Respond with JSON:
@@ -524,6 +525,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 }
                 """,
             "improve" => """
+                {
+                  "verdict": "PASS or FAIL",
+                  "issues": ["<issue1>", "<issue2>"],
+                  "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
+                }
+                """,
+            "docwriting" => """
                 {
                   "verdict": "PASS or FAIL",
                   "issues": ["<issue1>", "<issue2>"],

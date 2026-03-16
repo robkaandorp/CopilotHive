@@ -36,4 +36,8 @@ internal static class Constants
     public const string DefaultReviewerModel    = "gpt-5.3-codex";
     /// <summary>Default model for tester, improver and orchestrator roles.</summary>
     public const string DefaultWorkerModel      = "claude-sonnet-4.6";
+    /// <summary>Default model for doc-writer role (fast, cheap model for documentation).</summary>
+    public const string DefaultDocWriterModel   = "claude-haiku-4.5";
+    /// <summary>Default premium model for doc-writer role.</summary>
+    public const string DefaultPremiumDocWriterModel = "claude-sonnet-4.6";
 }
