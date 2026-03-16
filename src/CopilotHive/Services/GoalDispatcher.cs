@@ -638,7 +638,18 @@ public sealed class GoalDispatcher : BackgroundService
             role, pipeline.GoalId, promptPreview);
 
         var branchAction = pipeline.CoderBranch is null ? BranchAction.Create : BranchAction.Checkout;
-        var repositories = ResolveRepositories(pipeline.Goal);
+
+        List<TargetRepository> repositories;
+        try
+        {
+            repositories = ResolveRepositories(pipeline.Goal);
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogError(ex, "Repository configuration error for goal {GoalId}", pipeline.GoalId);
+            await MarkGoalFailed(pipeline, ex.Message, ct);
+            return;
+        }
 
         // Resolve per-role model from config
         var roleName = role switch
@@ -1369,7 +1380,16 @@ public sealed class GoalDispatcher : BackgroundService
         _pipelineManager.PersistFull(pipeline);
     }
 
-    private List<TargetRepository> ResolveRepositories(Goal goal)
+    /// <summary>
+    /// Resolves the list of <see cref="TargetRepository"/> instances for the given goal by looking
+    /// up each repository name in the hive configuration.
+    /// </summary>
+    /// <param name="goal">The goal whose <see cref="Goal.RepositoryNames"/> are to be resolved.</param>
+    /// <returns>A list of resolved <see cref="TargetRepository"/> objects with injected credentials.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when any repository name referenced by the goal is not defined in hive-config.yaml.
+    /// </exception>
+    internal List<TargetRepository> ResolveRepositories(Goal goal)
     {
         var repos = new List<TargetRepository>();
 
@@ -1390,7 +1410,8 @@ public sealed class GoalDispatcher : BackgroundService
             }
             else
             {
-                _logger.LogWarning("Repository '{RepoName}' from goal not found in config", repoName);
+                throw new InvalidOperationException(
+                    $"Goal '{goal.Id}' references repository '{repoName}' which is not defined in hive-config.yaml. Add it to the repositories section or remove it from the goal.");
             }
         }
 

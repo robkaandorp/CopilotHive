@@ -1,3 +1,4 @@
+using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
@@ -153,6 +154,88 @@ public sealed class GoalDispatcherReviewVerdictTests
             brain);
 
         return (dispatcher, pipeline, taskId);
+    }
+}
+
+/// <summary>
+/// Tests for <see cref="GoalDispatcher.ResolveRepositories"/> fail-fast behavior.
+/// </summary>
+public sealed class GoalDispatcherResolveRepositoriesTests
+{
+    [Fact]
+    public void ResolveRepositories_AllValidNames_ReturnsAllRepositories()
+    {
+        var dispatcher = CreateDispatcher(
+        [
+            new RepositoryConfig { Name = "RepoA", Url = "https://github.com/org/repo-a" },
+            new RepositoryConfig { Name = "RepoB", Url = "https://github.com/org/repo-b" },
+        ]);
+        var goal = new Goal { Id = "goal-1", Description = "Test", RepositoryNames = ["RepoA", "RepoB"] };
+
+        var result = dispatcher.ResolveRepositories(goal);
+
+        Assert.Equal(2, result.Count);
+        Assert.Contains(result, r => r.Name == "RepoA");
+        Assert.Contains(result, r => r.Name == "RepoB");
+    }
+
+    [Fact]
+    public void ResolveRepositories_UnknownName_ThrowsInvalidOperationException()
+    {
+        var dispatcher = CreateDispatcher(
+        [
+            new RepositoryConfig { Name = "RepoA", Url = "https://github.com/org/repo-a" },
+        ]);
+        var goal = new Goal { Id = "goal-2", Description = "Test", RepositoryNames = ["unknown-repo"] };
+
+        Assert.Throws<InvalidOperationException>(() => dispatcher.ResolveRepositories(goal));
+    }
+
+    [Fact]
+    public void ResolveRepositories_ExceptionMessage_IncludesGoalIdAndRepoName()
+    {
+        var dispatcher = CreateDispatcher(
+        [
+            new RepositoryConfig { Name = "RepoA", Url = "https://github.com/org/repo-a" },
+        ]);
+        var goal = new Goal { Id = "goal-42", Description = "Test", RepositoryNames = ["missing-repo"] };
+
+        var ex = Assert.Throws<InvalidOperationException>(() => dispatcher.ResolveRepositories(goal));
+
+        Assert.Contains("goal-42", ex.Message);
+        Assert.Contains("missing-repo", ex.Message);
+    }
+
+    [Fact]
+    public void ResolveRepositories_MixOfValidAndInvalidRepos_FailsWithoutPartialResults()
+    {
+        var dispatcher = CreateDispatcher(
+        [
+            new RepositoryConfig { Name = "RepoA", Url = "https://github.com/org/repo-a" },
+        ]);
+        var goal = new Goal { Id = "goal-3", Description = "Test", RepositoryNames = ["RepoA", "bad-repo"] };
+
+        Assert.Throws<InvalidOperationException>(() => dispatcher.ResolveRepositories(goal));
+    }
+
+    private static GoalDispatcher CreateDispatcher(List<RepositoryConfig> repos)
+    {
+        var goal = new Goal { Id = "setup-goal", Description = "Setup" };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        goalManager.GetNextGoalAsync().GetAwaiter().GetResult();
+
+        var config = new HiveConfigFile { Repositories = repos };
+
+        return new GoalDispatcher(
+            goalManager,
+            new GoalPipelineManager(),
+            new TaskQueue(),
+            new WorkerPool(),
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            config: config);
     }
 }
 
