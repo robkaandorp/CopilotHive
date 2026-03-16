@@ -1,7 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text;
 using System.Text.RegularExpressions;
-using CopilotHive.Copilot;
 using CopilotHive.Metrics;
 using CopilotHive.Services;
 using CopilotHive.Telemetry;

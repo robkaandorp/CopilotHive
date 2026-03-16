@@ -3,9 +3,8 @@ using CopilotHive.Services;
 namespace CopilotHive.Orchestration;
 
 /// <summary>
-/// LLM-powered brain for the distributed orchestrator. Unlike <see cref="IOrchestratorBrain"/>
-/// (which spawns its own container), this interface is designed for the server-mode orchestrator
-/// where the Brain runs alongside the server process and supports multiple concurrent goals.
+/// LLM-powered brain for the distributed orchestrator.
+/// Runs alongside the server process and supports multiple concurrent goals.
 /// </summary>
 public interface IDistributedBrain
 {
