@@ -32,6 +32,10 @@ internal static class Constants
     public const int    DefaultMaxIterations = 10;
     public const string DefaultModel         = "claude-opus-4.6";
 
+    // Version
+    /// <summary>Current orchestrator version reported to workers on registration.</summary>
+    public const string OrchestratorVersion = "1.0.0";
+
     /// <summary>Default model for reviewer role.</summary>
     public const string DefaultReviewerModel    = "gpt-5.3-codex";
     /// <summary>Default model for tester, improver and orchestrator roles.</summary>

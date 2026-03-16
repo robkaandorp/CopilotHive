@@ -17,7 +17,7 @@ public sealed class HiveOrchestratorService(
     ILogger<HiveOrchestratorService> logger,
     AgentsManager? agentsManager = null) : HiveOrchestrator.HiveOrchestratorBase
 {
-    private const string OrchestratorVersion = "1.0.0";
+
 
     /// <summary>
     /// Registers a worker with the orchestrator and assigns it an ID.
@@ -44,7 +44,7 @@ public sealed class HiveOrchestratorService(
             return Task.FromResult(new RegisterResponse
             {
                 Accepted = true,
-                OrchestratorVersion = OrchestratorVersion,
+                OrchestratorVersion = Constants.OrchestratorVersion,
                 AssignedWorkerId = workerId,
             });
         }
@@ -54,7 +54,7 @@ public sealed class HiveOrchestratorService(
             return Task.FromResult(new RegisterResponse
             {
                 Accepted = false,
-                OrchestratorVersion = OrchestratorVersion,
+                OrchestratorVersion = Constants.OrchestratorVersion,
                 AssignedWorkerId = workerId,
             });
         }
