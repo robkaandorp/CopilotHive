@@ -302,6 +302,9 @@ public sealed class GoalDispatcher : BackgroundService
         if (interpretation.Issues is not null)
             pipeline.Metrics.Issues.AddRange(interpretation.Issues);
 
+        // Propagate model_tier from the interpretation so DispatchToRole can upgrade the model if needed.
+        pipeline.LatestModelTier = interpretation.ModelTier == "premium" ? "premium" : "standard";
+
         // Decide next step based on the action
         switch (interpretation.Action)
         {
@@ -1362,6 +1365,7 @@ public sealed class GoalDispatcher : BackgroundService
             };
 
             pipeline.AdvanceTo(firstRole == WorkerRole.Coder ? GoalPhase.Coding : GoalPhase.Review);
+            pipeline.LatestModelTier = goalPlan.ModelTier == "premium" ? "premium" : "standard";
             await DispatchToRole(pipeline, firstRole, goalPlan.Prompt, ct);
         }
         else
