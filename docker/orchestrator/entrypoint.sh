@@ -70,7 +70,7 @@ echo "[entrypoint] Starting CopilotHive Orchestrator"
 # Pass the Brain port as env var so the .NET app can connect
 export BRAIN_COPILOT_PORT="${COPILOT_PORT}"
 
-dotnet CopilotHive.dll --serve --port="${GRPC_PORT:-5000}" "$@" &
+dotnet CopilotHive.dll --port="${GRPC_PORT:-5000}" "$@" &
 APP_PID=$!
 echo "[entrypoint] Orchestrator started with PID ${APP_PID}"
 
