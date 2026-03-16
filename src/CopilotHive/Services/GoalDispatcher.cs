@@ -151,6 +151,15 @@ public sealed class GoalDispatcher : BackgroundService
             return;
         }
 
+        // Guard: ignore late-arriving completions for goals already finished
+        if (pipeline.Phase is GoalPhase.Done or GoalPhase.Failed)
+        {
+            _logger.LogInformation(
+                "Task {TaskId} completed but goal {GoalId} already {Phase} — ignoring duplicate",
+                complete.TaskId, pipeline.GoalId, pipeline.Phase);
+            return;
+        }
+
         _logger.LogInformation("Pipeline {GoalId} task completed (phase={Phase}, status={Status})",
             pipeline.GoalId, pipeline.Phase, complete.Status);
 
@@ -1073,6 +1082,13 @@ public sealed class GoalDispatcher : BackgroundService
 
     private async Task MarkGoalCompleted(GoalPipeline pipeline, CancellationToken ct)
     {
+        // Defensive: prevent double-completion
+        if (pipeline.Phase == GoalPhase.Done)
+        {
+            _logger.LogWarning("Goal {GoalId} is already Done — skipping duplicate completion", pipeline.GoalId);
+            return;
+        }
+
         pipeline.AdvanceTo(GoalPhase.Done);
 
         var completedMeta = new GoalUpdateMetadata
