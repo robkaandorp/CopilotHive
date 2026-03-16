@@ -98,6 +98,8 @@ public sealed class GoalPipeline
     public int ReviewRetries { get; private set; }
     /// <summary>Number of times the test phase has been retried in the current iteration.</summary>
     public int TestRetries { get; private set; }
+    /// <summary>Number of times the improver has been retried due to agents.md size violations.</summary>
+    public int ImproverRetries { get; private set; }
     /// <summary>Maximum number of task-level retries allowed.</summary>
     public int MaxRetries { get; init; } = Constants.DefaultMaxRetriesPerTask;
     /// <summary>Maximum number of iterations allowed before the goal is failed.</summary>
@@ -266,6 +268,16 @@ public sealed class GoalPipeline
         {
             TestRetries++;
             return TestRetries < MaxRetries;
+        }
+    }
+
+    /// <summary>Increment the improver retry counter. Returns true if retries remain.</summary>
+    public bool IncrementImproverRetry()
+    {
+        lock (_lock)
+        {
+            ImproverRetries++;
+            return ImproverRetries < MaxRetries;
         }
     }
 

@@ -225,6 +225,39 @@ public sealed class GoalDispatcher : BackgroundService
             _logger.LogInformation("Improver completed for goal {GoalId} — syncing config repo for updated agents.md files",
                 pipeline.GoalId);
             await SyncAgentsFromConfigRepoAsync(ct);
+
+            // Validate agents.md file sizes; re-dispatch improver if any exceed the 4000 char limit
+            if (_configRepo is not null)
+            {
+                const int MaxAgentsMdChars = 4000;
+                const int MaxImproverRetries = 3;
+
+                foreach (var role in new[] { "coder", "tester", "reviewer", "improver", "orchestrator" })
+                {
+                    var agentsMdPath = Path.Combine(_configRepo.LocalPath, "agents", $"{role}.agents.md");
+                    if (!File.Exists(agentsMdPath)) continue;
+
+                    var content = await File.ReadAllTextAsync(agentsMdPath, ct);
+                    if (content.Length <= MaxAgentsMdChars) continue;
+
+                    if (pipeline.ImproverRetries < MaxImproverRetries)
+                    {
+                        pipeline.IncrementImproverRetry();
+                        _logger.LogWarning(
+                            "agents.md for role '{Role}' is {Count} characters, exceeding the 4000 char limit. Retrying improver (attempt {Attempt}/{Max}).",
+                            role, content.Length, pipeline.ImproverRetries, MaxImproverRetries);
+
+                        var retryPrompt = $"Your updated {role}.agents.md is {content.Length} characters, which exceeds the 4000 character limit. The Copilot CLI will discard content beyond this limit. Please condense the file to under 4000 characters while keeping the most impactful rules. Remove verbose examples, merge similar rules, and use concise language.";
+                        await DispatchToRole(pipeline, WorkerRole.Improver, retryPrompt, ct);
+                        return;
+                    }
+
+                    _logger.LogWarning(
+                        "agents.md for role '{Role}' still exceeds 4000 chars after {Max} retries. Discarding improver changes.",
+                        role, MaxImproverRetries);
+                    await RestoreAgentsMdFromGitAsync(role, ct);
+                }
+            }
         }
 
         // Update metrics if available from Brain interpretation
@@ -829,6 +862,26 @@ public sealed class GoalDispatcher : BackgroundService
         {
             var stderr = await process.StandardError.ReadToEndAsync(ct);
             throw new InvalidOperationException($"git {arguments} failed: {stderr}");
+        }
+    }
+
+    private async Task RestoreAgentsMdFromGitAsync(string role, CancellationToken ct)
+    {
+        if (_configRepo is null) return;
+
+        var psi = new System.Diagnostics.ProcessStartInfo("git", $"checkout HEAD~1 -- agents/{role}.agents.md")
+        {
+            WorkingDirectory = _configRepo.LocalPath,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        using var process = System.Diagnostics.Process.Start(psi)!;
+        await process.WaitForExitAsync(ct);
+        if (process.ExitCode != 0)
+        {
+            var stderr = await process.StandardError.ReadToEndAsync(ct);
+            _logger.LogWarning("Failed to restore {Role} agents.md from git: {Error}", role, stderr);
         }
     }
 
