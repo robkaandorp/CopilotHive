@@ -524,6 +524,15 @@ public sealed class GoalDispatcher : BackgroundService
                 if (!string.IsNullOrEmpty(phaseInstructions))
                     improveContext = phaseInstructions + "\n\n" + improveContext;
 
+                var telemetryAggregator = new TelemetryAggregator();
+                var telemetryRoles = new[] { "coder", "reviewer", "tester" };
+                var stateDir = Environment.GetEnvironmentVariable("STATE_DIR") ?? "/app/state";
+                var telemetrySummary = telemetryAggregator.AggregateTelemetry(stateDir, telemetryRoles);
+                var telemetryText = telemetryAggregator.FormatSummary(telemetrySummary);
+                if (!string.IsNullOrEmpty(telemetryText))
+                    improveContext += "\n\n## Telemetry\n" + telemetryText;
+                telemetryAggregator.ClearTelemetryFiles(stateDir, telemetryRoles);
+
                 var improvePrompt = _brain is not null
                     ? await _brain.CraftPromptAsync(pipeline, "improver", improveContext, ct)
                     : "Update the *.agents.md files based on iteration results.\n\n" + analysis;
