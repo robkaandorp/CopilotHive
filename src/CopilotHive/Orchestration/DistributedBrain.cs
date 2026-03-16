@@ -76,6 +76,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 ? SystemPrompt
                 : $"{SystemPrompt}\n\n{orchestratorInstructions}",
             Tools = [], // no tools — pure reasoning agent
+            Infer = false,
         };
     }
 
@@ -151,6 +152,18 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             return existing;
 
         var session = await _copilotClient!.CreateSessionAsync(BuildBrainSessionConfig());
+
+        // Pre-select the orchestrator agent so the role-specific prompt is active
+        // from the first message — without this the runtime relies on inference.
+        try
+        {
+            await session.Rpc.Agent.SelectAsync(_orchestratorAgent.Name);
+            _logger.LogDebug("Pre-selected orchestrator agent via RPC for goal {GoalId}", pipeline.GoalId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to pre-select orchestrator agent for goal {GoalId}", pipeline.GoalId);
+        }
 
         if (_sessions.TryAdd(pipeline.GoalId, session))
         {
