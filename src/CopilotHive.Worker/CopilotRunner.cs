@@ -306,8 +306,8 @@ public sealed class CopilotRunner : IAsyncDisposable
                     _log.Info("↩ Agent deselected, returning to parent");
                     break;
                 // Streaming events for observability
-                case AssistantMessageDeltaEvent:
-                    // Incremental response text — we capture the final in AssistantMessageEvent
+                case AssistantMessageDeltaEvent delta:
+                    Console.Write(delta.Data.DeltaContent);
                     break;
                 default:
                     // Log unhandled event types at debug level for discovery
