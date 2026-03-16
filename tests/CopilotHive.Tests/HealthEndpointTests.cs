@@ -1,5 +1,9 @@
 using System.Net;
 using System.Text.Json;
+using CopilotHive.Goals;
+using CopilotHive.Services;
+using CopilotHive.Shared.Grpc;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace CopilotHive.Tests;
 
@@ -11,11 +15,13 @@ namespace CopilotHive.Tests;
 public class HealthEndpointTests : IClassFixture<HiveTestFactory>
 {
     private readonly HttpClient _client;
+    private readonly HiveTestFactory _factory;
 
     /// <summary>Receives the shared factory and creates an <see cref="HttpClient"/> backed by the test server.</summary>
     /// <param name="factory">The shared <see cref="HiveTestFactory"/> fixture for this test class.</param>
     public HealthEndpointTests(HiveTestFactory factory)
     {
+        _factory = factory;
         _client = factory.CreateClient();
     }
 
@@ -96,5 +102,41 @@ public class HealthEndpointTests : IClassFixture<HiveTestFactory>
         using var json = await GetHealthJsonAsync();
         Assert.True(json.RootElement.TryGetProperty("serverTime", out var val));
         Assert.True(DateTime.TryParse(val.GetString(), out _));
+    }
+
+    [Fact]
+    public async Task GetHealth_ActiveGoals_ReflectsAddedPendingGoal()
+    {
+        // Get baseline count before adding a goal.
+        using var before = await GetHealthJsonAsync();
+        var baselineActive = before.RootElement.GetProperty("activeGoals").GetInt32();
+
+        // Add a pending goal via the singleton ApiGoalSource.
+        var goalSource = _factory.Services.GetRequiredService<ApiGoalSource>();
+        goalSource.AddGoal(new Goal { Id = "test-goal-" + Guid.NewGuid(), Description = "behavior test goal" });
+
+        // Verify the count increased.
+        using var after = await GetHealthJsonAsync();
+        var newActive = after.RootElement.GetProperty("activeGoals").GetInt32();
+        Assert.True(newActive > baselineActive,
+            $"Expected activeGoals to increase from {baselineActive}, but got {newActive}");
+    }
+
+    [Fact]
+    public async Task GetHealth_ConnectedWorkers_ReflectsRegisteredWorker()
+    {
+        // Get baseline count before registering a worker.
+        using var before = await GetHealthJsonAsync();
+        var baselineWorkers = before.RootElement.GetProperty("connectedWorkers").GetInt32();
+
+        // Register a worker via the singleton WorkerPool.
+        var workerPool = _factory.Services.GetRequiredService<WorkerPool>();
+        workerPool.RegisterWorker("test-worker-" + Guid.NewGuid(), WorkerRole.Coder, []);
+
+        // Verify the count increased.
+        using var after = await GetHealthJsonAsync();
+        var newWorkers = after.RootElement.GetProperty("connectedWorkers").GetInt32();
+        Assert.True(newWorkers > baselineWorkers,
+            $"Expected connectedWorkers to increase from {baselineWorkers}, but got {newWorkers}");
     }
 }
