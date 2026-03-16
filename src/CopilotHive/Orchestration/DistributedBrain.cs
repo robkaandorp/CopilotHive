@@ -290,7 +290,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {
               "action": "spawn_coder",
               "prompt": "<the prompt you want to send to the first worker>",
-              "reason": "<why you chose this plan>"
+              "reason": "<why you chose this plan>",
+              "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
             }
 
             Valid actions: spawn_coder, spawn_reviewer, spawn_tester, done, skip
@@ -511,25 +512,29 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     "failed_tests": <number>,
                     "coverage_percent": <number>
                   },
-                  "issues": ["<issue1>", "<issue2>"]
+                  "issues": ["<issue1>", "<issue2>"],
+                  "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
                 }
                 """,
             "reviewer" => """
                 {
                   "review_verdict": "APPROVE or REQUEST_CHANGES",
-                  "issues": ["<issue1>", "<issue2>"]
+                  "issues": ["<issue1>", "<issue2>"],
+                  "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
                 }
                 """,
             "improve" => """
                 {
                   "verdict": "PASS or FAIL",
-                  "issues": ["<issue1>", "<issue2>"]
+                  "issues": ["<issue1>", "<issue2>"],
+                  "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
                 }
                 """,
             _ => """
                 {
                   "verdict": "PASS or FAIL or COMPLETE",
-                  "issues": ["<issue1>", "<issue2>"]
+                  "issues": ["<issue1>", "<issue2>"],
+                  "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
                 }
                 """,
         };
@@ -605,7 +610,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {
               "action": "<next action: spawn_coder, spawn_reviewer, spawn_tester, merge, done, skip>",
               "prompt": "<prompt for the worker, if spawning one>",
-              "reason": "<why this is the right next step>"
+              "reason": "<why this is the right next step>",
+              "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
             }
             """;
 
