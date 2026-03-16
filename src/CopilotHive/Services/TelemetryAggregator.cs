@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -138,11 +139,13 @@ public sealed class TelemetryAggregator
             var callLabel = role.ApiCalls == 1 ? "API call" : "API calls";
 
             sb.AppendLine(
-                $" - {role.Role}: {role.InputTokens:N0} input + {role.OutputTokens:N0} output tokens, " +
-                $"{role.ApiCalls} {callLabel}, {seconds}s, ${role.Cost:F2}");
+                string.Format(CultureInfo.InvariantCulture,
+                    " - {0}: {1:N0} input + {2:N0} output tokens, {3} {4}, {5}s, ${6:F2}",
+                    role.Role, role.InputTokens, role.OutputTokens, role.ApiCalls, callLabel, seconds, role.Cost));
         }
 
-        sb.Append($" Total: {grandTotalTokens:N0} tokens, ${grandTotalCost:F2}");
+        sb.Append(string.Format(CultureInfo.InvariantCulture,
+            " Total: {0:N0} tokens, ${1:F2}", grandTotalTokens, grandTotalCost));
 
         return sb.ToString();
     }
