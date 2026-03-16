@@ -68,7 +68,7 @@ public sealed class IterationPlan
     /// </summary>
     public static IterationPlan Default(bool includeImprove = false)
     {
-        var phases = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Review, GoalPhase.Testing };
+        var phases = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review };
         if (includeImprove) phases.Add(GoalPhase.Improve);
         phases.Add(GoalPhase.Merging);
         return new IterationPlan { Phases = phases, Reason = "Default plan" };

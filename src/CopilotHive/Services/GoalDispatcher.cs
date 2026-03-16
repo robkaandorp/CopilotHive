@@ -311,8 +311,8 @@ public sealed class GoalDispatcher : BackgroundService
         if (interpretation.Issues is not null)
             pipeline.Metrics.Issues.AddRange(interpretation.Issues);
 
-        // Propagate model_tier from the interpretation so DispatchToRole can upgrade the model if needed.
-        pipeline.LatestModelTier = interpretation.ModelTier == "premium" ? "premium" : "standard";
+        // Propagate model_tier using first-non-null-wins — don't overwrite a tier already set by an earlier Brain call.
+        DistributedBrain.ApplyModelTierIfNotSet(pipeline, interpretation.ModelTier);
 
         // Decide next step based on the action
         switch (interpretation.Action)
@@ -605,7 +605,7 @@ public sealed class GoalDispatcher : BackgroundService
 
     /// <summary>
     /// Validates an IterationPlan to ensure safety invariants:
-    /// must contain Coding, at least one of Review or Testing, and end with Merging.
+    /// must contain Coding, at least one of Testing or Review, and end with Merging.
     /// Missing phases are inserted in the correct position.
     /// </summary>
     internal static IterationPlan ValidatePlan(IterationPlan plan)
@@ -618,11 +618,11 @@ public sealed class GoalDispatcher : BackgroundService
             phases.Insert(0, GoalPhase.Coding);
         }
 
-        // Must contain at least one of Review or Testing
-        if (!phases.Contains(GoalPhase.Review) && !phases.Contains(GoalPhase.Testing))
+        // Must contain at least one of Testing or Review
+        if (!phases.Contains(GoalPhase.Testing) && !phases.Contains(GoalPhase.Review))
         {
             var codingIndex = phases.IndexOf(GoalPhase.Coding);
-            phases.Insert(codingIndex + 1, GoalPhase.Review);
+            phases.Insert(codingIndex + 1, GoalPhase.Testing);
         }
 
         // Must end with Merging — remove any misplaced Merging entries, then ensure it's last
@@ -833,7 +833,7 @@ public sealed class GoalDispatcher : BackgroundService
     /// <summary>
     /// When a merge fails (typically due to conflicts), send the goal back to the coder
     /// to rebase the feature branch onto the latest base branch. The full pipeline
-    /// (Coding → Review → Testing → Merging) then runs again.
+    /// (Coding → Testing → Review → Merging) then runs again.
     /// </summary>
     private async Task HandleMergeFailureAsync(GoalPipeline pipeline, string errorMessage, CancellationToken ct)
     {
@@ -1398,7 +1398,7 @@ public sealed class GoalDispatcher : BackgroundService
             };
 
             pipeline.AdvanceTo(firstRole == WorkerRole.Coder ? GoalPhase.Coding : GoalPhase.Review);
-            pipeline.LatestModelTier = goalPlan.ModelTier == "premium" ? "premium" : "standard";
+            DistributedBrain.ApplyModelTierIfNotSet(pipeline, goalPlan.ModelTier);
             await DispatchToRole(pipeline, firstRole, goalPlan.Prompt, ct);
         }
         else

@@ -282,7 +282,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             Decide which phase to start with. Consider:
             - Is this a documentation-only change? (just coder, maybe skip review)
-            - Is this a code change? (needs coder → reviewer → tester → merge)
+            - Is this a code change? (needs coder → tester → reviewer → merge)
             - Is there context from previous iterations?
 
             Respond with JSON:
@@ -354,11 +354,11 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - Is this a retry after failure? (what phases need re-running)
             - What does the metrics history suggest?
 
-            Available phases: coding, review, testing, improve, merging
+            Available phases: coding, testing, review, improve, merging
 
             Respond with JSON:
             {
-              "phases": ["coding", "review", "testing", "merging"],
+              "phases": ["coding", "testing", "review", "merging"],
               "phase_instructions": {
                 "coding": "specific instructions for the coder...",
                 "review": "focus review on..."
