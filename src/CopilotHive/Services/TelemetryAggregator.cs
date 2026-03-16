@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace CopilotHive.Services;
 
@@ -24,6 +25,30 @@ public record TelemetrySummary(IReadOnlyList<TelemetryRoleData> Roles);
 /// </summary>
 public sealed class TelemetryAggregator
 {
+    private sealed record TelemetryRecord
+    {
+        [JsonPropertyName("input_tokens")]
+        public long InputTokens { get; set; }
+
+        [JsonPropertyName("output_tokens")]
+        public long OutputTokens { get; set; }
+
+        [JsonPropertyName("cache_read_tokens")]
+        public long CacheReadTokens { get; set; }
+
+        [JsonPropertyName("cache_write_tokens")]
+        public long CacheWriteTokens { get; set; }
+
+        [JsonPropertyName("duration_ms")]
+        public long DurationMs { get; set; }
+
+        [JsonPropertyName("cost")]
+        public decimal Cost { get; set; }
+
+        [JsonPropertyName("api_call_id")]
+        public string? ApiCallId { get; set; }
+    }
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -60,13 +85,14 @@ public sealed class TelemetryAggregator
 
                     try
                     {
-                        using var doc = JsonDocument.Parse(line);
-                        var root = doc.RootElement;
+                        var record = JsonSerializer.Deserialize<TelemetryRecord>(line, JsonOptions);
+                        if (record == null)
+                            continue;
 
-                        inputTokens += GetLong(root, "input_tokens");
-                        outputTokens += GetLong(root, "output_tokens");
-                        durationMs += GetLong(root, "duration_ms");
-                        cost += GetDecimal(root, "cost");
+                        inputTokens += record.InputTokens;
+                        outputTokens += record.OutputTokens;
+                        durationMs += record.DurationMs;
+                        cost += record.Cost;
                         apiCalls++;
                     }
                     catch (JsonException)
@@ -137,30 +163,15 @@ public sealed class TelemetryAggregator
             {
                 File.WriteAllText(path, string.Empty);
             }
-            catch
+            catch (IOException)
             {
-                // Best-effort: never disrupt the main workflow
+                // ignore — file may be in use or inaccessible
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // ignore — no write permission
             }
         }
     }
 
-    private static long GetLong(JsonElement root, string property)
-    {
-        if (root.TryGetProperty(property, out var el))
-        {
-            if (el.ValueKind == JsonValueKind.Number)
-                return el.TryGetInt64(out var v) ? v : (long)el.GetDouble();
-        }
-        return 0L;
-    }
-
-    private static decimal GetDecimal(JsonElement root, string property)
-    {
-        if (root.TryGetProperty(property, out var el))
-        {
-            if (el.ValueKind == JsonValueKind.Number)
-                return el.TryGetDecimal(out var v) ? v : (decimal)el.GetDouble();
-        }
-        return 0m;
-    }
 }
