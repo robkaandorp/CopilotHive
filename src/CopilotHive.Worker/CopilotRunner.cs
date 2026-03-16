@@ -61,6 +61,7 @@ public sealed class CopilotRunner : IAsyncDisposable
             Description = $"CopilotHive worker agent for the {role} role",
             Prompt = agentsMdContent,
             Tools = GetToolsForRole(role),
+            Infer = false,
         };
         _log.Info($"Custom agent set for role '{role}' ({agentsMdContent.Length} chars, tools={(_customAgent.Tools is null ? "all" : $"[{string.Join(",", _customAgent.Tools)}]")})");
         _log.Debug($"Agent prompt:\n{agentsMdContent}");
@@ -195,6 +196,7 @@ public sealed class CopilotRunner : IAsyncDisposable
             try
             {
                 _session = await _client.CreateSessionAsync(sessionConfig);
+                await SelectCustomAgentAsync();
                 _log.Info($"Connected to Copilot CLI on port {_port} (attempt {attempt})");
                 _log.Debug($"Session config: streaming={false}, customAgents={(_customAgent?.Name ?? "none")}");
                 return;
@@ -230,9 +232,30 @@ public sealed class CopilotRunner : IAsyncDisposable
             config.Model = model;
 
         _session = await _client!.CreateSessionAsync(config);
+        await SelectCustomAgentAsync();
 
         var modelInfo = string.IsNullOrEmpty(model) ? "default" : model;
         _log.Info($"Session reset (localhost:{_port}, agent={_customAgent?.Name ?? "none"}, model={modelInfo})");
+    }
+
+    /// <summary>
+    /// Pre-selects the custom agent on the active session via RPC so that the
+    /// role-specific system prompt is active from the very first user message.
+    /// Without this call the runtime relies on inference to match the agent,
+    /// which is unreliable with generic descriptions.
+    /// </summary>
+    private async Task SelectCustomAgentAsync()
+    {
+        if (_session is null || _customAgent is null) return;
+        try
+        {
+            await _session.Rpc.Agent.SelectAsync(_customAgent.Name);
+            _log.Info($"Pre-selected agent '{_customAgent.Name}' via RPC");
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"Failed to pre-select agent '{_customAgent.Name}': {ex.Message}");
+        }
     }
 
     /// <summary>
