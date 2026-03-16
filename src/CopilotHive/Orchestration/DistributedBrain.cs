@@ -297,6 +297,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             """;
 
         var decision = await AskAsync(pipeline, prompt, ct);
+        ApplyModelTierIfNotSet(pipeline, decision?.ModelTier);
         return decision ?? new OrchestratorDecision
         {
             Action = OrchestratorActionType.SpawnCoder,
@@ -469,7 +470,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - The worker infrastructure handles branch creation, checkout, and pushing — do NOT tell workers to create branches or push
             - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, build, test, and commit. Do NOT include git branch or git push commands.
             - For reviewers: tell them to review the diff on branch "{{pipeline.CoderBranch ?? "TBD"}}" against the base branch, produce a REVIEW_REPORT
-            - For testers: tell them to build, run tests, write integration tests, produce a TEST_REPORT
+            - For testers: tell them to build, run tests with coverage (`dotnet test /p:CollectCoverage=true /p:CoverletOutputFormat=text`), write integration tests, produce a TEST_REPORT
             - Include any context from previous phases that would help the worker
 
             Respond with JSON:
@@ -484,7 +485,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             """;
 
         var decision = await AskAsync(pipeline, prompt, ct);
-        pipeline.LatestModelTier = decision?.ModelTier?.ToLowerInvariant() is "premium" ? "premium" : "standard";
+        ApplyModelTierIfNotSet(pipeline, decision?.ModelTier);
         return decision?.Prompt ?? GetFallbackPrompt(workerRole, pipeline);
     }
 
@@ -585,6 +586,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 Reason = "Failed to interpret output",
             };
 
+        ApplyModelTierIfNotSet(pipeline, result.ModelTier);
         return ApplyTestMetricsFallback(result, workerRole, workerOutput, _logger);
     }
 
@@ -614,7 +616,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             }
             """;
 
-        return await AskAsync(pipeline, prompt, ct)
+        var decision = await AskAsync(pipeline, prompt, ct);
+        ApplyModelTierIfNotSet(pipeline, decision?.ModelTier);
+        return decision
             ?? new OrchestratorDecision
             {
                 Action = OrchestratorActionType.Done,
@@ -696,6 +700,21 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         await session.SendAsync(new MessageOptions { Prompt = prompt });
         return await done.Task;
+    }
+
+    /// <summary>
+    /// Applies the first-non-null wins rule for model tier: sets <see cref="GoalPipeline.LatestModelTier"/>
+    /// only when it has not been explicitly set yet (empty string) and <paramref name="modelTier"/> is non-null.
+    /// Normalises the value to <c>"premium"</c> or <c>"standard"</c>.
+    /// </summary>
+    /// <param name="pipeline">The current goal pipeline whose tier may be updated.</param>
+    /// <param name="modelTier">The model tier string returned by the Brain LLM, or <c>null</c> if absent.</param>
+    public static void ApplyModelTierIfNotSet(GoalPipeline pipeline, string? modelTier)
+    {
+        if (!string.IsNullOrEmpty(pipeline.LatestModelTier) || modelTier is null)
+            return;
+
+        pipeline.LatestModelTier = modelTier.ToLowerInvariant() == "premium" ? "premium" : "standard";
     }
 
     /// <summary>
@@ -860,13 +879,56 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         if (total is null && passed is null && failed is null && buildSuccess is null)
             return null;
 
+        // Parse coverage percent from Coverlet text table TOTAL row or key-value lines.
+        double? coveragePercent = null;
+
+        // Pattern A — Coverlet text table TOTAL row: | TOTAL | 73.5% | 61.2% | 80.1% |
+        var coverletTotalMatch = Regex.Match(
+            output,
+            @"\|\s*TOTAL\s*\|\s*(\d+\.?\d*)%",
+            RegexOptions.IgnoreCase);
+        if (coverletTotalMatch.Success
+            && double.TryParse(coverletTotalMatch.Groups[1].Value,
+                System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var coverletPct))
+        {
+            coveragePercent = coverletPct;
+        }
+
+        // Pattern B — Key-value lines: "coverage_percent: 73.5" or "coverage: 73.5%"
+        if (coveragePercent is null)
+        {
+            var kvMatch = Regex.Match(
+                output,
+                @"coverage[_\s]*percent\s*[:\s]+(\d+\.?\d*)",
+                RegexOptions.IgnoreCase);
+            if (!kvMatch.Success)
+            {
+                kvMatch = Regex.Match(
+                    output,
+                    @"coverage\s*:\s*(\d+\.?\d*)%",
+                    RegexOptions.IgnoreCase);
+            }
+
+            if (kvMatch.Success
+                && double.TryParse(kvMatch.Groups[1].Value,
+                    System.Globalization.NumberStyles.Any,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var kvPct))
+            {
+                coveragePercent = kvPct;
+            }
+        }
+
         return new ExtractedTestMetrics
         {
-            TotalTests   = total,
-            PassedTests  = passed,
-            FailedTests  = failed,
-            SkippedTests = skipped,
-            BuildSuccess = buildSuccess,
+            TotalTests      = total,
+            PassedTests     = passed,
+            FailedTests     = failed,
+            SkippedTests    = skipped,
+            BuildSuccess    = buildSuccess,
+            CoveragePercent = coveragePercent,
         };
     }
 
@@ -890,7 +952,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             "tester" => $"""
                 You are testing code for this goal: {pipeline.Description}
                 This is iteration {pipeline.Iteration}. The coder's work is on branch {pipeline.CoderBranch}.
-                Build the project, run all tests, write integration tests, and produce a TEST_REPORT block with:
+                Build the project, run all tests with coverage (`dotnet test /p:CollectCoverage=true /p:CoverletOutputFormat=text`), write integration tests, and produce a TEST_REPORT block with:
                 - verdict: PASS or FAIL
                 - build_success, total_tests, passed_tests, failed_tests, coverage_percent
                 - issues: list of issues found (if any)
