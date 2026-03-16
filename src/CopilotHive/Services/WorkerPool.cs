@@ -21,7 +21,7 @@ public sealed record WorkerPoolStats
 /// Thread-safe registry of currently connected workers. Supports registration,
 /// lookup, heartbeat tracking, and busy/idle state management.
 /// </summary>
-public sealed class WorkerPool
+public sealed class WorkerPool : IWorkerPool
 {
     private readonly ConcurrentDictionary<string, ConnectedWorker> _workers = new();
 

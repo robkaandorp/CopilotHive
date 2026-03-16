@@ -40,6 +40,7 @@ static async Task<int> RunServerAsync(string[] args)
 
     builder.Services.AddGrpc();
     builder.Services.AddSingleton<WorkerPool>();
+    builder.Services.AddSingleton<IWorkerPool>(sp => sp.GetRequiredService<WorkerPool>());
     builder.Services.AddSingleton<TaskQueue>();
     builder.Services.AddSingleton<ApiGoalSource>();
     builder.Services.AddSingleton<TaskCompletionNotifier>();
@@ -82,6 +83,7 @@ static async Task<int> RunServerAsync(string[] args)
 
     builder.Services.AddSingleton<GoalDispatcher>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<GoalDispatcher>());
+    builder.Services.AddHostedService<StaleWorkerCleanupService>();
 
     if (!string.IsNullOrEmpty(configRepoUrl))
     {
