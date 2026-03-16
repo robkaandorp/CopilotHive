@@ -48,6 +48,18 @@ public sealed class HiveConfiguration
     /// <summary>Model for the orchestrator's output interpretation (default: claude-sonnet-4.6).</summary>
     public string? OrchestratorModel { get; init; }
 
+    /// <summary>Premium model for the coder role, used when the Brain selects the 'premium' tier.</summary>
+    public string? PremiumCoderModel { get; init; }
+
+    /// <summary>Premium model for the reviewer role, used when the Brain selects the 'premium' tier.</summary>
+    public string? PremiumReviewerModel { get; init; }
+
+    /// <summary>Premium model for the tester role, used when the Brain selects the 'premium' tier.</summary>
+    public string? PremiumTesterModel { get; init; }
+
+    /// <summary>Premium model for the improver role, used when the Brain selects the 'premium' tier.</summary>
+    public string? PremiumImproverModel { get; init; }
+
     /// <summary>
     /// Resolves the model to use for a given agent role.
     /// Falls back to <see cref="Model"/> when no role-specific override is set.
@@ -62,5 +74,19 @@ public sealed class HiveConfiguration
         "improver" => ImproverModel ?? Constants.DefaultWorkerModel,
         "orchestrator" => OrchestratorModel ?? Constants.DefaultWorkerModel,
         _ => Model,
+    };
+
+    /// <summary>
+    /// Resolves the premium model configured for a given agent role, or <c>null</c> if none is set.
+    /// </summary>
+    /// <param name="agentRole">Role name (e.g. "coder", "reviewer").</param>
+    /// <returns>The premium model identifier for the role, or <c>null</c> if not configured.</returns>
+    public string? GetPremiumModelForRole(string agentRole) => agentRole.ToLowerInvariant() switch
+    {
+        "coder" => PremiumCoderModel,
+        "reviewer" => PremiumReviewerModel,
+        "tester" => PremiumTesterModel,
+        "improver" => PremiumImproverModel,
+        _ => null,
     };
 }

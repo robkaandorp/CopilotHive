@@ -463,11 +463,15 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {
               "action": "spawn_{{workerRole}}",
               "prompt": "<the complete prompt to send to the worker>",
-              "reason": "<why you crafted the prompt this way>"
+              "reason": "<why you crafted the prompt this way>",
+              "model_tier": "standard or premium"
             }
+
+            You may specify a model tier in your response. Add a 'model_tier' field with value 'standard' or 'premium'. Use 'premium' for complex tasks, retry situations, or when previous attempts failed. Default is 'standard'.
             """;
 
         var decision = await AskAsync(pipeline, prompt, ct);
+        pipeline.LatestModelTier = decision?.ModelTier?.ToLowerInvariant() is "premium" ? "premium" : "standard";
         return decision?.Prompt ?? GetFallbackPrompt(workerRole, pipeline);
     }
 

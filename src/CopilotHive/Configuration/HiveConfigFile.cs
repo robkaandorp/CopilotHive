@@ -22,6 +22,16 @@ public sealed class HiveConfigFile
         Workers.TryGetValue(roleName.ToLowerInvariant(), out var wc) && !string.IsNullOrEmpty(wc.Model)
             ? wc.Model
             : Orchestrator.Model;
+
+    /// <summary>
+    /// Resolves the premium model configured for a given role, or <c>null</c> if none is set.
+    /// </summary>
+    /// <param name="roleName">Role name (e.g. "coder", "reviewer").</param>
+    /// <returns>The premium model identifier for the role, or <c>null</c> if not configured.</returns>
+    public string? GetPremiumModelForRole(string roleName) =>
+        Workers.TryGetValue(roleName.ToLowerInvariant(), out var wc) && !string.IsNullOrEmpty(wc.PremiumModel)
+            ? wc.PremiumModel
+            : null;
 }
 
 /// <summary>
@@ -44,6 +54,9 @@ public sealed class WorkerConfig
 {
     /// <summary>Model override for this worker role; <c>null</c> means use the global default.</summary>
     public string? Model { get; set; }
+
+    /// <summary>Premium model override for this worker role, selected when the Brain requests the 'premium' tier.</summary>
+    public string? PremiumModel { get; set; }
 }
 
 /// <summary>
