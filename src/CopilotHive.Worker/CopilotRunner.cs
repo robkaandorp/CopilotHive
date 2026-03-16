@@ -289,6 +289,22 @@ public sealed class CopilotRunner : IAsyncDisposable
                 case SessionErrorEvent err:
                     done.TrySetException(new CopilotRunnerException(err.Data.Message));
                     break;
+                // Sub-agent lifecycle events
+                case SubagentSelectedEvent selected:
+                    _log.Info($"🎯 Agent selected: {selected.Data.AgentDisplayName} (tools: {(selected.Data.Tools is { Length: > 0 } t ? string.Join(", ", t) : "all")})");
+                    break;
+                case SubagentStartedEvent started:
+                    _log.Info($"▶ Sub-agent started: {started.Data.AgentDisplayName} — {started.Data.AgentDescription}");
+                    break;
+                case SubagentCompletedEvent completed:
+                    _log.Info($"✅ Sub-agent completed: {completed.Data.AgentDisplayName}");
+                    break;
+                case SubagentFailedEvent failed:
+                    _log.Error($"❌ Sub-agent failed: {failed.Data.AgentDisplayName} — {failed.Data.Error}");
+                    break;
+                case SubagentDeselectedEvent:
+                    _log.Info("↩ Agent deselected, returning to parent");
+                    break;
                 // Streaming events for observability
                 case AssistantMessageDeltaEvent:
                     // Incremental response text — we capture the final in AssistantMessageEvent
