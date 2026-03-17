@@ -41,6 +41,25 @@ public static class WorkerRoleExtensions
     };
 
     /// <summary>
+    /// Returns a human-readable display name for the given <see cref="WorkerRole"/>
+    /// (e.g. "Doc Writer" for <see cref="WorkerRole.DocWriter"/>).
+    /// </summary>
+    /// <param name="role">The role to convert.</param>
+    /// <returns>The display name string.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when <paramref name="role"/> has no defined display name.</exception>
+    public static string ToDisplayName(this WorkerRole role) => role switch
+    {
+        WorkerRole.Coder        => "Coder",
+        WorkerRole.Tester       => "Tester",
+        WorkerRole.Reviewer     => "Reviewer",
+        WorkerRole.Improver     => "Improver",
+        WorkerRole.Orchestrator => "Orchestrator",
+        WorkerRole.DocWriter    => "Doc Writer",
+        WorkerRole.MergeWorker  => "Merge Worker",
+        _ => throw new InvalidOperationException($"No display name defined for WorkerRole '{role}'.")
+    };
+
+    /// <summary>
     /// Converts a domain <see cref="WorkerRole"/> to the corresponding gRPC protobuf type.
     /// </summary>
     public static CopilotHive.Shared.Grpc.WorkerRole ToGrpcRole(this WorkerRole role) => role switch
