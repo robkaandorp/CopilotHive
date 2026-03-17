@@ -992,6 +992,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 - issues: list of issues found (if any)
                 Do NOT run git push — the orchestrator handles that.
                 """,
+            "docwriter" => $"""
+                You are the doc-writer. Update documentation for the code changes on branch {pipeline.CoderBranch}.
+                Goal: {pipeline.Description}
+                Tasks: update CHANGELOG.md, XML doc comments, and README.md if needed. Build to verify. Commit.
+                Do NOT write tests. Do NOT implement features. Do NOT run git push.
+                Produce a DOC_REPORT block with files_updated, changelog_entries, verdict (PASS/FAIL), issues.
+                """,
             _ => $"Work on this goal: {pipeline.Description}",
         };
 

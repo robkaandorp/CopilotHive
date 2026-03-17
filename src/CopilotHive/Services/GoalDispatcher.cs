@@ -552,9 +552,7 @@ public sealed class GoalDispatcher : BackgroundService
 
             case GoalPhase.DocWriting:
                 pipeline.AdvanceTo(GoalPhase.DocWriting);
-                var docPrompt = _brain is not null
-                    ? await _brain.CraftPromptAsync(pipeline, "docwriter", phaseInstructions, ct)
-                    : $"Update documentation for the changes made to: {pipeline.Description}";
+                var docPrompt = BuildDocWriterPrompt(pipeline, phaseInstructions);
                 await DispatchToRole(pipeline, WorkerRole.DocsWriter, docPrompt, ct);
                 break;
 
@@ -1520,6 +1518,46 @@ public sealed class GoalDispatcher : BackgroundService
             6. Verify with `git diff HEAD origin/<base-branch>` that you have a non-empty diff
 
             A response that only describes changes without actually editing files is a FAILURE.
+            """;
+    }
+
+    /// <summary>
+    /// Builds a doc-writer prompt directly (bypasses Brain to avoid goal-description echo).
+    /// </summary>
+    private static string BuildDocWriterPrompt(GoalPipeline pipeline, string? phaseInstructions)
+    {
+        var additionalContext = phaseInstructions is not null
+            ? $"\nAdditional context from the Brain:\n{phaseInstructions}\n"
+            : "";
+
+        return $"""
+            You are the doc-writer. Your ONLY job is to update documentation for the code changes
+            that have already been made on branch {pipeline.CoderBranch ?? "TBD"}.
+
+            Goal summary: {pipeline.Description}
+            {additionalContext}
+            Your tasks (do ALL of these):
+            1. Run `git log --oneline --all` to see what changed on this branch
+            2. Run `git diff HEAD~5..HEAD --stat` to see which files were recently modified
+            3. Update the CHANGELOG.md — add entries under [Unreleased] describing what was added/changed/fixed
+            4. Update XML doc comments (`<summary>`, `<param>`, `<returns>`) on any new or changed public APIs
+            5. Update README.md if the changes affect user-facing features or configuration
+            6. Run `dotnet build` to verify your doc comment changes compile
+            7. Run `git add` + `git commit` with message "docs: update documentation for [brief description]"
+
+            CRITICAL RULES:
+            - Do NOT write or run tests — that is the tester's job
+            - Do NOT implement features or fix bugs — that is the coder's job
+            - Do NOT run git push — the orchestrator handles that
+            - Focus ONLY on documentation artifacts (CHANGELOG, README, XML doc comments)
+
+            When done, produce a DOC_REPORT block:
+            ```DOC_REPORT
+            files_updated: [list of files you changed]
+            changelog_entries: [number of entries added]
+            verdict: PASS or FAIL
+            issues: [any issues encountered]
+            ```
             """;
     }
 
