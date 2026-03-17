@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `GoalDispatcherBuildIterationSummaryTests` — xUnit test class with 2 tests verifying `BuildIterationSummary()` correctly handles `ImproverSkipped` flag: ensures exactly one "Improve" phase entry appears in output (no duplicates) regardless of whether PhaseDurations already recorded an "Improve" entry
+- `IterationSummary` YAML-level test for null `TestCounts` omission — verifies that when `IterationSummary.TestCounts` is null, the serialised YAML output omits the `test_counts` key entirely
+- `IterationSummary` YAML-level test for null `PhaseResult` — verifies that when a phase result entry in YAML has a null `result` field, `FileGoalSource.ReadGoalsAsync()` throws `InvalidOperationException` rather than silently defaulting
 - `ConnectedWorkerTests.cs` — comprehensive xUnit test suite for `ConnectedWorker` class with 6 tests covering constructor initialization, state transitions (MarkBusy/MarkIdle), heartbeat updates, message channel I/O, and stale detection logic.
 - `PhaseDurations` tracking in goals.yaml — GoalUpdateMetadata, Goal, and GoalFileEntry now include per-phase wall-clock durations (in seconds); FileGoalSource reads and writes phase_durations on goal completion; GoalDispatcher wires pipeline.Metrics.PhaseDurations to the completion metadata; 4 new xUnit tests verify reading/writing phase durations across multiple scenarios.
 - `WorkerUtilizationService` — computes per-role worker utilization metrics from the current pool state; includes overall utilization fraction (0.0–1.0), per-role breakdown, and bottleneck role detection (utilization > 0.8).
@@ -45,6 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Coverage collection switched from `coverlet.msbuild` to `--collect:"XPlat Code Coverage"` collector approach (resolves package conflict)
 
 ### Fixed
+- Duplicate "Improve" phase entries in `BuildIterationSummary()` — when `ImproverSkipped=true` and PhaseDurations already contained an "Improve" entry, the summary would produce two entries for the same phase; now explicitly removes any existing "Improve" entry before appending the skipped one
+- Null `Result` field in `PhaseResultEntry` from YAML now throws `InvalidOperationException` instead of silently defaulting to `"pass"`, consistent with codebase convention of no silent fallbacks (treats null Result like null Id)
 - Root cause of coder no-ops — Brain was generating `git checkout -b feature/...` commands in coder prompts, causing coders to commit on wrong branches; TaskExecutor then detected 0 changes on the infrastructure branch
 - Removed conflicting `coverlet.msbuild` 6.0.2 package (conflicted with `coverlet.collector` 8.0.0)
 
