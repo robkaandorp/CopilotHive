@@ -43,10 +43,10 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
             _ => "worker",
         };
 
-        var baseBranch = "main";
         var repoList = repositories.ToList();
-        if (repoList.Count > 0)
-            baseBranch = repoList[0].DefaultBranch;
+        if (repoList.Count == 0)
+            throw new InvalidOperationException($"No repositories configured for goal '{goalId}'.");
+        var baseBranch = repoList[0].DefaultBranch;
 
         var branchInfo = branchCoordinator.GetBranchInfo(goalId, roleName, iteration, branchAction, baseBranch);
 

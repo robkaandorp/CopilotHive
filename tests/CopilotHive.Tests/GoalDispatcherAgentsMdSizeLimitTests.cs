@@ -136,11 +136,29 @@ public sealed class GoalDispatcherAgentsMdSizeLimitTests : IDisposable
             ConfigRepoManager configRepo,
             ILogger<GoalDispatcher>? logger = null)
     {
-        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
+        var goal = new Goal
+        {
+            Id = $"goal-{Guid.NewGuid():N}",
+            Description = "Test goal",
+            RepositoryNames = ["test-repo"],
+        };
         var goalSource = new FakeImproverGoalSource(goal);
         var goalManager = new GoalManager();
         goalManager.AddSource(goalSource);
         goalManager.GetNextGoalAsync().GetAwaiter().GetResult();
+
+        var configFile = new HiveConfigFile
+        {
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "test-repo",
+                    Url = "https://example.com/test-repo.git",
+                    DefaultBranch = "develop",
+                },
+            ],
+        };
 
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
@@ -160,6 +178,7 @@ public sealed class GoalDispatcherAgentsMdSizeLimitTests : IDisposable
             notifier,
             logger ?? NullLogger<GoalDispatcher>.Instance,
             brain,
+            config: configFile,
             configRepo: configRepo);
 
         return (dispatcher, pipeline, taskId, taskQueue);

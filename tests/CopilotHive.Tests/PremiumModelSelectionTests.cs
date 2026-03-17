@@ -201,11 +201,28 @@ public class PremiumModelSelectionTests
     private static (GoalDispatcher dispatcher, GoalPipeline pipeline, string taskId, TaskQueue taskQueue)
         CreateDispatcher(GoalPhase phase, IDistributedBrain brain, HiveConfigFile? configFile = null, int maxRetries = 3)
     {
-        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
+        var goal = new Goal
+        {
+            Id = $"goal-{Guid.NewGuid():N}",
+            Description = "Test goal",
+            RepositoryNames = ["test-repo"],
+        };
         var goalSource = new PremiumFakeGoalSource(goal);
         var goalManager = new GoalManager();
         goalManager.AddSource(goalSource);
         goalManager.GetNextGoalAsync().GetAwaiter().GetResult();
+
+        // Ensure the config has a matching repository entry
+        configFile ??= new HiveConfigFile();
+        if (!configFile.Repositories.Any(r => r.Name == "test-repo"))
+        {
+            configFile.Repositories.Add(new RepositoryConfig
+            {
+                Name = "test-repo",
+                Url = "https://example.com/test-repo.git",
+                DefaultBranch = "develop",
+            });
+        }
 
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries);

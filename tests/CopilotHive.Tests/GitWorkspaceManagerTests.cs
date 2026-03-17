@@ -98,7 +98,7 @@ public class GitWorkspaceManagerTests : IDisposable
     }
 
     [Fact]
-    public async Task MergeToMain_SucceedsForCleanMerge()
+    public async Task MergeBranch_SucceedsForCleanMerge()
     {
         await _manager.InitBareRepoAsync();
         var clonePath = await _manager.CreateWorkerCloneAsync("merger");
@@ -109,7 +109,7 @@ public class GitWorkspaceManagerTests : IDisposable
         await RunGitInClone(clonePath, "commit", "-m", "add feature");
         await _manager.PushBranchAsync(clonePath, "feature/clean");
 
-        var (success, _) = await _manager.MergeToMainAsync(clonePath, "feature/clean");
+        var (success, _) = await _manager.MergeBranchAsync(clonePath, "feature/clean", "main");
 
         Assert.True(success);
     }
@@ -180,7 +180,7 @@ public class GitWorkspaceManagerTests : IDisposable
         await RunGitInClone(clonePath, "commit", "-m", "add feature to revert");
         await _manager.PushBranchAsync(clonePath, "feature/to-revert");
 
-        var (success, _) = await _manager.MergeToMainAsync(clonePath, "feature/to-revert");
+        var (success, _) = await _manager.MergeBranchAsync(clonePath, "feature/to-revert", "main");
         Assert.True(success);
 
         // Verify file exists on main after merge
@@ -188,7 +188,7 @@ public class GitWorkspaceManagerTests : IDisposable
         Assert.True(File.Exists(Path.Combine(verifyClone, "feature.txt")));
 
         // Revert the merge
-        await _manager.RevertLastMergeAsync(clonePath);
+        await _manager.RevertLastMergeAsync(clonePath, "main");
 
         // Verify file is gone on main after revert
         var postRevertClone = await _manager.CreateWorkerCloneAsync("verify-reverted");

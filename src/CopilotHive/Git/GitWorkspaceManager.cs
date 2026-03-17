@@ -28,13 +28,16 @@ public sealed class GitWorkspaceManager
     /// the initial commit is seeded with the contents of that directory (respecting
     /// any .gitignore found there). Otherwise an empty initial commit is created.
     /// </summary>
-    public async Task InitBareRepoAsync(string? sourcePath = null, CancellationToken ct = default)
+    /// <param name="sourcePath">Optional directory whose contents seed the initial commit.</param>
+    /// <param name="initialBranch">Name of the initial branch to create.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task InitBareRepoAsync(string? sourcePath = null, string initialBranch = "main", CancellationToken ct = default)
     {
         Directory.CreateDirectory(_bareRepoPath);
 
         if (!Directory.Exists(Path.Combine(_bareRepoPath, "HEAD")))
         {
-            await RunGitAsync(_bareRepoPath, ["init", "--bare", "--initial-branch=main"], ct);
+            await RunGitAsync(_bareRepoPath, ["init", "--bare", $"--initial-branch={initialBranch}"], ct);
 
             var tempClone = Path.Combine(_workspacePath, "_init-temp");
             try
@@ -58,7 +61,7 @@ public sealed class GitWorkspaceManager
                     await RunGitAsync(tempClone, ["commit", "--allow-empty", "-m", "Initial commit"], ct);
                 }
 
-                await RunGitAsync(tempClone, ["push", "origin", "main"], ct);
+                await RunGitAsync(tempClone, ["push", "origin", initialBranch], ct);
             }
             finally
             {
@@ -181,28 +184,29 @@ public sealed class GitWorkspaceManager
     }
 
     /// <summary>
-    /// Merges the specified branch into main and pushes the result to origin.
-    /// Aborts the merge automatically if a conflict occurs.
+    /// Merges the specified branch into the target branch and pushes the result to origin.
     /// </summary>
     /// <param name="clonePath">Path to the worker's local clone.</param>
     /// <param name="branchName">Name of the feature branch to merge.</param>
+    /// <param name="targetBranch">Name of the branch to merge into.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>
     /// A tuple where <c>Success</c> indicates whether the merge succeeded
     /// and <c>Output</c> contains the git output or conflict details.
     /// </returns>
-    public async Task<(bool Success, string Output)> MergeToMainAsync(
+    public async Task<(bool Success, string Output)> MergeBranchAsync(
         string clonePath,
         string branchName,
+        string targetBranch,
         CancellationToken ct = default)
     {
-        await RunGitAsync(clonePath, ["checkout", "main"], ct);
-        await RunGitAsync(clonePath, ["pull", "origin", "main"], ct);
+        await RunGitAsync(clonePath, ["checkout", targetBranch], ct);
+        await RunGitAsync(clonePath, ["pull", "origin", targetBranch], ct);
 
         try
         {
             var output = await RunGitAsync(clonePath, ["merge", branchName, "--no-ff", "-m", $"Merge {branchName}"], ct);
-            await RunGitAsync(clonePath, ["push", "origin", "main"], ct);
+            await RunGitAsync(clonePath, ["push", "origin", targetBranch], ct);
             return (true, output);
         }
         catch (GitException ex)
@@ -216,7 +220,7 @@ public sealed class GitWorkspaceManager
     /// Returns the diff between the current HEAD of the clone and the specified base branch.
     /// </summary>
     /// <param name="clonePath">Path to the worker's local clone.</param>
-    /// <param name="baseBranch">Branch to diff against (defaults to "main").</param>
+    /// <param name="baseBranch">Branch to diff against.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The unified diff as a string.</returns>
     public async Task<string> GetDiffAsync(string clonePath, string baseBranch = "main", CancellationToken ct = default)
@@ -225,14 +229,17 @@ public sealed class GitWorkspaceManager
     }
 
     /// <summary>
-    /// Reverts the last merge commit on main and force-pushes to origin.
+    /// Reverts the last merge commit on the target branch and force-pushes to origin.
     /// Used when post-merge verification fails.
     /// </summary>
-    public async Task RevertLastMergeAsync(string clonePath, CancellationToken ct = default)
+    /// <param name="clonePath">Path to the worker's local clone.</param>
+    /// <param name="targetBranch">Name of the branch to revert on.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task RevertLastMergeAsync(string clonePath, string targetBranch, CancellationToken ct = default)
     {
-        await RunGitAsync(clonePath, ["checkout", "main"], ct);
+        await RunGitAsync(clonePath, ["checkout", targetBranch], ct);
         await RunGitAsync(clonePath, ["reset", "--hard", "HEAD~1"], ct);
-        await RunGitAsync(clonePath, ["push", "--force", "origin", "main"], ct);
+        await RunGitAsync(clonePath, ["push", "--force", "origin", targetBranch], ct);
     }
 
     /// <summary>

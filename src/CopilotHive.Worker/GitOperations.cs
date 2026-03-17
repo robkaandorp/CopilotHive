@@ -87,7 +87,7 @@ public static class GitOperations
         if (msgExit == 0)
             status.LastCommitMessage = msgOut.Trim();
 
-        // Diff stat against origin/main (may fail if no upstream)
+        // Diff stat against the previous commit (may fail if no commits)
         var (statExit, statOut, _) = await RunGitCommandAsync(
             repoDir, "diff --stat --numstat HEAD~1", ct);
         if (statExit == 0)
