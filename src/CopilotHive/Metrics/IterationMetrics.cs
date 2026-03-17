@@ -73,6 +73,11 @@ public sealed class IterationMetrics
     /// <summary>Arbitrary custom key/value metrics recorded by workers.</summary>
     public Dictionary<string, object> Custom { get; set; } = [];
 
+    /// <summary>Whether the improve phase was skipped due to a non-critical failure (e.g. Brain timeout).</summary>
+    public bool ImproverSkipped { get; set; }
+    /// <summary>Reason the improver was skipped, if applicable.</summary>
+    public string? ImproverSkipReason { get; set; }
+
     /// <summary>Ratio of passed unit tests to total unit tests (0 when no tests exist).</summary>
     [JsonIgnore]
     public double PassRate => TotalTests > 0 ? (double)PassedTests / TotalTests : 0;

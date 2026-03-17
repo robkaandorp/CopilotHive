@@ -51,6 +51,8 @@ public sealed class ApiGoalSource : IGoalSource
                 goal.Iterations = metadata.Iterations.Value;
             if (metadata.FailureReason is not null)
                 goal.FailureReason = metadata.FailureReason;
+            if (metadata.Notes is { Count: > 0 })
+                goal.Notes.AddRange(metadata.Notes);
         }
 
         return Task.CompletedTask;

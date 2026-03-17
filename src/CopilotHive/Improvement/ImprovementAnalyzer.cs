@@ -84,21 +84,19 @@ public sealed class ImprovementAnalyzer
         IReadOnlyList<IterationMetrics> history,
         IReadOnlyDictionary<string, string> agentsMd)
     {
+        // The agents.md files are available on disk in the worker's working directory.
+        // Injecting their contents into the prompt wastes tokens and can cause timeouts.
+        // We only include the metric analysis; the improver reads files directly.
         var sb = new System.Text.StringBuilder();
         sb.Append(BuildAnalysis(current, history));
 
         if (agentsMd.Count > 0)
         {
             sb.AppendLine();
-            sb.AppendLine("## Current AGENTS.md Files (also available as files in your working directory)");
-            foreach (var (role, content) in agentsMd)
-            {
-                sb.AppendLine($"### {role}.agents.md");
-                sb.AppendLine("```");
-                sb.AppendLine(content.TrimEnd());
-                sb.AppendLine("```");
-                sb.AppendLine();
-            }
+            sb.AppendLine("## AGENTS.md Files Available on Disk");
+            sb.AppendLine("The following agents.md files are in your working directory — read them directly:");
+            foreach (var role in agentsMd.Keys)
+                sb.AppendLine($"- agents/{role}.agents.md");
         }
 
         return sb.ToString();

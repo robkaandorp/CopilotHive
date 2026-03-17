@@ -562,47 +562,34 @@ public sealed class GoalDispatcher : BackgroundService
                 pipeline.AdvanceTo(GoalPhase.Improve);
                 _logger.LogInformation("Dispatching Improver for goal {GoalId}", pipeline.GoalId);
 
-                // Pull the config repo to ensure the improver container starts with the latest agents.md files
-                await SyncAgentsFromConfigRepoAsync(ct);
-
-                // Capture HEAD SHA before any improver changes so we can restore if all retries fail
-                if (_configRepo is not null)
-                    pipeline.PreImproverSha = await GetCurrentCommitShaAsync(_configRepo.LocalPath, ct);
-
-                var analysis = "";
-                if (_improvementAnalyzer is not null && _agentsManager is not null && _metricsTracker is not null)
+                try
                 {
-                    var agentsMd = new Dictionary<string, string>();
-                    foreach (var role in WorkerRoles.AgentRoles)
-                    {
-                        var roleName = role.ToRoleName();
-                        var content = _agentsManager.GetAgentsMd(roleName);
-                        if (!string.IsNullOrEmpty(content)) agentsMd[roleName] = content;
-                    }
-                    analysis = _improvementAnalyzer.BuildAnalysis(pipeline.Metrics, _metricsTracker.History, agentsMd);
+                    await DispatchImproverCoreAsync(pipeline, phaseInstructions, ct);
                 }
+                catch (Exception ex)
+                {
+                    // Improve is non-blocking: if it fails, log a warning and continue to Merging.
+                    // The goal already passed review and is ready to merge.
+                    var skipReason = $"Improver failed: {ex.Message}";
+                    _logger.LogWarning(ex, "Improver failed for goal {GoalId} — skipping to merge. Reason: {Reason}",
+                        pipeline.GoalId, skipReason);
 
-                var improveContext = "Analyze the iteration and update the *.agents.md files directly.\n\n" + analysis + "\n\n"
-                    + "You have access to the agents/ folder containing *.agents.md files. "
-                    + "Read, edit, and save the files directly using the file tools. "
-                    + "Only modify files that need changes based on the evidence. "
-                    + "Do NOT modify any source code or tests — only *.agents.md files.";
-                if (!string.IsNullOrEmpty(phaseInstructions))
-                    improveContext = phaseInstructions + "\n\n" + improveContext;
+                    pipeline.Metrics.ImproverSkipped = true;
+                    pipeline.Metrics.ImproverSkipReason = skipReason;
 
-                var telemetryAggregator = new TelemetryAggregator();
-                var telemetryRoleNames = WorkerRoles.TelemetryRoles.Select(r => r.ToRoleName());
-                var stateDir = Environment.GetEnvironmentVariable("STATE_DIR") ?? "/app/state";
-                var telemetrySummary = telemetryAggregator.AggregateTelemetry(stateDir, telemetryRoleNames);
-                var telemetryText = telemetryAggregator.FormatSummary(telemetrySummary);
-                if (!string.IsNullOrEmpty(telemetryText))
-                    improveContext += "\n\n## Telemetry\n" + telemetryText;
-                telemetryAggregator.ClearTelemetryFiles(stateDir, telemetryRoleNames);
+                    var notesMeta = new GoalUpdateMetadata
+                    {
+                        Notes = [$"Improver skipped: {ex.Message}"],
+                    };
+                    await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.InProgress, notesMeta, ct);
+                    await CommitGoalsToConfigRepoAsync(
+                        $"Goal '{pipeline.GoalId}': improver skipped ({ex.GetType().Name})", ct);
 
-                var improvePrompt = _brain is not null
-                    ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Improver, improveContext, ct)
-                    : "Update the *.agents.md files based on iteration results.\n\n" + analysis;
-                await DispatchToRole(pipeline, WorkerRole.Improver, improvePrompt, ct);
+                    // Fall through to the next phase (Merging) by letting EnforceRemainingPhasesAsync pick it up
+                    var nextPhase = pipeline.Plan?.NextPhaseAfter(GoalPhase.Improve);
+                    if (nextPhase.HasValue)
+                        await DispatchPhaseAsync(pipeline, nextPhase.Value, null, ct);
+                }
                 break;
 
             case GoalPhase.Merging:
@@ -615,6 +602,44 @@ public sealed class GoalDispatcher : BackgroundService
                     phase, pipeline.GoalId);
                 break;
         }
+    }
+
+    /// <summary>Core improver dispatch logic, extracted so the caller can catch failures gracefully.</summary>
+    private async Task DispatchImproverCoreAsync(
+        GoalPipeline pipeline, string? phaseInstructions, CancellationToken ct)
+    {
+        // Pull the config repo to ensure the improver container starts with the latest agents.md files
+        await SyncAgentsFromConfigRepoAsync(ct);
+
+        // Capture HEAD SHA before any improver changes so we can restore if all retries fail
+        if (_configRepo is not null)
+            pipeline.PreImproverSha = await GetCurrentCommitShaAsync(_configRepo.LocalPath, ct);
+
+        var analysis = "";
+        if (_improvementAnalyzer is not null && _agentsManager is not null && _metricsTracker is not null)
+            analysis = _improvementAnalyzer.BuildAnalysis(pipeline.Metrics, _metricsTracker.History);
+
+        var improveContext = "Analyze the iteration and update the *.agents.md files directly.\n\n" + analysis + "\n\n"
+            + "You have access to the agents/ folder containing *.agents.md files. "
+            + "Read, edit, and save the files directly using the file tools. "
+            + "Only modify files that need changes based on the evidence. "
+            + "Do NOT modify any source code or tests — only *.agents.md files.";
+        if (!string.IsNullOrEmpty(phaseInstructions))
+            improveContext = phaseInstructions + "\n\n" + improveContext;
+
+        var telemetryAggregator = new TelemetryAggregator();
+        var telemetryRoleNames = WorkerRoles.TelemetryRoles.Select(r => r.ToRoleName());
+        var stateDir = Environment.GetEnvironmentVariable("STATE_DIR") ?? "/app/state";
+        var telemetrySummary = telemetryAggregator.AggregateTelemetry(stateDir, telemetryRoleNames);
+        var telemetryText = telemetryAggregator.FormatSummary(telemetrySummary);
+        if (!string.IsNullOrEmpty(telemetryText))
+            improveContext += "\n\n## Telemetry\n" + telemetryText;
+        telemetryAggregator.ClearTelemetryFiles(stateDir, telemetryRoleNames);
+
+        var improvePrompt = _brain is not null
+            ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Improver, improveContext, ct)
+            : "Update the *.agents.md files based on iteration results.\n\n" + analysis;
+        await DispatchToRole(pipeline, WorkerRole.Improver, improvePrompt, ct);
     }
 
     /// <summary>

@@ -27,6 +27,8 @@ public sealed class Goal
     public int? Iterations { get; set; }
     /// <summary>Reason the goal failed, or <c>null</c> for non-failed goals.</summary>
     public string? FailureReason { get; set; }
+    /// <summary>Optional informational notes (e.g. "improver skipped: timeout").</summary>
+    public List<string> Notes { get; set; } = [];
 }
 
 /// <summary>Scheduling priority levels for goals.</summary>

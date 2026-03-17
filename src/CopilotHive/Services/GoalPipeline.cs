@@ -64,6 +64,13 @@ public sealed class IterationPlan
         return CurrentPhase;
     }
 
+    /// <summary>Returns the phase that comes after the specified phase, or null if none.</summary>
+    public GoalPhase? NextPhaseAfter(GoalPhase phase)
+    {
+        var index = Phases.IndexOf(phase);
+        return index >= 0 && index + 1 < Phases.Count ? Phases[index + 1] : null;
+    }
+
     /// <summary>
     /// Creates a default plan with the standard phase order.
     /// Used as fallback when the Brain doesn't provide a plan.

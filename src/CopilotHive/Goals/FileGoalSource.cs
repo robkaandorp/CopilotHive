@@ -62,6 +62,8 @@ public sealed class FileGoalSource : IGoalSource
                     goal.Iterations = metadata.Iterations.Value;
                 if (metadata.FailureReason is not null)
                     goal.FailureReason = metadata.FailureReason;
+                if (metadata.Notes is { Count: > 0 })
+                    goal.Notes.AddRange(metadata.Notes);
             }
 
             await WriteGoalsAsync(goals, ct);
@@ -108,6 +110,7 @@ public sealed class FileGoalSource : IGoalSource
                 Completed_at = g.CompletedAt?.ToString("o"),
                 Iterations = g.Iterations,
                 Failure_reason = g.FailureReason,
+                Notes = g.Notes.Count > 0 ? g.Notes : null,
             }).ToList(),
         };
 
@@ -131,6 +134,7 @@ public sealed class FileGoalSource : IGoalSource
         CompletedAt = ParseTimestamp(entry.Completed_at),
         Iterations = entry.Iterations,
         FailureReason = entry.Failure_reason,
+        Notes = entry.Notes ?? [],
     };
 
     private static GoalPriority ParsePriority(string? value) => value?.ToLowerInvariant() switch
@@ -178,5 +182,6 @@ public sealed class FileGoalSource : IGoalSource
         public string? Completed_at { get; set; }
         public int? Iterations { get; set; }
         public string? Failure_reason { get; set; }
+        public List<string>? Notes { get; set; }
     }
 }

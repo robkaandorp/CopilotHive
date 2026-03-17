@@ -13,6 +13,8 @@ public sealed record GoalUpdateMetadata
     public int? Iterations { get; init; }
     /// <summary>Failure reason (only for failed goals).</summary>
     public string? FailureReason { get; init; }
+    /// <summary>Optional informational notes (e.g. "improver skipped: timeout").</summary>
+    public List<string>? Notes { get; init; }
 }
 
 /// <summary>

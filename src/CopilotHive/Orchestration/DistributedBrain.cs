@@ -685,32 +685,69 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     private async Task<OrchestratorDecision?> AskAsync(GoalPipeline pipeline, string prompt, CancellationToken ct)
     {
-        try
+        const int maxRetries = 2;
+
+        for (var attempt = 0; attempt <= maxRetries; attempt++)
         {
-            var session = await GetOrCreateSessionAsync(pipeline, ct);
+            try
+            {
+                var session = await GetOrCreateSessionAsync(pipeline, ct);
 
-            _logger.LogDebug("Brain prompt for {GoalId}:\n{Prompt}", pipeline.GoalId, Truncate(prompt, Constants.TruncationVerbose));
+                _logger.LogDebug("Brain prompt for {GoalId}:\n{Prompt}", pipeline.GoalId, Truncate(prompt, Constants.TruncationVerbose));
 
-            var response = await SendToSessionAsync(session, prompt, ct);
+                var response = await SendToSessionAsync(session, prompt, ct);
 
-            _logger.LogDebug("Brain response for {GoalId}:\n{Response}", pipeline.GoalId, Truncate(response, Constants.TruncationVerbose));
+                _logger.LogDebug("Brain response for {GoalId}:\n{Response}", pipeline.GoalId, Truncate(response, Constants.TruncationVerbose));
 
-            // Keep audit log in the pipeline for debugging
-            pipeline.Conversation.Add(new ConversationEntry("user", prompt));
-            pipeline.Conversation.Add(new ConversationEntry("assistant", response));
+                // Keep audit log in the pipeline for debugging
+                pipeline.Conversation.Add(new ConversationEntry("user", prompt));
+                pipeline.Conversation.Add(new ConversationEntry("assistant", response));
 
-            var parsed = ProtocolJson.ParseFromLlmResponse<OrchestratorDecision>(response);
-            if (parsed is null)
-                _logger.LogWarning("Failed to parse Brain JSON response: {Response}", Truncate(response, Constants.TruncationShort));
+                var parsed = ProtocolJson.ParseFromLlmResponse<OrchestratorDecision>(response);
+                if (parsed is not null)
+                    return parsed;
 
-            return parsed;
+                _logger.LogWarning("Failed to parse Brain JSON response (attempt {Attempt}/{Max}): {Response}",
+                    attempt + 1, maxRetries + 1, Truncate(response, Constants.TruncationShort));
+
+                // Retry on parse failure — the LLM may produce valid JSON on the next attempt
+                if (attempt < maxRetries)
+                {
+                    _logger.LogInformation("Retrying Brain query for {GoalId} after parse failure (attempt {Attempt})",
+                        pipeline.GoalId, attempt + 2);
+                    continue;
+                }
+
+                return null;
+            }
+            catch (TaskCanceledException) when (attempt < maxRetries && !ct.IsCancellationRequested)
+            {
+                // Timeout from the per-query CancelAfter — retry
+                _logger.LogWarning(
+                    "Brain LLM query timed out for goal {GoalId} (attempt {Attempt}/{Max}) — retrying",
+                    pipeline.GoalId, attempt + 1, maxRetries + 1);
+                pipeline.Conversation.Add(new ConversationEntry("system", $"Timeout on attempt {attempt + 1}"));
+                await Task.Delay(TimeSpan.FromSeconds(Constants.RetryDelaySeconds), ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Brain LLM query failed for goal {GoalId} (attempt {Attempt}/{Max})",
+                    pipeline.GoalId, attempt + 1, maxRetries + 1);
+                pipeline.Conversation.Add(new ConversationEntry("system", $"Error: {ex.Message}"));
+
+                if (attempt < maxRetries)
+                {
+                    _logger.LogInformation("Retrying Brain query for {GoalId} after error (attempt {Attempt})",
+                        pipeline.GoalId, attempt + 2);
+                    await Task.Delay(TimeSpan.FromSeconds(Constants.RetryDelaySeconds), ct);
+                    continue;
+                }
+
+                return null;
+            }
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Brain LLM query failed for goal {GoalId}", pipeline.GoalId);
-            pipeline.Conversation.Add(new ConversationEntry("system", $"Error: {ex.Message}"));
-            return null;
-        }
+
+        return null;
     }
 
     private static async Task<string> SendToSessionAsync(CopilotSession session, string prompt, CancellationToken ct)
