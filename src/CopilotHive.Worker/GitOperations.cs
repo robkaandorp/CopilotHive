@@ -61,11 +61,13 @@ public static class GitOperations
 
     /// <summary>
     /// Retrieves current git status information for the repository at the given path.
+    /// Compares the current branch to the base branch to capture ALL changes on the feature branch.
     /// </summary>
     /// <param name="repoDir">Path to the local git repository.</param>
+    /// <param name="baseBranch">The base branch to diff against (e.g. "origin/main"). Falls back to HEAD~1 if null.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>A <see cref="GitStatus"/> containing branch, commit, and diff statistics.</returns>
-    public static async Task<GitStatus> GetGitStatusAsync(string repoDir, CancellationToken ct)
+    public static async Task<GitStatus> GetGitStatusAsync(string repoDir, string? baseBranch, CancellationToken ct)
     {
         var status = new GitStatus();
 
@@ -87,9 +89,11 @@ public static class GitOperations
         if (msgExit == 0)
             status.LastCommitMessage = msgOut.Trim();
 
-        // Diff stat against the previous commit (may fail if no commits)
+        // Diff stat: compare all changes on the feature branch vs the base branch.
+        // Uses three-dot diff (base...HEAD) to capture everything since the branch point.
+        var diffRef = !string.IsNullOrEmpty(baseBranch) ? $"origin/{baseBranch}...HEAD" : "HEAD~1";
         var (statExit, statOut, _) = await RunGitCommandAsync(
-            repoDir, "diff --stat --numstat HEAD~1", ct);
+            repoDir, $"diff --stat --numstat {diffRef}", ct);
         if (statExit == 0)
             ParseDiffStat(statOut, status);
 

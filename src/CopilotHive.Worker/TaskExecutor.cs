@@ -152,7 +152,8 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
 
                 foreach (var (repo, dir) in repoDirectories)
                 {
-                    var status = await GitOperations.GetGitStatusAsync(dir, ct);
+                    var baseBranch = assignment.BranchInfo?.BaseBranch ?? repo.DefaultBranch;
+                    var status = await GitOperations.GetGitStatusAsync(dir, baseBranch, ct);
 
                     // Push if there are changes, we have a feature branch, and the role is allowed to push.
                     // Reviewer is read-only — it must never push changes to the coder's branch.

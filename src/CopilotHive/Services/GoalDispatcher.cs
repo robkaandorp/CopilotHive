@@ -1546,7 +1546,7 @@ public sealed class GoalDispatcher : BackgroundService
             3. Use the /build skill to build the project and fix any errors
             4. Use the /test skill to run the tests and fix any failures
             5. Run `git add` + `git commit` with a descriptive message
-            6. Verify with `git diff HEAD origin/<base-branch>` that you have a non-empty diff
+            6. Verify with `git diff origin/<base-branch>...HEAD --stat` that you have a non-empty diff
 
             A response that only describes changes without actually editing files is a FAILURE.
             """;
@@ -1571,8 +1571,8 @@ public sealed class GoalDispatcher : BackgroundService
             Goal summary: {pipeline.Description}
             {additionalContext}
             Your tasks (do ALL of these):
-            1. Run `git log --oneline --all` to see what changed on this branch
-            2. Run `git diff HEAD~5..HEAD --stat` to see which files were recently modified
+            1. Run `git diff origin/<base-branch>...HEAD --stat` to see ALL files changed on this branch
+            2. Run `git diff origin/<base-branch>...HEAD` to review the full diff
             3. Update the CHANGELOG.md — add entries under [Unreleased] describing what was added/changed/fixed
             4. Update XML doc comments (`<summary>`, `<param>`, `<returns>`) on any new or changed public APIs
             5. Update README.md if the changes affect user-facing features or configuration
