@@ -470,7 +470,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, build, test, and commit. Do NOT include git branch or git push commands.
                 """,
             WorkerRole.Reviewer => $"""
-                - For reviewers: tell them to review the diff on branch "{branch}" against the base branch, produce a REVIEW_REPORT
+                - For reviewers: tell them to run `git diff origin/<base-branch>...HEAD` to review ALL changes on branch "{branch}". The `origin/` prefix is required because the clone only has remote tracking refs. Produce a REVIEW_REPORT.
                 """,
             WorkerRole.Tester => """
                 - For testers: tell them to build, run the test skill, write integration tests, produce a TEST_REPORT
