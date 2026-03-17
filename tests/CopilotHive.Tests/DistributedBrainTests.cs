@@ -95,6 +95,8 @@ public sealed class DistributedBrainTests
     [InlineData("coder", "Write the code and commit")]
     [InlineData("reviewer", "REVIEW_REPORT")]
     [InlineData("tester", "TEST_REPORT")]
+    [InlineData("docswriter", "DOC_REPORT")]
+    [InlineData("improver", "agents.md")]
     public void GetFallbackPrompt_KnownRoles_ContainsExpectedContent(string role, string expectedFragment)
     {
         // GetFallbackPrompt is private static, but we can invoke it via reflection
@@ -112,7 +114,7 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public void GetFallbackPrompt_UnknownRole_ReturnsGenericPrompt()
+    public void GetFallbackPrompt_UnknownRole_Throws()
     {
         var method = typeof(DistributedBrain).GetMethod(
             "GetFallbackPrompt",
@@ -121,9 +123,9 @@ public sealed class DistributedBrainTests
         Assert.NotNull(method);
 
         var pipeline = CreatePipeline("g-1", "Fix the bug");
-        var result = (string)method.Invoke(null, ["unknown-role", pipeline])!;
-
-        Assert.Contains("Fix the bug", result);
+        var ex = Assert.Throws<System.Reflection.TargetInvocationException>(
+            () => method.Invoke(null, ["unknown-role", pipeline]));
+        Assert.IsType<InvalidOperationException>(ex.InnerException);
     }
 
     // ── BuildContextualPrompt was removed (per-goal sessions handle context natively) ──
@@ -281,14 +283,14 @@ public sealed class DistributedBrainTests
         };
 
         var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "tester", "Passed: 5, Failed: 0, Total: 5", logger);
+            decision, "testing", "Passed: 5, Failed: 0, Total: 5", logger);
 
         Assert.Equal(10, result.TestMetrics!.TotalTests);
         Assert.Equal(9,  result.TestMetrics.PassedTests);
         Assert.Equal(1,  result.TestMetrics.FailedTests);
     }
 
-    /// <summary>Test B — Brain returns null test_metrics for tester phase → fallback kicks in.</summary>
+    /// <summary>Test B — Brain returns null test_metrics for testing phase → fallback kicks in.</summary>
     [Fact]
     public void ApplyTestMetricsFallback_BrainReturnsNullMetrics_FallbackUsed()
     {
@@ -297,7 +299,7 @@ public sealed class DistributedBrainTests
         var rawOutput = "Passed: 8, Failed: 0, Total: 8";
 
         var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "tester", rawOutput, logger);
+            decision, "testing", rawOutput, logger);
 
         Assert.NotNull(result.TestMetrics);
         Assert.Equal(8, result.TestMetrics.TotalTests);
@@ -318,7 +320,7 @@ public sealed class DistributedBrainTests
         var rawOutput = "total: 10\npassed: 10";
 
         var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "tester", rawOutput, logger);
+            decision, "testing", rawOutput, logger);
 
         Assert.Equal(5, result.TestMetrics!.TotalTests);
         Assert.Equal(5, result.TestMetrics.PassedTests);
@@ -336,7 +338,7 @@ public sealed class DistributedBrainTests
         var rawOutput = "total: 8\npassed: 8";
 
         var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "tester", rawOutput, logger);
+            decision, "testing", rawOutput, logger);
 
         Assert.Equal(8, result.TestMetrics!.TotalTests);
         Assert.Equal(8, result.TestMetrics.PassedTests);
@@ -350,7 +352,7 @@ public sealed class DistributedBrainTests
         var rawOutput = "total: 8\npassed: 8";
 
         var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "coder", rawOutput, logger);
+            decision, "coding", rawOutput, logger);
 
         Assert.Null(result.TestMetrics);
     }
@@ -396,7 +398,7 @@ public sealed class DistributedBrainTests
         var testerOutput = "Passed!  - Failed:     9, Passed:   322, Skipped:     0, Total:   331";
 
         var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "tester", testerOutput, logger);
+            decision, "testing", testerOutput, logger);
 
         Assert.NotNull(result.TestMetrics);
         Assert.Equal(322, result.TestMetrics.PassedTests);
@@ -415,7 +417,7 @@ public sealed class DistributedBrainTests
         var testerOutput = "Failed: 10, Passed: 0, Skipped: 0, Total: 10";
 
         var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "tester", testerOutput, logger);
+            decision, "testing", testerOutput, logger);
 
         Assert.NotNull(result.TestMetrics);
         Assert.Equal(0, result.TestMetrics.PassedTests ?? -1);
@@ -433,7 +435,7 @@ public sealed class DistributedBrainTests
         var testerOutput = "Passed!  - Failed:     0, Passed:   322, Skipped:     0, Total:   322";
 
         var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "tester", testerOutput, logger);
+            decision, "testing", testerOutput, logger);
 
         Assert.NotNull(result.TestMetrics);
         Assert.Equal(5, result.TestMetrics.PassedTests);

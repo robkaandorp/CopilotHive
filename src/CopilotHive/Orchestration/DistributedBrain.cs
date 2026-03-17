@@ -505,9 +505,17 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     public async Task<OrchestratorDecision> InterpretOutputAsync(
         GoalPipeline pipeline, string workerRole, string workerOutput, CancellationToken ct = default)
     {
+        // Keys are GoalPhase names (lowercase), not WorkerRole names
         var schema = workerRole.ToLowerInvariant() switch
         {
-            "tester" => """
+            "coding" => """
+                {
+                  "verdict": "PASS or FAIL",
+                  "issues": ["<issue1>", "<issue2>"],
+                  "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
+                }
+                """,
+            "testing" => """
                 {
                   "verdict": "PASS or FAIL",
                   "test_metrics": {
@@ -521,16 +529,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                   "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
                 }
                 """,
-            "reviewer" => """
+            "review" => """
                 {
                   "review_verdict": "APPROVE or REQUEST_CHANGES",
-                  "issues": ["<issue1>", "<issue2>"],
-                  "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
-                }
-                """,
-            "improve" => """
-                {
-                  "verdict": "PASS or FAIL",
                   "issues": ["<issue1>", "<issue2>"],
                   "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
                 }
@@ -542,25 +543,24 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                   "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
                 }
                 """,
-            _ => """
+            "improve" => """
                 {
-                  "verdict": "PASS or FAIL or COMPLETE",
+                  "verdict": "PASS or FAIL",
                   "issues": ["<issue1>", "<issue2>"],
                   "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
                 }
                 """,
+            _ => throw new InvalidOperationException($"Unhandled worker phase in InterpretOutputAsync: '{workerRole}'"),
         };
 
-        var modeInstruction = workerRole.ToLowerInvariant() == "improve"
-            ? """
+        var modeInstruction = """
               IMPORTANT: You are in INTERPRETATION mode, NOT prompt-crafting mode.
               Do NOT return an "action" or "prompt" field. Do NOT suggest spawning any worker.
               Your ONLY job is to analyze the output below and return a verdict.
 
-              """
-            : "";
+              """;
 
-        var testerInstruction = workerRole.Equals("tester", StringComparison.OrdinalIgnoreCase)
+        var testerInstruction = workerRole.Equals("testing", StringComparison.OrdinalIgnoreCase)
             ? """
 
               CRITICAL TESTER INSTRUCTIONS:
@@ -584,6 +584,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - Did the worker succeed or fail at its task?
             - For testers: did all tests pass? What are the numbers? You MUST populate the test_metrics object with actual numbers from the output — look for test counts in tables, summaries, or dotnet test output.
             - For reviewers: did they approve or request changes? What issues?
+            - For docwriters: did they update CHANGELOG, README, or XML doc comments? Did they produce a DOC_REPORT? Did they commit?
+            - For coders: did they make code changes and commit? Check for git commit evidence.
             - Extract any specific issues mentioned
 
             Respond ONLY with this JSON (no other fields):
@@ -760,7 +762,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     internal static OrchestratorDecision ApplyTestMetricsFallback(
         OrchestratorDecision decision, string workerRole, string rawOutput, ILogger logger)
     {
-        if (!workerRole.Equals("tester", StringComparison.OrdinalIgnoreCase))
+        // workerRole is a GoalPhase name (e.g. "testing"), not a WorkerRole name
+        if (!workerRole.Equals("testing", StringComparison.OrdinalIgnoreCase))
             return decision;
 
         if ((decision.TestMetrics?.TotalTests ?? 0) > 0 &&
@@ -992,14 +995,20 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 - issues: list of issues found (if any)
                 Do NOT run git push — the orchestrator handles that.
                 """,
-            "docwriter" => $"""
+            "docswriter" => $"""
                 You are the doc-writer. Update documentation for the code changes on branch {pipeline.CoderBranch}.
                 Goal: {pipeline.Description}
                 Tasks: update CHANGELOG.md, XML doc comments, and README.md if needed. Build to verify. Commit.
                 Do NOT write tests. Do NOT implement features. Do NOT run git push.
                 Produce a DOC_REPORT block with files_updated, changelog_entries, verdict (PASS/FAIL), issues.
                 """,
-            _ => $"Work on this goal: {pipeline.Description}",
+            "improver" => $"""
+                You are the improver. Analyze the iteration results and update *.agents.md files.
+                Goal: {pipeline.Description}
+                This is iteration {pipeline.Iteration}. Review the metrics and feedback to improve agent instructions.
+                Commit your changes. Do NOT run git push.
+                """,
+            _ => throw new InvalidOperationException($"Unhandled role in GetFallbackPrompt: '{role}'"),
         };
 
     /// <summary>
