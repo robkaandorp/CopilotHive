@@ -88,7 +88,7 @@ goals:
       improver: gpt-4o
 ```
 
-When a goal completes (success or failure), the Orchestrator updates the goal entry with metadata including `phase_durations` — a map of phase names to wall-clock durations in seconds:
+When a goal completes (success or failure), the Orchestrator updates the goal entry with metadata including `phase_durations` — a map of phase names to wall-clock durations in seconds — and `iteration_summaries` — an array of structured summaries (one per iteration) capturing phases, test results, and review verdicts:
 
 ```yaml
 goals:
@@ -104,6 +104,44 @@ goals:
       DocWriting: 45.2
       Review: 60.1
       Merge: 12.5
+    iteration_summaries:
+      - iteration: 1
+        phases:
+          - name: Coding
+            result: pass
+            duration_seconds: 60.0
+          - name: Testing
+            result: fail
+            duration_seconds: 20.5
+        test_counts:
+          total: 10
+          passed: 8
+          failed: 2
+        review_verdict: null
+        notes: []
+      - iteration: 2
+        phases:
+          - name: Coding
+            result: pass
+            duration_seconds: 65.5
+          - name: Testing
+            result: pass
+            duration_seconds: 65.3
+          - name: DocWriting
+            result: pass
+            duration_seconds: 45.2
+          - name: Review
+            result: pass
+            duration_seconds: 60.1
+          - name: Merge
+            result: pass
+            duration_seconds: 12.5
+        test_counts:
+          total: 10
+          passed: 10
+          failed: 0
+        review_verdict: approve
+        notes: []
 ```
 
 ## Project Structure
@@ -136,6 +174,7 @@ goals:
 - **Non-blocking improve phase** — improver failures don't prevent goal completion; recorded in goal notes and metrics
 - **Three-dot diff comparison** — accurate detection of all changes on feature branches using `origin/{baseBranch}...HEAD`
 - **Goal notes** — non-fatal observations tracked in goals.yaml (e.g. "Improver skipped: timeout")
+- **Iteration summaries** — structured per-iteration metrics (phases, test counts, review verdicts) recorded in goals.yaml for observability without reading logs
 
 ## Contributing
 

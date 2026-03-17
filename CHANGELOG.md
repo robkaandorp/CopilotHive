@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Brain retry mechanism — `AskAsync` retries up to 2 times on timeout, transient errors, and JSON parse failures (5-second backoff)
 - Dirty-worktree safety net — `EnsureCleanWorktreeAsync` re-prompts Copilot up to 2 times if uncommitted changes remain after task execution
 - `GitOperations.HasUncommittedChangesAsync()` for detecting dirty worktrees
+- `IterationSummary` — structured summary of a completed pipeline iteration, containing iteration number, per-phase results (name, result, duration), test counts, review verdict, and notes; automatically appended to `Goal.IterationSummaries` after each iteration completes (success or failure)
+- `PhaseResult` — per-phase execution result (name, result: "pass"/"fail"/"skip", duration_seconds)
+- `TestCounts` — aggregate test counts (total, passed, failed) for a test run
+- `Goal.IterationSummaries` — list of `IterationSummary` entries tracking metrics from each completed iteration
+- `GoalUpdateMetadata.IterationSummary` — optional structured summary to append during goal completion/failure
+- `FileGoalSource` now reads and writes `iteration_summaries` in goals.yaml with full round-trip fidelity
+- `GoalDispatcher.BuildIterationSummary()` — constructs `IterationSummary` from pipeline metrics, marking the failed phase as "fail" and tracking skipped phases (e.g. improver timeout)
+- `IterationSummaryTests` — 7 xUnit tests verifying `IterationSummary` structure, YAML serialisation, round-tripping via `FileGoalSource`, null handling, and multi-iteration appending
 
 ### Changed
 - Extracted `OrchestratorVersion` string into `Constants.OrchestratorVersion` public const in `Constants.cs`; `HiveOrchestratorService` now references the constant instead of a hardcoded literal.
