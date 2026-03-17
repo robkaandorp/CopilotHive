@@ -52,13 +52,6 @@ static async Task<int> RunServerAsync(string[] args)
         agentsDir = Path.Combine(Directory.GetCurrentDirectory(), "agents");
     builder.Services.AddSingleton(new AgentsManager(agentsDir));
 
-    // Skills: framework-agnostic build/test/install instructions
-    var skillsDir = Environment.GetEnvironmentVariable("SKILLS_DIR")
-        ?? Path.Combine(AppContext.BaseDirectory, ".github", "copilot", "skills");
-    if (!Directory.Exists(skillsDir))
-        skillsDir = Path.Combine(Directory.GetCurrentDirectory(), ".github", "copilot", "skills");
-    builder.Services.AddSingleton(new CopilotHive.Skills.SkillsManager(skillsDir));
-
     // Persistence: SQLite store for pipeline state (survives restarts)
     var stateDir = Environment.GetEnvironmentVariable("STATE_DIR") ?? "/app/state";
     var dbPath = Path.Combine(stateDir, "copilothive.db");
@@ -81,8 +74,7 @@ static async Task<int> RunServerAsync(string[] args)
         builder.Services.AddSingleton<IDistributedBrain>(sp =>
             new DistributedBrain(brainPort, sp.GetRequiredService<ILogger<DistributedBrain>>(),
                 sp.GetRequiredService<MetricsTracker>(),
-                sp.GetService<AgentsManager>(),
-                sp.GetService<CopilotHive.Skills.SkillsManager>()));
+                sp.GetService<AgentsManager>()));
     }
     else
     {

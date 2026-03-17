@@ -1,3 +1,8 @@
+---
+name: build
+description: How to build the project. Use this when you need to compile or build the codebase.
+---
+
 # Build Skill
 
 ## How to Build

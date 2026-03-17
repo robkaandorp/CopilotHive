@@ -18,7 +18,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly int _port;
     private readonly ILogger<DistributedBrain> _logger;
     private readonly MetricsTracker? _metricsTracker;
-    private readonly Skills.SkillsManager? _skillsManager;
     private CopilotClient? _copilotClient;
     private readonly ConcurrentDictionary<string, CopilotSession> _sessions = new();
 
@@ -58,15 +57,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <param name="logger">Logger instance.</param>
     /// <param name="metricsTracker">Optional tracker used to include historical metrics in prompts.</param>
     /// <param name="agentsManager">Optional manager used to load the orchestrator's AGENTS.md.</param>
-    /// <param name="skillsManager">Optional manager providing framework-agnostic build/test instructions.</param>
     public DistributedBrain(int port, ILogger<DistributedBrain> logger,
-        MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null,
-        Skills.SkillsManager? skillsManager = null)
+        MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null)
     {
         _port = port;
         _logger = logger;
         _metricsTracker = metricsTracker;
-        _skillsManager = skillsManager;
 
         // Build the orchestrator custom agent with no tools (reasoning-only)
         var orchestratorInstructions = agentsManager?.GetAgentsMd("orchestrator") ?? "";
@@ -486,8 +482,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _ => throw new InvalidOperationException($"Unhandled role in CraftPromptAsync: '{workerRole}'"),
         };
 
-        var skillsContext = _skillsManager?.GetBuildAndTestInstructions() ?? "";
-
         var prompt = $$"""
             Craft a prompt for the {{workerRole}} worker.
 
@@ -496,7 +490,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Branch: {{branch}}
             {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
             {{(historyContext.Length > 0 ? $"\n{historyContext}" : "")}}
-            {{(skillsContext.Length > 0 ? $"\nProject skills (include these in the prompt for the worker):\n{skillsContext}" : "")}}
+
+            The worker has access to project skills (e.g. /build, /test) that describe how to build and test this project.
+            Tell the worker to use those skills instead of hardcoding framework-specific commands.
 
             Rules for the prompt you craft:
             - CRITICAL: The branch name is EXACTLY "{{branch}}" — do NOT invent or change it

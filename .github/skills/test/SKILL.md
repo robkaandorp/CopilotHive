@@ -1,3 +1,8 @@
+---
+name: test
+description: How to run tests and interpret the results. Use this when you need to run the test suite or write new tests.
+---
+
 # Test Skill
 
 ## How to Run Tests
