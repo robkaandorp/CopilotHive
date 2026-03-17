@@ -400,16 +400,17 @@ public sealed class GoalDispatcher : BackgroundService
     /// When the Brain says "Done" too early, enforce any remaining mandatory pipeline phases.
     /// Returns true if a phase was dispatched (i.e., don't mark complete yet).
     /// Phase order is determined by the pipeline's IterationPlan (from Brain or default fallback).
-    /// If Review or Testing had a FAIL verdict, loop back to Coding instead of advancing.
+    /// If Review, DocWriting, or Testing had a FAIL verdict, loop back to Coding instead of advancing.
     /// </summary>
     private async Task<bool> EnforceRemainingPhasesAsync(
         GoalPipeline pipeline, CancellationToken ct, string? verdict = null, string? reason = null)
     {
-        // If Review or Testing failed, loop back to Coding for another attempt
-        if ((verdict is "FAIL" || (verdict is "REQUEST_CHANGES" && pipeline.Phase == GoalPhase.Review))
-            && pipeline.Phase is GoalPhase.Review or GoalPhase.Testing)
+        // If Review, DocWriting, or Testing failed, loop back to Coding for another attempt
+        if (verdict is "FAIL"
+            && pipeline.Phase is GoalPhase.Review or GoalPhase.Testing or GoalPhase.DocWriting
+            || verdict is "REQUEST_CHANGES" && pipeline.Phase == GoalPhase.Review)
         {
-            var isReview = pipeline.Phase == GoalPhase.Review;
+            var isReview = pipeline.Phase is GoalPhase.Review or GoalPhase.DocWriting;
             var canRetry = isReview ? pipeline.IncrementReviewRetry() : pipeline.IncrementTestRetry();
             if (!canRetry)
             {
