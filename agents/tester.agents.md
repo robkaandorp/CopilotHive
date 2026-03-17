@@ -44,21 +44,13 @@ What must be true for this to pass.
 
 Run the project build. This is the first gate — if it doesn't compile, stop here.
 
-First, check the skills/ directory for a build skill with project-specific instructions.
-
-If no build skill exists, locate the solution file:
-
-```bash
-find . -name '*.slnx' -o -name '*.sln' -o -name 'Makefile' -o -name 'package.json' | head -5
-```
-
-Then build using the discovered method.
+Use the /build skill for project-specific build instructions.
 
 ### Phase 3: Run Existing Tests
 
 Run ALL existing tests (unit tests written by the coder + any prior tests).
 
-Check the skills/ directory for a test skill with project-specific instructions.
+Use the /test skill for project-specific test instructions.
 
 Record results: total, passed, failed, skipped.
 
