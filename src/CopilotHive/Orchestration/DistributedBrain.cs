@@ -278,6 +278,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Plan the workflow for this goal:
             {{pipeline.Description}}
 
+            Branch: copilothive/{{pipeline.GoalId}}
+
             {{metricsContext}}
             {{historyContext}}
 
@@ -287,6 +289,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - Is there context from previous iterations?
             IMPORTANT: Always include the docwriting phase for any change — the doc-writer updates
             the CHANGELOG, README, and XML doc comments. Even internal services need changelog entries.
+
+            Rules for the prompt you craft:
+            - CRITICAL: The branch "copilothive/{{pipeline.GoalId}}" is already checked out — the worker is ALREADY on this branch
+            - NEVER include git checkout, git branch, git switch, or git push commands — the infrastructure handles all branching
+            - NEVER include framework-specific build/test commands (dotnet build, npm test, etc.) — tell workers to use /build and /test skills
+            - NEVER invent or modify branch names — use exactly "copilothive/{{pipeline.GoalId}}"
 
             Respond with JSON:
             {
@@ -500,6 +508,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - CRITICAL: The branch is already checked out at "{{branch}}" — the worker is ALREADY on this branch
             - NEVER include git checkout, git branch, git switch, or git push commands — the infrastructure handles all branching
             - NEVER include framework-specific build/test commands (dotnet build, npm test, etc.) — tell workers to use /build and /test skills
+            - NEVER invent or modify branch names — use exactly "{{branch}}"
             {{roleInstruction}}
             - Include any context from previous phases that would help the worker
 
