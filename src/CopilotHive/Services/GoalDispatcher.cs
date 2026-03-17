@@ -1574,8 +1574,7 @@ public sealed class GoalDispatcher : BackgroundService
             3. Update the CHANGELOG.md — add entries under [Unreleased] describing what was added/changed/fixed
             4. Update XML doc comments (`<summary>`, `<param>`, `<returns>`) on any new or changed public APIs
             5. Update README.md if the changes affect user-facing features or configuration
-            6. Use the /build skill to verify your doc comment changes compile
-            7. Run `git add -A && git commit` with message "docs: update documentation for [brief description]"
+            6. Run `git add -A && git commit` with message "docs: update documentation for [brief description]"
 
             CRITICAL RULES:
             - Do NOT write or run tests — that is the tester's job
