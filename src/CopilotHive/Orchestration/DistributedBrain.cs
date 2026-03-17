@@ -467,7 +467,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         var roleInstruction = role switch
         {
             WorkerRole.Coder => $"""
-                - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, build, test, and commit. Do NOT include git branch or git push commands.
+                - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, use /build skill, use /test skill, and commit with `git add -A && git commit`. NEVER include git checkout, git branch, or git push commands. NEVER include dotnet/npm/cargo commands — only reference /build and /test skills.
                 """,
             WorkerRole.Reviewer => $"""
                 - For reviewers: tell them to run `git diff origin/<base-branch>...HEAD` to review ALL changes on branch "{branch}". The `origin/` prefix is required because the clone only has remote tracking refs. Produce a REVIEW_REPORT.
@@ -497,8 +497,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Tell the worker to use those skills instead of hardcoding framework-specific commands.
 
             Rules for the prompt you craft:
-            - CRITICAL: The branch name is EXACTLY "{{branch}}" — do NOT invent or change it
-            - The worker infrastructure handles branch creation, checkout, and pushing — do NOT tell workers to create branches or push
+            - CRITICAL: The branch is already checked out at "{{branch}}" — the worker is ALREADY on this branch
+            - NEVER include git checkout, git branch, git switch, or git push commands — the infrastructure handles all branching
+            - NEVER include framework-specific build/test commands (dotnet build, npm test, etc.) — tell workers to use /build and /test skills
             {{roleInstruction}}
             - Include any context from previous phases that would help the worker
 
