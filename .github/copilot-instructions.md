@@ -79,3 +79,7 @@ dotnet test CopilotHive.slnx
   A failed goal with a clear error is better than a goal that silently produces garbage.
 - **Branch names are configuration.** They come from `HiveConfigFile.RepositoryConfig.DefaultBranch`
   and must never be hardcoded as `"main"` or `"develop"` in operational code.
+- **Framework and tooling references are configuration.** Prompts must not hardcode
+  framework-specific commands like `dotnet build`, `dotnet test`, or test framework names
+  like `xUnit`. Instead, reference project skills that contain the actual commands.
+  This keeps CopilotHive framework-agnostic.
