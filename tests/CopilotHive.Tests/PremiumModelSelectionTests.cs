@@ -275,8 +275,7 @@ file sealed class CapturingBrain : IDistributedBrain
         return Task.FromResult($"Work on {pipeline.Description} as {workerRole}");
     }
 
-    public Task<OrchestratorDecision> InterpretOutputAsync(
-        GoalPipeline pipeline, string workerRole, string workerOutput, CancellationToken ct = default) =>
+    public Task<OrchestratorDecision> InterpretOutputAsync(GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default) =>
         Task.FromResult(new OrchestratorDecision
         {
             Action = OrchestratorActionType.Done,
@@ -332,8 +331,7 @@ file sealed class PlanGoalPremiumBrain : IDistributedBrain
         return Task.FromResult($"Work on {pipeline.Description} as {workerRole}");
     }
 
-    public Task<OrchestratorDecision> InterpretOutputAsync(
-        GoalPipeline pipeline, string workerRole, string workerOutput, CancellationToken ct = default) =>
+    public Task<OrchestratorDecision> InterpretOutputAsync(GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default) =>
         Task.FromResult(new OrchestratorDecision { Action = OrchestratorActionType.Done, Verdict = "PASS" });
 
     public Task<OrchestratorDecision> DecideNextStepAsync(
@@ -364,8 +362,7 @@ file sealed class DecideNextStepPremiumBrain : IDistributedBrain
         return Task.FromResult($"Work on {pipeline.Description} as {workerRole}");
     }
 
-    public Task<OrchestratorDecision> InterpretOutputAsync(
-        GoalPipeline pipeline, string workerRole, string workerOutput, CancellationToken ct = default) =>
+    public Task<OrchestratorDecision> InterpretOutputAsync(GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default) =>
         Task.FromResult(new OrchestratorDecision { Action = OrchestratorActionType.Done, Verdict = "PASS" });
 
     public Task<OrchestratorDecision> DecideNextStepAsync(
@@ -401,8 +398,7 @@ file sealed class NullPromptPremiumInterpretBrain : IDistributedBrain
     /// Mimics a Brain that decides to spawn another coder with premium tier but leaves the prompt
     /// to be crafted by the fallback path — this is the scenario that triggers Bug 2.
     /// </summary>
-    public Task<OrchestratorDecision> InterpretOutputAsync(
-        GoalPipeline pipeline, string workerRole, string workerOutput, CancellationToken ct = default) =>
+    public Task<OrchestratorDecision> InterpretOutputAsync(GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default) =>
         Task.FromResult(new OrchestratorDecision
         {
             Action = OrchestratorActionType.SpawnCoder,

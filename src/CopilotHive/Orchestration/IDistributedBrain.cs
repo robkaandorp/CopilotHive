@@ -40,7 +40,7 @@ public interface IDistributedBrain
     /// </summary>
     Task<OrchestratorDecision> InterpretOutputAsync(
         GoalPipeline pipeline,
-        string workerRole,
+        GoalPhase phase,
         string workerOutput,
         CancellationToken ct = default);
 

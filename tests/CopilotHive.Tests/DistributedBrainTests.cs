@@ -165,7 +165,7 @@ public sealed class DistributedBrainTests
         var fake = new FakeDistributedBrain();
         var pipeline = CreatePipeline("g-8", "Fix bug");
 
-        var decision = await fake.InterpretOutputAsync(pipeline, "coder", "all done");
+        var decision = await fake.InterpretOutputAsync(pipeline, GoalPhase.Coding, "all done");
 
         Assert.Equal(OrchestratorActionType.Done, decision.Action);
     }
@@ -179,7 +179,7 @@ public sealed class DistributedBrainTests
         await fake.ConnectAsync();
         await fake.PlanGoalAsync(pipeline);
         await fake.CraftPromptAsync(pipeline, "coder");
-        await fake.InterpretOutputAsync(pipeline, "coder", "output");
+        await fake.InterpretOutputAsync(pipeline, GoalPhase.Coding, "output");
         await fake.DecideNextStepAsync(pipeline, "review passed");
         await fake.InformAsync(pipeline, "merge complete");
 
@@ -243,8 +243,7 @@ public sealed class DistributedBrainTests
             TestMetrics = new ExtractedTestMetrics { TotalTests = 10, PassedTests = 9, FailedTests = 1 },
         };
 
-        var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "testing", "Passed: 5, Failed: 0, Total: 5", logger);
+        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Testing, "Passed: 5, Failed: 0, Total: 5", logger);
 
         Assert.Equal(10, result.TestMetrics!.TotalTests);
         Assert.Equal(9,  result.TestMetrics.PassedTests);
@@ -259,8 +258,7 @@ public sealed class DistributedBrainTests
         var decision = new OrchestratorDecision { TestMetrics = null };
         var rawOutput = "Passed: 8, Failed: 0, Total: 8";
 
-        var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "testing", rawOutput, logger);
+        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Testing, rawOutput, logger);
 
         Assert.NotNull(result.TestMetrics);
         Assert.Equal(8, result.TestMetrics.TotalTests);
@@ -280,8 +278,7 @@ public sealed class DistributedBrainTests
         // Raw output has 10 — Brain's 5 should win
         var rawOutput = "total: 10\npassed: 10";
 
-        var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "testing", rawOutput, logger);
+        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Testing, rawOutput, logger);
 
         Assert.Equal(5, result.TestMetrics!.TotalTests);
         Assert.Equal(5, result.TestMetrics.PassedTests);
@@ -298,8 +295,7 @@ public sealed class DistributedBrainTests
         };
         var rawOutput = "total: 8\npassed: 8";
 
-        var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "testing", rawOutput, logger);
+        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Testing, rawOutput, logger);
 
         Assert.Equal(8, result.TestMetrics!.TotalTests);
         Assert.Equal(8, result.TestMetrics.PassedTests);
@@ -312,8 +308,7 @@ public sealed class DistributedBrainTests
         var decision = new OrchestratorDecision { TestMetrics = null };
         var rawOutput = "total: 8\npassed: 8";
 
-        var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "coding", rawOutput, logger);
+        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Coding, rawOutput, logger);
 
         Assert.Null(result.TestMetrics);
     }
@@ -358,8 +353,7 @@ public sealed class DistributedBrainTests
         };
         var testerOutput = "Passed!  - Failed:     9, Passed:   322, Skipped:     0, Total:   331";
 
-        var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "testing", testerOutput, logger);
+        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Testing, testerOutput, logger);
 
         Assert.NotNull(result.TestMetrics);
         Assert.Equal(322, result.TestMetrics.PassedTests);
@@ -377,8 +371,7 @@ public sealed class DistributedBrainTests
         };
         var testerOutput = "Failed: 10, Passed: 0, Skipped: 0, Total: 10";
 
-        var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "testing", testerOutput, logger);
+        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Testing, testerOutput, logger);
 
         Assert.NotNull(result.TestMetrics);
         Assert.Equal(0, result.TestMetrics.PassedTests ?? -1);
@@ -395,8 +388,7 @@ public sealed class DistributedBrainTests
         };
         var testerOutput = "Passed!  - Failed:     0, Passed:   322, Skipped:     0, Total:   322";
 
-        var result = DistributedBrain.ApplyTestMetricsFallback(
-            decision, "testing", testerOutput, logger);
+        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Testing, testerOutput, logger);
 
         Assert.NotNull(result.TestMetrics);
         Assert.Equal(5, result.TestMetrics.PassedTests);
@@ -425,7 +417,7 @@ file sealed class FakeDistributedBrain : IDistributedBrain
     public Func<GoalPipeline, OrchestratorDecision>? PlanGoalOverride { get; set; }
     public Func<GoalPipeline, IterationPlan>? PlanIterationOverride { get; set; }
     public Func<GoalPipeline, string, string?, string>? CraftPromptOverride { get; set; }
-    public Func<GoalPipeline, string, string, OrchestratorDecision>? InterpretOutputOverride { get; set; }
+    public Func<GoalPipeline, GoalPhase, string, OrchestratorDecision>? InterpretOutputOverride { get; set; }
     public Func<GoalPipeline, string, OrchestratorDecision>? DecideNextStepOverride { get; set; }
 
     public Task ConnectAsync(CancellationToken ct = default)
@@ -458,11 +450,10 @@ file sealed class FakeDistributedBrain : IDistributedBrain
         return Task.FromResult(prompt);
     }
 
-    public Task<OrchestratorDecision> InterpretOutputAsync(
-        GoalPipeline pipeline, string workerRole, string workerOutput, CancellationToken ct = default)
+    public Task<OrchestratorDecision> InterpretOutputAsync(GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default)
     {
         InterpretCalls++;
-        var decision = InterpretOutputOverride?.Invoke(pipeline, workerRole, workerOutput)
+        var decision = InterpretOutputOverride?.Invoke(pipeline, phase, workerOutput)
             ?? new OrchestratorDecision { Action = OrchestratorActionType.Done, Verdict = "PASS" };
         return Task.FromResult(decision);
     }

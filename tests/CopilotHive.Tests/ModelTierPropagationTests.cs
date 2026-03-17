@@ -146,7 +146,7 @@ public sealed class ModelTierPropagationTests
         var brain = new ModelTierTrackingBrain(interpretTier: "premium");
         var pipeline = CreatePipeline();
 
-        await brain.InterpretOutputAsync(pipeline, "coder", "some output");
+        await brain.InterpretOutputAsync(pipeline, GoalPhase.Coding, "some output");
 
         Assert.Equal("premium", pipeline.LatestModelTier);
     }
@@ -164,7 +164,7 @@ public sealed class ModelTierPropagationTests
         await brain.PlanGoalAsync(pipeline);
         Assert.Equal("premium", pipeline.LatestModelTier);
 
-        await brain.InterpretOutputAsync(pipeline, "coder", "output");
+        await brain.InterpretOutputAsync(pipeline, GoalPhase.Coding, "output");
 
         Assert.Equal("premium", pipeline.LatestModelTier);
     }
@@ -222,8 +222,7 @@ file sealed class ModelTierTrackingBrain : IDistributedBrain
         return Task.FromResult($"Work on {pipeline.Description} as {workerRole}");
     }
 
-    public Task<OrchestratorDecision> InterpretOutputAsync(
-        GoalPipeline pipeline, string workerRole, string workerOutput, CancellationToken ct = default)
+    public Task<OrchestratorDecision> InterpretOutputAsync(GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default)
     {
         var decision = new OrchestratorDecision
         {

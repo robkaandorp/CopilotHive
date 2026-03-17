@@ -217,8 +217,7 @@ file sealed class FakeImproverBrain : IDistributedBrain
         GoalPipeline pipeline, string workerRole, string? additionalContext = null, CancellationToken ct = default) =>
         Task.FromResult($"Work on {pipeline.Description} as {workerRole}");
 
-    public Task<OrchestratorDecision> InterpretOutputAsync(
-        GoalPipeline pipeline, string workerRole, string workerOutput, CancellationToken ct = default) =>
+    public Task<OrchestratorDecision> InterpretOutputAsync(GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default) =>
         Task.FromResult(new OrchestratorDecision { Action = OrchestratorActionType.Done });
 
     public Task<OrchestratorDecision> DecideNextStepAsync(

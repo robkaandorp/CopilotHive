@@ -244,7 +244,7 @@ public sealed class GoalDispatcherResolveRepositoriesTests
 /// </summary>
 file sealed class FakeDispatcherBrain : IDistributedBrain
 {
-    public Func<GoalPipeline, string, string, OrchestratorDecision>? InterpretOutputOverride { get; set; }
+    public Func<GoalPipeline, GoalPhase, string, OrchestratorDecision>? InterpretOutputOverride { get; set; }
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
@@ -258,10 +258,9 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
         GoalPipeline pipeline, string workerRole, string? additionalContext = null, CancellationToken ct = default) =>
         Task.FromResult($"Work on {pipeline.Description} as {workerRole}");
 
-    public Task<OrchestratorDecision> InterpretOutputAsync(
-        GoalPipeline pipeline, string workerRole, string workerOutput, CancellationToken ct = default)
+    public Task<OrchestratorDecision> InterpretOutputAsync(GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default)
     {
-        var decision = InterpretOutputOverride?.Invoke(pipeline, workerRole, workerOutput)
+        var decision = InterpretOutputOverride?.Invoke(pipeline, phase, workerOutput)
             ?? new OrchestratorDecision { Action = OrchestratorActionType.Done, Verdict = "PASS" };
         return Task.FromResult(decision);
     }

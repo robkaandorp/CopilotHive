@@ -527,24 +527,23 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// Asks the Brain to interpret the output of a worker and return a verdict.
     /// </summary>
     /// <param name="pipeline">Current goal pipeline state.</param>
-    /// <param name="workerRole">Role of the worker that produced the output.</param>
+    /// <param name="phase">The goal phase that produced the output.</param>
     /// <param name="workerOutput">Raw text output from the worker.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>An <see cref="OrchestratorDecision"/> with the extracted verdict and metrics.</returns>
     public async Task<OrchestratorDecision> InterpretOutputAsync(
-        GoalPipeline pipeline, string workerRole, string workerOutput, CancellationToken ct = default)
+        GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default)
     {
-        // Keys are GoalPhase names (lowercase), not WorkerRole names
-        var schema = workerRole.ToLowerInvariant() switch
+        var schema = phase switch
         {
-            "coding" => """
+            GoalPhase.Coding => """
                 {
                   "verdict": "PASS or FAIL",
                   "issues": ["<issue1>", "<issue2>"],
                   "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
                 }
                 """,
-            "testing" => """
+            GoalPhase.Testing => """
                 {
                   "verdict": "PASS or FAIL",
                   "test_metrics": {
@@ -558,29 +557,31 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                   "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
                 }
                 """,
-            "review" => """
+            GoalPhase.Review => """
                 {
                   "review_verdict": "APPROVE or REQUEST_CHANGES",
                   "issues": ["<issue1>", "<issue2>"],
                   "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
                 }
                 """,
-            "docwriting" => """
+            GoalPhase.DocWriting => """
                 {
                   "verdict": "PASS or FAIL",
                   "issues": ["<issue1>", "<issue2>"],
                   "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
                 }
                 """,
-            "improve" => """
+            GoalPhase.Improve => """
                 {
                   "verdict": "PASS or FAIL",
                   "issues": ["<issue1>", "<issue2>"],
                   "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
                 }
                 """,
-            _ => throw new InvalidOperationException($"Unhandled worker phase in InterpretOutputAsync: '{workerRole}'"),
+            _ => throw new InvalidOperationException($"Unhandled phase in InterpretOutputAsync: '{phase}'"),
         };
+
+        var phaseName = phase.ToString();
 
         var modeInstruction = """
               IMPORTANT: You are in INTERPRETATION mode, NOT prompt-crafting mode.
@@ -589,7 +590,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
               """;
 
-        var testerInstruction = workerRole.Equals("testing", StringComparison.OrdinalIgnoreCase)
+        var testerInstruction = phase == GoalPhase.Testing
             ? """
 
               CRITICAL TESTER INSTRUCTIONS:
@@ -603,9 +604,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             : "";
 
         var prompt = $$"""
-            {{modeInstruction}}Interpret this {{workerRole}}'s output and extract structured data.
+            {{modeInstruction}}Interpret this {{phaseName}}'s output and extract structured data.
             {{testerInstruction}}
-            === {{workerRole.ToUpperInvariant()}} OUTPUT (truncated) ===
+            === {{phaseName.ToUpperInvariant()}} OUTPUT (truncated) ===
             {{Truncate(workerOutput, Constants.TruncationVeryLong)}}
             === END OUTPUT ===
 
@@ -630,7 +631,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             };
 
         ApplyModelTierIfNotSet(pipeline, result.ModelTier);
-        return ApplyTestMetricsFallback(result, workerRole, workerOutput, _logger);
+        return ApplyTestMetricsFallback(result, phase, workerOutput, _logger);
     }
 
     /// <summary>
@@ -789,10 +790,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// Brain values take priority unless they are null or zero, in which case fallback values win.
     /// </summary>
     internal static OrchestratorDecision ApplyTestMetricsFallback(
-        OrchestratorDecision decision, string workerRole, string rawOutput, ILogger logger)
+        OrchestratorDecision decision, GoalPhase phase, string rawOutput, ILogger logger)
     {
-        // workerRole is a GoalPhase name (e.g. "testing"), not a WorkerRole name
-        if (!workerRole.Equals("testing", StringComparison.OrdinalIgnoreCase))
+        if (phase != GoalPhase.Testing)
             return decision;
 
         if ((decision.TestMetrics?.TotalTests ?? 0) > 0 &&

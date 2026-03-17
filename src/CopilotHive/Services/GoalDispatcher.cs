@@ -225,7 +225,7 @@ public sealed class GoalDispatcher : BackgroundService
         // Ask the Brain to interpret the worker output
         var interpretation = await _brain!.InterpretOutputAsync(
             pipeline,
-            pipeline.Phase.ToString().ToLowerInvariant(),
+            pipeline.Phase,
             complete.Output,
             ct);
 
