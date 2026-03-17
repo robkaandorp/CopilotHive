@@ -97,6 +97,10 @@ public static class WorkerRoles
     public static readonly WorkerRole[] AgentRoles =
         [WorkerRole.Coder, WorkerRole.Tester, WorkerRole.Reviewer, WorkerRole.Improver, WorkerRole.Orchestrator, WorkerRole.DocWriter];
 
+    /// <summary>Roles that run as Docker workers and can receive gRPC broadcasts (excludes Orchestrator, MergeWorker).</summary>
+    public static readonly WorkerRole[] BroadcastableRoles =
+        [WorkerRole.Coder, WorkerRole.Tester, WorkerRole.Reviewer, WorkerRole.Improver, WorkerRole.DocWriter];
+
     /// <summary>Roles whose telemetry is aggregated for the improver.</summary>
     public static readonly WorkerRole[] TelemetryRoles =
         [WorkerRole.Coder, WorkerRole.Reviewer, WorkerRole.Tester];

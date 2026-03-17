@@ -1059,7 +1059,13 @@ public sealed class GoalDispatcher : BackgroundService
                 if (repoContent == currentContent) continue;
 
                 _agentsManager.UpdateAgentsMd(roleName, repoContent);
-                await BroadcastAgentsUpdateAsync(role, repoContent, ct);
+
+                // Only broadcast to Docker workers — Orchestrator/MergeWorker have no gRPC equivalent
+                if (WorkerRoles.BroadcastableRoles.Contains(role))
+                {
+                    await BroadcastAgentsUpdateAsync(role, repoContent, ct);
+                }
+
                 _logger.LogInformation("Synced {Role} AGENTS.md from config repo (changed)", roleName);
             }
         }
