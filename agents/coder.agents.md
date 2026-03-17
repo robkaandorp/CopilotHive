@@ -7,8 +7,8 @@ Every task requires you to edit files, build, test, and commit.
 
 Do NOT write a summary or plan. Start editing immediately:
 1. **Read** relevant files → **Edit/create** files → **Verify** edits by reading back
-2. **Build** the project using the build skill (check skills/ directory) and fix errors
-3. **Test** using the test skill (check skills/ directory) and fix failures
+2. **Build** the project using the /build skill and fix errors
+3. **Test** using the /test skill and fix failures
 4. **Commit** with `git add` + `git commit`
 
 A text-only response without file edits is a **failure**.
