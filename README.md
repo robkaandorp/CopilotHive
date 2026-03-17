@@ -88,6 +88,24 @@ goals:
       improver: gpt-4o
 ```
 
+When a goal completes (success or failure), the Orchestrator updates the goal entry with metadata including `phase_durations` — a map of phase names to wall-clock durations in seconds:
+
+```yaml
+goals:
+  - id: my-feature
+    # ... (input fields above)
+    started_at: "2026-03-17T19:38:37Z"
+    completed_at: "2026-03-17T19:42:15Z"
+    iterations: 2
+    status: completed
+    phase_durations:
+      Coding: 125.5
+      Testing: 85.3
+      DocWriting: 45.2
+      Review: 60.1
+      Merge: 12.5
+```
+
 ## Project Structure
 
 | Directory | Description |

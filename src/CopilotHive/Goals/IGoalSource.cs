@@ -15,6 +15,8 @@ public sealed record GoalUpdateMetadata
     public string? FailureReason { get; init; }
     /// <summary>Optional informational notes (e.g. "improver skipped: timeout").</summary>
     public List<string>? Notes { get; init; }
+    /// <summary>Per-phase wall-clock durations in seconds.</summary>
+    public Dictionary<string, double>? PhaseDurations { get; init; }
 }
 
 /// <summary>
