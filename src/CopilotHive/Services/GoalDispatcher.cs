@@ -280,6 +280,18 @@ public sealed class GoalDispatcher : BackgroundService
         // Propagate model_tier using first-non-null-wins — don't overwrite a tier already set by an earlier Brain call.
         DistributedBrain.ApplyModelTierIfNotSet(pipeline, interpretation.ModelTier);
 
+        // Guard: if the Brain says Done/Skip but the reviewer verdict is REQUEST_CHANGES,
+        // correct the action to RequestChanges so the coder gets another chance.
+        if (pipeline.Phase == GoalPhase.Review
+            && interpretation.Action is OrchestratorActionType.Done or OrchestratorActionType.Skip
+            && pipeline.Metrics.ReviewVerdict == "REQUEST_CHANGES")
+        {
+            _logger.LogWarning(
+                "Brain said {Action} for {GoalId} at Review but verdict is REQUEST_CHANGES — correcting to RequestChanges",
+                interpretation.Action, pipeline.GoalId);
+            interpretation = interpretation with { Action = OrchestratorActionType.RequestChanges };
+        }
+
         // Decide next step based on the action
         switch (interpretation.Action)
         {
@@ -394,7 +406,8 @@ public sealed class GoalDispatcher : BackgroundService
         GoalPipeline pipeline, CancellationToken ct, string? verdict = null, string? reason = null)
     {
         // If Review or Testing failed, loop back to Coding for another attempt
-        if (verdict is "FAIL" && pipeline.Phase is GoalPhase.Review or GoalPhase.Testing)
+        if ((verdict is "FAIL" || (verdict is "REQUEST_CHANGES" && pipeline.Phase == GoalPhase.Review))
+            && pipeline.Phase is GoalPhase.Review or GoalPhase.Testing)
         {
             var isReview = pipeline.Phase == GoalPhase.Review;
             var canRetry = isReview ? pipeline.IncrementReviewRetry() : pipeline.IncrementTestRetry();
