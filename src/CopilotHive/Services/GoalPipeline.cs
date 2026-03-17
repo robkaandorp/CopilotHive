@@ -328,4 +328,20 @@ public sealed class GoalPipeline
 
         return string.Join("\n", parts);
     }
+
+    /// <summary>Returns a human-friendly display name for the given <see cref="GoalPhase"/>.</summary>
+    /// <param name="phase">The pipeline phase to get a display name for.</param>
+    /// <returns>A human-readable string representation of the phase.</returns>
+    public static string GetDisplayName(GoalPhase phase) => phase switch
+    {
+        GoalPhase.Coding     => "Coding",
+        GoalPhase.Testing    => "Testing",
+        GoalPhase.DocWriting => "Doc Writing",
+        GoalPhase.Review     => "Review",
+        GoalPhase.Improve    => "Improvement",
+        GoalPhase.Merging    => "Merging",
+        GoalPhase.Done       => "Done",
+        GoalPhase.Failed     => "Failed",
+        _                    => phase.ToString()
+    };
 }
