@@ -36,7 +36,11 @@ CopilotHive/
 │   ├── tester.agents.md
 │   ├── docwriter.agents.md
 │   └── reviewer.agents.md
-└── VISION.md                         # Architecture and design document
+├── docs/                              # Design documents and research
+│   ├── VISION.md                      # Architecture and design document
+│   ├── TOOL_ANALYSIS.md               # SDK tool handling analysis
+│   └── COPILOT_PERMISSIONS.md         # CLI/SDK permissions research
+└── docker/                            # Container definitions
 ```
 
 ## Build and Test

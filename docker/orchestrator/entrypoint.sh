@@ -40,6 +40,15 @@ COPILOT_ARGS=(
     --model "$COPILOT_MODEL"
 )
 
+# The Brain is a pure reasoning engine — deny all tool access
+COPILOT_ARGS+=(
+    --deny-tool='shell'
+    --deny-tool='write'
+    --deny-tool='read'
+    --deny-tool='url'
+    --deny-tool='memory'
+)
+
 # Create an empty workspace so Copilot has nothing to explore
 mkdir -p /tmp/brain-workspace
 

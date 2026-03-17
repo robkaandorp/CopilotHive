@@ -79,6 +79,14 @@ if [[ -n "${COPILOT_MODEL}" ]]; then
     COPILOT_ARGS+=(--model "$COPILOT_MODEL")
 fi
 
+# Deny destructive git commands — infrastructure handles branching and pushing
+COPILOT_ARGS+=(
+    --deny-tool='shell(git push)'
+    --deny-tool='shell(git checkout)'
+    --deny-tool='shell(git branch)'
+    --deny-tool='shell(git switch)'
+)
+
 echo "[entrypoint] Starting: copilot ${COPILOT_ARGS[*]}"
 
 # --- Launch Copilot in the background ---
