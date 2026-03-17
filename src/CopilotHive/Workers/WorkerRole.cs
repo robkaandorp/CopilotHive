@@ -52,6 +52,20 @@ public static class WorkerRoleExtensions
         WorkerRole.DocWriter => CopilotHive.Shared.Grpc.WorkerRole.DocWriter,
         _ => throw new InvalidOperationException($"WorkerRole '{role}' has no gRPC equivalent"),
     };
+
+    /// <summary>
+    /// Converts a gRPC <see cref="CopilotHive.Shared.Grpc.WorkerRole"/> to its canonical lowercase name.
+    /// Mirrors <see cref="ToRoleName(WorkerRole)"/> for use at gRPC boundaries.
+    /// </summary>
+    public static string ToRoleName(this CopilotHive.Shared.Grpc.WorkerRole role) => role switch
+    {
+        CopilotHive.Shared.Grpc.WorkerRole.Coder => "coder",
+        CopilotHive.Shared.Grpc.WorkerRole.Tester => "tester",
+        CopilotHive.Shared.Grpc.WorkerRole.Reviewer => "reviewer",
+        CopilotHive.Shared.Grpc.WorkerRole.Improver => "improver",
+        CopilotHive.Shared.Grpc.WorkerRole.DocWriter => "docwriter",
+        _ => throw new InvalidOperationException($"Grpc WorkerRole '{role}' has no role name"),
+    };
 }
 
 /// <summary>

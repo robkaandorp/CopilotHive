@@ -334,6 +334,7 @@ public sealed class GoalPipeline
     /// <returns>A human-readable string representation of the phase.</returns>
     public static string GetDisplayName(GoalPhase phase) => phase switch
     {
+        GoalPhase.Planning   => "Planning",
         GoalPhase.Coding     => "Coding",
         GoalPhase.Testing    => "Testing",
         GoalPhase.DocWriting => "Doc Writing",
@@ -342,6 +343,6 @@ public sealed class GoalPipeline
         GoalPhase.Merging    => "Merging",
         GoalPhase.Done       => "Done",
         GoalPhase.Failed     => "Failed",
-        _                    => phase.ToString()
+        _                    => throw new InvalidOperationException($"Unhandled GoalPhase: {phase}")
     };
 }

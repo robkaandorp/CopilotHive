@@ -1,6 +1,8 @@
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Shared.Grpc;
+using CopilotHive.Workers;
+using WorkerRole = CopilotHive.Shared.Grpc.WorkerRole;
 
 namespace CopilotHive.Services;
 
@@ -34,15 +36,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
         ArgumentException.ThrowIfNullOrWhiteSpace(goalId);
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
 
-        var roleName = role switch
-        {
-            WorkerRole.Coder => "coder",
-            WorkerRole.Reviewer => "reviewer",
-            WorkerRole.Tester => "tester",
-            WorkerRole.Improver => "improver",
-            WorkerRole.DocWriter => "docwriter",
-            _ => throw new InvalidOperationException($"Unhandled WorkerRole in TaskBuilder: '{role}'"),
-        };
+        var roleName = WorkerRoleExtensions.ToRoleName(role);
 
         var repoList = repositories.ToList();
         if (repoList.Count == 0)

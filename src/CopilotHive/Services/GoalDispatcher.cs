@@ -1443,17 +1443,40 @@ public sealed class GoalDispatcher : BackgroundService
             }
             pipeline.SetPlan(iterationPlan);
 
-            var firstRole = goalPlan.Action switch
+            var goalAction = goalPlan.Action;
+            switch (goalAction)
             {
-                OrchestratorActionType.SpawnReviewer => WorkerRole.Reviewer,
-                OrchestratorActionType.SpawnTester => WorkerRole.Tester,
-                OrchestratorActionType.SpawnImprover => WorkerRole.Improver,
-                _ => WorkerRole.Coder,
-            };
+                case OrchestratorActionType.Done:
+                case OrchestratorActionType.Skip:
+                    _logger.LogInformation("Brain decided to {Action} goal {GoalId} at planning stage",
+                        goalAction, pipeline.GoalId);
+                    await MarkGoalCompleted(pipeline, ct);
+                    break;
 
-            pipeline.AdvanceTo(firstRole == WorkerRole.Coder ? GoalPhase.Coding : GoalPhase.Review);
-            DistributedBrain.ApplyModelTierIfNotSet(pipeline, goalPlan.ModelTier);
-            await DispatchToRole(pipeline, firstRole, goalPlan.Prompt, ct);
+                case OrchestratorActionType.SpawnCoder:
+                case OrchestratorActionType.SpawnReviewer:
+                case OrchestratorActionType.SpawnTester:
+                case OrchestratorActionType.SpawnImprover:
+                case OrchestratorActionType.SpawnDocWriter:
+                    var (firstRole, firstPhase) = goalAction switch
+                    {
+                        OrchestratorActionType.SpawnCoder => (WorkerRole.Coder, GoalPhase.Coding),
+                        OrchestratorActionType.SpawnReviewer => (WorkerRole.Reviewer, GoalPhase.Review),
+                        OrchestratorActionType.SpawnTester => (WorkerRole.Tester, GoalPhase.Testing),
+                        OrchestratorActionType.SpawnImprover => (WorkerRole.Improver, GoalPhase.Improve),
+                        OrchestratorActionType.SpawnDocWriter => (WorkerRole.DocWriter, GoalPhase.DocWriting),
+                        _ => throw new InvalidOperationException($"Unhandled spawn action: {goalAction}"),
+                    };
+
+                    pipeline.AdvanceTo(firstPhase);
+                    DistributedBrain.ApplyModelTierIfNotSet(pipeline, goalPlan.ModelTier);
+                    await DispatchToRole(pipeline, firstRole, goalPlan.Prompt, ct);
+                    break;
+
+                default:
+                    throw new InvalidOperationException(
+                        $"Unhandled Brain action '{goalAction}' during goal planning for '{pipeline.GoalId}'");
+            }
         }
         else
         {
