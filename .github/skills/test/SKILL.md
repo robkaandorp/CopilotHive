@@ -16,7 +16,7 @@ find . -name '*.slnx' -o -name '*.sln' | head -3
 Then run all tests with coverage:
 
 ```bash
-dotnet test <solution-file> /p:CollectCoverage=true /p:CoverletOutputFormat=text
+dotnet test <solution-file> --collect:"XPlat Code Coverage" --results-directory ./TestResults
 ```
 
 ## Reading Results
@@ -24,14 +24,19 @@ dotnet test <solution-file> /p:CollectCoverage=true /p:CoverletOutputFormat=text
 After running tests, look for the test summary line. Example output:
 
 ```
-Passed!  - Failed:     0, Passed:   322, Skipped:     0, Total:   322, Duration: 3s
+Passed!  - Failed:     0, Passed:   418, Skipped:     0, Total:   418, Duration: 13s
 ```
 
 Record:
 - **total_tests**: the Total count
 - **passed_tests**: the Passed count
 - **failed_tests**: the Failed count
-- **coverage_percent**: the line coverage percentage from the Coverlet table (look for the TOTAL row)
+
+For coverage, parse the Cobertura XML in the TestResults directory:
+```bash
+cat TestResults/*/coverage.cobertura.xml | grep '<coverage' | head -1
+```
+The `line-rate` attribute is the coverage percentage (0.37 = 37%).
 
 ## Writing New Tests
 
