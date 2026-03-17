@@ -183,5 +183,7 @@ public sealed class FileGoalSource : IGoalSource
         public int? Iterations { get; set; }
         public string? Failure_reason { get; set; }
         public List<string>? Notes { get; set; }
+        /// <summary>Per-phase wall-clock durations in seconds.</summary>
+        public Dictionary<string, double>? PhaseDurations { get; set; }
     }
 }

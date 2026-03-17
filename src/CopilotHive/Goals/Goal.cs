@@ -29,6 +29,8 @@ public sealed class Goal
     public string? FailureReason { get; set; }
     /// <summary>Optional informational notes (e.g. "improver skipped: timeout").</summary>
     public List<string> Notes { get; set; } = [];
+    /// <summary>Per-phase wall-clock durations in seconds.</summary>
+    public Dictionary<string, double>? PhaseDurations { get; set; }
 }
 
 /// <summary>Scheduling priority levels for goals.</summary>
