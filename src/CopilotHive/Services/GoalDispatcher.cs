@@ -28,6 +28,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly AgentsManager? _agentsManager;
     private readonly MetricsTracker? _metricsTracker;
     private readonly ConfigRepoManager? _configRepo;
+    private readonly Skills.SkillsManager? _skillsManager;
     private readonly ILogger<GoalDispatcher> _logger;
     private readonly HiveConfigFile? _config;
 
@@ -51,6 +52,7 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="agentsManager">Optional manager for per-role AGENTS.md files.</param>
     /// <param name="improvementAnalyzer">Optional analyzer that decides when to run the improver.</param>
     /// <param name="configRepo">Optional config repo manager for syncing AGENTS.md files.</param>
+    /// <param name="skillsManager">Optional skills manager for framework-agnostic build/test instructions.</param>
     public GoalDispatcher(
         GoalManager goalManager,
         GoalPipelineManager pipelineManager,
@@ -63,7 +65,8 @@ public sealed class GoalDispatcher : BackgroundService
         MetricsTracker? metricsTracker = null,
         AgentsManager? agentsManager = null,
         ImprovementAnalyzer? improvementAnalyzer = null,
-        ConfigRepoManager? configRepo = null)
+        ConfigRepoManager? configRepo = null,
+        Skills.SkillsManager? skillsManager = null)
     {
         _goalManager = goalManager;
         _pipelineManager = pipelineManager;
@@ -76,6 +79,7 @@ public sealed class GoalDispatcher : BackgroundService
         _logger = logger;
         _config = config;
         _configRepo = configRepo;
+        _skillsManager = skillsManager;
 
         completionNotifier.OnTaskCompleted += complete => HandleTaskCompletionAsync(complete);
     }
@@ -922,7 +926,7 @@ public sealed class GoalDispatcher : BackgroundService
             1. Run `git fetch origin`
             2. Run `git rebase origin/{defaultBranch}`
             3. Resolve any merge conflicts — keep the intent of the original changes
-            4. Run `dotnet build` and `dotnet test` to verify everything works
+            4. Build and test to verify everything works
             5. Commit the resolved changes
             """;
 
@@ -1502,8 +1506,11 @@ public sealed class GoalDispatcher : BackgroundService
         return repos;
     }
 
-    private static string BuildCoderPrompt(Goal goal)
+    private string BuildCoderPrompt(Goal goal)
     {
+        var buildTestInstructions = _skillsManager?.GetBuildAndTestInstructions()
+            ?? "Build the project and run the tests.";
+
         return $"""
             You are a coder. Implement the following task. Start by reading the relevant source files, then make your code changes, build, test, and commit.
 
@@ -1512,19 +1519,21 @@ public sealed class GoalDispatcher : BackgroundService
             Do NOT describe or plan changes — actually make them:
             1. Read the relevant source files
             2. Edit the files
-            3. Run `dotnet build` and fix any errors
-            4. Run `dotnet test` and fix any failures
+            3. Build the project and fix any errors
+            4. Run the tests and fix any failures
             5. Run `git add` + `git commit` with a descriptive message
             6. Verify with `git diff HEAD origin/<base-branch>` that you have a non-empty diff
 
             A response that only describes changes without actually editing files is a FAILURE.
+
+            {buildTestInstructions}
             """;
     }
 
     /// <summary>
     /// Builds a doc-writer prompt directly (bypasses Brain to avoid goal-description echo).
     /// </summary>
-    private static string BuildDocWriterPrompt(GoalPipeline pipeline, string? phaseInstructions)
+    private string BuildDocWriterPrompt(GoalPipeline pipeline, string? phaseInstructions)
     {
         var additionalContext = phaseInstructions is not null
             ? $"\nAdditional context from the Brain:\n{phaseInstructions}\n"
@@ -1532,6 +1541,9 @@ public sealed class GoalDispatcher : BackgroundService
 
         var branch = pipeline.CoderBranch
             ?? throw new InvalidOperationException("CoderBranch must be set before building doc-writer prompt");
+
+        var buildInstructions = _skillsManager?.GetSkill(Skills.SkillsManager.Names.Build)
+            ?? "Build the project to verify your changes compile.";
 
         return $"""
             You are the doc-writer. Your ONLY job is to update documentation for the code changes
@@ -1545,8 +1557,10 @@ public sealed class GoalDispatcher : BackgroundService
             3. Update the CHANGELOG.md — add entries under [Unreleased] describing what was added/changed/fixed
             4. Update XML doc comments (`<summary>`, `<param>`, `<returns>`) on any new or changed public APIs
             5. Update README.md if the changes affect user-facing features or configuration
-            6. Run `dotnet build` to verify your doc comment changes compile
+            6. Build the project to verify your doc comment changes compile
             7. Run `git add` + `git commit` with message "docs: update documentation for [brief description]"
+
+            {buildInstructions}
 
             CRITICAL RULES:
             - Do NOT write or run tests — that is the tester's job

@@ -18,6 +18,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly int _port;
     private readonly ILogger<DistributedBrain> _logger;
     private readonly MetricsTracker? _metricsTracker;
+    private readonly Skills.SkillsManager? _skillsManager;
     private CopilotClient? _copilotClient;
     private readonly ConcurrentDictionary<string, CopilotSession> _sessions = new();
 
@@ -57,12 +58,15 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <param name="logger">Logger instance.</param>
     /// <param name="metricsTracker">Optional tracker used to include historical metrics in prompts.</param>
     /// <param name="agentsManager">Optional manager used to load the orchestrator's AGENTS.md.</param>
+    /// <param name="skillsManager">Optional manager providing framework-agnostic build/test instructions.</param>
     public DistributedBrain(int port, ILogger<DistributedBrain> logger,
-        MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null)
+        MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null,
+        Skills.SkillsManager? skillsManager = null)
     {
         _port = port;
         _logger = logger;
         _metricsTracker = metricsTracker;
+        _skillsManager = skillsManager;
 
         // Build the orchestrator custom agent with no tools (reasoning-only)
         var orchestratorInstructions = agentsManager?.GetAgentsMd("orchestrator") ?? "";
@@ -482,6 +486,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _ => throw new InvalidOperationException($"Unhandled role in CraftPromptAsync: '{workerRole}'"),
         };
 
+        var skillsContext = _skillsManager?.GetBuildAndTestInstructions() ?? "";
+
         var prompt = $$"""
             Craft a prompt for the {{workerRole}} worker.
 
@@ -490,6 +496,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Branch: {{branch}}
             {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
             {{(historyContext.Length > 0 ? $"\n{historyContext}" : "")}}
+            {{(skillsContext.Length > 0 ? $"\nProject skills (include these in the prompt for the worker):\n{skillsContext}" : "")}}
 
             Rules for the prompt you craft:
             - CRITICAL: The branch name is EXACTLY "{{branch}}" — do NOT invent or change it
@@ -601,7 +608,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             Analyze the output carefully:
             - Did the worker succeed or fail at its task?
-            - For testers: did all tests pass? What are the numbers? You MUST populate the test_metrics object with actual numbers from the output — look for test counts in tables, summaries, or dotnet test output.
+            - For testers: did all tests pass? What are the numbers? You MUST populate the test_metrics object with actual numbers from the output — look for test counts in tables, summaries, or test runner output.
             - For reviewers: did they approve or request changes? What issues?
             - For docwriters: did they update CHANGELOG, README, or XML doc comments? Did they produce a DOC_REPORT? Did they commit?
             - For coders: did they make code changes and commit? Check for git commit evidence.
@@ -988,14 +995,20 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         };
     }
 
-    internal static string GetFallbackPrompt(string role, GoalPipeline pipeline) =>
-        role.ToLowerInvariant() switch
+    internal string GetFallbackPrompt(string role, GoalPipeline pipeline)
+    {
+        var buildTestInstructions = _skillsManager?.GetBuildAndTestInstructions()
+            ?? "Build the project and run the tests.";
+
+        return role.ToLowerInvariant() switch
         {
             "coder" => $"""
                 You are working on this goal: {pipeline.Description}
                 This is iteration {pipeline.Iteration}. Work on the {pipeline.CoderBranch} branch.
                 Write the code and commit your changes with clear commit messages.
                 Do NOT run git push — the orchestrator handles that.
+
+                {buildTestInstructions}
                 """,
             "reviewer" => $"""
                 You are reviewing code changes for this goal: {pipeline.Description}
@@ -1008,11 +1021,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             "tester" => $"""
                 You are testing code for this goal: {pipeline.Description}
                 This is iteration {pipeline.Iteration}. The coder's work is on branch {pipeline.CoderBranch}.
-                Build the project, run all tests with coverage (`dotnet test /p:CollectCoverage=true /p:CoverletOutputFormat=text`), write integration tests, and produce a TEST_REPORT block with:
+                Build the project, run all tests with coverage, write integration tests, and produce a TEST_REPORT block with:
                 - verdict: PASS or FAIL
                 - build_success, total_tests, passed_tests, failed_tests, coverage_percent
                 - issues: list of issues found (if any)
                 Do NOT run git push — the orchestrator handles that.
+
+                {buildTestInstructions}
                 """,
             "docswriter" => $"""
                 You are the doc-writer. Update documentation for the code changes on branch {pipeline.CoderBranch}.
@@ -1029,6 +1044,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 """,
             _ => throw new InvalidOperationException($"Unhandled role in GetFallbackPrompt: '{role}'"),
         };
+    }
 
     /// <summary>
     /// Builds a concise metrics history summary from the last N iterations for inclusion in prompts.

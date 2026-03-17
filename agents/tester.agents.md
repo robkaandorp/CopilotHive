@@ -30,8 +30,8 @@ What must be true for this to pass.
 - [ ] [Describe data flow test]
 
 ### Runtime Verification
-- [ ] Project builds successfully (`dotnet build` / equivalent)
-- [ ] All existing tests pass (`dotnet test` / equivalent)
+- [ ] Project builds successfully (use build skill or equivalent)
+- [ ] All existing tests pass (use test skill or equivalent)
 - [ ] Application starts and runs without errors
 - [ ] [Describe specific runtime checks]
 
@@ -44,25 +44,21 @@ What must be true for this to pass.
 
 Run the project build. This is the first gate — if it doesn't compile, stop here.
 
-First, locate the solution file (the project may use `.slnx` instead of `.sln`):
+First, check the skills/ directory for a build skill with project-specific instructions.
+
+If no build skill exists, locate the solution file:
 
 ```bash
-find . -name '*.slnx' -o -name '*.sln' | head -3
+find . -name '*.slnx' -o -name '*.sln' -o -name 'Makefile' -o -name 'package.json' | head -5
 ```
 
-Then build using the discovered file:
-
-```bash
-dotnet build  # or: dotnet build <path-to-solution-file>
-```
+Then build using the discovered method.
 
 ### Phase 3: Run Existing Tests
 
-Run ALL existing tests (unit tests written by the coder + any prior tests):
+Run ALL existing tests (unit tests written by the coder + any prior tests).
 
-```bash
-dotnet test  # or the project's test command
-```
+Check the skills/ directory for a test skill with project-specific instructions.
 
 Record results: total, passed, failed, skipped.
 

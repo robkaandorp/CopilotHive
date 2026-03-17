@@ -15,7 +15,7 @@ adherence. Focus on bugs, security, logic errors, and maintainability — not st
    If absent entirely, note as observation, not REQUEST_CHANGES.
 6. **Produce your review report** in the format below.
 
-**Do NOT run `dotnet build` or `dotnet test`** — that's the tester's job.
+**Do NOT build or run tests** — that's the tester's job.
 
 **Unverified SDK types:** Flag as `[MINOR] Unverified by build: <Type.Member>`.
 Note in summary that tester should confirm type resolution.

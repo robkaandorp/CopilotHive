@@ -99,15 +99,15 @@ public sealed class DistributedBrainTests
     [InlineData("improver", "agents.md")]
     public void GetFallbackPrompt_KnownRoles_ContainsExpectedContent(string role, string expectedFragment)
     {
-        // GetFallbackPrompt is private static, but we can invoke it via reflection
+        var brain = new DistributedBrain(9999, NullLogger<DistributedBrain>.Instance);
         var method = typeof(DistributedBrain).GetMethod(
             "GetFallbackPrompt",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
 
         Assert.NotNull(method);
 
         var pipeline = CreatePipeline("test-goal", "Implement feature X");
-        var result = (string)method.Invoke(null, [role, pipeline])!;
+        var result = (string)method.Invoke(brain, [role, pipeline])!;
 
         Assert.Contains(expectedFragment, result);
         Assert.Contains("Implement feature X", result);
@@ -116,15 +116,16 @@ public sealed class DistributedBrainTests
     [Fact]
     public void GetFallbackPrompt_UnknownRole_Throws()
     {
+        var brain = new DistributedBrain(9999, NullLogger<DistributedBrain>.Instance);
         var method = typeof(DistributedBrain).GetMethod(
             "GetFallbackPrompt",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
 
         Assert.NotNull(method);
 
         var pipeline = CreatePipeline("g-1", "Fix the bug");
         var ex = Assert.Throws<System.Reflection.TargetInvocationException>(
-            () => method.Invoke(null, ["unknown-role", pipeline]));
+            () => method.Invoke(brain, ["unknown-role", pipeline]));
         Assert.IsType<InvalidOperationException>(ex.InnerException);
     }
 
