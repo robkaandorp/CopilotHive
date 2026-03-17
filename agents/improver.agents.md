@@ -10,6 +10,7 @@ agent instructions to produce better results in the next iteration.
 You have direct access to the `agents/` folder containing `*.agents.md` files.
 Use the file tools (view, edit) to read and modify these files directly.
 You **cannot** run shell commands — file reading and editing only.
+Do NOT run git add, git commit, or any git commands — the infrastructure handles committing and pushing your changes automatically after you finish editing.
 
 ## Your Task
 

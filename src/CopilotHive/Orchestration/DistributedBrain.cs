@@ -482,7 +482,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 - For docwriters: tell them to update README, CHANGELOG, and XML doc comments based on the code changes on the branch, build to verify, and commit. Produce a DOC_REPORT.
                 """,
             WorkerRole.Improver => """
-                - For improvers: tell them to analyze iteration results and update *.agents.md files. Commit changes.
+                - For improvers: tell them to analyze iteration results and update *.agents.md files directly using file tools. Do NOT tell them to run git commands — the infrastructure commits and pushes automatically.
                 """,
             _ => throw new InvalidOperationException($"Unhandled role in CraftPromptAsync: '{roleName}'"),
         };
