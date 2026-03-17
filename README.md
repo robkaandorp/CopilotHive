@@ -103,6 +103,7 @@ goals:
 
 - **Server-only mode** — gRPC server + HTTP health endpoint (no CLI mode)
 - **LLM-powered Brain** — `DistributedBrain` uses GitHub Copilot SDK for orchestration decisions
+- **Worker utilization metrics** — `GET /health/utilization` endpoint provides per-role worker utilization and bottleneck detection
 - **Self-improvement loop** — the improver modifies `agents.md` based on accumulated metrics
 - **SQLite persistence** — `PipelineStore` with auto-migration for pipeline state
 - **Config repo** — externalized agent instructions and goals (`CopilotHive-Config`)
