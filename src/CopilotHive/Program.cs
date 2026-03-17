@@ -53,9 +53,10 @@ static async Task<int> RunServerAsync(string[] args)
     builder.Services.AddSingleton(new AgentsManager(agentsDir));
 
     // Skills: framework-agnostic build/test/install instructions
-    var skillsDir = Environment.GetEnvironmentVariable("SKILLS_DIR") ?? Path.Combine(AppContext.BaseDirectory, "skills");
+    var skillsDir = Environment.GetEnvironmentVariable("SKILLS_DIR")
+        ?? Path.Combine(AppContext.BaseDirectory, ".github", "copilot", "skills");
     if (!Directory.Exists(skillsDir))
-        skillsDir = Path.Combine(Directory.GetCurrentDirectory(), "skills");
+        skillsDir = Path.Combine(Directory.GetCurrentDirectory(), ".github", "copilot", "skills");
     builder.Services.AddSingleton(new CopilotHive.Skills.SkillsManager(skillsDir));
 
     // Persistence: SQLite store for pipeline state (survives restarts)
