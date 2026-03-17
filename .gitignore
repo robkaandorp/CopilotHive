@@ -18,3 +18,7 @@ agents/history/
 ## Secrets
 .env
 copilothive-smoketest.db
+
+# Coverage artifacts
+coverage.cobertura.xml
+TestResults/
