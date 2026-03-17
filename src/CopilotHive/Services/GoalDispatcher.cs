@@ -1578,12 +1578,9 @@ public sealed class GoalDispatcher : BackgroundService
             ? $"\nAdditional context from the Brain:\n{phaseInstructions}\n"
             : "";
 
-        var branch = pipeline.CoderBranch
-            ?? throw new InvalidOperationException("CoderBranch must be set before building doc-writer prompt");
-
         return $"""
             You are the doc-writer. Your ONLY job is to update documentation for the code changes
-            that have already been made on branch {branch}.
+            that have already been made on this branch.
 
             Goal summary: {pipeline.Description}
             {additionalContext}

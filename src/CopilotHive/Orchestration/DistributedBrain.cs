@@ -278,8 +278,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Plan the workflow for this goal:
             {{pipeline.Description}}
 
-            Branch: copilothive/{{pipeline.GoalId}}
-
             {{metricsContext}}
             {{historyContext}}
 
@@ -291,10 +289,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             the CHANGELOG, README, and XML doc comments. Even internal services need changelog entries.
 
             Rules for the prompt you craft:
-            - CRITICAL: The branch "copilothive/{{pipeline.GoalId}}" is already checked out — the worker is ALREADY on this branch
+            - The branch is already checked out by the infrastructure — do NOT mention branch names
             - NEVER include git checkout, git branch, git switch, or git push commands — the infrastructure handles all branching
             - NEVER include framework-specific build/test commands (dotnet build, npm test, etc.) — tell workers to use /build and /test skills
-            - NEVER invent or modify branch names — use exactly "copilothive/{{pipeline.GoalId}}"
 
             Respond with JSON:
             {
@@ -468,17 +465,15 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         GoalPipeline pipeline, WorkerRole role, string? additionalContext, CancellationToken ct = default)
     {
         var historyContext = BuildMetricsHistoryContext(3);
-        var branch = pipeline.CoderBranch
-            ?? throw new InvalidOperationException("CoderBranch must be set before crafting prompts");
 
         var roleName = role.ToRoleName();
         var roleInstruction = role switch
         {
-            WorkerRole.Coder => $"""
+            WorkerRole.Coder => """
                 - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, use /build skill, use /test skill, and commit with `git add -A && git commit`. NEVER include git checkout, git branch, or git push commands. NEVER include dotnet/npm/cargo commands — only reference /build and /test skills.
                 """,
-            WorkerRole.Reviewer => $"""
-                - For reviewers: tell them to run `git diff origin/<base-branch>...HEAD` to review ALL changes on branch "{branch}". The `origin/` prefix is required because the clone only has remote tracking refs. Produce a REVIEW_REPORT.
+            WorkerRole.Reviewer => """
+                - For reviewers: tell them to run `git diff origin/<base-branch>...HEAD` to review ALL changes. The base branch and feature branch are provided in the workspace context. The `origin/` prefix is required because the clone only has remote tracking refs. Produce a REVIEW_REPORT.
                 """,
             WorkerRole.Tester => """
                 - For testers: tell them to build, run the test skill, write integration tests, produce a TEST_REPORT
@@ -497,7 +492,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             Goal: {{pipeline.Description}}
             Iteration: {{pipeline.Iteration}}
-            Branch: {{branch}}
             {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
             {{(historyContext.Length > 0 ? $"\n{historyContext}" : "")}}
 
@@ -505,10 +499,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Tell the worker to use those skills instead of hardcoding framework-specific commands.
 
             Rules for the prompt you craft:
-            - CRITICAL: The branch is already checked out at "{{branch}}" — the worker is ALREADY on this branch
+            - The branch is already checked out by the infrastructure — do NOT mention branch names
             - NEVER include git checkout, git branch, git switch, or git push commands — the infrastructure handles all branching
             - NEVER include framework-specific build/test commands (dotnet build, npm test, etc.) — tell workers to use /build and /test skills
-            - NEVER invent or modify branch names — use exactly "{{branch}}"
             {{roleInstruction}}
             - Include any context from previous phases that would help the worker
 
