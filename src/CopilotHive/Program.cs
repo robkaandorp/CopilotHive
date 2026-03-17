@@ -81,6 +81,7 @@ static async Task<int> RunServerAsync(string[] args)
         Console.WriteLine("[Hive] Brain disabled — running in mechanical mode (no BRAIN_COPILOT_PORT set)");
     }
 
+    builder.Services.AddSingleton<WorkerUtilizationService>();
     builder.Services.AddSingleton<GoalDispatcher>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<GoalDispatcher>());
     builder.Services.AddHostedService<StaleWorkerCleanupService>();
@@ -175,6 +176,8 @@ static async Task<int> RunServerAsync(string[] args)
             WorkerPool = workerPool.GetDetailedStats(),
         });
     });
+
+    app.MapGet("/health/utilization", (WorkerUtilizationService svc) => Results.Ok(svc.GetUtilization()));
 
     // ── Goals REST API ───────────────────────────────────────────────────────
     var goalsApi = app.MapGroup("/api/goals");
