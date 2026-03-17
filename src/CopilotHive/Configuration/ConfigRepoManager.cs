@@ -129,23 +129,6 @@ public sealed class ConfigRepoManager
     }
 
     /// <summary>
-    /// Commits and pushes an updated AGENTS.md for a specific role back to the config repo.
-    /// </summary>
-    public async Task CommitAgentsUpdateAsync(string role, string content, CancellationToken ct = default)
-    {
-        var agentsDir = Path.Combine(_localPath, "agents");
-        Directory.CreateDirectory(agentsDir);
-
-        var filePath = Path.Combine(agentsDir, $"{role.ToLowerInvariant()}.agents.md");
-        await File.WriteAllTextAsync(filePath, content, ct);
-
-        await RunGitAsync(_localPath, ["add", filePath], ct);
-        await RunGitAsync(_localPath,
-            ["commit", "-m", $"Update {role} AGENTS.md"], ct);
-        await RunGitAsync(_localPath, ["push", "origin", "HEAD"], ct);
-    }
-
-    /// <summary>
     /// Commits and pushes a single file that has already been written to disk.
     /// Used to persist goals.yaml status updates back to the config repo.
     /// </summary>

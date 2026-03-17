@@ -143,6 +143,10 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
 
             if (isImprover)
             {
+                // Enforce character limit on *.agents.md files before committing.
+                // Re-prompts Copilot in the same session to condense if over limit.
+                copilotOutput = await EnsureAgentsMdWithinLimitsAsync(copilotOutput, ct);
+
                 // Improver: commit and push changes to the config repo agents folder
                 aggregatedStatus = await CommitAndPushConfigRepoAsync(ct);
             }
@@ -254,6 +258,73 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
             _log.Error("Working directory still dirty after commit retries — uncommitted changes may be lost");
 
         return previousOutput;
+    }
+
+    /// <summary>
+    /// Checks all *.agents.md files in the config repo agents folder against the character limit.
+    /// If any file exceeds the limit, re-prompts Copilot in the same session to condense it.
+    /// After max retries, discards all changes to keep the config repo clean.
+    /// </summary>
+    private async Task<string> EnsureAgentsMdWithinLimitsAsync(string previousOutput, CancellationToken ct)
+    {
+        if (!Directory.Exists(ConfigAgentsDir))
+            return previousOutput;
+
+        for (var attempt = 0; attempt < WorkerConstants.AgentsMdMaxRetries; attempt++)
+        {
+            var violations = GetAgentsMdViolations();
+            if (violations.Count == 0)
+                return previousOutput;
+
+            _log.Info($"Agents.md size check (attempt {attempt + 1}/{WorkerConstants.AgentsMdMaxRetries}): " +
+                      $"{violations.Count} file(s) over {WorkerConstants.AgentsMdMaxCharacters} chars");
+
+            var violationDetails = string.Join("\n", violations.Select(v =>
+                $"  - {v.FileName}: {v.CharCount} characters (limit: {WorkerConstants.AgentsMdMaxCharacters})"));
+
+            var condensePrompt = $"""
+                The following agents.md file(s) exceed the {WorkerConstants.AgentsMdMaxCharacters}-character limit:
+                {violationDetails}
+
+                Please condense each file to fit within {WorkerConstants.AgentsMdMaxCharacters} characters.
+                Prioritize the most impactful rules and remove less important content.
+                Do NOT add new content — only condense what is there.
+                """;
+
+            var condenseOutput = await copilotRunner.SendPromptAsync(condensePrompt, ConfigAgentsDir, ct);
+            previousOutput += "\n\n[Agents.md size enforcement]\n" + condenseOutput;
+        }
+
+        // Final check after all retries
+        var remaining = GetAgentsMdViolations();
+        if (remaining.Count > 0)
+        {
+            var fileNames = string.Join(", ", remaining.Select(v => $"{v.FileName} ({v.CharCount} chars)"));
+            _log.Error($"Agents.md still over limit after {WorkerConstants.AgentsMdMaxRetries} retries: {fileNames}. Discarding all changes.");
+
+            // Discard all agents.md changes to keep config repo clean
+            await GitOperations.RunGitCommandAsync(ConfigRepoDir, "checkout -- agents/", ct);
+            previousOutput += $"\n\n[Agents.md changes discarded — files still over {WorkerConstants.AgentsMdMaxCharacters}-char limit after {WorkerConstants.AgentsMdMaxRetries} retries: {fileNames}]";
+        }
+
+        return previousOutput;
+    }
+
+    /// <summary>
+    /// Returns a list of *.agents.md files that exceed the character limit.
+    /// </summary>
+    private static List<(string FileName, int CharCount)> GetAgentsMdViolations()
+    {
+        var violations = new List<(string FileName, int CharCount)>();
+
+        foreach (var file in Directory.GetFiles(ConfigAgentsDir, "*.agents.md"))
+        {
+            var content = File.ReadAllText(file);
+            if (content.Length > WorkerConstants.AgentsMdMaxCharacters)
+                violations.Add((Path.GetFileName(file), content.Length));
+        }
+
+        return violations;
     }
 
     /// <summary>

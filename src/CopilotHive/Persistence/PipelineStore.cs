@@ -243,7 +243,7 @@ public sealed class PipelineStore : IAsyncDisposable
             using var cmd = _db.CreateCommand();
             cmd.CommandText = """
                 SELECT goal_id, description, goal_json, phase, iteration,
-                       review_retries, test_retries, improver_retries, max_retries, max_iterations,
+                       review_retries, test_retries, max_retries, max_iterations,
                        active_task_id, coder_branch, phase_outputs, metrics_json,
                        created_at, completed_at
                 FROM pipelines
@@ -263,15 +263,14 @@ public sealed class PipelineStore : IAsyncDisposable
                     Iteration = reader.GetInt32(4),
                     ReviewRetries = reader.GetInt32(5),
                     TestRetries = reader.GetInt32(6),
-                    ImproverRetries = reader.GetInt32(7),
-                    MaxRetries = reader.GetInt32(8),
-                    MaxIterations = reader.GetInt32(9),
-                    ActiveTaskId = reader.IsDBNull(10) ? null : reader.GetString(10),
-                    CoderBranch = reader.IsDBNull(11) ? null : reader.GetString(11),
-                    PhaseOutputs = JsonSerializer.Deserialize<Dictionary<string, string>>(reader.GetString(12), JsonOptions) ?? [],
-                    Metrics = JsonSerializer.Deserialize<IterationMetrics>(reader.GetString(13), JsonOptions) ?? new() { Iteration = 1 },
-                    CreatedAt = DateTime.Parse(reader.GetString(14), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
-                    CompletedAt = reader.IsDBNull(15) ? null : DateTime.Parse(reader.GetString(15), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+                    MaxRetries = reader.GetInt32(7),
+                    MaxIterations = reader.GetInt32(8),
+                    ActiveTaskId = reader.IsDBNull(9) ? null : reader.GetString(9),
+                    CoderBranch = reader.IsDBNull(10) ? null : reader.GetString(10),
+                    PhaseOutputs = JsonSerializer.Deserialize<Dictionary<string, string>>(reader.GetString(11), JsonOptions) ?? [],
+                    Metrics = JsonSerializer.Deserialize<IterationMetrics>(reader.GetString(12), JsonOptions) ?? new() { Iteration = 1 },
+                    CreatedAt = DateTime.Parse(reader.GetString(13), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+                    CompletedAt = reader.IsDBNull(14) ? null : DateTime.Parse(reader.GetString(14), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
                     Conversation = LoadConversationCore(goalId),
                 });
             }
@@ -291,12 +290,12 @@ public sealed class PipelineStore : IAsyncDisposable
         cmd.CommandText = """
             INSERT OR REPLACE INTO pipelines
                 (goal_id, description, goal_json, phase, iteration,
-                 review_retries, test_retries, improver_retries, max_retries, max_iterations,
+                 review_retries, test_retries, max_retries, max_iterations,
                  active_task_id, coder_branch, phase_outputs, metrics_json,
                  created_at, completed_at)
             VALUES
                 (@goalId, @desc, @goalJson, @phase, @iteration,
-                 @reviewRetries, @testRetries, @improverRetries, @maxRetries, @maxIterations,
+                 @reviewRetries, @testRetries, @maxRetries, @maxIterations,
                  @activeTaskId, @coderBranch, @phaseOutputs, @metricsJson,
                  @createdAt, @completedAt)
             """;
@@ -307,7 +306,6 @@ public sealed class PipelineStore : IAsyncDisposable
         cmd.Parameters.AddWithValue("@iteration", pipeline.Iteration);
         cmd.Parameters.AddWithValue("@reviewRetries", pipeline.ReviewRetries);
         cmd.Parameters.AddWithValue("@testRetries", pipeline.TestRetries);
-        cmd.Parameters.AddWithValue("@improverRetries", pipeline.ImproverRetries);
         cmd.Parameters.AddWithValue("@maxRetries", pipeline.MaxRetries);
         cmd.Parameters.AddWithValue("@maxIterations", pipeline.MaxIterations);
         cmd.Parameters.AddWithValue("@activeTaskId", (object?)pipeline.ActiveTaskId ?? DBNull.Value);
@@ -400,8 +398,6 @@ public sealed class PipelineSnapshot
     public int ReviewRetries { get; init; }
     /// <summary>Number of test retries consumed so far.</summary>
     public int TestRetries { get; init; }
-    /// <summary>Number of improver retries consumed so far.</summary>
-    public int ImproverRetries { get; init; }
     /// <summary>Maximum retries allowed per task.</summary>
     public int MaxRetries { get; init; }
     /// <summary>Maximum iterations allowed before the goal is failed.</summary>
