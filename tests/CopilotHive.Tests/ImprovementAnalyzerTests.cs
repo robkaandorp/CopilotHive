@@ -277,14 +277,15 @@ public class ImprovementAnalyzerTests
 
         var priorities = _analyzer.GetRolePriorities(current, new List<IterationMetrics>());
 
-        Assert.Equal(3, priorities.Count);
+        Assert.Equal(6, priorities.Count);
         // reviewer should be first (highest score)
         Assert.Equal(WorkerRole.Reviewer, priorities[0].Role);
-        // remaining two should be in alphabetical order (coder before tester, both at 0)
-        Assert.Equal(WorkerRole.Coder, priorities[1].Role);
-        Assert.Equal(WorkerRole.Tester, priorities[2].Role);
-        // descending order check
-        Assert.True(priorities[0].ConfidenceScore >= priorities[1].ConfidenceScore);
-        Assert.True(priorities[1].ConfidenceScore >= priorities[2].ConfidenceScore);
+        // all results should be in descending score order, ties broken alphabetically
+        for (int i = 1; i < priorities.Count; i++)
+        {
+            Assert.True(priorities[i - 1].ConfidenceScore >= priorities[i].ConfidenceScore);
+            if (priorities[i - 1].ConfidenceScore == priorities[i].ConfidenceScore)
+                Assert.True(priorities[i - 1].Role.CompareTo(priorities[i].Role) <= 0);
+        }
     }
 }

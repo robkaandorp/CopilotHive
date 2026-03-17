@@ -220,10 +220,11 @@ public sealed class ImprovementAnalyzer
                      _ => "Current iteration had a build failure",
                      "build failures"),
                 ],
-                _ => null,
+                WorkerRole.DocWriter or WorkerRole.Improver or WorkerRole.Orchestrator => [],
+                _ => throw new InvalidOperationException($"Unhandled role in AnalyzeRole: '{role}'"),
             };
 
-        if (signals is null)
+        if (signals.Count == 0)
             return new RoleImprovementRecommendation(role, false, 0, []);
 
         var reasons = new List<string>();

@@ -69,6 +69,5 @@ public static class WorkerRoles
         [WorkerRole.Coder, WorkerRole.Reviewer, WorkerRole.Tester];
 
     /// <summary>Roles that the improvement analyzer can produce recommendations for.</summary>
-    public static readonly WorkerRole[] ImprovableRoles =
-        [WorkerRole.Coder, WorkerRole.Reviewer, WorkerRole.Tester];
+    public static readonly WorkerRole[] ImprovableRoles = AgentRoles;
 }
