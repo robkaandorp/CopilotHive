@@ -1572,19 +1572,21 @@ public sealed class GoalDispatcher : BackgroundService
             1. Run `git diff origin/<base-branch>...HEAD --stat` to see ALL files changed on this branch
             2. Run `git diff origin/<base-branch>...HEAD` to review the full diff
             3. Update the CHANGELOG.md — add entries under [Unreleased] describing what was added/changed/fixed
-            4. Update XML doc comments (`<summary>`, `<param>`, `<returns>`) on any new or changed public APIs
+            4. Verify XML doc comments on new/changed public APIs are present and accurate — flag missing or incorrect ones in your DOC_REPORT but do NOT edit source code files (that is the coder's job)
             5. Update README.md if the changes affect user-facing features or configuration
             6. Run `git add -A && git commit` with message "docs: update documentation for [brief description]"
 
             CRITICAL RULES:
+            - Do NOT edit source code (.cs files) — that is the coder's job
             - Do NOT write or run tests — that is the tester's job
-            - Do NOT implement features or fix bugs — that is the coder's job
             - Do NOT run git push — the orchestrator handles that
+            - Only edit documentation files: CHANGELOG.md, README.md, and other .md files
 
             When done, produce a DOC_REPORT block:
             ```DOC_REPORT
             files_updated: [list of files you changed]
             changelog_entries: [number of entries added]
+            xml_doc_issues: [list of missing or incorrect XML doc comments, or 'none']
             verdict: PASS or FAIL
             issues: [any issues encountered]
             ```
