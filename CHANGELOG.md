@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ConnectedWorkerTests.cs` — comprehensive xUnit test suite for `ConnectedWorker` class with 6 tests covering constructor initialization, state transitions (MarkBusy/MarkIdle), heartbeat updates, message channel I/O, and stale detection logic.
 - `WorkerUtilizationService` — computes per-role worker utilization metrics from the current pool state; includes overall utilization fraction (0.0–1.0), per-role breakdown, and bottleneck role detection (utilization > 0.8).
 - `WorkerUtilizationMetrics` DTO with `OverallUtilization` (double), `RoleBreakdown` (dictionary of role name to utilization fraction), and `BottleneckRoles` (list of role names exceeding 80% utilization).
 - `GET /health/utilization` endpoint that returns current worker pool utilization metrics as JSON; registered in `Program.cs` and backed by `WorkerUtilizationService`.
