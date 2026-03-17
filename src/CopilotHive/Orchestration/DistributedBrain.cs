@@ -459,23 +459,42 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         GoalPipeline pipeline, string workerRole, string? additionalContext, CancellationToken ct = default)
     {
         var historyContext = BuildMetricsHistoryContext(3);
+        var branch = pipeline.CoderBranch
+            ?? throw new InvalidOperationException("CoderBranch must be set before crafting prompts");
+
+        var roleInstruction = workerRole.ToLowerInvariant() switch
+        {
+            "coder" => $"""
+                - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, build, test, and commit. Do NOT include git branch or git push commands.
+                """,
+            "reviewer" => $"""
+                - For reviewers: tell them to review the diff on branch "{branch}" against the base branch, produce a REVIEW_REPORT
+                """,
+            "tester" => """
+                - For testers: tell them to build, run the test skill, write integration tests, produce a TEST_REPORT
+                """,
+            "docswriter" => """
+                - For docwriters: tell them to update README, CHANGELOG, and XML doc comments based on the code changes on the branch, build to verify, and commit. Produce a DOC_REPORT.
+                """,
+            "improver" => """
+                - For improvers: tell them to analyze iteration results and update *.agents.md files. Commit changes.
+                """,
+            _ => throw new InvalidOperationException($"Unhandled role in CraftPromptAsync: '{workerRole}'"),
+        };
 
         var prompt = $$"""
             Craft a prompt for the {{workerRole}} worker.
 
             Goal: {{pipeline.Description}}
             Iteration: {{pipeline.Iteration}}
-            Branch: {{pipeline.CoderBranch ?? "TBD"}}
+            Branch: {{branch}}
             {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
             {{(historyContext.Length > 0 ? $"\n{historyContext}" : "")}}
 
             Rules for the prompt you craft:
-            - CRITICAL: The branch name is EXACTLY "{{pipeline.CoderBranch ?? "TBD"}}" — do NOT invent or change it
+            - CRITICAL: The branch name is EXACTLY "{{branch}}" — do NOT invent or change it
             - The worker infrastructure handles branch creation, checkout, and pushing — do NOT tell workers to create branches or push
-            - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, build, test, and commit. Do NOT include git branch or git push commands.
-            - For reviewers: tell them to review the diff on branch "{{pipeline.CoderBranch ?? "TBD"}}" against the base branch, produce a REVIEW_REPORT
-            - For testers: tell them to build, run tests with coverage (`dotnet test /p:CollectCoverage=true /p:CoverletOutputFormat=text`), write integration tests, produce a TEST_REPORT
-            - For docwriters: tell them to update README, CHANGELOG, and XML doc comments based on the code changes on the branch, build to verify, and commit. Produce a DOC_REPORT.
+            {{roleInstruction}}
             - Include any context from previous phases that would help the worker
 
             Respond with JSON:

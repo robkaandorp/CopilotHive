@@ -151,6 +151,7 @@ public sealed class DistributedBrainTests
     {
         var brain = new DistributedBrain(9999, NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-4", "Some goal");
+        pipeline.SetActiveTask("task-1", "copilothive/g-4/coder-001");
 
         var prompt = await brain.CraftPromptAsync(pipeline, "coder", null);
 
