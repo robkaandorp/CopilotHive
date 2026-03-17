@@ -97,6 +97,18 @@ public static class GitOperations
     }
 
     /// <summary>
+    /// Returns true if the working directory has uncommitted changes (staged or unstaged).
+    /// Uses <c>git status --porcelain</c> which outputs one line per changed file.
+    /// </summary>
+    /// <param name="repoDir">Path to the local git repository.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public static async Task<bool> HasUncommittedChangesAsync(string repoDir, CancellationToken ct)
+    {
+        var (exitCode, stdout, _) = await RunGitCommandAsync(repoDir, "status --porcelain", ct);
+        return exitCode == 0 && !string.IsNullOrWhiteSpace(stdout);
+    }
+
+    /// <summary>
     /// Run a git command and return (exitCode, stdout, stderr).
     /// </summary>
     public static async Task<(int ExitCode, string Stdout, string Stderr)> RunGitCommandAsync(

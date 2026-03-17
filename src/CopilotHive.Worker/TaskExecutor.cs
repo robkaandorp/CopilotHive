@@ -128,6 +128,16 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
             _log.Info($"Sending prompt to Copilot ({enrichedPrompt.Length} chars)");
             var copilotOutput = await copilotRunner.SendPromptAsync(enrichedPrompt, primaryWorkDir, ct);
 
+            // For roles that push code, ensure Copilot committed its changes.
+            // If the working directory is dirty, re-prompt Copilot to commit.
+            if (!isImprover && assignment.Role != WorkerRole.Reviewer)
+            {
+                foreach (var (_, dir) in repoDirectories)
+                {
+                    copilotOutput = await EnsureCleanWorktreeAsync(copilotOutput, dir, ct);
+                }
+            }
+
             // Collect git status from each repo and push changes
             GitStatus? aggregatedStatus = null;
 
@@ -209,6 +219,40 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
                 },
             };
         }
+    }
+
+    /// <summary>
+    /// Checks if the working directory has uncommitted changes and, if so, re-prompts Copilot
+    /// to stage and commit them. Retries up to <paramref name="maxRetries"/> times.
+    /// Returns the accumulated Copilot output including any cleanup conversation.
+    /// </summary>
+    private async Task<string> EnsureCleanWorktreeAsync(
+        string previousOutput, string workDir, CancellationToken ct, int maxRetries = 2)
+    {
+        for (var attempt = 0; attempt < maxRetries; attempt++)
+        {
+            if (!await GitOperations.HasUncommittedChangesAsync(workDir, ct))
+                return previousOutput;
+
+            _log.Info($"Working directory has uncommitted changes (attempt {attempt + 1}/{maxRetries}), prompting Copilot to commit...");
+
+            var commitPrompt = """
+                Your working directory has uncommitted changes. Please:
+                1. Run `git add -A` to stage all changes
+                2. Run `git commit` with a descriptive message summarizing what you did
+                3. Run `git status` to verify the working directory is clean
+
+                Do NOT push — the infrastructure handles pushing.
+                """;
+
+            var cleanupOutput = await copilotRunner.SendPromptAsync(commitPrompt, workDir, ct);
+            previousOutput += "\n\n[Auto-commit prompt]\n" + cleanupOutput;
+        }
+
+        if (await GitOperations.HasUncommittedChangesAsync(workDir, ct))
+            _log.Error("Working directory still dirty after commit retries — uncommitted changes may be lost");
+
+        return previousOutput;
     }
 
     /// <summary>
