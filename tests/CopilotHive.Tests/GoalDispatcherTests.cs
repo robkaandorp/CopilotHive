@@ -3,7 +3,10 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
+using CopilotHive.Workers;
 using Microsoft.Extensions.Logging.Abstractions;
+
+using WorkerRole = CopilotHive.Workers.WorkerRole;
 
 namespace CopilotHive.Tests;
 
@@ -255,8 +258,8 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
         Task.FromResult(IterationPlan.Default());
 
     public Task<string> CraftPromptAsync(
-        GoalPipeline pipeline, string workerRole, string? additionalContext = null, CancellationToken ct = default) =>
-        Task.FromResult($"Work on {pipeline.Description} as {workerRole}");
+        GoalPipeline pipeline, WorkerRole role, string? additionalContext = null, CancellationToken ct = default) =>
+        Task.FromResult($"Work on {pipeline.Description} as {role.ToRoleName()}");
 
     public Task<OrchestratorDecision> InterpretOutputAsync(GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default)
     {

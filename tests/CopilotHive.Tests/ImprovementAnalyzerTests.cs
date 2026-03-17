@@ -1,5 +1,6 @@
 using CopilotHive.Improvement;
 using CopilotHive.Metrics;
+using CopilotHive.Workers;
 
 namespace CopilotHive.Tests;
 
@@ -174,9 +175,9 @@ public class ImprovementAnalyzerTests
         };
         var history = new List<IterationMetrics>();
 
-        var reviewer = _analyzer.AnalyzeRole("reviewer", current, history);
-        var coder = _analyzer.AnalyzeRole("coder", current, history);
-        var tester = _analyzer.AnalyzeRole("tester", current, history);
+        var reviewer = _analyzer.AnalyzeRole(WorkerRole.Reviewer, current, history);
+        var coder = _analyzer.AnalyzeRole(WorkerRole.Coder, current, history);
+        var tester = _analyzer.AnalyzeRole(WorkerRole.Tester, current, history);
 
         Assert.True(reviewer.ConfidenceScore >= 50);
         Assert.True(reviewer.ShouldImprove);
@@ -198,9 +199,9 @@ public class ImprovementAnalyzerTests
         };
         var history = new List<IterationMetrics>();
 
-        var reviewer = _analyzer.AnalyzeRole("reviewer", current, history);
-        var tester = _analyzer.AnalyzeRole("tester", current, history);
-        var coder = _analyzer.AnalyzeRole("coder", current, history);
+        var reviewer = _analyzer.AnalyzeRole(WorkerRole.Reviewer, current, history);
+        var tester = _analyzer.AnalyzeRole(WorkerRole.Tester, current, history);
+        var coder = _analyzer.AnalyzeRole(WorkerRole.Coder, current, history);
 
         Assert.True(reviewer.ConfidenceScore >= 50);
         Assert.True(tester.ConfidenceScore >= 50);
@@ -217,12 +218,12 @@ public class ImprovementAnalyzerTests
             BuildSuccess = true,
         };
 
-        var withHistory = _analyzer.AnalyzeRole("reviewer", current, new List<IterationMetrics>
+        var withHistory = _analyzer.AnalyzeRole(WorkerRole.Reviewer, current, new List<IterationMetrics>
         {
             new() { ReviewIssuesFound = 1, ReviewRetryCount = 1 },
             new() { ReviewIssuesFound = 2, ReviewRetryCount = 1 },
         });
-        var withoutHistory = _analyzer.AnalyzeRole("reviewer", current, new List<IterationMetrics>());
+        var withoutHistory = _analyzer.AnalyzeRole(WorkerRole.Reviewer, current, new List<IterationMetrics>());
 
         // Without history only current signals (50 pts); with history score should be higher
         Assert.Equal(50, withoutHistory.ConfidenceScore);
@@ -243,7 +244,7 @@ public class ImprovementAnalyzerTests
         };
         var history = new List<IterationMetrics>();
 
-        foreach (var role in new[] { "coder", "reviewer", "tester" })
+        foreach (var role in new[] { WorkerRole.Coder, WorkerRole.Reviewer, WorkerRole.Tester })
         {
             var rec = _analyzer.AnalyzeRole(role, current, history);
             Assert.Equal(0, rec.ConfidenceScore);
@@ -258,8 +259,8 @@ public class ImprovementAnalyzerTests
         var historicalIteration = new IterationMetrics { FailedTests = 3, TestRetryCount = 1 };
         var history = new List<IterationMetrics> { historicalIteration, historicalIteration };
 
-        var withHistory = _analyzer.AnalyzeRole("tester", current, history);
-        var withoutHistory = _analyzer.AnalyzeRole("tester", current, new List<IterationMetrics>());
+        var withHistory = _analyzer.AnalyzeRole(WorkerRole.Tester, current, history);
+        var withoutHistory = _analyzer.AnalyzeRole(WorkerRole.Tester, current, new List<IterationMetrics>());
 
         Assert.True(withHistory.ConfidenceScore > withoutHistory.ConfidenceScore);
     }
@@ -278,10 +279,10 @@ public class ImprovementAnalyzerTests
 
         Assert.Equal(3, priorities.Count);
         // reviewer should be first (highest score)
-        Assert.Equal("reviewer", priorities[0].Role);
+        Assert.Equal(WorkerRole.Reviewer, priorities[0].Role);
         // remaining two should be in alphabetical order (coder before tester, both at 0)
-        Assert.Equal("coder", priorities[1].Role);
-        Assert.Equal("tester", priorities[2].Role);
+        Assert.Equal(WorkerRole.Coder, priorities[1].Role);
+        Assert.Equal(WorkerRole.Tester, priorities[2].Role);
         // descending order check
         Assert.True(priorities[0].ConfidenceScore >= priorities[1].ConfidenceScore);
         Assert.True(priorities[1].ConfidenceScore >= priorities[2].ConfidenceScore);

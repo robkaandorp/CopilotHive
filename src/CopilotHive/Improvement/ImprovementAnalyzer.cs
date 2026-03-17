@@ -1,16 +1,17 @@
 using CopilotHive.Metrics;
+using CopilotHive.Workers;
 
 namespace CopilotHive.Improvement;
 
 /// <summary>
 /// Recommendation for whether a specific role should be improved, with a confidence score and reasons.
 /// </summary>
-/// <param name="Role">The worker role name.</param>
+/// <param name="Role">The worker role.</param>
 /// <param name="ShouldImprove">Whether improvement is recommended (ConfidenceScore >= 50).</param>
 /// <param name="ConfidenceScore">Score in [0, 100] indicating how strongly improvement is warranted.</param>
 /// <param name="Reasons">Human-readable explanations for the score.</param>
 public record RoleImprovementRecommendation(
-    string Role,
+    WorkerRole Role,
     bool ShouldImprove,
     int ConfidenceScore,
     List<string> Reasons
@@ -185,15 +186,14 @@ public sealed class ImprovementAnalyzer
     /// Analyses metrics for a specific role and returns a confidence-scored recommendation.
     /// </summary>
     public RoleImprovementRecommendation AnalyzeRole(
-        string role,
+        WorkerRole role,
         IterationMetrics current,
         IReadOnlyList<IterationMetrics> history)
     {
-        // Define signals as: (predicate, current-reason factory, history signal description)
         List<(Func<IterationMetrics, bool> HasSignal, Func<IterationMetrics, string> CurrentReason, string HistorySignalName)>? signals =
-            role.ToLowerInvariant() switch
+            role switch
             {
-                "reviewer" =>
+                WorkerRole.Reviewer =>
                 [
                     (m => m.ReviewIssuesFound > 0,
                      m => $"Current iteration had {m.ReviewIssuesFound} review issues",
@@ -202,7 +202,7 @@ public sealed class ImprovementAnalyzer
                      m => $"Current iteration had {m.ReviewRetryCount} review retries",
                      "review retries"),
                 ],
-                "tester" =>
+                WorkerRole.Tester =>
                 [
                     (m => m.FailedTests > 0,
                      m => $"Current iteration had {m.FailedTests} test failures",
@@ -211,7 +211,7 @@ public sealed class ImprovementAnalyzer
                      m => $"Current iteration had {m.TestRetryCount} test retries",
                      "test retries"),
                 ],
-                "coder" =>
+                WorkerRole.Coder =>
                 [
                     (m => m.Issues.Count > 0,
                      m => $"Current iteration had {m.Issues.Count} code issues",
@@ -257,7 +257,7 @@ public sealed class ImprovementAnalyzer
         IterationMetrics current,
         IReadOnlyList<IterationMetrics> history)
     {
-        return new[] { "coder", "reviewer", "tester" }
+        return WorkerRoles.ImprovableRoles
             .Select(role => AnalyzeRole(role, current, history))
             .OrderByDescending(r => r.ConfidenceScore)
             .ThenBy(r => r.Role)

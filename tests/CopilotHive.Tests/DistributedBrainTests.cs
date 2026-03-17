@@ -2,7 +2,10 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
+using CopilotHive.Workers;
 using Microsoft.Extensions.Logging.Abstractions;
+
+using WorkerRole = CopilotHive.Workers.WorkerRole;
 
 namespace CopilotHive.Tests;
 
@@ -115,7 +118,7 @@ public sealed class DistributedBrainTests
         pipeline.SetActiveTask("task-1", "copilothive/g-4/coder-001");
 
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => brain.CraftPromptAsync(pipeline, "coder", null));
+            () => brain.CraftPromptAsync(pipeline, WorkerRole.Coder, null));
     }
 
     [Fact]
@@ -153,7 +156,7 @@ public sealed class DistributedBrainTests
         var fake = new FakeDistributedBrain();
         var pipeline = CreatePipeline("g-7", "Add tests");
 
-        var prompt = await fake.CraftPromptAsync(pipeline, "tester", "extra context");
+        var prompt = await fake.CraftPromptAsync(pipeline, WorkerRole.Tester, "extra context");
 
         Assert.Contains("Add tests", prompt);
         Assert.Contains("tester", prompt);
@@ -178,7 +181,7 @@ public sealed class DistributedBrainTests
 
         await fake.ConnectAsync();
         await fake.PlanGoalAsync(pipeline);
-        await fake.CraftPromptAsync(pipeline, "coder");
+        await fake.CraftPromptAsync(pipeline, WorkerRole.Coder);
         await fake.InterpretOutputAsync(pipeline, GoalPhase.Coding, "output");
         await fake.DecideNextStepAsync(pipeline, "review passed");
         await fake.InformAsync(pipeline, "merge complete");
@@ -416,7 +419,7 @@ file sealed class FakeDistributedBrain : IDistributedBrain
 
     public Func<GoalPipeline, OrchestratorDecision>? PlanGoalOverride { get; set; }
     public Func<GoalPipeline, IterationPlan>? PlanIterationOverride { get; set; }
-    public Func<GoalPipeline, string, string?, string>? CraftPromptOverride { get; set; }
+    public Func<GoalPipeline, WorkerRole, string?, string>? CraftPromptOverride { get; set; }
     public Func<GoalPipeline, GoalPhase, string, OrchestratorDecision>? InterpretOutputOverride { get; set; }
     public Func<GoalPipeline, string, OrchestratorDecision>? DecideNextStepOverride { get; set; }
 
@@ -442,11 +445,11 @@ file sealed class FakeDistributedBrain : IDistributedBrain
     }
 
     public Task<string> CraftPromptAsync(
-        GoalPipeline pipeline, string workerRole, string? additionalContext = null, CancellationToken ct = default)
+        GoalPipeline pipeline, WorkerRole role, string? additionalContext = null, CancellationToken ct = default)
     {
         CraftCalls++;
-        var prompt = CraftPromptOverride?.Invoke(pipeline, workerRole, additionalContext)
-            ?? $"Work on {pipeline.Description} as {workerRole}";
+        var prompt = CraftPromptOverride?.Invoke(pipeline, role, additionalContext)
+            ?? $"Work on {pipeline.Description} as {role.ToRoleName()}";
         return Task.FromResult(prompt);
     }
 

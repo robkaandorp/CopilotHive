@@ -1,6 +1,7 @@
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
+using CopilotHive.Workers;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests;
@@ -99,7 +100,7 @@ public sealed class ModelTierPropagationTests
 
         Assert.Equal("premium", pipeline.LatestModelTier);
 
-        await brain.CraftPromptAsync(pipeline, "coder");
+        await brain.CraftPromptAsync(pipeline, WorkerRole.Coder);
 
         Assert.Equal("premium", pipeline.LatestModelTier);
     }
@@ -118,7 +119,7 @@ public sealed class ModelTierPropagationTests
 
         Assert.Equal("", pipeline.LatestModelTier);
 
-        await brain.CraftPromptAsync(pipeline, "coder");
+        await brain.CraftPromptAsync(pipeline, WorkerRole.Coder);
 
         Assert.Equal("premium", pipeline.LatestModelTier);
     }
@@ -215,11 +216,11 @@ file sealed class ModelTierTrackingBrain : IDistributedBrain
         Task.FromResult(IterationPlan.Default());
 
     public Task<string> CraftPromptAsync(
-        GoalPipeline pipeline, string workerRole, string? additionalContext = null, CancellationToken ct = default)
+        GoalPipeline pipeline, WorkerRole role, string? additionalContext = null, CancellationToken ct = default)
     {
         var decision = new OrchestratorDecision { ModelTier = _craftTier };
         DistributedBrain.ApplyModelTierIfNotSet(pipeline, decision.ModelTier);
-        return Task.FromResult($"Work on {pipeline.Description} as {workerRole}");
+        return Task.FromResult($"Work on {pipeline.Description} as {role.ToRoleName()}");
     }
 
     public Task<OrchestratorDecision> InterpretOutputAsync(GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default)

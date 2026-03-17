@@ -6,6 +6,9 @@ using CopilotHive.Improvement;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Shared.Grpc;
+using CopilotHive.Workers;
+using GrpcWorkerRole = CopilotHive.Shared.Grpc.WorkerRole;
+using WorkerRole = CopilotHive.Workers.WorkerRole;
 
 namespace CopilotHive.Services;
 
@@ -205,7 +208,7 @@ public sealed class GoalDispatcher : BackgroundService
                 "Verify your work with 'git status' and 'git log --oneline -3' before finishing.\n\n" +
                 $"Previous coder output (for context):\n{(complete.Output.Length > 500 ? complete.Output[..500] + "..." : complete.Output)}";
 
-            var retryPrompt = await _brain!.CraftPromptAsync(pipeline, "coder", noOpContext, ct);
+            var retryPrompt = await _brain!.CraftPromptAsync(pipeline, WorkerRole.Coder, noOpContext, ct);
             await DispatchToRole(pipeline, WorkerRole.Coder, retryPrompt, ct);
             return;
         }
@@ -242,9 +245,9 @@ public sealed class GoalDispatcher : BackgroundService
                 const int MaxAgentsMdChars = 4000;
                 const int MaxImproverRetries = 3;
 
-                foreach (var role in new[] { "coder", "tester", "reviewer", "improver", "orchestrator", "docwriter" })
+                foreach (var role in WorkerRoles.AgentRoles)
                 {
-                    var agentsMdPath = Path.Combine(_configRepo.LocalPath, "agents", $"{role}.agents.md");
+                    var agentsMdPath = Path.Combine(_configRepo.LocalPath, "agents", $"{role.ToRoleName()}.agents.md");
                     if (!File.Exists(agentsMdPath)) continue;
 
                     var content = await File.ReadAllTextAsync(agentsMdPath, ct);
@@ -255,7 +258,7 @@ public sealed class GoalDispatcher : BackgroundService
                             "agents.md for '{Role}' is {Count} chars, exceeds 4000 limit. Retry {Attempt}/3.",
                             role, content.Length, pipeline.ImproverRetries);
 
-                        var retryPrompt = $"Your updated {role}.agents.md is {content.Length} characters, which exceeds the 4000 character limit. The Copilot CLI will discard content beyond this limit. Please condense the file to under 4000 characters while keeping the most impactful rules. Remove verbose examples, merge similar rules, and use concise language.";
+                        var retryPrompt = $"Your updated {role.ToRoleName()}.agents.md is {content.Length} characters, which exceeds the 4000 character limit. The Copilot CLI will discard content beyond this limit. Please condense the file to under 4000 characters while keeping the most impactful rules. Remove verbose examples, merge similar rules, and use concise language.";
                         await DispatchToRole(pipeline, WorkerRole.Improver, retryPrompt, ct);
                         await SyncAgentsFromConfigRepoAsync(ct);
                         content = await File.ReadAllTextAsync(agentsMdPath, ct);
@@ -362,7 +365,7 @@ public sealed class GoalDispatcher : BackgroundService
                         ? $"\n\nAccumulated issues from all review rounds (fix ALL of these):\n{allIssues}"
                         : "");
 
-                var fixPrompt = await _brain.CraftPromptAsync(pipeline, "coder", fixContext, ct);
+                var fixPrompt = await _brain.CraftPromptAsync(pipeline, WorkerRole.Coder, fixContext, ct);
                 await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
                 break;
 
@@ -378,7 +381,7 @@ public sealed class GoalDispatcher : BackgroundService
                     return;
                 }
                 pipeline.AdvanceTo(GoalPhase.Coding);
-                var retryPrompt = await _brain.CraftPromptAsync(pipeline, "coder",
+                var retryPrompt = await _brain.CraftPromptAsync(pipeline, WorkerRole.Coder,
                     $"Test failures:\n{interpretation.Reason}", ct);
                 await DispatchToRole(pipeline, WorkerRole.Coder, retryPrompt, ct);
                 break;
@@ -477,7 +480,7 @@ public sealed class GoalDispatcher : BackgroundService
 
             var feedbackKind = isReview ? "Reviewer feedback" : "Test failures";
             var fixPrompt = _brain is not null
-                ? await _brain.CraftPromptAsync(pipeline, "coder",
+                ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Coder,
                     $"{feedbackKind}:\n{reason ?? "See previous output."}", ct)
                 : $"Fix issues for: {pipeline.Description}. {feedbackKind}:\n{reason}";
             await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
@@ -537,7 +540,7 @@ public sealed class GoalDispatcher : BackgroundService
             case GoalPhase.Review:
                 pipeline.AdvanceTo(GoalPhase.Review);
                 var reviewPrompt = _brain is not null
-                    ? await _brain.CraftPromptAsync(pipeline, "reviewer", phaseInstructions, ct)
+                    ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Reviewer, phaseInstructions, ct)
                     : $"Review the code changes for: {pipeline.Description}";
                 await DispatchToRole(pipeline, WorkerRole.Reviewer, reviewPrompt, ct);
                 break;
@@ -545,7 +548,7 @@ public sealed class GoalDispatcher : BackgroundService
             case GoalPhase.Testing:
                 pipeline.AdvanceTo(GoalPhase.Testing);
                 var testPrompt = _brain is not null
-                    ? await _brain.CraftPromptAsync(pipeline, "tester", phaseInstructions, ct)
+                    ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Tester, phaseInstructions, ct)
                     : $"Run the existing tests and verify the changes for: {pipeline.Description}";
                 await DispatchToRole(pipeline, WorkerRole.Tester, testPrompt, ct);
                 break;
@@ -571,10 +574,11 @@ public sealed class GoalDispatcher : BackgroundService
                 if (_improvementAnalyzer is not null && _agentsManager is not null && _metricsTracker is not null)
                 {
                     var agentsMd = new Dictionary<string, string>();
-                    foreach (var role in new[] { "coder", "tester", "reviewer", "improver", "docwriter" })
+                    foreach (var role in WorkerRoles.AgentRoles)
                     {
-                        var content = _agentsManager.GetAgentsMd(role);
-                        if (!string.IsNullOrEmpty(content)) agentsMd[role] = content;
+                        var roleName = role.ToRoleName();
+                        var content = _agentsManager.GetAgentsMd(roleName);
+                        if (!string.IsNullOrEmpty(content)) agentsMd[roleName] = content;
                     }
                     analysis = _improvementAnalyzer.BuildAnalysis(pipeline.Metrics, _metricsTracker.History, agentsMd);
                 }
@@ -588,16 +592,16 @@ public sealed class GoalDispatcher : BackgroundService
                     improveContext = phaseInstructions + "\n\n" + improveContext;
 
                 var telemetryAggregator = new TelemetryAggregator();
-                var telemetryRoles = new[] { "coder", "reviewer", "tester" };
+                var telemetryRoleNames = WorkerRoles.TelemetryRoles.Select(r => r.ToRoleName());
                 var stateDir = Environment.GetEnvironmentVariable("STATE_DIR") ?? "/app/state";
-                var telemetrySummary = telemetryAggregator.AggregateTelemetry(stateDir, telemetryRoles);
+                var telemetrySummary = telemetryAggregator.AggregateTelemetry(stateDir, telemetryRoleNames);
                 var telemetryText = telemetryAggregator.FormatSummary(telemetrySummary);
                 if (!string.IsNullOrEmpty(telemetryText))
                     improveContext += "\n\n## Telemetry\n" + telemetryText;
-                telemetryAggregator.ClearTelemetryFiles(stateDir, telemetryRoles);
+                telemetryAggregator.ClearTelemetryFiles(stateDir, telemetryRoleNames);
 
                 var improvePrompt = _brain is not null
-                    ? await _brain.CraftPromptAsync(pipeline, "improver", improveContext, ct)
+                    ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Improver, improveContext, ct)
                     : "Update the *.agents.md files based on iteration results.\n\n" + analysis;
                 await DispatchToRole(pipeline, WorkerRole.Improver, improvePrompt, ct);
                 break;
@@ -651,7 +655,7 @@ public sealed class GoalDispatcher : BackgroundService
         if (string.IsNullOrWhiteSpace(prompt) && _brain is not null)
         {
             var preservedTier = pipeline.LatestModelTier;
-            prompt = await _brain.CraftPromptAsync(pipeline, role.ToString().ToLowerInvariant(), null, ct);
+            prompt = await _brain.CraftPromptAsync(pipeline, role, null, ct);
             // Always restore the preserved tier — CraftPromptAsync is only used for prompt text,
             // and must never influence model_tier.
             pipeline.LatestModelTier = preservedTier;
@@ -681,15 +685,7 @@ public sealed class GoalDispatcher : BackgroundService
         }
 
         // Resolve per-role model from config; upgrade to premium when the Brain requested it
-        var roleName = role switch
-        {
-            WorkerRole.Coder => "coder",
-            WorkerRole.Reviewer => "reviewer",
-            WorkerRole.Tester => "tester",
-            WorkerRole.Improver => "improver",
-            WorkerRole.DocWriter => "docwriter",
-            _ => "coder",
-        };
+        var roleName = role.ToRoleName();
         var model = _config?.GetModelForRole(roleName);
         if (pipeline.LatestModelTier == "premium" && _config is not null)
         {
@@ -700,10 +696,11 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogDebug("Model for {Role}: {Model} (tier={Tier}, configLoaded={ConfigLoaded})",
             roleName, model ?? "(null)", pipeline.LatestModelTier, _config is not null);
 
+        var grpcRole = role.ToGrpcRole();
         var task = _taskBuilder.Build(
             goalId: pipeline.GoalId,
             goalDescription: pipeline.Description,
-            role: role,
+            role: grpcRole,
             iteration: pipeline.Iteration,
             repositories: repositories,
             prompt: prompt,
@@ -731,12 +728,12 @@ public sealed class GoalDispatcher : BackgroundService
             role, task.TaskId, pipeline.GoalId, task.BranchInfo?.FeatureBranch);
 
         // Try to push directly to an idle worker
-        var idleWorker = _workerPool.GetIdleWorker(role);
+        var idleWorker = _workerPool.GetIdleWorker(grpcRole);
         if (idleWorker is not null)
         {
-            var queuedTask = _taskQueue.TryDequeue(role);
+            var queuedTask = _taskQueue.TryDequeue(grpcRole);
             if (queuedTask is null && idleWorker.IsGeneric)
-                queuedTask = _taskQueue.TryDequeue(WorkerRole.Unspecified);
+                queuedTask = _taskQueue.TryDequeue(GrpcWorkerRole.Unspecified);
 
             if (queuedTask is not null)
             {
@@ -946,7 +943,7 @@ public sealed class GoalDispatcher : BackgroundService
         }
 
         var fixPrompt = _brain is not null
-            ? await _brain.CraftPromptAsync(pipeline, "coder", rebaseContext, ct)
+            ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Coder, rebaseContext, ct)
             : rebaseContext;
         await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
     }
@@ -968,12 +965,13 @@ public sealed class GoalDispatcher : BackgroundService
         }
     }
 
-    private async Task RestoreAgentsMdFromGitAsync(string role, string? sha, CancellationToken ct)
+    private async Task RestoreAgentsMdFromGitAsync(WorkerRole role, string? sha, CancellationToken ct)
     {
         if (_configRepo is null) return;
 
+        var roleName = role.ToRoleName();
         var gitRef = string.IsNullOrWhiteSpace(sha) ? "HEAD~1" : sha;
-        var psi = new System.Diagnostics.ProcessStartInfo("git", $"checkout {gitRef} -- agents/{role}.agents.md")
+        var psi = new System.Diagnostics.ProcessStartInfo("git", $"checkout {gitRef} -- agents/{roleName}.agents.md")
         {
             WorkingDirectory = _configRepo.LocalPath,
             RedirectStandardOutput = true,
@@ -1009,17 +1007,19 @@ public sealed class GoalDispatcher : BackgroundService
     /// Sends an UpdateAgents message to all connected workers whose role matches the given role string.
     /// Best-effort: failures are logged but do not block the pipeline.
     /// </summary>
-    private async Task BroadcastAgentsUpdateAsync(string role, string content, CancellationToken ct)
+    private async Task BroadcastAgentsUpdateAsync(WorkerRole role, string content, CancellationToken ct)
     {
+        var grpcRole = role.ToGrpcRole();
         var workers = _workerPool.GetAllWorkers()
-            .Where(w => w.Role.ToString().Equals(role, StringComparison.OrdinalIgnoreCase));
+            .Where(w => w.Role == grpcRole);
 
+        var roleName = role.ToRoleName();
         var message = new OrchestratorMessage
         {
             UpdateAgents = new UpdateAgents
             {
                 AgentsMdContent = content,
-                Role = role,
+                Role = roleName,
             }
         };
 
@@ -1028,7 +1028,7 @@ public sealed class GoalDispatcher : BackgroundService
             try
             {
                 await worker.MessageChannel.Writer.WriteAsync(message, ct);
-                _logger.LogInformation("Sent updated AGENTS.md to worker {WorkerId} (role={Role})", worker.Id, role);
+                _logger.LogInformation("Sent updated AGENTS.md to worker {WorkerId} (role={Role})", worker.Id, roleName);
             }
             catch (Exception ex)
             {
@@ -1049,17 +1049,18 @@ public sealed class GoalDispatcher : BackgroundService
         {
             await _configRepo.SyncRepoAsync(ct);
 
-            foreach (var role in new[] { "coder", "tester", "reviewer", "improver", "orchestrator" })
+            foreach (var role in WorkerRoles.AgentRoles)
             {
-                var repoContent = await _configRepo.LoadAgentsMdAsync(role, ct);
+                var roleName = role.ToRoleName();
+                var repoContent = await _configRepo.LoadAgentsMdAsync(roleName, ct);
                 if (string.IsNullOrEmpty(repoContent)) continue;
 
-                var currentContent = _agentsManager.GetAgentsMd(role);
+                var currentContent = _agentsManager.GetAgentsMd(roleName);
                 if (repoContent == currentContent) continue;
 
-                _agentsManager.UpdateAgentsMd(role, repoContent);
+                _agentsManager.UpdateAgentsMd(roleName, repoContent);
                 await BroadcastAgentsUpdateAsync(role, repoContent, ct);
-                _logger.LogInformation("Synced {Role} AGENTS.md from config repo (changed)", role);
+                _logger.LogInformation("Synced {Role} AGENTS.md from config repo (changed)", roleName);
             }
         }
         catch (Exception ex)
@@ -1323,10 +1324,11 @@ public sealed class GoalDispatcher : BackgroundService
     {
         if (_agentsManager is not null)
         {
-            foreach (var role in new[] { "coder", "tester", "reviewer", "improver", "orchestrator" })
+            foreach (var role in WorkerRoles.AgentRoles)
             {
-                var history = _agentsManager.GetHistory(role);
-                pipeline.Metrics.AgentsMdVersions[role] = $"v{history.Length:D3}";
+                var roleName = role.ToRoleName();
+                var history = _agentsManager.GetHistory(roleName);
+                pipeline.Metrics.AgentsMdVersions[roleName] = $"v{history.Length:D3}";
             }
         }
     }

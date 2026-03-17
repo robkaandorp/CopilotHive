@@ -3,8 +3,11 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
+using CopilotHive.Workers;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+
+using WorkerRole = CopilotHive.Workers.WorkerRole;
 
 namespace CopilotHive.Tests;
 
@@ -44,7 +47,7 @@ public sealed class GoalDispatcherAgentsMdSizeLimitTests : IDisposable
         // Assert: no retry increments and no retry dispatch
         Assert.Equal(0, pipeline.ImproverRetries);
         // Strict: the improver was NOT re-dispatched (initial invocation only)
-        Assert.Null(taskQueue.TryDequeue(WorkerRole.Improver));
+        Assert.Null(taskQueue.TryDequeue(CopilotHive.Shared.Grpc.WorkerRole.Improver));
     }
 
     [Fact]
@@ -74,13 +77,13 @@ public sealed class GoalDispatcherAgentsMdSizeLimitTests : IDisposable
         Assert.Equal(1, pipeline.ImproverRetries);
 
         // Strict: exactly one retry task was dispatched — verify prompt content
-        var retryTask = taskQueue.TryDequeue(WorkerRole.Improver);
+        var retryTask = taskQueue.TryDequeue(CopilotHive.Shared.Grpc.WorkerRole.Improver);
         Assert.NotNull(retryTask);
         Assert.Contains("4001", retryTask.Prompt);
         Assert.Contains("improver", retryTask.Prompt);
 
         // Strict: no second retry (would indicate the while loop didn't exit correctly)
-        Assert.Null(taskQueue.TryDequeue(WorkerRole.Improver));
+        Assert.Null(taskQueue.TryDequeue(CopilotHive.Shared.Grpc.WorkerRole.Improver));
     }
 
     [Fact]
@@ -111,7 +114,7 @@ public sealed class GoalDispatcherAgentsMdSizeLimitTests : IDisposable
         Assert.Equal(3, pipeline.ImproverRetries);
 
         // Strict: improver was NOT re-dispatched (while condition false; retries exhausted)
-        Assert.Null(taskQueue.TryDequeue(WorkerRole.Improver));
+        Assert.Null(taskQueue.TryDequeue(CopilotHive.Shared.Grpc.WorkerRole.Improver));
 
         // A "Discarding" warning must have been logged (restore was attempted)
         Assert.Contains(logger.Warnings, w => w.Contains("Discarding"));
@@ -214,8 +217,8 @@ file sealed class FakeImproverBrain : IDistributedBrain
         Task.FromResult(IterationPlan.Default());
 
     public Task<string> CraftPromptAsync(
-        GoalPipeline pipeline, string workerRole, string? additionalContext = null, CancellationToken ct = default) =>
-        Task.FromResult($"Work on {pipeline.Description} as {workerRole}");
+        GoalPipeline pipeline, WorkerRole role, string? additionalContext = null, CancellationToken ct = default) =>
+        Task.FromResult($"Work on {pipeline.Description} as {role.ToRoleName()}");
 
     public Task<OrchestratorDecision> InterpretOutputAsync(GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default) =>
         Task.FromResult(new OrchestratorDecision { Action = OrchestratorActionType.Done });

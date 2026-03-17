@@ -40,7 +40,8 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
             WorkerRole.Reviewer => "reviewer",
             WorkerRole.Tester => "tester",
             WorkerRole.Improver => "improver",
-            _ => "worker",
+            WorkerRole.DocWriter => "docwriter",
+            _ => throw new InvalidOperationException($"Unhandled WorkerRole in TaskBuilder: '{role}'"),
         };
 
         var repoList = repositories.ToList();

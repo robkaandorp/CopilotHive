@@ -4,6 +4,7 @@ using System.Text.RegularExpressions;
 using CopilotHive.Metrics;
 using CopilotHive.Services;
 using CopilotHive.Telemetry;
+using CopilotHive.Workers;
 using GitHub.Copilot.SDK;
 
 namespace CopilotHive.Orchestration;
@@ -451,39 +452,40 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// Asks the Brain to craft a prompt for the specified worker role.
     /// </summary>
     /// <param name="pipeline">Current goal pipeline state.</param>
-    /// <param name="workerRole">Role of the worker the prompt will be sent to.</param>
+    /// <param name="role">Role of the worker the prompt will be sent to.</param>
     /// <param name="additionalContext">Optional extra context to include in the prompt.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The crafted prompt string.</returns>
     public async Task<string> CraftPromptAsync(
-        GoalPipeline pipeline, string workerRole, string? additionalContext, CancellationToken ct = default)
+        GoalPipeline pipeline, WorkerRole role, string? additionalContext, CancellationToken ct = default)
     {
         var historyContext = BuildMetricsHistoryContext(3);
         var branch = pipeline.CoderBranch
             ?? throw new InvalidOperationException("CoderBranch must be set before crafting prompts");
 
-        var roleInstruction = workerRole.ToLowerInvariant() switch
+        var roleName = role.ToRoleName();
+        var roleInstruction = role switch
         {
-            "coder" => $"""
+            WorkerRole.Coder => $"""
                 - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, build, test, and commit. Do NOT include git branch or git push commands.
                 """,
-            "reviewer" => $"""
+            WorkerRole.Reviewer => $"""
                 - For reviewers: tell them to review the diff on branch "{branch}" against the base branch, produce a REVIEW_REPORT
                 """,
-            "tester" => """
+            WorkerRole.Tester => """
                 - For testers: tell them to build, run the test skill, write integration tests, produce a TEST_REPORT
                 """,
-            "docwriter" => """
+            WorkerRole.DocWriter => """
                 - For docwriters: tell them to update README, CHANGELOG, and XML doc comments based on the code changes on the branch, build to verify, and commit. Produce a DOC_REPORT.
                 """,
-            "improver" => """
+            WorkerRole.Improver => """
                 - For improvers: tell them to analyze iteration results and update *.agents.md files. Commit changes.
                 """,
-            _ => throw new InvalidOperationException($"Unhandled role in CraftPromptAsync: '{workerRole}'"),
+            _ => throw new InvalidOperationException($"Unhandled role in CraftPromptAsync: '{roleName}'"),
         };
 
         var prompt = $$"""
-            Craft a prompt for the {{workerRole}} worker.
+            Craft a prompt for the {{roleName}} worker.
 
             Goal: {{pipeline.Description}}
             Iteration: {{pipeline.Iteration}}
@@ -502,7 +504,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             Respond with JSON:
             {
-              "action": "spawn_{{workerRole}}",
+              "action": "spawn_{{roleName}}",
               "prompt": "<the complete prompt to send to the worker>",
               "reason": "<why you crafted the prompt this way>",
               "model_tier": "standard or premium — default is standard; only use premium after a FAILED attempt"
@@ -515,7 +517,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         ApplyModelTierIfNotSet(pipeline, decision?.ModelTier);
         return decision?.Prompt
             ?? throw new InvalidOperationException(
-                $"Brain failed to craft prompt for '{workerRole}' on goal '{pipeline.GoalId}'. " +
+                $"Brain failed to craft prompt for '{roleName}' on goal '{pipeline.GoalId}'. " +
                 "Decision was null or missing the 'prompt' field.");
     }
 

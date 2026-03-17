@@ -1,4 +1,5 @@
 using CopilotHive.Services;
+using CopilotHive.Workers;
 
 namespace CopilotHive.Orchestration;
 
@@ -30,7 +31,7 @@ public interface IDistributedBrain
     /// </summary>
     Task<string> CraftPromptAsync(
         GoalPipeline pipeline,
-        string workerRole,
+        WorkerRole role,
         string? additionalContext = null,
         CancellationToken ct = default);
 

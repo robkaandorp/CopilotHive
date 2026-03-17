@@ -2,6 +2,7 @@ using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
+using CopilotHive.Workers;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests;
@@ -269,10 +270,10 @@ file sealed class CapturingBrain : IDistributedBrain
         Task.FromResult(IterationPlan.Default());
 
     public Task<string> CraftPromptAsync(
-        GoalPipeline pipeline, string workerRole, string? additionalContext = null, CancellationToken ct = default)
+        GoalPipeline pipeline, WorkerRole role, string? additionalContext = null, CancellationToken ct = default)
     {
         pipeline.LatestModelTier = _modelTierToReturn;
-        return Task.FromResult($"Work on {pipeline.Description} as {workerRole}");
+        return Task.FromResult($"Work on {pipeline.Description} as {role.ToRoleName()}");
     }
 
     public Task<OrchestratorDecision> InterpretOutputAsync(GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default) =>
@@ -290,7 +291,7 @@ file sealed class CapturingBrain : IDistributedBrain
         Task.CompletedTask;
 }
 
-file sealed class PremiumFakeGoalSource : IGoalSource
+file sealed class PremiumFakeGoalSource: IGoalSource
 {
     private readonly Goal _goal;
 
@@ -325,10 +326,10 @@ file sealed class PlanGoalPremiumBrain : IDistributedBrain
         Task.FromResult(IterationPlan.Default());
 
     public Task<string> CraftPromptAsync(
-        GoalPipeline pipeline, string workerRole, string? additionalContext = null, CancellationToken ct = default)
+        GoalPipeline pipeline, WorkerRole role, string? additionalContext = null, CancellationToken ct = default)
     {
         pipeline.LatestModelTier = "standard";
-        return Task.FromResult($"Work on {pipeline.Description} as {workerRole}");
+        return Task.FromResult($"Work on {pipeline.Description} as {role.ToRoleName()}");
     }
 
     public Task<OrchestratorDecision> InterpretOutputAsync(GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default) =>
@@ -345,7 +346,7 @@ file sealed class PlanGoalPremiumBrain : IDistributedBrain
 /// <summary>
 /// Brain stub whose <see cref="DecideNextStepAsync"/> returns <c>model_tier = "premium"</c>.
 /// </summary>
-file sealed class DecideNextStepPremiumBrain : IDistributedBrain
+file sealed class DecideNextStepPremiumBrain: IDistributedBrain
 {
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
@@ -356,10 +357,10 @@ file sealed class DecideNextStepPremiumBrain : IDistributedBrain
         Task.FromResult(IterationPlan.Default());
 
     public Task<string> CraftPromptAsync(
-        GoalPipeline pipeline, string workerRole, string? additionalContext = null, CancellationToken ct = default)
+        GoalPipeline pipeline, WorkerRole role, string? additionalContext = null, CancellationToken ct = default)
     {
         pipeline.LatestModelTier = "standard";
-        return Task.FromResult($"Work on {pipeline.Description} as {workerRole}");
+        return Task.FromResult($"Work on {pipeline.Description} as {role.ToRoleName()}");
     }
 
     public Task<OrchestratorDecision> InterpretOutputAsync(GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default) =>
@@ -412,10 +413,10 @@ file sealed class NullPromptPremiumInterpretBrain : IDistributedBrain
     /// overwrite the "premium" tier from the earlier InterpretOutputAsync decision.
     /// </summary>
     public Task<string> CraftPromptAsync(
-        GoalPipeline pipeline, string workerRole, string? additionalContext = null, CancellationToken ct = default)
+        GoalPipeline pipeline, WorkerRole role, string? additionalContext = null, CancellationToken ct = default)
     {
         pipeline.LatestModelTier = "standard";
-        return Task.FromResult($"Retry: work on {pipeline.Description} as {workerRole}");
+        return Task.FromResult($"Retry: work on {pipeline.Description} as {role.ToRoleName()}");
     }
 
     public Task<OrchestratorDecision> DecideNextStepAsync(
