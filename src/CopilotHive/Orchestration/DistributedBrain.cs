@@ -295,7 +295,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
               "model_tier": "standard or premium — default is standard; only use premium after a FAILED attempt"
             }
 
-            Valid actions: spawn_coder, spawn_reviewer, spawn_tester, spawn_doc_writer, done, skip
+            Valid actions: {{BrainActions.FormatForPrompt(BrainActions.PlanningActions)}}
             """;
 
         var decision = await AskAsync(pipeline, prompt, ct);
@@ -621,7 +621,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             Respond with JSON:
             {
-              "action": "<next action: spawn_coder, spawn_reviewer, spawn_tester, merge, done, skip>",
+              "action": "<next action: {{BrainActions.FormatForPrompt(BrainActions.NextStepActions)}}>",
               "prompt": "<prompt for the worker, if spawning one>",
               "reason": "<why this is the right next step>",
               "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
