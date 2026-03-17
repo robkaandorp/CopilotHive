@@ -15,10 +15,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GoalPipeline.GetDisplayName(GoalPhase)` static helper that returns human-friendly display names for all pipeline phases (e.g. `"Doc Writing"` for `DocWriting`, `"Improvement"` for `Improve`).
 - `WorkerRoleExtensions.ToDisplayName()` extension method that returns human-friendly display names for all `WorkerRole` enum values (e.g. `"Doc Writer"` for `DocWriter`, `"Merge Worker"` for `MergeWorker`); throws `InvalidOperationException` for unhandled values.
 - `GoalExtensions.ToDisplayName()` extension methods for `GoalPriority` (returns "Critical", "High", "Normal", "Low") and `GoalStatus` (returns "Pending", "In Progress", "Completed", "Failed", "Cancelled"); both use explicit switch expressions and throw `InvalidOperationException` for unhandled values.
+- `Goal.Notes` list field and `GoalUpdateMetadata.Notes` for recording non-fatal observations in goals.yaml (e.g. "Improver skipped: timeout")
+- `IterationMetrics.ImproverSkipped` and `ImproverSkipReason` fields for tracking when the improve phase was skipped
+- `IterationPlan.NextPhaseAfter(GoalPhase)` helper method for finding the next phase in a plan
+- Brain retry mechanism — `AskAsync` retries up to 2 times on timeout, transient errors, and JSON parse failures (5-second backoff)
+- Dirty-worktree safety net — `EnsureCleanWorktreeAsync` re-prompts Copilot up to 2 times if uncommitted changes remain after task execution
+- `GitOperations.HasUncommittedChangesAsync()` for detecting dirty worktrees
 
 ### Changed
 - Extracted `OrchestratorVersion` string into `Constants.OrchestratorVersion` public const in `Constants.cs`; `HiveOrchestratorService` now references the constant instead of a hardcoded literal.
 - Extracted `CleanupIntervalSeconds` and `StaleTimeoutMinutes` constants from `StaleWorkerCleanupService` into a new dedicated static class `CleanupDefaults` (in `CopilotHive.Services`) for improved discoverability and reuse.
+- Improve phase is now non-blocking — failures (Brain timeout, dispatch errors) are logged as warnings and recorded in goal notes/metrics; the pipeline continues to Merging instead of failing the goal
+- Git diff comparisons now use three-dot syntax (`origin/{baseBranch}...HEAD`) instead of `HEAD~1`, correctly detecting all changes on a feature branch
+- DocWriter scope restricted — no longer edits source code (.cs files) or runs builds; reviews XML doc comments and flags issues in `DOC_REPORT.xml_doc_issues` but only modifies .md files
+- Brain prompt instructions hardened — "NEVER include git checkout/branch/switch/push commands" and "NEVER include framework-specific build/test commands"
+- Improver prompt no longer includes agents.md file contents (files are on disk); only lists file paths, saving thousands of tokens
+- Commit instructions in agents.md simplified to single line `git add -A && git commit`
+- Brain reviewer instructions include `origin/` prefix for diff commands (worker clones only have remote tracking refs)
+- Coverage collection switched from `coverlet.msbuild` to `--collect:"XPlat Code Coverage"` collector approach (resolves package conflict)
+
+### Fixed
+- Root cause of coder no-ops — Brain was generating `git checkout -b feature/...` commands in coder prompts, causing coders to commit on wrong branches; TaskExecutor then detected 0 changes on the infrastructure branch
+- Removed conflicting `coverlet.msbuild` 6.0.2 package (conflicted with `coverlet.collector` 8.0.0)
 
 ## [0.8] — Doc Writer Role
 

@@ -52,14 +52,12 @@ public void SetCustomAgent(string role, string agentsMdContent)
 \\\csharp
 internal static List<string>? GetToolsForRole(string? role) => role switch
 {
-    "improver" => [],       // NO tools — text-only
-    _ => null,              // coder, tester, reviewer get ALL tools
+    _ => null,  // all roles get full tool access (permissions control what's allowed)
 };
 \\\
 
 **Key insight:** 
-- Tool list can be 
-ull (approve all) or an empty/filtered list
+- Tool list is `null` for all roles (approve all tools); per-role **permission handlers** control what's actually allowed (e.g. improver gets read-only + shell, reviewer gets read-only)
 - Currently uses **system tools only** (shell commands, file I/O)
 - No custom tool definitions yet
 
@@ -164,7 +162,7 @@ private static readonly PermissionRequestHandler ReviewerPermissions =
 
 1. **Signature:** \(PermissionRequest request, context?) → Task<PermissionRequestResult>\
 2. **Request object** contains:
-   - \equest.Kind\ — e.g., "read", "write", "shell", etc.
+   - \request.Kind\ — e.g., "read", "write", "shell", etc.
    - (Possibly tool name, but not verified in current code)
 3. **Response options:**
    - \PermissionRequestResultKind.Approved\ → allow tool call

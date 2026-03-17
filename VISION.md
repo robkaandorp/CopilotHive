@@ -20,7 +20,7 @@ As CopilotHive scales, the orchestration layer will evolve to support generic wo
         │                      │                      │
  ┌──────▼──────┐       ┌──────▼───────┐       ┌──────▼──────┐
  │   Improver  │       │   Analyst    │       │  Doc Writer │
- └─────────────┘       │   (future)   │       │  (future)   │
+ └─────────────┘       │   (future)   │       │     ✅      │
                         └──────────────┘       └─────────────┘
 ```
 

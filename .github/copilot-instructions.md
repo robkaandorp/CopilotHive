@@ -23,17 +23,19 @@ CopilotHive/
 ├── src/CopilotHive/                  # Main orchestrator application
 │   ├── Agents/AgentsManager.cs       # AGENTS.md versioning and rollback
 │   ├── Configuration/                # HiveConfiguration record
-│   ├── Copilot/CopilotWorkerClient.cs # SDK wrapper with retry logic
 │   ├── Git/GitWorkspaceManager.cs    # Bare repo, clones, branching, merging
 │   ├── Metrics/                      # Per-iteration metrics tracking
-│   ├── Orchestration/Orchestrator.cs # Main loop: coder → tester → docwriter → reviewer → merge
+│   ├── Orchestration/DistributedBrain.cs # LLM-powered Brain for orchestration decisions
+│   ├── Services/GoalDispatcher.cs    # Pipeline state machine with phase sequencing
 │   ├── Workers/DockerWorkerManager.cs # Docker container lifecycle
 │   └── Program.cs                    # CLI entrypoint
-├── tests/CopilotHive.Tests/         # xUnit tests (366+ tests)
+├── tests/CopilotHive.Tests/         # 436 xUnit tests
 ├── agents/                           # AGENTS.md templates per role
 │   ├── orchestrator.agents.md
 │   ├── coder.agents.md
-│   └── tester.agents.md
+│   ├── tester.agents.md
+│   ├── docwriter.agents.md
+│   └── reviewer.agents.md
 └── VISION.md                         # Architecture and design document
 ```
 
@@ -83,3 +85,10 @@ dotnet test CopilotHive.slnx
   framework-specific commands like `dotnet build`, `dotnet test`, or test framework names
   like `xUnit`. Instead, reference project skills that contain the actual commands.
   This keeps CopilotHive framework-agnostic.
+- **Improve phase is non-blocking.** If the improver fails (Brain timeout, dispatch error),
+  the goal continues to Merging. Failures are recorded in `Goal.Notes` and
+  `IterationMetrics.ImproverSkipped` — they must never fail the goal.
+- **Brain prompts must never include git checkout/branch/switch/push commands.** Branch
+  management is handled by infrastructure (`TaskExecutor`). Brain prompts also must never
+  include framework-specific build/test commands (e.g. `dotnet build`, `dotnet test`);
+  workers discover these via project skills.

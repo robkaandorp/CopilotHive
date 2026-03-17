@@ -35,7 +35,7 @@ Goals flow through a structured pipeline:
 3. **Doc Writing**: A worker (assigned the doc-writer role) updates documentation to reflect the changes.
 4. **Review**: A worker (assigned the reviewer role) inspects the diff, tests, and documentation.
 5. **Merge**: The Brain decides when quality is sufficient and merges the branch.
-6. **Improve**: A worker (assigned the improver role) updates `agents.md` based on metrics.
+6. **Improve** *(non-blocking)*: A worker (assigned the improver role) updates `agents.md` based on metrics. If improvement fails, the pipeline still completes — the failure is recorded in goal notes and metrics.
 
 If testing or review fails, the pipeline retries the coding step (up to a configured limit).
 
@@ -95,7 +95,7 @@ goals:
 | `src/CopilotHive/` | Main orchestrator — Brain, GoalDispatcher, persistence, metrics |
 | `src/CopilotHive.Shared/` | Shared protobuf definitions and DTOs |
 | `src/CopilotHive.Worker/` | Worker process (runs inside Docker containers) |
-| `tests/` | 333 xUnit tests |
+| `tests/` | 436 xUnit tests |
 | `agents/` | Default agent templates (overridden by config repo at runtime) |
 | `docker/` | Dockerfiles and container configuration |
 
@@ -113,6 +113,11 @@ goals:
 - **Fallback metrics parsing** — robust parsing handles varied worker output formats
 - **Duplicate goal completion guards** — prevents re-processing of already-completed goals
 - **Telemetry** — per-run metrics aggregated and fed into the improver
+- **Dirty-worktree safety net** — automatically re-prompts Copilot if uncommitted changes remain after task execution
+- **Brain retry mechanism** — automatic retries on LLM timeout or transient failures (up to 2 retries with 5-second backoff)
+- **Non-blocking improve phase** — improver failures don't prevent goal completion; recorded in goal notes and metrics
+- **Three-dot diff comparison** — accurate detection of all changes on feature branches using `origin/{baseBranch}...HEAD`
+- **Goal notes** — non-fatal observations tracked in goals.yaml (e.g. "Improver skipped: timeout")
 
 ## Contributing
 
