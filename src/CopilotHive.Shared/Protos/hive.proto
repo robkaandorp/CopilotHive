@@ -38,7 +38,7 @@ enum WorkerRole {
   WORKER_ROLE_REVIEWER = 2;
   WORKER_ROLE_TESTER = 3;
   WORKER_ROLE_IMPROVER = 4;
-  WORKER_ROLE_DOCS_WRITER = 5;
+  WORKER_ROLE_DOC_WRITER = 5;
 }
 
 // === Bidirectional Stream Messages ===

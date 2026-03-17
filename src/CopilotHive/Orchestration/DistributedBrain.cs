@@ -477,7 +477,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             "tester" => """
                 - For testers: tell them to build, run the test skill, write integration tests, produce a TEST_REPORT
                 """,
-            "docswriter" => """
+            "docwriter" => """
                 - For docwriters: tell them to update README, CHANGELOG, and XML doc comments based on the code changes on the branch, build to verify, and commit. Produce a DOC_REPORT.
                 """,
             "improver" => """
@@ -1029,7 +1029,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
                 {buildTestInstructions}
                 """,
-            "docswriter" => $"""
+            "docwriter" => $"""
                 You are the doc-writer. Update documentation for the code changes on branch {pipeline.CoderBranch}.
                 Goal: {pipeline.Description}
                 Tasks: update CHANGELOG.md, XML doc comments, and README.md if needed. Build to verify. Commit.

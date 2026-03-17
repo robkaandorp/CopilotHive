@@ -285,7 +285,7 @@ public sealed class WorkerService(
         "reviewer" => WorkerRole.Reviewer,
         "tester" => WorkerRole.Tester,
         "improver" => WorkerRole.Improver,
-        "docwriter" or "docs_writer" => WorkerRole.DocsWriter,
+        "docwriter" or "doc_writer" => WorkerRole.DocWriter,
         _ => WorkerRole.Unspecified,
     };
 

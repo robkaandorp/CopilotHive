@@ -342,7 +342,7 @@ public sealed class GoalDispatcher : BackgroundService
 
             case OrchestratorActionType.SpawnDocWriter:
                 pipeline.AdvanceTo(GoalPhase.DocWriting);
-                await DispatchToRole(pipeline, WorkerRole.DocsWriter, interpretation.Prompt, ct);
+                await DispatchToRole(pipeline, WorkerRole.DocWriter, interpretation.Prompt, ct);
                 break;
 
             case OrchestratorActionType.RequestChanges:
@@ -557,7 +557,7 @@ public sealed class GoalDispatcher : BackgroundService
             case GoalPhase.DocWriting:
                 pipeline.AdvanceTo(GoalPhase.DocWriting);
                 var docPrompt = BuildDocWriterPrompt(pipeline, phaseInstructions);
-                await DispatchToRole(pipeline, WorkerRole.DocsWriter, docPrompt, ct);
+                await DispatchToRole(pipeline, WorkerRole.DocWriter, docPrompt, ct);
                 break;
 
             case GoalPhase.Improve:
@@ -691,7 +691,7 @@ public sealed class GoalDispatcher : BackgroundService
             WorkerRole.Reviewer => "reviewer",
             WorkerRole.Tester => "tester",
             WorkerRole.Improver => "improver",
-            WorkerRole.DocsWriter => "docwriter",
+            WorkerRole.DocWriter => "docwriter",
             _ => "coder",
         };
         var model = _config?.GetModelForRole(roleName);

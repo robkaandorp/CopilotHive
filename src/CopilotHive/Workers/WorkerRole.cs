@@ -14,7 +14,7 @@ public enum WorkerRole
     /// <summary>LLM-powered orchestrator that plans and directs the other workers.</summary>
     Orchestrator,
     /// <summary>Writes or updates documentation.</summary>
-    DocsWriter,
+    DocWriter,
     /// <summary>Merges feature branches into the main branch.</summary>
     MergeWorker,
 }

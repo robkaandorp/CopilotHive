@@ -95,7 +95,7 @@ public sealed class DistributedBrainTests
     [InlineData("coder", "Write the code and commit")]
     [InlineData("reviewer", "REVIEW_REPORT")]
     [InlineData("tester", "TEST_REPORT")]
-    [InlineData("docswriter", "DOC_REPORT")]
+    [InlineData("docwriter", "DOC_REPORT")]
     [InlineData("improver", "agents.md")]
     public void GetFallbackPrompt_KnownRoles_ContainsExpectedContent(string role, string expectedFragment)
     {
