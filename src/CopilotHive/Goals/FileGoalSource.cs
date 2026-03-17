@@ -182,7 +182,7 @@ public sealed class FileGoalSource : IGoalSource
         Phases = e.Phases?.Select(p => new PhaseResult
         {
             Name = p.Name ?? string.Empty,
-            Result = p.Result ?? "pass",
+            Result = p.Result ?? throw new InvalidOperationException("PhaseResultEntry.Result must not be null"),
             DurationSeconds = p.DurationSeconds,
         }).ToList() ?? [],
         TestCounts = e.TestCounts is null ? null : new TestCounts

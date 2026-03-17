@@ -277,6 +277,56 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
 }
 
 /// <summary>
+/// Tests for <see cref="GoalDispatcher.BuildIterationSummary"/> logic.
+/// </summary>
+public sealed class GoalDispatcherBuildIterationSummaryTests
+{
+    /// <summary>
+    /// When <see cref="CopilotHive.Metrics.IterationMetrics.ImproverSkipped"/> is true AND PhaseDurations already
+    /// contains an "Improve" entry, the output must contain exactly one "Improve" phase result
+    /// with result "skip" (no duplicate entries).
+    /// </summary>
+    [Fact]
+    public void BuildIterationSummary_ImproverSkipped_WithImproveInPhaseDurations_ExactlyOneSkipEntry()
+    {
+        var goal = new Goal { Id = "test-goal", Description = "Test" };
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
+
+        pipeline.Metrics.PhaseDurations["Coding"]  = TimeSpan.FromSeconds(60);
+        pipeline.Metrics.PhaseDurations["Improve"]  = TimeSpan.FromSeconds(5);
+        pipeline.Metrics.PhaseDurations["Testing"]  = TimeSpan.FromSeconds(30);
+        pipeline.Metrics.ImproverSkipped            = true;
+        pipeline.Metrics.ImproverSkipReason         = "Brain timeout";
+
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+
+        var improvePhases = summary.Phases.Where(p => p.Name == "Improve").ToList();
+        Assert.Single(improvePhases);
+        Assert.Equal("skip", improvePhases[0].Result);
+    }
+
+    /// <summary>
+    /// When <see cref="CopilotHive.Metrics.IterationMetrics.ImproverSkipped"/> is true and PhaseDurations does NOT
+    /// contain an "Improve" entry, a single "skip" entry is still produced.
+    /// </summary>
+    [Fact]
+    public void BuildIterationSummary_ImproverSkipped_WithoutImproveInPhaseDurations_SingleSkipEntry()
+    {
+        var goal = new Goal { Id = "test-goal-2", Description = "Test" };
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
+
+        pipeline.Metrics.PhaseDurations["Coding"]  = TimeSpan.FromSeconds(60);
+        pipeline.Metrics.ImproverSkipped            = true;
+
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+
+        var improvePhases = summary.Phases.Where(p => p.Name == "Improve").ToList();
+        Assert.Single(improvePhases);
+        Assert.Equal("skip", improvePhases[0].Result);
+    }
+}
+
+/// <summary>
 /// Minimal <see cref="IGoalSource"/> that returns a single pre-configured goal.
 /// </summary>
 file sealed class FakeGoalSource : IGoalSource

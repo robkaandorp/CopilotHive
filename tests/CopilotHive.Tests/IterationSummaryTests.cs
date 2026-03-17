@@ -279,4 +279,62 @@ public sealed class IterationSummaryTests : IDisposable
         Assert.Null(summary.TestCounts);
         Assert.Null(summary.ReviewVerdict);
     }
+
+    /// <summary>
+    /// When <see cref="IterationSummary.TestCounts"/> is null, serialising the summary to YAML
+    /// via <see cref="FileGoalSource"/> must omit the <c>test_counts</c> key entirely.
+    /// </summary>
+    [Fact]
+    public async Task IterationSummary_NullTestCounts_OmittedFromYaml()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: no-tests-goal
+                description: "Goal with no tests"
+            """);
+
+        var source = new FileGoalSource(path);
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 80.0 }],
+            TestCounts = null,
+        };
+
+        var metadata = new GoalUpdateMetadata
+        {
+            CompletedAt = new DateTime(2025, 6, 1, 0, 0, 0, DateTimeKind.Utc),
+            Iterations = 1,
+            IterationSummary = summary,
+        };
+
+        await source.UpdateGoalStatusAsync("no-tests-goal", GoalStatus.Completed, metadata);
+
+        var yaml = await File.ReadAllTextAsync(path);
+        Assert.DoesNotContain("test_counts", yaml);
+    }
+
+    /// <summary>
+    /// When a <see cref="FileGoalSource.PhaseResultEntry"/> in YAML has a null <c>result</c>
+    /// field, <see cref="FileGoalSource.ReadGoalsAsync"/> must throw
+    /// <see cref="InvalidOperationException"/> rather than silently defaulting to "pass".
+    /// </summary>
+    [Fact]
+    public async Task MapIterationSummary_NullPhaseResult_ThrowsInvalidOperationException()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: null-result-goal
+                description: "Goal with a null phase result"
+                iteration_summaries:
+                  - iteration: 1
+                    phases:
+                      - name: Coding
+                        duration_seconds: 60.0
+            """);
+
+        var source = new FileGoalSource(path);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => source.ReadGoalsAsync());
+    }
 }

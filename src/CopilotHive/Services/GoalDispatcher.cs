@@ -1230,7 +1230,7 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="pipeline">Pipeline whose metrics to summarise.</param>
     /// <param name="failedPhase">The phase that caused failure, or <c>null</c> for a completed goal.</param>
     /// <returns>A populated <see cref="IterationSummary"/>.</returns>
-    private static IterationSummary BuildIterationSummary(GoalPipeline pipeline, GoalPhase? failedPhase)
+    internal static IterationSummary BuildIterationSummary(GoalPipeline pipeline, GoalPhase? failedPhase)
     {
         var metrics = pipeline.Metrics;
 
@@ -1243,9 +1243,12 @@ public sealed class GoalDispatcher : BackgroundService
             })
             .ToList();
 
-        // Phases that were skipped are not in PhaseDurations — add them separately
+        // Phases that were skipped are not in PhaseDurations — add them separately.
+        // If PhaseDurations already recorded an "Improve" entry (e.g. the phase started then failed),
+        // remove it so the summary never contains duplicate phase names.
         if (metrics.ImproverSkipped)
         {
+            phases.RemoveAll(p => p.Name == "Improve");
             phases.Add(new PhaseResult { Name = "Improve", Result = "skip", DurationSeconds = 0 });
         }
 
