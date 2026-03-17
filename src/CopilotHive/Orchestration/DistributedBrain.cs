@@ -517,7 +517,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         var decision = await AskAsync(pipeline, prompt, ct);
         ApplyModelTierIfNotSet(pipeline, decision?.ModelTier);
-        return decision?.Prompt ?? GetFallbackPrompt(workerRole, pipeline);
+        return decision?.Prompt
+            ?? throw new InvalidOperationException(
+                $"Brain failed to craft prompt for '{workerRole}' on goal '{pipeline.GoalId}'. " +
+                "Decision was null or missing the 'prompt' field.");
     }
 
     /// <summary>
@@ -992,57 +995,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             SkippedTests    = skipped,
             BuildSuccess    = buildSuccess,
             CoveragePercent = coveragePercent,
-        };
-    }
-
-    internal string GetFallbackPrompt(string role, GoalPipeline pipeline)
-    {
-        var buildTestInstructions = _skillsManager?.GetBuildAndTestInstructions()
-            ?? "Build the project and run the tests.";
-
-        return role.ToLowerInvariant() switch
-        {
-            "coder" => $"""
-                You are working on this goal: {pipeline.Description}
-                This is iteration {pipeline.Iteration}. Work on the {pipeline.CoderBranch} branch.
-                Write the code and commit your changes with clear commit messages.
-                Do NOT run git push — the orchestrator handles that.
-
-                {buildTestInstructions}
-                """,
-            "reviewer" => $"""
-                You are reviewing code changes for this goal: {pipeline.Description}
-                This is iteration {pipeline.Iteration}. The coder's work is on branch {pipeline.CoderBranch}.
-                Review the diff against the base branch and produce a REVIEW_REPORT block with:
-                - verdict: APPROVE or REQUEST_CHANGES
-                - issues: list of issues found (if any)
-                Do NOT modify any code. Do NOT run git push.
-                """,
-            "tester" => $"""
-                You are testing code for this goal: {pipeline.Description}
-                This is iteration {pipeline.Iteration}. The coder's work is on branch {pipeline.CoderBranch}.
-                Build the project, run all tests with coverage, write integration tests, and produce a TEST_REPORT block with:
-                - verdict: PASS or FAIL
-                - build_success, total_tests, passed_tests, failed_tests, coverage_percent
-                - issues: list of issues found (if any)
-                Do NOT run git push — the orchestrator handles that.
-
-                {buildTestInstructions}
-                """,
-            "docwriter" => $"""
-                You are the doc-writer. Update documentation for the code changes on branch {pipeline.CoderBranch}.
-                Goal: {pipeline.Description}
-                Tasks: update CHANGELOG.md, XML doc comments, and README.md if needed. Build to verify. Commit.
-                Do NOT write tests. Do NOT implement features. Do NOT run git push.
-                Produce a DOC_REPORT block with files_updated, changelog_entries, verdict (PASS/FAIL), issues.
-                """,
-            "improver" => $"""
-                You are the improver. Analyze the iteration results and update *.agents.md files.
-                Goal: {pipeline.Description}
-                This is iteration {pipeline.Iteration}. Review the metrics and feedback to improve agent instructions.
-                Commit your changes. Do NOT run git push.
-                """,
-            _ => throw new InvalidOperationException($"Unhandled role in GetFallbackPrompt: '{role}'"),
         };
     }
 

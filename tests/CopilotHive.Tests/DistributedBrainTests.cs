@@ -89,51 +89,11 @@ public sealed class DistributedBrainTests
         await brain.DisposeAsync();
     }
 
-    // ── GetFallbackPrompt (via CraftPromptAsync without connection) ─────
-
-    [Theory]
-    [InlineData("coder", "Write the code and commit")]
-    [InlineData("reviewer", "REVIEW_REPORT")]
-    [InlineData("tester", "TEST_REPORT")]
-    [InlineData("docwriter", "DOC_REPORT")]
-    [InlineData("improver", "agents.md")]
-    public void GetFallbackPrompt_KnownRoles_ContainsExpectedContent(string role, string expectedFragment)
-    {
-        var brain = new DistributedBrain(9999, NullLogger<DistributedBrain>.Instance);
-        var method = typeof(DistributedBrain).GetMethod(
-            "GetFallbackPrompt",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-
-        Assert.NotNull(method);
-
-        var pipeline = CreatePipeline("test-goal", "Implement feature X");
-        var result = (string)method.Invoke(brain, [role, pipeline])!;
-
-        Assert.Contains(expectedFragment, result);
-        Assert.Contains("Implement feature X", result);
-    }
-
-    [Fact]
-    public void GetFallbackPrompt_UnknownRole_Throws()
-    {
-        var brain = new DistributedBrain(9999, NullLogger<DistributedBrain>.Instance);
-        var method = typeof(DistributedBrain).GetMethod(
-            "GetFallbackPrompt",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-
-        Assert.NotNull(method);
-
-        var pipeline = CreatePipeline("g-1", "Fix the bug");
-        var ex = Assert.Throws<System.Reflection.TargetInvocationException>(
-            () => method.Invoke(brain, ["unknown-role", pipeline]));
-        Assert.IsType<InvalidOperationException>(ex.InnerException);
-    }
-
-    // ── BuildContextualPrompt was removed (per-goal sessions handle context natively) ──
+    // ── GetFallbackPrompt removed — Brain failure = failed goal ─────────
 
     // ── EnsureConnected fallback behavior ───────────────────────────────
     // With per-goal sessions, AskAsync catches the InvalidOperationException
-    // and returns null, causing callers to use fallback logic instead of throwing.
+    // and returns null. CraftPromptAsync now throws instead of falling back.
 
     [Fact]
     public async Task PlanGoalAsync_WithoutConnect_ReturnsFallbackDecision()
@@ -148,15 +108,14 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task CraftPromptAsync_WithoutConnect_ReturnsFallbackPrompt()
+    public async Task CraftPromptAsync_WithoutConnect_Throws()
     {
         var brain = new DistributedBrain(9999, NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-4", "Some goal");
         pipeline.SetActiveTask("task-1", "copilothive/g-4/coder-001");
 
-        var prompt = await brain.CraftPromptAsync(pipeline, "coder", null);
-
-        Assert.Contains("Some goal", prompt);
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => brain.CraftPromptAsync(pipeline, "coder", null));
     }
 
     [Fact]
