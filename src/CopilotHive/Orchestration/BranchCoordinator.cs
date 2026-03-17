@@ -25,7 +25,7 @@ public sealed class BranchCoordinator
     /// <summary>
     /// Builds a <see cref="BranchInfo"/> proto message for the given parameters.
     /// </summary>
-    public BranchInfo GetBranchInfo(string goalId, string role, int iteration, BranchAction action, string baseBranch = "main")
+    public BranchInfo GetBranchInfo(string goalId, string role, int iteration, BranchAction action, string baseBranch)
     {
         var featureBranch = GetFeatureBranch(goalId, role, iteration);
 
