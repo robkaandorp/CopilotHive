@@ -67,3 +67,15 @@ dotnet test CopilotHive.slnx
 
 - **Do not make assumptions, always verify.** Check actual state (logs, databases,
   git status, running processes) before drawing conclusions or making changes.
+
+## Error Handling Philosophy
+
+- **No silent fallbacks.** Every switch/if-else that resolves roles, prompts, actions,
+  or branch names must handle all cases explicitly. A catch-all `_` or `default` case
+  must throw an error (e.g. `InvalidOperationException`), not return a generic fallback.
+  Silent fallbacks mask bugs and prevent proper debugging and self-improvement.
+- **Fail fast on invalid state.** If a required value (like `CoderBranch`) is null when
+  it should be set, throw immediately rather than substituting a placeholder like "TBD".
+  A failed goal with a clear error is better than a goal that silently produces garbage.
+- **Branch names are configuration.** They come from `HiveConfigFile.RepositoryConfig.DefaultBranch`
+  and must never be hardcoded as `"main"` or `"develop"` in operational code.
