@@ -100,8 +100,7 @@ The verdict meanings:
 
 ## Git Workflow
 
-- Commit your test plan, integration tests, and test report on the current branch.
-- Do NOT run `git push` — the orchestrator handles pushing for you.
+Commit your changes with `git add -A && git commit` before finishing. Do NOT run `git push`.
 
 ## Important Rules
 

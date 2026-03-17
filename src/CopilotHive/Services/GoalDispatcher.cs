@@ -203,9 +203,8 @@ public sealed class GoalDispatcher : BackgroundService
 
             var noOpContext =
                 "CRITICAL: Your previous attempt produced ZERO file changes. " +
-                "You MUST edit files and commit them with git. " +
-                "Do NOT just describe or discuss changes — actually make them. " +
-                "Verify your work with 'git status' and 'git log --oneline -3' before finishing.\n\n" +
+                "You MUST edit files and commit them with `git add -A && git commit`. " +
+                "Do NOT just describe or discuss changes — actually make them.\n\n" +
                 $"Previous coder output (for context):\n{(complete.Output.Length > 500 ? complete.Output[..500] + "..." : complete.Output)}";
 
             var retryPrompt = await _brain!.CraftPromptAsync(pipeline, WorkerRole.Coder, noOpContext, ct);
@@ -1545,8 +1544,7 @@ public sealed class GoalDispatcher : BackgroundService
             2. Edit the files
             3. Use the /build skill to build the project and fix any errors
             4. Use the /test skill to run the tests and fix any failures
-            5. Run `git add` + `git commit` with a descriptive message
-            6. Verify with `git diff origin/<base-branch>...HEAD --stat` that you have a non-empty diff
+            5. Run `git add -A && git commit` with a descriptive message
 
             A response that only describes changes without actually editing files is a FAILURE.
             """;
@@ -1577,13 +1575,12 @@ public sealed class GoalDispatcher : BackgroundService
             4. Update XML doc comments (`<summary>`, `<param>`, `<returns>`) on any new or changed public APIs
             5. Update README.md if the changes affect user-facing features or configuration
             6. Use the /build skill to verify your doc comment changes compile
-            7. Run `git add` + `git commit` with message "docs: update documentation for [brief description]"
+            7. Run `git add -A && git commit` with message "docs: update documentation for [brief description]"
 
             CRITICAL RULES:
             - Do NOT write or run tests — that is the tester's job
             - Do NOT implement features or fix bugs — that is the coder's job
             - Do NOT run git push — the orchestrator handles that
-            - Focus ONLY on documentation artifacts (CHANGELOG, README, XML doc comments)
 
             When done, produce a DOC_REPORT block:
             ```DOC_REPORT

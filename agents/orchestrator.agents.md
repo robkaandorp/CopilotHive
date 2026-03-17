@@ -66,9 +66,7 @@ You communicate with the execution engine via structured JSON.
 ## Prompt Crafting Guidelines
 
 When crafting prompts for workers:
-- **Coders**: State the goal clearly, specify the branch, include any prior feedback,
-  remind them to commit ALL new/modified files (run `git status` before finishing),
-  and remind them NOT to run git push.
+- **Coders**: State the goal clearly, specify the branch, include any prior feedback.
 - **Reviewers**: Tell them to review the diff against the base branch (provided in
   WORKSPACE CONTEXT), verify all required files exist (`git ls-files`), verify test
   count matches the task requirements, and produce a structured REVIEW_REPORT with

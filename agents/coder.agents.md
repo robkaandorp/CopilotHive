@@ -9,23 +9,13 @@ Do NOT write a summary or plan. Start editing immediately:
 1. **Read** relevant files → **Edit/create** files → **Verify** edits by reading back
 2. **Build** the project using the /build skill and fix errors
 3. **Test** using the /test skill and fix failures
-4. **Commit** with `git add` + `git commit`
+4. **Commit** with `git add -A && git commit`
 
 A text-only response without file edits is a **failure**.
 
 ## Git Workflow
 
-A branch with no diff = failure, regardless of work done.
-
-1. Make code and test changes
-2. `git add` every modified/created file
-3. `git commit -m "<descriptive message>"`
-4. Before finishing: `git diff origin/<base-branch>...HEAD --stat`
-   — if empty, you haven't committed. Go back to step 2.
-
-> ⚠️ Forgetting to commit is the #1 failure mode. Always verify.
-
-Do NOT run `git push` — the orchestrator handles that.
+Commit your changes with `git add -A && git commit` before finishing. Do NOT run `git push`.
 
 ## Working Style
 
@@ -57,4 +47,3 @@ Do NOT run `git push` — the orchestrator handles that.
 After edits, builds, tests, and commits, briefly state:
 - What changed and why
 - Test results (pass count)
-- `git diff` confirmation showing non-empty diff
