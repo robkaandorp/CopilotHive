@@ -12,24 +12,16 @@ public class MultiRepoTests
     // ──────────────────────────────────────────
 
     [Theory]
-    [InlineData("feature-xyz", "coder", 1, "copilothive/feature-xyz/coder-001")]
-    [InlineData("fix-auth", "tester", 12, "copilothive/fix-auth/tester-012")]
-    [InlineData("upgrade-db", "reviewer", 0, "copilothive/upgrade-db/reviewer-000")]
-    [InlineData("my-goal", "improver", 100, "copilothive/my-goal/improver-100")]
+    [InlineData("feature-xyz", "copilothive/feature-xyz")]
+    [InlineData("fix-auth", "copilothive/fix-auth")]
+    [InlineData("upgrade-db", "copilothive/upgrade-db")]
+    [InlineData("my-goal", "copilothive/my-goal")]
     public void BranchCoordinator_GetFeatureBranch_GeneratesCorrectName(
-        string goalId, string role, int iteration, string expected)
+        string goalId, string expected)
     {
         var coordinator = new BranchCoordinator();
-        var branch = coordinator.GetFeatureBranch(goalId, role, iteration);
+        var branch = coordinator.GetFeatureBranch(goalId);
         Assert.Equal(expected, branch);
-    }
-
-    [Fact]
-    public void BranchCoordinator_GetFeatureBranch_NormalizesRoleToLowerCase()
-    {
-        var coordinator = new BranchCoordinator();
-        var branch = coordinator.GetFeatureBranch("goal-1", "CODER", 5);
-        Assert.Equal("copilothive/goal-1/coder-005", branch);
     }
 
     [Fact]
@@ -37,14 +29,14 @@ public class MultiRepoTests
     {
         var coordinator = new BranchCoordinator();
 
-        coordinator.RecordBranchCreated("goal-a", "repo-1", "copilothive/goal-a/coder-001");
-        coordinator.RecordBranchCreated("goal-a", "repo-2", "copilothive/goal-a/coder-001");
-        coordinator.RecordBranchCreated("goal-b", "repo-1", "copilothive/goal-b/tester-001");
+        coordinator.RecordBranchCreated("goal-a", "repo-1", "copilothive/goal-a");
+        coordinator.RecordBranchCreated("goal-a", "repo-2", "copilothive/goal-a");
+        coordinator.RecordBranchCreated("goal-b", "repo-1", "copilothive/goal-b");
 
         var goalABranches = coordinator.GetBranchesForGoal("goal-a");
         Assert.Equal(2, goalABranches.Count);
-        Assert.Contains(("repo-1", "copilothive/goal-a/coder-001"), goalABranches);
-        Assert.Contains(("repo-2", "copilothive/goal-a/coder-001"), goalABranches);
+        Assert.Contains(("repo-1", "copilothive/goal-a"), goalABranches);
+        Assert.Contains(("repo-2", "copilothive/goal-a"), goalABranches);
 
         var goalBBranches = coordinator.GetBranchesForGoal("goal-b");
         Assert.Single(goalBBranches);
@@ -74,10 +66,10 @@ public class MultiRepoTests
     public void BranchCoordinator_GetBranchInfo_ReturnsCorrectProto()
     {
         var coordinator = new BranchCoordinator();
-        var info = coordinator.GetBranchInfo("goal-1", "coder", 3, BranchAction.Create, "develop");
+        var info = coordinator.GetBranchInfo("goal-1", BranchAction.Create, "develop");
 
         Assert.Equal("develop", info.BaseBranch);
-        Assert.Equal("copilothive/goal-1/coder-003", info.FeatureBranch);
+        Assert.Equal("copilothive/goal-1", info.FeatureBranch);
         Assert.Equal(BranchAction.Create, info.Action);
     }
 
@@ -129,7 +121,7 @@ public class MultiRepoTests
             "goal-x", "desc", WorkerRole.Coder, 2, repos, "do stuff", BranchAction.Create);
 
         Assert.Equal("develop", assignment.BranchInfo.BaseBranch);
-        Assert.Equal("copilothive/goal-x/coder-002", assignment.BranchInfo.FeatureBranch);
+        Assert.Equal("copilothive/goal-x", assignment.BranchInfo.FeatureBranch);
         Assert.Equal(BranchAction.Create, assignment.BranchInfo.Action);
     }
 
@@ -148,7 +140,7 @@ public class MultiRepoTests
             "goal-y", "review changes", WorkerRole.Reviewer, 5, repos, "review", BranchAction.Checkout);
 
         Assert.Equal(BranchAction.Checkout, assignment.BranchInfo.Action);
-        Assert.Equal("copilothive/goal-y/reviewer-005", assignment.BranchInfo.FeatureBranch);
+        Assert.Equal("copilothive/goal-y", assignment.BranchInfo.FeatureBranch);
     }
 
     [Fact]

@@ -43,7 +43,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
             throw new InvalidOperationException($"No repositories configured for goal '{goalId}'.");
         var baseBranch = repoList[0].DefaultBranch;
 
-        var branchInfo = branchCoordinator.GetBranchInfo(goalId, roleName, iteration, branchAction, baseBranch);
+        var branchInfo = branchCoordinator.GetBranchInfo(goalId, branchAction, baseBranch);
 
         var assignment = new TaskAssignment
         {

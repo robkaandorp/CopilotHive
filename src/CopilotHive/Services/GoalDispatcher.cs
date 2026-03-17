@@ -731,12 +731,6 @@ public sealed class GoalDispatcher : BackgroundService
             branchAction: branchAction,
             model: model);
 
-        // Non-coder roles reuse the coder's branch (all work on the same feature branch)
-        if (branchAction == BranchAction.Checkout && pipeline.CoderBranch is not null && task.BranchInfo is not null)
-        {
-            task.BranchInfo.FeatureBranch = pipeline.CoderBranch;
-        }
-
         // Improver operates read-only: it can see the feature branch but must not push.
         // Downgrade the action to Unspecified so the worker runtime skips push operations.
         if (role == WorkerRole.Improver && task.BranchInfo is not null)

@@ -115,7 +115,7 @@ public sealed class DistributedBrainTests
     {
         var brain = new DistributedBrain(9999, NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-4", "Some goal");
-        pipeline.SetActiveTask("task-1", "copilothive/g-4/coder-001");
+        pipeline.SetActiveTask("task-1", "copilothive/g-4");
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => brain.CraftPromptAsync(pipeline, WorkerRole.Coder, null));

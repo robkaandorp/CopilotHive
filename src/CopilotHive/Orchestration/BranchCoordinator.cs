@@ -11,23 +11,20 @@ public sealed class BranchCoordinator
     private readonly ConcurrentDictionary<string, List<(string Repo, string Branch)>> _branchesByGoal = new();
 
     /// <summary>
-    /// Generates a consistent feature branch name: copilothive/{goalId}/{role}-{iteration:D3}
+    /// Generates a consistent feature branch name: copilothive/{goalId}
     /// </summary>
-    public string GetFeatureBranch(string goalId, string role, int iteration)
+    public string GetFeatureBranch(string goalId)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(goalId);
-        ArgumentException.ThrowIfNullOrWhiteSpace(role);
-        ArgumentOutOfRangeException.ThrowIfNegative(iteration);
-
-        return $"copilothive/{goalId}/{role.ToLowerInvariant()}-{iteration:D3}";
+        return $"copilothive/{goalId}";
     }
 
     /// <summary>
     /// Builds a <see cref="BranchInfo"/> proto message for the given parameters.
     /// </summary>
-    public BranchInfo GetBranchInfo(string goalId, string role, int iteration, BranchAction action, string baseBranch)
+    public BranchInfo GetBranchInfo(string goalId, BranchAction action, string baseBranch)
     {
-        var featureBranch = GetFeatureBranch(goalId, role, iteration);
+        var featureBranch = GetFeatureBranch(goalId);
 
         return new BranchInfo
         {
