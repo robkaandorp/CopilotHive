@@ -42,6 +42,9 @@ public sealed class ConfigRepoManager
     {
         if (Directory.Exists(Path.Combine(_localPath, ".git")))
         {
+            // Discard any uncommitted changes (e.g. from a failed improver commit)
+            // before pulling to prevent merge conflicts with incoming changes.
+            await RunGitAsync(_localPath, ["checkout", "--", "."], ct);
             await RunGitAsync(_localPath, ["pull", "--ff-only"], ct);
         }
         else
