@@ -31,6 +31,45 @@ public sealed class Goal
     public List<string> Notes { get; set; } = [];
     /// <summary>Per-phase wall-clock durations in seconds.</summary>
     public Dictionary<string, double>? PhaseDurations { get; set; }
+    /// <summary>Structured summaries written after each iteration completes.</summary>
+    public List<IterationSummary> IterationSummaries { get; set; } = [];
+}
+
+/// <summary>Structured summary of a single completed (or failed) pipeline iteration.</summary>
+public sealed class IterationSummary
+{
+    /// <summary>One-based iteration number.</summary>
+    public int Iteration { get; init; }
+    /// <summary>Per-phase results for this iteration.</summary>
+    public List<PhaseResult> Phases { get; init; } = [];
+    /// <summary>Test counts, or <c>null</c> if no tests were run.</summary>
+    public TestCounts? TestCounts { get; init; }
+    /// <summary>"approve", "reject", or <c>null</c> if no review was run.</summary>
+    public string? ReviewVerdict { get; init; }
+    /// <summary>Notable events such as "improver skipped due to timeout".</summary>
+    public List<string> Notes { get; init; } = [];
+}
+
+/// <summary>Result of a single pipeline phase within one iteration.</summary>
+public sealed class PhaseResult
+{
+    /// <summary>Phase name (e.g. "Coding", "Testing").</summary>
+    public required string Name { get; init; }
+    /// <summary>"pass", "fail", or "skip".</summary>
+    public required string Result { get; init; }
+    /// <summary>Wall-clock duration of the phase in seconds.</summary>
+    public double DurationSeconds { get; init; }
+}
+
+/// <summary>Aggregate test counts from a tester run.</summary>
+public sealed class TestCounts
+{
+    /// <summary>Total number of tests discovered.</summary>
+    public int Total { get; init; }
+    /// <summary>Number of tests that passed.</summary>
+    public int Passed { get; init; }
+    /// <summary>Number of tests that failed.</summary>
+    public int Failed { get; init; }
 }
 
 /// <summary>Scheduling priority levels for goals.</summary>

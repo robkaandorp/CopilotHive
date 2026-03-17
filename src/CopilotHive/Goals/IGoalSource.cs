@@ -17,6 +17,8 @@ public sealed record GoalUpdateMetadata
     public List<string>? Notes { get; init; }
     /// <summary>Per-phase wall-clock durations in seconds.</summary>
     public Dictionary<string, double>? PhaseDurations { get; init; }
+    /// <summary>Iteration summary to append to the goal's <see cref="Goal.IterationSummaries"/> list.</summary>
+    public IterationSummary? IterationSummary { get; init; }
 }
 
 /// <summary>

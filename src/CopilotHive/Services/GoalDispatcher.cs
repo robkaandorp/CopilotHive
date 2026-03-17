@@ -1103,6 +1103,7 @@ public sealed class GoalDispatcher : BackgroundService
             PhaseDurations = pipeline.Metrics.PhaseDurations is { Count: > 0 }
                 ? pipeline.Metrics.PhaseDurations.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.TotalSeconds)
                 : null,
+            IterationSummary = BuildIterationSummary(pipeline, failedPhase: null),
         };
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Completed, completedMeta, ct);
         await CommitGoalsToConfigRepoAsync($"Goal '{pipeline.GoalId}' completed", ct);
@@ -1174,6 +1175,7 @@ public sealed class GoalDispatcher : BackgroundService
 
     private async Task MarkGoalFailed(GoalPipeline pipeline, string reason, CancellationToken ct)
     {
+        var failedPhase = pipeline.Phase; // capture before AdvanceTo overwrites it
         pipeline.AdvanceTo(GoalPhase.Failed);
 
         var failedMeta = new GoalUpdateMetadata
@@ -1184,6 +1186,7 @@ public sealed class GoalDispatcher : BackgroundService
             PhaseDurations = pipeline.Metrics.PhaseDurations is { Count: > 0 }
                 ? pipeline.Metrics.PhaseDurations.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.TotalSeconds)
                 : null,
+            IterationSummary = BuildIterationSummary(pipeline, failedPhase),
         };
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Failed, failedMeta, ct);
         await CommitGoalsToConfigRepoAsync($"Goal '{pipeline.GoalId}' failed: {reason}", ct);
@@ -1204,6 +1207,61 @@ public sealed class GoalDispatcher : BackgroundService
         await CommitMetricsToConfigRepoAsync(pipeline, ct);
 
         _logger.LogWarning("Goal {GoalId} failed: {Reason}", pipeline.GoalId, reason);
+    }
+
+    /// <summary>
+    /// Builds an <see cref="IterationSummary"/> from the pipeline's current metrics.
+    /// All phases tracked in <see cref="IterationMetrics.PhaseDurations"/> are included;
+    /// the <paramref name="failedPhase"/> (if provided) is marked as "fail", all others as "pass".
+    /// </summary>
+    /// <param name="pipeline">Pipeline whose metrics to summarise.</param>
+    /// <param name="failedPhase">The phase that caused failure, or <c>null</c> for a completed goal.</param>
+    /// <returns>A populated <see cref="IterationSummary"/>.</returns>
+    private static IterationSummary BuildIterationSummary(GoalPipeline pipeline, GoalPhase? failedPhase)
+    {
+        var metrics = pipeline.Metrics;
+
+        var phases = metrics.PhaseDurations
+            .Select(kvp => new PhaseResult
+            {
+                Name = kvp.Key,
+                Result = failedPhase.HasValue && kvp.Key == failedPhase.Value.ToString() ? "fail" : "pass",
+                DurationSeconds = kvp.Value.TotalSeconds,
+            })
+            .ToList();
+
+        // Phases that were skipped are not in PhaseDurations — add them separately
+        if (metrics.ImproverSkipped)
+        {
+            phases.Add(new PhaseResult { Name = "Improve", Result = "skip", DurationSeconds = 0 });
+        }
+
+        TestCounts? testCounts = metrics.TotalTests > 0
+            ? new TestCounts
+            {
+                Total = metrics.TotalTests,
+                Passed = metrics.PassedTests,
+                Failed = metrics.FailedTests,
+            }
+            : null;
+
+        string? reviewVerdict = string.IsNullOrWhiteSpace(metrics.ReviewVerdict) ? null
+            : metrics.ReviewVerdict.Equals("APPROVED", StringComparison.OrdinalIgnoreCase) ? "approve"
+            : metrics.ReviewVerdict.Equals("CHANGES_REQUESTED", StringComparison.OrdinalIgnoreCase) ? "reject"
+            : metrics.ReviewVerdict.ToLowerInvariant();
+
+        var notes = new List<string>();
+        if (metrics.ImproverSkipped && !string.IsNullOrWhiteSpace(metrics.ImproverSkipReason))
+            notes.Add($"improver skipped: {metrics.ImproverSkipReason}");
+
+        return new IterationSummary
+        {
+            Iteration = pipeline.Iteration,
+            Phases = phases,
+            TestCounts = testCounts,
+            ReviewVerdict = reviewVerdict,
+            Notes = notes,
+        };
     }
 
     private async Task CleanupBrainSessionAsync(string goalId)

@@ -66,6 +66,8 @@ public sealed class FileGoalSource : IGoalSource
                     goal.Notes.AddRange(metadata.Notes);
                 if (metadata.PhaseDurations is { Count: > 0 })
                     goal.PhaseDurations = metadata.PhaseDurations;
+                if (metadata.IterationSummary is not null)
+                    goal.IterationSummaries.Add(metadata.IterationSummary);
             }
 
             await WriteGoalsAsync(goals, ct);
@@ -114,12 +116,16 @@ public sealed class FileGoalSource : IGoalSource
                 Failure_reason = g.FailureReason,
                 Notes = g.Notes.Count > 0 ? g.Notes : null,
                 PhaseDurations = g.PhaseDurations is { Count: > 0 } ? g.PhaseDurations : null,
+                IterationSummaries = g.IterationSummaries.Count > 0
+                    ? g.IterationSummaries.Select(MapIterationSummaryEntry).ToList()
+                    : null,
             }).ToList(),
         };
 
         var serializer = new SerializerBuilder()
             .WithNamingConvention(UnderscoredNamingConvention.Instance)
             .ConfigureDefaultValuesHandling(DefaultValuesHandling.OmitNull)
+            .WithIndentedSequences()
             .Build();
 
         var yaml = serializer.Serialize(doc);
@@ -139,6 +145,7 @@ public sealed class FileGoalSource : IGoalSource
         FailureReason = entry.Failure_reason,
         Notes = entry.Notes ?? [],
         PhaseDurations = entry.PhaseDurations,
+        IterationSummaries = entry.IterationSummaries?.Select(MapIterationSummary).ToList() ?? [],
     };
 
     private static GoalPriority ParsePriority(string? value) => value?.ToLowerInvariant() switch
@@ -169,6 +176,46 @@ public sealed class FileGoalSource : IGoalSource
         : DateTime.TryParse(value, null, System.Globalization.DateTimeStyles.RoundtripKind, out var dt) ? dt
         : null;
 
+    private static IterationSummary MapIterationSummary(IterationSummaryEntry e) => new()
+    {
+        Iteration = e.Iteration,
+        Phases = e.Phases?.Select(p => new PhaseResult
+        {
+            Name = p.Name ?? string.Empty,
+            Result = p.Result ?? "pass",
+            DurationSeconds = p.DurationSeconds,
+        }).ToList() ?? [],
+        TestCounts = e.TestCounts is null ? null : new TestCounts
+        {
+            Total = e.TestCounts.Total,
+            Passed = e.TestCounts.Passed,
+            Failed = e.TestCounts.Failed,
+        },
+        ReviewVerdict = e.ReviewVerdict,
+        Notes = e.Notes ?? [],
+    };
+
+    private static IterationSummaryEntry MapIterationSummaryEntry(IterationSummary s) => new()
+    {
+        Iteration = s.Iteration,
+        Phases = s.Phases.Count > 0
+            ? s.Phases.Select(p => new PhaseResultEntry
+            {
+                Name = p.Name,
+                Result = p.Result,
+                DurationSeconds = p.DurationSeconds,
+            }).ToList()
+            : null,
+        TestCounts = s.TestCounts is null ? null : new TestCountEntry
+        {
+            Total = s.TestCounts.Total,
+            Passed = s.TestCounts.Passed,
+            Failed = s.TestCounts.Failed,
+        },
+        ReviewVerdict = s.ReviewVerdict,
+        Notes = s.Notes.Count > 0 ? s.Notes : null,
+    };
+
     internal sealed class GoalFileDocument
     {
         public List<GoalFileEntry> Goals { get; set; } = [];
@@ -189,5 +236,33 @@ public sealed class FileGoalSource : IGoalSource
         public List<string>? Notes { get; set; }
         /// <summary>Per-phase wall-clock durations in seconds.</summary>
         public Dictionary<string, double>? PhaseDurations { get; set; }
+        /// <summary>Structured summaries for each completed iteration.</summary>
+        public List<IterationSummaryEntry>? IterationSummaries { get; set; }
+    }
+
+    /// <summary>YAML-serializable representation of an <see cref="IterationSummary"/>.</summary>
+    internal sealed class IterationSummaryEntry
+    {
+        public int Iteration { get; set; }
+        public List<PhaseResultEntry>? Phases { get; set; }
+        public TestCountEntry? TestCounts { get; set; }
+        public string? ReviewVerdict { get; set; }
+        public List<string>? Notes { get; set; }
+    }
+
+    /// <summary>YAML-serializable representation of a <see cref="PhaseResult"/>.</summary>
+    internal sealed class PhaseResultEntry
+    {
+        public string? Name { get; set; }
+        public string? Result { get; set; }
+        public double DurationSeconds { get; set; }
+    }
+
+    /// <summary>YAML-serializable representation of <see cref="TestCounts"/>.</summary>
+    internal sealed class TestCountEntry
+    {
+        public int Total { get; set; }
+        public int Passed { get; set; }
+        public int Failed { get; set; }
     }
 }
