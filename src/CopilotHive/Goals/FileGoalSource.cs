@@ -64,6 +64,8 @@ public sealed class FileGoalSource : IGoalSource
                     goal.FailureReason = metadata.FailureReason;
                 if (metadata.Notes is { Count: > 0 })
                     goal.Notes.AddRange(metadata.Notes);
+                if (metadata.PhaseDurations is { Count: > 0 })
+                    goal.PhaseDurations = metadata.PhaseDurations;
             }
 
             await WriteGoalsAsync(goals, ct);
@@ -111,6 +113,7 @@ public sealed class FileGoalSource : IGoalSource
                 Iterations = g.Iterations,
                 Failure_reason = g.FailureReason,
                 Notes = g.Notes.Count > 0 ? g.Notes : null,
+                PhaseDurations = g.PhaseDurations is { Count: > 0 } ? g.PhaseDurations : null,
             }).ToList(),
         };
 
@@ -135,6 +138,7 @@ public sealed class FileGoalSource : IGoalSource
         Iterations = entry.Iterations,
         FailureReason = entry.Failure_reason,
         Notes = entry.Notes ?? [],
+        PhaseDurations = entry.PhaseDurations,
     };
 
     private static GoalPriority ParsePriority(string? value) => value?.ToLowerInvariant() switch
@@ -183,5 +187,7 @@ public sealed class FileGoalSource : IGoalSource
         public int? Iterations { get; set; }
         public string? Failure_reason { get; set; }
         public List<string>? Notes { get; set; }
+        /// <summary>Per-phase wall-clock durations in seconds.</summary>
+        public Dictionary<string, double>? PhaseDurations { get; set; }
     }
 }

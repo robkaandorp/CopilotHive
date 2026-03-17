@@ -1,4 +1,6 @@
 using CopilotHive.Goals;
+using YamlDotNet.Serialization;
+using YamlDotNet.Serialization.NamingConventions;
 
 namespace CopilotHive.Tests;
 
@@ -527,5 +529,112 @@ public sealed class GoalTests : IDisposable
         Assert.DoesNotContain("completed_at", yaml);
         Assert.DoesNotContain("iterations", yaml);
         Assert.DoesNotContain("failure_reason", yaml);
+    }
+
+    // ── PhaseDurations ──────────────────────────────────────────────────────
+
+    [Fact]
+    public void GoalFileEntry_PhaseDurations_RoundTripsViaYaml()
+    {
+        var serializer = new SerializerBuilder()
+            .WithNamingConvention(UnderscoredNamingConvention.Instance)
+            .ConfigureDefaultValuesHandling(DefaultValuesHandling.OmitNull)
+            .Build();
+
+        var deserializer = new DeserializerBuilder()
+            .WithNamingConvention(UnderscoredNamingConvention.Instance)
+            .IgnoreUnmatchedProperties()
+            .Build();
+
+        var entry = new FileGoalSource.GoalFileEntry
+        {
+            Id = "test-goal",
+            Status = "completed",
+            PhaseDurations = new Dictionary<string, double>
+            {
+                ["Coding"] = 42.5,
+                ["Review"] = 10.0,
+            },
+        };
+
+        var yaml = serializer.Serialize(entry);
+        var roundTripped = deserializer.Deserialize<FileGoalSource.GoalFileEntry>(yaml);
+
+        Assert.NotNull(roundTripped.PhaseDurations);
+        Assert.Equal(42.5, roundTripped.PhaseDurations["Coding"]);
+        Assert.Equal(10.0, roundTripped.PhaseDurations["Review"]);
+    }
+
+    [Fact]
+    public async Task FileGoalSource_WritesPhaseDurationsToYaml_WhenSet()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: tracked-goal
+                description: "A goal with phase tracking"
+            """);
+
+        var source = new FileGoalSource(path);
+        var metadata = new GoalUpdateMetadata
+        {
+            CompletedAt = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+            PhaseDurations = new Dictionary<string, double>
+            {
+                ["Coding"] = 120.5,
+                ["Testing"] = 30.0,
+            },
+        };
+
+        await source.UpdateGoalStatusAsync("tracked-goal", GoalStatus.Completed, metadata);
+
+        var yaml = await File.ReadAllTextAsync(path);
+        Assert.Contains("phase_durations", yaml);
+        Assert.Contains("Coding: 120.5", yaml);
+        Assert.Contains("Testing: 30", yaml);
+    }
+
+    [Fact]
+    public async Task FileGoalSource_ReadsPhaseDurationsFromYaml_Correctly()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: goal-with-phases
+                description: "Has phase durations"
+                status: completed
+                phase_durations:
+                  Coding: 95.0
+                  Review: 20.5
+            """);
+
+        var source = new FileGoalSource(path);
+        var goals = await source.ReadGoalsAsync();
+
+        Assert.Single(goals);
+        var goal = goals[0];
+        Assert.NotNull(goal.PhaseDurations);
+        Assert.Equal(95.0, goal.PhaseDurations["Coding"]);
+        Assert.Equal(20.5, goal.PhaseDurations["Review"]);
+    }
+
+    [Fact]
+    public async Task FileGoalSource_NullPhaseDurations_DoesNotWritePhaseDurationsKey()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: no-phases-goal
+                description: "Goal without phase tracking"
+            """);
+
+        var source = new FileGoalSource(path);
+        var metadata = new GoalUpdateMetadata
+        {
+            CompletedAt = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+            PhaseDurations = null,
+        };
+
+        await source.UpdateGoalStatusAsync("no-phases-goal", GoalStatus.Completed, metadata);
+
+        var yaml = await File.ReadAllTextAsync(path);
+        Assert.DoesNotContain("phase_durations", yaml);
     }
 }

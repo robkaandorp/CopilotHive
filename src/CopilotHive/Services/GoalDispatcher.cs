@@ -1100,6 +1100,9 @@ public sealed class GoalDispatcher : BackgroundService
         {
             CompletedAt = pipeline.CompletedAt ?? DateTime.UtcNow,
             Iterations = pipeline.Iteration,
+            PhaseDurations = pipeline.Metrics.PhaseDurations is { Count: > 0 }
+                ? pipeline.Metrics.PhaseDurations.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.TotalSeconds)
+                : null,
         };
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Completed, completedMeta, ct);
         await CommitGoalsToConfigRepoAsync($"Goal '{pipeline.GoalId}' completed", ct);
@@ -1178,6 +1181,9 @@ public sealed class GoalDispatcher : BackgroundService
             CompletedAt = pipeline.CompletedAt ?? DateTime.UtcNow,
             Iterations = pipeline.Iteration,
             FailureReason = reason,
+            PhaseDurations = pipeline.Metrics.PhaseDurations is { Count: > 0 }
+                ? pipeline.Metrics.PhaseDurations.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.TotalSeconds)
+                : null,
         };
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Failed, failedMeta, ct);
         await CommitGoalsToConfigRepoAsync($"Goal '{pipeline.GoalId}' failed: {reason}", ct);
