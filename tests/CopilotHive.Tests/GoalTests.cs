@@ -589,8 +589,8 @@ public sealed class GoalTests : IDisposable
 
         var yaml = await File.ReadAllTextAsync(path);
         Assert.Contains("phase_durations", yaml);
-        Assert.Contains("coding: 120.5", yaml);
-        Assert.Contains("testing: 30", yaml);
+        Assert.Contains("Coding: 120.5", yaml);
+        Assert.Contains("Testing: 30", yaml);
     }
 
     [Fact]
