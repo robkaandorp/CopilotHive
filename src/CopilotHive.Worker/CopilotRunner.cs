@@ -145,6 +145,7 @@ public sealed class CopilotRunner : IAsyncDisposable
         if (_toolBridge is null)
             return tools;
 
+        // report_progress is available to all roles
         tools.Add(AIFunctionFactory.Create(
             async ([Description("Current status")] string status,
                    [Description("Details about what you're doing")] string details) =>
@@ -158,116 +159,135 @@ public sealed class CopilotRunner : IAsyncDisposable
             "Report your current progress to the orchestrator. " +
             "Call this periodically to show what you're working on."));
 
-        tools.Add(AIFunctionFactory.Create(
-            ([Description("PASS or FAIL")] string verdict,
-             [Description("Total number of tests")] int totalTests,
-             [Description("Number of tests that passed")] int passedTests,
-             [Description("Number of tests that failed")] int failedTests,
-             [Description("Code coverage percentage (0-100), or -1 if not available")] double coveragePercent,
-             [Description("Build succeeded (true/false)")] bool buildSuccess,
-             [Description("List of issues found, empty if none")] string[] issues) =>
+        // Role-specific reporting tools
+        var role = _currentRole.ToLowerInvariant();
+        switch (role)
+        {
+            case "tester":
+                tools.Add(BuildTestResultsTool());
+                break;
+            case "reviewer":
+                tools.Add(BuildReviewVerdictTool());
+                break;
+            case "coder":
+                tools.Add(BuildCodeChangesTool());
+                break;
+            case "docwriter":
+                tools.Add(BuildDocChangesTool());
+                break;
+            // improver has no reporting tool — it edits files directly
+        }
+
+        return tools;
+    }
+
+    private AIFunction BuildTestResultsTool() => AIFunctionFactory.Create(
+        ([Description("PASS or FAIL")] string verdict,
+         [Description("Total number of tests")] int totalTests,
+         [Description("Number of tests that passed")] int passedTests,
+         [Description("Number of tests that failed")] int failedTests,
+         [Description("Code coverage percentage (0-100), or -1 if not available")] double coveragePercent,
+         [Description("Build succeeded (true/false)")] bool buildSuccess,
+         [Description("List of issues found, empty if none")] string[] issues) =>
+        {
+            var error = ToolValidation.Check(
+                (!string.IsNullOrEmpty(verdict), "verdict is required"),
+                (verdict is "PASS" or "FAIL", "verdict must be exactly 'PASS' or 'FAIL'"),
+                (totalTests >= 0, "totalTests must be >= 0"),
+                (passedTests >= 0, "passedTests must be >= 0"),
+                (failedTests >= 0, "failedTests must be >= 0"),
+                (passedTests + failedTests <= totalTests,
+                    $"passedTests ({passedTests}) + failedTests ({failedTests}) must not exceed totalTests ({totalTests})"),
+                (coveragePercent is >= -1 and <= 100,
+                    $"coveragePercent must be -1 (unavailable) or 0-100, got {coveragePercent}"));
+            if (error is not null) return error;
+
+            _log.Info($"Tool call: report_test_results(verdict={verdict}, total={totalTests}, passed={passedTests}, failed={failedTests}, coverage={coveragePercent})");
+            _lastTestReport = new TestResultReport
             {
-                var error = ToolValidation.Check(
-                    (!string.IsNullOrEmpty(verdict), "verdict is required"),
-                    (verdict is "PASS" or "FAIL", "verdict must be exactly 'PASS' or 'FAIL'"),
-                    (totalTests >= 0, "totalTests must be >= 0"),
-                    (passedTests >= 0, "passedTests must be >= 0"),
-                    (failedTests >= 0, "failedTests must be >= 0"),
-                    (passedTests + failedTests <= totalTests,
-                        $"passedTests ({passedTests}) + failedTests ({failedTests}) must not exceed totalTests ({totalTests})"),
-                    (coveragePercent is >= -1 and <= 100,
-                        $"coveragePercent must be -1 (unavailable) or 0-100, got {coveragePercent}"));
-                if (error is not null) return error;
+                Verdict = verdict,
+                TotalTests = totalTests,
+                PassedTests = passedTests,
+                FailedTests = failedTests,
+                CoveragePercent = coveragePercent >= 0 ? coveragePercent : null,
+                BuildSuccess = buildSuccess,
+                Issues = issues.ToList(),
+            };
+            return "Test results recorded. The infrastructure will use these structured metrics.";
+        },
+        "report_test_results",
+        "Report structured test results. REQUIRED for testers after running tests. " +
+        "Call this ONCE with the final aggregated test counts and verdict.");
 
-                _log.Info($"Tool call: report_test_results(verdict={verdict}, total={totalTests}, passed={passedTests}, failed={failedTests}, coverage={coveragePercent})");
-                _lastTestReport = new TestResultReport
-                {
-                    Verdict = verdict,
-                    TotalTests = totalTests,
-                    PassedTests = passedTests,
-                    FailedTests = failedTests,
-                    CoveragePercent = coveragePercent >= 0 ? coveragePercent : null,
-                    BuildSuccess = buildSuccess,
-                    Issues = issues.ToList(),
-                };
-                return "Test results recorded. The infrastructure will use these structured metrics.";
-            },
-            "report_test_results",
-            "Report structured test results. REQUIRED for testers after running tests. " +
-            "Call this ONCE with the final aggregated test counts and verdict."));
+    private AIFunction BuildReviewVerdictTool() => AIFunctionFactory.Create(
+        ([Description("APPROVE or REQUEST_CHANGES")] string verdict,
+         [Description("List of issues found, empty if none")] string[] issues,
+         [Description("Overall review summary")] string summary) =>
+        {
+            var error = ToolValidation.Check(
+                (!string.IsNullOrEmpty(verdict), "verdict is required"),
+                (verdict is "APPROVE" or "REQUEST_CHANGES",
+                    "verdict must be exactly 'APPROVE' or 'REQUEST_CHANGES'"));
+            if (error is not null) return error;
 
-        // ---- Reviewer tool ----
-        tools.Add(AIFunctionFactory.Create(
-            ([Description("APPROVE or REQUEST_CHANGES")] string verdict,
-             [Description("List of issues found, empty if none")] string[] issues,
-             [Description("Overall review summary")] string summary) =>
+            _log.Info($"Tool call: report_review_verdict(verdict={verdict}, issues={issues.Length})");
+            _lastWorkerReport = new WorkerReport
             {
-                var error = ToolValidation.Check(
-                    (!string.IsNullOrEmpty(verdict), "verdict is required"),
-                    (verdict is "APPROVE" or "REQUEST_CHANGES",
-                        "verdict must be exactly 'APPROVE' or 'REQUEST_CHANGES'"));
-                if (error is not null) return error;
+                Verdict = verdict,
+                Issues = issues.ToList(),
+                Summary = summary,
+            };
+            return "Review verdict recorded.";
+        },
+        "report_review_verdict",
+        "Report your code review verdict. REQUIRED for reviewers after completing the review. " +
+        "Call this ONCE with the final verdict and all issues found.");
 
-                _log.Info($"Tool call: report_review_verdict(verdict={verdict}, issues={issues.Length})");
-                _lastWorkerReport = new WorkerReport
-                {
-                    Verdict = verdict,
-                    Issues = issues.ToList(),
-                    Summary = summary,
-                };
-                return "Review verdict recorded.";
-            },
-            "report_review_verdict",
-            "Report your code review verdict. REQUIRED for reviewers after completing the review. " +
-            "Call this ONCE with the final verdict and all issues found."));
+    private AIFunction BuildCodeChangesTool() => AIFunctionFactory.Create(
+        ([Description("PASS or FAIL")] string verdict,
+         [Description("List of files modified")] string[] filesModified,
+         [Description("Summary of changes made")] string summary) =>
+        {
+            var error = ToolValidation.Check(
+                (!string.IsNullOrEmpty(verdict), "verdict is required"),
+                (verdict is "PASS" or "FAIL", "verdict must be exactly 'PASS' or 'FAIL'"));
+            if (error is not null) return error;
 
-        // ---- Coder tool ----
-        tools.Add(AIFunctionFactory.Create(
-            ([Description("PASS or FAIL")] string verdict,
-             [Description("List of files modified")] string[] filesModified,
-             [Description("Summary of changes made")] string summary) =>
+            _log.Info($"Tool call: report_code_changes(verdict={verdict}, files={filesModified.Length})");
+            _lastWorkerReport = new WorkerReport
             {
-                var error = ToolValidation.Check(
-                    (!string.IsNullOrEmpty(verdict), "verdict is required"),
-                    (verdict is "PASS" or "FAIL", "verdict must be exactly 'PASS' or 'FAIL'"));
-                if (error is not null) return error;
+                Verdict = verdict,
+                FilesChanged = filesModified.ToList(),
+                Summary = summary,
+            };
+            return "Code changes recorded.";
+        },
+        "report_code_changes",
+        "Report your code changes. REQUIRED for coders after implementing and committing. " +
+        "Call this ONCE with the final verdict, list of files changed, and summary.");
 
-                _log.Info($"Tool call: report_code_changes(verdict={verdict}, files={filesModified.Length})");
-                _lastWorkerReport = new WorkerReport
-                {
-                    Verdict = verdict,
-                    FilesChanged = filesModified.ToList(),
-                    Summary = summary,
-                };
-                return "Code changes recorded.";
-            },
-            "report_code_changes",
-            "Report your code changes. REQUIRED for coders after implementing and committing. " +
-            "Call this ONCE with the final verdict, list of files changed, and summary."));
+    private AIFunction BuildDocChangesTool() => AIFunctionFactory.Create(
+        ([Description("PASS or FAIL")] string verdict,
+         [Description("List of documentation files updated")] string[] filesUpdated,
+         [Description("Summary of documentation changes")] string summary) =>
+        {
+            var error = ToolValidation.Check(
+                (!string.IsNullOrEmpty(verdict), "verdict is required"),
+                (verdict is "PASS" or "FAIL", "verdict must be exactly 'PASS' or 'FAIL'"));
+            if (error is not null) return error;
 
-        // ---- Doc-writer tool ----
-        tools.Add(AIFunctionFactory.Create(
-            ([Description("PASS or FAIL")] string verdict,
-             [Description("List of documentation files updated")] string[] filesUpdated,
-             [Description("Summary of documentation changes")] string summary) =>
+            _log.Info($"Tool call: report_doc_changes(verdict={verdict}, files={filesUpdated.Length})");
+            _lastWorkerReport = new WorkerReport
             {
-                var error = ToolValidation.Check(
-                    (!string.IsNullOrEmpty(verdict), "verdict is required"),
-                    (verdict is "PASS" or "FAIL", "verdict must be exactly 'PASS' or 'FAIL'"));
-                if (error is not null) return error;
-
-                _log.Info($"Tool call: report_doc_changes(verdict={verdict}, files={filesUpdated.Length})");
-                _lastWorkerReport = new WorkerReport
-                {
-                    Verdict = verdict,
-                    FilesChanged = filesUpdated.ToList(),
-                    Summary = summary,
-                };
-                return "Documentation changes recorded.";
-            },
-            "report_doc_changes",
-            "Report your documentation changes. REQUIRED for doc-writers after updating docs. " +
-            "Call this ONCE with the final verdict, files updated, and summary."));
+                Verdict = verdict,
+                FilesChanged = filesUpdated.ToList(),
+                Summary = summary,
+            };
+            return "Documentation changes recorded.";
+        },
+        "report_doc_changes",
+        "Report your documentation changes. REQUIRED for doc-writers after updating docs. " +
+        "Call this ONCE with the final verdict, files updated, and summary.");
 
         return tools;
     }
