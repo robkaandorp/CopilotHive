@@ -1,6 +1,6 @@
 ---
-name: install-dotnet
-description: Install the .NET SDK into the worker container
+name: install-sdk
+description: Install the .NET SDK and C# language server into the worker container
 ---
 
 # Install .NET SDK
@@ -28,12 +28,12 @@ export DOTNET_ROOT="$HOME/.dotnet"
 export PATH="$DOTNET_ROOT:$DOTNET_ROOT/tools:$PATH"
 ```
 
-## Install a Specific Version
+## Install C# Language Server
 
-To install a specific .NET SDK version instead of the latest in a channel:
+After the SDK is installed, install `csharp-ls` for code intelligence:
 
 ```bash
-curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --version 10.0.100
+dotnet tool install --global csharp-ls
 ```
 
 ## Verify
@@ -41,4 +41,5 @@ curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --version 10.0.100
 ```bash
 dotnet --version
 dotnet --list-sdks
+csharp-ls --version
 ```

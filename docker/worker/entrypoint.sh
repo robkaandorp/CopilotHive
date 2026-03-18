@@ -62,6 +62,7 @@ fi
 COPILOT_ARGS=(
     --add-dir /copilot-home
     --headless
+    --experimental
     --port "$COPILOT_PORT"
 )
 

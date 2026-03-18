@@ -21,9 +21,18 @@ export DOTNET_ROOT="$HOME/.dotnet"
 export PATH="$DOTNET_ROOT:$DOTNET_ROOT/tools:$PATH"
 ```
 
-Verify:
+## C# Language Server
+
+Install `csharp-ls` for code intelligence (go-to-definition, diagnostics):
+
+```bash
+dotnet tool install --global csharp-ls
+```
+
+## Verify
 
 ```bash
 dotnet --version
 dotnet --list-sdks
+csharp-ls --version
 ```
