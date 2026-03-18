@@ -29,6 +29,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
         // Wire tool bridge and task context into CopilotRunner
         copilotRunner.SetToolBridge(toolBridge);
         copilotRunner.SetCurrentTaskId(assignment.TaskId);
+        copilotRunner.ClearTestReport();
 
         try
         {
@@ -138,6 +139,13 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
                 }
             }
 
+            // For testers: ensure structured test metrics were reported via tool call.
+            // If the tester didn't call report_test_results, prompt it to do so.
+            if (assignment.Role == WorkerRole.Tester && copilotRunner.LastTestReport is null)
+            {
+                copilotOutput = await EnsureTestMetricsReportedAsync(copilotOutput, primaryWorkDir, ct);
+            }
+
             // Collect git status from each repo and push changes
             GitStatus? aggregatedStatus = null;
 
@@ -186,16 +194,28 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
 
             stopwatch.Stop();
 
+            // Build TaskMetrics from structured tool call data when available
+            var testReport = copilotRunner.LastTestReport;
+            var metrics = testReport is not null
+                ? new TaskMetrics
+                {
+                    Verdict = testReport.Verdict,
+                    BuildSuccess = testReport.BuildSuccess,
+                    TotalTests = testReport.TotalTests,
+                    PassedTests = testReport.PassedTests,
+                    FailedTests = testReport.FailedTests,
+                    CoveragePercent = testReport.CoveragePercent ?? 0,
+                    Issues = { testReport.Issues },
+                }
+                : new TaskMetrics { Verdict = "PASS" };
+
             return new TaskComplete
             {
                 TaskId = assignment.TaskId,
                 Status = GrpcTaskStatus.Completed,
                 Output = copilotOutput,
                 GitStatus = aggregatedStatus ?? new GitStatus(),
-                Metrics = new TaskMetrics
-                {
-                    Verdict = "PASS",
-                },
+                Metrics = metrics,
             };
         }
         catch (OperationCanceledException)
@@ -256,6 +276,43 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
 
         if (await GitOperations.HasUncommittedChangesAsync(workDir, ct))
             _log.Error("Working directory still dirty after commit retries — uncommitted changes may be lost");
+
+        return previousOutput;
+    }
+
+    /// <summary>
+    /// If the tester didn't call <c>report_test_results</c>, re-prompts Copilot in the same
+    /// session to report structured metrics via the tool call. No retry — single prompt.
+    /// </summary>
+    private async Task<string> EnsureTestMetricsReportedAsync(
+        string previousOutput, string workDir, CancellationToken ct)
+    {
+        _log.Info("Tester did not call report_test_results — prompting to report metrics");
+
+        var metricsPrompt = """
+            You have not yet reported your test results. You MUST call the `report_test_results` tool
+            now with the final aggregated test counts from your test run.
+
+            Extract the numbers from the test output you already produced and call the tool with:
+            - verdict: "PASS" if all tests passed, "FAIL" if any failed
+            - totalTests: total number of tests
+            - passedTests: number that passed
+            - failedTests: number that failed
+            - coveragePercent: coverage percentage, or -1 if not available
+            - buildSuccess: true if the build succeeded
+            - issues: array of issue strings, or empty array if none
+
+            Call the tool now. Do not explain — just call it.
+            """;
+
+        var metricsOutput = await copilotRunner.SendPromptAsync(metricsPrompt, workDir, ct);
+        previousOutput += "\n\n[Test metrics enforcement]\n" + metricsOutput;
+
+        if (copilotRunner.LastTestReport is null)
+            _log.Error("Tester still did not report test metrics after prompt — falling back to text parsing");
+        else
+            _log.Info($"Tester reported metrics: {copilotRunner.LastTestReport.Verdict}, " +
+                      $"{copilotRunner.LastTestReport.PassedTests}/{copilotRunner.LastTestReport.TotalTests} passed");
 
         return previousOutput;
     }

@@ -220,6 +220,25 @@ public sealed class GoalDispatcher : BackgroundService
             "Worker output for {GoalId} (phase={Phase}):\n{Output}",
             pipeline.GoalId, pipeline.Phase, outputPreview);
 
+        // Use structured test metrics from worker tool call when available.
+        // This eliminates the need for Brain interpretation of test counts.
+        var hasStructuredMetrics = false;
+        if (pipeline.Phase == GoalPhase.Testing && complete.Metrics is { TotalTests: > 0 })
+        {
+            var m = complete.Metrics;
+            pipeline.Metrics.TotalTests = m.TotalTests;
+            pipeline.Metrics.PassedTests = m.PassedTests;
+            pipeline.Metrics.FailedTests = m.FailedTests;
+            pipeline.Metrics.BuildSuccess = m.BuildSuccess;
+            if (m.CoveragePercent > 0)
+                pipeline.Metrics.CoveragePercent = m.CoveragePercent;
+            hasStructuredMetrics = true;
+
+            _logger.LogInformation(
+                "Structured test metrics for {GoalId}: {Passed}/{Total} passed, {Failed} failed, verdict={Verdict}",
+                pipeline.GoalId, m.PassedTests, m.TotalTests, m.FailedTests, m.Verdict);
+        }
+
         // Ask the Brain to interpret the worker output
         var interpretation = await _brain!.InterpretOutputAsync(
             pipeline,
@@ -230,6 +249,20 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogInformation("Brain interpretation for {GoalId}: Action={Action}, Verdict={Verdict}",
             pipeline.GoalId, interpretation.Action, interpretation.Verdict ?? interpretation.ReviewVerdict);
 
+        // Override Brain verdict with structured metrics when available — tool call is authoritative
+        if (hasStructuredMetrics && complete.Metrics is { } structuredMetrics
+            && !string.IsNullOrEmpty(structuredMetrics.Verdict))
+        {
+            var structuredVerdict = structuredMetrics.Verdict;
+            if (interpretation.Verdict != structuredVerdict)
+            {
+                _logger.LogInformation(
+                    "Overriding Brain verdict {BrainVerdict} with structured metrics verdict {ToolVerdict} for {GoalId}",
+                    interpretation.Verdict, structuredVerdict, pipeline.GoalId);
+                interpretation = interpretation with { Verdict = structuredVerdict };
+            }
+        }
+
         // After Improver: sync config repo to pick up the changes it pushed directly
         if (pipeline.Phase == GoalPhase.Improve)
         {
@@ -238,8 +271,8 @@ public sealed class GoalDispatcher : BackgroundService
             await SyncAgentsFromConfigRepoAsync(ct);
         }
 
-        // Update metrics if available from Brain interpretation
-        if (interpretation.TestMetrics is not null)
+        // Update metrics from Brain interpretation (skip if structured metrics already populated)
+        if (!hasStructuredMetrics && interpretation.TestMetrics is not null)
         {
             pipeline.Metrics.TotalTests = interpretation.TestMetrics.TotalTests ?? 0;
             pipeline.Metrics.PassedTests = interpretation.TestMetrics.PassedTests ?? 0;
@@ -248,7 +281,7 @@ public sealed class GoalDispatcher : BackgroundService
             pipeline.Metrics.BuildSuccess = interpretation.TestMetrics.BuildSuccess ?? false;
         }
 
-        // Fallback: if this is the Testing phase and Brain didn't extract metrics,
+        // Fallback: if this is the Testing phase and no metrics from tool call or Brain,
         // parse the raw worker output for test result patterns (e.g. "Passed: 268")
         if (pipeline.Phase == GoalPhase.Testing && pipeline.Metrics.TotalTests == 0)
         {

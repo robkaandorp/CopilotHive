@@ -73,30 +73,22 @@ Actually run the system and verify it works:
 - Check exit codes, output format, error messages.
 - For services: verify endpoints respond. For CLI tools: verify command output.
 
-### Phase 6: Test Report
+### Phase 6: Report Results
 
-After all testing, produce a structured test report. This is MANDATORY.
+After all testing, you MUST call the `report_test_results` tool with your final results.
+This is the primary way test metrics are reported to the orchestrator.
 
-```
-TEST_REPORT:
-build_success: true|false
-unit_tests_total: <number>
-unit_tests_passed: <number>
-integration_tests_total: <number>
-integration_tests_passed: <number>
-runtime_verified: true|false
-coverage_percent: <number>
-verdict: PASS|FAIL|PARTIAL
-summary: <one paragraph describing findings>
-issues:
-- <issue 1 description>
-- <issue 2 description>
-```
+Call `report_test_results` with:
+- `verdict`: "PASS" or "FAIL"
+- `totalTests`: total number of tests run
+- `passedTests`: number that passed
+- `failedTests`: number that failed
+- `coveragePercent`: coverage percentage, or -1 if not measured
+- `buildSuccess`: true if the build succeeded
+- `issues`: array of issue descriptions (empty if none)
 
-The verdict meanings:
-- **PASS** — All tests pass, build works, runtime verified, acceptance criteria met.
-- **PARTIAL** — Build works and most tests pass, but some issues remain.
-- **FAIL** — Build fails, critical tests fail, or runtime verification fails.
+After calling the tool, also produce a human-readable summary in your response text
+for logging purposes. Include specific findings, failure details, and any issues.
 
 ## Git Workflow
 
@@ -106,6 +98,6 @@ Commit your changes with `git add -A && git commit` before finishing. Do NOT run
 
 - NEVER skip the build verification step.
 - NEVER report PASS if any test is failing.
-- ALWAYS produce the TEST_REPORT block — the orchestrator parses it.
+- ALWAYS call the `report_test_results` tool — it is the primary metrics channel.
 - Be specific about failures — include error messages, stack traces, and reproduction steps.
 - If you find bugs, describe them clearly. Do NOT fix the code — that is the coder's job.

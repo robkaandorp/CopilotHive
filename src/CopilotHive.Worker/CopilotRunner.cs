@@ -22,6 +22,15 @@ public sealed class CopilotRunner : IAsyncDisposable
     private IToolCallBridge? _toolBridge;
     private string? _currentTaskId;
 
+    // Structured test metrics reported via the report_test_results tool call
+    private TestResultReport? _lastTestReport;
+
+    /// <summary>Structured test results reported by the tester via tool call, or null if not reported.</summary>
+    public TestResultReport? LastTestReport => _lastTestReport;
+
+    /// <summary>Clears any previously reported test results. Call before starting a new task.</summary>
+    public void ClearTestReport() => _lastTestReport = null;
+
     /// <summary>Maximum number of connection attempts before giving up.</summary>
     public int MaxConnectRetries { get; init; } = WorkerConstants.MaxConnectRetries;
     /// <summary>Delay between consecutive connection attempts.</summary>
@@ -138,6 +147,32 @@ public sealed class CopilotRunner : IAsyncDisposable
             "report_progress",
             "Report your current progress to the orchestrator. " +
             "Call this periodically to show what you're working on."));
+
+        tools.Add(AIFunctionFactory.Create(
+            ([Description("PASS or FAIL")] string verdict,
+             [Description("Total number of tests")] int totalTests,
+             [Description("Number of tests that passed")] int passedTests,
+             [Description("Number of tests that failed")] int failedTests,
+             [Description("Code coverage percentage (0-100), or -1 if not available")] double coveragePercent,
+             [Description("Build succeeded (true/false)")] bool buildSuccess,
+             [Description("List of issues found, empty if none")] string[] issues) =>
+            {
+                _log.Info($"Tool call: report_test_results(verdict={verdict}, total={totalTests}, passed={passedTests}, failed={failedTests})");
+                _lastTestReport = new TestResultReport
+                {
+                    Verdict = verdict,
+                    TotalTests = totalTests,
+                    PassedTests = passedTests,
+                    FailedTests = failedTests,
+                    CoveragePercent = coveragePercent >= 0 ? coveragePercent : null,
+                    BuildSuccess = buildSuccess,
+                    Issues = issues.ToList(),
+                };
+                return "Test results recorded. The infrastructure will use these structured metrics.";
+            },
+            "report_test_results",
+            "Report structured test results. REQUIRED for testers after running tests. " +
+            "Call this ONCE with the final aggregated test counts and verdict."));
 
         return tools;
     }
