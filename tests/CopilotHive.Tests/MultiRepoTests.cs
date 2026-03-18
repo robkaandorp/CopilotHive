@@ -2,6 +2,8 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
+using CopilotHive.Workers;
+using WorkerRole = CopilotHive.Workers.WorkerRole;
 
 namespace CopilotHive.Tests;
 
@@ -161,7 +163,7 @@ public class MultiRepoTests
         Assert.Equal("goal-z", assignment.GoalId);
         Assert.Equal("test it", assignment.GoalDescription);
         Assert.Equal("run tests", assignment.Prompt);
-        Assert.Equal(WorkerRole.Tester, assignment.Role);
+        Assert.Equal(CopilotHive.Shared.Grpc.WorkerRole.Tester, assignment.Role);
     }
 
     // ──────────────────────────────────────────

@@ -683,11 +683,10 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogDebug("Model for {Role}: {Model} (tier={Tier}, configLoaded={ConfigLoaded})",
             roleName, model ?? "(null)", pipeline.LatestModelTier, _config is not null);
 
-        var grpcRole = role.ToGrpcRole();
         var task = _taskBuilder.Build(
             goalId: pipeline.GoalId,
             goalDescription: pipeline.Description,
-            role: grpcRole,
+            role: role,
             iteration: pipeline.Iteration,
             repositories: repositories,
             prompt: prompt,
@@ -708,7 +707,8 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogInformation("Dispatched {Role} task {TaskId} for goal {GoalId} (branch={Branch})",
             role, task.TaskId, pipeline.GoalId, task.BranchInfo?.FeatureBranch);
 
-        // Try to push directly to an idle worker
+        // Try to push directly to an idle worker (convert to gRPC type at communication boundary)
+        var grpcRole = role.ToGrpcRole();
         var idleWorker = _workerPool.GetIdleWorker(grpcRole);
         if (idleWorker is not null)
         {

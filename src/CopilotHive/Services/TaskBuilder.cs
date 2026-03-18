@@ -2,7 +2,7 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
-using WorkerRole = CopilotHive.Shared.Grpc.WorkerRole;
+using DomainRole = CopilotHive.Workers.WorkerRole;
 
 namespace CopilotHive.Services;
 
@@ -26,7 +26,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
     public TaskAssignment Build(
         string goalId,
         string goalDescription,
-        WorkerRole role,
+        DomainRole role,
         int iteration,
         IEnumerable<TargetRepository> repositories,
         string prompt,
@@ -36,7 +36,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
         ArgumentException.ThrowIfNullOrWhiteSpace(goalId);
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
 
-        var roleName = WorkerRoleExtensions.ToRoleName(role);
+        var roleName = role.ToRoleName();
 
         var repoList = repositories.ToList();
         if (repoList.Count == 0)
@@ -52,7 +52,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
             GoalDescription = goalDescription,
             Prompt = prompt,
             BranchInfo = branchInfo,
-            Role = role,
+            Role = role.ToGrpcRole(),
             Model = model ?? "",
         };
 

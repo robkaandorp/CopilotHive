@@ -2,6 +2,8 @@ using System.Collections.Concurrent;
 using Grpc.Core;
 using Grpc.Net.Client;
 using CopilotHive.Shared.Grpc;
+using CopilotHive.Workers;
+using GrpcRole = CopilotHive.Shared.Grpc.WorkerRole;
 
 namespace CopilotHive.Worker;
 
@@ -102,7 +104,7 @@ public sealed class WorkerService(
     private async Task ProcessMessagesAsync(
         AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
         string assignedId,
-        WorkerRole workerRole,
+        GrpcRole workerRole,
         CancellationToken ct)
     {
         CancellationTokenSource? taskCts = null;
@@ -165,7 +167,9 @@ public sealed class WorkerService(
                 case OrchestratorMessage.PayloadOneofCase.UpdateAgents:
                     var update = message.UpdateAgents;
                     _log.Info($"Updating custom agent for role: {update.Role}");
-                    _copilotRunner.SetCustomAgent(update.Role, update.AgentsMdContent);
+                    var parsedRole = WorkerRoleExtensions.ParseRole(update.Role)
+                        ?? throw new InvalidOperationException($"Unknown role in UpdateAgents: '{update.Role}'");
+                    _copilotRunner.SetCustomAgent(parsedRole, update.AgentsMdContent);
                     break;
 
                 case OrchestratorMessage.PayloadOneofCase.ToolResponse:
@@ -256,7 +260,7 @@ public sealed class WorkerService(
     private static async Task RunHeartbeatAsync(
         HiveOrchestrator.HiveOrchestratorClient client,
         string assignedId,
-        WorkerRole workerRole,
+        GrpcRole workerRole,
         CancellationToken ct)
     {
         using var timer = new PeriodicTimer(HeartbeatInterval);
@@ -279,14 +283,14 @@ public sealed class WorkerService(
         }
     }
 
-    private static WorkerRole ParseRole(string role) => role.ToLowerInvariant() switch
+    private static GrpcRole ParseRole(string role) => role.ToLowerInvariant() switch
     {
-        "coder" => WorkerRole.Coder,
-        "reviewer" => WorkerRole.Reviewer,
-        "tester" => WorkerRole.Tester,
-        "improver" => WorkerRole.Improver,
-        "docwriter" or "doc_writer" => WorkerRole.DocWriter,
-        _ => WorkerRole.Unspecified,
+        "coder" => GrpcRole.Coder,
+        "reviewer" => GrpcRole.Reviewer,
+        "tester" => GrpcRole.Tester,
+        "improver" => GrpcRole.Improver,
+        "docwriter" or "doc_writer" => GrpcRole.DocWriter,
+        _ => GrpcRole.Unspecified,
     };
 
     private static async IAsyncEnumerable<T> ReadMessages<T>(

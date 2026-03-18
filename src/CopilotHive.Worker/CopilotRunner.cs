@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using CopilotHive.Shared;
 using CopilotHive.Worker.Telemetry;
+using CopilotHive.Workers;
 using GitHub.Copilot.SDK;
 using Microsoft.Extensions.AI;
 
@@ -15,7 +16,7 @@ public sealed class CopilotRunner : IAsyncDisposable
     private CopilotClient? _client;
     private CopilotSession? _session;
     private readonly int _port;
-    private string _currentRole = "worker";
+    private WorkerRole _currentRole;
     private CustomAgentConfig? _customAgent;
     private readonly WorkerLogger _log = new("Copilot");
 
@@ -69,33 +70,35 @@ public sealed class CopilotRunner : IAsyncDisposable
     /// Sets the custom agent configuration for the specified role.
     /// Updates the current role label used for telemetry and permissions.
     /// </summary>
-    public void SetCustomAgent(string role, string agentsMdContent)
+    public void SetCustomAgent(WorkerRole role, string agentsMdContent)
     {
         _currentRole = role;
+        var roleName = role.ToRoleName();
         _customAgent = new CustomAgentConfig
         {
-            Name = role,
-            DisplayName = $"CopilotHive {char.ToUpperInvariant(role[0])}{role[1..]}",
-            Description = $"CopilotHive worker agent for the {role} role",
+            Name = roleName,
+            DisplayName = $"CopilotHive {char.ToUpperInvariant(roleName[0])}{roleName[1..]}",
+            Description = $"CopilotHive worker agent for the {roleName} role",
             Prompt = agentsMdContent,
             Tools = GetToolsForRole(role),
             Infer = false,
         };
-        _log.Info($"Custom agent set for role '{role}' ({agentsMdContent.Length} chars, tools={(_customAgent.Tools is null ? "all" : $"[{string.Join(",", _customAgent.Tools)}]")})");
+        _log.Info($"Custom agent set for role '{roleName}' ({agentsMdContent.Length} chars, tools={(_customAgent.Tools is null ? "all" : $"[{string.Join(",", _customAgent.Tools)}]")})");
         _log.Debug($"Agent prompt:\n{agentsMdContent}");
     }
 
     private SessionConfig BuildSessionConfig()
     {
+        var roleName = _currentRole.ToRoleName();
         _client ??= new CopilotClient(new CopilotClientOptionsWithTelemetry
         {
             CliUrl = $"localhost:{_port}",
             AutoStart = false,
             Telemetry = new TelemetryConfig
             {
-                FilePath = $"/app/state/otel-{_currentRole}.jsonl",
+                FilePath = $"/app/state/otel-{roleName}.jsonl",
                 ExporterType = "file",
-                SourceName = $"copilothive-worker-{_currentRole}",
+                SourceName = $"copilothive-worker-{roleName}",
                 CaptureContent = true
             }
         });
@@ -160,19 +163,18 @@ public sealed class CopilotRunner : IAsyncDisposable
             "Call this periodically to show what you're working on."));
 
         // Role-specific reporting tools
-        var role = _currentRole.ToLowerInvariant();
-        switch (role)
+        switch (_currentRole)
         {
-            case "tester":
+            case WorkerRole.Tester:
                 tools.Add(BuildTestResultsTool());
                 break;
-            case "reviewer":
+            case WorkerRole.Reviewer:
                 tools.Add(BuildReviewVerdictTool());
                 break;
-            case "coder":
+            case WorkerRole.Coder:
                 tools.Add(BuildCodeChangesTool());
                 break;
-            case "docwriter":
+            case WorkerRole.DocWriter:
                 tools.Add(BuildDocChangesTool());
                 break;
             // improver has no reporting tool — it edits files directly
@@ -289,21 +291,18 @@ public sealed class CopilotRunner : IAsyncDisposable
         "Report your documentation changes. REQUIRED for doc-writers after updating docs. " +
         "Call this ONCE with the final verdict, files updated, and summary.");
 
-        return tools;
-    }
-
     /// <summary>Returns the tool whitelist for a given role. Null means all tools.</summary>
-    internal static List<string>? GetToolsForRole(string? role) => role switch
+    internal static List<string>? GetToolsForRole(WorkerRole role) => role switch
     {
         _ => null,  // all roles get full tool access (permissions control what's allowed)
     };
 
     /// <summary>Returns the permission handler appropriate for the role.</summary>
-    internal static PermissionRequestHandler GetPermissionHandlerForRole(string? role) => role switch
+    internal static PermissionRequestHandler GetPermissionHandlerForRole(WorkerRole role) => role switch
     {
-        "improver" => ImproverPermissions,
-        "reviewer" => ReviewerPermissions,
-        _ => PermissionHandler.ApproveAll,  // coder, tester
+        WorkerRole.Improver => ImproverPermissions,
+        WorkerRole.Reviewer => ReviewerPermissions,
+        _ => PermissionHandler.ApproveAll,  // coder, tester, docwriter
     };
 
     /// <summary>Improver: can read and write *.agents.md files but cannot execute shell commands.</summary>
@@ -452,7 +451,7 @@ public sealed class CopilotRunner : IAsyncDisposable
                 case AssistantUsageEvent usage:
                     Console.WriteLine($"[SDK] Usage: model={usage.Data.Model} in={usage.Data.InputTokens} out={usage.Data.OutputTokens} cost={usage.Data.Cost:F4} duration={usage.Data.Duration:F0}ms");
                     Console.Out.Flush();
-                    FileTracer.WriteUsage(usage.Data, $"/app/state/traces-{_currentRole}.jsonl", _currentRole);
+                    FileTracer.WriteUsage(usage.Data, $"/app/state/traces-{_currentRole.ToRoleName()}.jsonl", _currentRole.ToRoleName());
                     break;
                 case SessionIdleEvent:
                     Console.WriteLine("[SDK] SessionIdle");
