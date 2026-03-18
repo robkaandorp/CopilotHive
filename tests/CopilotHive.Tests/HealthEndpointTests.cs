@@ -29,22 +29,22 @@ public class HealthEndpointTests : IClassFixture<HiveTestFactory>
     /// <returns>A parsed <see cref="JsonDocument"/> of the response body.</returns>
     private async Task<JsonDocument> GetHealthJsonAsync()
     {
-        var response = await _client.GetAsync("/health");
+        var response = await _client.GetAsync("/health", TestContext.Current.CancellationToken);
         response.EnsureSuccessStatusCode();
-        return JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        return JsonDocument.Parse(await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken));
     }
 
     [Fact]
     public async Task GetHealth_Returns200()
     {
-        var response = await _client.GetAsync("/health");
+        var response = await _client.GetAsync("/health", TestContext.Current.CancellationToken);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 
     [Fact]
     public async Task GetHealth_ReturnsJsonContentType()
     {
-        var response = await _client.GetAsync("/health");
+        var response = await _client.GetAsync("/health", TestContext.Current.CancellationToken);
         Assert.Contains("application/json", response.Content.Headers.ContentType?.ToString());
     }
 

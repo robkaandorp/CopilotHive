@@ -104,7 +104,7 @@ public sealed class DistributedBrainTests
         var brain = new DistributedBrain(9999, NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-3", "Some goal");
 
-        var decision = await brain.PlanGoalAsync(pipeline);
+        var decision = await brain.PlanGoalAsync(pipeline, TestContext.Current.CancellationToken);
 
         Assert.Equal(OrchestratorActionType.SpawnCoder, decision.Action);
         Assert.Contains("Default", decision.Reason);
@@ -118,7 +118,7 @@ public sealed class DistributedBrainTests
         pipeline.SetActiveTask("task-1", "copilothive/g-4");
 
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => brain.CraftPromptAsync(pipeline, WorkerRole.Coder, null));
+            () => brain.CraftPromptAsync(pipeline, WorkerRole.Coder, null, TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -128,7 +128,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("g-5", "Some goal");
 
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => brain.InformAsync(pipeline, "status update"));
+            () => brain.InformAsync(pipeline, "status update", TestContext.Current.CancellationToken));
     }
 
     // ── FakeDistributedBrain (IDistributedBrain stub) ───────────────────
@@ -144,7 +144,7 @@ public sealed class DistributedBrainTests
         };
 
         var pipeline = CreatePipeline("g-6", "Update README");
-        var decision = await fake.PlanGoalAsync(pipeline);
+        var decision = await fake.PlanGoalAsync(pipeline, TestContext.Current.CancellationToken);
 
         Assert.Equal(OrchestratorActionType.SpawnReviewer, decision.Action);
         Assert.Equal("Skip coding — docs only", decision.Reason);
@@ -156,7 +156,7 @@ public sealed class DistributedBrainTests
         var fake = new FakeDistributedBrain();
         var pipeline = CreatePipeline("g-7", "Add tests");
 
-        var prompt = await fake.CraftPromptAsync(pipeline, WorkerRole.Tester, "extra context");
+        var prompt = await fake.CraftPromptAsync(pipeline, WorkerRole.Tester, "extra context", TestContext.Current.CancellationToken);
 
         Assert.Contains("Add tests", prompt);
         Assert.Contains("tester", prompt);
@@ -168,7 +168,7 @@ public sealed class DistributedBrainTests
         var fake = new FakeDistributedBrain();
         var pipeline = CreatePipeline("g-8", "Fix bug");
 
-        var decision = await fake.InterpretOutputAsync(pipeline, GoalPhase.Coding, "all done");
+        var decision = await fake.InterpretOutputAsync(pipeline, GoalPhase.Coding, "all done", TestContext.Current.CancellationToken);
 
         Assert.Equal(OrchestratorActionType.Done, decision.Action);
     }
@@ -179,12 +179,12 @@ public sealed class DistributedBrainTests
         var fake = new FakeDistributedBrain();
         var pipeline = CreatePipeline("g-9", "Multi-step goal");
 
-        await fake.ConnectAsync();
-        await fake.PlanGoalAsync(pipeline);
-        await fake.CraftPromptAsync(pipeline, WorkerRole.Coder);
-        await fake.InterpretOutputAsync(pipeline, GoalPhase.Coding, "output");
-        await fake.DecideNextStepAsync(pipeline, "review passed");
-        await fake.InformAsync(pipeline, "merge complete");
+        await fake.ConnectAsync(TestContext.Current.CancellationToken);
+        await fake.PlanGoalAsync(pipeline, TestContext.Current.CancellationToken);
+        await fake.CraftPromptAsync(pipeline, WorkerRole.Coder, null, TestContext.Current.CancellationToken);
+        await fake.InterpretOutputAsync(pipeline, GoalPhase.Coding, "output", TestContext.Current.CancellationToken);
+        await fake.DecideNextStepAsync(pipeline, "review passed", TestContext.Current.CancellationToken);
+        await fake.InformAsync(pipeline, "merge complete", TestContext.Current.CancellationToken);
 
         Assert.True(fake.Connected);
         Assert.Equal(1, fake.PlanCalls);

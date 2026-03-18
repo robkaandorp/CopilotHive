@@ -103,10 +103,10 @@ public sealed class ConnectedWorkerTests
             Assignment = new TaskAssignment { TaskId = "task-99" },
         };
 
-        await worker.MessageChannel.Writer.WriteAsync(message);
+        await worker.MessageChannel.Writer.WriteAsync(message, TestContext.Current.CancellationToken);
         worker.MessageChannel.Writer.Complete();
 
-        var received = await worker.MessageChannel.Reader.ReadAsync();
+        var received = await worker.MessageChannel.Reader.ReadAsync(TestContext.Current.CancellationToken);
 
         Assert.Equal(message, received);
     }

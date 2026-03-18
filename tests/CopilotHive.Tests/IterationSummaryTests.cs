@@ -145,9 +145,9 @@ public sealed class IterationSummaryTests : IDisposable
             IterationSummary = summary,
         };
 
-        await source.UpdateGoalStatusAsync("my-goal", GoalStatus.Completed, metadata);
+        await source.UpdateGoalStatusAsync("my-goal", GoalStatus.Completed, metadata, TestContext.Current.CancellationToken);
 
-        var yaml = await File.ReadAllTextAsync(path);
+        var yaml = await File.ReadAllTextAsync(path, TestContext.Current.CancellationToken);
         Assert.Contains("iteration_summaries", yaml);
         Assert.Contains("iteration: 1", yaml);
         Assert.Contains("Coding", yaml);
@@ -186,10 +186,10 @@ public sealed class IterationSummaryTests : IDisposable
                 Notes = ["improver was skipped"],
             },
         };
-        await source.UpdateGoalStatusAsync("goal-with-summaries", GoalStatus.Completed, metadata);
+        await source.UpdateGoalStatusAsync("goal-with-summaries", GoalStatus.Completed, metadata, TestContext.Current.CancellationToken);
 
         // Now read back and verify
-        var goals = await source.ReadGoalsAsync();
+        var goals = await source.ReadGoalsAsync(TestContext.Current.CancellationToken);
 
         Assert.Single(goals);
         var goal = goals[0];
@@ -238,9 +238,9 @@ public sealed class IterationSummaryTests : IDisposable
             },
         };
 
-        await source.UpdateGoalStatusAsync("multi-iter-goal", GoalStatus.Completed, metadata);
+        await source.UpdateGoalStatusAsync("multi-iter-goal", GoalStatus.Completed, metadata, TestContext.Current.CancellationToken);
 
-        var goals = await source.ReadGoalsAsync();
+        var goals = await source.ReadGoalsAsync(TestContext.Current.CancellationToken);
         Assert.Single(goals);
         Assert.Equal(2, goals[0].IterationSummaries.Count);
         Assert.Equal(1, goals[0].IterationSummaries[0].Iteration);
@@ -259,9 +259,9 @@ public sealed class IterationSummaryTests : IDisposable
         var source = new FileGoalSource(path);
         var metadata = new GoalUpdateMetadata { CompletedAt = DateTime.UtcNow };
 
-        await source.UpdateGoalStatusAsync("plain-goal", GoalStatus.Completed, metadata);
+        await source.UpdateGoalStatusAsync("plain-goal", GoalStatus.Completed, metadata, TestContext.Current.CancellationToken);
 
-        var yaml = await File.ReadAllTextAsync(path);
+        var yaml = await File.ReadAllTextAsync(path, TestContext.Current.CancellationToken);
         Assert.DoesNotContain("iteration_summaries", yaml);
     }
 
@@ -308,9 +308,9 @@ public sealed class IterationSummaryTests : IDisposable
             IterationSummary = summary,
         };
 
-        await source.UpdateGoalStatusAsync("no-tests-goal", GoalStatus.Completed, metadata);
+        await source.UpdateGoalStatusAsync("no-tests-goal", GoalStatus.Completed, metadata, TestContext.Current.CancellationToken);
 
-        var yaml = await File.ReadAllTextAsync(path);
+        var yaml = await File.ReadAllTextAsync(path, TestContext.Current.CancellationToken);
         Assert.DoesNotContain("test_counts", yaml);
     }
 
@@ -335,6 +335,6 @@ public sealed class IterationSummaryTests : IDisposable
 
         var source = new FileGoalSource(path);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => source.ReadGoalsAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => source.ReadGoalsAsync(TestContext.Current.CancellationToken));
     }
 }

@@ -155,7 +155,7 @@ public sealed class StaleWorkerCleanupServiceTests
         await svc.StartAsync(CancellationToken.None);
 
         // Wait (up to 5 s) for the error to be logged; this ensures no timing flakiness.
-        await errorLoggedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await errorLoggedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         await svc.StopAsync(CancellationToken.None);
 

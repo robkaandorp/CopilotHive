@@ -96,11 +96,11 @@ public sealed class ModelTierPropagationTests
         var brain = new ModelTierTrackingBrain(decideTier: "premium", craftTier: "standard");
         var pipeline = CreatePipeline();
 
-        await brain.DecideNextStepAsync(pipeline, "some context");
+        await brain.DecideNextStepAsync(pipeline, "some context", TestContext.Current.CancellationToken);
 
         Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
 
-        await brain.CraftPromptAsync(pipeline, WorkerRole.Coder);
+        await brain.CraftPromptAsync(pipeline, WorkerRole.Coder, ct: TestContext.Current.CancellationToken);
 
         Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
     }
@@ -115,11 +115,11 @@ public sealed class ModelTierPropagationTests
         var brain = new ModelTierTrackingBrain(decideTier: null, craftTier: "premium");
         var pipeline = CreatePipeline();
 
-        await brain.DecideNextStepAsync(pipeline, "some context");
+        await brain.DecideNextStepAsync(pipeline, "some context", TestContext.Current.CancellationToken);
 
         Assert.Equal(ModelTier.Default, pipeline.LatestModelTier);
 
-        await brain.CraftPromptAsync(pipeline, WorkerRole.Coder);
+        await brain.CraftPromptAsync(pipeline, WorkerRole.Coder, ct: TestContext.Current.CancellationToken);
 
         Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
     }
@@ -133,7 +133,7 @@ public sealed class ModelTierPropagationTests
         var brain = new ModelTierTrackingBrain(planTier: "premium");
         var pipeline = CreatePipeline();
 
-        await brain.PlanGoalAsync(pipeline);
+        await brain.PlanGoalAsync(pipeline, TestContext.Current.CancellationToken);
 
         Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
     }
@@ -147,7 +147,7 @@ public sealed class ModelTierPropagationTests
         var brain = new ModelTierTrackingBrain(interpretTier: "premium");
         var pipeline = CreatePipeline();
 
-        await brain.InterpretOutputAsync(pipeline, GoalPhase.Coding, "some output");
+        await brain.InterpretOutputAsync(pipeline, GoalPhase.Coding, "some output", TestContext.Current.CancellationToken);
 
         Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
     }
@@ -162,10 +162,10 @@ public sealed class ModelTierPropagationTests
         var brain = new ModelTierTrackingBrain(planTier: "premium", interpretTier: "standard");
         var pipeline = CreatePipeline();
 
-        await brain.PlanGoalAsync(pipeline);
+        await brain.PlanGoalAsync(pipeline, TestContext.Current.CancellationToken);
         Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
 
-        await brain.InterpretOutputAsync(pipeline, GoalPhase.Coding, "output");
+        await brain.InterpretOutputAsync(pipeline, GoalPhase.Coding, "output", TestContext.Current.CancellationToken);
 
         Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
     }

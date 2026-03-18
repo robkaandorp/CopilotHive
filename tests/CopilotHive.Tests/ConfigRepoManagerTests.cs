@@ -207,11 +207,12 @@ public class ConfigRepoManagerTests : IDisposable
         Directory.CreateDirectory(agentsDir);
         await File.WriteAllTextAsync(
             Path.Combine(agentsDir, "coder.agents.md"),
-            "# Coder\nYou write great code.");
+            "# Coder\nYou write great code.",
+            TestContext.Current.CancellationToken);
 
         var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
 
-        var content = await manager.LoadAgentsMdAsync(WorkerRole.Coder);
+        var content = await manager.LoadAgentsMdAsync(WorkerRole.Coder, TestContext.Current.CancellationToken);
 
         Assert.NotNull(content);
         Assert.Contains("You write great code.", content);
@@ -222,7 +223,7 @@ public class ConfigRepoManagerTests : IDisposable
     {
         var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
 
-        var content = await manager.LoadAgentsMdAsync(WorkerRole.MergeWorker);
+        var content = await manager.LoadAgentsMdAsync(WorkerRole.MergeWorker, TestContext.Current.CancellationToken);
 
         Assert.Null(content);
     }
@@ -234,11 +235,12 @@ public class ConfigRepoManagerTests : IDisposable
         Directory.CreateDirectory(agentsDir);
         await File.WriteAllTextAsync(
             Path.Combine(agentsDir, "tester.agents.md"),
-            "# Tester instructions");
+            "# Tester instructions",
+            TestContext.Current.CancellationToken);
 
         var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
 
-        var content = await manager.LoadAgentsMdAsync(WorkerRole.Tester);
+        var content = await manager.LoadAgentsMdAsync(WorkerRole.Tester, TestContext.Current.CancellationToken);
 
         Assert.NotNull(content);
         Assert.Contains("Tester instructions", content);
@@ -256,10 +258,11 @@ public class ConfigRepoManagerTests : IDisposable
             repositories:
               - name: test-repo
                 url: https://github.com/test/repo.git
-            """);
+            """,
+            TestContext.Current.CancellationToken);
 
         var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
-        var config = await manager.LoadConfigAsync();
+        var config = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
 
         Assert.Equal("1.0", config.Version);
         Assert.Single(config.Repositories);
@@ -271,7 +274,7 @@ public class ConfigRepoManagerTests : IDisposable
     {
         var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
 
-        await Assert.ThrowsAsync<FileNotFoundException>(() => manager.LoadConfigAsync());
+        await Assert.ThrowsAsync<FileNotFoundException>(() => manager.LoadConfigAsync(TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -284,11 +287,12 @@ public class ConfigRepoManagerTests : IDisposable
             repositories:
               - name: cached-repo
                 url: https://github.com/test/cached.git
-            """);
+            """,
+            TestContext.Current.CancellationToken);
 
         var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
-        var first = await manager.LoadConfigAsync();
-        var second = await manager.LoadConfigAsync();
+        var first = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        var second = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
 
         Assert.Same(first, second);
     }
@@ -297,9 +301,9 @@ public class ConfigRepoManagerTests : IDisposable
 
     private async Task<ConfigRepoManager> CreateManagerWithConfigAsync(string yaml)
     {
-        await File.WriteAllTextAsync(Path.Combine(_tempDir, "hive-config.yaml"), yaml);
+        await File.WriteAllTextAsync(Path.Combine(_tempDir, "hive-config.yaml"), yaml, TestContext.Current.CancellationToken);
         var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
-        await manager.LoadConfigAsync();
+        await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
         return manager;
     }
 }

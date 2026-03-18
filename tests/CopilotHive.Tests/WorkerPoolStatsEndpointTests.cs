@@ -48,7 +48,7 @@ public class WorkerPoolStatsEndpointTests : IClassFixture<HiveTestFactory>
     [Fact]
     public async Task GetHealth_Returns200_WithWorkerPool()
     {
-        var response = await _client.GetAsync("/health");
+        var response = await _client.GetAsync("/health", TestContext.Current.CancellationToken);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 

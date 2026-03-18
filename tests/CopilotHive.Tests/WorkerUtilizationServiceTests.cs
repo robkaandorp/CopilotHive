@@ -126,7 +126,7 @@ public class UtilizationEndpointTests : IClassFixture<HiveTestFactory>
     [Fact]
     public async Task UtilizationEndpoint_Returns200WithJsonContentType()
     {
-        var response = await _client.GetAsync("/health/utilization");
+        var response = await _client.GetAsync("/health/utilization", TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Contains("application/json", response.Content.Headers.ContentType?.ToString());

@@ -35,7 +35,7 @@ public sealed class GoalDispatcherReviewVerdictTests
             TaskId = taskId,
             Status = Shared.Grpc.TaskStatus.Completed,
             Output = "Several critical issues found.",
-        });
+        }, TestContext.Current.CancellationToken);
 
         Assert.Equal(ReviewVerdict.RequestChanges, pipeline.Metrics.ReviewVerdict);
     }
@@ -59,7 +59,7 @@ public sealed class GoalDispatcherReviewVerdictTests
             TaskId = taskId,
             Status = Shared.Grpc.TaskStatus.Completed,
             Output = "LGTM, no issues found.",
-        });
+        }, TestContext.Current.CancellationToken);
 
         Assert.Equal(ReviewVerdict.Approve, pipeline.Metrics.ReviewVerdict);
     }
@@ -87,7 +87,7 @@ public sealed class GoalDispatcherReviewVerdictTests
             TaskId = taskId,
             Status = Shared.Grpc.TaskStatus.Completed,
             Output = "Worker output.",
-        });
+        }, TestContext.Current.CancellationToken);
 
         Assert.True(
             pipeline.Metrics.ReviewVerdict is null,
@@ -117,7 +117,7 @@ public sealed class GoalDispatcherReviewVerdictTests
             TaskId = taskId,
             Status = Shared.Grpc.TaskStatus.Completed,
             Output = "Looks good overall.",
-        });
+        }, TestContext.Current.CancellationToken);
 
         Assert.Equal(ReviewVerdict.Approve, pipeline.Metrics.ReviewVerdict);
     }

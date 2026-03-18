@@ -43,7 +43,7 @@ public sealed class GoalTests : IDisposable
             """);
 
         var source = new FileGoalSource(path);
-        var goals = await source.GetPendingGoalsAsync();
+        var goals = await source.GetPendingGoalsAsync(TestContext.Current.CancellationToken);
 
         Assert.Equal(2, goals.Count);
         Assert.Equal("add-dark-mode", goals[0].Id);
@@ -59,7 +59,7 @@ public sealed class GoalTests : IDisposable
         var path = WriteTempYaml("");
         var source = new FileGoalSource(path);
 
-        var goals = await source.GetPendingGoalsAsync();
+        var goals = await source.GetPendingGoalsAsync(TestContext.Current.CancellationToken);
 
         Assert.Empty(goals);
     }
@@ -68,7 +68,7 @@ public sealed class GoalTests : IDisposable
     public async Task FileGoalSource_MissingFile_ReturnsEmpty()
     {
         var source = new FileGoalSource(Path.Combine(_tempDir, "nonexistent.yaml"));
-        var goals = await source.GetPendingGoalsAsync();
+        var goals = await source.GetPendingGoalsAsync(TestContext.Current.CancellationToken);
 
         Assert.Empty(goals);
     }
@@ -82,7 +82,7 @@ public sealed class GoalTests : IDisposable
             """);
 
         var source = new FileGoalSource(path);
-        var goals = await source.GetPendingGoalsAsync();
+        var goals = await source.GetPendingGoalsAsync(TestContext.Current.CancellationToken);
 
         Assert.Single(goals);
         Assert.Equal("minimal-goal", goals[0].Id);
@@ -103,11 +103,11 @@ public sealed class GoalTests : IDisposable
             """);
 
         var source = new FileGoalSource(path);
-        await source.UpdateGoalStatusAsync("task-1", GoalStatus.Completed);
+        await source.UpdateGoalStatusAsync("task-1", GoalStatus.Completed, ct: TestContext.Current.CancellationToken);
 
         // Re-read from file to confirm persistence
         var source2 = new FileGoalSource(path);
-        var all = await source2.ReadGoalsAsync();
+        var all = await source2.ReadGoalsAsync(TestContext.Current.CancellationToken);
 
         Assert.Single(all);
         Assert.Equal(GoalStatus.Completed, all[0].Status);
@@ -124,7 +124,7 @@ public sealed class GoalTests : IDisposable
 
         var source = new FileGoalSource(path);
         await Assert.ThrowsAsync<KeyNotFoundException>(
-            () => source.UpdateGoalStatusAsync("nonexistent", GoalStatus.Failed));
+            () => source.UpdateGoalStatusAsync("nonexistent", GoalStatus.Failed, ct: TestContext.Current.CancellationToken));
     }
 
     // ── ApiGoalSource ────────────────────────────────────────────────────────
@@ -136,7 +136,7 @@ public sealed class GoalTests : IDisposable
         source.AddGoal(new Goal { Id = "g1", Description = "First goal" });
         source.AddGoal(new Goal { Id = "g2", Description = "Second goal" });
 
-        var pending = await source.GetPendingGoalsAsync();
+        var pending = await source.GetPendingGoalsAsync(TestContext.Current.CancellationToken);
         Assert.Equal(2, pending.Count);
     }
 
@@ -146,9 +146,9 @@ public sealed class GoalTests : IDisposable
         var source = new ApiGoalSource();
         source.AddGoal(new Goal { Id = "g1", Description = "Goal one" });
 
-        await source.UpdateGoalStatusAsync("g1", GoalStatus.Completed);
+        await source.UpdateGoalStatusAsync("g1", GoalStatus.Completed, ct: TestContext.Current.CancellationToken);
 
-        var pending = await source.GetPendingGoalsAsync();
+        var pending = await source.GetPendingGoalsAsync(TestContext.Current.CancellationToken);
         Assert.Empty(pending);
 
         var all = source.GetAllGoals();
@@ -165,7 +165,7 @@ public sealed class GoalTests : IDisposable
         Assert.Throws<InvalidOperationException>(
             () => source.AddGoal(new Goal { Id = "dup", Description = "Second" }));
 
-        var pending = await source.GetPendingGoalsAsync();
+        var pending = await source.GetPendingGoalsAsync(TestContext.Current.CancellationToken);
         Assert.Single(pending);
     }
 
@@ -182,7 +182,7 @@ public sealed class GoalTests : IDisposable
         var manager = new GoalManager();
         manager.AddSource(source);
 
-        var next = await manager.GetNextGoalAsync();
+        var next = await manager.GetNextGoalAsync(TestContext.Current.CancellationToken);
 
         Assert.NotNull(next);
         Assert.Equal("critical", next.Id);
@@ -198,10 +198,10 @@ public sealed class GoalTests : IDisposable
         manager.AddSource(source);
 
         // GetNextGoalAsync registers the goal in the source map
-        var goal = await manager.GetNextGoalAsync();
+        var goal = await manager.GetNextGoalAsync(TestContext.Current.CancellationToken);
         Assert.NotNull(goal);
 
-        await manager.CompleteGoalAsync("task-1");
+        await manager.CompleteGoalAsync("task-1", ct: TestContext.Current.CancellationToken);
 
         Assert.Equal(GoalStatus.Completed, source.GetGoal("task-1")!.Status);
     }
@@ -215,8 +215,8 @@ public sealed class GoalTests : IDisposable
         var manager = new GoalManager();
         manager.AddSource(source);
 
-        _ = await manager.GetNextGoalAsync();
-        await manager.FailGoalAsync("task-2", "tests failed");
+        _ = await manager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+        await manager.FailGoalAsync("task-2", "tests failed", ct: TestContext.Current.CancellationToken);
 
         Assert.Equal(GoalStatus.Failed, source.GetGoal("task-2")!.Status);
     }
@@ -227,7 +227,7 @@ public sealed class GoalTests : IDisposable
         var manager = new GoalManager();
         manager.AddSource(new ApiGoalSource());
 
-        var next = await manager.GetNextGoalAsync();
+        var next = await manager.GetNextGoalAsync(TestContext.Current.CancellationToken);
         Assert.Null(next);
     }
 
@@ -244,7 +244,7 @@ public sealed class GoalTests : IDisposable
         manager.AddSource(fileSource);
         manager.AddSource(apiSource);
 
-        var next = await manager.GetNextGoalAsync();
+        var next = await manager.GetNextGoalAsync(TestContext.Current.CancellationToken);
 
         Assert.NotNull(next);
         Assert.Equal("api-critical", next.Id);
@@ -266,7 +266,7 @@ public sealed class GoalTests : IDisposable
         var manager = new GoalManager();
         manager.AddSource(source);
 
-        var next = await manager.GetNextGoalAsync();
+        var next = await manager.GetNextGoalAsync(TestContext.Current.CancellationToken);
 
         Assert.NotNull(next);
         Assert.Equal("higher", next.Id);
@@ -288,7 +288,7 @@ public sealed class GoalTests : IDisposable
             """);
 
         var source = new FileGoalSource(path);
-        var pending = await source.GetPendingGoalsAsync();
+        var pending = await source.GetPendingGoalsAsync(TestContext.Current.CancellationToken);
 
         Assert.Single(pending);
         Assert.Equal("pending-goal", pending[0].Id);
@@ -308,7 +308,7 @@ public sealed class GoalTests : IDisposable
             """);
 
         var source = new FileGoalSource(path);
-        var pending = await source.GetPendingGoalsAsync();
+        var pending = await source.GetPendingGoalsAsync(TestContext.Current.CancellationToken);
 
         Assert.Single(pending);
         Assert.Equal("new-goal", pending[0].Id);
@@ -328,7 +328,7 @@ public sealed class GoalTests : IDisposable
             """);
 
         var source = new FileGoalSource(path);
-        var pending = await source.GetPendingGoalsAsync();
+        var pending = await source.GetPendingGoalsAsync(TestContext.Current.CancellationToken);
 
         Assert.Single(pending);
         Assert.Equal("waiting-goal", pending[0].Id);
@@ -353,11 +353,11 @@ public sealed class GoalTests : IDisposable
         // Simulate goal being picked up (in_progress with started_at)
         var startedAt = new DateTime(2025, 6, 15, 10, 30, 0, DateTimeKind.Utc);
         await source.UpdateGoalStatusAsync("round-trip-goal", GoalStatus.InProgress,
-            new GoalUpdateMetadata { StartedAt = startedAt });
+            new GoalUpdateMetadata { StartedAt = startedAt }, TestContext.Current.CancellationToken);
 
         // Re-read and verify
         var source2 = new FileGoalSource(path);
-        var goals = await source2.ReadGoalsAsync();
+        var goals = await source2.ReadGoalsAsync(TestContext.Current.CancellationToken);
 
         Assert.Single(goals);
         var goal = goals[0];
@@ -386,15 +386,15 @@ public sealed class GoalTests : IDisposable
 
         // Set in-progress
         await source.UpdateGoalStatusAsync("completed-goal", GoalStatus.InProgress,
-            new GoalUpdateMetadata { StartedAt = startedAt });
+            new GoalUpdateMetadata { StartedAt = startedAt }, TestContext.Current.CancellationToken);
 
         // Set completed
         await source.UpdateGoalStatusAsync("completed-goal", GoalStatus.Completed,
-            new GoalUpdateMetadata { CompletedAt = completedAt, Iterations = 3 });
+            new GoalUpdateMetadata { CompletedAt = completedAt, Iterations = 3 }, TestContext.Current.CancellationToken);
 
         // Re-read from file
         var source2 = new FileGoalSource(path);
-        var goals = await source2.ReadGoalsAsync();
+        var goals = await source2.ReadGoalsAsync(TestContext.Current.CancellationToken);
 
         Assert.Single(goals);
         var goal = goals[0];
@@ -422,11 +422,11 @@ public sealed class GoalTests : IDisposable
                 CompletedAt = new DateTime(2025, 6, 15, 12, 0, 0, DateTimeKind.Utc),
                 Iterations = 5,
                 FailureReason = "Exceeded max test retries",
-            });
+            }, TestContext.Current.CancellationToken);
 
         // Re-read from file
         var source2 = new FileGoalSource(path);
-        var goals = await source2.ReadGoalsAsync();
+        var goals = await source2.ReadGoalsAsync(TestContext.Current.CancellationToken);
 
         Assert.Single(goals);
         var goal = goals[0];
@@ -455,22 +455,22 @@ public sealed class GoalTests : IDisposable
 
         // Complete goal-a
         await source.UpdateGoalStatusAsync("goal-a", GoalStatus.Completed,
-            new GoalUpdateMetadata { CompletedAt = DateTime.UtcNow, Iterations = 2 });
+            new GoalUpdateMetadata { CompletedAt = DateTime.UtcNow, Iterations = 2 }, TestContext.Current.CancellationToken);
 
         // Fail goal-b
         await source.UpdateGoalStatusAsync("goal-b", GoalStatus.Failed,
-            new GoalUpdateMetadata { FailureReason = "merge conflict" });
+            new GoalUpdateMetadata { FailureReason = "merge conflict" }, TestContext.Current.CancellationToken);
 
         // goal-c stays pending
 
         // Re-read — only pending goals returned by GetPendingGoalsAsync
         var source2 = new FileGoalSource(path);
-        var pending = await source2.GetPendingGoalsAsync();
+        var pending = await source2.GetPendingGoalsAsync(TestContext.Current.CancellationToken);
         Assert.Single(pending);
         Assert.Equal("goal-c", pending[0].Id);
 
         // But all goals are in the file
-        var all = await source2.ReadGoalsAsync();
+        var all = await source2.ReadGoalsAsync(TestContext.Current.CancellationToken);
         Assert.Equal(3, all.Count);
     }
 
@@ -493,7 +493,7 @@ public sealed class GoalTests : IDisposable
             """);
 
         var source = new FileGoalSource(path);
-        var goals = await source.ReadGoalsAsync();
+        var goals = await source.ReadGoalsAsync(TestContext.Current.CancellationToken);
 
         Assert.Equal(2, goals.Count);
 
@@ -520,9 +520,9 @@ public sealed class GoalTests : IDisposable
 
         var source = new FileGoalSource(path);
         // Re-write via update to force serialization
-        await source.UpdateGoalStatusAsync("clean-goal", GoalStatus.Pending);
+        await source.UpdateGoalStatusAsync("clean-goal", GoalStatus.Pending, ct: TestContext.Current.CancellationToken);
 
-        var yaml = await File.ReadAllTextAsync(path);
+        var yaml = await File.ReadAllTextAsync(path, TestContext.Current.CancellationToken);
 
         // Null fields should not appear in the output
         Assert.DoesNotContain("started_at", yaml);
@@ -585,9 +585,9 @@ public sealed class GoalTests : IDisposable
             },
         };
 
-        await source.UpdateGoalStatusAsync("tracked-goal", GoalStatus.Completed, metadata);
+        await source.UpdateGoalStatusAsync("tracked-goal", GoalStatus.Completed, metadata, TestContext.Current.CancellationToken);
 
-        var yaml = await File.ReadAllTextAsync(path);
+        var yaml = await File.ReadAllTextAsync(path, TestContext.Current.CancellationToken);
         Assert.Contains("phase_durations", yaml);
         Assert.Contains("Coding: 120.5", yaml);
         Assert.Contains("Testing: 30", yaml);
@@ -607,7 +607,7 @@ public sealed class GoalTests : IDisposable
             """);
 
         var source = new FileGoalSource(path);
-        var goals = await source.ReadGoalsAsync();
+        var goals = await source.ReadGoalsAsync(TestContext.Current.CancellationToken);
 
         Assert.Single(goals);
         var goal = goals[0];
@@ -632,9 +632,9 @@ public sealed class GoalTests : IDisposable
             PhaseDurations = null,
         };
 
-        await source.UpdateGoalStatusAsync("no-phases-goal", GoalStatus.Completed, metadata);
+        await source.UpdateGoalStatusAsync("no-phases-goal", GoalStatus.Completed, metadata, TestContext.Current.CancellationToken);
 
-        var yaml = await File.ReadAllTextAsync(path);
+        var yaml = await File.ReadAllTextAsync(path, TestContext.Current.CancellationToken);
         Assert.DoesNotContain("phase_durations", yaml);
     }
 }

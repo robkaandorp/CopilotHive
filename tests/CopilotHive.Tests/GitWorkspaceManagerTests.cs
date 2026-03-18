@@ -37,7 +37,7 @@ public class GitWorkspaceManagerTests : IDisposable
     [Fact]
     public async Task InitBareRepo_CreatesBareRepository()
     {
-        await _manager.InitBareRepoAsync();
+        await _manager.InitBareRepoAsync(ct: TestContext.Current.CancellationToken);
 
         Assert.True(Directory.Exists(_manager.BareRepoPath));
         // A bare repo has HEAD directly in the directory
@@ -47,8 +47,8 @@ public class GitWorkspaceManagerTests : IDisposable
     [Fact]
     public async Task InitBareRepo_IsIdempotent()
     {
-        await _manager.InitBareRepoAsync();
-        await _manager.InitBareRepoAsync(); // should not throw
+        await _manager.InitBareRepoAsync(ct: TestContext.Current.CancellationToken);
+        await _manager.InitBareRepoAsync(ct: TestContext.Current.CancellationToken); // should not throw
 
         Assert.True(Directory.Exists(_manager.BareRepoPath));
     }
@@ -56,9 +56,9 @@ public class GitWorkspaceManagerTests : IDisposable
     [Fact]
     public async Task CreateWorkerClone_ClonesFromBareRepo()
     {
-        await _manager.InitBareRepoAsync();
+        await _manager.InitBareRepoAsync(ct: TestContext.Current.CancellationToken);
 
-        var clonePath = await _manager.CreateWorkerCloneAsync("test-worker");
+        var clonePath = await _manager.CreateWorkerCloneAsync("test-worker", TestContext.Current.CancellationToken);
 
         Assert.True(Directory.Exists(clonePath));
         Assert.True(Directory.Exists(Path.Combine(clonePath, ".git")));
@@ -67,49 +67,49 @@ public class GitWorkspaceManagerTests : IDisposable
     [Fact]
     public async Task CreateBranch_CreatesBranchInClone()
     {
-        await _manager.InitBareRepoAsync();
-        var clonePath = await _manager.CreateWorkerCloneAsync("brancher");
+        await _manager.InitBareRepoAsync(ct: TestContext.Current.CancellationToken);
+        var clonePath = await _manager.CreateWorkerCloneAsync("brancher", TestContext.Current.CancellationToken);
 
-        await _manager.CreateBranchAsync(clonePath, "feature/test");
+        await _manager.CreateBranchAsync(clonePath, "feature/test", TestContext.Current.CancellationToken);
 
         // Verify we're on the new branch by checking HEAD
-        var headRef = await File.ReadAllTextAsync(Path.Combine(clonePath, ".git", "HEAD"));
+        var headRef = await File.ReadAllTextAsync(Path.Combine(clonePath, ".git", "HEAD"), TestContext.Current.CancellationToken);
         Assert.Contains("feature/test", headRef);
     }
 
     [Fact]
     public async Task PushBranch_PushesToBareRepo()
     {
-        await _manager.InitBareRepoAsync();
-        var clonePath = await _manager.CreateWorkerCloneAsync("pusher");
-        await _manager.CreateBranchAsync(clonePath, "coder/task-1");
+        await _manager.InitBareRepoAsync(ct: TestContext.Current.CancellationToken);
+        var clonePath = await _manager.CreateWorkerCloneAsync("pusher", TestContext.Current.CancellationToken);
+        await _manager.CreateBranchAsync(clonePath, "coder/task-1", TestContext.Current.CancellationToken);
 
         // Create a file and commit
-        await File.WriteAllTextAsync(Path.Combine(clonePath, "test.txt"), "hello");
+        await File.WriteAllTextAsync(Path.Combine(clonePath, "test.txt"), "hello", TestContext.Current.CancellationToken);
         await RunGitInClone(clonePath, "add", ".");
         await RunGitInClone(clonePath, "commit", "-m", "test commit");
 
-        await _manager.PushBranchAsync(clonePath, "coder/task-1");
+        await _manager.PushBranchAsync(clonePath, "coder/task-1", TestContext.Current.CancellationToken);
 
         // Verify branch exists in bare repo
-        var clonePath2 = await _manager.CreateWorkerCloneAsync("verifier");
-        await _manager.PullBranchAsync(clonePath2, "coder/task-1");
+        var clonePath2 = await _manager.CreateWorkerCloneAsync("verifier", TestContext.Current.CancellationToken);
+        await _manager.PullBranchAsync(clonePath2, "coder/task-1", TestContext.Current.CancellationToken);
         Assert.True(File.Exists(Path.Combine(clonePath2, "test.txt")));
     }
 
     [Fact]
     public async Task MergeBranch_SucceedsForCleanMerge()
     {
-        await _manager.InitBareRepoAsync();
-        var clonePath = await _manager.CreateWorkerCloneAsync("merger");
-        await _manager.CreateBranchAsync(clonePath, "feature/clean");
+        await _manager.InitBareRepoAsync(ct: TestContext.Current.CancellationToken);
+        var clonePath = await _manager.CreateWorkerCloneAsync("merger", TestContext.Current.CancellationToken);
+        await _manager.CreateBranchAsync(clonePath, "feature/clean", TestContext.Current.CancellationToken);
 
-        await File.WriteAllTextAsync(Path.Combine(clonePath, "feature.txt"), "feature code");
+        await File.WriteAllTextAsync(Path.Combine(clonePath, "feature.txt"), "feature code", TestContext.Current.CancellationToken);
         await RunGitInClone(clonePath, "add", ".");
         await RunGitInClone(clonePath, "commit", "-m", "add feature");
-        await _manager.PushBranchAsync(clonePath, "feature/clean");
+        await _manager.PushBranchAsync(clonePath, "feature/clean", TestContext.Current.CancellationToken);
 
-        var (success, _) = await _manager.MergeBranchAsync(clonePath, "feature/clean", "main");
+        var (success, _) = await _manager.MergeBranchAsync(clonePath, "feature/clean", "main", TestContext.Current.CancellationToken);
 
         Assert.True(success);
     }
@@ -117,15 +117,15 @@ public class GitWorkspaceManagerTests : IDisposable
     [Fact]
     public async Task GetDiff_ReturnsChanges()
     {
-        await _manager.InitBareRepoAsync();
-        var clonePath = await _manager.CreateWorkerCloneAsync("differ");
-        await _manager.CreateBranchAsync(clonePath, "feature/diff-test");
+        await _manager.InitBareRepoAsync(ct: TestContext.Current.CancellationToken);
+        var clonePath = await _manager.CreateWorkerCloneAsync("differ", TestContext.Current.CancellationToken);
+        await _manager.CreateBranchAsync(clonePath, "feature/diff-test", TestContext.Current.CancellationToken);
 
-        await File.WriteAllTextAsync(Path.Combine(clonePath, "new-file.txt"), "new content");
+        await File.WriteAllTextAsync(Path.Combine(clonePath, "new-file.txt"), "new content", TestContext.Current.CancellationToken);
         await RunGitInClone(clonePath, "add", ".");
         await RunGitInClone(clonePath, "commit", "-m", "add file");
 
-        var diff = await _manager.GetDiffAsync(clonePath);
+        var diff = await _manager.GetDiffAsync(clonePath, ct: TestContext.Current.CancellationToken);
 
         Assert.Contains("new-file.txt", diff);
     }
@@ -136,18 +136,18 @@ public class GitWorkspaceManagerTests : IDisposable
         // Arrange: create a fake source project
         var sourceDir = Path.Combine(_tempDir, "_source");
         Directory.CreateDirectory(sourceDir);
-        await File.WriteAllTextAsync(Path.Combine(sourceDir, "Program.cs"), "Console.WriteLine(\"Hello\");");
+        await File.WriteAllTextAsync(Path.Combine(sourceDir, "Program.cs"), "Console.WriteLine(\"Hello\");", TestContext.Current.CancellationToken);
         Directory.CreateDirectory(Path.Combine(sourceDir, "src"));
-        await File.WriteAllTextAsync(Path.Combine(sourceDir, "src", "Lib.cs"), "class Lib {}");
+        await File.WriteAllTextAsync(Path.Combine(sourceDir, "src", "Lib.cs"), "class Lib {}", TestContext.Current.CancellationToken);
         // Also create dirs that should be skipped
         Directory.CreateDirectory(Path.Combine(sourceDir, ".git", "objects"));
-        await File.WriteAllTextAsync(Path.Combine(sourceDir, ".git", "HEAD"), "ref: refs/heads/main");
+        await File.WriteAllTextAsync(Path.Combine(sourceDir, ".git", "HEAD"), "ref: refs/heads/main", TestContext.Current.CancellationToken);
         Directory.CreateDirectory(Path.Combine(sourceDir, "bin", "Debug"));
-        await File.WriteAllTextAsync(Path.Combine(sourceDir, "bin", "Debug", "app.dll"), "binary");
+        await File.WriteAllTextAsync(Path.Combine(sourceDir, "bin", "Debug", "app.dll"), "binary", TestContext.Current.CancellationToken);
 
         // Act
-        await _manager.InitBareRepoAsync(sourceDir);
-        var clonePath = await _manager.CreateWorkerCloneAsync("seeded-worker");
+        await _manager.InitBareRepoAsync(sourceDir, ct: TestContext.Current.CancellationToken);
+        var clonePath = await _manager.CreateWorkerCloneAsync("seeded-worker", TestContext.Current.CancellationToken);
 
         // Assert: source files are present
         Assert.True(File.Exists(Path.Combine(clonePath, "Program.cs")));
@@ -159,8 +159,8 @@ public class GitWorkspaceManagerTests : IDisposable
     [Fact]
     public async Task InitBareRepo_WithNullSourcePath_CreatesEmptyCommit()
     {
-        await _manager.InitBareRepoAsync(sourcePath: null);
-        var clonePath = await _manager.CreateWorkerCloneAsync("empty-check");
+        await _manager.InitBareRepoAsync(sourcePath: null, ct: TestContext.Current.CancellationToken);
+        var clonePath = await _manager.CreateWorkerCloneAsync("empty-check", TestContext.Current.CancellationToken);
 
         // Clone should exist but have no files (empty initial commit)
         var files = Directory.GetFiles(clonePath).Where(f => !f.Contains(".git")).ToArray();
@@ -170,28 +170,28 @@ public class GitWorkspaceManagerTests : IDisposable
     [Fact]
     public async Task RevertLastMerge_UndoesMergeCommit()
     {
-        await _manager.InitBareRepoAsync();
+        await _manager.InitBareRepoAsync(ct: TestContext.Current.CancellationToken);
 
         // Create and merge a feature branch
-        var clonePath = await _manager.CreateWorkerCloneAsync("revert-merger");
-        await _manager.CreateBranchAsync(clonePath, "feature/to-revert");
-        await File.WriteAllTextAsync(Path.Combine(clonePath, "feature.txt"), "will be reverted");
+        var clonePath = await _manager.CreateWorkerCloneAsync("revert-merger", TestContext.Current.CancellationToken);
+        await _manager.CreateBranchAsync(clonePath, "feature/to-revert", TestContext.Current.CancellationToken);
+        await File.WriteAllTextAsync(Path.Combine(clonePath, "feature.txt"), "will be reverted", TestContext.Current.CancellationToken);
         await RunGitInClone(clonePath, "add", ".");
         await RunGitInClone(clonePath, "commit", "-m", "add feature to revert");
-        await _manager.PushBranchAsync(clonePath, "feature/to-revert");
+        await _manager.PushBranchAsync(clonePath, "feature/to-revert", TestContext.Current.CancellationToken);
 
-        var (success, _) = await _manager.MergeBranchAsync(clonePath, "feature/to-revert", "main");
+        var (success, _) = await _manager.MergeBranchAsync(clonePath, "feature/to-revert", "main", TestContext.Current.CancellationToken);
         Assert.True(success);
 
         // Verify file exists on main after merge
-        var verifyClone = await _manager.CreateWorkerCloneAsync("verify-merged");
+        var verifyClone = await _manager.CreateWorkerCloneAsync("verify-merged", TestContext.Current.CancellationToken);
         Assert.True(File.Exists(Path.Combine(verifyClone, "feature.txt")));
 
         // Revert the merge
-        await _manager.RevertLastMergeAsync(clonePath, "main");
+        await _manager.RevertLastMergeAsync(clonePath, "main", TestContext.Current.CancellationToken);
 
         // Verify file is gone on main after revert
-        var postRevertClone = await _manager.CreateWorkerCloneAsync("verify-reverted");
+        var postRevertClone = await _manager.CreateWorkerCloneAsync("verify-reverted", TestContext.Current.CancellationToken);
         Assert.False(File.Exists(Path.Combine(postRevertClone, "feature.txt")));
     }
 

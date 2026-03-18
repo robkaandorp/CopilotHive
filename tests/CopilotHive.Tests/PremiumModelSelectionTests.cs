@@ -73,7 +73,7 @@ public class PremiumModelSelectionTests
         var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
 
         // Act: call PlanGoalAsync and apply the same propagation the dispatcher performs
-        var decision = await brain.PlanGoalAsync(pipeline);
+        var decision = await brain.PlanGoalAsync(pipeline, TestContext.Current.CancellationToken);
         pipeline.LatestModelTier = ModelTierExtensions.ParseModelTier(decision.ModelTier);
 
         // Assert: both the decision object and the pipeline reflect the premium tier
@@ -90,7 +90,7 @@ public class PremiumModelSelectionTests
         var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
 
         // Act
-        var decision = await brain.DecideNextStepAsync(pipeline, "What should we do next?");
+        var decision = await brain.DecideNextStepAsync(pipeline, "What should we do next?", TestContext.Current.CancellationToken);
 
         // Assert: the returned decision carries the premium tier
         Assert.Equal("premium", decision.ModelTier);
@@ -127,7 +127,7 @@ public class PremiumModelSelectionTests
             Status = Shared.Grpc.TaskStatus.Completed,
             Output = "Coding complete.",
             GitStatus = new Shared.Grpc.GitStatus { FilesChanged = 3 }, // avoid no-op detection
-        });
+        }, TestContext.Current.CancellationToken);
 
         // Assert: the premium tier set by InterpretOutputAsync must survive the CraftPrompt fallback.
         Assert.Equal("premium-coder-model", capturedModel);
@@ -161,7 +161,7 @@ public class PremiumModelSelectionTests
             TaskId = taskId,
             Status = Shared.Grpc.TaskStatus.Completed,
             Output = "Done.",
-        });
+        }, TestContext.Current.CancellationToken);
 
         Assert.Equal("premium-coder-model", capturedModel);
     }
@@ -191,7 +191,7 @@ public class PremiumModelSelectionTests
             TaskId = taskId,
             Status = Shared.Grpc.TaskStatus.Completed,
             Output = "Done.",
-        });
+        }, TestContext.Current.CancellationToken);
 
         Assert.Equal("standard-coder-model", capturedModel);
     }

@@ -10,7 +10,7 @@ public class CopilotRetryPolicyTests
     public async Task ExecuteAsync_SucceedsOnFirstAttempt_ReturnsResult()
     {
         var result = await CopilotRetryPolicy.ExecuteAsync(
-            () => Task.FromResult(42), delayFunc: NoDelay);
+            () => Task.FromResult(42), delayFunc: NoDelay, ct: TestContext.Current.CancellationToken);
         Assert.Equal(42, result);
     }
 
@@ -24,7 +24,7 @@ public class CopilotRetryPolicyTests
             if (attempts < 3)
                 throw new InvalidOperationException("Transient error");
             return Task.FromResult(99);
-        }, delayFunc: NoDelay);
+        }, delayFunc: NoDelay, ct: TestContext.Current.CancellationToken);
 
         Assert.Equal(99, result);
         Assert.Equal(3, attempts);
@@ -44,7 +44,8 @@ public class CopilotRetryPolicyTests
             return Task.FromResult(0);
         },
         onRetry: (attempt, _, _) => retryAttempts.Add(attempt),
-        delayFunc: NoDelay);
+        delayFunc: NoDelay,
+        ct: TestContext.Current.CancellationToken);
 
         Assert.Single(retryAttempts);
         Assert.Equal(1, retryAttempts[0]);
@@ -96,7 +97,7 @@ public class CopilotRetryPolicyTests
         {
             called = true;
             return Task.CompletedTask;
-        }, delayFunc: NoDelay);
+        }, delayFunc: NoDelay, ct: TestContext.Current.CancellationToken);
         Assert.True(called);
     }
 
@@ -113,7 +114,8 @@ public class CopilotRetryPolicyTests
                 throw new InvalidOperationException("fail");
             return Task.FromResult(0);
         },
-        delayFunc: (delay, _) => { recordedDelays.Add(delay); return Task.CompletedTask; });
+        delayFunc: (delay, _) => { recordedDelays.Add(delay); return Task.CompletedTask; },
+        ct: TestContext.Current.CancellationToken);
 
         Assert.Equal(3, recordedDelays.Count);
         Assert.Equal(TimeSpan.FromSeconds(5), recordedDelays[0]);
