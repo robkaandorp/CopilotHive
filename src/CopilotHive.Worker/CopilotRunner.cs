@@ -157,7 +157,7 @@ public sealed class CopilotRunner : IAsyncDisposable
              [Description("Build succeeded (true/false)")] bool buildSuccess,
              [Description("List of issues found, empty if none")] string[] issues) =>
             {
-                _log.Info($"Tool call: report_test_results(verdict={verdict}, total={totalTests}, passed={passedTests}, failed={failedTests})");
+                _log.Info($"Tool call: report_test_results(verdict={verdict}, total={totalTests}, passed={passedTests}, failed={failedTests}, coverage={coveragePercent})");
                 _lastTestReport = new TestResultReport
                 {
                     Verdict = verdict,
