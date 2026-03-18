@@ -30,6 +30,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
         copilotRunner.SetToolBridge(toolBridge);
         copilotRunner.SetCurrentTaskId(assignment.TaskId);
         copilotRunner.ClearTestReport();
+        copilotRunner.ClearWorkerReport();
 
         try
         {
@@ -196,8 +197,11 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
 
             // Build TaskMetrics from structured tool call data when available
             var testReport = copilotRunner.LastTestReport;
-            var metrics = testReport is not null
-                ? new TaskMetrics
+            var workerReport = copilotRunner.LastWorkerReport;
+            TaskMetrics metrics;
+            if (testReport is not null)
+            {
+                metrics = new TaskMetrics
                 {
                     Verdict = testReport.Verdict,
                     BuildSuccess = testReport.BuildSuccess,
@@ -206,8 +210,20 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
                     FailedTests = testReport.FailedTests,
                     CoveragePercent = testReport.CoveragePercent ?? 0,
                     Issues = { testReport.Issues },
-                }
-                : new TaskMetrics { Verdict = "PASS" };
+                };
+            }
+            else if (workerReport is not null)
+            {
+                metrics = new TaskMetrics
+                {
+                    Verdict = workerReport.Verdict,
+                    Issues = { workerReport.Issues },
+                };
+            }
+            else
+            {
+                metrics = new TaskMetrics { Verdict = "PASS" };
+            }
 
             return new TaskComplete
             {

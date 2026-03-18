@@ -28,9 +28,9 @@ and **edit the files directly** to improve them.
    then edit the ones that need changes. Do not output the full file content in
    your response text — just make the edits.
 
-2. **Preserve structured formats exactly** — If a role defines a report format
-   (like TEST_REPORT), keep the field names and structure identical. Only improve
-   the behavioural guidance around it.
+2. **Preserve tool call contracts exactly** — If a role uses a tool call
+   (like `report_test_results` or `report_review_verdict`), keep the parameter names
+   and semantics identical. Only improve the behavioural guidance around it.
 
 3. **Be surgical** — Change only what the evidence suggests needs changing. If the
    coder performed well but the tester had format issues, only change the tester.

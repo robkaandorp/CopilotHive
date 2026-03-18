@@ -239,6 +239,24 @@ public sealed class GoalDispatcher : BackgroundService
                 pipeline.GoalId, m.PassedTests, m.TotalTests, m.FailedTests, m.Verdict);
         }
 
+        // Use structured reviewer verdict from tool call when available.
+        var hasStructuredReview = false;
+        if (pipeline.Phase == GoalPhase.Review && complete.Metrics is { Verdict: "APPROVE" or "REQUEST_CHANGES" })
+        {
+            var m = complete.Metrics;
+            pipeline.Metrics.ReviewVerdict = m.Verdict;
+            if (m.Issues is { Count: > 0 })
+            {
+                pipeline.Metrics.ReviewIssuesFound += m.Issues.Count;
+                pipeline.Metrics.ReviewIssues.AddRange(m.Issues);
+            }
+            hasStructuredReview = true;
+
+            _logger.LogInformation(
+                "Structured review verdict for {GoalId}: {Verdict}, {IssueCount} issues",
+                pipeline.GoalId, m.Verdict, m.Issues.Count);
+        }
+
         // Ask the Brain to interpret the worker output
         var interpretation = await _brain!.InterpretOutputAsync(
             pipeline,
@@ -260,6 +278,20 @@ public sealed class GoalDispatcher : BackgroundService
                     "Overriding Brain verdict {BrainVerdict} with structured metrics verdict {ToolVerdict} for {GoalId}",
                     interpretation.Verdict, structuredVerdict, pipeline.GoalId);
                 interpretation = interpretation with { Verdict = structuredVerdict };
+            }
+        }
+
+        // Override Brain verdict with structured review verdict — tool call is authoritative
+        if (hasStructuredReview && complete.Metrics is { Verdict: "APPROVE" or "REQUEST_CHANGES" } reviewMetrics)
+        {
+            // Map reviewer verdict to Brain verdict format (APPROVE→PASS, REQUEST_CHANGES→FAIL)
+            var brainEquivalent = reviewMetrics.Verdict == "APPROVE" ? "PASS" : "FAIL";
+            if (interpretation.Verdict != brainEquivalent)
+            {
+                _logger.LogInformation(
+                    "Overriding Brain verdict {BrainVerdict} with structured review verdict {ReviewVerdict} for {GoalId}",
+                    interpretation.Verdict, reviewMetrics.Verdict, pipeline.GoalId);
+                interpretation = interpretation with { Verdict = brainEquivalent };
             }
         }
 
@@ -292,8 +324,8 @@ public sealed class GoalDispatcher : BackgroundService
                     pipeline.GoalId, pipeline.Metrics.PassedTests, pipeline.Metrics.TotalTests, pipeline.Metrics.FailedTests);
         }
 
-        // Populate review metrics when the reviewer phase completes
-        if (pipeline.Phase == GoalPhase.Review)
+        // Populate review metrics when the reviewer phase completes (skip if structured data already set)
+        if (pipeline.Phase == GoalPhase.Review && !hasStructuredReview)
         {
             pipeline.Metrics.ReviewVerdict = interpretation.Verdict == "FAIL"
                 ? "REQUEST_CHANGES"
@@ -1550,7 +1582,7 @@ public sealed class GoalDispatcher : BackgroundService
             1. Run `git diff origin/<base-branch>...HEAD --stat` to see ALL files changed on this branch
             2. Run `git diff origin/<base-branch>...HEAD` to review the full diff
             3. Update the CHANGELOG.md — add entries under [Unreleased] describing what was added/changed/fixed
-            4. Verify XML doc comments on new/changed public APIs are present and accurate — flag missing or incorrect ones in your DOC_REPORT but do NOT edit source code files (that is the coder's job)
+            4. Verify XML doc comments on new/changed public APIs are present and accurate — flag missing or incorrect ones in your report but do NOT edit source code files (that is the coder's job)
             5. Update README.md if the changes affect user-facing features or configuration
             6. Run `git add -A && git commit` with message "docs: update documentation for [brief description]"
 
@@ -1560,14 +1592,10 @@ public sealed class GoalDispatcher : BackgroundService
             - Do NOT run git push — the orchestrator handles that
             - Only edit documentation files: CHANGELOG.md, README.md, and other .md files
 
-            When done, produce a DOC_REPORT block:
-            ```DOC_REPORT
-            files_updated: [list of files you changed]
-            changelog_entries: [number of entries added]
-            xml_doc_issues: [list of missing or incorrect XML doc comments, or 'none']
-            verdict: PASS or FAIL
-            issues: [any issues encountered]
-            ```
+            When done, call the `report_doc_changes` tool with:
+            - verdict: "PASS" if you successfully updated documentation, "FAIL" if you could not
+            - filesUpdated: array of files you changed (e.g. ["CHANGELOG.md", "README.md"])
+            - summary: brief description of what you documented
             """;
     }
 

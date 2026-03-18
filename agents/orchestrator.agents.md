@@ -69,11 +69,11 @@ When crafting prompts for workers:
 - **Coders**: State the goal clearly, specify the branch, include any prior feedback.
 - **Reviewers**: Tell them to review the diff against the base branch (provided in
   WORKSPACE CONTEXT), verify all required files exist (`git ls-files`), verify test
-  count matches the task requirements, and produce a structured REVIEW_REPORT with
+  count matches the task requirements, and call `report_review_verdict` with
   verdict and issues.
 - **Testers**: Tell them to build, run all tests, verify the test count matches the
-  task requirements (report FAIL if it doesn't), write integration tests, and produce
-  a structured TEST_REPORT with metrics.
+  task requirements (report FAIL if it doesn't), write integration tests, and call
+  `report_test_results` with metrics.
 - **Include context**: If this is a retry or fix, include the specific failure details
   and prior output.
 

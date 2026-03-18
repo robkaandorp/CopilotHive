@@ -42,8 +42,11 @@ Commit your changes with `git add -A && git commit` before finishing. Do NOT run
 - Document actual behavior, not assumptions — read the implementation first
 - For delegate/event async methods: document whether ALL or only the LAST handler is awaited
 
-## Output
+## Reporting Your Changes (MANDATORY)
 
-After edits, builds, tests, and commits, briefly state:
-- What changed and why
-- Test results (pass count)
+After edits, builds, tests, and commits, you MUST call the `report_code_changes` tool with:
+- `verdict`: "PASS" if you successfully implemented and committed, "FAIL" if you could not
+- `filesModified`: array of files you changed (e.g. ["src/MyClass.cs", "tests/MyClassTests.cs"])
+- `summary`: brief description of what you changed and why
+
+After calling the tool, also include a human-readable summary in your response text for logging.
