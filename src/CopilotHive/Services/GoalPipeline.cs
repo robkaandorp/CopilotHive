@@ -99,6 +99,9 @@ public sealed class GoalPipeline
     /// <summary>The goal this pipeline is working toward.</summary>
     public Goal Goal { get; }
 
+    /// <summary>State machine that enforces valid phase transitions.</summary>
+    public PipelineStateMachine StateMachine { get; } = new();
+
     /// <summary>Current phase the pipeline is executing.</summary>
     public GoalPhase Phase { get; private set; } = GoalPhase.Planning;
     /// <summary>One-based iteration counter; increments each time the pipeline loops.</summary>

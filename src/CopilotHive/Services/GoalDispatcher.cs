@@ -325,220 +325,147 @@ public sealed class GoalDispatcher : BackgroundService
             interpretation = interpretation with { Action = OrchestratorActionType.RequestChanges };
         }
 
-        // Decide next step based on the action
-        switch (interpretation.Action)
+        // Map Brain action → state machine input.
+        // SpawnCoder at Coding is a "re-dispatch same worker" — no state transition needed.
+        var phaseInput = MapToPhaseInput(interpretation.Action, pipeline.Phase);
+        if (phaseInput is null)
         {
-            case OrchestratorActionType.SpawnCoder:
-                await DispatchToRole(pipeline, WorkerRole.Coder, interpretation.Prompt, ct);
+            // Re-dispatch coder without a state transition (e.g., Brain wants another attempt)
+            _logger.LogInformation("Brain requested re-dispatch of Coder for {GoalId}", pipeline.GoalId);
+            await DispatchToRole(pipeline, WorkerRole.Coder, interpretation.Prompt, ct);
+            return;
+        }
+
+        // State machine transition
+        var result = pipeline.StateMachine.Transition(phaseInput.Value);
+
+        switch (result.Effect)
+        {
+            case TransitionEffect.Continue:
+                pipeline.AdvanceTo(result.NextPhase);
+                string? instructions = null;
+                pipeline.Plan?.PhaseInstructions.TryGetValue(result.NextPhase, out instructions);
+                await DispatchPhaseAsync(pipeline, result.NextPhase, instructions, ct);
                 break;
 
-            case OrchestratorActionType.SpawnReviewer:
-                pipeline.AdvanceTo(GoalPhase.Review);
-                await DispatchToRole(pipeline, WorkerRole.Reviewer, interpretation.Prompt, ct);
+            case TransitionEffect.NewIteration:
+                await HandleNewIterationAsync(pipeline, interpretation, ct);
                 break;
 
-            case OrchestratorActionType.SpawnTester:
-                pipeline.AdvanceTo(GoalPhase.Testing);
-                await DispatchToRole(pipeline, WorkerRole.Tester, interpretation.Prompt, ct);
-                break;
-
-            case OrchestratorActionType.SpawnImprover:
-                pipeline.AdvanceTo(GoalPhase.Improve);
-                await DispatchToRole(pipeline, WorkerRole.Improver, interpretation.Prompt, ct);
-                break;
-
-            case OrchestratorActionType.SpawnDocWriter:
-                pipeline.AdvanceTo(GoalPhase.DocWriting);
-                await DispatchToRole(pipeline, WorkerRole.DocWriter, interpretation.Prompt, ct);
-                break;
-
-            case OrchestratorActionType.RequestChanges:
-                if (!pipeline.IncrementReviewRetry())
-                {
-                    await MarkGoalFailed(pipeline, "Exceeded max review retries", ct);
-                    return;
-                }
-                if (!pipeline.IncrementIteration())
-                {
-                    await MarkGoalFailed(pipeline, "Exceeded max iterations", ct);
-                    return;
-                }
-                pipeline.AdvanceTo(GoalPhase.Coding);
-
-                // Build cumulative context: include ALL review issues found so far,
-                // not just the latest round, so the coder addresses everything at once.
-                var allIssues = BuildAccumulatedReviewIssues(pipeline);
-                var fixContext = $"Latest reviewer feedback:\n{interpretation.Reason}"
-                    + (allIssues.Length > 0
-                        ? $"\n\nAccumulated issues from all review rounds (fix ALL of these):\n{allIssues}"
-                        : "");
-
-                var fixPrompt = await _brain.CraftPromptAsync(pipeline, WorkerRole.Coder, fixContext, ct);
-                await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
-                break;
-
-            case OrchestratorActionType.Retry:
-                if (!pipeline.IncrementTestRetry())
-                {
-                    await MarkGoalFailed(pipeline, "Exceeded max test retries", ct);
-                    return;
-                }
-                if (!pipeline.IncrementIteration())
-                {
-                    await MarkGoalFailed(pipeline, "Exceeded max iterations", ct);
-                    return;
-                }
-                pipeline.AdvanceTo(GoalPhase.Coding);
-                var retryPrompt = await _brain.CraftPromptAsync(pipeline, WorkerRole.Coder,
-                    $"Test failures:\n{interpretation.Reason}", ct);
-                await DispatchToRole(pipeline, WorkerRole.Coder, retryPrompt, ct);
-                break;
-
-            case OrchestratorActionType.Merge:
-                // Enforce remaining phases before merge
-                var mergeEnforced = await EnforceRemainingPhasesAsync(pipeline, ct,
-                    interpretation.Verdict ?? interpretation.ReviewVerdict, interpretation.Reason);
-                if (!mergeEnforced)
-                {
-                    pipeline.AdvanceTo(GoalPhase.Merging);
-                    await PerformMergeAsync(pipeline, ct);
-                }
-                break;
-
-            case OrchestratorActionType.Done:
-            case OrchestratorActionType.Skip:
-                // Enforce minimum pipeline phases before allowing completion
-                var enforced = await EnforceRemainingPhasesAsync(pipeline, ct,
-                    interpretation.Verdict ?? interpretation.ReviewVerdict, interpretation.Reason);
-                if (!enforced)
-                    await MarkGoalCompleted(pipeline, ct);
-                break;
-
-            default:
-                _logger.LogWarning(
-                    "Unrecognized Brain action '{Action}' for {GoalId} (phase={Phase}) — enforcing remaining phases",
-                    interpretation.Action, pipeline.GoalId, pipeline.Phase);
-
-                // Instead of recursing, enforce remaining pipeline phases or complete
-                var defaultEnforced = await EnforceRemainingPhasesAsync(pipeline, ct,
-                    interpretation.Verdict ?? interpretation.ReviewVerdict ?? "UNKNOWN",
-                    interpretation.Reason ?? $"Unrecognized action: {interpretation.Action}");
-                if (!defaultEnforced)
-                    await MarkGoalCompleted(pipeline, ct);
+            case TransitionEffect.Completed:
+                pipeline.AdvanceTo(GoalPhase.Done);
+                await MarkGoalCompleted(pipeline, ct);
                 break;
         }
     }
 
     /// <summary>
-    /// When the Brain says "Done" too early, enforce any remaining mandatory pipeline phases.
-    /// Returns true if a phase was dispatched (i.e., don't mark complete yet).
-    /// Phase order is determined by the pipeline's IterationPlan (from Brain or default fallback).
-    /// If Review, DocWriting, or Testing had a FAIL verdict, loop back to Coding instead of advancing.
+    /// Maps a Brain action to a state machine <see cref="PhaseInput"/>.
+    /// Returns null for "re-dispatch same worker" (no state transition needed).
     /// </summary>
-    private async Task<bool> EnforceRemainingPhasesAsync(
-        GoalPipeline pipeline, CancellationToken ct, string? verdict = null, string? reason = null)
+    internal static PhaseInput? MapToPhaseInput(OrchestratorActionType action, GoalPhase currentPhase)
     {
-        // If Review, DocWriting, or Testing failed, loop back to Coding for another attempt
-        if (verdict is "FAIL"
-            && pipeline.Phase is GoalPhase.Review or GoalPhase.Testing or GoalPhase.DocWriting
-            || verdict is "REQUEST_CHANGES" && pipeline.Phase == GoalPhase.Review)
+        return action switch
         {
-            var isReview = pipeline.Phase is GoalPhase.Review or GoalPhase.DocWriting;
-            var canRetry = isReview ? pipeline.IncrementReviewRetry() : pipeline.IncrementTestRetry();
-            if (!canRetry)
-            {
-                await MarkGoalFailed(pipeline,
-                    $"Exceeded max {(isReview ? "review" : "test")} retries", ct);
-                return true;
-            }
+            OrchestratorActionType.RequestChanges => PhaseInput.RequestChanges,
+            OrchestratorActionType.Retry => PhaseInput.Failed,
 
-            _logger.LogInformation(
-                "{Phase} failed for goal {GoalId} — sending back to Coder (reason: {Reason})",
-                pipeline.Phase, pipeline.GoalId, reason ?? "unspecified");
+            OrchestratorActionType.Done
+                or OrchestratorActionType.Skip
+                or OrchestratorActionType.Merge => PhaseInput.Succeeded,
 
-            if (!pipeline.IncrementIteration())
-            {
-                await MarkGoalFailed(pipeline, "Exceeded max iterations", ct);
-                return true;
-            }
-            pipeline.AdvanceTo(GoalPhase.Coding);
-            pipeline.ClearPlan();
+            // SpawnCoder at Coding = "try coder again" (no state transition)
+            OrchestratorActionType.SpawnCoder when currentPhase == GoalPhase.Coding => null,
+            // SpawnCoder from any other phase = something failed → back to coding
+            OrchestratorActionType.SpawnCoder => PhaseInput.Failed,
 
-            // Re-plan iteration with failure context so the Brain can adjust strategy
-            if (_brain is not null)
-            {
-                try
-                {
-                    var newPlan = await _brain.PlanIterationAsync(pipeline, ct);
-                    ValidatePlan(newPlan);
-                    pipeline.SetPlan(newPlan);
-                    _logger.LogInformation(
-                        "Re-planned iteration {Iteration} for goal {GoalId} after {Phase} failure: {Reason}",
-                        pipeline.Iteration, pipeline.GoalId, pipeline.Phase, newPlan.Reason);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to re-plan iteration for goal {GoalId}, using default plan",
-                        pipeline.GoalId);
-                    pipeline.SetPlan(IterationPlan.Default());
-                }
-            }
-            else
-            {
-                pipeline.SetPlan(IterationPlan.Default());
-            }
+            // SpawnXxx for a different worker = current phase succeeded, advance
+            OrchestratorActionType.SpawnTester
+                or OrchestratorActionType.SpawnReviewer
+                or OrchestratorActionType.SpawnDocWriter
+                or OrchestratorActionType.SpawnImprover => PhaseInput.Succeeded,
 
-            var feedbackKind = isReview ? "Reviewer feedback" : "Test failures";
-            var fixPrompt = _brain is not null
-                ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Coder,
-                    $"{feedbackKind}:\n{reason ?? "See previous output."}", ct)
-                : $"Fix issues for: {pipeline.Description}. {feedbackKind}:\n{reason}";
-            await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
-            return true;
+            _ => throw new InvalidOperationException($"Unknown Brain action: {action}"),
+        };
+    }
+
+    /// <summary>
+    /// Handles a <see cref="TransitionEffect.NewIteration"/> result from the state machine.
+    /// Checks retry/iteration limits, re-plans, and dispatches the coder.
+    /// </summary>
+    private async Task HandleNewIterationAsync(
+        GoalPipeline pipeline, OrchestratorDecision interpretation, CancellationToken ct)
+    {
+        // Determine which retry counter to increment based on the phase we came from
+        var previousPhase = interpretation.Action switch
+        {
+            OrchestratorActionType.RequestChanges => pipeline.Phase, // already set to Coding by state machine
+            _ => pipeline.Phase,
+        };
+        // Use the context: review/docwriting failures use review retry, others use test retry
+        var isReviewRelated = pipeline.Metrics.ReviewVerdict is "REQUEST_CHANGES"
+            || interpretation.Action == OrchestratorActionType.RequestChanges;
+        var canRetry = isReviewRelated
+            ? pipeline.IncrementReviewRetry()
+            : pipeline.IncrementTestRetry();
+
+        if (!canRetry)
+        {
+            pipeline.StateMachine.Fail();
+            pipeline.AdvanceTo(GoalPhase.Failed);
+            await MarkGoalFailed(pipeline,
+                $"Exceeded max {(isReviewRelated ? "review" : "test")} retries", ct);
+            return;
         }
 
-        // Ensure we have an iteration plan — create default fallback if missing
-        if (pipeline.Plan is null)
+        if (!pipeline.IncrementIteration())
         {
-            var alwaysImprove = _config?.Orchestrator?.AlwaysImprove ?? false;
-            var shouldImprove = alwaysImprove || (_improvementAnalyzer?.ShouldImprove(pipeline.Metrics) ?? false);
-            pipeline.SetPlan(IterationPlan.Default(shouldImprove));
+            pipeline.StateMachine.Fail();
+            pipeline.AdvanceTo(GoalPhase.Failed);
+            await MarkGoalFailed(pipeline, "Exceeded max iterations", ct);
+            return;
         }
 
-        // Enforce always_improve: inject Improve phase before Merging if Brain omitted it
-        var alwaysImproveConfig = _config?.Orchestrator?.AlwaysImprove ?? false;
-        if (alwaysImproveConfig && !pipeline.Plan!.Phases.Contains(GoalPhase.Improve))
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        // Re-plan the iteration with failure context
+        IterationPlan newPlan;
+        try
         {
-            var mergingIndex = pipeline.Plan.Phases.IndexOf(GoalPhase.Merging);
-            if (mergingIndex >= 0)
-                pipeline.Plan.Phases.Insert(mergingIndex, GoalPhase.Improve);
-            else
-                pipeline.Plan.Phases.Add(GoalPhase.Improve);
+            newPlan = _brain is not null
+                ? ValidatePlan(await _brain.PlanIterationAsync(pipeline, ct))
+                : IterationPlan.Default();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to re-plan iteration for {GoalId}, using default plan",
+                pipeline.GoalId);
+            newPlan = IterationPlan.Default();
         }
 
-        var plan = pipeline.Plan!;
-
-        // Sync plan position to the current pipeline phase
-        while (plan.CurrentPhase is not null && plan.CurrentPhase != pipeline.Phase)
-        {
-            plan.Advance();
-        }
-
-        // Advance past the current phase to get the next one
-        var nextPhase = plan.Advance();
-
-        if (nextPhase is null)
-            return false;
+        pipeline.SetPlan(newPlan);
+        pipeline.StateMachine.StartIteration(newPlan.Phases);
 
         _logger.LogInformation(
-            "Enforcing pipeline phase {Phase} for goal {GoalId} (Brain wanted Done at {CurrentPhase})",
-            nextPhase, pipeline.GoalId, pipeline.Phase);
+            "New iteration {Iteration} for goal {GoalId}: {Phases}",
+            pipeline.Iteration, pipeline.GoalId, string.Join(" → ", newPlan.Phases));
 
-        // Get phase-specific instructions from the plan (if any)
-        plan.PhaseInstructions.TryGetValue(nextPhase.Value, out var phaseInstructions);
+        // Build context for the coder
+        var feedbackKind = isReviewRelated ? "Reviewer feedback" : "Test failures";
+        var context = $"{feedbackKind}:\n{interpretation.Reason ?? "See previous output."}";
 
-        await DispatchPhaseAsync(pipeline, nextPhase.Value, phaseInstructions, ct);
-        return true;
+        if (isReviewRelated)
+        {
+            var allIssues = BuildAccumulatedReviewIssues(pipeline);
+            if (allIssues.Length > 0)
+                context += $"\n\nAccumulated issues from all review rounds (fix ALL of these):\n{allIssues}";
+        }
+
+        var fixPrompt = _brain is not null
+            ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Coder, context, ct)
+            : $"Fix issues for: {pipeline.Description}. {context}";
+
+        await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
     }
 
     /// <summary>Dispatch a specific pipeline phase to the appropriate worker.</summary>
@@ -548,7 +475,6 @@ public sealed class GoalDispatcher : BackgroundService
         switch (phase)
         {
             case GoalPhase.Review:
-                pipeline.AdvanceTo(GoalPhase.Review);
                 var reviewPrompt = _brain is not null
                     ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Reviewer, phaseInstructions, ct)
                     : $"Review the code changes for: {pipeline.Description}";
@@ -556,7 +482,6 @@ public sealed class GoalDispatcher : BackgroundService
                 break;
 
             case GoalPhase.Testing:
-                pipeline.AdvanceTo(GoalPhase.Testing);
                 var testPrompt = _brain is not null
                     ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Tester, phaseInstructions, ct)
                     : $"Run the existing tests and verify the changes for: {pipeline.Description}";
@@ -564,13 +489,11 @@ public sealed class GoalDispatcher : BackgroundService
                 break;
 
             case GoalPhase.DocWriting:
-                pipeline.AdvanceTo(GoalPhase.DocWriting);
                 var docPrompt = BuildDocWriterPrompt(pipeline, phaseInstructions);
                 await DispatchToRole(pipeline, WorkerRole.DocWriter, docPrompt, ct);
                 break;
 
             case GoalPhase.Improve:
-                pipeline.AdvanceTo(GoalPhase.Improve);
                 _logger.LogInformation("Dispatching Improver for goal {GoalId}", pipeline.GoalId);
 
                 try
@@ -579,10 +502,9 @@ public sealed class GoalDispatcher : BackgroundService
                 }
                 catch (Exception ex)
                 {
-                    // Improve is non-blocking: if it fails, log a warning and continue to Merging.
-                    // The goal already passed review and is ready to merge.
+                    // Improve is non-blocking: if it fails, log and advance via state machine.
                     var skipReason = $"Improver failed: {ex.Message}";
-                    _logger.LogWarning(ex, "Improver failed for goal {GoalId} — skipping to merge. Reason: {Reason}",
+                    _logger.LogWarning(ex, "Improver failed for goal {GoalId} — skipping to next phase. Reason: {Reason}",
                         pipeline.GoalId, skipReason);
 
                     pipeline.Metrics.ImproverSkipped = true;
@@ -596,15 +518,17 @@ public sealed class GoalDispatcher : BackgroundService
                     await CommitGoalsToConfigRepoAsync(
                         $"Goal '{pipeline.GoalId}': improver skipped ({ex.GetType().Name})", ct);
 
-                    // Fall through to the next phase (Merging) by letting EnforceRemainingPhasesAsync pick it up
-                    var nextPhase = pipeline.Plan?.NextPhaseAfter(GoalPhase.Improve);
-                    if (nextPhase.HasValue)
-                        await DispatchPhaseAsync(pipeline, nextPhase.Value, null, ct);
+                    // Advance past the failed Improve phase (non-blocking in state machine)
+                    var skipResult = pipeline.StateMachine.Transition(PhaseInput.Failed);
+                    pipeline.AdvanceTo(skipResult.NextPhase);
+                    if (skipResult.Effect == TransitionEffect.Continue)
+                        await DispatchPhaseAsync(pipeline, skipResult.NextPhase, null, ct);
+                    else if (skipResult.Effect == TransitionEffect.Completed)
+                        await MarkGoalCompleted(pipeline, ct);
                 }
                 break;
 
             case GoalPhase.Merging:
-                pipeline.AdvanceTo(GoalPhase.Merging);
                 await PerformMergeAsync(pipeline, ct);
                 break;
 
@@ -900,20 +824,29 @@ public sealed class GoalDispatcher : BackgroundService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Merge failed for goal {GoalId} — checking if retryable", pipeline.GoalId);
-            await HandleMergeFailureAsync(pipeline, ex.Message, ct);
+
+            // State machine: merge failed → NewIteration (back to Coding)
+            var mergeResult = pipeline.StateMachine.Transition(PhaseInput.Failed);
+            if (mergeResult.Effect == TransitionEffect.NewIteration)
+                await HandleMergeFailureAsync(pipeline, ex.Message, ct);
+            else
+                await MarkGoalFailed(pipeline, $"Unexpected merge failure effect: {mergeResult.Effect}", ct);
         }
     }
 
     /// <summary>
     /// When a merge fails (typically due to conflicts), send the goal back to the coder
     /// to rebase the feature branch onto the latest base branch. The full pipeline
-    /// (Coding → Testing → Review → Merging) then runs again.
+    /// (Coding → Testing → Review → Merging) then runs again via the state machine.
     /// </summary>
     private async Task HandleMergeFailureAsync(GoalPipeline pipeline, string errorMessage, CancellationToken ct)
     {
-        // Use the review retry counter to limit total merge-conflict retries
+        // State machine already transitioned to Coding (NewIteration) before this is called.
+        // Check retry/iteration limits.
         if (!pipeline.IncrementReviewRetry())
         {
+            pipeline.StateMachine.Fail();
+            pipeline.AdvanceTo(GoalPhase.Failed);
             await MarkGoalFailed(pipeline, $"Merge failed after max retries: {errorMessage}", ct);
             return;
         }
@@ -924,11 +857,12 @@ public sealed class GoalDispatcher : BackgroundService
 
         if (!pipeline.IncrementIteration())
         {
+            pipeline.StateMachine.Fail();
+            pipeline.AdvanceTo(GoalPhase.Failed);
             await MarkGoalFailed(pipeline, "Exceeded max iterations during merge conflict resolution", ct);
             return;
         }
         pipeline.AdvanceTo(GoalPhase.Coding);
-        pipeline.ClearPlan();
 
         var repos = ResolveRepositories(pipeline.Goal);
         var defaultBranch = repos.FirstOrDefault()?.DefaultBranch ?? "main";
@@ -949,23 +883,20 @@ public sealed class GoalDispatcher : BackgroundService
             """;
 
         // Re-plan with full pipeline so the rebase goes through review and testing
-        if (_brain is not null)
+        IterationPlan newPlan;
+        try
         {
-            try
-            {
-                var newPlan = await _brain.PlanIterationAsync(pipeline, ct);
-                ValidatePlan(newPlan);
-                pipeline.SetPlan(newPlan);
-            }
-            catch
-            {
-                pipeline.SetPlan(IterationPlan.Default());
-            }
+            newPlan = _brain is not null
+                ? ValidatePlan(await _brain.PlanIterationAsync(pipeline, ct))
+                : IterationPlan.Default();
         }
-        else
+        catch
         {
-            pipeline.SetPlan(IterationPlan.Default());
+            newPlan = IterationPlan.Default();
         }
+
+        pipeline.SetPlan(newPlan);
+        pipeline.StateMachine.StartIteration(newPlan.Phases);
 
         var fixPrompt = _brain is not null
             ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Coder, rebaseContext, ct)
@@ -1502,6 +1433,7 @@ public sealed class GoalDispatcher : BackgroundService
                 iterationPlan = IterationPlan.Default();
             }
             pipeline.SetPlan(iterationPlan);
+            pipeline.StateMachine.StartIteration(iterationPlan.Phases);
 
             var goalAction = goalPlan.Action;
             switch (goalAction)
@@ -1518,19 +1450,11 @@ public sealed class GoalDispatcher : BackgroundService
                 case OrchestratorActionType.SpawnTester:
                 case OrchestratorActionType.SpawnImprover:
                 case OrchestratorActionType.SpawnDocWriter:
-                    var (firstRole, firstPhase) = goalAction switch
-                    {
-                        OrchestratorActionType.SpawnCoder => (WorkerRole.Coder, GoalPhase.Coding),
-                        OrchestratorActionType.SpawnReviewer => (WorkerRole.Reviewer, GoalPhase.Review),
-                        OrchestratorActionType.SpawnTester => (WorkerRole.Tester, GoalPhase.Testing),
-                        OrchestratorActionType.SpawnImprover => (WorkerRole.Improver, GoalPhase.Improve),
-                        OrchestratorActionType.SpawnDocWriter => (WorkerRole.DocWriter, GoalPhase.DocWriting),
-                        _ => throw new InvalidOperationException($"Unhandled spawn action: {goalAction}"),
-                    };
-
-                    pipeline.AdvanceTo(firstPhase);
+                    // State machine starts at Coding (from StartIteration).
+                    // Brain always starts with SpawnCoder in practice.
+                    pipeline.AdvanceTo(GoalPhase.Coding);
                     DistributedBrain.ApplyModelTierIfNotSet(pipeline, goalPlan.ModelTier);
-                    await DispatchToRole(pipeline, firstRole, goalPlan.Prompt, ct);
+                    await DispatchToRole(pipeline, WorkerRole.Coder, goalPlan.Prompt, ct);
                     break;
 
                 default:
@@ -1541,7 +1465,9 @@ public sealed class GoalDispatcher : BackgroundService
         else
         {
             // Mechanical fallback: just dispatch to coder with default plan
-            pipeline.SetPlan(IterationPlan.Default());
+            var defaultPlan = IterationPlan.Default();
+            pipeline.SetPlan(defaultPlan);
+            pipeline.StateMachine.StartIteration(defaultPlan.Phases);
             pipeline.AdvanceTo(GoalPhase.Coding);
             await DispatchToRole(pipeline, WorkerRole.Coder, BuildCoderPrompt(goal), ct);
         }
