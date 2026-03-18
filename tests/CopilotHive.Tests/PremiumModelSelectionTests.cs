@@ -12,11 +12,11 @@ public class PremiumModelSelectionTests
     // ── HiveConfiguration.GetPremiumModelForRole ─────────────────────────
 
     [Theory]
-    [InlineData("coder", "gpt-5.4-premium")]
-    [InlineData("reviewer", "claude-opus-4.6-premium")]
-    [InlineData("tester", "gpt-5-premium")]
-    [InlineData("improver", "claude-opus-premium")]
-    public void GetPremiumModelForRole_WhenConfigured_ReturnsConfiguredModel(string role, string expectedModel)
+    [InlineData(WorkerRole.Coder, "gpt-5.4-premium")]
+    [InlineData(WorkerRole.Reviewer, "claude-opus-4.6-premium")]
+    [InlineData(WorkerRole.Tester, "gpt-5-premium")]
+    [InlineData(WorkerRole.Improver, "claude-opus-premium")]
+    public void GetPremiumModelForRole_WhenConfigured_ReturnsConfiguredModel(WorkerRole role, string expectedModel)
     {
         var config = new HiveConfiguration
         {
@@ -32,13 +32,13 @@ public class PremiumModelSelectionTests
     }
 
     [Theory]
-    [InlineData("coder")]
-    [InlineData("reviewer")]
-    [InlineData("tester")]
-    [InlineData("improver")]
-    [InlineData("orchestrator")]
-    [InlineData("unknown")]
-    public void GetPremiumModelForRole_WhenNotConfigured_ReturnsNull(string role)
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Reviewer)]
+    [InlineData(WorkerRole.Tester)]
+    [InlineData(WorkerRole.Improver)]
+    [InlineData(WorkerRole.Orchestrator)]
+    [InlineData(WorkerRole.DocWriter)]
+    public void GetPremiumModelForRole_WhenNotConfigured_ReturnsNull(WorkerRole role)
     {
         var config = new HiveConfiguration
         {
@@ -50,7 +50,7 @@ public class PremiumModelSelectionTests
     }
 
     [Fact]
-    public void GetPremiumModelForRole_CaseInsensitive()
+    public void GetPremiumModelForRole_EnumValues_ReturnsCorrectModel()
     {
         var config = new HiveConfiguration
         {
@@ -59,8 +59,7 @@ public class PremiumModelSelectionTests
             PremiumCoderModel = "premium-coder",
         };
 
-        Assert.Equal("premium-coder", config.GetPremiumModelForRole("CODER"));
-        Assert.Equal("premium-coder", config.GetPremiumModelForRole("Coder"));
+        Assert.Equal("premium-coder", config.GetPremiumModelForRole(WorkerRole.Coder));
     }
 
     // ── Brain model_tier propagation ─────────────────────────────────────
@@ -75,11 +74,11 @@ public class PremiumModelSelectionTests
 
         // Act: call PlanGoalAsync and apply the same propagation the dispatcher performs
         var decision = await brain.PlanGoalAsync(pipeline);
-        pipeline.LatestModelTier = decision.ModelTier == "premium" ? "premium" : "standard";
+        pipeline.LatestModelTier = ModelTierExtensions.ParseModelTier(decision.ModelTier);
 
         // Assert: both the decision object and the pipeline reflect the premium tier
         Assert.Equal("premium", decision.ModelTier);
-        Assert.Equal("premium", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
     }
 
     [Fact]
@@ -254,11 +253,11 @@ public class PremiumModelSelectionTests
 /// </summary>
 file sealed class CapturingBrain : IDistributedBrain
 {
-    private readonly string _modelTierToReturn;
+    private readonly ModelTier _modelTierToReturn;
 
     public CapturingBrain(string modelTierToReturn)
     {
-        _modelTierToReturn = modelTierToReturn;
+        _modelTierToReturn = ModelTierExtensions.ParseModelTier(modelTierToReturn);
     }
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
@@ -328,7 +327,7 @@ file sealed class PlanGoalPremiumBrain : IDistributedBrain
     public Task<string> CraftPromptAsync(
         GoalPipeline pipeline, WorkerRole role, string? additionalContext = null, CancellationToken ct = default)
     {
-        pipeline.LatestModelTier = "standard";
+        pipeline.LatestModelTier = ModelTier.Standard;
         return Task.FromResult($"Work on {pipeline.Description} as {role.ToRoleName()}");
     }
 
@@ -346,7 +345,7 @@ file sealed class PlanGoalPremiumBrain : IDistributedBrain
 /// <summary>
 /// Brain stub whose <see cref="DecideNextStepAsync"/> returns <c>model_tier = "premium"</c>.
 /// </summary>
-file sealed class DecideNextStepPremiumBrain: IDistributedBrain
+file sealed class DecideNextStepPremiumBrain : IDistributedBrain
 {
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
@@ -359,7 +358,7 @@ file sealed class DecideNextStepPremiumBrain: IDistributedBrain
     public Task<string> CraftPromptAsync(
         GoalPipeline pipeline, WorkerRole role, string? additionalContext = null, CancellationToken ct = default)
     {
-        pipeline.LatestModelTier = "standard";
+        pipeline.LatestModelTier = ModelTier.Standard;
         return Task.FromResult($"Work on {pipeline.Description} as {role.ToRoleName()}");
     }
 
@@ -415,7 +414,7 @@ file sealed class NullPromptPremiumInterpretBrain : IDistributedBrain
     public Task<string> CraftPromptAsync(
         GoalPipeline pipeline, WorkerRole role, string? additionalContext = null, CancellationToken ct = default)
     {
-        pipeline.LatestModelTier = "standard";
+        pipeline.LatestModelTier = ModelTier.Standard;
         return Task.FromResult($"Retry: work on {pipeline.Description} as {role.ToRoleName()}");
     }
 

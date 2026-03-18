@@ -20,7 +20,7 @@ public sealed class ModelTierPropagationTests
 
         DistributedBrain.ApplyModelTierIfNotSet(pipeline, "standard");
 
-        Assert.Equal("standard", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Standard, pipeline.LatestModelTier);
     }
 
     [Fact]
@@ -30,7 +30,7 @@ public sealed class ModelTierPropagationTests
 
         DistributedBrain.ApplyModelTierIfNotSet(pipeline, "premium");
 
-        Assert.Equal("premium", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
     }
 
     [Fact]
@@ -40,7 +40,7 @@ public sealed class ModelTierPropagationTests
 
         DistributedBrain.ApplyModelTierIfNotSet(pipeline, null);
 
-        Assert.Equal("", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Default, pipeline.LatestModelTier);
     }
 
     [Fact]
@@ -50,11 +50,11 @@ public sealed class ModelTierPropagationTests
         // DecideNextStepAsync returns "premium" first; CraftPromptAsync returns "standard" — premium must survive.
         var pipeline = CreatePipeline();
         DistributedBrain.ApplyModelTierIfNotSet(pipeline, "premium");
-        Assert.Equal("premium", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
 
         DistributedBrain.ApplyModelTierIfNotSet(pipeline, "standard");
 
-        Assert.Equal("premium", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
     }
 
     [Fact]
@@ -62,20 +62,20 @@ public sealed class ModelTierPropagationTests
     {
         var pipeline = CreatePipeline();
         DistributedBrain.ApplyModelTierIfNotSet(pipeline, "standard");
-        Assert.Equal("standard", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Standard, pipeline.LatestModelTier);
 
         DistributedBrain.ApplyModelTierIfNotSet(pipeline, "premium");
 
-        Assert.Equal("standard", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Standard, pipeline.LatestModelTier);
     }
 
     [Theory]
-    [InlineData("PREMIUM", "premium")]
-    [InlineData("Premium", "premium")]
-    [InlineData("STANDARD", "standard")]
-    [InlineData("Standard", "standard")]
-    [InlineData("unknown-tier", "standard")]
-    public void ApplyModelTierIfNotSet_NormalisesToLowerCaseKnownValues(string input, string expected)
+    [InlineData("PREMIUM", ModelTier.Premium)]
+    [InlineData("Premium", ModelTier.Premium)]
+    [InlineData("STANDARD", ModelTier.Standard)]
+    [InlineData("Standard", ModelTier.Standard)]
+    [InlineData("unknown-tier", ModelTier.Default)]
+    public void ApplyModelTierIfNotSet_NormalisesToLowerCaseKnownValues(string input, ModelTier expected)
     {
         var pipeline = CreatePipeline();
 
@@ -98,11 +98,11 @@ public sealed class ModelTierPropagationTests
 
         await brain.DecideNextStepAsync(pipeline, "some context");
 
-        Assert.Equal("premium", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
 
         await brain.CraftPromptAsync(pipeline, WorkerRole.Coder);
 
-        Assert.Equal("premium", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
     }
 
     /// <summary>
@@ -117,11 +117,11 @@ public sealed class ModelTierPropagationTests
 
         await brain.DecideNextStepAsync(pipeline, "some context");
 
-        Assert.Equal("", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Default, pipeline.LatestModelTier);
 
         await brain.CraftPromptAsync(pipeline, WorkerRole.Coder);
 
-        Assert.Equal("premium", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
     }
 
     /// <summary>
@@ -135,7 +135,7 @@ public sealed class ModelTierPropagationTests
 
         await brain.PlanGoalAsync(pipeline);
 
-        Assert.Equal("premium", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
     }
 
     /// <summary>
@@ -149,7 +149,7 @@ public sealed class ModelTierPropagationTests
 
         await brain.InterpretOutputAsync(pipeline, GoalPhase.Coding, "some output");
 
-        Assert.Equal("premium", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
     }
 
     /// <summary>
@@ -163,11 +163,11 @@ public sealed class ModelTierPropagationTests
         var pipeline = CreatePipeline();
 
         await brain.PlanGoalAsync(pipeline);
-        Assert.Equal("premium", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
 
         await brain.InterpretOutputAsync(pipeline, GoalPhase.Coding, "output");
 
-        Assert.Equal("premium", pipeline.LatestModelTier);
+        Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────

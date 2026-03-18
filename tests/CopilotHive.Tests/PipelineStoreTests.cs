@@ -3,6 +3,7 @@ using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
+using CopilotHive.Workers;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -92,8 +93,8 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     public void SavePipeline_ThenLoad_RestoresPhaseOutputs()
     {
         var pipeline = CreatePipeline();
-        pipeline.RecordOutput("coder", 1, "code output");
-        pipeline.RecordOutput("tester", 1, "test output");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "code output");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "test output");
 
         _store.SavePipeline(pipeline);
         var snap = Assert.Single(_store.LoadActivePipelines());

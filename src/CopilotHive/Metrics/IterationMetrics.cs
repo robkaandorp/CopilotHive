@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using CopilotHive.Workers;
 
 namespace CopilotHive.Metrics;
 
@@ -39,9 +40,9 @@ public sealed class IterationMetrics
     /// <summary>Whether runtime smoke-tests confirmed the application starts correctly.</summary>
     public bool RuntimeVerified { get; set; }
 
-    // Tester verdict: PASS, PARTIAL, FAIL
-    /// <summary>Overall tester verdict: PASS, PARTIAL, or FAIL.</summary>
-    public string Verdict { get; set; } = "";
+    // Tester verdict
+    /// <summary>Overall tester verdict: Pass, Partial, or Fail.</summary>
+    public TaskVerdict? Verdict { get; set; }
     /// <summary>Short human-readable summary from the test report.</summary>
     public string TestReportSummary { get; set; } = "";
     /// <summary>List of issues identified during testing.</summary>
@@ -51,8 +52,8 @@ public sealed class IterationMetrics
     public int ReviewIssuesFound { get; set; }
     /// <summary>Detailed list of review issues.</summary>
     public List<string> ReviewIssues { get; set; } = [];
-    /// <summary>Reviewer's verdict string (e.g. "APPROVED", "CHANGES_REQUESTED").</summary>
-    public string ReviewVerdict { get; set; } = "";
+    /// <summary>Reviewer's verdict.</summary>
+    public ReviewVerdict? ReviewVerdict { get; set; }
     /// <summary>Number of task retries consumed during this iteration (review + test retries).</summary>
     public int RetryCount { get; set; }
     /// <summary>Number of review-phase retries specifically.</summary>

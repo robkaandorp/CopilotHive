@@ -66,7 +66,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _metricsTracker = metricsTracker;
 
         // Build the orchestrator custom agent with no tools (reasoning-only)
-        var orchestratorInstructions = agentsManager?.GetAgentsMd("orchestrator") ?? "";
+        var orchestratorInstructions = agentsManager?.GetAgentsMd(WorkerRole.Orchestrator) ?? "";
         _orchestratorAgent = new CustomAgentConfig
         {
             Name = "orchestrator",
@@ -808,10 +808,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <param name="modelTier">The model tier string returned by the Brain LLM, or <c>null</c> if absent.</param>
     public static void ApplyModelTierIfNotSet(GoalPipeline pipeline, string? modelTier)
     {
-        if (!string.IsNullOrEmpty(pipeline.LatestModelTier) || modelTier is null)
+        if (pipeline.LatestModelTier != ModelTier.Default || modelTier is null)
             return;
 
-        pipeline.LatestModelTier = modelTier.ToLowerInvariant() == "premium" ? "premium" : "standard";
+        pipeline.LatestModelTier = ModelTierExtensions.ParseModelTier(modelTier);
     }
 
     /// <summary>

@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Workers;
 
 namespace CopilotHive.Tests;
 
@@ -210,7 +211,7 @@ public class ConfigRepoManagerTests : IDisposable
 
         var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
 
-        var content = await manager.LoadAgentsMdAsync("coder");
+        var content = await manager.LoadAgentsMdAsync(WorkerRole.Coder);
 
         Assert.NotNull(content);
         Assert.Contains("You write great code.", content);
@@ -221,7 +222,7 @@ public class ConfigRepoManagerTests : IDisposable
     {
         var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
 
-        var content = await manager.LoadAgentsMdAsync("nonexistent");
+        var content = await manager.LoadAgentsMdAsync(WorkerRole.MergeWorker);
 
         Assert.Null(content);
     }
@@ -237,7 +238,7 @@ public class ConfigRepoManagerTests : IDisposable
 
         var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
 
-        var content = await manager.LoadAgentsMdAsync("TESTER");
+        var content = await manager.LoadAgentsMdAsync(WorkerRole.Tester);
 
         Assert.NotNull(content);
         Assert.Contains("Tester instructions", content);

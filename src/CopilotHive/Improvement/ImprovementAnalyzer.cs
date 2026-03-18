@@ -36,10 +36,10 @@ public sealed class ImprovementAnalyzer
     /// </summary>
     public bool ShouldImprove(IterationMetrics metrics)
     {
-        if (metrics.Verdict.Equals("FAIL", StringComparison.OrdinalIgnoreCase))
+        if (metrics.Verdict == TaskVerdict.Fail)
             return true;
 
-        if (metrics.Verdict.Equals("PARTIAL", StringComparison.OrdinalIgnoreCase))
+        if (metrics.Verdict == TaskVerdict.Partial)
             return true;
 
         if (metrics.RetryCount > 0)
@@ -116,7 +116,7 @@ public sealed class ImprovementAnalyzer
         sb.AppendLine($"- Integration tests: {current.IntegrationTestsPassed}/{current.IntegrationTestsTotal} passed");
         sb.AppendLine($"- Coverage: {current.CoveragePercent:F1}%");
 
-        if (!string.IsNullOrEmpty(current.ReviewVerdict))
+        if (current.ReviewVerdict is not null)
             sb.AppendLine($"- Review verdict: {current.ReviewVerdict} ({current.ReviewIssuesFound} issues found)");
 
         if (current.PhaseDurations.Count > 0)

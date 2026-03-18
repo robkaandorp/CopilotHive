@@ -17,7 +17,7 @@ public class ImprovementAnalyzerTests
     {
         var metrics = new IterationMetrics
         {
-            Verdict = "PASS",
+            Verdict = TaskVerdict.Pass,
             TotalTests = 10,
             PassedTests = 10,
             FailedTests = 0,
@@ -30,14 +30,14 @@ public class ImprovementAnalyzerTests
     [Fact]
     public void ShouldImprove_FailVerdict_ReturnsTrue()
     {
-        var metrics = new IterationMetrics { Verdict = "FAIL" };
+        var metrics = new IterationMetrics { Verdict = TaskVerdict.Fail };
         Assert.True(_analyzer.ShouldImprove(metrics));
     }
 
     [Fact]
     public void ShouldImprove_PartialVerdict_ReturnsTrue()
     {
-        var metrics = new IterationMetrics { Verdict = "PARTIAL" };
+        var metrics = new IterationMetrics { Verdict = TaskVerdict.Partial };
         Assert.True(_analyzer.ShouldImprove(metrics));
     }
 
@@ -46,7 +46,7 @@ public class ImprovementAnalyzerTests
     {
         var metrics = new IterationMetrics
         {
-            Verdict = "PASS",
+            Verdict = TaskVerdict.Pass,
             RetryCount = 1,
         };
         Assert.True(_analyzer.ShouldImprove(metrics));
@@ -55,8 +55,8 @@ public class ImprovementAnalyzerTests
     [Fact]
     public void ShouldImprove_PassWithIssues_ReturnsTrue()
     {
-        var metrics = new IterationMetrics { Verdict = "PASS" };
-        metrics.Issues.Add("Minor formatting issue");
+        var metrics = new IterationMetrics { Verdict = TaskVerdict.Pass };
+        metrics.Issues.Add("Some issue found");
         Assert.True(_analyzer.ShouldImprove(metrics));
     }
 
@@ -65,7 +65,7 @@ public class ImprovementAnalyzerTests
     {
         var metrics = new IterationMetrics
         {
-            Verdict = "PASS",
+            Verdict = TaskVerdict.Pass,
             FailedTests = 1,
         };
         Assert.True(_analyzer.ShouldImprove(metrics));
@@ -78,7 +78,7 @@ public class ImprovementAnalyzerTests
     [Fact]
     public void BuildRequests_ReturnsOnePerRole()
     {
-        var metrics = new IterationMetrics { Verdict = "FAIL", Iteration = 1 };
+        var metrics = new IterationMetrics { Verdict = TaskVerdict.Fail, Iteration = 1 };
         var agentsMd = new Dictionary<string, string>
         {
             ["coder"] = "# Coder instructions",
@@ -98,7 +98,7 @@ public class ImprovementAnalyzerTests
         var metrics = new IterationMetrics
         {
             Iteration = 3,
-            Verdict = "FAIL",
+            Verdict = TaskVerdict.Fail,
             TotalTests = 10,
             PassedTests = 7,
             FailedTests = 3,
@@ -115,7 +115,7 @@ public class ImprovementAnalyzerTests
 
         var prompt = requests[0].Prompt;
         Assert.Contains("Iteration: 3", prompt);
-        Assert.Contains("Verdict: FAIL", prompt);
+        Assert.Contains("Verdict: Fail", prompt);
         Assert.Contains("7/10", prompt);
         Assert.Contains("Total retries: 2", prompt);
         Assert.Contains("NullReferenceException in Parser", prompt);
@@ -124,29 +124,29 @@ public class ImprovementAnalyzerTests
     [Fact]
     public void BuildAnalysis_IncludesHistoryTrends()
     {
-        var current = new IterationMetrics { Iteration = 3, Verdict = "FAIL" };
+        var current = new IterationMetrics { Iteration = 3, Verdict = TaskVerdict.Fail };
         var history = new List<IterationMetrics>
         {
-            new() { Iteration = 1, Verdict = "FAIL", PassedTests = 5, TotalTests = 10, RetryCount = 3, CoveragePercent = 40 },
-            new() { Iteration = 2, Verdict = "PARTIAL", PassedTests = 8, TotalTests = 10, RetryCount = 1, CoveragePercent = 60 },
+            new() { Iteration = 1, Verdict = TaskVerdict.Fail, PassedTests = 5, TotalTests = 10, RetryCount = 3, CoveragePercent = 40 },
+            new() { Iteration = 2, Verdict = TaskVerdict.Partial, PassedTests = 8, TotalTests = 10, RetryCount = 1, CoveragePercent = 60 },
             current,
         };
 
         var analysis = _analyzer.BuildAnalysis(current, history);
 
         Assert.Contains("Metrics Trend", analysis);
-        Assert.Contains("Iteration 1: FAIL", analysis);
-        Assert.Contains("Iteration 2: PARTIAL", analysis);
+        Assert.Contains("Iteration 1: Fail", analysis);
+        Assert.Contains("Iteration 2: Partial", analysis);
     }
 
     [Fact]
     public void BuildAnalysis_IdentifiesRecurringIssues()
     {
         var issue = "Format mismatch in TEST_REPORT";
-        var current = new IterationMetrics { Iteration = 3, Verdict = "FAIL" };
+        var current = new IterationMetrics { Iteration = 3, Verdict = TaskVerdict.Fail };
         current.Issues.Add(issue);
 
-        var prev = new IterationMetrics { Iteration = 2, Verdict = "FAIL" };
+        var prev = new IterationMetrics { Iteration = 2, Verdict = TaskVerdict.Fail };
         prev.Issues.Add(issue);
 
         var history = new List<IterationMetrics> { prev, current };
@@ -166,9 +166,9 @@ public class ImprovementAnalyzerTests
     {
         var current = new IterationMetrics
         {
-            Verdict = "FAIL",
-            ReviewIssuesFound = 3,
+            Verdict = TaskVerdict.Fail,
             ReviewRetryCount = 1,
+            ReviewIssuesFound = 2,
             BuildSuccess = true,
             FailedTests = 0,
             TestRetryCount = 0,
@@ -190,9 +190,9 @@ public class ImprovementAnalyzerTests
     {
         var current = new IterationMetrics
         {
-            Verdict = "FAIL",
-            ReviewIssuesFound = 2,
+            Verdict = TaskVerdict.Fail,
             ReviewRetryCount = 1,
+            ReviewIssuesFound = 2,
             FailedTests = 4,
             TestRetryCount = 2,
             BuildSuccess = true,
@@ -235,9 +235,8 @@ public class ImprovementAnalyzerTests
     {
         var current = new IterationMetrics
         {
-            Verdict = "PASS",
+            Verdict = TaskVerdict.Pass,
             BuildSuccess = true,
-            FailedTests = 0,
             TestRetryCount = 0,
             ReviewIssuesFound = 0,
             ReviewRetryCount = 0,

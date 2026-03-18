@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using CopilotHive.Workers;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -106,9 +107,9 @@ public sealed class ConfigRepoManager
     /// Loads a per-role AGENTS.md file from the config repo (agents/{role}.agents.md).
     /// Returns null if the file does not exist.
     /// </summary>
-    public async Task<string?> LoadAgentsMdAsync(string role, CancellationToken ct = default)
+    public async Task<string?> LoadAgentsMdAsync(WorkerRole role, CancellationToken ct = default)
     {
-        var agentsPath = Path.Combine(_localPath, "agents", $"{role.ToLowerInvariant()}.agents.md");
+        var agentsPath = Path.Combine(_localPath, "agents", $"{role.ToRoleName()}.agents.md");
         if (!File.Exists(agentsPath))
             return null;
 

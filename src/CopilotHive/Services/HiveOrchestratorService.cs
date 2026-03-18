@@ -2,6 +2,8 @@ using Grpc.Core;
 using Microsoft.Extensions.Logging;
 using CopilotHive.Agents;
 using CopilotHive.Shared.Grpc;
+using CopilotHive.Workers;
+using GrpcWorkerRole = CopilotHive.Shared.Grpc.WorkerRole;
 
 namespace CopilotHive.Services;
 
@@ -31,7 +33,7 @@ public sealed class HiveOrchestratorService(
             ? $"{request.Role.ToString().ToLowerInvariant()}-{Guid.NewGuid():N}"[..24]
             : request.WorkerId;
 
-        if (request.Role == WorkerRole.Unspecified)
+        if (request.Role == GrpcWorkerRole.Unspecified)
         {
             logger.LogInformation("Registering generic worker: {WorkerId} (no fixed role)", workerId);
         }
@@ -178,14 +180,14 @@ public sealed class HiveOrchestratorService(
         CancellationToken cancellationToken)
     {
         workerPool.MarkIdle(worker.Id);
-        var isGeneric = worker.Role == WorkerRole.Unspecified;
+        var isGeneric = worker.Role == GrpcWorkerRole.Unspecified;
         logger.LogInformation("Worker {WorkerId} is ready (role={Role}, generic={IsGeneric})",
             worker.Id, worker.Role, isGeneric);
 
         // For fixed-role workers, send their role's agents.md on ready
         if (!isGeneric && agentsManager is not null)
         {
-            await SendAgentsMdAsync(worker, worker.Role.ToString().ToLowerInvariant(), cancellationToken);
+            await SendAgentsMdAsync(worker, worker.Role, cancellationToken);
         }
 
         // Dequeue a matching task — generic workers accept any role
@@ -201,7 +203,7 @@ public sealed class HiveOrchestratorService(
                     worker.Id, taskRoleName, task.TaskId);
 
                 if (agentsManager is not null)
-                    await SendAgentsMdAsync(worker, taskRoleName, cancellationToken);
+                    await SendAgentsMdAsync(worker, task.Role, cancellationToken);
             }
 
             taskQueue.Activate(task, worker.Id);
@@ -214,11 +216,13 @@ public sealed class HiveOrchestratorService(
         }
     }
 
-    private async Task SendAgentsMdAsync(ConnectedWorker worker, string roleName, CancellationToken ct)
+    private async Task SendAgentsMdAsync(ConnectedWorker worker, GrpcWorkerRole grpcRole, CancellationToken ct)
     {
-        var agentsContent = agentsManager?.GetAgentsMd(roleName);
+        var role = grpcRole.ToDomainRole();
+        var agentsContent = agentsManager?.GetAgentsMd(role);
         if (string.IsNullOrEmpty(agentsContent)) return;
 
+        var roleName = role.ToRoleName();
         try
         {
             await worker.MessageChannel.Writer.WriteAsync(
@@ -329,7 +333,7 @@ public sealed class HiveOrchestratorService(
         {
             pipeline.ClearActiveTask();
             pipeline.RecordOutput(
-                worker.Role.ToString().ToLowerInvariant(),
+                worker.Role.ToDomainRole(),
                 pipeline.Iteration,
                 complete.Output);
         }

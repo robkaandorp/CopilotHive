@@ -192,9 +192,10 @@ public sealed class CopilotRunner : IAsyncDisposable
          [Description("Build succeeded (true/false)")] bool buildSuccess,
          [Description("List of issues found, empty if none")] string[] issues) =>
         {
+            var parsed = TaskVerdictExtensions.ParseTaskVerdict(verdict);
             var error = ToolValidation.Check(
                 (!string.IsNullOrEmpty(verdict), "verdict is required"),
-                (verdict is "PASS" or "FAIL", "verdict must be exactly 'PASS' or 'FAIL'"),
+                (parsed is TaskVerdict.Pass or TaskVerdict.Fail, "verdict must be exactly 'PASS' or 'FAIL'"),
                 (totalTests >= 0, "totalTests must be >= 0"),
                 (passedTests >= 0, "passedTests must be >= 0"),
                 (failedTests >= 0, "failedTests must be >= 0"),
@@ -207,7 +208,7 @@ public sealed class CopilotRunner : IAsyncDisposable
             _log.Info($"Tool call: report_test_results(verdict={verdict}, total={totalTests}, passed={passedTests}, failed={failedTests}, coverage={coveragePercent})");
             _lastTestReport = new TestResultReport
             {
-                Verdict = verdict,
+                Verdict = parsed!.Value,
                 TotalTests = totalTests,
                 PassedTests = passedTests,
                 FailedTests = failedTests,
@@ -226,16 +227,16 @@ public sealed class CopilotRunner : IAsyncDisposable
          [Description("List of issues found, empty if none")] string[] issues,
          [Description("Overall review summary")] string summary) =>
         {
+            var parsed = ReviewVerdictExtensions.ParseReviewVerdict(verdict);
             var error = ToolValidation.Check(
                 (!string.IsNullOrEmpty(verdict), "verdict is required"),
-                (verdict is "APPROVE" or "REQUEST_CHANGES",
-                    "verdict must be exactly 'APPROVE' or 'REQUEST_CHANGES'"));
+                (parsed is not null, "verdict must be exactly 'APPROVE' or 'REQUEST_CHANGES'"));
             if (error is not null) return error;
 
             _log.Info($"Tool call: report_review_verdict(verdict={verdict}, issues={issues.Length})");
             _lastWorkerReport = new WorkerReport
             {
-                Verdict = verdict,
+                ReviewVerdict = parsed!.Value,
                 Issues = issues.ToList(),
                 Summary = summary,
             };
@@ -250,15 +251,16 @@ public sealed class CopilotRunner : IAsyncDisposable
          [Description("List of files modified")] string[] filesModified,
          [Description("Summary of changes made")] string summary) =>
         {
+            var parsed = TaskVerdictExtensions.ParseTaskVerdict(verdict);
             var error = ToolValidation.Check(
                 (!string.IsNullOrEmpty(verdict), "verdict is required"),
-                (verdict is "PASS" or "FAIL", "verdict must be exactly 'PASS' or 'FAIL'"));
+                (parsed is TaskVerdict.Pass or TaskVerdict.Fail, "verdict must be exactly 'PASS' or 'FAIL'"));
             if (error is not null) return error;
 
             _log.Info($"Tool call: report_code_changes(verdict={verdict}, files={filesModified.Length})");
             _lastWorkerReport = new WorkerReport
             {
-                Verdict = verdict,
+                TaskVerdict = parsed!.Value,
                 FilesChanged = filesModified.ToList(),
                 Summary = summary,
             };
@@ -273,15 +275,16 @@ public sealed class CopilotRunner : IAsyncDisposable
          [Description("List of documentation files updated")] string[] filesUpdated,
          [Description("Summary of documentation changes")] string summary) =>
         {
+            var parsed = TaskVerdictExtensions.ParseTaskVerdict(verdict);
             var error = ToolValidation.Check(
                 (!string.IsNullOrEmpty(verdict), "verdict is required"),
-                (verdict is "PASS" or "FAIL", "verdict must be exactly 'PASS' or 'FAIL'"));
+                (parsed is TaskVerdict.Pass or TaskVerdict.Fail, "verdict must be exactly 'PASS' or 'FAIL'"));
             if (error is not null) return error;
 
             _log.Info($"Tool call: report_doc_changes(verdict={verdict}, files={filesUpdated.Length})");
             _lastWorkerReport = new WorkerReport
             {
-                Verdict = verdict,
+                TaskVerdict = parsed!.Value,
                 FilesChanged = filesUpdated.ToList(),
                 Summary = summary,
             };

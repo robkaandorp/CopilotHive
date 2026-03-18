@@ -1,5 +1,6 @@
 using CopilotHive.Goals;
 using CopilotHive.Services;
+using CopilotHive.Workers;
 
 namespace CopilotHive.Tests;
 
@@ -132,7 +133,7 @@ public sealed class GoalPipelineTests
     {
         var pipeline = new GoalPipeline(CreateGoal());
 
-        pipeline.RecordOutput("coder", 1, "some output");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "some output");
 
         Assert.True(pipeline.PhaseOutputs.ContainsKey("coder-1"));
         Assert.Equal("some output", pipeline.PhaseOutputs["coder-1"]);
@@ -143,9 +144,9 @@ public sealed class GoalPipelineTests
     {
         var pipeline = new GoalPipeline(CreateGoal());
 
-        pipeline.RecordOutput("coder", 1, "code output");
-        pipeline.RecordOutput("tester", 1, "test output");
-        pipeline.RecordOutput("coder", 2, "code v2");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "code output");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "test output");
+        pipeline.RecordOutput(WorkerRole.Coder, 2, "code v2");
 
         Assert.Equal(3, pipeline.PhaseOutputs.Count);
         Assert.Equal("code output", pipeline.PhaseOutputs["coder-1"]);
@@ -158,8 +159,8 @@ public sealed class GoalPipelineTests
     {
         var pipeline = new GoalPipeline(CreateGoal());
 
-        pipeline.RecordOutput("coder", 1, "first");
-        pipeline.RecordOutput("coder", 1, "second");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "first");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "second");
 
         Assert.Equal("second", pipeline.PhaseOutputs["coder-1"]);
     }
@@ -274,7 +275,7 @@ public sealed class GoalPipelineTests
     public void BuildContextSummary_WithPhaseOutputs_IncludesOutputSections()
     {
         var pipeline = new GoalPipeline(CreateGoal());
-        pipeline.RecordOutput("coder", 1, "hello world");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "hello world");
 
         var summary = pipeline.BuildContextSummary();
 
@@ -287,7 +288,7 @@ public sealed class GoalPipelineTests
     {
         var pipeline = new GoalPipeline(CreateGoal());
         var longOutput = new string('x', 3000);
-        pipeline.RecordOutput("coder", 1, longOutput);
+        pipeline.RecordOutput(WorkerRole.Coder, 1, longOutput);
 
         var summary = pipeline.BuildContextSummary();
 

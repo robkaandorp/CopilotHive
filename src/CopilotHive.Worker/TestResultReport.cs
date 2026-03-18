@@ -1,3 +1,5 @@
+using CopilotHive.Workers;
+
 namespace CopilotHive.Worker;
 
 /// <summary>
@@ -6,8 +8,8 @@ namespace CopilotHive.Worker;
 /// </summary>
 public sealed record TestResultReport
 {
-    /// <summary>"PASS" or "FAIL".</summary>
-    public required string Verdict { get; init; }
+    /// <summary>Pass or Fail.</summary>
+    public required TaskVerdict Verdict { get; init; }
     /// <summary>Total number of tests discovered.</summary>
     public required int TotalTests { get; init; }
     /// <summary>Number of tests that passed.</summary>

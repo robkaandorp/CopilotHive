@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using CopilotHive.Shared.Grpc;
+using CopilotHive.Workers;
 using GrpcTaskStatus = CopilotHive.Shared.Grpc.TaskStatus;
+using GrpcWorkerRole = CopilotHive.Shared.Grpc.WorkerRole;
 
 namespace CopilotHive.Worker;
 
@@ -34,7 +36,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
 
         try
         {
-            var isImprover = assignment.Role == WorkerRole.Improver;
+            var isImprover = assignment.Role == GrpcWorkerRole.Improver;
 
             // Clone each repository (skip for improver — it works on the config repo agents folder)
             var repoDirectories = new List<(RepositoryInfo Repo, string Dir)>();
@@ -132,7 +134,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
 
             // For roles that push code, ensure Copilot committed its changes.
             // If the working directory is dirty, re-prompt Copilot to commit.
-            if (!isImprover && assignment.Role != WorkerRole.Reviewer)
+            if (!isImprover && assignment.Role != GrpcWorkerRole.Reviewer)
             {
                 foreach (var (_, dir) in repoDirectories)
                 {
@@ -142,7 +144,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
 
             // For testers: ensure structured test metrics were reported via tool call.
             // If the tester didn't call report_test_results, prompt it to do so.
-            if (assignment.Role == WorkerRole.Tester && copilotRunner.LastTestReport is null)
+            if (assignment.Role == GrpcWorkerRole.Tester && copilotRunner.LastTestReport is null)
             {
                 copilotOutput = await EnsureTestMetricsReportedAsync(copilotOutput, primaryWorkDir, ct);
             }
@@ -161,7 +163,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
             }
             else
             {
-                var isReviewer = assignment.Role == WorkerRole.Reviewer;
+                var isReviewer = assignment.Role == GrpcWorkerRole.Reviewer;
 
                 foreach (var (repo, dir) in repoDirectories)
                 {
@@ -203,7 +205,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
             {
                 metrics = new TaskMetrics
                 {
-                    Verdict = testReport.Verdict,
+                    Verdict = testReport.Verdict.ToVerdictString(),
                     BuildSuccess = testReport.BuildSuccess,
                     TotalTests = testReport.TotalTests,
                     PassedTests = testReport.PassedTests,
@@ -214,9 +216,12 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
             }
             else if (workerReport is not null)
             {
+                var verdictStr = workerReport.ReviewVerdict?.ToVerdictString()
+                    ?? workerReport.TaskVerdict?.ToVerdictString()
+                    ?? "PASS";
                 metrics = new TaskMetrics
                 {
-                    Verdict = workerReport.Verdict,
+                    Verdict = verdictStr,
                     Issues = { workerReport.Issues },
                 };
             }

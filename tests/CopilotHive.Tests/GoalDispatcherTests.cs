@@ -37,7 +37,7 @@ public sealed class GoalDispatcherReviewVerdictTests
             Output = "Several critical issues found.",
         });
 
-        Assert.Equal("REQUEST_CHANGES", pipeline.Metrics.ReviewVerdict);
+        Assert.Equal(ReviewVerdict.RequestChanges, pipeline.Metrics.ReviewVerdict);
     }
 
     [Fact]
@@ -61,7 +61,7 @@ public sealed class GoalDispatcherReviewVerdictTests
             Output = "LGTM, no issues found.",
         });
 
-        Assert.Equal("APPROVE", pipeline.Metrics.ReviewVerdict);
+        Assert.Equal(ReviewVerdict.Approve, pipeline.Metrics.ReviewVerdict);
     }
 
     [Theory]
@@ -90,8 +90,8 @@ public sealed class GoalDispatcherReviewVerdictTests
         });
 
         Assert.True(
-            pipeline.Metrics.ReviewVerdict is null or "",
-            $"Expected ReviewVerdict to be null or empty for phase {phase} with verdict {verdict}, " +
+            pipeline.Metrics.ReviewVerdict is null,
+            $"Expected ReviewVerdict to be null for phase {phase} with verdict {verdict}, " +
             $"but was: '{pipeline.Metrics.ReviewVerdict}'");
     }
 
@@ -106,7 +106,7 @@ public sealed class GoalDispatcherReviewVerdictTests
             {
                 Action = OrchestratorActionType.Done,
                 Verdict = null,
-                ReviewVerdict = "APPROVED",
+                ReviewVerdict = "APPROVE",
             },
         };
 
@@ -119,7 +119,7 @@ public sealed class GoalDispatcherReviewVerdictTests
             Output = "Looks good overall.",
         });
 
-        Assert.Equal("APPROVED", pipeline.Metrics.ReviewVerdict);
+        Assert.Equal(ReviewVerdict.Approve, pipeline.Metrics.ReviewVerdict);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────

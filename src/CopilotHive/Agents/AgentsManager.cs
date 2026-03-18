@@ -1,3 +1,5 @@
+using CopilotHive.Workers;
+
 namespace CopilotHive.Agents;
 
 /// <summary>
@@ -23,20 +25,20 @@ public sealed class AgentsManager
     /// <summary>
     /// Returns the full path to the AGENTS.md file for the given role.
     /// </summary>
-    /// <param name="role">Worker role name (e.g. "coder").</param>
+    /// <param name="role">Worker role.</param>
     /// <returns>Absolute file path for the role's AGENTS.md.</returns>
-    public string GetAgentsMdPath(string role)
+    public string GetAgentsMdPath(WorkerRole role)
     {
-        return Path.Combine(_agentsPath, $"{role}.agents.md");
+        return Path.Combine(_agentsPath, $"{role.ToRoleName()}.agents.md");
     }
 
     /// <summary>
     /// Reads and returns the AGENTS.md content for the specified role.
     /// Returns an empty string when the file does not exist.
     /// </summary>
-    /// <param name="role">Worker role name.</param>
+    /// <param name="role">Worker role.</param>
     /// <returns>File contents, or empty string if not found.</returns>
-    public string GetAgentsMd(string role)
+    public string GetAgentsMd(WorkerRole role)
     {
         var path = GetAgentsMdPath(role);
         return File.Exists(path) ? File.ReadAllText(path) : string.Empty;
@@ -45,11 +47,10 @@ public sealed class AgentsManager
     /// <summary>
     /// Archives the current AGENTS.md and overwrites it with the new content.
     /// </summary>
-    /// <param name="role">Worker role name.</param>
+    /// <param name="role">Worker role.</param>
     /// <param name="newContent">New AGENTS.md content to write.</param>
-    public void UpdateAgentsMd(string role, string newContent)
+    public void UpdateAgentsMd(WorkerRole role, string newContent)
     {
-        // Archive current version before overwriting
         var currentContent = GetAgentsMd(role);
         if (!string.IsNullOrEmpty(currentContent))
         {
@@ -57,15 +58,15 @@ public sealed class AgentsManager
         }
 
         File.WriteAllText(GetAgentsMdPath(role), newContent);
-        Console.WriteLine($"[Agents] Updated AGENTS.md for {role}");
+        Console.WriteLine($"[Agents] Updated AGENTS.md for {role.ToRoleName()}");
     }
 
     /// <summary>
     /// Rolls back the AGENTS.md for the given role to the most recent archived version.
     /// </summary>
-    /// <param name="role">Worker role name.</param>
+    /// <param name="role">Worker role.</param>
     /// <returns><c>true</c> if a rollback was performed; <c>false</c> if no history exists.</returns>
-    public bool RollbackAgentsMd(string role)
+    public bool RollbackAgentsMd(WorkerRole role)
     {
         var versions = GetVersionFiles(role);
         if (versions.Length == 0)
@@ -76,16 +77,16 @@ public sealed class AgentsManager
         File.WriteAllText(GetAgentsMdPath(role), content);
         File.Delete(latest);
 
-        Console.WriteLine($"[Agents] Rolled back {role} to {Path.GetFileName(latest)}");
+        Console.WriteLine($"[Agents] Rolled back {role.ToRoleName()} to {Path.GetFileName(latest)}");
         return true;
     }
 
     /// <summary>
     /// Returns the filenames of all archived versions for the given role, in chronological order.
     /// </summary>
-    /// <param name="role">Worker role name.</param>
+    /// <param name="role">Worker role.</param>
     /// <returns>Array of version filenames (e.g. <c>v001.agents.md</c>).</returns>
-    public string[] GetHistory(string role)
+    public string[] GetHistory(WorkerRole role)
     {
         return GetVersionFiles(role)
             .Select(Path.GetFileName)
@@ -93,9 +94,10 @@ public sealed class AgentsManager
             .ToArray()!;
     }
 
-    private void ArchiveVersion(string role, string content)
+    private void ArchiveVersion(WorkerRole role, string content)
     {
-        var roleHistoryPath = Path.Combine(_historyPath, role);
+        var roleName = role.ToRoleName();
+        var roleHistoryPath = Path.Combine(_historyPath, roleName);
         Directory.CreateDirectory(roleHistoryPath);
 
         var version = GetVersionFiles(role).Length + 1;
@@ -103,9 +105,9 @@ public sealed class AgentsManager
         File.WriteAllText(versionFile, content);
     }
 
-    private string[] GetVersionFiles(string role)
+    private string[] GetVersionFiles(WorkerRole role)
     {
-        var roleHistoryPath = Path.Combine(_historyPath, role);
+        var roleHistoryPath = Path.Combine(_historyPath, role.ToRoleName());
         if (!Directory.Exists(roleHistoryPath))
             return [];
 

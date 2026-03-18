@@ -1,3 +1,5 @@
+using CopilotHive.Workers;
+
 namespace CopilotHive.Worker;
 
 /// <summary>
@@ -7,10 +9,11 @@ namespace CopilotHive.Worker;
 /// </summary>
 public sealed record WorkerReport
 {
-    /// <summary>
-    /// Verdict: "APPROVE"/"REQUEST_CHANGES" for reviewers, "PASS"/"FAIL" for coders/doc-writers.
-    /// </summary>
-    public required string Verdict { get; init; }
+    /// <summary>Task verdict for coders/doc-writers (Pass/Fail). Null for reviewers.</summary>
+    public TaskVerdict? TaskVerdict { get; init; }
+
+    /// <summary>Review verdict for reviewers (Approve/RequestChanges). Null for coders/doc-writers.</summary>
+    public ReviewVerdict? ReviewVerdict { get; init; }
 
     /// <summary>Issues found (review issues, build failures, etc.). Empty if none.</summary>
     public List<string> Issues { get; init; } = [];

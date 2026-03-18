@@ -1,3 +1,5 @@
+using CopilotHive.Workers;
+
 namespace CopilotHive.Configuration;
 
 /// <summary>
@@ -70,31 +72,31 @@ public sealed class HiveConfiguration
     /// Resolves the model to use for a given agent role.
     /// Falls back to <see cref="Model"/> when no role-specific override is set.
     /// </summary>
-    /// <param name="agentRole">Role name (e.g. "coder", "reviewer").</param>
+    /// <param name="role">Worker role (e.g. Coder, Reviewer).</param>
     /// <returns>The model identifier string for the specified role.</returns>
-    public string GetModelForRole(string agentRole) => agentRole.ToLowerInvariant() switch
+    public string GetModelForRole(WorkerRole role) => role switch
     {
-        "coder" => CoderModel ?? Model,
-        "reviewer" => ReviewerModel ?? Constants.DefaultReviewerModel,
-        "tester" => TesterModel ?? Constants.DefaultWorkerModel,
-        "improver" => ImproverModel ?? Constants.DefaultWorkerModel,
-        "docwriter" => DocWriterModel ?? Constants.DefaultDocWriterModel,
-        "orchestrator" => OrchestratorModel ?? Constants.DefaultWorkerModel,
+        WorkerRole.Coder => CoderModel ?? Model,
+        WorkerRole.Reviewer => ReviewerModel ?? Constants.DefaultReviewerModel,
+        WorkerRole.Tester => TesterModel ?? Constants.DefaultWorkerModel,
+        WorkerRole.Improver => ImproverModel ?? Constants.DefaultWorkerModel,
+        WorkerRole.DocWriter => DocWriterModel ?? Constants.DefaultDocWriterModel,
+        WorkerRole.Orchestrator => OrchestratorModel ?? Constants.DefaultWorkerModel,
         _ => Model,
     };
 
     /// <summary>
     /// Resolves the premium model configured for a given agent role, or <c>null</c> if none is set.
     /// </summary>
-    /// <param name="agentRole">Role name (e.g. "coder", "reviewer").</param>
+    /// <param name="role">Worker role.</param>
     /// <returns>The premium model identifier for the role, or <c>null</c> if not configured.</returns>
-    public string? GetPremiumModelForRole(string agentRole) => agentRole.ToLowerInvariant() switch
+    public string? GetPremiumModelForRole(WorkerRole role) => role switch
     {
-        "coder" => PremiumCoderModel,
-        "reviewer" => PremiumReviewerModel,
-        "tester" => PremiumTesterModel,
-        "improver" => PremiumImproverModel,
-        "docwriter" => PremiumDocWriterModel,
+        WorkerRole.Coder => PremiumCoderModel,
+        WorkerRole.Reviewer => PremiumReviewerModel,
+        WorkerRole.Tester => PremiumTesterModel,
+        WorkerRole.Improver => PremiumImproverModel,
+        WorkerRole.DocWriter => PremiumDocWriterModel,
         _ => null,
     };
 }

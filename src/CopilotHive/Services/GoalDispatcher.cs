@@ -244,7 +244,7 @@ public sealed class GoalDispatcher : BackgroundService
         if (pipeline.Phase == GoalPhase.Review && complete.Metrics is { Verdict: "APPROVE" or "REQUEST_CHANGES" })
         {
             var m = complete.Metrics;
-            pipeline.Metrics.ReviewVerdict = m.Verdict;
+            pipeline.Metrics.ReviewVerdict = ReviewVerdictExtensions.ParseReviewVerdict(m.Verdict);
             if (m.Issues is { Count: > 0 })
             {
                 pipeline.Metrics.ReviewIssuesFound += m.Issues.Count;
@@ -328,10 +328,10 @@ public sealed class GoalDispatcher : BackgroundService
         if (pipeline.Phase == GoalPhase.Review && !hasStructuredReview)
         {
             pipeline.Metrics.ReviewVerdict = interpretation.Verdict == "FAIL"
-                ? "REQUEST_CHANGES"
+                ? ReviewVerdict.RequestChanges
                 : interpretation.Verdict == "PASS"
-                    ? "APPROVE"
-                    : interpretation.ReviewVerdict ?? "";
+                    ? ReviewVerdict.Approve
+                    : ReviewVerdictExtensions.ParseReviewVerdict(interpretation.ReviewVerdict);
             if (interpretation.Issues is { Count: > 0 })
             {
                 pipeline.Metrics.ReviewIssuesFound += interpretation.Issues.Count;
@@ -349,7 +349,7 @@ public sealed class GoalDispatcher : BackgroundService
         // correct the action to RequestChanges so the coder gets another chance.
         if (pipeline.Phase == GoalPhase.Review
             && interpretation.Action is OrchestratorActionType.Done or OrchestratorActionType.Skip
-            && pipeline.Metrics.ReviewVerdict == "REQUEST_CHANGES")
+            && pipeline.Metrics.ReviewVerdict == ReviewVerdict.RequestChanges)
         {
             _logger.LogWarning(
                 "Brain said {Action} for {GoalId} at Review but verdict is REQUEST_CHANGES — correcting to RequestChanges",
@@ -435,7 +435,7 @@ public sealed class GoalDispatcher : BackgroundService
             _ => pipeline.Phase,
         };
         // Use the context: review/docwriting failures use review retry, others use test retry
-        var isReviewRelated = pipeline.Metrics.ReviewVerdict is "REQUEST_CHANGES"
+        var isReviewRelated = pipeline.Metrics.ReviewVerdict == ReviewVerdict.RequestChanges
             || interpretation.Action == OrchestratorActionType.RequestChanges;
         var canRetry = isReviewRelated
             ? pipeline.IncrementReviewRetry()
@@ -674,7 +674,7 @@ public sealed class GoalDispatcher : BackgroundService
         // Resolve per-role model from config; upgrade to premium when the Brain requested it
         var roleName = role.ToRoleName();
         var model = _config?.GetModelForRole(roleName);
-        if (pipeline.LatestModelTier == "premium" && _config is not null)
+        if (pipeline.LatestModelTier == ModelTier.Premium && _config is not null)
         {
             var premiumModel = _config.GetPremiumModelForRole(roleName);
             if (premiumModel is not null)
@@ -725,7 +725,7 @@ public sealed class GoalDispatcher : BackgroundService
                     var taskRoleName = queuedTask.Role.ToString().ToLowerInvariant();
                     _logger.LogInformation("Generic worker {WorkerId} assigned role {Role} for task {TaskId}",
                         idleWorker.Id, taskRoleName, queuedTask.TaskId);
-                    await SendAgentsMdToWorkerAsync(idleWorker, taskRoleName, ct);
+                    await SendAgentsMdToWorkerAsync(idleWorker, queuedTask.Role.ToDomainRole(), ct);
                 }
 
                 _taskQueue.Activate(queuedTask, idleWorker.Id);
@@ -737,12 +737,13 @@ public sealed class GoalDispatcher : BackgroundService
         }
     }
 
-    private async Task SendAgentsMdToWorkerAsync(ConnectedWorker worker, string roleName, CancellationToken ct)
+    private async Task SendAgentsMdToWorkerAsync(ConnectedWorker worker, WorkerRole role, CancellationToken ct)
     {
         if (_agentsManager is null) return;
-        var content = _agentsManager.GetAgentsMd(roleName);
+        var content = _agentsManager.GetAgentsMd(role);
         if (string.IsNullOrEmpty(content)) return;
 
+        var roleName = role.ToRoleName();
         try
         {
             await worker.MessageChannel.Writer.WriteAsync(
@@ -1002,13 +1003,13 @@ public sealed class GoalDispatcher : BackgroundService
             foreach (var role in WorkerRoles.AgentRoles)
             {
                 var roleName = role.ToRoleName();
-                var repoContent = await _configRepo.LoadAgentsMdAsync(roleName, ct);
+                var repoContent = await _configRepo.LoadAgentsMdAsync(role, ct);
                 if (string.IsNullOrEmpty(repoContent)) continue;
 
-                var currentContent = _agentsManager.GetAgentsMd(roleName);
+                var currentContent = _agentsManager.GetAgentsMd(role);
                 if (repoContent == currentContent) continue;
 
-                _agentsManager.UpdateAgentsMd(roleName, repoContent);
+                _agentsManager.UpdateAgentsMd(role, repoContent);
 
                 // Only broadcast to Docker workers — Orchestrator/MergeWorker have no gRPC equivalent
                 if (WorkerRoles.BroadcastableRoles.Contains(role))
@@ -1125,7 +1126,7 @@ public sealed class GoalDispatcher : BackgroundService
 
         pipeline.Metrics.Iteration = pipeline.Iteration;
         pipeline.Metrics.Duration = duration;
-        pipeline.Metrics.Verdict = "PASS";
+        pipeline.Metrics.Verdict = TaskVerdict.Pass;
         pipeline.Metrics.RetryCount = pipeline.ReviewRetries + pipeline.TestRetries;
         pipeline.Metrics.ReviewRetryCount = pipeline.ReviewRetries;
         pipeline.Metrics.TestRetryCount = pipeline.TestRetries;
@@ -1208,7 +1209,7 @@ public sealed class GoalDispatcher : BackgroundService
 
         pipeline.Metrics.Iteration = pipeline.Iteration;
         pipeline.Metrics.Duration = duration;
-        pipeline.Metrics.Verdict = "FAIL";
+        pipeline.Metrics.Verdict = TaskVerdict.Fail;
         pipeline.Metrics.RetryCount = pipeline.ReviewRetries + pipeline.TestRetries;
         pipeline.Metrics.ReviewRetryCount = pipeline.ReviewRetries;
         pipeline.Metrics.TestRetryCount = pipeline.TestRetries;
@@ -1258,10 +1259,12 @@ public sealed class GoalDispatcher : BackgroundService
             }
             : null;
 
-        string? reviewVerdict = string.IsNullOrWhiteSpace(metrics.ReviewVerdict) ? null
-            : metrics.ReviewVerdict.Equals("APPROVED", StringComparison.OrdinalIgnoreCase) ? "approve"
-            : metrics.ReviewVerdict.Equals("CHANGES_REQUESTED", StringComparison.OrdinalIgnoreCase) ? "reject"
-            : metrics.ReviewVerdict.ToLowerInvariant();
+        string? reviewVerdict = metrics.ReviewVerdict switch
+        {
+            ReviewVerdict.Approve => "approve",
+            ReviewVerdict.RequestChanges => "reject",
+            _ => null,
+        };
 
         var notes = new List<string>();
         if (metrics.ImproverSkipped && !string.IsNullOrWhiteSpace(metrics.ImproverSkipReason))
@@ -1350,7 +1353,7 @@ public sealed class GoalDispatcher : BackgroundService
             foreach (var role in WorkerRoles.AgentRoles)
             {
                 var roleName = role.ToRoleName();
-                var history = _agentsManager.GetHistory(roleName);
+                var history = _agentsManager.GetHistory(role);
                 pipeline.Metrics.AgentsMdVersions[roleName] = $"v{history.Length:D3}";
             }
         }
@@ -1360,9 +1363,9 @@ public sealed class GoalDispatcher : BackgroundService
     /// Determines which roles had their AGENTS.md modified this iteration by comparing
     /// current versions against the previous iteration's recorded versions.
     /// </summary>
-    private List<string> GetModifiedRoles(IterationMetrics current)
+    private List<WorkerRole> GetModifiedRoles(IterationMetrics current)
     {
-        var modified = new List<string>();
+        var modified = new List<WorkerRole>();
         var history = _metricsTracker!.History;
 
         // Need at least 2 entries: previous + current (just recorded)
@@ -1371,12 +1374,14 @@ public sealed class GoalDispatcher : BackgroundService
 
         var previous = history[^2];
 
-        foreach (var (role, currentVersion) in current.AgentsMdVersions)
+        foreach (var (roleName, currentVersion) in current.AgentsMdVersions)
         {
-            if (!previous.AgentsMdVersions.TryGetValue(role, out var previousVersion)
+            if (!previous.AgentsMdVersions.TryGetValue(roleName, out var previousVersion)
                 || currentVersion != previousVersion)
             {
-                modified.Add(role);
+                var role = WorkerRoleExtensions.ParseRole(roleName);
+                if (role.HasValue)
+                    modified.Add(role.Value);
             }
         }
 

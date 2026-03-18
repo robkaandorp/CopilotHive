@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Workers;
 
 namespace CopilotHive.Tests;
 
@@ -13,10 +14,10 @@ public class HiveConfigurationTests
             GitHubToken = "fake",
         };
 
-        Assert.Equal("claude-opus-4.6", config.GetModelForRole("coder"));
-        Assert.Equal("gpt-5.3-codex", config.GetModelForRole("reviewer"));
-        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole("tester"));
-        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole("improver"));
+        Assert.Equal("claude-opus-4.6", config.GetModelForRole(WorkerRole.Coder));
+        Assert.Equal("gpt-5.3-codex", config.GetModelForRole(WorkerRole.Reviewer));
+        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole(WorkerRole.Tester));
+        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole(WorkerRole.Improver));
     }
 
     [Fact]
@@ -32,14 +33,14 @@ public class HiveConfigurationTests
             ImproverModel = "gpt-5.2",
         };
 
-        Assert.Equal("gpt-5.4", config.GetModelForRole("coder"));
-        Assert.Equal("claude-opus-4.6", config.GetModelForRole("reviewer"));
-        Assert.Equal("gpt-5-mini", config.GetModelForRole("tester"));
-        Assert.Equal("gpt-5.2", config.GetModelForRole("improver"));
+        Assert.Equal("gpt-5.4", config.GetModelForRole(WorkerRole.Coder));
+        Assert.Equal("claude-opus-4.6", config.GetModelForRole(WorkerRole.Reviewer));
+        Assert.Equal("gpt-5-mini", config.GetModelForRole(WorkerRole.Tester));
+        Assert.Equal("gpt-5.2", config.GetModelForRole(WorkerRole.Improver));
     }
 
     [Fact]
-    public void GetModelForRole_FallbackModel_UsedForCoderAndUnknownRoles()
+    public void GetModelForRole_FallbackModel_UsedForCoderAndUnmatchedRoles()
     {
         var config = new HiveConfiguration
         {
@@ -49,13 +50,13 @@ public class HiveConfigurationTests
         };
 
         // Coder falls back to Model (no CoderModel set)
-        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole("coder"));
-        // Unknown role falls back to Model
-        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole("planner"));
+        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole(WorkerRole.Coder));
+        // MergeWorker falls to default _ => Model
+        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole(WorkerRole.MergeWorker));
     }
 
     [Fact]
-    public void GetModelForRole_CaseInsensitive()
+    public void GetModelForRole_EnumValues_ReturnExpectedDefaults()
     {
         var config = new HiveConfiguration
         {
@@ -63,9 +64,9 @@ public class HiveConfigurationTests
             GitHubToken = "fake",
         };
 
-        Assert.Equal("claude-opus-4.6", config.GetModelForRole("Coder"));
-        Assert.Equal("gpt-5.3-codex", config.GetModelForRole("REVIEWER"));
-        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole("Tester"));
+        Assert.Equal("claude-opus-4.6", config.GetModelForRole(WorkerRole.Coder));
+        Assert.Equal("gpt-5.3-codex", config.GetModelForRole(WorkerRole.Reviewer));
+        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole(WorkerRole.Tester));
     }
 
     [Fact]
@@ -77,7 +78,7 @@ public class HiveConfigurationTests
             GitHubToken = "fake",
         };
 
-        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole("orchestrator"));
+        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole(WorkerRole.Orchestrator));
     }
 
     [Fact]
@@ -90,6 +91,6 @@ public class HiveConfigurationTests
             OrchestratorModel = "gpt-5-mini",
         };
 
-        Assert.Equal("gpt-5-mini", config.GetModelForRole("orchestrator"));
+        Assert.Equal("gpt-5-mini", config.GetModelForRole(WorkerRole.Orchestrator));
     }
 }

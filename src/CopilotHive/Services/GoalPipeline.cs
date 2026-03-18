@@ -3,6 +3,7 @@ using CopilotHive.Goals;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
+using CopilotHive.Workers;
 
 namespace CopilotHive.Services;
 
@@ -142,11 +143,11 @@ public sealed class GoalPipeline
     public DateTime? CompletedAt { get; private set; }
 
     /// <summary>
-    /// Model tier requested by the Brain for the most recently dispatched task ('standard' or 'premium').
-    /// Empty string means no tier has been explicitly set yet — the first Brain method that returns a
-    /// non-null model_tier will populate this (first non-null wins).
+    /// Model tier requested by the Brain for the most recently dispatched task.
+    /// <see cref="ModelTier.Default"/> means no tier has been explicitly set yet — the first Brain method
+    /// that returns a non-null model_tier will populate this (first non-null wins).
     /// </summary>
-    public string LatestModelTier { get; set; } = "";
+    public ModelTier LatestModelTier { get; set; } = ModelTier.Default;
 
     /// <summary>
     /// Creates a new pipeline for the specified goal.
@@ -263,9 +264,9 @@ public sealed class GoalPipeline
     }
 
     /// <summary>Record output from a completed phase.</summary>
-    public void RecordOutput(string role, int iteration, string output)
+    public void RecordOutput(WorkerRole role, int iteration, string output)
     {
-        PhaseOutputs[$"{role}-{iteration}"] = output;
+        PhaseOutputs[$"{role.ToRoleName()}-{iteration}"] = output;
     }
 
     /// <summary>Increment the review retry counter. Returns true if retries remain.</summary>
