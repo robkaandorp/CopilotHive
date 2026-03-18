@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using CopilotHive.Shared;
 using CopilotHive.Worker.Telemetry;
 using GitHub.Copilot.SDK;
 using Microsoft.Extensions.AI;
@@ -157,6 +158,18 @@ public sealed class CopilotRunner : IAsyncDisposable
              [Description("Build succeeded (true/false)")] bool buildSuccess,
              [Description("List of issues found, empty if none")] string[] issues) =>
             {
+                var error = ToolValidation.Check(
+                    (!string.IsNullOrEmpty(verdict), "verdict is required"),
+                    (verdict is "PASS" or "FAIL", "verdict must be exactly 'PASS' or 'FAIL'"),
+                    (totalTests >= 0, "totalTests must be >= 0"),
+                    (passedTests >= 0, "passedTests must be >= 0"),
+                    (failedTests >= 0, "failedTests must be >= 0"),
+                    (passedTests + failedTests <= totalTests,
+                        $"passedTests ({passedTests}) + failedTests ({failedTests}) must not exceed totalTests ({totalTests})"),
+                    (coveragePercent is >= -1 and <= 100,
+                        $"coveragePercent must be -1 (unavailable) or 0-100, got {coveragePercent}"));
+                if (error is not null) return error;
+
                 _log.Info($"Tool call: report_test_results(verdict={verdict}, total={totalTests}, passed={passedTests}, failed={failedTests}, coverage={coveragePercent})");
                 _lastTestReport = new TestResultReport
                 {
