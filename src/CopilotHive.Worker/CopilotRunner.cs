@@ -295,6 +295,7 @@ public sealed class CopilotRunner : IAsyncDisposable
     /// <summary>
     /// Send a prompt to the Copilot CLI and return the response text.
     /// With streaming enabled, captures tool execution events and intent updates.
+    /// Retries with exponential backoff on transient SDK errors (rate limits, model timeouts).
     /// </summary>
     public async Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
     {
@@ -304,10 +305,27 @@ public sealed class CopilotRunner : IAsyncDisposable
         _log.Info($"Sending prompt ({prompt.Length} chars) to localhost:{_port}");
         _log.LogBlock("PROMPT TO MODEL", prompt);
 
+        var result = await CopilotHive.Shared.CopilotRetryPolicy.ExecuteAsync(
+            () => SendPromptCoreAsync(prompt, ct),
+            onRetry: (attempt, delay, ex) =>
+            {
+                Console.WriteLine($"[SDK] Copilot call failed (attempt {attempt}/{CopilotHive.Shared.CopilotRetryPolicy.MaxRetries + 1}): {ex.Message}");
+                Console.WriteLine($"[SDK] Retrying in {delay.TotalSeconds:F0}s...");
+                Console.Out.Flush();
+            },
+            ct);
+
+        _log.Info($"Received response ({result.Length} chars)");
+        _log.LogBlock("MODEL RESPONSE", result);
+        return result;
+    }
+
+    private async Task<string> SendPromptCoreAsync(string prompt, CancellationToken ct)
+    {
         var done = new TaskCompletionSource<string>();
         var response = "";
 
-        using var subscription = _session.On(evt =>
+        using var subscription = _session!.On(evt =>
         {
             switch (evt)
             {
@@ -376,12 +394,8 @@ public sealed class CopilotRunner : IAsyncDisposable
 
         using var ctReg = ct.Register(() => done.TrySetCanceled());
 
-        await _session.SendAsync(new MessageOptions { Prompt = prompt });
-        var result = await done.Task;
-
-        _log.Info($"Received response ({result.Length} chars)");
-        _log.LogBlock("MODEL RESPONSE", result);
-        return result;
+        await _session!.SendAsync(new MessageOptions { Prompt = prompt });
+        return await done.Task;
     }
 
     /// <summary>Disposes the active Copilot session and stops the underlying client.</summary>

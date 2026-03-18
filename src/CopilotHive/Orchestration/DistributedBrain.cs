@@ -687,72 +687,65 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     private async Task<OrchestratorDecision?> AskAsync(GoalPipeline pipeline, string prompt, CancellationToken ct)
     {
-        const int maxRetries = 2;
-
-        for (var attempt = 0; attempt <= maxRetries; attempt++)
+        try
         {
-            try
-            {
-                var session = await GetOrCreateSessionAsync(pipeline, ct);
+            var session = await GetOrCreateSessionAsync(pipeline, ct);
 
-                _logger.LogDebug("Brain prompt for {GoalId}:\n{Prompt}", pipeline.GoalId, Truncate(prompt, Constants.TruncationVerbose));
-
-                var response = await SendToSessionAsync(session, prompt, ct);
-
-                _logger.LogDebug("Brain response for {GoalId}:\n{Response}", pipeline.GoalId, Truncate(response, Constants.TruncationVerbose));
-
-                // Keep audit log in the pipeline for debugging
-                pipeline.Conversation.Add(new ConversationEntry("user", prompt));
-                pipeline.Conversation.Add(new ConversationEntry("assistant", response));
-
-                var parsed = ProtocolJson.ParseFromLlmResponse<OrchestratorDecision>(response);
-                if (parsed is not null)
-                    return parsed;
-
-                _logger.LogWarning("Failed to parse Brain JSON response (attempt {Attempt}/{Max}): {Response}",
-                    attempt + 1, maxRetries + 1, Truncate(response, Constants.TruncationShort));
-
-                // Retry on parse failure — the LLM may produce valid JSON on the next attempt
-                if (attempt < maxRetries)
+            return await Shared.CopilotRetryPolicy.ExecuteAsync(
+                async () =>
                 {
-                    _logger.LogInformation("Retrying Brain query for {GoalId} after parse failure (attempt {Attempt})",
-                        pipeline.GoalId, attempt + 2);
-                    continue;
-                }
+                    _logger.LogDebug("Brain prompt for {GoalId}:\n{Prompt}", pipeline.GoalId, Truncate(prompt, Constants.TruncationVerbose));
 
-                return null;
-            }
-            catch (TaskCanceledException) when (attempt < maxRetries && !ct.IsCancellationRequested)
-            {
-                // Timeout from the per-query CancelAfter — retry
-                _logger.LogWarning(
-                    "Brain LLM query timed out for goal {GoalId} (attempt {Attempt}/{Max}) — retrying",
-                    pipeline.GoalId, attempt + 1, maxRetries + 1);
-                pipeline.Conversation.Add(new ConversationEntry("system", $"Timeout on attempt {attempt + 1}"));
-                await Task.Delay(TimeSpan.FromSeconds(Constants.RetryDelaySeconds), ct);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Brain LLM query failed for goal {GoalId} (attempt {Attempt}/{Max})",
-                    pipeline.GoalId, attempt + 1, maxRetries + 1);
-                pipeline.Conversation.Add(new ConversationEntry("system", $"Error: {ex.Message}"));
+                    var response = await SendToSessionCoreAsync(session, prompt, ct);
 
-                if (attempt < maxRetries)
+                    _logger.LogDebug("Brain response for {GoalId}:\n{Response}", pipeline.GoalId, Truncate(response, Constants.TruncationVerbose));
+
+                    pipeline.Conversation.Add(new ConversationEntry("user", prompt));
+                    pipeline.Conversation.Add(new ConversationEntry("assistant", response));
+
+                    var parsed = ProtocolJson.ParseFromLlmResponse<OrchestratorDecision>(response);
+                    return parsed ?? throw new InvalidOperationException(
+                        $"Failed to parse Brain JSON: {Truncate(response, Constants.TruncationShort)}");
+                },
+                onRetry: (attempt, delay, ex) =>
                 {
-                    _logger.LogInformation("Retrying Brain query for {GoalId} after error (attempt {Attempt})",
-                        pipeline.GoalId, attempt + 2);
-                    await Task.Delay(TimeSpan.FromSeconds(Constants.RetryDelaySeconds), ct);
-                    continue;
-                }
-
-                return null;
-            }
+                    _logger.LogWarning(
+                        "Brain query failed for {GoalId} (attempt {Attempt}/{Max}): {Error}. Retrying in {Delay}s",
+                        pipeline.GoalId, attempt, Shared.CopilotRetryPolicy.MaxRetries + 1, ex.Message, delay.TotalSeconds);
+                    pipeline.Conversation.Add(new ConversationEntry("system", $"Error on attempt {attempt}: {ex.Message}"));
+                },
+                ct);
         }
-
-        return null;
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Brain query failed for goal {GoalId} after all retries", pipeline.GoalId);
+            pipeline.Conversation.Add(new ConversationEntry("system", $"Final error: {ex.Message}"));
+            return null;
+        }
     }
 
-    private static async Task<string> SendToSessionAsync(CopilotSession session, string prompt, CancellationToken ct)
+    /// <summary>
+    /// Sends a prompt to a Copilot session with exponential backoff retry.
+    /// Used for priming, status updates, and other non-AskAsync calls.
+    /// </summary>
+    private async Task<string> SendToSessionAsync(CopilotSession session, string prompt, CancellationToken ct)
+    {
+        return await Shared.CopilotRetryPolicy.ExecuteAsync(
+            () => SendToSessionCoreAsync(session, prompt, ct),
+            onRetry: (attempt, delay, ex) =>
+            {
+                _logger.LogWarning(
+                    "Brain Copilot call failed (attempt {Attempt}/{Max}): {Error}. Retrying in {Delay}s",
+                    attempt, Shared.CopilotRetryPolicy.MaxRetries + 1, ex.Message, delay.TotalSeconds);
+            },
+            ct);
+    }
+
+    private static async Task<string> SendToSessionCoreAsync(CopilotSession session, string prompt, CancellationToken ct)
     {
         var done = new TaskCompletionSource<string>();
         var response = "";
