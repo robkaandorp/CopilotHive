@@ -195,206 +195,165 @@ public sealed class DistributedBrainTests
         Assert.Equal("merge complete", fake.Informations[0]);
     }
 
-    // ── FallbackParseTestMetrics / ApplyTestMetricsFallback Tests ────────
+    // ── BuildDecisionFromToolCall Tests ────────────────────────────────
 
     [Fact]
-    public void FallbackParseTestMetrics_DotnetTestSummary_ExtractsCorrectCounts()
+    public void BuildDecisionFromToolCall_ReportPlan_BuildsCorrectDecision()
     {
-        var output = "Passed!  - Failed:     0, Passed:   268, Skipped:     0, Total:   268";
-
-        var metrics = DistributedBrain.FallbackParseTestMetrics(output);
-
-        Assert.NotNull(metrics);
-        Assert.Equal(268, metrics.TotalTests);
-        Assert.Equal(268, metrics.PassedTests);
-        Assert.Equal(0,   metrics.FailedTests ?? -1); // 0 was explicitly in the output
-    }
-
-    [Fact]
-    public void FallbackParseTestMetrics_EmptyString_ReturnsNull()
-    {
-        var metrics = DistributedBrain.FallbackParseTestMetrics("");
-        Assert.Null(metrics);
-    }
-
-    [Fact]
-    public void FallbackParseTestMetrics_NoPatterns_ReturnsNull()
-    {
-        var metrics = DistributedBrain.FallbackParseTestMetrics("No test output here.");
-        Assert.Null(metrics);
-    }
-
-    [Fact]
-    public void FallbackParseTestMetrics_KeyValueLines_ExtractsCorrectCounts()
-    {
-        var output = "total: 8\npassed: 8\nfailed: 0";
-
-        var metrics = DistributedBrain.FallbackParseTestMetrics(output);
-
-        Assert.NotNull(metrics);
-        Assert.Equal(8, metrics.TotalTests);
-        Assert.Equal(8, metrics.PassedTests);
-    }
-
-    /// <summary>Test A — Brain returns valid test_metrics → those values are used.</summary>
-    [Fact]
-    public void ApplyTestMetricsFallback_BrainReturnsValidMetrics_BrainValuesUsed()
-    {
-        var logger = NullLogger<DistributedBrain>.Instance;
-        var decision = new OrchestratorDecision
+        var toolCall = new DistributedBrain.BrainToolCallResult("report_plan", new Dictionary<string, object?>
         {
-            TestMetrics = new ExtractedTestMetrics { TotalTests = 10, PassedTests = 9, FailedTests = 1 },
-        };
+            ["action"] = "spawn_coder",
+            ["prompt"] = "Implement the feature",
+            ["reason"] = "Starting with coding phase",
+            ["model_tier"] = "standard",
+        });
 
-        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Testing, "Passed: 5, Failed: 0, Total: 5", logger);
+        var decision = DistributedBrain.BuildDecisionFromToolCall(toolCall);
 
-        Assert.Equal(10, result.TestMetrics!.TotalTests);
-        Assert.Equal(9,  result.TestMetrics.PassedTests);
-        Assert.Equal(1,  result.TestMetrics.FailedTests);
+        Assert.Equal(OrchestratorActionType.SpawnCoder, decision.Action);
+        Assert.Equal("Implement the feature", decision.Prompt);
+        Assert.Equal("Starting with coding phase", decision.Reason);
+        Assert.Equal("standard", decision.ModelTier);
     }
 
-    /// <summary>Test B — Brain returns null test_metrics for testing phase → fallback kicks in.</summary>
     [Fact]
-    public void ApplyTestMetricsFallback_BrainReturnsNullMetrics_FallbackUsed()
+    public void BuildDecisionFromToolCall_ReportInterpretation_BuildsCorrectDecision()
     {
-        var logger = NullLogger<DistributedBrain>.Instance;
-        var decision = new OrchestratorDecision { TestMetrics = null };
-        var rawOutput = "Passed: 8, Failed: 0, Total: 8";
-
-        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Testing, rawOutput, logger);
-
-        Assert.NotNull(result.TestMetrics);
-        Assert.Equal(8, result.TestMetrics.TotalTests);
-        Assert.Equal(8, result.TestMetrics.PassedTests);
-        Assert.Equal(0, result.TestMetrics.FailedTests ?? -1); // 0 was explicitly in the output
-    }
-
-    /// <summary>Test C — Brain values take priority unless Brain values are 0.</summary>
-    [Fact]
-    public void ApplyTestMetricsFallback_BrainNonZero_BrainWins()
-    {
-        var logger = NullLogger<DistributedBrain>.Instance;
-        var decision = new OrchestratorDecision
+        var toolCall = new DistributedBrain.BrainToolCallResult("report_interpretation", new Dictionary<string, object?>
         {
-            TestMetrics = new ExtractedTestMetrics { TotalTests = 5, PassedTests = 5 },
-        };
-        // Raw output has 10 — Brain's 5 should win
-        var rawOutput = "total: 10\npassed: 10";
+            ["verdict"] = "PASS",
+            ["review_verdict"] = "",
+            ["issues"] = new string[] { "minor style issue" },
+            ["reason"] = "All tests passed, one minor style nit",
+            ["model_tier"] = "standard",
+        });
 
-        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Testing, rawOutput, logger);
+        var decision = DistributedBrain.BuildDecisionFromToolCall(toolCall);
 
-        Assert.Equal(5, result.TestMetrics!.TotalTests);
-        Assert.Equal(5, result.TestMetrics.PassedTests);
+        Assert.Equal(OrchestratorActionType.Done, decision.Action);
+        Assert.Equal("PASS", decision.Verdict);
+        Assert.Null(decision.ReviewVerdict);
+        Assert.Single(decision.Issues!);
+        Assert.Equal("minor style issue", decision.Issues![0]);
+        Assert.Equal("All tests passed, one minor style nit", decision.Reason);
     }
 
-    /// <summary>Test C (variant) — Brain returns total_tests: 0 → fallback wins.</summary>
     [Fact]
-    public void ApplyTestMetricsFallback_BrainReturnsZeroTotal_FallbackWins()
+    public void BuildDecisionFromToolCall_ReportInterpretation_ReviewVerdict()
     {
-        var logger = NullLogger<DistributedBrain>.Instance;
-        var decision = new OrchestratorDecision
+        var toolCall = new DistributedBrain.BrainToolCallResult("report_interpretation", new Dictionary<string, object?>
         {
-            TestMetrics = new ExtractedTestMetrics { TotalTests = 0, PassedTests = 0 },
-        };
-        var rawOutput = "total: 8\npassed: 8";
+            ["verdict"] = "FAIL",
+            ["review_verdict"] = "REQUEST_CHANGES",
+            ["issues"] = new string[] { "missing error handling", "no tests" },
+            ["reason"] = "Reviewer found critical issues",
+            ["model_tier"] = "premium",
+        });
 
-        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Testing, rawOutput, logger);
+        var decision = DistributedBrain.BuildDecisionFromToolCall(toolCall);
 
-        Assert.Equal(8, result.TestMetrics!.TotalTests);
-        Assert.Equal(8, result.TestMetrics.PassedTests);
+        Assert.Equal("FAIL", decision.Verdict);
+        Assert.Equal("REQUEST_CHANGES", decision.ReviewVerdict);
+        Assert.Equal(2, decision.Issues!.Count);
+        Assert.Equal("Reviewer found critical issues", decision.Reason);
+        Assert.Equal("premium", decision.ModelTier);
     }
 
     [Fact]
-    public void ApplyTestMetricsFallback_NonTesterRole_NoChange()
+    public void BuildDecisionFromToolCall_UnknownTool_Throws()
     {
-        var logger = NullLogger<DistributedBrain>.Instance;
-        var decision = new OrchestratorDecision { TestMetrics = null };
-        var rawOutput = "total: 8\npassed: 8";
+        var toolCall = new DistributedBrain.BrainToolCallResult("unknown_tool", new Dictionary<string, object?>());
 
-        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Coding, rawOutput, logger);
-
-        Assert.Null(result.TestMetrics);
+        Assert.Throws<InvalidOperationException>(() => DistributedBrain.BuildDecisionFromToolCall(toolCall));
     }
 
-    // ── New: xUnit / fallback-merge Tests ────────────────────────────────
-
-    [Fact]
-    public void FallbackParseTestMetrics_XUnitRunnerFormat_ExtractsCorrectCounts()
+    [Theory]
+    [InlineData("spawn_coder", OrchestratorActionType.SpawnCoder)]
+    [InlineData("spawn_tester", OrchestratorActionType.SpawnTester)]
+    [InlineData("spawn_reviewer", OrchestratorActionType.SpawnReviewer)]
+    [InlineData("spawn_doc_writer", OrchestratorActionType.SpawnDocWriter)]
+    [InlineData("spawn_improver", OrchestratorActionType.SpawnImprover)]
+    [InlineData("request_changes", OrchestratorActionType.RequestChanges)]
+    [InlineData("retry", OrchestratorActionType.Retry)]
+    [InlineData("merge", OrchestratorActionType.Merge)]
+    [InlineData("done", OrchestratorActionType.Done)]
+    [InlineData("skip", OrchestratorActionType.Skip)]
+    public void BuildDecisionFromToolCall_AllActions_ParseCorrectly(string actionStr, OrchestratorActionType expected)
     {
-        // Real xUnit runner output with extra spaces
-        var output = "Passed!  - Failed:     0, Passed:   322, Skipped:     0, Total:   322, Duration: 3s";
-
-        var result = DistributedBrain.FallbackParseTestMetrics(output);
-
-        Assert.NotNull(result);
-        Assert.Equal(322, result.PassedTests);
-        Assert.Equal(322, result.TotalTests);
-        Assert.Equal(0,   result.FailedTests ?? -1);
-        Assert.Equal(0,   result.SkippedTests ?? -1);
-    }
-
-    [Fact]
-    public void FallbackParseTestMetrics_StandardDotnetFormat_ExtractsCorrectCounts()
-    {
-        var output = "Failed: 0, Passed: 322, Skipped: 0, Total: 322, Duration: 2s";
-
-        var result = DistributedBrain.FallbackParseTestMetrics(output);
-
-        Assert.NotNull(result);
-        Assert.Equal(322, result.PassedTests);
-        Assert.Equal(322, result.TotalTests);
-    }
-
-    /// <summary>Core bug: Brain extracted TotalTests but not PassedTests → fallback PassedTests used.</summary>
-    [Fact]
-    public void ApplyTestMetricsFallback_BrainPassedZeroFallbackNonZero_FallbackPassedUsed()
-    {
-        var logger = NullLogger<DistributedBrain>.Instance;
-        var decision = new OrchestratorDecision
+        var toolCall = new DistributedBrain.BrainToolCallResult("report_plan", new Dictionary<string, object?>
         {
-            TestMetrics = new ExtractedTestMetrics { TotalTests = 331, PassedTests = 0 },
-        };
-        var testerOutput = "Passed!  - Failed:     9, Passed:   322, Skipped:     0, Total:   331";
+            ["action"] = actionStr, ["prompt"] = "", ["reason"] = "", ["model_tier"] = "standard",
+        });
 
-        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Testing, testerOutput, logger);
+        var decision = DistributedBrain.BuildDecisionFromToolCall(toolCall);
 
-        Assert.NotNull(result.TestMetrics);
-        Assert.Equal(322, result.TestMetrics.PassedTests);
-        Assert.Equal(331, result.TestMetrics.TotalTests);
+        Assert.Equal(expected, decision.Action);
     }
 
-    /// <summary>Both Brain and fallback have PassedTests=0 → keep 0.</summary>
     [Fact]
-    public void ApplyTestMetricsFallback_BrainPassedZeroFallbackZero_KeepsZero()
+    public void BuildDecisionFromToolCall_InvalidAction_Throws()
     {
-        var logger = NullLogger<DistributedBrain>.Instance;
-        var decision = new OrchestratorDecision
+        var toolCall = new DistributedBrain.BrainToolCallResult("report_plan", new Dictionary<string, object?>
         {
-            TestMetrics = new ExtractedTestMetrics { TotalTests = 10, PassedTests = 0 },
-        };
-        var testerOutput = "Failed: 10, Passed: 0, Skipped: 0, Total: 10";
+            ["action"] = "invalid_action", ["prompt"] = "", ["reason"] = "", ["model_tier"] = "standard",
+        });
 
-        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Testing, testerOutput, logger);
-
-        Assert.NotNull(result.TestMetrics);
-        Assert.Equal(0, result.TestMetrics.PassedTests ?? -1);
+        Assert.Throws<InvalidOperationException>(() => DistributedBrain.BuildDecisionFromToolCall(toolCall));
     }
 
-    /// <summary>Brain has PassedTests=5 → Brain wins even if fallback has 322.</summary>
+    // ── BuildIterationPlanFromToolCall Tests ─────────────────────────────
+
     [Fact]
-    public void ApplyTestMetricsFallback_BrainPassedNonZero_BrainPassedWins()
+    public void BuildIterationPlanFromToolCall_ValidPhases_BuildsCorrectPlan()
     {
-        var logger = NullLogger<DistributedBrain>.Instance;
-        var decision = new OrchestratorDecision
+        var toolCall = new DistributedBrain.BrainToolCallResult("report_iteration_plan", new Dictionary<string, object?>
         {
-            TestMetrics = new ExtractedTestMetrics { TotalTests = 5, PassedTests = 5 },
-        };
-        var testerOutput = "Passed!  - Failed:     0, Passed:   322, Skipped:     0, Total:   322";
+            ["phases"] = new string[] { "coding", "testing", "review", "merging" },
+            ["phase_instructions"] = """{"coding":"focus on tests","review":"check edge cases"}""",
+            ["reason"] = "Standard workflow",
+        });
 
-        var result = DistributedBrain.ApplyTestMetricsFallback(decision, GoalPhase.Testing, testerOutput, logger);
+        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
 
-        Assert.NotNull(result.TestMetrics);
-        Assert.Equal(5, result.TestMetrics.PassedTests);
+        Assert.Equal(4, plan.Phases.Count);
+        Assert.Equal(GoalPhase.Coding, plan.Phases[0]);
+        Assert.Equal(GoalPhase.Testing, plan.Phases[1]);
+        Assert.Equal(GoalPhase.Review, plan.Phases[2]);
+        Assert.Equal(GoalPhase.Merging, plan.Phases[3]);
+        Assert.Equal("Standard workflow", plan.Reason);
+        Assert.Equal("focus on tests", plan.PhaseInstructions[GoalPhase.Coding]);
+    }
+
+    [Fact]
+    public void BuildIterationPlanFromToolCall_EmptyPhases_ReturnsEmptyPlan()
+    {
+        var toolCall = new DistributedBrain.BrainToolCallResult("report_iteration_plan", new Dictionary<string, object?>
+        {
+            ["phases"] = Array.Empty<string>(),
+            ["phase_instructions"] = "{}",
+            ["reason"] = "nothing to do",
+        });
+
+        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+
+        Assert.Empty(plan.Phases);
+    }
+
+    [Fact]
+    public void BuildIterationPlanFromToolCall_InvalidPhaseNames_Skipped()
+    {
+        var toolCall = new DistributedBrain.BrainToolCallResult("report_iteration_plan", new Dictionary<string, object?>
+        {
+            ["phases"] = new string[] { "coding", "invalid_phase", "testing" },
+            ["phase_instructions"] = "{}",
+            ["reason"] = "test",
+        });
+
+        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+
+        Assert.Equal(2, plan.Phases.Count);
+        Assert.Equal(GoalPhase.Coding, plan.Phases[0]);
+        Assert.Equal(GoalPhase.Testing, plan.Phases[1]);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────

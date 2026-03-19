@@ -1,11 +1,13 @@
 using System.Collections.Concurrent;
+using System.ComponentModel;
 using System.Text;
-using System.Text.RegularExpressions;
+using System.Text.Json;
 using CopilotHive.Metrics;
 using CopilotHive.Services;
 using CopilotHive.Telemetry;
 using CopilotHive.Workers;
 using GitHub.Copilot.SDK;
+using Microsoft.Extensions.AI;
 
 namespace CopilotHive.Orchestration;
 
@@ -23,6 +25,21 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly ConcurrentDictionary<string, CopilotSession> _sessions = new();
 
     private readonly CustomAgentConfig _orchestratorAgent;
+    private readonly List<AIFunction> _brainTools;
+
+    /// <summary>
+    /// Serialises all Brain LLM calls so that <see cref="_lastToolCallResult"/> is
+    /// never overwritten by a concurrent goal's tool lambda.
+    /// </summary>
+    private readonly SemaphoreSlim _brainCallGate = new(1, 1);
+
+    /// <summary>
+    /// Stores the last tool call result captured by the Brain tool lambdas.
+    /// Written by tool lambdas (from SDK thread), read by <see cref="SendToSessionCoreAsync"/>
+    /// after <see cref="SessionIdleEvent"/> fires.
+    /// Access is serialised by <see cref="_brainCallGate"/>.
+    /// </summary>
+    private volatile BrainToolCallResult? _lastToolCallResult;
 
     private const string SystemPrompt = """
         You are the CopilotHive Orchestrator Brain — a product owner and project manager
@@ -30,15 +47,15 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         - You decide which workers to spawn and in what order
         - You craft the prompts sent to workers (coder, reviewer, tester, improver)
-        - You interpret worker output to determine verdicts and extract metrics
+        - You interpret worker output to determine verdicts
         - You decide whether to retry, skip, or proceed to the next phase
 
         CRITICAL RULES:
-        - Do NOT run any shell commands, tools, or file operations.
+        - Do NOT run any shell commands, tools, or file operations other than the reporting tools provided.
         - Do NOT explore the filesystem, install packages, or execute code.
-        - You are a REASONING-ONLY agent. Analyze text input and produce JSON responses.
-        - Always respond with valid JSON matching the requested schema.
-        - Do NOT wrap the JSON in markdown code fences. Return ONLY the JSON object.
+        - You are a REASONING agent. Analyze input and report decisions via tool calls.
+        - Always call the appropriate tool (report_plan, report_iteration_plan, report_interpretation) to report your decision.
+        - Do NOT return raw JSON in your response — use the tools provided.
         """;
 
     /// <summary>
@@ -65,17 +82,20 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _logger = logger;
         _metricsTracker = metricsTracker;
 
-        // Build the orchestrator custom agent with no tools (reasoning-only)
+        _brainTools = BuildBrainTools();
+        var toolNames = _brainTools.Select(t => t.Name).ToList();
+
+        // Build the orchestrator custom agent with Brain-specific tools
         var orchestratorInstructions = agentsManager?.GetAgentsMd(WorkerRole.Orchestrator) ?? "";
         _orchestratorAgent = new CustomAgentConfig
         {
             Name = "orchestrator",
             DisplayName = "CopilotHive Orchestrator",
-            Description = "LLM-powered product owner and project manager — reasoning only, no tools",
+            Description = "LLM-powered product owner and project manager — reports decisions via tool calls",
             Prompt = string.IsNullOrWhiteSpace(orchestratorInstructions)
                 ? SystemPrompt
                 : $"{SystemPrompt}\n\n{orchestratorInstructions}",
-            Tools = [], // no tools — pure reasoning agent
+            Tools = toolNames,
             Infer = false,
         };
     }
@@ -131,7 +151,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         Streaming = false,
         OnPermissionRequest = DenyAllPermissions,
         CustomAgents = [_orchestratorAgent],
-        AvailableTools = [], // no tools for the orchestrator — pure reasoning
+        Tools = _brainTools,
         InfiniteSessions = new InfiniteSessionConfig
         {
             Enabled = true,
@@ -139,6 +159,101 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             BufferExhaustionThreshold = 0.95,
         },
     };
+
+    /// <summary>
+    /// Builds the AIFunction tools that the Brain LLM can call to report structured decisions.
+    /// Each tool captures its arguments into <see cref="_lastToolCallResult"/> so the caller
+    /// can read the structured result after <see cref="SessionIdleEvent"/> fires.
+    /// </summary>
+    private List<AIFunction> BuildBrainTools()
+    {
+        var validActions = new HashSet<string>(
+            BrainActions.PlanningActions.Concat(BrainActions.NextStepActions).Distinct());
+        var validPhases = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "coding", "testing", "docwriting", "review", "improve", "merging" };
+        var validModelTiers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "standard", "premium" };
+
+        return
+        [
+            AIFunctionFactory.Create(
+                ([Description("Action: spawn_coder, spawn_tester, spawn_reviewer, spawn_doc_writer, spawn_improver, request_changes, retry, merge, done, skip")] string action,
+                 [Description("The prompt to send to the worker, if spawning one")] string prompt,
+                 [Description("Why you chose this action")] string reason,
+                 [Description("Model tier: standard or premium")] string model_tier) =>
+                {
+                    var isSpawn = action?.StartsWith("spawn_", StringComparison.Ordinal) == true;
+                    var error = Shared.ToolValidation.Check(
+                        (!string.IsNullOrEmpty(action), "action is required"),
+                        (action is not null && validActions.Contains(action),
+                            $"action must be one of: {string.Join(", ", validActions)}"),
+                        (!isSpawn || !string.IsNullOrWhiteSpace(prompt),
+                            "prompt is required when spawning a worker"),
+                        (!string.IsNullOrEmpty(reason), "reason is required"),
+                        (string.IsNullOrEmpty(model_tier) || validModelTiers.Contains(model_tier),
+                            "model_tier must be 'standard' or 'premium'"));
+                    if (error is not null) return error;
+
+                    _lastToolCallResult = new BrainToolCallResult("report_plan", new Dictionary<string, object?>
+                    {
+                        ["action"] = action, ["prompt"] = prompt, ["reason"] = reason, ["model_tier"] = model_tier,
+                    });
+                    return "Decision recorded.";
+                },
+                "report_plan",
+                "Report your orchestration decision — which worker to spawn, what prompt to send, and why."),
+
+            AIFunctionFactory.Create(
+                ([Description("Ordered phase names, e.g. [\"coding\",\"testing\",\"docwriting\",\"review\",\"merging\"]")] string[] phases,
+                 [Description("JSON-encoded dict of phase name to instruction, e.g. {\"coding\":\"focus on...\",\"review\":\"check...\"}")] string phase_instructions,
+                 [Description("Why you chose this iteration plan")] string reason) =>
+                {
+                    var invalidPhases = phases?.Where(p => !validPhases.Contains(p)).ToList() ?? [];
+                    var error = Shared.ToolValidation.Check(
+                        (phases is { Length: > 0 }, "phases must be a non-empty array"),
+                        (invalidPhases.Count == 0,
+                            $"invalid phase names: {string.Join(", ", invalidPhases)}. Valid: {string.Join(", ", validPhases)}"),
+                        (!string.IsNullOrEmpty(reason), "reason is required"));
+                    if (error is not null) return error;
+
+                    _lastToolCallResult = new BrainToolCallResult("report_iteration_plan", new Dictionary<string, object?>
+                    {
+                        ["phases"] = phases, ["phase_instructions"] = phase_instructions, ["reason"] = reason,
+                    });
+                    return "Iteration plan recorded.";
+                },
+                "report_iteration_plan",
+                "Report your iteration plan — which phases to run and in what order."),
+
+            AIFunctionFactory.Create(
+                ([Description("Verdict: PASS or FAIL")] string verdict,
+                 [Description("Review verdict: APPROVE or REQUEST_CHANGES (for review phase only, empty string otherwise)")] string review_verdict,
+                 [Description("List of issues found")] string[] issues,
+                 [Description("Why this verdict — what went right or wrong")] string reason,
+                 [Description("Model tier: standard or premium")] string model_tier) =>
+                {
+                    var error = Shared.ToolValidation.Check(
+                        (!string.IsNullOrEmpty(verdict), "verdict is required"),
+                        (verdict is "PASS" or "FAIL", "verdict must be exactly 'PASS' or 'FAIL'"),
+                        (string.IsNullOrEmpty(review_verdict) || review_verdict is "APPROVE" or "REQUEST_CHANGES",
+                            "review_verdict must be empty, 'APPROVE', or 'REQUEST_CHANGES'"),
+                        (!string.IsNullOrEmpty(reason), "reason is required"),
+                        (string.IsNullOrEmpty(model_tier) || validModelTiers.Contains(model_tier),
+                            "model_tier must be 'standard' or 'premium'"));
+                    if (error is not null) return error;
+
+                    _lastToolCallResult = new BrainToolCallResult("report_interpretation", new Dictionary<string, object?>
+                    {
+                        ["verdict"] = verdict, ["review_verdict"] = review_verdict, ["issues"] = issues, ["reason"] = reason, ["model_tier"] = model_tier,
+                    });
+                    return "Interpretation recorded.";
+                },
+                "report_interpretation",
+                "Report your interpretation of worker output — verdict, issues, reason, and review verdict if applicable."),
+        ];
+    }
+
+    /// <summary>Result captured from a Brain tool call.</summary>
+    internal sealed record BrainToolCallResult(string ToolName, Dictionary<string, object?> Arguments);
 
     /// <summary>
     /// Gets or creates a dedicated Copilot session for a goal.
@@ -293,15 +408,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - NEVER include git checkout, git branch, git switch, or git push commands — the infrastructure handles all branching
             - NEVER include framework-specific build/test commands (dotnet build, npm test, etc.) — tell workers to use /build and /test skills
 
-            Respond with JSON:
-            {
-              "action": "spawn_coder",
-              "prompt": "<the prompt you want to send to the first worker>",
-              "reason": "<why you chose this plan>",
-              "model_tier": "standard or premium — default is standard; only use premium after a FAILED attempt"
-            }
-
+            Call the `report_plan` tool with your decision.
             Valid actions: {{BrainActions.FormatForPrompt(BrainActions.PlanningActions)}}
+            Model tier should be 'standard' unless a previous attempt FAILED and needs a stronger model.
             """;
 
         var decision = await AskAsync(pipeline, prompt, ct);
@@ -366,37 +475,41 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             Available phases: coding, testing, docwriting, review, improve, merging
 
-            Respond with JSON:
-            {
-              "phases": ["coding", "testing", "docwriting", "review", "merging"],
-              "phase_instructions": {
-                "coding": "specific instructions for the coder...",
-                "review": "focus review on..."
-              },
-              "reason": "why this plan"
-            }
+            Call the `report_iteration_plan` tool with:
+            - phases: ordered list of phase names
+            - phase_instructions: JSON object with per-phase instructions (e.g. {"coding": "focus on...", "review": "check..."})
+            - reason: why this plan
             """;
 
         try
         {
             var session = await GetOrCreateSessionAsync(pipeline, ct);
-            var response = await SendToSessionAsync(session, prompt, ct);
+            var (response, toolCall) = await Shared.CopilotRetryPolicy.ExecuteAsync(
+                () => SendToSessionCoreAsync(session, prompt, ct),
+                onRetry: (attempt, delay, ex) =>
+                {
+                    _logger.LogWarning(
+                        "Brain iteration plan call failed (attempt {Attempt}/{Max}): {Error}. Retrying in {Delay}s",
+                        attempt, Shared.CopilotRetryPolicy.MaxRetries + 1, ex.Message, delay.TotalSeconds);
+                },
+                ct);
 
             pipeline.Conversation.Add(new ConversationEntry("user", prompt));
             pipeline.Conversation.Add(new ConversationEntry("assistant", response));
 
-            var dto = ProtocolJson.ParseFromLlmResponse<IterationPlanDto>(response);
-            if (dto?.Phases is { Count: > 0 })
+            if (toolCall is not { ToolName: "report_iteration_plan" })
+                throw new InvalidOperationException(
+                    $"Brain did not call report_iteration_plan for {pipeline.GoalId}. Tool: {toolCall?.ToolName ?? "none"}");
+
+            var plan = BuildIterationPlanFromToolCall(toolCall);
+
+            if (plan is { Phases.Count: > 0 })
             {
-                var plan = MapIterationPlan(dto);
-                if (plan.Phases.Count > 0)
-                {
-                    _logger.LogInformation(
-                        "Brain planned iteration {Iteration} for goal {GoalId}: [{Phases}] — {Reason}",
-                        pipeline.Iteration, pipeline.GoalId,
-                        string.Join(", ", plan.Phases), plan.Reason ?? "no reason");
-                    return plan;
-                }
+                _logger.LogInformation(
+                    "Brain planned iteration {Iteration} for goal {GoalId}: [{Phases}] — {Reason}",
+                    pipeline.Iteration, pipeline.GoalId,
+                    string.Join(", ", plan.Phases), plan.Reason ?? "no reason");
+                return plan;
             }
 
             _logger.LogWarning("Failed to parse iteration plan from Brain response: {Response}",
@@ -440,6 +553,48 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             PhaseInstructions = instructions,
             Reason = dto.Reason,
         };
+    }
+
+    /// <summary>
+    /// Builds an <see cref="IterationPlan"/> from a <c>report_iteration_plan</c> tool call result.
+    /// </summary>
+    internal static IterationPlan BuildIterationPlanFromToolCall(BrainToolCallResult toolCall)
+    {
+        var args = toolCall.Arguments;
+
+        var phaseNames = new List<string>();
+        if (args.TryGetValue("phases", out var phasesVal) && phasesVal is not null)
+        {
+            if (phasesVal is string[] arr)
+                phaseNames = arr.ToList();
+            else if (phasesVal is JsonElement je && je.ValueKind == JsonValueKind.Array)
+                phaseNames = je.EnumerateArray().Select(e => e.GetString() ?? "").ToList();
+            else if (phasesVal is IEnumerable<object> list)
+                phaseNames = list.Select(x => x?.ToString() ?? "").ToList();
+        }
+
+        Dictionary<string, string>? phaseInstructions = null;
+        var piStr = GetStringArg(args, "phase_instructions");
+        if (!string.IsNullOrEmpty(piStr))
+        {
+            try
+            {
+                phaseInstructions = JsonSerializer.Deserialize<Dictionary<string, string>>(piStr, ProtocolJson.Options);
+            }
+            catch (JsonException)
+            {
+                // Best-effort: ignore unparsable phase instructions
+            }
+        }
+
+        var dto = new IterationPlanDto
+        {
+            Phases = phaseNames,
+            PhaseInstructions = phaseInstructions,
+            Reason = GetStringArg(args, "reason"),
+        };
+
+        return MapIterationPlan(dto);
     }
 
     /// <summary>DTO for deserializing the Brain's iteration plan JSON response.</summary>
@@ -505,15 +660,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {{roleInstruction}}
             - Include any context from previous phases that would help the worker
 
-            Respond with JSON:
-            {
-              "action": "spawn_{{roleName}}",
-              "prompt": "<the complete prompt to send to the worker>",
-              "reason": "<why you crafted the prompt this way>",
-              "model_tier": "standard or premium — default is standard; only use premium after a FAILED attempt"
-            }
-
-            You may specify a model tier in your response. Add a 'model_tier' field with value 'standard' or 'premium'. Default is 'standard'. Only use 'premium' when: (1) a previous attempt FAILED and needs a stronger model, or (2) the task requires fixing complex bugs found in review. Do NOT use premium for first attempts or routine tasks — standard models are capable enough.
+            Call the `report_plan` tool with action=spawn_{{roleName}} and the prompt you crafted.
+            Model tier should be 'standard' unless a previous attempt FAILED and needs a stronger model.
             """;
 
         var decision = await AskAsync(pipeline, prompt, ct);
@@ -535,92 +683,41 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     public async Task<OrchestratorDecision> InterpretOutputAsync(
         GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default)
     {
-        var schema = phase switch
-        {
-            GoalPhase.Coding => """
-                {
-                  "verdict": "PASS or FAIL",
-                  "issues": ["<issue1>", "<issue2>"],
-                  "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
-                }
-                """,
-            GoalPhase.Testing => """
-                {
-                  "verdict": "PASS or FAIL",
-                  "test_metrics": {
-                    "build_success": true/false,
-                    "total_tests": <number>,
-                    "passed_tests": <number>,
-                    "failed_tests": <number>,
-                    "coverage_percent": <number>
-                  },
-                  "issues": ["<issue1>", "<issue2>"],
-                  "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
-                }
-                """,
-            GoalPhase.Review => """
-                {
-                  "review_verdict": "APPROVE or REQUEST_CHANGES",
-                  "issues": ["<issue1>", "<issue2>"],
-                  "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
-                }
-                """,
-            GoalPhase.DocWriting => """
-                {
-                  "verdict": "PASS or FAIL",
-                  "issues": ["<issue1>", "<issue2>"],
-                  "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
-                }
-                """,
-            GoalPhase.Improve => """
-                {
-                  "verdict": "PASS or FAIL",
-                  "issues": ["<issue1>", "<issue2>"],
-                  "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
-                }
-                """,
-            _ => throw new InvalidOperationException($"Unhandled phase in InterpretOutputAsync: '{phase}'"),
-        };
-
         var phaseName = phase.ToString();
 
         var modeInstruction = """
               IMPORTANT: You are in INTERPRETATION mode, NOT prompt-crafting mode.
-              Do NOT return an "action" or "prompt" field. Do NOT suggest spawning any worker.
+              Do NOT suggest spawning any worker.
               Your ONLY job is to analyze the output below and return a verdict.
 
               """;
 
-        var testerInstruction = phase == GoalPhase.Testing
+        var reviewInstruction = phase == GoalPhase.Review
             ? """
 
-              CRITICAL TESTER INSTRUCTIONS:
-              For tester output: You MUST extract test counts from the output. Look for patterns like
-              'Passed: N, Failed: N, Total: N' or 'Passed! - Failed: 0, Passed: 322, Skipped: 0, Total: 322'
-              or 'X passed, Y failed' or 'Tests run: N'. The `total_tests` and `passed_tests` fields inside
-              `test_metrics` are REQUIRED when the worker phase is Testing — do NOT leave them null or zero
-              if the output contains numeric results.
+              For reviewers: set review_verdict to 'APPROVE' or 'REQUEST_CHANGES'.
 
               """
             : "";
 
         var prompt = $$"""
-            {{modeInstruction}}Interpret this {{phaseName}}'s output and extract structured data.
-            {{testerInstruction}}
+            {{modeInstruction}}Interpret this {{phaseName}}'s output.
+            {{reviewInstruction}}
             === {{phaseName.ToUpperInvariant()}} OUTPUT (truncated) ===
             {{Truncate(workerOutput, Constants.TruncationVeryLong)}}
             === END OUTPUT ===
 
             Analyze the output carefully:
             - Did the worker succeed or fail at its task?
-            - For testers: did all tests pass? What are the numbers? You MUST populate the test_metrics object with actual numbers from the output — look for test counts in tables, summaries, or test runner output.
             - For reviewers: did they approve or request changes? What issues?
-            - For docwriters: did they update CHANGELOG, README, or XML doc comments? Did they produce a DOC_REPORT? Did they commit?
+            - For docwriters: did they update CHANGELOG, README, or XML doc comments? Did they commit?
             - For coders: did they make code changes and commit? Check for git commit evidence.
             - Extract any specific issues mentioned
 
-            Respond ONLY with this JSON (no other fields):
-            {{schema}}
+            Call the `report_interpretation` tool with the verdict (PASS or FAIL), any issues,
+            a reason explaining what went right or wrong,
+            and review_verdict (APPROVE or REQUEST_CHANGES) if this is a review phase.
+            Model tier should be 'standard' unless a retry with a stronger model is needed.
             """;
 
         var result = await AskAsync(pipeline, prompt, ct)
@@ -632,7 +729,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             };
 
         ApplyModelTierIfNotSet(pipeline, result.ModelTier);
-        return ApplyTestMetricsFallback(result, phase, workerOutput, _logger);
+        return result;
     }
 
     /// <summary>
@@ -652,13 +749,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             What should we do next?
 
-            Respond with JSON:
-            {
-              "action": "<next action: {{BrainActions.FormatForPrompt(BrainActions.NextStepActions)}}>",
-              "prompt": "<prompt for the worker, if spawning one>",
-              "reason": "<why this is the right next step>",
-              "model_tier": "standard or premium — use premium for complex, high-stakes, or retry tasks"
-            }
+            Call the `report_plan` tool with your decision.
+            Valid actions: {{BrainActions.FormatForPrompt(BrainActions.NextStepActions)}}
+            Model tier should be 'standard' unless a retry with a stronger model is needed.
             """;
 
         var decision = await AskAsync(pipeline, prompt, ct);
@@ -696,16 +789,19 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 {
                     _logger.LogDebug("Brain prompt for {GoalId}:\n{Prompt}", pipeline.GoalId, Truncate(prompt, Constants.TruncationVerbose));
 
-                    var response = await SendToSessionCoreAsync(session, prompt, ct);
+                    var (response, toolCall) = await SendToSessionCoreAsync(session, prompt, ct);
 
                     _logger.LogDebug("Brain response for {GoalId}:\n{Response}", pipeline.GoalId, Truncate(response, Constants.TruncationVerbose));
 
                     pipeline.Conversation.Add(new ConversationEntry("user", prompt));
                     pipeline.Conversation.Add(new ConversationEntry("assistant", response));
 
-                    var parsed = ProtocolJson.ParseFromLlmResponse<OrchestratorDecision>(response);
-                    return parsed ?? throw new InvalidOperationException(
-                        $"Failed to parse Brain JSON: {Truncate(response, Constants.TruncationShort)}");
+                    if (toolCall is null)
+                        throw new InvalidOperationException(
+                            $"Brain did not use a tool call for {pipeline.GoalId}. Response: {Truncate(response, Constants.TruncationShort)}");
+
+                    _logger.LogDebug("Brain used tool call '{Tool}' for {GoalId}", toolCall.ToolName, pipeline.GoalId);
+                    return BuildDecisionFromToolCall(toolCall);
                 },
                 onRetry: (attempt, delay, ex) =>
                 {
@@ -729,12 +825,78 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
+    /// Builds an <see cref="OrchestratorDecision"/> from a <c>report_plan</c> or
+    /// <c>report_interpretation</c> tool call result.
+    /// </summary>
+    internal static OrchestratorDecision BuildDecisionFromToolCall(BrainToolCallResult toolCall)
+    {
+        var args = toolCall.Arguments;
+
+        return toolCall.ToolName switch
+        {
+            "report_plan" => new OrchestratorDecision
+            {
+                Action = ParseAction(GetStringArg(args, "action")),
+                Prompt = GetStringArg(args, "prompt"),
+                Reason = GetStringArg(args, "reason"),
+                ModelTier = GetStringArg(args, "model_tier"),
+            },
+            "report_interpretation" => new OrchestratorDecision
+            {
+                Action = OrchestratorActionType.Done,
+                Verdict = GetStringArg(args, "verdict"),
+                ReviewVerdict = GetStringArg(args, "review_verdict") is { Length: > 0 } rv ? rv : null,
+                Issues = GetStringArrayArg(args, "issues"),
+                Reason = GetStringArg(args, "reason"),
+                ModelTier = GetStringArg(args, "model_tier"),
+            },
+            _ => throw new InvalidOperationException($"Unexpected Brain tool call: '{toolCall.ToolName}'"),
+        };
+    }
+
+    private static OrchestratorActionType ParseAction(string? action) =>
+        action switch
+        {
+            "spawn_coder" => OrchestratorActionType.SpawnCoder,
+            "spawn_tester" => OrchestratorActionType.SpawnTester,
+            "spawn_reviewer" => OrchestratorActionType.SpawnReviewer,
+            "spawn_doc_writer" => OrchestratorActionType.SpawnDocWriter,
+            "spawn_improver" => OrchestratorActionType.SpawnImprover,
+            "request_changes" => OrchestratorActionType.RequestChanges,
+            "retry" => OrchestratorActionType.Retry,
+            "merge" => OrchestratorActionType.Merge,
+            "done" => OrchestratorActionType.Done,
+            "skip" => OrchestratorActionType.Skip,
+            _ => throw new InvalidOperationException($"Unknown Brain action: '{action}'"),
+        };
+
+    private static string? GetStringArg(Dictionary<string, object?> args, string key) =>
+        args.TryGetValue(key, out var val) ? val?.ToString() : null;
+
+    private static List<string>? GetStringArrayArg(Dictionary<string, object?> args, string key)
+    {
+        if (!args.TryGetValue(key, out var val) || val is null)
+            return null;
+
+        if (val is string[] arr)
+            return arr.ToList();
+
+        if (val is JsonElement je && je.ValueKind == JsonValueKind.Array)
+            return je.EnumerateArray().Select(e => e.GetString() ?? "").ToList();
+
+        if (val is IEnumerable<object> list)
+            return list.Select(x => x?.ToString() ?? "").ToList();
+
+        return null;
+    }
+
+    /// <summary>
     /// Sends a prompt to a Copilot session with exponential backoff retry.
     /// Used for priming, status updates, and other non-AskAsync calls.
     /// </summary>
     private async Task<string> SendToSessionAsync(CopilotSession session, string prompt, CancellationToken ct)
     {
-        return await Shared.CopilotRetryPolicy.ExecuteAsync(
+        var (text, _) = await Shared.CopilotRetryPolicy.ExecuteAsync(
             () => SendToSessionCoreAsync(session, prompt, ct),
             onRetry: (attempt, delay, ex) =>
             {
@@ -743,60 +905,74 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     attempt, Shared.CopilotRetryPolicy.MaxRetries + 1, ex.Message, delay.TotalSeconds);
             },
             ct);
+        return text;
     }
 
-    private static async Task<string> SendToSessionCoreAsync(CopilotSession session, string prompt, CancellationToken ct)
+    private async Task<(string Text, BrainToolCallResult? ToolCall)> SendToSessionCoreAsync(
+        CopilotSession session, string prompt, CancellationToken ct)
     {
-        var done = new TaskCompletionSource<string>();
-        var response = "";
-
-        using var subscription = session.On(evt =>
+        await _brainCallGate.WaitAsync(ct);
+        try
         {
-            switch (evt)
+            var done = new TaskCompletionSource<(string, BrainToolCallResult?)>();
+            var response = "";
+
+            // Clear any previous tool call result before sending
+            _lastToolCallResult = null;
+
+            using var subscription = session.On(evt =>
             {
-                case AssistantMessageEvent msg:
-                    response = msg.Data.Content;
-                    Console.WriteLine($"[Brain-SDK] AssistantMessage ({response.Length} chars)");
-                    Console.Out.Flush();
-                    break;
-                case AssistantUsageEvent usage:
-                    Console.WriteLine($"[Brain-SDK] Usage: model={usage.Data.Model} in={usage.Data.InputTokens} out={usage.Data.OutputTokens} cost={usage.Data.Cost:F4} duration={usage.Data.Duration:F0}ms");
-                    Console.Out.Flush();
-                    FileTracer.WriteUsage(usage.Data, "/app/state/traces-brain.jsonl", "brain");
-                    break;
-                case SessionIdleEvent:
-                    Console.WriteLine("[Brain-SDK] SessionIdle");
-                    Console.Out.Flush();
-                    done.TrySetResult(response);
-                    break;
-                case SessionErrorEvent err:
-                    Console.WriteLine($"[Brain-SDK] SessionError: {err.Data.Message}");
-                    Console.Out.Flush();
-                    done.TrySetException(new InvalidOperationException(err.Data.Message));
-                    break;
-                // Muted — Brain doesn't stream, these are just noise
-                case AssistantTurnStartEvent:
-                case AssistantTurnEndEvent:
-                case AssistantReasoningEvent:
-                case SessionUsageInfoEvent:
-                case PendingMessagesModifiedEvent:
-                case UserMessageEvent:
-                case SubagentSelectedEvent:
-                case SessionInfoEvent:
-                    break;
-                default:
-                    Console.WriteLine($"[Brain-SDK] {evt.GetType().Name}");
-                    Console.Out.Flush();
-                    break;
-            }
-        });
+                switch (evt)
+                {
+                    case AssistantMessageEvent msg:
+                        response = msg.Data.Content;
+                        Console.WriteLine($"[Brain-SDK] AssistantMessage ({response.Length} chars)");
+                        Console.Out.Flush();
+                        break;
+                    case AssistantUsageEvent usage:
+                        Console.WriteLine($"[Brain-SDK] Usage: model={usage.Data.Model} in={usage.Data.InputTokens} out={usage.Data.OutputTokens} cost={usage.Data.Cost:F4} duration={usage.Data.Duration:F0}ms");
+                        Console.Out.Flush();
+                        FileTracer.WriteUsage(usage.Data, "/app/state/traces-brain.jsonl", "brain");
+                        break;
+                    case SessionIdleEvent:
+                        Console.WriteLine("[Brain-SDK] SessionIdle");
+                        Console.Out.Flush();
+                        done.TrySetResult((response, _lastToolCallResult));
+                        break;
+                    case SessionErrorEvent err:
+                        Console.WriteLine($"[Brain-SDK] SessionError: {err.Data.Message}");
+                        Console.Out.Flush();
+                        done.TrySetException(new InvalidOperationException(err.Data.Message));
+                        break;
+                    case AssistantTurnStartEvent:
+                    case AssistantTurnEndEvent:
+                    case AssistantReasoningEvent:
+                    case SessionUsageInfoEvent:
+                    case PendingMessagesModifiedEvent:
+                    case UserMessageEvent:
+                    case SubagentSelectedEvent:
+                    case SessionInfoEvent:
+                    case ToolExecutionStartEvent:
+                    case ToolExecutionCompleteEvent:
+                        break;
+                    default:
+                        Console.WriteLine($"[Brain-SDK] {evt.GetType().Name}");
+                        Console.Out.Flush();
+                        break;
+                }
+            });
 
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(TimeSpan.FromMinutes(Constants.TaskTimeoutMinutes));
-        using var ctReg = cts.Token.Register(() => done.TrySetCanceled());
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromMinutes(Constants.TaskTimeoutMinutes));
+            using var ctReg = cts.Token.Register(() => done.TrySetCanceled());
 
-        await session.SendAsync(new MessageOptions { Prompt = prompt });
-        return await done.Task;
+            await session.SendAsync(new MessageOptions { Prompt = prompt });
+            return await done.Task;
+        }
+        finally
+        {
+            _brainCallGate.Release();
+        }
     }
 
     /// <summary>
@@ -812,221 +988,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             return;
 
         pipeline.LatestModelTier = ModelTierExtensions.ParseModelTier(modelTier);
-    }
-
-    /// <summary>
-    /// Applies fallback test metrics parsing when the Brain failed to extract metrics for tester output.
-    /// If the worker role is "tester" and the Brain returned null or zero test counts, parses the raw
-    /// output with <see cref="FallbackParseTestMetrics"/> and merges the result into the decision.
-    /// Brain values take priority unless they are null or zero, in which case fallback values win.
-    /// </summary>
-    internal static OrchestratorDecision ApplyTestMetricsFallback(
-        OrchestratorDecision decision, GoalPhase phase, string rawOutput, ILogger logger)
-    {
-        if (phase != GoalPhase.Testing)
-            return decision;
-
-        if ((decision.TestMetrics?.TotalTests ?? 0) > 0 &&
-            (decision.TestMetrics?.PassedTests ?? 0) > 0)
-            return decision; // Brain extracted valid metrics — nothing to do
-
-        var fallback = FallbackParseTestMetrics(rawOutput);
-        if (fallback is null)
-            return decision; // Fallback found nothing — nothing to do
-
-        logger.LogWarning(
-            "Brain failed to extract test_metrics for tester phase, running fallback parser.");
-
-        // Merge: Brain values win when non-null and non-zero; fallback fills the gaps
-        var existing = decision.TestMetrics;
-        var merged = new ExtractedTestMetrics
-        {
-            PassedTests  = (existing?.PassedTests  ?? 0) > 0 ? existing!.PassedTests  : fallback.PassedTests,
-            TotalTests   = (existing?.TotalTests   ?? 0) > 0 ? existing!.TotalTests   : fallback.TotalTests,
-            FailedTests  = (existing?.FailedTests  ?? 0) > 0 ? existing!.FailedTests  : fallback.FailedTests,
-            SkippedTests = (existing?.SkippedTests ?? 0) > 0 ? existing!.SkippedTests : fallback.SkippedTests,
-            BuildSuccess  = existing?.BuildSuccess  ?? fallback.BuildSuccess,
-            CoveragePercent = existing?.CoveragePercent ?? fallback.CoveragePercent,
-        };
-
-        return decision with { TestMetrics = merged };
-    }
-
-    /// <summary>
-    /// Parses raw worker output for common dotnet test result patterns and returns
-    /// a populated <see cref="ExtractedTestMetrics"/> object.
-    /// Returns <c>null</c> if no recognisable test counts are found.
-    /// Also called by <see cref="GoalDispatcher.FallbackParseTestMetrics"/> to keep the logic DRY.
-    /// </summary>
-    internal static ExtractedTestMetrics? FallbackParseTestMetrics(string output)
-    {
-        if (string.IsNullOrEmpty(output))
-            return null;
-
-        int? total = null, passed = null, failed = null, skipped = null;
-        bool? buildSuccess = null;
-
-        // xUnit runner summary: "Passed!  - Failed:     0, Passed:   322, Skipped:     0, Total:   322"
-        var xunitMatch = Regex.Match(output,
-            @"Passed!\s*-\s*Failed:\s+(\d+),\s*Passed:\s+(\d+),\s*Skipped:\s+(\d+),\s*Total:\s+(\d+)",
-            RegexOptions.IgnoreCase);
-        if (xunitMatch.Success)
-        {
-            failed  = int.Parse(xunitMatch.Groups[1].Value);
-            passed  = int.Parse(xunitMatch.Groups[2].Value);
-            skipped = int.Parse(xunitMatch.Groups[3].Value);
-            total   = int.Parse(xunitMatch.Groups[4].Value);
-        }
-
-        // dotnet test summary (full): "Passed! - Failed: 0, Passed: 268, Skipped: 0, Total: 268"
-        Match? dotnetMatch = null;
-        if (!xunitMatch.Success)
-        {
-            dotnetMatch = Regex.Match(
-                output,
-                @"Failed:\s+(\d+),\s*Passed:\s+(\d+),\s*Skipped:\s+(\d+),\s*Total:\s+(\d+)",
-                RegexOptions.IgnoreCase);
-        }
-
-        if (dotnetMatch is { Success: true })
-        {
-            failed  = int.Parse(dotnetMatch.Groups[1].Value);
-            passed  = int.Parse(dotnetMatch.Groups[2].Value);
-            skipped = int.Parse(dotnetMatch.Groups[3].Value);
-            total   = int.Parse(dotnetMatch.Groups[4].Value);
-        }
-        else if (!xunitMatch.Success)
-        {
-            // Short summary: "Passed: 8, Failed: 0, Total: 8" (comma-separated, no Skipped field)
-            // Use [ \t] (not \s) to avoid spanning multiple lines
-            var shortMatch = Regex.Match(
-                output,
-                @"Passed:[ \t]*(\d+)[ \t]*,[ \t]*Failed:[ \t]*(\d+)[ \t]*,[ \t]*Total:[ \t]*(\d+)",
-                RegexOptions.IgnoreCase);
-
-            if (shortMatch.Success)
-            {
-                passed  = int.Parse(shortMatch.Groups[1].Value);
-                failed  = int.Parse(shortMatch.Groups[2].Value);
-                total   = int.Parse(shortMatch.Groups[3].Value);
-            }
-        }
-
-        if (total is null)
-        {
-            // Markdown table rows and key-value lines
-            int mdTotal = 0, mdPassed = 0, mdFailed = 0;
-            foreach (var line in output.Split('\n'))
-            {
-                var trimmed = line.Trim();
-
-                var mdMatch = Regex.Match(trimmed, @"^\|\s*(\w+)\s*\|\s*(\d+)\s*\|");
-                if (mdMatch.Success)
-                {
-                    var key = mdMatch.Groups[1].Value;
-                    var val = int.Parse(mdMatch.Groups[2].Value);
-                    if (key.Equals("Total",  StringComparison.OrdinalIgnoreCase)) mdTotal  = Math.Max(mdTotal,  val);
-                    else if (key.Equals("Passed",  StringComparison.OrdinalIgnoreCase)) mdPassed = Math.Max(mdPassed, val);
-                    else if (key.Equals("Failed",  StringComparison.OrdinalIgnoreCase)) mdFailed = Math.Max(mdFailed, val);
-                    else if (key.Equals("Errors",  StringComparison.OrdinalIgnoreCase)) buildSuccess = val == 0;
-                    continue;
-                }
-
-                // Key-value line format: "total_tests: 273"
-                if (trimmed.StartsWith("unit_tests_total:",  StringComparison.OrdinalIgnoreCase)
-                    || trimmed.StartsWith("total_tests:",    StringComparison.OrdinalIgnoreCase)
-                    || trimmed.StartsWith("total:",          StringComparison.OrdinalIgnoreCase))
-                {
-                    if (int.TryParse(trimmed[(trimmed.IndexOf(':') + 1)..].Trim(), out var t))
-                        mdTotal = Math.Max(mdTotal, t);
-                }
-                else if (trimmed.StartsWith("unit_tests_passed:", StringComparison.OrdinalIgnoreCase)
-                         || trimmed.StartsWith("passed_tests:",    StringComparison.OrdinalIgnoreCase)
-                         || trimmed.StartsWith("passed:",          StringComparison.OrdinalIgnoreCase))
-                {
-                    if (int.TryParse(trimmed[(trimmed.IndexOf(':') + 1)..].Trim(), out var p))
-                        mdPassed = Math.Max(mdPassed, p);
-                }
-                else if (trimmed.StartsWith("failed_tests:", StringComparison.OrdinalIgnoreCase)
-                         || trimmed.StartsWith("failed:",     StringComparison.OrdinalIgnoreCase))
-                {
-                    if (int.TryParse(trimmed[(trimmed.IndexOf(':') + 1)..].Trim(), out var f))
-                        mdFailed = Math.Max(mdFailed, f);
-                }
-            }
-
-            if (mdTotal > 0)  total  = mdTotal;
-            if (mdPassed > 0) passed = mdPassed;
-            if (mdFailed > 0) failed = mdFailed;
-        }
-
-        // Parse build success from common patterns
-        if (!buildSuccess.HasValue)
-        {
-            buildSuccess =
-                output.Contains("Build succeeded", StringComparison.OrdinalIgnoreCase)
-                || Regex.IsMatch(output, @"\|\s*Errors\s*\|\s*0\s*\|")
-                || Regex.IsMatch(output, @"✅\s*\*{0,2}Succeeded\*{0,2}", RegexOptions.IgnoreCase)
-                || Regex.IsMatch(output, @"Build(?:\s+(?:Status|Result))?\s*:\s*(?:✅\s*)?PASS", RegexOptions.IgnoreCase)
-                || Regex.IsMatch(output, @"\b0\s+error(?:s|\(s\))", RegexOptions.IgnoreCase)
-                ? true
-                : (bool?)null;
-        }
-
-        if (total is null && passed is null && failed is null && buildSuccess is null)
-            return null;
-
-        // Parse coverage percent from Coverlet text table TOTAL row or key-value lines.
-        double? coveragePercent = null;
-
-        // Pattern A — Coverlet text table TOTAL row: | TOTAL | 73.5% | 61.2% | 80.1% |
-        var coverletTotalMatch = Regex.Match(
-            output,
-            @"\|\s*TOTAL\s*\|\s*(\d+\.?\d*)%",
-            RegexOptions.IgnoreCase);
-        if (coverletTotalMatch.Success
-            && double.TryParse(coverletTotalMatch.Groups[1].Value,
-                System.Globalization.NumberStyles.Any,
-                System.Globalization.CultureInfo.InvariantCulture,
-                out var coverletPct))
-        {
-            coveragePercent = coverletPct;
-        }
-
-        // Pattern B — Key-value lines: "coverage_percent: 73.5" or "coverage: 73.5%"
-        if (coveragePercent is null)
-        {
-            var kvMatch = Regex.Match(
-                output,
-                @"coverage[_\s]*percent\s*[:\s]+(\d+\.?\d*)",
-                RegexOptions.IgnoreCase);
-            if (!kvMatch.Success)
-            {
-                kvMatch = Regex.Match(
-                    output,
-                    @"coverage\s*:\s*(\d+\.?\d*)%",
-                    RegexOptions.IgnoreCase);
-            }
-
-            if (kvMatch.Success
-                && double.TryParse(kvMatch.Groups[1].Value,
-                    System.Globalization.NumberStyles.Any,
-                    System.Globalization.CultureInfo.InvariantCulture,
-                    out var kvPct))
-            {
-                coveragePercent = kvPct;
-            }
-        }
-
-        return new ExtractedTestMetrics
-        {
-            TotalTests      = total,
-            PassedTests     = passed,
-            FailedTests     = failed,
-            SkippedTests    = skipped,
-            BuildSuccess    = buildSuccess,
-            CoveragePercent = coveragePercent,
-        };
     }
 
     /// <summary>
@@ -1105,5 +1066,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             await _copilotClient.StopAsync();
             _copilotClient = null;
         }
+
+        _brainCallGate.Dispose();
     }
 }

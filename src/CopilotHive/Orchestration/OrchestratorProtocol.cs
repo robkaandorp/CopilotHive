@@ -52,10 +52,6 @@ public sealed record OrchestratorDecision
     [JsonPropertyName("verdict")]
     public string? Verdict { get; init; }
 
-    /// <summary>Structured test metrics extracted from tester worker output.</summary>
-    [JsonPropertyName("test_metrics")]
-    public ExtractedTestMetrics? TestMetrics { get; init; }
-
     /// <summary>The reviewer's verdict (e.g. "APPROVED", "CHANGES_REQUESTED").</summary>
     [JsonPropertyName("review_verdict")]
     public string? ReviewVerdict { get; init; }
@@ -67,36 +63,6 @@ public sealed record OrchestratorDecision
     /// <summary>Model tier requested by the Brain ('standard' or 'premium'). Defaults to 'standard'.</summary>
     [JsonPropertyName("model_tier")]
     public string? ModelTier { get; init; }
-}
-
-/// <summary>
-/// Structured test metrics extracted by the orchestrator LLM from worker output.
-/// </summary>
-public sealed record ExtractedTestMetrics
-{
-    /// <summary>Whether the build succeeded.</summary>
-    [JsonPropertyName("build_success")]
-    public bool? BuildSuccess { get; init; }
-
-    /// <summary>Total number of tests discovered.</summary>
-    [JsonPropertyName("total_tests")]
-    public int? TotalTests { get; init; }
-
-    /// <summary>Number of tests that passed.</summary>
-    [JsonPropertyName("passed_tests")]
-    public int? PassedTests { get; init; }
-
-    /// <summary>Number of tests that failed.</summary>
-    [JsonPropertyName("failed_tests")]
-    public int? FailedTests { get; init; }
-
-    /// <summary>Number of tests that were skipped.</summary>
-    [JsonPropertyName("skipped_tests")]
-    public int? SkippedTests { get; init; }
-
-    /// <summary>Code coverage percentage.</summary>
-    [JsonPropertyName("coverage_percent")]
-    public double? CoveragePercent { get; init; }
 }
 
 /// <summary>
@@ -133,31 +99,4 @@ public static class ProtocolJson
         WriteIndented = false,
     };
 
-    /// <summary>
-    /// Attempts to extract a JSON object from text that may contain markdown fences.
-    /// </summary>
-    public static T? ParseFromLlmResponse<T>(string response) where T : class
-    {
-        // Try direct parse first
-        try
-        {
-            return JsonSerializer.Deserialize<T>(response.Trim(), Options);
-        }
-        catch (JsonException ex) { Console.WriteLine($"[Protocol] Direct JSON parse failed, trying extraction: {ex.Message}"); }
-
-        // Try extracting from markdown code block
-        var jsonStart = response.IndexOf('{');
-        var jsonEnd = response.LastIndexOf('}');
-        if (jsonStart >= 0 && jsonEnd > jsonStart)
-        {
-            try
-            {
-                var json = response[jsonStart..(jsonEnd + 1)];
-                return JsonSerializer.Deserialize<T>(json, Options);
-            }
-            catch (JsonException ex) { Console.WriteLine($"[Protocol] Extracted JSON parse failed: {ex.Message}"); }
-        }
-
-        return null;
-    }
 }

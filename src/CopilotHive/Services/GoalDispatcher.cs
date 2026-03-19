@@ -303,27 +303,6 @@ public sealed class GoalDispatcher : BackgroundService
             await SyncAgentsFromConfigRepoAsync(ct);
         }
 
-        // Update metrics from Brain interpretation (skip if structured metrics already populated)
-        if (!hasStructuredMetrics && interpretation.TestMetrics is not null)
-        {
-            pipeline.Metrics.TotalTests = interpretation.TestMetrics.TotalTests ?? 0;
-            pipeline.Metrics.PassedTests = interpretation.TestMetrics.PassedTests ?? 0;
-            pipeline.Metrics.FailedTests = interpretation.TestMetrics.FailedTests ?? 0;
-            pipeline.Metrics.CoveragePercent = interpretation.TestMetrics.CoveragePercent ?? 0;
-            pipeline.Metrics.BuildSuccess = interpretation.TestMetrics.BuildSuccess ?? false;
-        }
-
-        // Fallback: if this is the Testing phase and no metrics from tool call or Brain,
-        // parse the raw worker output for test result patterns (e.g. "Passed: 268")
-        if (pipeline.Phase == GoalPhase.Testing && pipeline.Metrics.TotalTests == 0)
-        {
-            FallbackParseTestMetrics(complete.Output, pipeline.Metrics);
-            if (pipeline.Metrics.TotalTests > 0)
-                _logger.LogInformation(
-                    "Fallback metrics parsed for {GoalId}: {Passed}/{Total} passed, {Failed} failed",
-                    pipeline.GoalId, pipeline.Metrics.PassedTests, pipeline.Metrics.TotalTests, pipeline.Metrics.FailedTests);
-        }
-
         // Populate review metrics when the reviewer phase completes (skip if structured data already set)
         if (pipeline.Phase == GoalPhase.Review && !hasStructuredReview)
         {
@@ -486,11 +465,10 @@ public sealed class GoalDispatcher : BackgroundService
         var feedbackKind = isReviewRelated ? "Reviewer feedback" : "Test failures";
         var context = $"{feedbackKind}:\n{interpretation.Reason ?? "See previous output."}";
 
-        if (isReviewRelated)
+        if (isReviewRelated && pipeline.Metrics.ReviewIssues is { Count: > 0 })
         {
-            var allIssues = BuildAccumulatedReviewIssues(pipeline);
-            if (allIssues.Length > 0)
-                context += $"\n\nAccumulated issues from all review rounds (fix ALL of these):\n{allIssues}";
+            var allIssues = string.Join("\n", pipeline.Metrics.ReviewIssues);
+            context += $"\n\nAccumulated issues from all review rounds (fix ALL of these):\n{allIssues}";
         }
 
         var fixPrompt = _brain is not null
@@ -1021,74 +999,6 @@ public sealed class GoalDispatcher : BackgroundService
         }
 
         _lastAgentsSync = DateTime.UtcNow;
-    }
-
-    /// <summary>
-    /// Collects all review issues from past Brain interpretations in the pipeline's conversation history.
-    /// Returns a deduplicated summary the Brain can use to ensure the coder fixes everything.
-    /// </summary>
-    private static string BuildAccumulatedReviewIssues(GoalPipeline pipeline)
-    {
-        var allIssues = new List<string>();
-        var round = 0;
-
-        foreach (var entry in pipeline.Conversation)
-        {
-            if (entry.Role != "assistant")
-                continue;
-
-            // Look for review interpretation responses containing REQUEST_CHANGES
-            var content = entry.Content;
-            if (!content.Contains("REQUEST_CHANGES", StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            round++;
-
-            // Extract individual issue strings from the "issues" JSON array
-            var issueStart = content.IndexOf("\"issues\"", StringComparison.Ordinal);
-            if (issueStart < 0)
-                continue;
-
-            var arrayStart = content.IndexOf('[', issueStart);
-            var arrayEnd = content.IndexOf(']', arrayStart > 0 ? arrayStart : issueStart);
-            if (arrayStart < 0 || arrayEnd < 0)
-                continue;
-
-            var arrayContent = content[(arrayStart + 1)..arrayEnd];
-            foreach (var part in arrayContent.Split('"'))
-            {
-                var trimmed = part.Trim().Trim(',').Trim();
-                if (trimmed.Length > 10)
-                    allIssues.Add($"[Round {round}] {trimmed}");
-            }
-        }
-
-        return allIssues.Count > 0
-            ? string.Join("\n", allIssues)
-            : "";
-    }
-
-    /// <summary>
-    /// Fallback metric extraction from raw worker output when the Brain doesn't return test_metrics.
-    /// Delegates to <see cref="DistributedBrain.FallbackParseTestMetrics"/> for the actual parsing
-    /// and maps the result onto the mutable <paramref name="metrics"/> object.
-    /// </summary>
-    internal static void FallbackParseTestMetrics(string output, IterationMetrics metrics)
-    {
-        var extracted = DistributedBrain.FallbackParseTestMetrics(output);
-        if (extracted is null)
-            return;
-
-        if (extracted.TotalTests.HasValue)
-            metrics.TotalTests = Math.Max(metrics.TotalTests, extracted.TotalTests.Value);
-        if (extracted.PassedTests.HasValue)
-            metrics.PassedTests = Math.Max(metrics.PassedTests, extracted.PassedTests.Value);
-        if (extracted.FailedTests.HasValue)
-            metrics.FailedTests = Math.Max(metrics.FailedTests, extracted.FailedTests.Value);
-        if (extracted.BuildSuccess is true)
-            metrics.BuildSuccess = true;
-        if (extracted.CoveragePercent.HasValue)
-            metrics.CoveragePercent = Math.Max(metrics.CoveragePercent, extracted.CoveragePercent.Value);
     }
 
     private async Task MarkGoalCompleted(GoalPipeline pipeline, CancellationToken ct)
