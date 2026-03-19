@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `GET /health` endpoint now includes an `"uptime"` field formatted as `"HH:mm:ss"` (hours:minutes:seconds), allowing hours to exceed 24 for long-running servers; also includes raw `UptimeSpan` (TimeSpan) for programmatic parsing
+- `HealthEndpointTests.GetHealth_UptimeField_MatchesHhMmSsFormat()` xUnit test verifies the uptime field is present and matches the expected format
 - `GoalId.Validate(string)` static method in new `Configuration/GoalId.cs` for validating goal identifiers — IDs must be non-empty, lowercase kebab-case (letters, digits, hyphens only; no leading/trailing hyphens) to match git branch naming convention
 - Goal ID validation in `FileGoalSource.MapToGoal()` — validates each goal ID after parsing from goals.yaml
 - Goal ID validation in `ApiGoalSource.AddGoal()` — validates goal ID when adding a new goal via API
