@@ -94,8 +94,7 @@ public sealed class GoalDispatcher : BackgroundService
             return "Brain is not available. Please proceed with your best judgment.";
 
         _logger.LogInformation("Worker asks Brain: {Question}", question);
-        var decision = await _brain.DecideNextStepAsync(pipeline, $"A worker asks: {question}", ct);
-        var answer = decision.Prompt ?? decision.Action.ToString();
+        var answer = await _brain.CraftPromptAsync(pipeline, pipeline.Phase, $"A worker asks: {question}", ct);
         _logger.LogInformation("Brain answers: {Answer}", answer[..Math.Min(answer.Length, 200)]);
         return answer;
     }
@@ -188,7 +187,7 @@ public sealed class GoalDispatcher : BackgroundService
     private async Task DriveNextPhaseAsync(GoalPipeline pipeline, TaskComplete complete, CancellationToken ct)
     {
         // No-op detection: if the coder returned without making any file changes,
-        // skip Brain interpretation and immediately retry with a stronger prompt.
+        // skip verdict extraction and immediately retry with a stronger prompt.
         if (pipeline.Phase == GoalPhase.Coding && (complete.GitStatus?.FilesChanged ?? 0) == 0)
         {
             _logger.LogWarning(
@@ -207,12 +206,14 @@ public sealed class GoalDispatcher : BackgroundService
                 "Do NOT just describe or discuss changes — actually make them.\n\n" +
                 $"Previous coder output (for context):\n{(complete.Output.Length > 500 ? complete.Output[..500] + "..." : complete.Output)}";
 
-            var retryPrompt = await _brain!.CraftPromptAsync(pipeline, WorkerRole.Coder, noOpContext, ct);
+            var retryPrompt = _brain is not null
+                ? await _brain.CraftPromptAsync(pipeline, GoalPhase.Coding, noOpContext, ct)
+                : $"Work on: {pipeline.Description}. {noOpContext}";
             await DispatchToRole(pipeline, WorkerRole.Coder, retryPrompt, ct);
             return;
         }
 
-        // Log the raw worker output BEFORE Brain interpretation — critical for debugging
+        // Log the raw worker output — critical for debugging
         var outputPreview = complete.Output.Length > 2000
             ? complete.Output[..2000] + $"... ({complete.Output.Length} chars total)"
             : complete.Output;
@@ -220,79 +221,44 @@ public sealed class GoalDispatcher : BackgroundService
             "Worker output for {GoalId} (phase={Phase}):\n{Output}",
             pipeline.GoalId, pipeline.Phase, outputPreview);
 
-        // Use structured test metrics from worker tool call when available.
-        // This eliminates the need for Brain interpretation of test counts.
-        var hasStructuredMetrics = false;
-        if (pipeline.Phase == GoalPhase.Testing && complete.Metrics is { TotalTests: > 0 })
+        // Extract structured verdict from worker tool call metrics
+        var verdict = "PASS"; // Default: worker completed successfully
+        if (complete.Metrics is { } metrics)
         {
-            var m = complete.Metrics;
-            pipeline.Metrics.TotalTests = m.TotalTests;
-            pipeline.Metrics.PassedTests = m.PassedTests;
-            pipeline.Metrics.FailedTests = m.FailedTests;
-            pipeline.Metrics.BuildSuccess = m.BuildSuccess;
-            if (m.CoveragePercent > 0)
-                pipeline.Metrics.CoveragePercent = m.CoveragePercent;
-            hasStructuredMetrics = true;
+            if (!string.IsNullOrEmpty(metrics.Verdict))
+                verdict = metrics.Verdict;
 
-            _logger.LogInformation(
-                "Structured test metrics for {GoalId}: {Passed}/{Total} passed, {Failed} failed, verdict={Verdict}",
-                pipeline.GoalId, m.PassedTests, m.TotalTests, m.FailedTests, m.Verdict);
-        }
-
-        // Use structured reviewer verdict from tool call when available.
-        var hasStructuredReview = false;
-        if (pipeline.Phase == GoalPhase.Review && complete.Metrics is { Verdict: "APPROVE" or "REQUEST_CHANGES" })
-        {
-            var m = complete.Metrics;
-            pipeline.Metrics.ReviewVerdict = ReviewVerdictExtensions.ParseReviewVerdict(m.Verdict);
-            if (m.Issues is { Count: > 0 })
+            // Populate pipeline metrics from structured data
+            if (pipeline.Phase == GoalPhase.Testing && metrics.TotalTests > 0)
             {
-                pipeline.Metrics.ReviewIssuesFound += m.Issues.Count;
-                pipeline.Metrics.ReviewIssues.AddRange(m.Issues);
-            }
-            hasStructuredReview = true;
+                pipeline.Metrics.TotalTests = metrics.TotalTests;
+                pipeline.Metrics.PassedTests = metrics.PassedTests;
+                pipeline.Metrics.FailedTests = metrics.FailedTests;
+                pipeline.Metrics.BuildSuccess = metrics.BuildSuccess;
+                if (metrics.CoveragePercent > 0)
+                    pipeline.Metrics.CoveragePercent = metrics.CoveragePercent;
 
-            _logger.LogInformation(
-                "Structured review verdict for {GoalId}: {Verdict}, {IssueCount} issues",
-                pipeline.GoalId, m.Verdict, m.Issues.Count);
-        }
-
-        // Ask the Brain to interpret the worker output
-        var interpretation = await _brain!.InterpretOutputAsync(
-            pipeline,
-            pipeline.Phase,
-            complete.Output,
-            ct);
-
-        _logger.LogInformation("Brain interpretation for {GoalId}: Action={Action}, Verdict={Verdict}",
-            pipeline.GoalId, interpretation.Action, interpretation.Verdict ?? interpretation.ReviewVerdict);
-
-        // Override Brain verdict with structured metrics when available — tool call is authoritative
-        if (hasStructuredMetrics && complete.Metrics is { } structuredMetrics
-            && !string.IsNullOrEmpty(structuredMetrics.Verdict))
-        {
-            var structuredVerdict = structuredMetrics.Verdict;
-            if (interpretation.Verdict != structuredVerdict)
-            {
                 _logger.LogInformation(
-                    "Overriding Brain verdict {BrainVerdict} with structured metrics verdict {ToolVerdict} for {GoalId}",
-                    interpretation.Verdict, structuredVerdict, pipeline.GoalId);
-                interpretation = interpretation with { Verdict = structuredVerdict };
+                    "Structured test metrics for {GoalId}: {Passed}/{Total} passed, {Failed} failed, verdict={Verdict}",
+                    pipeline.GoalId, metrics.PassedTests, metrics.TotalTests, metrics.FailedTests, metrics.Verdict);
             }
-        }
 
-        // Override Brain verdict with structured review verdict — tool call is authoritative
-        if (hasStructuredReview && complete.Metrics is { Verdict: "APPROVE" or "REQUEST_CHANGES" } reviewMetrics)
-        {
-            // Map reviewer verdict to Brain verdict format (APPROVE→PASS, REQUEST_CHANGES→FAIL)
-            var brainEquivalent = reviewMetrics.Verdict == "APPROVE" ? "PASS" : "FAIL";
-            if (interpretation.Verdict != brainEquivalent)
+            if (pipeline.Phase == GoalPhase.Review && verdict is "APPROVE" or "REQUEST_CHANGES")
             {
+                pipeline.Metrics.ReviewVerdict = ReviewVerdictExtensions.ParseReviewVerdict(verdict);
+                if (metrics.Issues is { Count: > 0 })
+                {
+                    pipeline.Metrics.ReviewIssuesFound += metrics.Issues.Count;
+                    pipeline.Metrics.ReviewIssues.AddRange(metrics.Issues);
+                }
+
                 _logger.LogInformation(
-                    "Overriding Brain verdict {BrainVerdict} with structured review verdict {ReviewVerdict} for {GoalId}",
-                    interpretation.Verdict, reviewMetrics.Verdict, pipeline.GoalId);
-                interpretation = interpretation with { Verdict = brainEquivalent };
+                    "Structured review verdict for {GoalId}: {Verdict}, {IssueCount} issues",
+                    pipeline.GoalId, verdict, metrics.Issues?.Count ?? 0);
             }
+
+            if (metrics.Issues is not null)
+                pipeline.Metrics.Issues.AddRange(metrics.Issues);
         }
 
         // After Improver: sync config repo to pick up the changes it pushed directly
@@ -303,52 +269,21 @@ public sealed class GoalDispatcher : BackgroundService
             await SyncAgentsFromConfigRepoAsync(ct);
         }
 
-        // Populate review metrics when the reviewer phase completes (skip if structured data already set)
-        if (pipeline.Phase == GoalPhase.Review && !hasStructuredReview)
-        {
-            pipeline.Metrics.ReviewVerdict = interpretation.Verdict == "FAIL"
-                ? ReviewVerdict.RequestChanges
-                : interpretation.Verdict == "PASS"
-                    ? ReviewVerdict.Approve
-                    : ReviewVerdictExtensions.ParseReviewVerdict(interpretation.ReviewVerdict);
-            if (interpretation.Issues is { Count: > 0 })
+        // Map verdict to PhaseInput directly — no Brain interpretation needed
+        var phaseInput = pipeline.Phase == GoalPhase.Improve
+            ? PhaseInput.Succeeded // Improve phase is non-blocking
+            : verdict switch
             {
-                pipeline.Metrics.ReviewIssuesFound += interpretation.Issues.Count;
-                pipeline.Metrics.ReviewIssues.AddRange(interpretation.Issues);
-            }
-        }
+                "FAIL" => PhaseInput.Failed,
+                "REQUEST_CHANGES" => PhaseInput.RequestChanges,
+                _ => PhaseInput.Succeeded, // PASS, APPROVE, or no verdict
+            };
 
-        if (interpretation.Issues is not null)
-            pipeline.Metrics.Issues.AddRange(interpretation.Issues);
-
-        // Propagate model_tier using first-non-null-wins — don't overwrite a tier already set by an earlier Brain call.
-        DistributedBrain.ApplyModelTierIfNotSet(pipeline, interpretation.ModelTier);
-
-        // Guard: if the Brain says Done/Skip but the reviewer verdict is REQUEST_CHANGES,
-        // correct the action to RequestChanges so the coder gets another chance.
-        if (pipeline.Phase == GoalPhase.Review
-            && interpretation.Action is OrchestratorActionType.Done or OrchestratorActionType.Skip
-            && pipeline.Metrics.ReviewVerdict == ReviewVerdict.RequestChanges)
-        {
-            _logger.LogWarning(
-                "Brain said {Action} for {GoalId} at Review but verdict is REQUEST_CHANGES — correcting to RequestChanges",
-                interpretation.Action, pipeline.GoalId);
-            interpretation = interpretation with { Action = OrchestratorActionType.RequestChanges };
-        }
-
-        // Map Brain action → state machine input.
-        // SpawnCoder at Coding is a "re-dispatch same worker" — no state transition needed.
-        var phaseInput = MapToPhaseInput(interpretation.Action, pipeline.Phase);
-        if (phaseInput is null)
-        {
-            // Re-dispatch coder without a state transition (e.g., Brain wants another attempt)
-            _logger.LogInformation("Brain requested re-dispatch of Coder for {GoalId}", pipeline.GoalId);
-            await DispatchToRole(pipeline, WorkerRole.Coder, interpretation.Prompt, ct);
-            return;
-        }
+        _logger.LogInformation("Verdict for {GoalId} phase {Phase}: {Verdict} → {PhaseInput}",
+            pipeline.GoalId, pipeline.Phase, verdict, phaseInput);
 
         // State machine transition
-        var result = pipeline.StateMachine.Transition(phaseInput.Value);
+        var result = pipeline.StateMachine.Transition(phaseInput);
 
         switch (result.Effect)
         {
@@ -360,7 +295,7 @@ public sealed class GoalDispatcher : BackgroundService
                 break;
 
             case TransitionEffect.NewIteration:
-                await HandleNewIterationAsync(pipeline, interpretation, ct);
+                await HandleNewIterationAsync(pipeline, verdict, ct);
                 break;
 
             case TransitionEffect.Completed:
@@ -371,51 +306,15 @@ public sealed class GoalDispatcher : BackgroundService
     }
 
     /// <summary>
-    /// Maps a Brain action to a state machine <see cref="PhaseInput"/>.
-    /// Returns null for "re-dispatch same worker" (no state transition needed).
-    /// </summary>
-    internal static PhaseInput? MapToPhaseInput(OrchestratorActionType action, GoalPhase currentPhase)
-    {
-        return action switch
-        {
-            OrchestratorActionType.RequestChanges => PhaseInput.RequestChanges,
-            OrchestratorActionType.Retry => PhaseInput.Failed,
-
-            OrchestratorActionType.Done
-                or OrchestratorActionType.Skip
-                or OrchestratorActionType.Merge => PhaseInput.Succeeded,
-
-            // SpawnCoder at Coding = "try coder again" (no state transition)
-            OrchestratorActionType.SpawnCoder when currentPhase == GoalPhase.Coding => null,
-            // SpawnCoder from any other phase = something failed → back to coding
-            OrchestratorActionType.SpawnCoder => PhaseInput.Failed,
-
-            // SpawnXxx for a different worker = current phase succeeded, advance
-            OrchestratorActionType.SpawnTester
-                or OrchestratorActionType.SpawnReviewer
-                or OrchestratorActionType.SpawnDocWriter
-                or OrchestratorActionType.SpawnImprover => PhaseInput.Succeeded,
-
-            _ => throw new InvalidOperationException($"Unknown Brain action: {action}"),
-        };
-    }
-
-    /// <summary>
     /// Handles a <see cref="TransitionEffect.NewIteration"/> result from the state machine.
     /// Checks retry/iteration limits, re-plans, and dispatches the coder.
     /// </summary>
     private async Task HandleNewIterationAsync(
-        GoalPipeline pipeline, OrchestratorDecision interpretation, CancellationToken ct)
+        GoalPipeline pipeline, string verdict, CancellationToken ct)
     {
-        // Determine which retry counter to increment based on the phase we came from
-        var previousPhase = interpretation.Action switch
-        {
-            OrchestratorActionType.RequestChanges => pipeline.Phase, // already set to Coding by state machine
-            _ => pipeline.Phase,
-        };
-        // Use the context: review/docwriting failures use review retry, others use test retry
-        var isReviewRelated = pipeline.Metrics.ReviewVerdict == ReviewVerdict.RequestChanges
-            || interpretation.Action == OrchestratorActionType.RequestChanges;
+        // Determine which retry counter to increment based on the verdict
+        var isReviewRelated = verdict == "REQUEST_CHANGES"
+            || pipeline.Metrics.ReviewVerdict == ReviewVerdict.RequestChanges;
         var canRetry = isReviewRelated
             ? pipeline.IncrementReviewRetry()
             : pipeline.IncrementTestRetry();
@@ -463,7 +362,7 @@ public sealed class GoalDispatcher : BackgroundService
 
         // Build context for the coder
         var feedbackKind = isReviewRelated ? "Reviewer feedback" : "Test failures";
-        var context = $"{feedbackKind}:\n{interpretation.Reason ?? "See previous output."}";
+        var context = $"{feedbackKind}: see previous output.";
 
         if (isReviewRelated && pipeline.Metrics.ReviewIssues is { Count: > 0 })
         {
@@ -472,7 +371,7 @@ public sealed class GoalDispatcher : BackgroundService
         }
 
         var fixPrompt = _brain is not null
-            ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Coder, context, ct)
+            ? await _brain.CraftPromptAsync(pipeline, GoalPhase.Coding, context, ct)
             : $"Fix issues for: {pipeline.Description}. {context}";
 
         await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
@@ -484,18 +383,13 @@ public sealed class GoalDispatcher : BackgroundService
     {
         switch (phase)
         {
+            case GoalPhase.Coding:
             case GoalPhase.Review:
-                var reviewPrompt = _brain is not null
-                    ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Reviewer, phaseInstructions, ct)
-                    : $"Review the code changes for: {pipeline.Description}";
-                await DispatchToRole(pipeline, WorkerRole.Reviewer, reviewPrompt, ct);
-                break;
-
             case GoalPhase.Testing:
-                var testPrompt = _brain is not null
-                    ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Tester, phaseInstructions, ct)
-                    : $"Run the existing tests and verify the changes for: {pipeline.Description}";
-                await DispatchToRole(pipeline, WorkerRole.Tester, testPrompt, ct);
+                var prompt = _brain is not null
+                    ? await _brain.CraftPromptAsync(pipeline, phase, phaseInstructions, ct)
+                    : $"Work on: {pipeline.Description} (phase: {phase})";
+                await DispatchToRole(pipeline, phase.ToWorkerRole(), prompt, ct);
                 break;
 
             case GoalPhase.DocWriting:
@@ -543,9 +437,8 @@ public sealed class GoalDispatcher : BackgroundService
                 break;
 
             default:
-                _logger.LogWarning("Unexpected phase {Phase} in plan for goal {GoalId} — skipping",
-                    phase, pipeline.GoalId);
-                break;
+                throw new InvalidOperationException(
+                    $"Unexpected phase {phase} in plan for goal {pipeline.GoalId}");
         }
     }
 
@@ -578,7 +471,7 @@ public sealed class GoalDispatcher : BackgroundService
         telemetryAggregator.ClearTelemetryFiles(stateDir, telemetryRoleNames);
 
         var improvePrompt = _brain is not null
-            ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Improver, improveContext, ct)
+            ? await _brain.CraftPromptAsync(pipeline, GoalPhase.Improve, improveContext, ct)
             : "Update the *.agents.md files based on iteration results.\n\n" + analysis;
         await DispatchToRole(pipeline, WorkerRole.Improver, improvePrompt, ct);
     }
@@ -614,18 +507,6 @@ public sealed class GoalDispatcher : BackgroundService
 
     private async Task DispatchToRole(GoalPipeline pipeline, WorkerRole role, string? prompt, CancellationToken ct)
     {
-        // If no prompt provided (Brain might have returned null), craft one.
-        // Preserve the current model tier first — CraftPromptAsync may reset it to "standard",
-        // silently losing a "premium" tier that was set by a prior Brain decision.
-        if (string.IsNullOrWhiteSpace(prompt) && _brain is not null)
-        {
-            var preservedTier = pipeline.LatestModelTier;
-            prompt = await _brain.CraftPromptAsync(pipeline, role, null, ct);
-            // Always restore the preserved tier — CraftPromptAsync is only used for prompt text,
-            // and must never influence model_tier.
-            pipeline.LatestModelTier = preservedTier;
-        }
-
         prompt ??= $"Work on: {pipeline.Description}";
 
         // Log the prompt being sent to the worker
@@ -905,7 +786,7 @@ public sealed class GoalDispatcher : BackgroundService
         pipeline.StateMachine.StartIteration(newPlan.Phases);
 
         var fixPrompt = _brain is not null
-            ? await _brain.CraftPromptAsync(pipeline, WorkerRole.Coder, rebaseContext, ct)
+            ? await _brain.CraftPromptAsync(pipeline, GoalPhase.Coding, rebaseContext, ct)
             : rebaseContext;
         await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
     }
@@ -1357,62 +1238,35 @@ public sealed class GoalDispatcher : BackgroundService
         var maxIterations = _config?.Orchestrator?.MaxIterations ?? Constants.DefaultMaxIterations;
         var pipeline = _pipelineManager.CreatePipeline(goal, maxRetries, maxIterations);
 
+        // Plan iteration phases
+        IterationPlan iterationPlan;
         if (_brain is not null)
         {
-            // Brain-powered: ask the Brain to plan the goal
-            var goalPlan = await _brain.PlanGoalAsync(pipeline, ct);
-
-            // Get the iteration plan from the Brain
-            IterationPlan iterationPlan;
             try
             {
-                iterationPlan = await _brain.PlanIterationAsync(pipeline, ct);
-                iterationPlan = ValidatePlan(iterationPlan);
+                iterationPlan = ValidatePlan(await _brain.PlanIterationAsync(pipeline, ct));
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Brain failed to plan iteration for {GoalId}, using default plan", pipeline.GoalId);
                 iterationPlan = IterationPlan.Default();
             }
-            pipeline.SetPlan(iterationPlan);
-            pipeline.StateMachine.StartIteration(iterationPlan.Phases);
-
-            var goalAction = goalPlan.Action;
-            switch (goalAction)
-            {
-                case OrchestratorActionType.Done:
-                case OrchestratorActionType.Skip:
-                    _logger.LogInformation("Brain decided to {Action} goal {GoalId} at planning stage",
-                        goalAction, pipeline.GoalId);
-                    await MarkGoalCompleted(pipeline, ct);
-                    break;
-
-                case OrchestratorActionType.SpawnCoder:
-                case OrchestratorActionType.SpawnReviewer:
-                case OrchestratorActionType.SpawnTester:
-                case OrchestratorActionType.SpawnImprover:
-                case OrchestratorActionType.SpawnDocWriter:
-                    // State machine starts at Coding (from StartIteration).
-                    // Brain always starts with SpawnCoder in practice.
-                    pipeline.AdvanceTo(GoalPhase.Coding);
-                    DistributedBrain.ApplyModelTierIfNotSet(pipeline, goalPlan.ModelTier);
-                    await DispatchToRole(pipeline, WorkerRole.Coder, goalPlan.Prompt, ct);
-                    break;
-
-                default:
-                    throw new InvalidOperationException(
-                        $"Unhandled Brain action '{goalAction}' during goal planning for '{pipeline.GoalId}'");
-            }
         }
         else
         {
-            // Mechanical fallback: just dispatch to coder with default plan
-            var defaultPlan = IterationPlan.Default();
-            pipeline.SetPlan(defaultPlan);
-            pipeline.StateMachine.StartIteration(defaultPlan.Phases);
-            pipeline.AdvanceTo(GoalPhase.Coding);
-            await DispatchToRole(pipeline, WorkerRole.Coder, BuildCoderPrompt(goal), ct);
+            iterationPlan = IterationPlan.Default();
         }
+
+        pipeline.SetPlan(iterationPlan);
+        pipeline.StateMachine.StartIteration(iterationPlan.Phases);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        // Craft prompt for coder and dispatch
+        var coderPrompt = _brain is not null
+            ? await _brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, ct)
+            : BuildCoderPrompt(goal);
+
+        await DispatchToRole(pipeline, WorkerRole.Coder, coderPrompt, ct);
 
         _pipelineManager.PersistFull(pipeline);
     }

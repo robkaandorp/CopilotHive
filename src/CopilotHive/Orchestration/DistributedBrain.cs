@@ -13,8 +13,8 @@ namespace CopilotHive.Orchestration;
 
 /// <summary>
 /// LLM-powered brain that runs inside the orchestrator container.
-/// Uses the Copilot SDK with a separate session per goal so each goal
-/// gets its own native conversation context managed by Copilot.
+/// The Brain has two jobs: plan iteration phases and craft worker prompts.
+/// Workers report structured verdicts; the state machine drives sequencing.
 /// </summary>
 public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 {
@@ -42,30 +42,28 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private volatile BrainToolCallResult? _lastToolCallResult;
 
     private const string SystemPrompt = """
-        You are the CopilotHive Orchestrator Brain — a product owner and project manager
-        for a distributed multi-agent software development system. You make ALL tactical decisions:
+        You are the CopilotHive Orchestrator Brain — a product owner and project manager.
+        You have two jobs:
+        1. Plan iteration phases using the report_iteration_plan tool
+        2. Craft clear, specific prompts for workers when asked
 
-        - You decide which workers to spawn and in what order
-        - You craft the prompts sent to workers (coder, reviewer, tester, improver)
-        - You interpret worker output to determine verdicts
-        - You decide whether to retry, skip, or proceed to the next phase
-
-        CRITICAL RULES:
-        - Do NOT run any shell commands, tools, or file operations other than the reporting tools provided.
-        - Do NOT explore the filesystem, install packages, or execute code.
-        - You are a REASONING agent. Analyze input and report decisions via tool calls.
-        - Always call the appropriate tool (report_plan, report_iteration_plan, report_interpretation) to report your decision.
-        - Do NOT return raw JSON in your response — use the tools provided.
+        RULES:
+        - Do NOT run shell commands, tools, or file operations
+        - When planning iterations, always call report_iteration_plan
+        - When crafting prompts, respond with ONLY the prompt text — no tool calls, no JSON, no markdown formatting
+        - Never include git checkout/branch/switch/push commands in prompts — infrastructure handles branching
+        - Never include framework-specific build/test commands — workers use /build and /test skills
         """;
 
     /// <summary>
-    /// Permission handler that denies ALL tool/command execution.
-    /// The Brain is reasoning-only and must never run shell commands or file operations.
+    /// Permission handler that approves all tool calls.
+    /// Built-in tools (shell, read, write, url) are already blocked by --deny-tool CLI flags
+    /// in entrypoint.sh. Custom tools (report_iteration_plan) need approval to execute.
     /// </summary>
-    private static readonly PermissionRequestHandler DenyAllPermissions =
+    private static readonly PermissionRequestHandler ApproveBrainTools =
         (_, _) => Task.FromResult(new PermissionRequestResult
         {
-            Kind = PermissionRequestResultKind.DeniedByRules,
+            Kind = PermissionRequestResultKind.Approved,
         });
 
     /// <summary>
@@ -83,19 +81,22 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _metricsTracker = metricsTracker;
 
         _brainTools = BuildBrainTools();
-        var toolNames = _brainTools.Select(t => t.Name).ToList();
 
-        // Build the orchestrator custom agent with Brain-specific tools
+        // Build the orchestrator custom agent — Tools = null allows all tools.
+        // Custom tools are registered on SessionConfig.Tools (AIFunction list).
+        // Built-in tools are blocked by --deny-tool CLI flags in entrypoint.sh.
+        // Setting an explicit tool name list here causes the CLI to look up names in its
+        // built-in registry, which fails for custom tools with a JS TypeError.
         var orchestratorInstructions = agentsManager?.GetAgentsMd(WorkerRole.Orchestrator) ?? "";
         _orchestratorAgent = new CustomAgentConfig
         {
             Name = "orchestrator",
             DisplayName = "CopilotHive Orchestrator",
-            Description = "LLM-powered product owner and project manager — reports decisions via tool calls",
+            Description = "LLM-powered product owner and project manager — plans iterations and crafts prompts",
             Prompt = string.IsNullOrWhiteSpace(orchestratorInstructions)
                 ? SystemPrompt
                 : $"{SystemPrompt}\n\n{orchestratorInstructions}",
-            Tools = toolNames,
+            Tools = null,
             Infer = false,
         };
     }
@@ -149,7 +150,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private SessionConfig BuildBrainSessionConfig() => new()
     {
         Streaming = false,
-        OnPermissionRequest = DenyAllPermissions,
+        OnPermissionRequest = ApproveBrainTools,
         CustomAgents = [_orchestratorAgent],
         Tools = _brainTools,
         InfiniteSessions = new InfiniteSessionConfig
@@ -161,47 +162,16 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     };
 
     /// <summary>
-    /// Builds the AIFunction tools that the Brain LLM can call to report structured decisions.
-    /// Each tool captures its arguments into <see cref="_lastToolCallResult"/> so the caller
-    /// can read the structured result after <see cref="SessionIdleEvent"/> fires.
+    /// Builds the AIFunction tools that the Brain LLM can call.
+    /// Only <c>report_iteration_plan</c> — prompt crafting uses plain text responses.
     /// </summary>
     private List<AIFunction> BuildBrainTools()
     {
-        var validActions = new HashSet<string>(
-            BrainActions.PlanningActions.Concat(BrainActions.NextStepActions).Distinct());
         var validPhases = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { "coding", "testing", "docwriting", "review", "improve", "merging" };
-        var validModelTiers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "standard", "premium" };
 
         return
         [
-            AIFunctionFactory.Create(
-                ([Description("Action: spawn_coder, spawn_tester, spawn_reviewer, spawn_doc_writer, spawn_improver, request_changes, retry, merge, done, skip")] string action,
-                 [Description("The prompt to send to the worker, if spawning one")] string prompt,
-                 [Description("Why you chose this action")] string reason,
-                 [Description("Model tier: standard or premium")] string model_tier) =>
-                {
-                    var isSpawn = action?.StartsWith("spawn_", StringComparison.Ordinal) == true;
-                    var error = Shared.ToolValidation.Check(
-                        (!string.IsNullOrEmpty(action), "action is required"),
-                        (action is not null && validActions.Contains(action),
-                            $"action must be one of: {string.Join(", ", validActions)}"),
-                        (!isSpawn || !string.IsNullOrWhiteSpace(prompt),
-                            "prompt is required when spawning a worker"),
-                        (!string.IsNullOrEmpty(reason), "reason is required"),
-                        (string.IsNullOrEmpty(model_tier) || validModelTiers.Contains(model_tier),
-                            "model_tier must be 'standard' or 'premium'"));
-                    if (error is not null) return error;
-
-                    _lastToolCallResult = new BrainToolCallResult("report_plan", new Dictionary<string, object?>
-                    {
-                        ["action"] = action, ["prompt"] = prompt, ["reason"] = reason, ["model_tier"] = model_tier,
-                    });
-                    return "Decision recorded.";
-                },
-                "report_plan",
-                "Report your orchestration decision — which worker to spawn, what prompt to send, and why."),
-
             AIFunctionFactory.Create(
                 ([Description("Ordered phase names, e.g. [\"coding\",\"testing\",\"docwriting\",\"review\",\"merging\"]")] string[] phases,
                  [Description("JSON-encoded dict of phase name to instruction, e.g. {\"coding\":\"focus on...\",\"review\":\"check...\"}")] string phase_instructions,
@@ -223,32 +193,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 },
                 "report_iteration_plan",
                 "Report your iteration plan — which phases to run and in what order."),
-
-            AIFunctionFactory.Create(
-                ([Description("Verdict: PASS or FAIL")] string verdict,
-                 [Description("Review verdict: APPROVE or REQUEST_CHANGES (for review phase only, empty string otherwise)")] string review_verdict,
-                 [Description("List of issues found")] string[] issues,
-                 [Description("Why this verdict — what went right or wrong")] string reason,
-                 [Description("Model tier: standard or premium")] string model_tier) =>
-                {
-                    var error = Shared.ToolValidation.Check(
-                        (!string.IsNullOrEmpty(verdict), "verdict is required"),
-                        (verdict is "PASS" or "FAIL", "verdict must be exactly 'PASS' or 'FAIL'"),
-                        (string.IsNullOrEmpty(review_verdict) || review_verdict is "APPROVE" or "REQUEST_CHANGES",
-                            "review_verdict must be empty, 'APPROVE', or 'REQUEST_CHANGES'"),
-                        (!string.IsNullOrEmpty(reason), "reason is required"),
-                        (string.IsNullOrEmpty(model_tier) || validModelTiers.Contains(model_tier),
-                            "model_tier must be 'standard' or 'premium'"));
-                    if (error is not null) return error;
-
-                    _lastToolCallResult = new BrainToolCallResult("report_interpretation", new Dictionary<string, object?>
-                    {
-                        ["verdict"] = verdict, ["review_verdict"] = review_verdict, ["issues"] = issues, ["reason"] = reason, ["model_tier"] = model_tier,
-                    });
-                    return "Interpretation recorded.";
-                },
-                "report_interpretation",
-                "Report your interpretation of worker output — verdict, issues, reason, and review verdict if applicable."),
         ];
     }
 
@@ -369,60 +313,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
-    /// Asks the Brain to plan the best approach for executing the given goal pipeline.
-    /// </summary>
-    /// <param name="pipeline">Current goal pipeline state.</param>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>An <see cref="OrchestratorDecision"/> containing the recommended first action.</returns>
-    public async Task<OrchestratorDecision> PlanGoalAsync(GoalPipeline pipeline, CancellationToken ct = default)
-    {
-        var metricsContext = pipeline.Iteration > 1
-            ? $"""
-              Previous iteration metrics:
-              - Tests: {pipeline.Metrics.PassedTests}/{pipeline.Metrics.TotalTests} passed
-              - Coverage: {pipeline.Metrics.CoveragePercent}%
-              - Review retries: {pipeline.ReviewRetries}
-              - Test retries: {pipeline.TestRetries}
-              - Issues: {string.Join(", ", pipeline.Metrics.Issues)}
-              """
-            : "This is the first iteration — no previous metrics.";
-
-        var historyContext = BuildMetricsHistoryContext();
-
-        var prompt = $$"""
-            Plan the workflow for this goal:
-            {{pipeline.Description}}
-
-            {{metricsContext}}
-            {{historyContext}}
-
-            Decide which phase to start with. Consider:
-            - Is this a documentation-only change? (coder for edits, skip testing, docwriter updates docs)
-            - Is this a code change? (needs coder → tester → docwriter → reviewer → merge)
-            - Is there context from previous iterations?
-            IMPORTANT: Always include the docwriting phase for any change — the doc-writer updates
-            the CHANGELOG, README, and XML doc comments. Even internal services need changelog entries.
-
-            Rules for the prompt you craft:
-            - The branch is already checked out by the infrastructure — do NOT mention branch names
-            - NEVER include git checkout, git branch, git switch, or git push commands — the infrastructure handles all branching
-            - NEVER include framework-specific build/test commands (dotnet build, npm test, etc.) — tell workers to use /build and /test skills
-
-            Call the `report_plan` tool with your decision.
-            Valid actions: {{BrainActions.FormatForPrompt(BrainActions.PlanningActions)}}
-            Model tier should be 'standard' unless a previous attempt FAILED and needs a stronger model.
-            """;
-
-        var decision = await AskAsync(pipeline, prompt, ct);
-        ApplyModelTierIfNotSet(pipeline, decision?.ModelTier);
-        return decision ?? new OrchestratorDecision
-        {
-            Action = OrchestratorActionType.SpawnCoder,
-            Reason = "Default: starting with coding phase",
-        };
-    }
-
-    /// <summary>
     /// Asks the Brain to plan which phases should run during the current iteration.
     /// </summary>
     /// <param name="pipeline">Current goal pipeline state.</param>
@@ -525,7 +415,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         return IterationPlan.Default();
     }
 
-    private static IterationPlan MapIterationPlan(IterationPlanDto dto)
+    internal static IterationPlan MapIterationPlan(IterationPlanDto dto)
     {
         var phases = new List<GoalPhase>();
         foreach (var name in dto.Phases)
@@ -598,7 +488,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>DTO for deserializing the Brain's iteration plan JSON response.</summary>
-    private sealed record IterationPlanDto
+    internal sealed record IterationPlanDto
     {
         /// <summary>Ordered list of phase names the Brain wants to execute this iteration.</summary>
         public List<string> Phases { get; init; } = [];
@@ -609,37 +499,42 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
-    /// Asks the Brain to craft a prompt for the specified worker role.
+    /// Asks the Brain to craft a prompt for the specified phase's worker.
+    /// Sends a message to the Brain session and returns the assistant's plain text response.
     /// </summary>
     /// <param name="pipeline">Current goal pipeline state.</param>
-    /// <param name="role">Role of the worker the prompt will be sent to.</param>
+    /// <param name="phase">The phase whose worker needs a prompt.</param>
     /// <param name="additionalContext">Optional extra context to include in the prompt.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The crafted prompt string.</returns>
     public async Task<string> CraftPromptAsync(
-        GoalPipeline pipeline, WorkerRole role, string? additionalContext, CancellationToken ct = default)
+        GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
     {
+        var roleName = phase.ToWorkerRole().ToRoleName();
         var historyContext = BuildMetricsHistoryContext(3);
 
-        var roleName = role.ToRoleName();
-        var roleInstruction = role switch
+        var phaseInstructions = "";
+        if (pipeline.Plan?.PhaseInstructions.TryGetValue(phase, out var instructions) == true)
+            phaseInstructions = $"\nPhase instructions from the plan:\n{instructions}";
+
+        var roleInstruction = phase switch
         {
-            WorkerRole.Coder => """
+            GoalPhase.Coding => """
                 - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, use /build skill, use /test skill, and commit with `git add -A && git commit`. NEVER include git checkout, git branch, or git push commands. NEVER include dotnet/npm/cargo commands — only reference /build and /test skills.
                 """,
-            WorkerRole.Reviewer => """
+            GoalPhase.Review => """
                 - For reviewers: tell them to run `git diff origin/<base-branch>...HEAD` to review ALL changes. The base branch and feature branch are provided in the workspace context. The `origin/` prefix is required because the clone only has remote tracking refs. Produce a REVIEW_REPORT.
                 """,
-            WorkerRole.Tester => """
+            GoalPhase.Testing => """
                 - For testers: tell them to build, run the test skill, write integration tests, produce a TEST_REPORT
                 """,
-            WorkerRole.DocWriter => """
+            GoalPhase.DocWriting => """
                 - For docwriters: tell them to update README, CHANGELOG, and XML doc comments based on the code changes on the branch, build to verify, and commit. Produce a DOC_REPORT.
                 """,
-            WorkerRole.Improver => """
+            GoalPhase.Improve => """
                 - For improvers: tell them to analyze iteration results and update *.agents.md files directly using file tools. Do NOT tell them to run git commands — the infrastructure commits and pushes automatically.
                 """,
-            _ => throw new InvalidOperationException($"Unhandled role in CraftPromptAsync: '{roleName}'"),
+            _ => throw new InvalidOperationException($"Unhandled phase in CraftPromptAsync: '{phase}'"),
         };
 
         var prompt = $$"""
@@ -647,6 +542,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             Goal: {{pipeline.Description}}
             Iteration: {{pipeline.Iteration}}
+            Current phase: {{phase}}
+            {{phaseInstructions}}
             {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
             {{(historyContext.Length > 0 ? $"\n{historyContext}" : "")}}
 
@@ -660,157 +557,43 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {{roleInstruction}}
             - Include any context from previous phases that would help the worker
 
-            Call the `report_plan` tool with action=spawn_{{roleName}} and the prompt you crafted.
-            Model tier should be 'standard' unless a previous attempt FAILED and needs a stronger model.
+            Respond with ONLY the prompt text — no tool calls, no JSON, no markdown wrapping.
             """;
 
-        var decision = await AskAsync(pipeline, prompt, ct);
-        ApplyModelTierIfNotSet(pipeline, decision?.ModelTier);
-        return decision?.Prompt
-            ?? throw new InvalidOperationException(
-                $"Brain failed to craft prompt for '{roleName}' on goal '{pipeline.GoalId}'. " +
-                "Decision was null or missing the 'prompt' field.");
-    }
-
-    /// <summary>
-    /// Asks the Brain to interpret the output of a worker and return a verdict.
-    /// </summary>
-    /// <param name="pipeline">Current goal pipeline state.</param>
-    /// <param name="phase">The goal phase that produced the output.</param>
-    /// <param name="workerOutput">Raw text output from the worker.</param>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>An <see cref="OrchestratorDecision"/> with the extracted verdict and metrics.</returns>
-    public async Task<OrchestratorDecision> InterpretOutputAsync(
-        GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default)
-    {
-        var phaseName = phase.ToString();
-
-        var modeInstruction = """
-              IMPORTANT: You are in INTERPRETATION mode, NOT prompt-crafting mode.
-              Do NOT suggest spawning any worker.
-              Your ONLY job is to analyze the output below and return a verdict.
-
-              """;
-
-        var reviewInstruction = phase == GoalPhase.Review
-            ? """
-
-              For reviewers: set review_verdict to 'APPROVE' or 'REQUEST_CHANGES'.
-
-              """
-            : "";
-
-        var prompt = $$"""
-            {{modeInstruction}}Interpret this {{phaseName}}'s output.
-            {{reviewInstruction}}
-            === {{phaseName.ToUpperInvariant()}} OUTPUT (truncated) ===
-            {{Truncate(workerOutput, Constants.TruncationVeryLong)}}
-            === END OUTPUT ===
-
-            Analyze the output carefully:
-            - Did the worker succeed or fail at its task?
-            - For reviewers: did they approve or request changes? What issues?
-            - For docwriters: did they update CHANGELOG, README, or XML doc comments? Did they commit?
-            - For coders: did they make code changes and commit? Check for git commit evidence.
-            - Extract any specific issues mentioned
-
-            Call the `report_interpretation` tool with the verdict (PASS or FAIL), any issues,
-            a reason explaining what went right or wrong,
-            and review_verdict (APPROVE or REQUEST_CHANGES) if this is a review phase.
-            Model tier should be 'standard' unless a retry with a stronger model is needed.
-            """;
-
-        var result = await AskAsync(pipeline, prompt, ct)
-            ?? new OrchestratorDecision
-            {
-                Action = OrchestratorActionType.Done,
-                Verdict = "UNKNOWN",
-                Reason = "Failed to interpret output",
-            };
-
-        ApplyModelTierIfNotSet(pipeline, result.ModelTier);
-        return result;
-    }
-
-    /// <summary>
-    /// Asks the Brain what the next step should be given the current pipeline phase and context.
-    /// </summary>
-    /// <param name="pipeline">Current goal pipeline state.</param>
-    /// <param name="context">Textual context describing the current situation.</param>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>An <see cref="OrchestratorDecision"/> with the recommended next action.</returns>
-    public async Task<OrchestratorDecision> DecideNextStepAsync(
-        GoalPipeline pipeline, string context, CancellationToken ct = default)
-    {
-        var prompt = $$"""
-            Current goal: {{pipeline.Description}}
-            Current phase: {{pipeline.Phase}}
-            {{context}}
-
-            What should we do next?
-
-            Call the `report_plan` tool with your decision.
-            Valid actions: {{BrainActions.FormatForPrompt(BrainActions.NextStepActions)}}
-            Model tier should be 'standard' unless a retry with a stronger model is needed.
-            """;
-
-        var decision = await AskAsync(pipeline, prompt, ct);
-        ApplyModelTierIfNotSet(pipeline, decision?.ModelTier);
-        return decision
-            ?? new OrchestratorDecision
-            {
-                Action = OrchestratorActionType.Done,
-                Reason = "Failed to decide — defaulting to done",
-            };
-    }
-
-    /// <summary>
-    /// Informs the Brain of something that happened so it can maintain conversation context.
-    /// </summary>
-    /// <param name="pipeline">Current goal pipeline state.</param>
-    /// <param name="information">Human-readable status update to pass to the Brain.</param>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>A task that represents the asynchronous operation.</returns>
-    public async Task InformAsync(GoalPipeline pipeline, string information, CancellationToken ct = default)
-    {
-        var session = await GetOrCreateSessionAsync(pipeline, ct);
-        await SendToSessionAsync(session,
-            $"[STATUS UPDATE] {information}\n\nAcknowledge briefly.", ct);
-    }
-
-    private async Task<OrchestratorDecision?> AskAsync(GoalPipeline pipeline, string prompt, CancellationToken ct)
-    {
         try
         {
             var session = await GetOrCreateSessionAsync(pipeline, ct);
 
-            return await Shared.CopilotRetryPolicy.ExecuteAsync(
+            var craftedPrompt = await Shared.CopilotRetryPolicy.ExecuteAsync(
                 async () =>
                 {
-                    _logger.LogDebug("Brain prompt for {GoalId}:\n{Prompt}", pipeline.GoalId, Truncate(prompt, Constants.TruncationVerbose));
+                    _logger.LogDebug("Brain craft-prompt request for {GoalId} (phase={Phase}):\n{Prompt}",
+                        pipeline.GoalId, phase, Truncate(prompt, Constants.TruncationVerbose));
 
-                    var (response, toolCall) = await SendToSessionCoreAsync(session, prompt, ct);
+                    var (response, _) = await SendToSessionCoreAsync(session, prompt, ct);
 
-                    _logger.LogDebug("Brain response for {GoalId}:\n{Response}", pipeline.GoalId, Truncate(response, Constants.TruncationVerbose));
+                    _logger.LogDebug("Brain craft-prompt response for {GoalId}:\n{Response}",
+                        pipeline.GoalId, Truncate(response, Constants.TruncationVerbose));
 
                     pipeline.Conversation.Add(new ConversationEntry("user", prompt));
                     pipeline.Conversation.Add(new ConversationEntry("assistant", response));
 
-                    if (toolCall is null)
+                    if (string.IsNullOrWhiteSpace(response))
                         throw new InvalidOperationException(
-                            $"Brain did not use a tool call for {pipeline.GoalId}. Response: {Truncate(response, Constants.TruncationShort)}");
+                            $"Brain returned empty prompt for {pipeline.GoalId} phase {phase}");
 
-                    _logger.LogDebug("Brain used tool call '{Tool}' for {GoalId}", toolCall.ToolName, pipeline.GoalId);
-                    return BuildDecisionFromToolCall(toolCall);
+                    return response;
                 },
                 onRetry: (attempt, delay, ex) =>
                 {
                     _logger.LogWarning(
-                        "Brain query failed for {GoalId} (attempt {Attempt}/{Max}): {Error}. Retrying in {Delay}s",
+                        "Brain craft-prompt failed for {GoalId} (attempt {Attempt}/{Max}): {Error}. Retrying in {Delay}s",
                         pipeline.GoalId, attempt, Shared.CopilotRetryPolicy.MaxRetries + 1, ex.Message, delay.TotalSeconds);
                     pipeline.Conversation.Add(new ConversationEntry("system", $"Error on attempt {attempt}: {ex.Message}"));
                 },
                 ct);
+
+            return craftedPrompt;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -818,62 +601,17 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Brain query failed for goal {GoalId} after all retries", pipeline.GoalId);
-            pipeline.Conversation.Add(new ConversationEntry("system", $"Final error: {ex.Message}"));
-            return null;
+            _logger.LogError(ex, "Brain failed to craft prompt for {GoalId} phase {Phase} — using fallback",
+                pipeline.GoalId, phase);
+            pipeline.Conversation.Add(new ConversationEntry("system", $"CraftPrompt error: {ex.Message}"));
+            return $"Work on: {pipeline.Description}";
         }
     }
 
-    /// <summary>
-    /// Builds an <see cref="OrchestratorDecision"/> from a <c>report_plan</c> or
-    /// <c>report_interpretation</c> tool call result.
-    /// </summary>
-    internal static OrchestratorDecision BuildDecisionFromToolCall(BrainToolCallResult toolCall)
-    {
-        var args = toolCall.Arguments;
-
-        return toolCall.ToolName switch
-        {
-            "report_plan" => new OrchestratorDecision
-            {
-                Action = ParseAction(GetStringArg(args, "action")),
-                Prompt = GetStringArg(args, "prompt"),
-                Reason = GetStringArg(args, "reason"),
-                ModelTier = GetStringArg(args, "model_tier"),
-            },
-            "report_interpretation" => new OrchestratorDecision
-            {
-                Action = OrchestratorActionType.Done,
-                Verdict = GetStringArg(args, "verdict"),
-                ReviewVerdict = GetStringArg(args, "review_verdict") is { Length: > 0 } rv ? rv : null,
-                Issues = GetStringArrayArg(args, "issues"),
-                Reason = GetStringArg(args, "reason"),
-                ModelTier = GetStringArg(args, "model_tier"),
-            },
-            _ => throw new InvalidOperationException($"Unexpected Brain tool call: '{toolCall.ToolName}'"),
-        };
-    }
-
-    private static OrchestratorActionType ParseAction(string? action) =>
-        action switch
-        {
-            "spawn_coder" => OrchestratorActionType.SpawnCoder,
-            "spawn_tester" => OrchestratorActionType.SpawnTester,
-            "spawn_reviewer" => OrchestratorActionType.SpawnReviewer,
-            "spawn_doc_writer" => OrchestratorActionType.SpawnDocWriter,
-            "spawn_improver" => OrchestratorActionType.SpawnImprover,
-            "request_changes" => OrchestratorActionType.RequestChanges,
-            "retry" => OrchestratorActionType.Retry,
-            "merge" => OrchestratorActionType.Merge,
-            "done" => OrchestratorActionType.Done,
-            "skip" => OrchestratorActionType.Skip,
-            _ => throw new InvalidOperationException($"Unknown Brain action: '{action}'"),
-        };
-
-    private static string? GetStringArg(Dictionary<string, object?> args, string key) =>
+    internal static string? GetStringArg(Dictionary<string, object?> args, string key) =>
         args.TryGetValue(key, out var val) ? val?.ToString() : null;
 
-    private static List<string>? GetStringArrayArg(Dictionary<string, object?> args, string key)
+    internal static List<string>? GetStringArrayArg(Dictionary<string, object?> args, string key)
     {
         if (!args.TryGetValue(key, out var val) || val is null)
             return null;
@@ -892,7 +630,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     /// <summary>
     /// Sends a prompt to a Copilot session with exponential backoff retry.
-    /// Used for priming, status updates, and other non-AskAsync calls.
+    /// Used for priming, status updates, and other non-tool-call calls.
     /// </summary>
     private async Task<string> SendToSessionAsync(CopilotSession session, string prompt, CancellationToken ct)
     {
@@ -952,8 +690,18 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     case UserMessageEvent:
                     case SubagentSelectedEvent:
                     case SessionInfoEvent:
-                    case ToolExecutionStartEvent:
-                    case ToolExecutionCompleteEvent:
+                        break;
+                    case SubagentStartedEvent subStart:
+                        Console.WriteLine($"[Brain-SDK] SubagentStarted");
+                        Console.Out.Flush();
+                        break;
+                    case ToolExecutionStartEvent toolStart:
+                        Console.WriteLine($"[Brain-SDK] ToolStart: {toolStart.Data?.ToolName ?? "unknown"} (id={toolStart.Data?.ToolCallId})");
+                        Console.Out.Flush();
+                        break;
+                    case ToolExecutionCompleteEvent toolEnd:
+                        Console.WriteLine($"[Brain-SDK] ToolComplete: {toolEnd.Data?.ToolCallId} success={toolEnd.Data?.Success} error={toolEnd.Data?.Error?.Message}");
+                        Console.Out.Flush();
                         break;
                     default:
                         Console.WriteLine($"[Brain-SDK] {evt.GetType().Name}");

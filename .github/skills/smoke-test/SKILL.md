@@ -71,14 +71,14 @@ dotnet build CopilotHive.slnx
 
 Must succeed with 0 errors before proceeding.
 
-### 7. Rebuild containers (no cache)
+### 7. Rebuild containers
 
 ```powershell
 cd C:\Projects\Personal\CopilotHive\docker
-docker compose build --no-cache
+docker compose build
 ```
 
-This ensures containers have the latest code. Takes ~60-90 seconds.
+This ensures containers have the latest code.
 
 ### 8. Start containers
 

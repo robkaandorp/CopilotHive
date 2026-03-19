@@ -15,16 +15,9 @@ public sealed class GoalDispatcherReviewVerdictTests
     // ── ReviewVerdict mapping ────────────────────────────────────────────
 
     [Fact]
-    public async Task ReviewPhase_VerdictFail_SetsReviewVerdictRequestChanges()
+    public async Task ReviewPhase_VerdictRequestChanges_SetsReviewVerdictRequestChanges()
     {
-        var brain = new FakeDispatcherBrain
-        {
-            InterpretOutputOverride = (_, _, _) => new OrchestratorDecision
-            {
-                Action = OrchestratorActionType.Done,
-                Verdict = "FAIL",
-            },
-        };
+        var brain = new FakeDispatcherBrain();
 
         // maxRetries=0 so the FAIL-verdict retry path calls MarkGoalFailed instead of
         // re-dispatching to Coder, keeping the test self-contained.
@@ -35,22 +28,16 @@ public sealed class GoalDispatcherReviewVerdictTests
             TaskId = taskId,
             Status = Shared.Grpc.TaskStatus.Completed,
             Output = "Several critical issues found.",
+            Metrics = new TaskMetrics { Verdict = "REQUEST_CHANGES", Issues = { "critical issue" } },
         }, TestContext.Current.CancellationToken);
 
         Assert.Equal(ReviewVerdict.RequestChanges, pipeline.Metrics.ReviewVerdict);
     }
 
     [Fact]
-    public async Task ReviewPhase_VerdictPass_SetsReviewVerdictApprove()
+    public async Task ReviewPhase_VerdictApprove_SetsReviewVerdictApprove()
     {
-        var brain = new FakeDispatcherBrain
-        {
-            InterpretOutputOverride = (_, _, _) => new OrchestratorDecision
-            {
-                Action = OrchestratorActionType.Done,
-                Verdict = "PASS",
-            },
-        };
+        var brain = new FakeDispatcherBrain();
 
         var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Review, brain);
 
@@ -59,6 +46,7 @@ public sealed class GoalDispatcherReviewVerdictTests
             TaskId = taskId,
             Status = Shared.Grpc.TaskStatus.Completed,
             Output = "LGTM, no issues found.",
+            Metrics = new TaskMetrics { Verdict = "APPROVE" },
         }, TestContext.Current.CancellationToken);
 
         Assert.Equal(ReviewVerdict.Approve, pipeline.Metrics.ReviewVerdict);
@@ -70,14 +58,7 @@ public sealed class GoalDispatcherReviewVerdictTests
     [InlineData(GoalPhase.Testing, "FAIL")]
     public async Task NonReviewPhase_AnyVerdict_ReviewVerdictRemainsEmpty(GoalPhase phase, string verdict)
     {
-        var brain = new FakeDispatcherBrain
-        {
-            InterpretOutputOverride = (_, _, _) => new OrchestratorDecision
-            {
-                Action = OrchestratorActionType.Done,
-                Verdict = verdict,
-            },
-        };
+        var brain = new FakeDispatcherBrain();
 
         // maxRetries=0 prevents retry dispatching so the test stays self-contained.
         var (dispatcher, pipeline, taskId) = CreateDispatcher(phase, brain, maxRetries: 0);
@@ -87,39 +68,13 @@ public sealed class GoalDispatcherReviewVerdictTests
             TaskId = taskId,
             Status = Shared.Grpc.TaskStatus.Completed,
             Output = "Worker output.",
+            Metrics = new TaskMetrics { Verdict = verdict },
         }, TestContext.Current.CancellationToken);
 
         Assert.True(
             pipeline.Metrics.ReviewVerdict is null,
             $"Expected ReviewVerdict to be null for phase {phase} with verdict {verdict}, " +
             $"but was: '{pipeline.Metrics.ReviewVerdict}'");
-    }
-
-    // ── ReviewVerdict fallback: unknown Verdict uses ReviewVerdict field ─
-
-    [Fact]
-    public async Task ReviewPhase_UnknownVerdict_FallsBackToReviewVerdictField()
-    {
-        var brain = new FakeDispatcherBrain
-        {
-            InterpretOutputOverride = (_, _, _) => new OrchestratorDecision
-            {
-                Action = OrchestratorActionType.Done,
-                Verdict = null,
-                ReviewVerdict = "APPROVE",
-            },
-        };
-
-        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Review, brain);
-
-        await dispatcher.HandleTaskCompletionAsync(new TaskComplete
-        {
-            TaskId = taskId,
-            Status = Shared.Grpc.TaskStatus.Completed,
-            Output = "Looks good overall.",
-        }, TestContext.Current.CancellationToken);
-
-        Assert.Equal(ReviewVerdict.Approve, pipeline.Metrics.ReviewVerdict);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
@@ -247,33 +202,17 @@ public sealed class GoalDispatcherResolveRepositoriesTests
 /// </summary>
 file sealed class FakeDispatcherBrain : IDistributedBrain
 {
-    public Func<GoalPipeline, GoalPhase, string, OrchestratorDecision>? InterpretOutputOverride { get; set; }
+    /// <summary>Verdict to return when a worker completes (used by the test harness).</summary>
+    public string Verdict { get; set; } = "PASS";
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
-
-    public Task<OrchestratorDecision> PlanGoalAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
-        Task.FromResult(new OrchestratorDecision { Action = OrchestratorActionType.SpawnCoder });
 
     public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
         Task.FromResult(IterationPlan.Default());
 
     public Task<string> CraftPromptAsync(
-        GoalPipeline pipeline, WorkerRole role, string? additionalContext = null, CancellationToken ct = default) =>
-        Task.FromResult($"Work on {pipeline.Description} as {role.ToRoleName()}");
-
-    public Task<OrchestratorDecision> InterpretOutputAsync(GoalPipeline pipeline, GoalPhase phase, string workerOutput, CancellationToken ct = default)
-    {
-        var decision = InterpretOutputOverride?.Invoke(pipeline, phase, workerOutput)
-            ?? new OrchestratorDecision { Action = OrchestratorActionType.Done, Verdict = "PASS" };
-        return Task.FromResult(decision);
-    }
-
-    public Task<OrchestratorDecision> DecideNextStepAsync(
-        GoalPipeline pipeline, string context, CancellationToken ct = default) =>
-        Task.FromResult(new OrchestratorDecision { Action = OrchestratorActionType.Done });
-
-    public Task InformAsync(GoalPipeline pipeline, string information, CancellationToken ct = default) =>
-        Task.CompletedTask;
+        GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
+        Task.FromResult($"Work on {pipeline.Description} as {phase}");
 }
 
 /// <summary>

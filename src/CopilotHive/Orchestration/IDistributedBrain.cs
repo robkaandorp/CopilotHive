@@ -1,22 +1,16 @@
 using CopilotHive.Services;
-using CopilotHive.Workers;
 
 namespace CopilotHive.Orchestration;
 
 /// <summary>
 /// LLM-powered brain for the distributed orchestrator.
-/// Runs alongside the server process and supports multiple concurrent goals.
+/// The Brain has two jobs: plan iteration phases and craft worker prompts.
+/// Workers report structured verdicts; the state machine drives sequencing.
 /// </summary>
 public interface IDistributedBrain
 {
     /// <summary>Connect to the local Copilot CLI instance.</summary>
     Task ConnectAsync(CancellationToken ct = default);
-
-    /// <summary>
-    /// Plan which phases are needed for a goal. Returns the first action to take.
-    /// The pipeline's conversation context is used for continuity.
-    /// </summary>
-    Task<OrchestratorDecision> PlanGoalAsync(GoalPipeline pipeline, CancellationToken ct = default);
 
     /// <summary>
     /// Plan the workflow phases for the current iteration. Called at the start of each
@@ -26,35 +20,12 @@ public interface IDistributedBrain
     Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default);
 
     /// <summary>
-    /// Craft a context-aware prompt for a specific worker role.
+    /// Craft a context-aware prompt for a specific phase's worker.
     /// Uses the pipeline's accumulated state and conversation history.
     /// </summary>
     Task<string> CraftPromptAsync(
         GoalPipeline pipeline,
-        WorkerRole role,
+        GoalPhase phase,
         string? additionalContext = null,
         CancellationToken ct = default);
-
-    /// <summary>
-    /// Interpret worker output and extract structured verdict/metrics.
-    /// Updates the pipeline's conversation context.
-    /// </summary>
-    Task<OrchestratorDecision> InterpretOutputAsync(
-        GoalPipeline pipeline,
-        GoalPhase phase,
-        string workerOutput,
-        CancellationToken ct = default);
-
-    /// <summary>
-    /// Decide the next step given the pipeline's current state and phase context.
-    /// </summary>
-    Task<OrchestratorDecision> DecideNextStepAsync(
-        GoalPipeline pipeline,
-        string context,
-        CancellationToken ct = default);
-
-    /// <summary>
-    /// Send a status update to the Brain for a specific goal's context.
-    /// </summary>
-    Task InformAsync(GoalPipeline pipeline, string information, CancellationToken ct = default);
 }

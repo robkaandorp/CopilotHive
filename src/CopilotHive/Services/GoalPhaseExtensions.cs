@@ -1,3 +1,5 @@
+using CopilotHive.Workers;
+
 namespace CopilotHive.Services;
 
 /// <summary>
@@ -23,5 +25,25 @@ public static class GoalPhaseExtensions
         GoalPhase.Done       => "Done",
         GoalPhase.Failed     => "Failed",
         _                    => throw new InvalidOperationException($"Unknown GoalPhase: {phase}")
+    };
+
+    /// <summary>
+    /// Maps a <see cref="GoalPhase"/> to the corresponding <see cref="WorkerRole"/>.
+    /// Only valid for phases that dispatch to a worker.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Thrown for phases that have no worker (Planning, Merging, Done, Failed).</exception>
+    public static WorkerRole ToWorkerRole(this GoalPhase phase) => phase switch
+    {
+        GoalPhase.Coding     => WorkerRole.Coder,
+        GoalPhase.Testing    => WorkerRole.Tester,
+        GoalPhase.Review     => WorkerRole.Reviewer,
+        GoalPhase.DocWriting => WorkerRole.DocWriter,
+        GoalPhase.Improve    => WorkerRole.Improver,
+        GoalPhase.Planning
+            or GoalPhase.Merging
+            or GoalPhase.Done
+            or GoalPhase.Failed => throw new InvalidOperationException(
+                $"GoalPhase '{phase}' does not map to a WorkerRole — it has no worker."),
+        _ => throw new InvalidOperationException($"Unknown GoalPhase: {phase}"),
     };
 }
