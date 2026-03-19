@@ -308,6 +308,9 @@ public sealed class HiveOrchestratorService(
         logger.LogInformation("Task {TaskId} completed by {WorkerId}: {Status}",
             complete.TaskId, worker.Id, complete.Status);
 
+        // Capture role before MarkIdle resets it to Unspecified
+        var workerRole = worker.Role;
+
         taskQueue.MarkComplete(complete.TaskId);
         workerPool.MarkIdle(worker.Id);
 
@@ -316,10 +319,13 @@ public sealed class HiveOrchestratorService(
         if (pipeline is not null)
         {
             pipeline.ClearActiveTask();
-            pipeline.RecordOutput(
-                worker.Role.ToDomainRole(),
-                pipeline.Iteration,
-                complete.Output);
+            if (workerRole != GrpcWorkerRole.Unspecified)
+            {
+                pipeline.RecordOutput(
+                    workerRole.ToDomainRole(),
+                    pipeline.Iteration,
+                    complete.Output);
+            }
         }
 
         // Notify GoalDispatcher asynchronously so it can ask the Brain what to do next
