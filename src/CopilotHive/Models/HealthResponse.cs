@@ -10,7 +10,7 @@ public sealed class HealthResponse
     /// <summary>Human-readable health status; always <c>"Healthy"</c> when the server is up.</summary>
     public string Status { get; init; } = "Healthy";
 
-    /// <summary>Human-readable uptime string, e.g. <c>"2d 3h 14m"</c>.</summary>
+    /// <summary>Uptime formatted as <c>"HH:mm:ss"</c>; hours grow beyond 24 for long-running servers.</summary>
     public string Uptime { get; init; } = string.Empty;
 
     /// <summary>Raw uptime as a <see cref="TimeSpan"/> for easy programmatic parsing.</summary>

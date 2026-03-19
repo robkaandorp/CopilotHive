@@ -180,7 +180,7 @@ static async Task<int> RunServerAsync(string[] args)
         return Results.Ok(new HealthResponse
         {
             Status = "Healthy",
-            Uptime = FormatUptime(uptime),
+            Uptime = $"{(int)uptime.TotalHours:D2}:{uptime.Minutes:D2}:{uptime.Seconds:D2}",
             UptimeSpan = uptime,
             ActiveGoals = goals.Count(g => g.Status is GoalStatus.Pending or GoalStatus.InProgress),
             CompletedGoals = goals.Count(g => g.Status == GoalStatus.Completed),
@@ -256,14 +256,6 @@ static void PrintBanner()
                              ╚═╝  ╚═╝╚═╝  ╚═══╝  ╚══════╝
         """);
 }
-
-// Formats uptime as a human-readable string, e.g. "2d 3h 14m", "5h 2m", or "45m 3s".
-static string FormatUptime(TimeSpan ts) =>
-    ts.Days > 0
-        ? $"{ts.Days}d {ts.Hours}h {ts.Minutes}m"
-        : ts.Hours > 0
-            ? $"{ts.Hours}h {ts.Minutes}m"
-            : $"{ts.Minutes}m {ts.Seconds}s";
 
 /// <summary>Request body for updating the status of a goal via the HTTP API.</summary>
 /// <param name="Status">New status string (e.g. "completed", "failed").</param>
