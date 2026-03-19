@@ -25,9 +25,9 @@ public sealed class GoalDispatcherReviewVerdictTests
         await dispatcher.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
-            Status = DomainTaskStatus.Completed,
+            Status = TaskOutcome.Completed,
             Output = "Several critical issues found.",
-            Metrics = new DomainTaskMetrics { Verdict = "REQUEST_CHANGES", Issues = { "critical issue" } },
+            Metrics = new TaskMetrics { Verdict = "REQUEST_CHANGES", Issues = { "critical issue" } },
         }, TestContext.Current.CancellationToken);
 
         Assert.Equal(ReviewVerdict.RequestChanges, pipeline.Metrics.ReviewVerdict);
@@ -43,9 +43,9 @@ public sealed class GoalDispatcherReviewVerdictTests
         await dispatcher.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
-            Status = DomainTaskStatus.Completed,
+            Status = TaskOutcome.Completed,
             Output = "LGTM, no issues found.",
-            Metrics = new DomainTaskMetrics { Verdict = "APPROVE" },
+            Metrics = new TaskMetrics { Verdict = "APPROVE" },
         }, TestContext.Current.CancellationToken);
 
         Assert.Equal(ReviewVerdict.Approve, pipeline.Metrics.ReviewVerdict);
@@ -65,9 +65,9 @@ public sealed class GoalDispatcherReviewVerdictTests
         await dispatcher.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
-            Status = DomainTaskStatus.Completed,
+            Status = TaskOutcome.Completed,
             Output = "Worker output.",
-            Metrics = new DomainTaskMetrics { Verdict = verdict },
+            Metrics = new TaskMetrics { Verdict = verdict },
         }, TestContext.Current.CancellationToken);
 
         Assert.True(
@@ -105,7 +105,7 @@ public sealed class GoalDispatcherReviewVerdictTests
             goalManager,
             pipelineManager,
             new TaskQueue(),
-            new WorkerPool(),
+            new GrpcWorkerGateway(new WorkerPool()),
             notifier,
             NullLogger<GoalDispatcher>.Instance,
             brain);
@@ -189,7 +189,7 @@ public sealed class GoalDispatcherResolveRepositoriesTests
             goalManager,
             new GoalPipelineManager(),
             new TaskQueue(),
-            new WorkerPool(),
+            new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
             NullLogger<GoalDispatcher>.Instance,
             config: config);

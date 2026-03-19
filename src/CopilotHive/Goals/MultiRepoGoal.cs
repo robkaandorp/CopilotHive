@@ -20,18 +20,3 @@ public sealed class MultiRepoGoal
     /// <summary>UTC timestamp when the goal was created.</summary>
     public DateTime CreatedAt { get; init; } = DateTime.UtcNow;
 }
-
-/// <summary>
-/// Describes a single repository targeted by a <see cref="MultiRepoGoal"/>.
-/// </summary>
-public sealed class TargetRepository
-{
-    /// <summary>Short name used to identify the repository.</summary>
-    public required string Name { get; init; }
-    /// <summary>Remote clone URL of the repository.</summary>
-    public required string Url { get; init; }
-    /// <summary>Default branch of the repository (e.g. "main").</summary>
-    public string DefaultBranch { get; init; } = "main";
-    /// <summary>Optional per-repository instructions appended to the worker prompt.</summary>
-    public string? SpecificInstructions { get; init; }
-}

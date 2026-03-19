@@ -5,7 +5,6 @@ using CopilotHive.Goals;
 using CopilotHive.Improvement;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
-using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
 using WorkerRole = CopilotHive.Workers.WorkerRole;
 
@@ -24,7 +23,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly GoalManager _goalManager;
     private readonly GoalPipelineManager _pipelineManager;
     private readonly TaskQueue _taskQueue;
-    private readonly WorkerPool _workerPool;
+    private readonly IWorkerGateway _workerGateway;
     private readonly IDistributedBrain? _brain;
     private readonly ImprovementAnalyzer? _improvementAnalyzer;
     private readonly AgentsManager? _agentsManager;
@@ -44,7 +43,7 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="goalManager">Source of pending goals.</param>
     /// <param name="pipelineManager">Tracks active goal pipelines.</param>
     /// <param name="taskQueue">Queue used to dispatch task assignments to workers.</param>
-    /// <param name="workerPool">Registry of currently connected workers.</param>
+    /// <param name="workerGateway">Abstraction for communicating with connected workers.</param>
     /// <param name="completionNotifier">Bridge that delivers task completion events to this dispatcher.</param>
     /// <param name="logger">Logger instance.</param>
     /// <param name="brain">Optional LLM brain for intelligent prompt crafting.</param>
@@ -57,7 +56,7 @@ public sealed class GoalDispatcher : BackgroundService
         GoalManager goalManager,
         GoalPipelineManager pipelineManager,
         TaskQueue taskQueue,
-        WorkerPool workerPool,
+        IWorkerGateway workerGateway,
         TaskCompletionNotifier completionNotifier,
         ILogger<GoalDispatcher> logger,
         IDistributedBrain? brain = null,
@@ -70,7 +69,7 @@ public sealed class GoalDispatcher : BackgroundService
         _goalManager = goalManager;
         _pipelineManager = pipelineManager;
         _taskQueue = taskQueue;
-        _workerPool = workerPool;
+        _workerGateway = workerGateway;
         _brain = brain;
         _improvementAnalyzer = improvementAnalyzer;
         _agentsManager = agentsManager;
@@ -515,7 +514,7 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogDebug("Prompt for {Role} (goal={GoalId}):\n{Prompt}",
             role, pipeline.GoalId, promptPreview);
 
-        var branchAction = pipeline.CoderBranch is null ? DomainBranchAction.Create : DomainBranchAction.Checkout;
+        var branchAction = pipeline.CoderBranch is null ? BranchAction.Create : BranchAction.Checkout;
 
         List<TargetRepository> repositories;
         try
@@ -555,7 +554,7 @@ public sealed class GoalDispatcher : BackgroundService
         // Downgrade the action to Unspecified so the worker runtime skips push operations.
         if (role == WorkerRole.Improver && task.BranchInfo is not null)
         {
-            task.BranchInfo.Action = DomainBranchAction.Unspecified;
+            task.BranchInfo.Action = BranchAction.Unspecified;
         }
 
         pipeline.SetActiveTask(task.TaskId, task.BranchInfo?.FeatureBranch);
@@ -566,7 +565,7 @@ public sealed class GoalDispatcher : BackgroundService
             role, task.TaskId, pipeline.GoalId, task.BranchInfo?.FeatureBranch);
 
         // Try to push directly to an idle worker
-        var idleWorker = _workerPool.GetIdleWorker();
+        var idleWorker = _workerGateway.GetIdleWorker();
         if (idleWorker is not null)
         {
             var queuedTask = _taskQueue.TryDequeue(role);
@@ -581,9 +580,8 @@ public sealed class GoalDispatcher : BackgroundService
                 await SendAgentsMdToWorkerAsync(idleWorker, queuedTask.Role, ct);
 
                 _taskQueue.Activate(queuedTask, idleWorker.Id);
-                _workerPool.MarkBusy(idleWorker.Id, queuedTask.TaskId);
-                await idleWorker.MessageChannel.Writer.WriteAsync(
-                    new OrchestratorMessage { Assignment = GrpcMapper.ToGrpc(queuedTask) }, ct);
+                _workerGateway.MarkBusy(idleWorker.Id, queuedTask.TaskId);
+                await _workerGateway.SendTaskAsync(idleWorker.Id, queuedTask, ct);
                 _logger.LogInformation("Task {TaskId} pushed to worker {WorkerId}", queuedTask.TaskId, idleWorker.Id);
             }
         }
@@ -598,15 +596,7 @@ public sealed class GoalDispatcher : BackgroundService
         var roleName = role.ToRoleName();
         try
         {
-            await worker.MessageChannel.Writer.WriteAsync(
-                new OrchestratorMessage
-                {
-                    UpdateAgents = new UpdateAgents
-                    {
-                        AgentsMdContent = content,
-                        Role = roleName,
-                    }
-                }, ct);
+            await _workerGateway.SendAgentsUpdateAsync(worker.Id, roleName, content, ct);
         }
         catch (Exception ex)
         {
@@ -812,24 +802,16 @@ public sealed class GoalDispatcher : BackgroundService
     /// </summary>
     private async Task BroadcastAgentsUpdateAsync(WorkerRole role, string content, CancellationToken ct)
     {
-        var workers = _workerPool.GetAllWorkers()
+        var workers = _workerGateway.GetAllWorkers()
             .Where(w => w.Role == role);
 
         var roleName = role.ToRoleName();
-        var message = new OrchestratorMessage
-        {
-            UpdateAgents = new UpdateAgents
-            {
-                AgentsMdContent = content,
-                Role = roleName,
-            }
-        };
 
         foreach (var worker in workers)
         {
             try
             {
-                await worker.MessageChannel.Writer.WriteAsync(message, ct);
+                await _workerGateway.SendAgentsUpdateAsync(worker.Id, roleName, content, ct);
                 _logger.LogInformation("Sent updated AGENTS.md to worker {WorkerId} (role={Role})", worker.Id, roleName);
             }
             catch (Exception ex)

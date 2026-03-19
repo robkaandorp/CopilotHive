@@ -67,11 +67,11 @@ public class MultiRepoTests
     public void BranchCoordinator_GetBranchInfo_ReturnsCorrectProto()
     {
         var coordinator = new BranchCoordinator();
-        var info = coordinator.GetBranchInfo("goal-1", DomainBranchAction.Create, "develop");
+        var info = coordinator.GetBranchInfo("goal-1", BranchAction.Create, "develop");
 
         Assert.Equal("develop", info.BaseBranch);
         Assert.Equal("copilothive/goal-1", info.FeatureBranch);
-        Assert.Equal(DomainBranchAction.Create, info.Action);
+        Assert.Equal(BranchAction.Create, info.Action);
     }
 
     // ──────────────────────────────────────────
@@ -97,7 +97,7 @@ public class MultiRepoTests
             iteration: 1,
             repositories: repos,
             prompt: "Implement the new endpoint",
-            branchAction: DomainBranchAction.Create);
+            branchAction: BranchAction.Create);
         Assert.Equal("api-service", assignment.Repositories[0].Name);
         Assert.Equal("https://github.com/org/api-service.git", assignment.Repositories[0].Url);
         Assert.Equal("main", assignment.Repositories[0].DefaultBranch);
@@ -117,11 +117,11 @@ public class MultiRepoTests
         };
 
         var assignment = builder.Build(
-            "goal-x", "desc", WorkerRole.Coder, 2, repos, "do stuff", DomainBranchAction.Create);
+            "goal-x", "desc", WorkerRole.Coder, 2, repos, "do stuff", BranchAction.Create);
 
         Assert.Equal("develop", assignment.BranchInfo!.BaseBranch);
         Assert.Equal("copilothive/goal-x", assignment.BranchInfo!.FeatureBranch);
-        Assert.Equal(DomainBranchAction.Create, assignment.BranchInfo!.Action);
+        Assert.Equal(BranchAction.Create, assignment.BranchInfo!.Action);
     }
 
     [Fact]
@@ -136,9 +136,9 @@ public class MultiRepoTests
         };
 
         var assignment = builder.Build(
-            "goal-y", "review changes", WorkerRole.Reviewer, 5, repos, "review", DomainBranchAction.Checkout);
+            "goal-y", "review changes", WorkerRole.Reviewer, 5, repos, "review", BranchAction.Checkout);
 
-        Assert.Equal(DomainBranchAction.Checkout, assignment.BranchInfo!.Action);
+        Assert.Equal(BranchAction.Checkout, assignment.BranchInfo!.Action);
         Assert.Equal("copilothive/goal-y", assignment.BranchInfo!.FeatureBranch);
     }
 
@@ -154,7 +154,7 @@ public class MultiRepoTests
         };
 
         var assignment = builder.Build(
-            "goal-z", "test it", WorkerRole.Tester, 7, repos, "run tests", DomainBranchAction.Checkout);
+            "goal-z", "test it", WorkerRole.Tester, 7, repos, "run tests", BranchAction.Checkout);
 
         Assert.Equal("goal-z-tester-007", assignment.TaskId);
         Assert.Equal("goal-z", assignment.GoalId);

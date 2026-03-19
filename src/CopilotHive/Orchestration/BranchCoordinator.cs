@@ -20,13 +20,13 @@ public sealed class BranchCoordinator
     }
 
     /// <summary>
-    /// Builds a <see cref="DomainBranchInfo"/> for the given parameters.
+    /// Builds a <see cref="BranchSpec"/> for the given parameters.
     /// </summary>
-    public DomainBranchInfo GetBranchInfo(string goalId, DomainBranchAction action, string baseBranch)
+    public BranchSpec GetBranchInfo(string goalId, BranchAction action, string baseBranch)
     {
         var featureBranch = GetFeatureBranch(goalId);
 
-        return new DomainBranchInfo
+        return new BranchSpec
         {
             BaseBranch = baseBranch,
             FeatureBranch = featureBranch,

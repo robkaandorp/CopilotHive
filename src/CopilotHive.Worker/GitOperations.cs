@@ -66,8 +66,8 @@ public static class GitOperations
     /// <param name="repoDir">Path to the local git repository.</param>
     /// <param name="baseBranch">The base branch to diff against (e.g. "origin/main"). Falls back to HEAD~1 if null.</param>
     /// <param name="ct">Cancellation token.</param>
-    /// <returns>A <see cref="DomainGitStatus"/> containing diff statistics.</returns>
-    public static async Task<DomainGitStatus> GetGitStatusAsync(string repoDir, string? baseBranch, CancellationToken ct)
+    /// <returns>A <see cref="GitChangeSummary"/> containing diff statistics.</returns>
+    public static async Task<GitChangeSummary> GetGitStatusAsync(string repoDir, string? baseBranch, CancellationToken ct)
     {
         var filesChanged = 0;
         var insertions = 0;
@@ -81,7 +81,7 @@ public static class GitOperations
         if (statExit == 0)
             ParseDiffStat(statOut, ref filesChanged, ref insertions, ref deletions);
 
-        return new DomainGitStatus
+        return new GitChangeSummary
         {
             FilesChanged = filesChanged,
             Insertions = insertions,

@@ -1,3 +1,4 @@
+using CopilotHive.Goals;
 using CopilotHive.Workers;
 
 namespace CopilotHive.Services;
@@ -5,7 +6,7 @@ namespace CopilotHive.Services;
 /// <summary>
 /// Domain representation of a task assignment. Replaces gRPC TaskAssignment in business logic.
 /// </summary>
-public sealed record DomainTask
+public sealed record WorkTask
 {
     /// <summary>Unique identifier for this task.</summary>
     public required string TaskId { get; init; }
@@ -20,9 +21,9 @@ public sealed record DomainTask
     /// <summary>Optional model ID for this task (e.g., "claude-sonnet-4.6").</summary>
     public string Model { get; init; } = "";
     /// <summary>Branch information for git operations, or <c>null</c> if not applicable.</summary>
-    public DomainBranchInfo? BranchInfo { get; set; }
+    public BranchSpec? BranchInfo { get; set; }
     /// <summary>Repositories the worker should operate on.</summary>
-    public required List<DomainRepositoryInfo> Repositories { get; init; }
+    public required List<TargetRepository> Repositories { get; init; }
     /// <summary>Current iteration number.</summary>
     public int Iteration { get; init; }
     /// <summary>Additional key-value metadata for the task.</summary>
@@ -37,17 +38,17 @@ public sealed record TaskResult
     /// <summary>Identifier of the completed task.</summary>
     public required string TaskId { get; init; }
     /// <summary>Outcome status of the task.</summary>
-    public required DomainTaskStatus Status { get; init; }
+    public required TaskOutcome Status { get; init; }
     /// <summary>Worker output text.</summary>
     public string Output { get; init; } = "";
     /// <summary>Structured metrics from the task execution.</summary>
-    public DomainTaskMetrics? Metrics { get; init; }
+    public TaskMetrics? Metrics { get; init; }
     /// <summary>Git diff statistics from the task execution.</summary>
-    public DomainGitStatus? GitStatus { get; init; }
+    public GitChangeSummary? GitStatus { get; init; }
 }
 
 /// <summary>Domain-level task completion status.</summary>
-public enum DomainTaskStatus
+public enum TaskOutcome
 {
     /// <summary>Task completed successfully.</summary>
     Completed,
@@ -60,7 +61,7 @@ public enum DomainTaskStatus
 /// <summary>
 /// Domain representation of task metrics. Replaces gRPC TaskMetrics in business logic.
 /// </summary>
-public sealed record DomainTaskMetrics
+public sealed record TaskMetrics
 {
     /// <summary>Overall verdict string (e.g. "PASS", "FAIL", "APPROVE").</summary>
     public string Verdict { get; init; } = "PASS";
@@ -81,7 +82,7 @@ public sealed record DomainTaskMetrics
 /// <summary>
 /// Domain representation of git diff status. Replaces gRPC GitStatus in business logic.
 /// </summary>
-public sealed record DomainGitStatus
+public sealed record GitChangeSummary
 {
     /// <summary>Number of files changed.</summary>
     public int FilesChanged { get; init; }
@@ -94,7 +95,7 @@ public sealed record DomainGitStatus
 }
 
 /// <summary>Domain-level branch action.</summary>
-public enum DomainBranchAction
+public enum BranchAction
 {
     /// <summary>No branch action specified.</summary>
     Unspecified,
@@ -109,25 +110,12 @@ public enum DomainBranchAction
 /// <summary>
 /// Domain representation of branch information. Replaces gRPC BranchInfo in business logic.
 /// </summary>
-public sealed record DomainBranchInfo
+public sealed record BranchSpec
 {
     /// <summary>The base branch to create from or merge into.</summary>
     public required string BaseBranch { get; init; }
     /// <summary>The feature branch name.</summary>
     public required string FeatureBranch { get; init; }
     /// <summary>The branch action to perform.</summary>
-    public required DomainBranchAction Action { get; set; }
-}
-
-/// <summary>
-/// Domain representation of repository information. Replaces gRPC RepositoryInfo in business logic.
-/// </summary>
-public sealed record DomainRepositoryInfo
-{
-    /// <summary>Repository name.</summary>
-    public required string Name { get; init; }
-    /// <summary>Repository URL.</summary>
-    public required string Url { get; init; }
-    /// <summary>Default branch name (e.g. "main").</summary>
-    public required string DefaultBranch { get; init; }
+    public required BranchAction Action { get; set; }
 }

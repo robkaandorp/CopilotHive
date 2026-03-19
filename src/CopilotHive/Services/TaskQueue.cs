@@ -4,19 +4,19 @@ using CopilotHive.Workers;
 namespace CopilotHive.Services;
 
 /// <summary>
-/// Thread-safe queue of pending and active <see cref="DomainTask"/> instances.
+/// Thread-safe queue of pending and active <see cref="WorkTask"/> instances.
 /// Supports role-based dequeue so workers only receive tasks matching their role.
 /// </summary>
 public sealed class TaskQueue
 {
-    private readonly ConcurrentQueue<DomainTask> _pending = new();
-    private readonly ConcurrentDictionary<string, DomainTask> _active = new();
+    private readonly ConcurrentQueue<WorkTask> _pending = new();
+    private readonly ConcurrentDictionary<string, WorkTask> _active = new();
 
     /// <summary>
     /// Adds a task to the pending queue.
     /// </summary>
-    /// <param name="task">The domain task to enqueue.</param>
-    public void Enqueue(DomainTask task)
+    /// <param name="task">The work task to enqueue.</param>
+    public void Enqueue(WorkTask task)
     {
         _pending.Enqueue(task);
         OnEnqueue?.Invoke(task);
@@ -26,19 +26,19 @@ public sealed class TaskQueue
     /// Optional callback invoked synchronously after each enqueue.
     /// Intended for test hooks that need to observe or react to dispatched tasks.
     /// </summary>
-    public Action<DomainTask>? OnEnqueue { get; set; }
+    public Action<WorkTask>? OnEnqueue { get; set; }
 
     /// <summary>
     /// Dequeue a pending task that matches the requested worker role.
     /// Returns <c>null</c> if no matching task is available.
     /// </summary>
-    public DomainTask? TryDequeue(WorkerRole role)
+    public WorkTask? TryDequeue(WorkerRole role)
     {
         if (role == WorkerRole.Unspecified)
             return TryDequeueAny();
 
         // Drain and re-enqueue non-matching items (bounded by queue size).
-        var skipped = new List<DomainTask>();
+        var skipped = new List<WorkTask>();
 
         while (_pending.TryDequeue(out var task))
         {
@@ -64,7 +64,7 @@ public sealed class TaskQueue
     /// <summary>
     /// Dequeue the next pending task regardless of role. Used by generic workers.
     /// </summary>
-    public DomainTask? TryDequeueAny()
+    public WorkTask? TryDequeueAny()
     {
         return _pending.TryDequeue(out var task) ? task : null;
     }
@@ -91,13 +91,13 @@ public sealed class TaskQueue
     /// </summary>
     /// <param name="taskId">Identifier of the task to retrieve.</param>
     /// <returns>The active task, or <c>null</c> if not found.</returns>
-    public DomainTask? GetActiveTask(string taskId) =>
+    public WorkTask? GetActiveTask(string taskId) =>
         _active.GetValueOrDefault(taskId);
 
     /// <summary>
     /// Move a task from the pending dequeue result into the active dictionary.
     /// </summary>
-    public void Activate(DomainTask task, string workerId)
+    public void Activate(WorkTask task, string workerId)
     {
         _active[task.TaskId] = task;
         task.Metadata["assigned_worker"] = workerId;

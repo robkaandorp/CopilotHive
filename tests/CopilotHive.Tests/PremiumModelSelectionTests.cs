@@ -90,10 +90,10 @@ public class PremiumModelSelectionTests
         await dispatcher.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
-            Status = DomainTaskStatus.Completed,
+            Status = TaskOutcome.Completed,
             Output = "Done.",
-            Metrics = new DomainTaskMetrics { Verdict = "PASS" },
-            GitStatus = new DomainGitStatus { FilesChanged = 3 },
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+            GitStatus = new GitChangeSummary { FilesChanged = 3 },
         }, TestContext.Current.CancellationToken);
 
         Assert.Equal("premium-tester-model", capturedModel);
@@ -122,10 +122,10 @@ public class PremiumModelSelectionTests
         await dispatcher.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
-            Status = DomainTaskStatus.Completed,
+            Status = TaskOutcome.Completed,
             Output = "Done.",
-            Metrics = new DomainTaskMetrics { Verdict = "PASS" },
-            GitStatus = new DomainGitStatus { FilesChanged = 3 },
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+            GitStatus = new GitChangeSummary { FilesChanged = 3 },
         }, TestContext.Current.CancellationToken);
 
         Assert.Equal("standard-tester-model", capturedModel);
@@ -176,7 +176,7 @@ public class PremiumModelSelectionTests
             goalManager,
             pipelineManager,
             taskQueue,
-            new WorkerPool(),
+            new GrpcWorkerGateway(new WorkerPool()),
             notifier,
             NullLogger<GoalDispatcher>.Instance,
             brain,

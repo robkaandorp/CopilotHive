@@ -1,5 +1,9 @@
+using CopilotHive.Goals;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
+
+using GrpcBranchAction = CopilotHive.Shared.Grpc.BranchAction;
+using GrpcTaskMetrics = CopilotHive.Shared.Grpc.TaskMetrics;
 
 namespace CopilotHive.Services;
 
@@ -8,8 +12,8 @@ namespace CopilotHive.Services;
 /// </summary>
 public static class GrpcMapper
 {
-    /// <summary>Converts a <see cref="DomainTask"/> to a gRPC <see cref="TaskAssignment"/>.</summary>
-    public static TaskAssignment ToGrpc(DomainTask task)
+    /// <summary>Converts a <see cref="WorkTask"/> to a gRPC <see cref="TaskAssignment"/>.</summary>
+    public static TaskAssignment ToGrpc(WorkTask task)
     {
         var assignment = new TaskAssignment
         {
@@ -53,9 +57,9 @@ public static class GrpcMapper
             TaskId = complete.TaskId,
             Status = complete.Status switch
             {
-                Shared.Grpc.TaskStatus.Completed => DomainTaskStatus.Completed,
-                Shared.Grpc.TaskStatus.Failed => DomainTaskStatus.Failed,
-                Shared.Grpc.TaskStatus.Cancelled => DomainTaskStatus.Cancelled,
+                Shared.Grpc.TaskStatus.Completed => TaskOutcome.Completed,
+                Shared.Grpc.TaskStatus.Failed => TaskOutcome.Failed,
+                Shared.Grpc.TaskStatus.Cancelled => TaskOutcome.Cancelled,
                 _ => throw new InvalidOperationException($"Unknown TaskStatus: {complete.Status}"),
             },
             Output = complete.Output,
@@ -64,10 +68,10 @@ public static class GrpcMapper
         };
     }
 
-    /// <summary>Converts a gRPC <see cref="TaskMetrics"/> to a domain <see cref="DomainTaskMetrics"/>.</summary>
-    public static DomainTaskMetrics ToDomain(TaskMetrics metrics)
+    /// <summary>Converts a gRPC <see cref="GrpcTaskMetrics"/> to a domain <see cref="TaskMetrics"/>.</summary>
+    public static TaskMetrics ToDomain(GrpcTaskMetrics metrics)
     {
-        return new DomainTaskMetrics
+        return new TaskMetrics
         {
             Verdict = metrics.Verdict,
             BuildSuccess = metrics.BuildSuccess,
@@ -79,10 +83,10 @@ public static class GrpcMapper
         };
     }
 
-    /// <summary>Converts a gRPC <see cref="GitStatus"/> to a domain <see cref="DomainGitStatus"/>.</summary>
-    public static DomainGitStatus ToDomain(GitStatus status)
+    /// <summary>Converts a gRPC <see cref="GitStatus"/> to a domain <see cref="GitChangeSummary"/>.</summary>
+    public static GitChangeSummary ToDomain(GitStatus status)
     {
-        return new DomainGitStatus
+        return new GitChangeSummary
         {
             FilesChanged = status.FilesChanged,
             Insertions = status.Insertions,
@@ -91,10 +95,10 @@ public static class GrpcMapper
         };
     }
 
-    /// <summary>Converts a gRPC <see cref="BranchInfo"/> to a domain <see cref="DomainBranchInfo"/>.</summary>
-    public static DomainBranchInfo ToDomain(BranchInfo info)
+    /// <summary>Converts a gRPC <see cref="BranchInfo"/> to a domain <see cref="BranchSpec"/>.</summary>
+    public static BranchSpec ToDomain(BranchInfo info)
     {
-        return new DomainBranchInfo
+        return new BranchSpec
         {
             BaseBranch = info.BaseBranch,
             FeatureBranch = info.FeatureBranch,
@@ -102,30 +106,30 @@ public static class GrpcMapper
         };
     }
 
-    /// <summary>Converts a domain <see cref="DomainBranchAction"/> to the gRPC equivalent.</summary>
-    public static BranchAction ToGrpc(DomainBranchAction action) => action switch
+    /// <summary>Converts a domain <see cref="BranchAction"/> to the gRPC equivalent.</summary>
+    public static GrpcBranchAction ToGrpc(BranchAction action) => action switch
     {
-        DomainBranchAction.Create => BranchAction.Create,
-        DomainBranchAction.Checkout => BranchAction.Checkout,
-        DomainBranchAction.Merge => BranchAction.Merge,
-        DomainBranchAction.Unspecified => BranchAction.Unspecified,
-        _ => throw new InvalidOperationException($"Unknown DomainBranchAction: {action}"),
-    };
-
-    /// <summary>Converts a gRPC <see cref="BranchAction"/> to the domain equivalent.</summary>
-    public static DomainBranchAction ToDomain(BranchAction action) => action switch
-    {
-        BranchAction.Create => DomainBranchAction.Create,
-        BranchAction.Checkout => DomainBranchAction.Checkout,
-        BranchAction.Merge => DomainBranchAction.Merge,
-        BranchAction.Unspecified => DomainBranchAction.Unspecified,
+        BranchAction.Create => GrpcBranchAction.Create,
+        BranchAction.Checkout => GrpcBranchAction.Checkout,
+        BranchAction.Merge => GrpcBranchAction.Merge,
+        BranchAction.Unspecified => GrpcBranchAction.Unspecified,
         _ => throw new InvalidOperationException($"Unknown BranchAction: {action}"),
     };
 
-    /// <summary>Converts a gRPC <see cref="TaskAssignment"/> to a domain <see cref="DomainTask"/>.</summary>
-    public static DomainTask ToDomain(TaskAssignment assignment)
+    /// <summary>Converts a gRPC <see cref="GrpcBranchAction"/> to the domain equivalent.</summary>
+    public static BranchAction ToDomain(GrpcBranchAction action) => action switch
     {
-        return new DomainTask
+        GrpcBranchAction.Create => BranchAction.Create,
+        GrpcBranchAction.Checkout => BranchAction.Checkout,
+        GrpcBranchAction.Merge => BranchAction.Merge,
+        GrpcBranchAction.Unspecified => BranchAction.Unspecified,
+        _ => throw new InvalidOperationException($"Unknown BranchAction: {action}"),
+    };
+
+    /// <summary>Converts a gRPC <see cref="TaskAssignment"/> to a domain <see cref="WorkTask"/>.</summary>
+    public static WorkTask ToDomain(TaskAssignment assignment)
+    {
+        return new WorkTask
         {
             TaskId = assignment.TaskId,
             GoalId = assignment.GoalId,
@@ -134,7 +138,7 @@ public static class GrpcMapper
             Role = ToDomainRole(assignment.Role),
             Model = assignment.Model,
             BranchInfo = assignment.BranchInfo is not null ? ToDomain(assignment.BranchInfo) : null,
-            Repositories = [.. assignment.Repositories.Select(r => new DomainRepositoryInfo
+            Repositories = [.. assignment.Repositories.Select(r => new TargetRepository
             {
                 Name = r.Name,
                 Url = r.Url,
@@ -152,16 +156,16 @@ public static class GrpcMapper
             TaskId = result.TaskId,
             Status = result.Status switch
             {
-                DomainTaskStatus.Completed => Shared.Grpc.TaskStatus.Completed,
-                DomainTaskStatus.Failed => Shared.Grpc.TaskStatus.Failed,
-                DomainTaskStatus.Cancelled => Shared.Grpc.TaskStatus.Cancelled,
-                _ => throw new InvalidOperationException($"Unknown DomainTaskStatus: {result.Status}"),
+                TaskOutcome.Completed => Shared.Grpc.TaskStatus.Completed,
+                TaskOutcome.Failed => Shared.Grpc.TaskStatus.Failed,
+                TaskOutcome.Cancelled => Shared.Grpc.TaskStatus.Cancelled,
+                _ => throw new InvalidOperationException($"Unknown TaskOutcome: {result.Status}"),
             },
             Output = result.Output,
         };
         if (result.Metrics is not null)
         {
-            complete.Metrics = new TaskMetrics
+            complete.Metrics = new GrpcTaskMetrics
             {
                 Verdict = result.Metrics.Verdict,
                 BuildSuccess = result.Metrics.BuildSuccess,

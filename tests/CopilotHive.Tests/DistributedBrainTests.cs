@@ -16,7 +16,7 @@ public sealed class DistributedBrainTests
     public async Task NotifyAsync_NoSubscribers_DoesNotThrow()
     {
         var notifier = new TaskCompletionNotifier();
-        var complete = new TaskResult { TaskId = "t-1", Status = DomainTaskStatus.Completed, Output = "done" };
+        var complete = new TaskResult { TaskId = "t-1", Status = TaskOutcome.Completed, Output = "done" };
         await notifier.NotifyAsync(complete);
     }
 
@@ -27,12 +27,12 @@ public sealed class DistributedBrainTests
         TaskResult? received = null;
         notifier.OnTaskCompleted += tc => { received = tc; return Task.CompletedTask; };
 
-        var complete = new TaskResult { TaskId = "t-42", Status = DomainTaskStatus.Completed, Output = "all tests pass" };
+        var complete = new TaskResult { TaskId = "t-42", Status = TaskOutcome.Completed, Output = "all tests pass" };
         await notifier.NotifyAsync(complete);
 
         Assert.NotNull(received);
         Assert.Equal("t-42", received.TaskId);
-        Assert.Equal(DomainTaskStatus.Completed, received.Status);
+        Assert.Equal(TaskOutcome.Completed, received.Status);
         Assert.Equal("all tests pass", received.Output);
     }
 
@@ -45,7 +45,7 @@ public sealed class DistributedBrainTests
         notifier.OnTaskCompleted += tc => { invocations.Add("sub2"); return Task.CompletedTask; };
         notifier.OnTaskCompleted += tc => { invocations.Add("sub3"); return Task.CompletedTask; };
 
-        var complete = new TaskResult { TaskId = "t-99", Status = DomainTaskStatus.Completed, Output = "" };
+        var complete = new TaskResult { TaskId = "t-99", Status = TaskOutcome.Completed, Output = "" };
         await notifier.NotifyAsync(complete);
 
         Assert.Equal(3, invocations.Count);

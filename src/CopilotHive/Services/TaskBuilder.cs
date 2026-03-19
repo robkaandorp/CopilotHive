@@ -5,12 +5,12 @@ using CopilotHive.Workers;
 namespace CopilotHive.Services;
 
 /// <summary>
-/// Constructs <see cref="DomainTask"/> instances from goal and branch information.
+/// Constructs <see cref="WorkTask"/> instances from goal and branch information.
 /// </summary>
 public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
 {
     /// <summary>
-    /// Builds a <see cref="DomainTask"/> for a multi-repo goal.
+    /// Builds a <see cref="WorkTask"/> for a multi-repo goal.
     /// </summary>
     /// <param name="goalId">Unique identifier of the goal.</param>
     /// <param name="goalDescription">Human-readable description of the goal.</param>
@@ -20,15 +20,15 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
     /// <param name="prompt">The prompt to send to the worker.</param>
     /// <param name="branchAction">Git branch action to perform (create, checkout, etc.).</param>
     /// <param name="model">Optional model ID for this task (e.g., "claude-sonnet-4.6").</param>
-    /// <returns>A fully constructed <see cref="DomainTask"/>.</returns>
-    public DomainTask Build(
+    /// <returns>A fully constructed <see cref="WorkTask"/>.</returns>
+    public WorkTask Build(
         string goalId,
         string goalDescription,
         WorkerRole role,
         int iteration,
         IEnumerable<TargetRepository> repositories,
         string prompt,
-        DomainBranchAction branchAction,
+        BranchAction branchAction,
         string? model = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(goalId);
@@ -43,14 +43,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
 
         var branchInfo = branchCoordinator.GetBranchInfo(goalId, branchAction, baseBranch);
 
-        var repoInfos = repoList.Select(repo => new DomainRepositoryInfo
-        {
-            Url = repo.Url,
-            Name = repo.Name,
-            DefaultBranch = repo.DefaultBranch,
-        }).ToList();
-
-        return new DomainTask
+        return new WorkTask
         {
             TaskId = $"{goalId}-{roleName}-{iteration:D3}",
             GoalId = goalId,
@@ -59,7 +52,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
             BranchInfo = branchInfo,
             Role = role,
             Model = model ?? "",
-            Repositories = repoInfos,
+            Repositories = repoList,
         };
     }
 }

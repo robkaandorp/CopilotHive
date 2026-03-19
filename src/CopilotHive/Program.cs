@@ -40,6 +40,8 @@ static async Task<int> RunServerAsync(string[] args)
     builder.Services.AddGrpc();
     builder.Services.AddSingleton<WorkerPool>();
     builder.Services.AddSingleton<IWorkerPool>(sp => sp.GetRequiredService<WorkerPool>());
+    builder.Services.AddSingleton<GrpcWorkerGateway>();
+    builder.Services.AddSingleton<IWorkerGateway>(sp => sp.GetRequiredService<GrpcWorkerGateway>());
     builder.Services.AddSingleton<TaskQueue>();
     builder.Services.AddSingleton<ApiGoalSource>();
     builder.Services.AddSingleton<TaskCompletionNotifier>();
