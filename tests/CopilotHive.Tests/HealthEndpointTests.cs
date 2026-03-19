@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using CopilotHive.Goals;
 using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
@@ -62,6 +63,16 @@ public class HealthEndpointTests : IClassFixture<HiveTestFactory>
         using var json = await GetHealthJsonAsync();
         Assert.True(json.RootElement.TryGetProperty("uptime", out var val));
         Assert.False(string.IsNullOrEmpty(val.GetString()));
+    }
+
+    [Fact]
+    public async Task GetHealth_UptimeField_MatchesHhMmSsFormat()
+    {
+        using var json = await GetHealthJsonAsync();
+        Assert.True(json.RootElement.TryGetProperty("uptime", out var val));
+        var uptime = val.GetString();
+        Assert.False(string.IsNullOrEmpty(uptime), "uptime field must not be empty");
+        Assert.Matches(@"^\d+:\d{2}:\d{2}$", uptime);
     }
 
     [Fact]
