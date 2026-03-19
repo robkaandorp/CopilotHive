@@ -1,0 +1,42 @@
+using CopilotHive.Workers;
+
+namespace CopilotHive.Worker;
+
+/// <summary>
+/// Abstracts the AI agent engine used by workers. The default implementation
+/// (<see cref="CopilotCliRunner"/>) communicates with the Copilot CLI via the
+/// GitHub.Copilot.SDK. Alternative implementations could use direct API calls
+/// or other agent frameworks.
+/// </summary>
+public interface IAgentRunner : IAsyncDisposable
+{
+    /// <summary>Structured test results reported by the tester via tool call, or null if not reported.</summary>
+    TestResultReport? LastTestReport { get; }
+
+    /// <summary>Structured report from reviewer/coder/doc-writer via tool call, or null if not reported.</summary>
+    WorkerReport? LastWorkerReport { get; }
+
+    /// <summary>Clears any previously reported test results. Call before starting a new task.</summary>
+    void ClearTestReport();
+
+    /// <summary>Clears any previously reported worker report. Call before starting a new task.</summary>
+    void ClearWorkerReport();
+
+    /// <summary>Sets the tool call bridge for custom tools. Must be called before session creation.</summary>
+    void SetToolBridge(IToolCallBridge? bridge);
+
+    /// <summary>Sets the current task ID for tool call context.</summary>
+    void SetCurrentTaskId(string? taskId);
+
+    /// <summary>Sets the custom agent configuration for the specified role.</summary>
+    void SetCustomAgent(WorkerRole role, string agentsMdContent);
+
+    /// <summary>Connects to the underlying AI agent engine.</summary>
+    Task ConnectAsync(CancellationToken ct = default);
+
+    /// <summary>Resets the current session, optionally switching to a different model.</summary>
+    Task ResetSessionAsync(string? model = null, CancellationToken ct = default);
+
+    /// <summary>Sends a prompt to the AI agent and returns its response.</summary>
+    Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct);
+}

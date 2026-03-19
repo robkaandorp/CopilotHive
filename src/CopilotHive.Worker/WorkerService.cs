@@ -20,7 +20,7 @@ public sealed class WorkerService(
 {
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(30);
 
-    private readonly CopilotRunner _copilotRunner = new(copilotPort);
+    private readonly IAgentRunner _agentRunner = new CopilotCliRunner(copilotPort);
     private readonly WorkerLogger _log = new("Worker");
 
     // Pending tool calls awaiting orchestrator responses, keyed by request_id
@@ -39,7 +39,7 @@ public sealed class WorkerService(
     {
         // Connect to the local Copilot CLI via SDK before registering with orchestrator
         _log.Info("Connecting to local Copilot CLI...");
-        await _copilotRunner.ConnectAsync(ct);
+        await _agentRunner.ConnectAsync(ct);
 
         // Enable HTTP/2 over plaintext (required for gRPC without TLS in Docker network)
         using var channel = GrpcChannel.ForAddress(orchestratorUrl, new GrpcChannelOptions
@@ -119,7 +119,7 @@ public sealed class WorkerService(
                     // Reset Copilot session with per-task model (if specified by orchestrator)
                     var taskModel = string.IsNullOrEmpty(domainTask.Model) ? null : domainTask.Model;
                     _log.Info($"Task model from orchestrator: '{domainTask.Model}' → resolved: '{taskModel ?? "(SDK default)"}'");
-                    await _copilotRunner.ResetSessionAsync(taskModel, ct);
+                    await _agentRunner.ResetSessionAsync(taskModel, ct);
 
                     // Run task execution concurrently so message loop can process
                     // ToolCallResponse messages from the orchestrator during execution
@@ -128,7 +128,7 @@ public sealed class WorkerService(
                     {
                         try
                         {
-                            var executor = new TaskExecutor(_copilotRunner, this);
+                            var executor = new TaskExecutor(_agentRunner, this);
                             var result = await executor.ExecuteAsync(domainTask, localCts.Token);
 
                             await stream.RequestStream.WriteAsync(new WorkerMessage
@@ -164,7 +164,7 @@ public sealed class WorkerService(
                     _log.Info($"Updating custom agent for role: {update.Role}");
                     var parsedRole = WorkerRoleExtensions.ParseRole(update.Role)
                         ?? throw new InvalidOperationException($"Unknown role in UpdateAgents: '{update.Role}'");
-                    _copilotRunner.SetCustomAgent(parsedRole, update.AgentsMdContent);
+                    _agentRunner.SetCustomAgent(parsedRole, update.AgentsMdContent);
                     break;
 
                 case OrchestratorMessage.PayloadOneofCase.ToolResponse:

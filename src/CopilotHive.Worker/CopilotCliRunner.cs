@@ -11,7 +11,7 @@ namespace CopilotHive.Worker;
 /// Communicates with the Copilot CLI running in headless mode via the GitHub.Copilot.SDK.
 /// The Copilot CLI is already running (started by entrypoint.sh); this class connects to it.
 /// </summary>
-public sealed class CopilotRunner : IAsyncDisposable
+public sealed class CopilotCliRunner : IAgentRunner
 {
     private CopilotClient? _client;
     private CopilotSession? _session;
@@ -48,10 +48,10 @@ public sealed class CopilotRunner : IAsyncDisposable
     public TimeSpan RetryDelay { get; init; } = WorkerConstants.RetryDelay;
 
     /// <summary>
-    /// Initialises a new <see cref="CopilotRunner"/> connecting on the given <paramref name="port"/>.
+    /// Initialises a new <see cref="CopilotCliRunner"/> connecting on the given <paramref name="port"/>.
     /// </summary>
     /// <param name="port">The TCP port the Copilot CLI headless server is listening on.</param>
-    public CopilotRunner(int port = WorkerConstants.DefaultAgentPort)
+    public CopilotCliRunner(int port = WorkerConstants.DefaultAgentPort)
     {
         _port = port;
     }
@@ -526,5 +526,5 @@ public sealed class CopilotRunner : IAsyncDisposable
     }
 }
 
-/// <summary>Represents an error raised by <see cref="CopilotRunner"/>.</summary>
+/// <summary>Represents an error raised by <see cref="CopilotCliRunner"/>.</summary>
 public sealed class CopilotRunnerException(string message) : Exception(message);

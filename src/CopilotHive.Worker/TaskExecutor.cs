@@ -9,7 +9,7 @@ namespace CopilotHive.Worker;
 /// Orchestrates the full lifecycle of a single task:
 /// clone repos, handle branches, run Copilot, collect results.
 /// </summary>
-public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? toolBridge = null)
+public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? toolBridge = null)
 {
     private const string WorkRoot = "/copilot-home";
     private const string ConfigRepoDir = "/config-repo";
@@ -28,10 +28,10 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
         var stopwatch = Stopwatch.StartNew();
 
         // Wire tool bridge and task context into CopilotRunner
-        copilotRunner.SetToolBridge(toolBridge);
-        copilotRunner.SetCurrentTaskId(task.TaskId);
-        copilotRunner.ClearTestReport();
-        copilotRunner.ClearWorkerReport();
+        agentRunner.SetToolBridge(toolBridge);
+        agentRunner.SetCurrentTaskId(task.TaskId);
+        agentRunner.ClearTestReport();
+        agentRunner.ClearWorkerReport();
 
         try
         {
@@ -129,7 +129,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
 
             // Send prompt to Copilot
             _log.Info($"Sending prompt to Copilot ({enrichedPrompt.Length} chars)");
-            var copilotOutput = await copilotRunner.SendPromptAsync(enrichedPrompt, primaryWorkDir, ct);
+            var copilotOutput = await agentRunner.SendPromptAsync(enrichedPrompt, primaryWorkDir, ct);
 
             // For roles that push code, ensure Copilot committed its changes.
             // If the working directory is dirty, re-prompt Copilot to commit.
@@ -143,7 +143,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
 
             // For testers: ensure structured test metrics were reported via tool call.
             // If the tester didn't call report_test_results, prompt it to do so.
-            if (task.Role == WorkerRole.Tester && copilotRunner.LastTestReport is null)
+            if (task.Role == WorkerRole.Tester && agentRunner.LastTestReport is null)
             {
                 copilotOutput = await EnsureTestMetricsReportedAsync(copilotOutput, primaryWorkDir, ct);
             }
@@ -203,8 +203,8 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
             stopwatch.Stop();
 
             // Build TaskMetrics from structured tool call data when available
-            var testReport = copilotRunner.LastTestReport;
-            var workerReport = copilotRunner.LastWorkerReport;
+            var testReport = agentRunner.LastTestReport;
+            var workerReport = agentRunner.LastWorkerReport;
             TaskMetrics metrics;
             if (testReport is not null)
             {
@@ -296,7 +296,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
                 Do NOT push — the infrastructure handles pushing.
                 """;
 
-            var cleanupOutput = await copilotRunner.SendPromptAsync(commitPrompt, workDir, ct);
+            var cleanupOutput = await agentRunner.SendPromptAsync(commitPrompt, workDir, ct);
             previousOutput += "\n\n[Auto-commit prompt]\n" + cleanupOutput;
         }
 
@@ -331,14 +331,14 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
             Call the tool now. Do not explain — just call it.
             """;
 
-        var metricsOutput = await copilotRunner.SendPromptAsync(metricsPrompt, workDir, ct);
+        var metricsOutput = await agentRunner.SendPromptAsync(metricsPrompt, workDir, ct);
         previousOutput += "\n\n[Test metrics enforcement]\n" + metricsOutput;
 
-        if (copilotRunner.LastTestReport is null)
+        if (agentRunner.LastTestReport is null)
             _log.Error("Tester still did not report test metrics after prompt — falling back to text parsing");
         else
-            _log.Info($"Tester reported metrics: {copilotRunner.LastTestReport.Verdict}, " +
-                      $"{copilotRunner.LastTestReport.PassedTests}/{copilotRunner.LastTestReport.TotalTests} passed");
+            _log.Info($"Tester reported metrics: {agentRunner.LastTestReport.Verdict}, " +
+                      $"{agentRunner.LastTestReport.PassedTests}/{agentRunner.LastTestReport.TotalTests} passed");
 
         return previousOutput;
     }
@@ -374,7 +374,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
                 Do NOT add new content — only condense what is there.
                 """;
 
-            var condenseOutput = await copilotRunner.SendPromptAsync(condensePrompt, ConfigAgentsDir, ct);
+            var condenseOutput = await agentRunner.SendPromptAsync(condensePrompt, ConfigAgentsDir, ct);
             previousOutput += "\n\n[Agents.md size enforcement]\n" + condenseOutput;
         }
 
