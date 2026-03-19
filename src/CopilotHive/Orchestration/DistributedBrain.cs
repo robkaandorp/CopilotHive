@@ -671,7 +671,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                             "{Source} Usage: model={Model} in={InputTokens} out={OutputTokens} cost={Cost:F4} duration={Duration:F0}ms",
                             "Brain-SDK", usage.Data.Model, usage.Data.InputTokens, usage.Data.OutputTokens,
                             usage.Data.Cost, usage.Data.Duration);
-                        Console.Out.Flush();
                         FileTracer.WriteUsage(usage.Data, "/app/state/traces-brain.jsonl", "brain");
                         break;
                     case SessionIdleEvent:
@@ -680,7 +679,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                         break;
                     case SessionErrorEvent err:
                         _logger.LogWarning("{Source} SessionError: {Message}", "Brain-SDK", err.Data.Message);
-                        Console.Out.Flush();
                         done.TrySetException(new InvalidOperationException(err.Data.Message));
                         break;
                     case AssistantTurnStartEvent:
@@ -692,17 +690,16 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     case SubagentSelectedEvent:
                     case SessionInfoEvent:
                         break;
-                    case SubagentStartedEvent subStart:
-                        Console.WriteLine($"[Brain-SDK] SubagentStarted");
-                        Console.Out.Flush();
+                    case SubagentStartedEvent:
+                        _logger.LogDebug("{Source} SubagentStarted", "Brain-SDK");
                         break;
                     case ToolExecutionStartEvent toolStart:
-                        Console.WriteLine($"[Brain-SDK] ToolStart: {toolStart.Data?.ToolName ?? "unknown"} (id={toolStart.Data?.ToolCallId})");
-                        Console.Out.Flush();
+                        _logger.LogDebug("{Source} ToolStart: {ToolName} (id={ToolCallId})",
+                            "Brain-SDK", toolStart.Data?.ToolName ?? "unknown", toolStart.Data?.ToolCallId);
                         break;
                     case ToolExecutionCompleteEvent toolEnd:
-                        Console.WriteLine($"[Brain-SDK] ToolComplete: {toolEnd.Data?.ToolCallId} success={toolEnd.Data?.Success} error={toolEnd.Data?.Error?.Message}");
-                        Console.Out.Flush();
+                        _logger.LogDebug("{Source} ToolComplete: {ToolCallId} success={Success} error={Error}",
+                            "Brain-SDK", toolEnd.Data?.ToolCallId, toolEnd.Data?.Success, toolEnd.Data?.Error?.Message);
                         break;
                     default:
                         _logger.LogDebug("{Source} {EventType}", "Brain-SDK", evt.GetType().Name);
