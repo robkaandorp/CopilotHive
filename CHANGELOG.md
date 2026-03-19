@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `GoalId.Validate(string)` static method in new `Configuration/GoalId.cs` for validating goal identifiers — IDs must be non-empty, lowercase kebab-case (letters, digits, hyphens only; no leading/trailing hyphens) to match git branch naming convention
+- Goal ID validation in `FileGoalSource.MapToGoal()` — validates each goal ID after parsing from goals.yaml
+- Goal ID validation in `ApiGoalSource.AddGoal()` — validates goal ID when adding a new goal via API
+- `GoalIdTests` — 6 xUnit tests (5 valid cases: `fix-build-error`, `add-feature`, `abc`, `a1b2`, `a-1-b`; 8 invalid cases covering empty/null, uppercase, spaces, leading/trailing hyphens, underscores)
+
+### Added (Previous)
 - `GoalDispatcherBuildIterationSummaryTests` — xUnit test class with 2 tests verifying `BuildIterationSummary()` correctly handles `ImproverSkipped` flag: ensures exactly one "Improve" phase entry appears in output (no duplicates) regardless of whether PhaseDurations already recorded an "Improve" entry
 - `IterationSummary` YAML-level test for null `TestCounts` omission — verifies that when `IterationSummary.TestCounts` is null, the serialised YAML output omits the `test_counts` key entirely
 - `IterationSummary` YAML-level test for null `PhaseResult` — verifies that when a phase result entry in YAML has a null `result` field, `FileGoalSource.ReadGoalsAsync()` throws `InvalidOperationException` rather than silently defaulting

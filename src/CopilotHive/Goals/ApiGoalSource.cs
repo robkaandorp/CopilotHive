@@ -1,3 +1,4 @@
+using CopilotHive.Configuration;
 using System.Collections.Concurrent;
 
 namespace CopilotHive.Goals;
@@ -65,6 +66,7 @@ public sealed class ApiGoalSource : IGoalSource
     /// <returns>The same goal that was added.</returns>
     public Goal AddGoal(Goal goal)
     {
+        GoalId.Validate(goal.Id);
         if (!_goals.TryAdd(goal.Id, goal))
             throw new InvalidOperationException($"Goal '{goal.Id}' already exists.");
 
