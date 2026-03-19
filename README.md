@@ -39,7 +39,7 @@ Goals flow through a structured pipeline:
 
 If testing or review fails, the pipeline retries the coding step (up to a configured limit).
 
-The **Brain** (`DistributedBrain`) interprets each worker's output using LLM reasoning via the GitHub Copilot SDK (JSON-RPC) to decide the next action — retry, advance, or escalate. Pipeline state is persisted to **SQLite** (`PipelineStore`) with auto-migration, so the server can resume after restarts. Metrics feed into the **improver** for self-improvement: the system tunes its own `agents.md` instructions over time.
+The **Brain** (`DistributedBrain`) plans iteration phases and crafts worker prompts using the GitHub Copilot SDK (JSON-RPC). Workers report structured verdicts via tool calls, and the pipeline state machine (`PipelineStateMachine`) drives sequencing — retrying, advancing, or failing based on those verdicts. Pipeline state is persisted to **SQLite** (`PipelineStore`) with auto-migration, so the server can resume after restarts. Metrics feed into the **improver** for self-improvement: the system tunes its own `agents.md` instructions over time.
 
 ## Getting Started
 
@@ -153,7 +153,7 @@ goals:
 | `src/CopilotHive/` | Main orchestrator — Brain, GoalDispatcher, persistence, metrics |
 | `src/CopilotHive.Shared/` | Shared protobuf definitions and DTOs |
 | `src/CopilotHive.Worker/` | Worker process (runs inside Docker containers) |
-| `tests/` | 436 xUnit tests |
+| `tests/` | 478 xUnit tests |
 | `agents/` | Default agent templates (overridden by config repo at runtime) |
 | `docker/` | Dockerfiles and container configuration |
 

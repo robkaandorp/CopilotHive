@@ -41,8 +41,8 @@ COPILOT_ARGS=(
 )
 
 # The Brain is a pure reasoning engine — deny built-in tools at CLI level.
-# Custom SDK tools (report_plan, etc.) are not affected by --deny-tool.
-# Permissions are also denied via the SDK's DenyAllPermissions handler.
+# Custom SDK tools (report_iteration_plan) are not affected by --deny-tool.
+# Permissions for custom tools are approved via the SDK's ApproveBrainTools handler.
 COPILOT_ARGS+=(
     --deny-tool='shell'
     --deny-tool='write'
