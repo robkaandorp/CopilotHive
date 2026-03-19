@@ -3,6 +3,8 @@ namespace CopilotHive.Workers;
 /// <summary>Role assigned to a worker container.</summary>
 public enum WorkerRole
 {
+    /// <summary>No role assigned yet. Used for idle workers before task assignment.</summary>
+    Unspecified,
     /// <summary>Implements code changes to fulfil a goal.</summary>
     Coder,
     /// <summary>Runs and writes automated tests.</summary>
@@ -30,6 +32,7 @@ public static class WorkerRoleExtensions
     /// </summary>
     public static string ToRoleName(this WorkerRole role) => role switch
     {
+        WorkerRole.Unspecified => "unspecified",
         WorkerRole.Coder => "coder",
         WorkerRole.Tester => "tester",
         WorkerRole.Reviewer => "reviewer",
@@ -46,6 +49,7 @@ public static class WorkerRoleExtensions
     /// </summary>
     public static string ToDisplayName(this WorkerRole role) => role switch
     {
+        WorkerRole.Unspecified  => "Unspecified",
         WorkerRole.Coder        => "Coder",
         WorkerRole.Tester       => "Tester",
         WorkerRole.Reviewer     => "Reviewer",

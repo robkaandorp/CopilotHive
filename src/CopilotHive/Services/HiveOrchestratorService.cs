@@ -3,7 +3,6 @@ using Microsoft.Extensions.Logging;
 using CopilotHive.Agents;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
-using GrpcWorkerRole = CopilotHive.Shared.Grpc.WorkerRole;
 
 namespace CopilotHive.Services;
 
@@ -182,7 +181,7 @@ public sealed class HiveOrchestratorService(
         if (task is not null)
         {
             // Set the worker's role from the task and send agents.md
-            var taskRoleName = task.Role.ToString().ToLowerInvariant();
+            var taskRoleName = task.Role.ToRoleName();
             worker.Role = task.Role;
             logger.LogInformation("Worker {WorkerId} assigned role {Role} for task {TaskId}",
                 worker.Id, taskRoleName, task.TaskId);
@@ -195,14 +194,13 @@ public sealed class HiveOrchestratorService(
             logger.LogInformation("Assigning task {TaskId} to worker {WorkerId}", task.TaskId, worker.Id);
 
             await worker.MessageChannel.Writer.WriteAsync(
-                new OrchestratorMessage { Assignment = task },
+                new OrchestratorMessage { Assignment = GrpcMapper.ToGrpc(task) },
                 cancellationToken);
         }
     }
 
-    private async Task SendAgentsMdAsync(ConnectedWorker worker, GrpcWorkerRole grpcRole, CancellationToken ct)
+    private async Task SendAgentsMdAsync(ConnectedWorker worker, Workers.WorkerRole role, CancellationToken ct)
     {
-        var role = grpcRole.ToDomainRole();
         var agentsContent = agentsManager?.GetAgentsMd(role);
         if (string.IsNullOrEmpty(agentsContent)) return;
 
@@ -319,21 +317,22 @@ public sealed class HiveOrchestratorService(
         if (pipeline is not null)
         {
             pipeline.ClearActiveTask();
-            if (workerRole != GrpcWorkerRole.Unspecified)
+            if (workerRole != Workers.WorkerRole.Unspecified)
             {
                 pipeline.RecordOutput(
-                    workerRole.ToDomainRole(),
+                    workerRole,
                     pipeline.Iteration,
                     complete.Output);
             }
         }
 
-        // Notify GoalDispatcher asynchronously so it can ask the Brain what to do next
+        // Convert to domain type at the boundary and notify GoalDispatcher
+        var result = GrpcMapper.ToDomain(complete);
         _ = Task.Run(async () =>
         {
             try
             {
-                await completionNotifier.NotifyAsync(complete);
+                await completionNotifier.NotifyAsync(result);
             }
             catch (Exception ex)
             {

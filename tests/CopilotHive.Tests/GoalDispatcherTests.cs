@@ -2,7 +2,6 @@ using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
-using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -23,12 +22,12 @@ public sealed class GoalDispatcherReviewVerdictTests
         // re-dispatching to Coder, keeping the test self-contained.
         var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Review, brain, maxRetries: 0);
 
-        await dispatcher.HandleTaskCompletionAsync(new TaskComplete
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
-            Status = Shared.Grpc.TaskStatus.Completed,
+            Status = DomainTaskStatus.Completed,
             Output = "Several critical issues found.",
-            Metrics = new TaskMetrics { Verdict = "REQUEST_CHANGES", Issues = { "critical issue" } },
+            Metrics = new DomainTaskMetrics { Verdict = "REQUEST_CHANGES", Issues = { "critical issue" } },
         }, TestContext.Current.CancellationToken);
 
         Assert.Equal(ReviewVerdict.RequestChanges, pipeline.Metrics.ReviewVerdict);
@@ -41,12 +40,12 @@ public sealed class GoalDispatcherReviewVerdictTests
 
         var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Review, brain);
 
-        await dispatcher.HandleTaskCompletionAsync(new TaskComplete
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
-            Status = Shared.Grpc.TaskStatus.Completed,
+            Status = DomainTaskStatus.Completed,
             Output = "LGTM, no issues found.",
-            Metrics = new TaskMetrics { Verdict = "APPROVE" },
+            Metrics = new DomainTaskMetrics { Verdict = "APPROVE" },
         }, TestContext.Current.CancellationToken);
 
         Assert.Equal(ReviewVerdict.Approve, pipeline.Metrics.ReviewVerdict);
@@ -63,12 +62,12 @@ public sealed class GoalDispatcherReviewVerdictTests
         // maxRetries=0 prevents retry dispatching so the test stays self-contained.
         var (dispatcher, pipeline, taskId) = CreateDispatcher(phase, brain, maxRetries: 0);
 
-        await dispatcher.HandleTaskCompletionAsync(new TaskComplete
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
-            Status = Shared.Grpc.TaskStatus.Completed,
+            Status = DomainTaskStatus.Completed,
             Output = "Worker output.",
-            Metrics = new TaskMetrics { Verdict = verdict },
+            Metrics = new DomainTaskMetrics { Verdict = verdict },
         }, TestContext.Current.CancellationToken);
 
         Assert.True(

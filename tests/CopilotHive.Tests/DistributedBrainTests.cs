@@ -1,7 +1,6 @@
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
-using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -17,7 +16,7 @@ public sealed class DistributedBrainTests
     public async Task NotifyAsync_NoSubscribers_DoesNotThrow()
     {
         var notifier = new TaskCompletionNotifier();
-        var complete = new TaskComplete { TaskId = "t-1", Status = Shared.Grpc.TaskStatus.Completed, Output = "done" };
+        var complete = new TaskResult { TaskId = "t-1", Status = DomainTaskStatus.Completed, Output = "done" };
         await notifier.NotifyAsync(complete);
     }
 
@@ -25,15 +24,15 @@ public sealed class DistributedBrainTests
     public async Task NotifyAsync_SingleSubscriber_ReceivesCorrectTaskComplete()
     {
         var notifier = new TaskCompletionNotifier();
-        TaskComplete? received = null;
+        TaskResult? received = null;
         notifier.OnTaskCompleted += tc => { received = tc; return Task.CompletedTask; };
 
-        var complete = new TaskComplete { TaskId = "t-42", Status = Shared.Grpc.TaskStatus.Completed, Output = "all tests pass" };
+        var complete = new TaskResult { TaskId = "t-42", Status = DomainTaskStatus.Completed, Output = "all tests pass" };
         await notifier.NotifyAsync(complete);
 
         Assert.NotNull(received);
         Assert.Equal("t-42", received.TaskId);
-        Assert.Equal(Shared.Grpc.TaskStatus.Completed, received.Status);
+        Assert.Equal(DomainTaskStatus.Completed, received.Status);
         Assert.Equal("all tests pass", received.Output);
     }
 
@@ -46,7 +45,7 @@ public sealed class DistributedBrainTests
         notifier.OnTaskCompleted += tc => { invocations.Add("sub2"); return Task.CompletedTask; };
         notifier.OnTaskCompleted += tc => { invocations.Add("sub3"); return Task.CompletedTask; };
 
-        var complete = new TaskComplete { TaskId = "t-99", Status = Shared.Grpc.TaskStatus.Completed, Output = "" };
+        var complete = new TaskResult { TaskId = "t-99", Status = DomainTaskStatus.Completed, Output = "" };
         await notifier.NotifyAsync(complete);
 
         Assert.Equal(3, invocations.Count);

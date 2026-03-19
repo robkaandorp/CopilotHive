@@ -1,5 +1,3 @@
-using CopilotHive.Shared.Grpc;
-
 namespace CopilotHive.Services;
 
 /// <summary>
@@ -11,7 +9,7 @@ namespace CopilotHive.Services;
 /// <c>GoalDispatcher</c> is a singleton, they cannot be injected into each
 /// other directly. <see cref="TaskCompletionNotifier"/> acts as the
 /// intermediary: the gRPC service calls <see cref="NotifyAsync"/> to
-/// propagate a <see cref="TaskComplete"/> message, and the
+/// propagate a <see cref="TaskResult"/> message, and the
 /// <c>GoalDispatcher</c> subscribes to <see cref="OnTaskCompleted"/> at
 /// application startup to react to those messages.
 /// </remarks>
@@ -21,21 +19,19 @@ public sealed class TaskCompletionNotifier
     /// Raised when a worker reports that a task has been completed.
     /// </summary>
     /// <remarks>
-    /// Subscribers receive the full <see cref="TaskComplete"/> protobuf
-    /// message and are expected to return a <see cref="Task"/> so that
-    /// asynchronous handling is supported. If no subscribers are registered
-    /// (i.e. the event is <see langword="null"/>), the notification is
-    /// silently dropped.
+    /// Subscribers receive the full <see cref="TaskResult"/> domain message
+    /// and are expected to return a <see cref="Task"/> so that asynchronous
+    /// handling is supported. If no subscribers are registered (i.e. the
+    /// event is <see langword="null"/>), the notification is silently dropped.
     /// </remarks>
-    public event Func<TaskComplete, Task>? OnTaskCompleted;
+    public event Func<TaskResult, Task>? OnTaskCompleted;
 
     /// <summary>
-    /// Fires the <see cref="OnTaskCompleted"/> event with the given
-    /// completion message.
+    /// Fires the <see cref="OnTaskCompleted"/> event with the given result.
     /// </summary>
-    /// <param name="complete">
-    /// The task completion message received from the worker via gRPC. Must
-    /// not be <see langword="null"/>.
+    /// <param name="result">
+    /// The task result converted from the gRPC completion message. Must not
+    /// be <see langword="null"/>.
     /// </param>
     /// <returns>
     /// A <see cref="Task"/> that represents the completion of the last
@@ -51,9 +47,9 @@ public sealed class TaskCompletionNotifier
     /// by the last subscriber in the invocation chain is awaited. Earlier
     /// subscribers' returned tasks are not observed by this method.
     /// </remarks>
-    public async Task NotifyAsync(TaskComplete complete)
+    public async Task NotifyAsync(TaskResult result)
     {
         if (OnTaskCompleted is not null)
-            await OnTaskCompleted(complete);
+            await OnTaskCompleted(result);
     }
 }

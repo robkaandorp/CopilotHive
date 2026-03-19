@@ -1,5 +1,6 @@
 using System.Threading.Channels;
 using CopilotHive.Shared.Grpc;
+using CopilotHive.Workers;
 
 namespace CopilotHive.Services;
 
@@ -12,7 +13,7 @@ public sealed class ConnectedWorker
     /// <summary>Unique identifier assigned to this worker.</summary>
     public required string Id { get; init; }
     /// <summary>Current role of this worker. Initially Unspecified; updated dynamically per task.</summary>
-    public required WorkerRole Role { get; set; }
+    public required Workers.WorkerRole Role { get; set; }
     /// <summary>Capabilities advertised by this worker during registration.</summary>
     public required string[] Capabilities { get; init; }
     /// <summary>Whether the worker is currently executing a task.</summary>

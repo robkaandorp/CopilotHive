@@ -1,5 +1,5 @@
 using CopilotHive.Services;
-using CopilotHive.Shared.Grpc;
+using CopilotHive.Workers;
 using Microsoft.Extensions.Logging;
 using Moq;
 

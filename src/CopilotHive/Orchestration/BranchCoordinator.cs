@@ -1,5 +1,5 @@
 using System.Collections.Concurrent;
-using CopilotHive.Shared.Grpc;
+using CopilotHive.Services;
 
 namespace CopilotHive.Orchestration;
 
@@ -20,13 +20,13 @@ public sealed class BranchCoordinator
     }
 
     /// <summary>
-    /// Builds a <see cref="BranchInfo"/> proto message for the given parameters.
+    /// Builds a <see cref="DomainBranchInfo"/> for the given parameters.
     /// </summary>
-    public BranchInfo GetBranchInfo(string goalId, BranchAction action, string baseBranch)
+    public DomainBranchInfo GetBranchInfo(string goalId, DomainBranchAction action, string baseBranch)
     {
         var featureBranch = GetFeatureBranch(goalId);
 
-        return new BranchInfo
+        return new DomainBranchInfo
         {
             BaseBranch = baseBranch,
             FeatureBranch = featureBranch,

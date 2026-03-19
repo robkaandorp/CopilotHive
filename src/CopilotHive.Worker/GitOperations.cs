@@ -1,5 +1,5 @@
 using System.Diagnostics;
-using CopilotHive.Shared.Grpc;
+using CopilotHive.Services;
 
 namespace CopilotHive.Worker;
 
@@ -66,28 +66,12 @@ public static class GitOperations
     /// <param name="repoDir">Path to the local git repository.</param>
     /// <param name="baseBranch">The base branch to diff against (e.g. "origin/main"). Falls back to HEAD~1 if null.</param>
     /// <param name="ct">Cancellation token.</param>
-    /// <returns>A <see cref="GitStatus"/> containing branch, commit, and diff statistics.</returns>
-    public static async Task<GitStatus> GetGitStatusAsync(string repoDir, string? baseBranch, CancellationToken ct)
+    /// <returns>A <see cref="DomainGitStatus"/> containing diff statistics.</returns>
+    public static async Task<DomainGitStatus> GetGitStatusAsync(string repoDir, string? baseBranch, CancellationToken ct)
     {
-        var status = new GitStatus();
-
-        // Current branch
-        var (branchExit, branchOut, _) = await RunGitCommandAsync(
-            repoDir, "rev-parse --abbrev-ref HEAD", ct);
-        if (branchExit == 0)
-            status.CurrentBranch = branchOut.Trim();
-
-        // Last commit SHA
-        var (shaExit, shaOut, _) = await RunGitCommandAsync(
-            repoDir, "rev-parse HEAD", ct);
-        if (shaExit == 0)
-            status.LastCommitSha = shaOut.Trim();
-
-        // Last commit message
-        var (msgExit, msgOut, _) = await RunGitCommandAsync(
-            repoDir, "log -1 --pretty=%s", ct);
-        if (msgExit == 0)
-            status.LastCommitMessage = msgOut.Trim();
+        var filesChanged = 0;
+        var insertions = 0;
+        var deletions = 0;
 
         // Diff stat: compare all changes on the feature branch vs the base branch.
         // Uses three-dot diff (base...HEAD) to capture everything since the branch point.
@@ -95,9 +79,14 @@ public static class GitOperations
         var (statExit, statOut, _) = await RunGitCommandAsync(
             repoDir, $"diff --stat --numstat {diffRef}", ct);
         if (statExit == 0)
-            ParseDiffStat(statOut, status);
+            ParseDiffStat(statOut, ref filesChanged, ref insertions, ref deletions);
 
-        return status;
+        return new DomainGitStatus
+        {
+            FilesChanged = filesChanged,
+            Insertions = insertions,
+            Deletions = deletions,
+        };
     }
 
     /// <summary>
@@ -170,12 +159,9 @@ public static class GitOperations
         }
     }
 
-    private static void ParseDiffStat(string numstatOutput, GitStatus status)
+    private static void ParseDiffStat(string numstatOutput, ref int filesChanged, ref int insertions, ref int deletions)
     {
         var lines = numstatOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        var filesChanged = 0;
-        var insertions = 0;
-        var deletions = 0;
 
         foreach (var line in lines)
         {
@@ -186,9 +172,5 @@ public static class GitOperations
             if (int.TryParse(parts[0], out var added)) insertions += added;
             if (int.TryParse(parts[1], out var removed)) deletions += removed;
         }
-
-        status.FilesChanged = filesChanged;
-        status.Insertions = insertions;
-        status.Deletions = deletions;
     }
 }

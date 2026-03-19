@@ -7,7 +7,6 @@ using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
-using GrpcWorkerRole = CopilotHive.Shared.Grpc.WorkerRole;
 using WorkerRole = CopilotHive.Workers.WorkerRole;
 
 namespace CopilotHive.Services;
@@ -80,7 +79,7 @@ public sealed class GoalDispatcher : BackgroundService
         _config = config;
         _configRepo = configRepo;
 
-        completionNotifier.OnTaskCompleted+= complete => HandleTaskCompletionAsync(complete);
+        completionNotifier.OnTaskCompleted+= result => HandleTaskCompletionAsync(result);
     }
 
     /// <inheritdoc/>
@@ -144,12 +143,12 @@ public sealed class GoalDispatcher : BackgroundService
     /// Called by HiveOrchestratorService when a worker completes a task.
     /// Drives the pipeline to its next phase using the Brain.
     /// </summary>
-    public async Task HandleTaskCompletionAsync(TaskComplete complete, CancellationToken ct = default)
+    public async Task HandleTaskCompletionAsync(TaskResult result, CancellationToken ct = default)
     {
-        var pipeline = _pipelineManager.GetByTaskId(complete.TaskId);
+        var pipeline = _pipelineManager.GetByTaskId(result.TaskId);
         if (pipeline is null)
         {
-            _logger.LogWarning("No pipeline found for completed task {TaskId}", complete.TaskId);
+            _logger.LogWarning("No pipeline found for completed task {TaskId}", result.TaskId);
             return;
         }
 
@@ -158,12 +157,12 @@ public sealed class GoalDispatcher : BackgroundService
         {
             _logger.LogInformation(
                 "Task {TaskId} completed but goal {GoalId} already {Phase} — ignoring duplicate",
-                complete.TaskId, pipeline.GoalId, pipeline.Phase);
+                result.TaskId, pipeline.GoalId, pipeline.Phase);
             return;
         }
 
         _logger.LogInformation("Pipeline {GoalId} task completed (phase={Phase}, status={Status})",
-            pipeline.GoalId, pipeline.Phase, complete.Status);
+            pipeline.GoalId, pipeline.Phase, result.Status);
 
         if (_brain is null)
         {
@@ -173,7 +172,7 @@ public sealed class GoalDispatcher : BackgroundService
 
         try
         {
-            await DriveNextPhaseAsync(pipeline, complete, ct);
+            await DriveNextPhaseAsync(pipeline, result, ct);
         }
         catch (Exception ex)
         {
@@ -184,11 +183,11 @@ public sealed class GoalDispatcher : BackgroundService
         _pipelineManager.PersistFull(pipeline);
     }
 
-    private async Task DriveNextPhaseAsync(GoalPipeline pipeline, TaskComplete complete, CancellationToken ct)
+    private async Task DriveNextPhaseAsync(GoalPipeline pipeline, TaskResult result, CancellationToken ct)
     {
         // No-op detection: if the coder returned without making any file changes,
         // skip verdict extraction and immediately retry with a stronger prompt.
-        if (pipeline.Phase == GoalPhase.Coding && (complete.GitStatus?.FilesChanged ?? 0) == 0)
+        if (pipeline.Phase == GoalPhase.Coding && (result.GitStatus?.FilesChanged ?? 0) == 0)
         {
             _logger.LogWarning(
                 "No-op detected: Coder for {GoalId} returned with 0 files changed — retrying with stronger prompt",
@@ -204,7 +203,7 @@ public sealed class GoalDispatcher : BackgroundService
                 "CRITICAL: Your previous attempt produced ZERO file changes. " +
                 "You MUST edit files and commit them with `git add -A && git commit`. " +
                 "Do NOT just describe or discuss changes — actually make them.\n\n" +
-                $"Previous coder output (for context):\n{(complete.Output.Length > 500 ? complete.Output[..500] + "..." : complete.Output)}";
+                $"Previous coder output (for context):\n{(result.Output.Length > 500 ? result.Output[..500] + "..." : result.Output)}";
 
             var retryPrompt = _brain is not null
                 ? await _brain.CraftPromptAsync(pipeline, GoalPhase.Coding, noOpContext, ct)
@@ -214,16 +213,16 @@ public sealed class GoalDispatcher : BackgroundService
         }
 
         // Log the raw worker output — critical for debugging
-        var outputPreview = complete.Output.Length > 2000
-            ? complete.Output[..2000] + $"... ({complete.Output.Length} chars total)"
-            : complete.Output;
+        var outputPreview = result.Output.Length > 2000
+            ? result.Output[..2000] + $"... ({result.Output.Length} chars total)"
+            : result.Output;
         _logger.LogInformation(
             "Worker output for {GoalId} (phase={Phase}):\n{Output}",
             pipeline.GoalId, pipeline.Phase, outputPreview);
 
         // Extract structured verdict from worker tool call metrics
         var verdict = "PASS"; // Default: worker completed successfully
-        if (complete.Metrics is { } metrics)
+        if (result.Metrics is { } metrics)
         {
             if (!string.IsNullOrEmpty(metrics.Verdict))
                 verdict = metrics.Verdict;
@@ -283,15 +282,15 @@ public sealed class GoalDispatcher : BackgroundService
             pipeline.GoalId, pipeline.Phase, verdict, phaseInput);
 
         // State machine transition
-        var result = pipeline.StateMachine.Transition(phaseInput);
+        var transition = pipeline.StateMachine.Transition(phaseInput);
 
-        switch (result.Effect)
+        switch (transition.Effect)
         {
             case TransitionEffect.Continue:
-                pipeline.AdvanceTo(result.NextPhase);
+                pipeline.AdvanceTo(transition.NextPhase);
                 string? instructions = null;
-                pipeline.Plan?.PhaseInstructions.TryGetValue(result.NextPhase, out instructions);
-                await DispatchPhaseAsync(pipeline, result.NextPhase, instructions, ct);
+                pipeline.Plan?.PhaseInstructions.TryGetValue(transition.NextPhase, out instructions);
+                await DispatchPhaseAsync(pipeline, transition.NextPhase, instructions, ct);
                 break;
 
             case TransitionEffect.NewIteration:
@@ -516,7 +515,7 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogDebug("Prompt for {Role} (goal={GoalId}):\n{Prompt}",
             role, pipeline.GoalId, promptPreview);
 
-        var branchAction = pipeline.CoderBranch is null ? BranchAction.Create : BranchAction.Checkout;
+        var branchAction = pipeline.CoderBranch is null ? DomainBranchAction.Create : DomainBranchAction.Checkout;
 
         List<TargetRepository> repositories;
         try
@@ -556,7 +555,7 @@ public sealed class GoalDispatcher : BackgroundService
         // Downgrade the action to Unspecified so the worker runtime skips push operations.
         if (role == WorkerRole.Improver && task.BranchInfo is not null)
         {
-            task.BranchInfo.Action = BranchAction.Unspecified;
+            task.BranchInfo.Action = DomainBranchAction.Unspecified;
         }
 
         pipeline.SetActiveTask(task.TaskId, task.BranchInfo?.FeatureBranch);
@@ -570,22 +569,21 @@ public sealed class GoalDispatcher : BackgroundService
         var idleWorker = _workerPool.GetIdleWorker();
         if (idleWorker is not null)
         {
-            var grpcRole = role.ToGrpcRole();
-            var queuedTask = _taskQueue.TryDequeue(grpcRole);
-            queuedTask ??= _taskQueue.TryDequeue(GrpcWorkerRole.Unspecified);
+            var queuedTask = _taskQueue.TryDequeue(role);
+            queuedTask ??= _taskQueue.TryDequeueAny();
 
             if (queuedTask is not null)
             {
                 idleWorker.Role = queuedTask.Role;
-                var taskRoleName = queuedTask.Role.ToString().ToLowerInvariant();
+                var taskRoleName = queuedTask.Role.ToRoleName();
                 _logger.LogInformation("Worker {WorkerId} assigned role {Role} for task {TaskId}",
                     idleWorker.Id, taskRoleName, queuedTask.TaskId);
-                await SendAgentsMdToWorkerAsync(idleWorker, queuedTask.Role.ToDomainRole(), ct);
+                await SendAgentsMdToWorkerAsync(idleWorker, queuedTask.Role, ct);
 
                 _taskQueue.Activate(queuedTask, idleWorker.Id);
                 _workerPool.MarkBusy(idleWorker.Id, queuedTask.TaskId);
                 await idleWorker.MessageChannel.Writer.WriteAsync(
-                    new OrchestratorMessage { Assignment = queuedTask }, ct);
+                    new OrchestratorMessage { Assignment = GrpcMapper.ToGrpc(queuedTask) }, ct);
                 _logger.LogInformation("Task {TaskId} pushed to worker {WorkerId}", queuedTask.TaskId, idleWorker.Id);
             }
         }
@@ -814,9 +812,8 @@ public sealed class GoalDispatcher : BackgroundService
     /// </summary>
     private async Task BroadcastAgentsUpdateAsync(WorkerRole role, string content, CancellationToken ct)
     {
-        var grpcRole = role.ToGrpcRole();
         var workers = _workerPool.GetAllWorkers()
-            .Where(w => w.Role == grpcRole);
+            .Where(w => w.Role == role);
 
         var roleName = role.ToRoleName();
         var message = new OrchestratorMessage

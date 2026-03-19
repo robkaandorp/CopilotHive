@@ -12,6 +12,7 @@ public static class WorkerRoleGrpcExtensions
     /// </summary>
     public static CopilotHive.Shared.Grpc.WorkerRole ToGrpcRole(this WorkerRole role) => role switch
     {
+        WorkerRole.Unspecified => CopilotHive.Shared.Grpc.WorkerRole.Unspecified,
         WorkerRole.Coder => CopilotHive.Shared.Grpc.WorkerRole.Coder,
         WorkerRole.Tester => CopilotHive.Shared.Grpc.WorkerRole.Tester,
         WorkerRole.Reviewer => CopilotHive.Shared.Grpc.WorkerRole.Reviewer,
@@ -25,6 +26,7 @@ public static class WorkerRoleGrpcExtensions
     /// </summary>
     public static WorkerRole ToDomainRole(this CopilotHive.Shared.Grpc.WorkerRole grpcRole) => grpcRole switch
     {
+        CopilotHive.Shared.Grpc.WorkerRole.Unspecified => WorkerRole.Unspecified,
         CopilotHive.Shared.Grpc.WorkerRole.Coder => WorkerRole.Coder,
         CopilotHive.Shared.Grpc.WorkerRole.Tester => WorkerRole.Tester,
         CopilotHive.Shared.Grpc.WorkerRole.Reviewer => WorkerRole.Reviewer,

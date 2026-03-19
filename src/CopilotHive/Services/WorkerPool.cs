@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 using CopilotHive.Models;
-using CopilotHive.Shared.Grpc;
+using CopilotHive.Workers;
 
 namespace CopilotHive.Services;
 

@@ -1,13 +1,11 @@
 using System.Diagnostics;
-using CopilotHive.Shared.Grpc;
+using CopilotHive.Services;
 using CopilotHive.Workers;
-using GrpcTaskStatus = CopilotHive.Shared.Grpc.TaskStatus;
-using GrpcWorkerRole = CopilotHive.Shared.Grpc.WorkerRole;
 
 namespace CopilotHive.Worker;
 
 /// <summary>
-/// Orchestrates the full lifecycle of a single task assignment:
+/// Orchestrates the full lifecycle of a single task:
 /// clone repos, handle branches, run Copilot, collect results.
 /// </summary>
 public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? toolBridge = null)
@@ -18,32 +16,32 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
     private readonly WorkerLogger _log = new("Task");
 
     /// <summary>
-    /// Executes the full lifecycle of a task assignment: cloning repos, branching,
+    /// Executes the full lifecycle of a task: cloning repos, branching,
     /// running Copilot, collecting results, and pushing changes.
     /// </summary>
-    /// <param name="assignment">The task assignment containing prompt, repos, and branch info.</param>
+    /// <param name="task">The domain task containing prompt, repos, and branch info.</param>
     /// <param name="ct">Cancellation token.</param>
-    /// <returns>A <see cref="TaskComplete"/> with status, output, and git metrics.</returns>
-    public async Task<TaskComplete> ExecuteAsync(TaskAssignment assignment, CancellationToken ct)
+    /// <returns>A <see cref="TaskResult"/> with status, output, and git metrics.</returns>
+    public async Task<TaskResult> ExecuteAsync(DomainTask task, CancellationToken ct)
     {
         var stopwatch = Stopwatch.StartNew();
 
         // Wire tool bridge and task context into CopilotRunner
         copilotRunner.SetToolBridge(toolBridge);
-        copilotRunner.SetCurrentTaskId(assignment.TaskId);
+        copilotRunner.SetCurrentTaskId(task.TaskId);
         copilotRunner.ClearTestReport();
         copilotRunner.ClearWorkerReport();
 
         try
         {
-            var isImprover = assignment.Role == GrpcWorkerRole.Improver;
+            var isImprover = task.Role == WorkerRole.Improver;
 
             // Clone each repository (skip for improver — it works on the config repo agents folder)
-            var repoDirectories = new List<(RepositoryInfo Repo, string Dir)>();
+            var repoDirectories = new List<(DomainRepositoryInfo Repo, string Dir)>();
 
             if (!isImprover)
             {
-                foreach (var repo in assignment.Repositories)
+                foreach (var repo in task.Repositories)
                 {
                     var targetDir = Path.Combine(WorkRoot, repo.Name);
 
@@ -55,11 +53,11 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
                     await GitOperations.CloneRepositoryAsync(repo.Url, targetDir, ct);
 
                     // Handle branch operations
-                    if (assignment.BranchInfo is { } branchInfo && !string.IsNullOrEmpty(branchInfo.FeatureBranch))
+                    if (task.BranchInfo is { } branchInfo && !string.IsNullOrEmpty(branchInfo.FeatureBranch))
                     {
                         switch (branchInfo.Action)
                         {
-                            case BranchAction.Create:
+                            case DomainBranchAction.Create:
                                 var baseBranch = string.IsNullOrEmpty(branchInfo.BaseBranch)
                                     ? repo.DefaultBranch
                                     : branchInfo.BaseBranch;
@@ -67,13 +65,13 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
                                 await GitOperations.CreateBranchAsync(targetDir, branchInfo.FeatureBranch, baseBranch, ct);
                                 break;
 
-                            case BranchAction.Checkout:
+                            case DomainBranchAction.Checkout:
                                 _log.Info($"Checking out branch {branchInfo.FeatureBranch}");
                                 await GitOperations.CheckoutBranchAsync(targetDir, branchInfo.FeatureBranch, ct);
                                 break;
 
-                            case BranchAction.Merge:
-                            case BranchAction.Unspecified:
+                            case DomainBranchAction.Merge:
+                            case DomainBranchAction.Unspecified:
                             default:
                                 break;
                         }
@@ -98,7 +96,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
             var contextLines = new List<string>
             {
                 "=== WORKSPACE CONTEXT ===",
-                $"Role: {assignment.Role}",
+                $"Role: {task.Role}",
             };
 
             if (repoDirectories.Count > 0)
@@ -114,7 +112,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
                 contextLines.Add("Files: *.agents.md (edit these directly)");
             }
 
-            if (assignment.BranchInfo is { } bi2)
+            if (task.BranchInfo is { } bi2)
             {
                 if (!string.IsNullOrEmpty(bi2.BaseBranch))
                     contextLines.Add($"Base branch: {bi2.BaseBranch}");
@@ -126,7 +124,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
             contextLines.Add("=========================");
             contextLines.Add("");
 
-            var enrichedPrompt = string.Join("\n", contextLines) + assignment.Prompt;
+            var enrichedPrompt = string.Join("\n", contextLines) + task.Prompt;
 
             // Send prompt to Copilot
             _log.Info($"Sending prompt to Copilot ({enrichedPrompt.Length} chars)");
@@ -134,7 +132,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
 
             // For roles that push code, ensure Copilot committed its changes.
             // If the working directory is dirty, re-prompt Copilot to commit.
-            if (!isImprover && assignment.Role != GrpcWorkerRole.Reviewer)
+            if (!isImprover && task.Role != WorkerRole.Reviewer)
             {
                 foreach (var (_, dir) in repoDirectories)
                 {
@@ -144,13 +142,13 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
 
             // For testers: ensure structured test metrics were reported via tool call.
             // If the tester didn't call report_test_results, prompt it to do so.
-            if (assignment.Role == GrpcWorkerRole.Tester && copilotRunner.LastTestReport is null)
+            if (task.Role == WorkerRole.Tester && copilotRunner.LastTestReport is null)
             {
                 copilotOutput = await EnsureTestMetricsReportedAsync(copilotOutput, primaryWorkDir, ct);
             }
 
             // Collect git status from each repo and push changes
-            GitStatus? aggregatedStatus = null;
+            DomainGitStatus? aggregatedStatus = null;
 
             if (isImprover)
             {
@@ -163,16 +161,17 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
             }
             else
             {
-                var isReviewer = assignment.Role == GrpcWorkerRole.Reviewer;
+                var isReviewer = task.Role == WorkerRole.Reviewer;
 
                 foreach (var (repo, dir) in repoDirectories)
                 {
-                    var baseBranch = assignment.BranchInfo?.BaseBranch ?? repo.DefaultBranch;
+                    var baseBranch = task.BranchInfo?.BaseBranch ?? repo.DefaultBranch;
                     var status = await GitOperations.GetGitStatusAsync(dir, baseBranch, ct);
 
                     // Push if there are changes, we have a feature branch, and the role is allowed to push.
                     // Reviewer is read-only — it must never push changes to the coder's branch.
-                    if (assignment.BranchInfo is { } bi
+                    var pushed = false;
+                    if (task.BranchInfo is { } bi
                         && !string.IsNullOrEmpty(bi.FeatureBranch)
                         && status.FilesChanged > 0
                         && !isReviewer)
@@ -180,30 +179,35 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
                         try
                         {
                             await GitOperations.PushBranchAsync(dir, bi.FeatureBranch, ct);
-                            status.Pushed = true;
+                            pushed = true;
                             _log.Info($"Pushed {bi.FeatureBranch} for {repo.Name}");
                         }
                         catch (Exception ex)
                         {
                             _log.Error($"Push failed for {repo.Name}: {ex.Message}");
-                            status.Pushed = false;
                         }
                     }
 
                     // Use first repo's status as the aggregate
-                    aggregatedStatus ??= status;
+                    aggregatedStatus ??= new DomainGitStatus
+                    {
+                        FilesChanged = status.FilesChanged,
+                        Insertions = status.Insertions,
+                        Deletions = status.Deletions,
+                        Pushed = pushed,
+                    };
                 }
             }
 
             stopwatch.Stop();
 
-            // Build TaskMetrics from structured tool call data when available
+            // Build DomainTaskMetrics from structured tool call data when available
             var testReport = copilotRunner.LastTestReport;
             var workerReport = copilotRunner.LastWorkerReport;
-            TaskMetrics metrics;
+            DomainTaskMetrics metrics;
             if (testReport is not null)
             {
-                metrics = new TaskMetrics
+                metrics = new DomainTaskMetrics
                 {
                     Verdict = testReport.Verdict.ToVerdictString(),
                     BuildSuccess = testReport.BuildSuccess,
@@ -211,7 +215,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
                     PassedTests = testReport.PassedTests,
                     FailedTests = testReport.FailedTests,
                     CoveragePercent = testReport.CoveragePercent ?? 0,
-                    Issues = { testReport.Issues },
+                    Issues = [.. testReport.Issues],
                 };
             }
             else if (workerReport is not null)
@@ -219,49 +223,49 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
                 var verdictStr = workerReport.ReviewVerdict?.ToVerdictString()
                     ?? workerReport.TaskVerdict?.ToVerdictString()
                     ?? "PASS";
-                metrics = new TaskMetrics
+                metrics = new DomainTaskMetrics
                 {
                     Verdict = verdictStr,
-                    Issues = { workerReport.Issues },
+                    Issues = [.. workerReport.Issues],
                 };
             }
             else
             {
-                metrics = new TaskMetrics { Verdict = "PASS" };
+                metrics = new DomainTaskMetrics { Verdict = "PASS" };
             }
 
-            return new TaskComplete
+            return new TaskResult
             {
-                TaskId = assignment.TaskId,
-                Status = GrpcTaskStatus.Completed,
+                TaskId = task.TaskId,
+                Status = DomainTaskStatus.Completed,
                 Output = copilotOutput,
-                GitStatus = aggregatedStatus ?? new GitStatus(),
+                GitStatus = aggregatedStatus ?? new DomainGitStatus(),
                 Metrics = metrics,
             };
         }
         catch (OperationCanceledException)
         {
-            return new TaskComplete
+            return new TaskResult
             {
-                TaskId = assignment.TaskId,
-                Status = GrpcTaskStatus.Cancelled,
+                TaskId = task.TaskId,
+                Status = DomainTaskStatus.Cancelled,
                 Output = "Task was cancelled.",
-                Metrics = new TaskMetrics { Verdict = "CANCELLED" },
+                Metrics = new DomainTaskMetrics { Verdict = "CANCELLED" },
             };
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[Task] Failed: {ex}");
 
-            return new TaskComplete
+            return new TaskResult
             {
-                TaskId = assignment.TaskId,
-                Status = GrpcTaskStatus.Failed,
+                TaskId = task.TaskId,
+                Status = DomainTaskStatus.Failed,
                 Output = $"Error: {ex.Message}",
-                Metrics = new TaskMetrics
+                Metrics = new DomainTaskMetrics
                 {
                     Verdict = "FAIL",
-                    Issues = { ex.Message },
+                    Issues = [ex.Message],
                 },
             };
         }
@@ -431,12 +435,10 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
     /// Commits and pushes any changes the improver made to *.agents.md files in the config repo.
     /// Only stages files in the agents/ subfolder to prevent accidental changes elsewhere.
     /// </summary>
-    private async Task<GitStatus> CommitAndPushConfigRepoAsync(CancellationToken ct)
+    private async Task<DomainGitStatus> CommitAndPushConfigRepoAsync(CancellationToken ct)
     {
-        var status = new GitStatus();
-
         if (!Directory.Exists(Path.Combine(ConfigRepoDir, ".git")))
-            return status;
+            return new DomainGitStatus();
 
         // Only stage agents/*.agents.md — defense-in-depth to prevent touching other files
         var (addExit, _, addErr) = await GitOperations.RunGitCommandAsync(
@@ -444,7 +446,7 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
         if (addExit != 0)
         {
             _log.Error($"git add failed: {addErr.Trim()}");
-            return status;
+            return new DomainGitStatus();
         }
 
         // Check if there are staged changes
@@ -453,12 +455,12 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
         if (diffExit != 0 || string.IsNullOrWhiteSpace(diffOut))
         {
             _log.Info("No agents.md changes to commit");
-            return status;
+            return new DomainGitStatus();
         }
 
         var changedFiles = diffOut.Trim().Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        status.FilesChanged = changedFiles.Length;
-        _log.Info($"Improver changed {changedFiles.Length} file(s): {string.Join(", ", changedFiles)}");
+        var filesChanged = changedFiles.Length;
+        _log.Info($"Improver changed {filesChanged} file(s): {string.Join(", ", changedFiles)}");
 
         // Commit
         var (commitExit, commitOut, commitErr) = await GitOperations.RunGitCommandAsync(
@@ -466,13 +468,13 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
         if (commitExit != 0)
         {
             _log.Error($"git commit failed: {commitErr.Trim()}");
-            return status;
+            return new DomainGitStatus { FilesChanged = filesChanged };
         }
 
-        status.LastCommitMessage = "Improve agents.md files (automated by CopilotHive Improver)";
         _log.Info($"Committed: {commitOut.Trim()}");
 
         // Pull (merge orchestrator's goals/metrics commits) then push
+        var pushed = false;
         try
         {
             var (pullExit, pullOut, pullErr) = await GitOperations.RunGitCommandAsync(
@@ -489,10 +491,10 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
             if (pushExit != 0)
             {
                 _log.Error($"git push failed: {pushErr.Trim()}");
-                return status;
+                return new DomainGitStatus { FilesChanged = filesChanged };
             }
 
-            status.Pushed = true;
+            pushed = true;
             _log.Info("Pushed config repo changes");
         }
         catch (Exception ex)
@@ -500,6 +502,6 @@ public sealed class TaskExecutor(CopilotRunner copilotRunner, IToolCallBridge? t
             _log.Error($"Push failed: {ex.Message}");
         }
 
-        return status;
+        return new DomainGitStatus { FilesChanged = filesChanged, Pushed = pushed };
     }
 }

@@ -1,5 +1,8 @@
 using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
+using CopilotHive.Workers;
+
+using WorkerRole = CopilotHive.Workers.WorkerRole;
 
 namespace CopilotHive.Tests;
 

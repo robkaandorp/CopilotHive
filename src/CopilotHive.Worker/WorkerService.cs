@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Grpc.Core;
 using Grpc.Net.Client;
+using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
 
@@ -112,11 +113,12 @@ public sealed class WorkerService(
                     taskCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
                     var assignment = message.Assignment;
-                    _log.Info($"Received task {assignment.TaskId}: {assignment.GoalDescription}");
+                    var domainTask = GrpcMapper.ToDomain(assignment);
+                    _log.Info($"Received task {domainTask.TaskId}: {domainTask.GoalDescription}");
 
                     // Reset Copilot session with per-task model (if specified by orchestrator)
-                    var taskModel = string.IsNullOrEmpty(assignment.Model) ? null : assignment.Model;
-                    _log.Info($"Task model from orchestrator: '{assignment.Model}' → resolved: '{taskModel ?? "(SDK default)"}'");
+                    var taskModel = string.IsNullOrEmpty(domainTask.Model) ? null : domainTask.Model;
+                    _log.Info($"Task model from orchestrator: '{domainTask.Model}' → resolved: '{taskModel ?? "(SDK default)"}'");
                     await _copilotRunner.ResetSessionAsync(taskModel, ct);
 
                     // Run task execution concurrently so message loop can process
@@ -127,15 +129,15 @@ public sealed class WorkerService(
                         try
                         {
                             var executor = new TaskExecutor(_copilotRunner, this);
-                            var result = await executor.ExecuteAsync(assignment, localCts.Token);
+                            var result = await executor.ExecuteAsync(domainTask, localCts.Token);
 
                             await stream.RequestStream.WriteAsync(new WorkerMessage
                             {
                                 WorkerId = assignedId,
-                                Complete = result,
+                                Complete = GrpcMapper.ToGrpc(result),
                             }, ct);
 
-                            _log.Info($"Task {assignment.TaskId} completed ({result.Status})");
+                            _log.Info($"Task {domainTask.TaskId} completed ({result.Status})");
                             await SendWorkerReady(stream, assignedId, ct);
                         }
                         catch (OperationCanceledException) { }

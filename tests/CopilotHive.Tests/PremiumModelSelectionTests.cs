@@ -87,13 +87,13 @@ public class PremiumModelSelectionTests
         var (dispatcher, pipeline, taskId, taskQueue) = CreateDispatcher(GoalPhase.Coding, brain, hiveConfigFile);
         taskQueue.OnEnqueue = t => capturedModel = t.Model;
 
-        await dispatcher.HandleTaskCompletionAsync(new Shared.Grpc.TaskComplete
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
-            Status = Shared.Grpc.TaskStatus.Completed,
+            Status = DomainTaskStatus.Completed,
             Output = "Done.",
-            Metrics = new Shared.Grpc.TaskMetrics { Verdict = "PASS" },
-            GitStatus = new Shared.Grpc.GitStatus { FilesChanged = 3 },
+            Metrics = new DomainTaskMetrics { Verdict = "PASS" },
+            GitStatus = new DomainGitStatus { FilesChanged = 3 },
         }, TestContext.Current.CancellationToken);
 
         Assert.Equal("premium-tester-model", capturedModel);
@@ -119,13 +119,13 @@ public class PremiumModelSelectionTests
         var (dispatcher, pipeline, taskId, taskQueue) = CreateDispatcher(GoalPhase.Coding, brain, hiveConfigFile);
         taskQueue.OnEnqueue = t => capturedModel = t.Model;
 
-        await dispatcher.HandleTaskCompletionAsync(new Shared.Grpc.TaskComplete
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
-            Status = Shared.Grpc.TaskStatus.Completed,
+            Status = DomainTaskStatus.Completed,
             Output = "Done.",
-            Metrics = new Shared.Grpc.TaskMetrics { Verdict = "PASS" },
-            GitStatus = new Shared.Grpc.GitStatus { FilesChanged = 3 },
+            Metrics = new DomainTaskMetrics { Verdict = "PASS" },
+            GitStatus = new DomainGitStatus { FilesChanged = 3 },
         }, TestContext.Current.CancellationToken);
 
         Assert.Equal("standard-tester-model", capturedModel);
