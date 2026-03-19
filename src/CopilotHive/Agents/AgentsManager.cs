@@ -1,4 +1,5 @@
 using CopilotHive.Workers;
+using Microsoft.Extensions.Logging;
 
 namespace CopilotHive.Agents;
 
@@ -9,16 +10,19 @@ public sealed class AgentsManager
 {
     private readonly string _agentsPath;
     private readonly string _historyPath;
+    private readonly ILogger<AgentsManager>? _logger;
 
     /// <summary>
     /// Initialises a new <see cref="AgentsManager"/> rooted at the given path.
     /// Creates the history directory if it does not already exist.
     /// </summary>
     /// <param name="agentsPath">Root directory where AGENTS.md files are stored.</param>
-    public AgentsManager(string agentsPath)
+    /// <param name="logger">Optional logger; when omitted, log output is suppressed.</param>
+    public AgentsManager(string agentsPath, ILogger<AgentsManager>? logger = null)
     {
         _agentsPath = Path.GetFullPath(agentsPath);
         _historyPath = Path.Combine(_agentsPath, "history");
+        _logger = logger;
         Directory.CreateDirectory(_historyPath);
     }
 
@@ -58,7 +62,7 @@ public sealed class AgentsManager
         }
 
         File.WriteAllText(GetAgentsMdPath(role), newContent);
-        Console.WriteLine($"[Agents] Updated AGENTS.md for {role.ToRoleName()}");
+        _logger?.LogInformation("Updated AGENTS.md for {Role}", role.ToRoleName());
     }
 
     /// <summary>
@@ -77,7 +81,7 @@ public sealed class AgentsManager
         File.WriteAllText(GetAgentsMdPath(role), content);
         File.Delete(latest);
 
-        Console.WriteLine($"[Agents] Rolled back {role.ToRoleName()} to {Path.GetFileName(latest)}");
+        _logger?.LogInformation("Rolled back {Role} to {VersionFile}", role.ToRoleName(), Path.GetFileName(latest));
         return true;
     }
 

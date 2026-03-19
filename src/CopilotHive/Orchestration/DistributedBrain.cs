@@ -926,21 +926,22 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 {
                     case AssistantMessageEvent msg:
                         response = msg.Data.Content;
-                        Console.WriteLine($"[Brain-SDK] AssistantMessage ({response.Length} chars)");
-                        Console.Out.Flush();
+                        _logger.LogDebug("{Source} AssistantMessage ({Length} chars)", "Brain-SDK", response.Length);
                         break;
                     case AssistantUsageEvent usage:
-                        Console.WriteLine($"[Brain-SDK] Usage: model={usage.Data.Model} in={usage.Data.InputTokens} out={usage.Data.OutputTokens} cost={usage.Data.Cost:F4} duration={usage.Data.Duration:F0}ms");
+                        _logger.LogDebug(
+                            "{Source} Usage: model={Model} in={InputTokens} out={OutputTokens} cost={Cost:F4} duration={Duration:F0}ms",
+                            "Brain-SDK", usage.Data.Model, usage.Data.InputTokens, usage.Data.OutputTokens,
+                            usage.Data.Cost, usage.Data.Duration);
                         Console.Out.Flush();
                         FileTracer.WriteUsage(usage.Data, "/app/state/traces-brain.jsonl", "brain");
                         break;
                     case SessionIdleEvent:
-                        Console.WriteLine("[Brain-SDK] SessionIdle");
-                        Console.Out.Flush();
+                        _logger.LogDebug("{Source} SessionIdle", "Brain-SDK");
                         done.TrySetResult((response, _lastToolCallResult));
                         break;
                     case SessionErrorEvent err:
-                        Console.WriteLine($"[Brain-SDK] SessionError: {err.Data.Message}");
+                        _logger.LogWarning("{Source} SessionError: {Message}", "Brain-SDK", err.Data.Message);
                         Console.Out.Flush();
                         done.TrySetException(new InvalidOperationException(err.Data.Message));
                         break;
@@ -956,8 +957,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     case ToolExecutionCompleteEvent:
                         break;
                     default:
-                        Console.WriteLine($"[Brain-SDK] {evt.GetType().Name}");
-                        Console.Out.Flush();
+                        _logger.LogDebug("{Source} {EventType}", "Brain-SDK", evt.GetType().Name);
                         break;
                 }
             });

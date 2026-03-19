@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 
 namespace CopilotHive.Metrics;
 
@@ -15,14 +16,17 @@ public sealed class MetricsTracker
 
     private readonly string _metricsPath;
     private readonly List<IterationMetrics> _history = [];
+    private readonly ILogger<MetricsTracker>? _logger;
 
     /// <summary>
     /// Initialises a new <see cref="MetricsTracker"/> and loads any previously saved metrics from disk.
     /// </summary>
     /// <param name="metricsPath">Directory where iteration JSON files are stored.</param>
-    public MetricsTracker(string metricsPath)
+    /// <param name="logger">Optional logger; when omitted, log output is suppressed.</param>
+    public MetricsTracker(string metricsPath, ILogger<MetricsTracker>? logger = null)
     {
         _metricsPath = Path.GetFullPath(metricsPath);
+        _logger = logger;
         Directory.CreateDirectory(_metricsPath);
         LoadHistory();
     }
@@ -45,9 +49,9 @@ public sealed class MetricsTracker
         var json = JsonSerializer.Serialize(metrics, JsonOptions);
         File.WriteAllText(filePath, json);
 
-        Console.WriteLine($"[Metrics] Recorded iteration {metrics.Iteration}: " +
-            $"{metrics.PassedTests}/{metrics.TotalTests} tests passed, " +
-            $"{metrics.CoveragePercent:F1}% coverage");
+        _logger?.LogInformation(
+            "Recorded iteration {Iteration}: {PassedTests}/{TotalTests} tests passed, {CoveragePercent:F1}% coverage",
+            metrics.Iteration, metrics.PassedTests, metrics.TotalTests, metrics.CoveragePercent);
     }
 
     /// <summary>
@@ -85,7 +89,7 @@ public sealed class MetricsTracker
         // If current extraction produced no test data, skip the test regression check entirely
         if (current.TotalTests == 0)
         {
-            Console.WriteLine("Test metrics not extracted (TotalTests=0); skipping test regression check");
+            _logger?.LogWarning("Test metrics not extracted (TotalTests=0); skipping test regression check");
             return comparison.CoverageDelta < -1.0;
         }
 
