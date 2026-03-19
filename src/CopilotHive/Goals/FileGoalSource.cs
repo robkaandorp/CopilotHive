@@ -1,3 +1,4 @@
+using CopilotHive.Configuration;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -132,21 +133,26 @@ public sealed class FileGoalSource : IGoalSource
         await File.WriteAllTextAsync(_filePath, yaml, ct);
     }
 
-    private static Goal MapToGoal(GoalFileEntry entry) => new()
+    private static Goal MapToGoal(GoalFileEntry entry)
     {
-        Id = entry.Id ?? throw new InvalidOperationException("Goal entry missing 'id' field."),
-        Description = entry.Description ?? string.Empty,
-        Priority = ParsePriority(entry.Priority),
-        Status = ParseStatus(entry.Status),
-        RepositoryNames = entry.Repositories ?? [],
-        StartedAt = ParseTimestamp(entry.Started_at),
-        CompletedAt = ParseTimestamp(entry.Completed_at),
-        Iterations = entry.Iterations,
-        FailureReason = entry.Failure_reason,
-        Notes = entry.Notes ?? [],
-        PhaseDurations = entry.PhaseDurations,
-        IterationSummaries = entry.IterationSummaries?.Select(MapIterationSummary).ToList() ?? [],
-    };
+        var id = entry.Id ?? throw new InvalidOperationException("Goal entry missing 'id' field.");
+        GoalId.Validate(id);
+        return new Goal
+        {
+            Id = id,
+            Description = entry.Description ?? string.Empty,
+            Priority = ParsePriority(entry.Priority),
+            Status = ParseStatus(entry.Status),
+            RepositoryNames = entry.Repositories ?? [],
+            StartedAt = ParseTimestamp(entry.Started_at),
+            CompletedAt = ParseTimestamp(entry.Completed_at),
+            Iterations = entry.Iterations,
+            FailureReason = entry.Failure_reason,
+            Notes = entry.Notes ?? [],
+            PhaseDurations = entry.PhaseDurations,
+            IterationSummaries = entry.IterationSummaries?.Select(MapIterationSummary).ToList() ?? [],
+        };
+    }
 
     private static GoalPriority ParsePriority(string? value) => value?.ToLowerInvariant() switch
     {
