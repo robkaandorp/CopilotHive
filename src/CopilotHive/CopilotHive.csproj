@@ -17,6 +17,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\CopilotHive.Worker\SDK\TelemetrySupport.cs" Link="SDK\TelemetrySupport.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <InternalsVisibleTo Include="CopilotHive.Tests" />
   </ItemGroup>
 
