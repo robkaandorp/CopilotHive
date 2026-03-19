@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `GrpcMapperTests` — comprehensive xUnit test suite with 27 tests (21 [Fact] + 6 [Theory]) covering:
+  - WorkTask and TaskResult round-trip conversions (domain → gRPC → domain) preserving all fields
+  - Null/empty handling for BranchSpec, TaskMetrics, GitChangeSummary, repositories, and metadata
+  - BranchAction and TaskOutcome enum bidirectional mappings (all values)
+  - WorkerRole enum mappings via `ToGrpcRole()` and `ToDomainRole()` for all roles (Coder, Tester, Reviewer, DocWriter, Improver, MergeWorker)
+  - Edge cases: zero test counts, 0% and 100% coverage, empty task IDs/prompts
+  - Unknown enum values throw `InvalidOperationException` (no silent fallbacks); `TaskStatus.Unspecified` and `TaskStatus.InProgress` throw appropriately
 - `GET /health` endpoint now includes an `"uptime"` field formatted as `"HH:mm:ss"` (hours:minutes:seconds), allowing hours to exceed 24 for long-running servers; also includes raw `UptimeSpan` (TimeSpan) for programmatic parsing
 - `HealthEndpointTests.GetHealth_UptimeField_MatchesHhMmSsFormat()` xUnit test verifies the uptime field is present and matches the expected format
 - `GoalId.Validate(string)` static method in new `Configuration/GoalId.cs` for validating goal identifiers — IDs must be non-empty, lowercase kebab-case (letters, digits, hyphens only; no leading/trailing hyphens) to match git branch naming convention
