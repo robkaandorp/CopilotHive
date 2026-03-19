@@ -266,6 +266,22 @@ public sealed class GrpcMapperTests
         Assert.Throws<InvalidOperationException>(() => GrpcMapper.ToDomain(complete));
     }
 
+    [Fact]
+    public void TaskOutcome_ToDomain_Unspecified_ThrowsInvalidOperationException()
+    {
+        // TaskStatus.Unspecified (0) is the proto3 wire default — mapper has no mapping for it.
+        var complete = new TaskComplete { TaskId = "t", Status = Shared.Grpc.TaskStatus.Unspecified, Output = "" };
+        Assert.Throws<InvalidOperationException>(() => GrpcMapper.ToDomain(complete));
+    }
+
+    [Fact]
+    public void TaskOutcome_ToDomain_InProgress_ThrowsInvalidOperationException()
+    {
+        // TaskStatus.InProgress is a valid proto value that has no corresponding TaskOutcome.
+        var complete = new TaskComplete { TaskId = "t", Status = Shared.Grpc.TaskStatus.InProgress, Output = "" };
+        Assert.Throws<InvalidOperationException>(() => GrpcMapper.ToDomain(complete));
+    }
+
     // ── WorkerRole enum ───────────────────────────────────────────────────────
 
     [Theory]
