@@ -362,6 +362,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - What does the metrics history suggest?
             IMPORTANT: Always include the docwriting phase — the doc-writer updates the CHANGELOG,
             README, and XML doc comments. Even internal changes need changelog entries.
+            Include the improve phase to let the improver refine agents.md guidance based on
+            how the iteration went — especially when steps needed retries or produced issues.
 
             Available phases: coding, testing, docwriting, review, improve, merging
 

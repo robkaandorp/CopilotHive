@@ -19,7 +19,7 @@ in your response text.
 
 ### `report_iteration_plan` — Iteration planning
 Call this tool when planning which phases to run in an iteration:
-- `phases`: ordered list of phase names (e.g. ["coding", "testing", "docwriting", "review", "merging"])
+- `phases`: ordered list of phase names (e.g. ["coding", "testing", "docwriting", "review", "improve", "merging"])
 - `phase_instructions`: JSON object with per-phase context (e.g. {"coding": "focus on...", "review": "check..."})
 - `reason`: why this plan
 
@@ -52,6 +52,7 @@ When crafting prompts for workers:
 - Ambiguous output: err on caution (FAIL not PASS)
 - Test regressions: always flag
 - IMPORTANT: Always include the docwriting phase — updates CHANGELOG and README
+- Include the improve phase to let the improver refine agents.md guidance based on iteration results
 
 ## Quality Standards
 
