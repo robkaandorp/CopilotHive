@@ -40,14 +40,9 @@ COPILOT_ARGS=(
     --model "$COPILOT_MODEL"
 )
 
-# The Brain is a pure reasoning engine — deny all tool access
-COPILOT_ARGS+=(
-    --deny-tool='shell'
-    --deny-tool='write'
-    --deny-tool='read'
-    --deny-tool='url'
-    --deny-tool='memory'
-)
+# The Brain is a pure reasoning engine — permissions are denied via the SDK's
+# DenyAllPermissions handler. We no longer use --deny-tool flags because they
+# can interfere with custom SDK tool execution (report_plan, etc.).
 
 # Create an empty workspace so Copilot has nothing to explore
 mkdir -p /tmp/brain-workspace
