@@ -29,7 +29,6 @@ static async Task<int> RunServerAsync(string[] args)
         ?? "./config-repo";
 
     PrintBanner();
-    Console.WriteLine($"[Hive] Starting gRPC server on port {port}, HTTP on port {port + 1}…");
 
     var builder = WebApplication.CreateBuilder(args);
 
@@ -50,7 +49,8 @@ static async Task<int> RunServerAsync(string[] args)
     var agentsDir = Environment.GetEnvironmentVariable("AGENTS_DIR") ?? Path.Combine(AppContext.BaseDirectory, "agents");
     if (!Directory.Exists(agentsDir))
         agentsDir = Path.Combine(Directory.GetCurrentDirectory(), "agents");
-    builder.Services.AddSingleton(new AgentsManager(agentsDir));
+    builder.Services.AddSingleton(sp =>
+        new AgentsManager(agentsDir, sp.GetRequiredService<ILogger<AgentsManager>>()));
 
     // Persistence: SQLite store for pipeline state (survives restarts)
     var stateDir = Environment.GetEnvironmentVariable("STATE_DIR") ?? "/app/state";
@@ -61,7 +61,8 @@ static async Task<int> RunServerAsync(string[] args)
     // Metrics: per-iteration metrics persistence
     var metricsDir = Path.Combine(stateDir, "metrics");
     Directory.CreateDirectory(metricsDir);
-    builder.Services.AddSingleton(new MetricsTracker(metricsDir));
+    builder.Services.AddSingleton(sp =>
+        new MetricsTracker(metricsDir, sp.GetRequiredService<ILogger<MetricsTracker>>()));
 
     builder.Services.AddSingleton(sp =>
         new GoalPipelineManager(sp.GetRequiredService<PipelineStore>()));
@@ -70,15 +71,10 @@ static async Task<int> RunServerAsync(string[] args)
     var brainPort = int.TryParse(Environment.GetEnvironmentVariable("BRAIN_COPILOT_PORT"), out var bp) ? bp : 0;
     if (brainPort > 0)
     {
-        Console.WriteLine($"[Hive] Brain enabled — connecting to Copilot on port {brainPort}");
         builder.Services.AddSingleton<IDistributedBrain>(sp =>
             new DistributedBrain(brainPort, sp.GetRequiredService<ILogger<DistributedBrain>>(),
                 sp.GetRequiredService<MetricsTracker>(),
                 sp.GetService<AgentsManager>()));
-    }
-    else
-    {
-        Console.WriteLine("[Hive] Brain disabled — running in mechanical mode (no BRAIN_COPILOT_PORT set)");
     }
 
     builder.Services.AddSingleton<WorkerUtilizationService>();
@@ -88,7 +84,6 @@ static async Task<int> RunServerAsync(string[] args)
 
     if (!string.IsNullOrEmpty(configRepoUrl))
     {
-        Console.WriteLine($"[Hive] Syncing config repo from {configRepoUrl}…");
         var configRepo = new ConfigRepoManager(configRepoUrl, configRepoPath);
         await configRepo.SyncRepoAsync();
         var hiveConfigFile = await configRepo.LoadConfigAsync();
@@ -101,14 +96,8 @@ static async Task<int> RunServerAsync(string[] args)
         {
             var configGoalsFile = Path.Combine(configRepo.LocalPath, "goals.yaml");
             if (File.Exists(configGoalsFile))
-            {
                 goalsFile = configGoalsFile;
-                Console.WriteLine($"[Hive] Using goals file from config repo: {configGoalsFile}");
-            }
         }
-
-        Console.WriteLine($"[Hive] Config loaded: {hiveConfigFile.Repositories.Count} repo(s), " +
-            $"{hiveConfigFile.Workers.Count} worker config(s)");
 
         // Enable debug logging if verbose_logging is set in config
         if (hiveConfigFile.Orchestrator.VerboseLogging)
@@ -117,7 +106,6 @@ static async Task<int> RunServerAsync(string[] args)
             // Keep framework noise suppressed even in verbose mode
             builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
             builder.Logging.AddFilter("Grpc", LogLevel.Warning);
-            Console.WriteLine("[Hive] Verbose logging enabled (Debug level)");
         }
     }
     builder.Services.AddSingleton(sp =>
@@ -144,13 +132,38 @@ static async Task<int> RunServerAsync(string[] args)
 
     var app = builder.Build();
 
+    var logger = app.Services.GetRequiredService<ILogger<Program>>();
+    logger.LogInformation("Starting gRPC server on port {GrpcPort}, HTTP on port {HttpPort}", port, port + 1);
+
+    if (brainPort > 0)
+        logger.LogInformation("Brain enabled — connecting to Copilot on port {BrainPort}", brainPort);
+    else
+        logger.LogWarning("Brain disabled — running in mechanical mode (no BRAIN_COPILOT_PORT set)");
+
+    if (!string.IsNullOrEmpty(configRepoUrl))
+    {
+        var configRepo = app.Services.GetService<ConfigRepoManager>();
+        var hiveConfigFile = app.Services.GetService<HiveConfigFile>();
+        logger.LogInformation("Synced config repo from {ConfigRepoUrl}", configRepoUrl);
+        if (hiveConfigFile is not null)
+        {
+            if (!string.IsNullOrEmpty(goalsFile))
+                logger.LogInformation("Using goals file from config repo: {GoalsFile}", goalsFile);
+            logger.LogInformation(
+                "Config loaded: {RepoCount} repo(s), {WorkerConfigCount} worker config(s)",
+                hiveConfigFile.Repositories.Count, hiveConfigFile.Workers.Count);
+            if (hiveConfigFile.Orchestrator.VerboseLogging)
+                logger.LogDebug("Verbose logging enabled (Debug level)");
+        }
+    }
+
     // Wire up Brain and completion event
     var brain = app.Services.GetService<IDistributedBrain>();
     if (brain is not null)
     {
-        Console.WriteLine("[Hive] Connecting Brain to Copilot…");
+        logger.LogInformation("Connecting Brain to Copilot…");
         await brain.ConnectAsync();
-        Console.WriteLine("[Hive] Brain connected.");
+        logger.LogInformation("Brain connected.");
     }
 
     app.MapGrpcService<HiveOrchestratorService>();

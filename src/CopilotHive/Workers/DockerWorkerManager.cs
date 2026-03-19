@@ -1,6 +1,7 @@
 using Docker.DotNet;
 using Docker.DotNet.Models;
 using CopilotHive.Configuration;
+using Microsoft.Extensions.Logging;
 
 namespace CopilotHive.Workers;
 
@@ -13,16 +14,19 @@ public sealed class DockerWorkerManager : IWorkerManager
     private readonly HiveConfiguration _config;
     private readonly Dictionary<string, WorkerInfo> _workers = [];
     private readonly string _sessionId = Guid.NewGuid().ToString("N")[..8];
+    private readonly ILogger<DockerWorkerManager>? _logger;
     private int _nextPort;
 
     /// <summary>
     /// Initialises a new <see cref="DockerWorkerManager"/> using the default local Docker daemon.
     /// </summary>
     /// <param name="config">Configuration providing the Docker image, base port, and credentials.</param>
-    public DockerWorkerManager(HiveConfiguration config)
+    /// <param name="logger">Optional logger; when omitted, log output is suppressed.</param>
+    public DockerWorkerManager(HiveConfiguration config, ILogger<DockerWorkerManager>? logger = null)
     {
         _config = config;
         _nextPort = config.BasePort;
+        _logger = logger;
         _docker = new DockerClientConfiguration().CreateClient();
     }
 
@@ -49,11 +53,11 @@ public sealed class DockerWorkerManager : IWorkerManager
                     container.ID,
                     new ContainerRemoveParameters { Force = true },
                     ct);
-                Console.WriteLine($"[Hive] Cleaned up stale container: {name}");
+                _logger?.LogInformation("Cleaned up stale container: {ContainerName}", name);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Hive] Warning: could not remove stale container {name}: {ex.Message}");
+                _logger?.LogWarning("Could not remove stale container {ContainerName}: {Message}", name, ex.Message);
             }
         }
     }
@@ -123,7 +127,7 @@ public sealed class DockerWorkerManager : IWorkerManager
         };
 
         _workers[id] = worker;
-        Console.WriteLine($"[Hive] Spawned {role} worker: {id} on port {port} (model: {model})");
+        _logger?.LogInformation("Spawned {Role} worker: {WorkerId} on port {Port} (model: {Model})", role, id, port, model);
         return worker;
     }
 
@@ -162,7 +166,7 @@ public sealed class DockerWorkerManager : IWorkerManager
         }
 
         _workers.Remove(workerId);
-        Console.WriteLine($"[Hive] Stopped worker: {workerId}");
+        _logger?.LogInformation("Stopped worker: {WorkerId}", workerId);
     }
 
     /// <summary>

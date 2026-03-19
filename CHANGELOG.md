@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Goal ID validation in `ApiGoalSource.AddGoal()` — validates goal ID when adding a new goal via API
 - `GoalIdTests` — 6 xUnit tests (5 valid cases: `fix-build-error`, `add-feature`, `abc`, `a1b2`, `a-1-b`; 8 invalid cases covering empty/null, uppercase, spaces, leading/trailing hyphens, underscores)
 
+### Changed
+- Orchestrator logging migrated from `Console.WriteLine` to `ILogger` with structured properties:
+  - `DistributedBrain.cs` — Brain SDK events (AssistantMessage, Usage, SessionIdle, SessionError) now logged via `ILogger.LogDebug` with structured fields (`Source`, `Length`, `Model`, `InputTokens`, `OutputTokens`, `Cost`, `Duration`, `EventType`) instead of `Console.WriteLine` with formatted strings
+  - `Program.cs` — Startup messages (gRPC server ports, Brain connection status, config loading) now logged after application build via `ILogger<Program>` with structured properties
+  - `AgentsManager.cs` — AGENTS.md update and rollback operations now logged via injected `ILogger<AgentsManager>?` (optional, null-safe) with structured role names and version info
+  - `MetricsTracker.cs` — Iteration metrics recording and test regression warnings now logged via injected `ILogger<MetricsTracker>?` with structured iteration, test, and coverage data
+  - `DockerWorkerManager.cs` — Worker spawning, cleanup, and stoppage now logged via injected `ILogger<DockerWorkerManager>?` with structured container, port, role, and model information
+- Optional logger injection added to `AgentsManager`, `MetricsTracker`, and `DockerWorkerManager` constructors — when omitted (defaults to null), log output is suppressed for backward compatibility
+- Service registration in `Program.cs` updated to inject `ILogger` instances for `AgentsManager` and `MetricsTracker` via dependency injection
+- Logging levels assigned consistently: `LogDebug` for SDK events and diagnostic detail, `LogInformation` for key operational events, `LogWarning` for error conditions and alerts
+
 ### Added (Previous)
 - `GoalDispatcherBuildIterationSummaryTests` — xUnit test class with 2 tests verifying `BuildIterationSummary()` correctly handles `ImproverSkipped` flag: ensures exactly one "Improve" phase entry appears in output (no duplicates) regardless of whether PhaseDurations already recorded an "Improve" entry
 - `IterationSummary` YAML-level test for null `TestCounts` omission — verifies that when `IterationSummary.TestCounts` is null, the serialised YAML output omits the `test_counts` key entirely
