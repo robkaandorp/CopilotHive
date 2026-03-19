@@ -131,7 +131,7 @@ public class HealthEndpointTests : IClassFixture<HiveTestFactory>
 
         // Register a worker via the singleton WorkerPool.
         var workerPool = _factory.Services.GetRequiredService<WorkerPool>();
-        workerPool.RegisterWorker("test-worker-" + Guid.NewGuid(), WorkerRole.Coder, []);
+        workerPool.RegisterWorker("test-worker-" + Guid.NewGuid(), []);
 
         // Verify the count increased.
         using var after = await GetHealthJsonAsync();

@@ -12,10 +12,10 @@ public sealed class WorkerPoolTests
 
     /// <summary>Registers a worker and back-dates its heartbeat to simulate staleness.</summary>
     private static ConnectedWorker RegisterWithHeartbeat(
-        WorkerPool pool, string id, WorkerRole role,
+        WorkerPool pool, string id,
         DateTime lastHeartbeat, bool isBusy = false)
     {
-        var worker = pool.RegisterWorker(id, role, []);
+        var worker = pool.RegisterWorker(id, []);
         worker.LastHeartbeat = lastHeartbeat;
         worker.IsBusy = isBusy;
         return worker;
@@ -44,8 +44,8 @@ public sealed class WorkerPoolTests
     {
         var pool = CreatePool();
         var now = DateTime.UtcNow;
-        RegisterWithHeartbeat(pool, "w1", WorkerRole.Coder, now.AddSeconds(-10));
-        RegisterWithHeartbeat(pool, "w2", WorkerRole.Reviewer, now.AddSeconds(-5));
+        RegisterWithHeartbeat(pool, "w1", now.AddSeconds(-10));
+        RegisterWithHeartbeat(pool, "w2", now.AddSeconds(-5));
 
         var result = pool.GetStaleWorkers(TimeSpan.FromMinutes(1));
 
@@ -66,7 +66,7 @@ public sealed class WorkerPoolTests
         // DateTime.UtcNow advances between the heartbeat assignment and the GetStaleWorkers call,
         // making a reliable exact-equality assertion impossible without a controlled time source.
         var withinBoundary = DateTime.UtcNow - timeout + TimeSpan.FromSeconds(1);
-        RegisterWithHeartbeat(pool, "w1", WorkerRole.Coder, withinBoundary);
+        RegisterWithHeartbeat(pool, "w1", withinBoundary);
 
         var result = pool.GetStaleWorkers(timeout);
 
@@ -83,7 +83,7 @@ public sealed class WorkerPoolTests
         var pool = CreatePool();
         var timeout = TimeSpan.FromMinutes(1);
         var justPast = DateTime.UtcNow - timeout - TimeSpan.FromMilliseconds(1);
-        RegisterWithHeartbeat(pool, "w1", WorkerRole.Coder, justPast);
+        RegisterWithHeartbeat(pool, "w1", justPast);
 
         var result = pool.GetStaleWorkers(timeout);
 
@@ -102,9 +102,9 @@ public sealed class WorkerPoolTests
         var timeout = TimeSpan.FromMinutes(5);
         var now = DateTime.UtcNow;
 
-        RegisterWithHeartbeat(pool, "fresh", WorkerRole.Coder, now.AddSeconds(-10));
-        RegisterWithHeartbeat(pool, "stale1", WorkerRole.Reviewer, now.AddMinutes(-10));
-        RegisterWithHeartbeat(pool, "stale2", WorkerRole.Tester, now.AddMinutes(-6));
+        RegisterWithHeartbeat(pool, "fresh", now.AddSeconds(-10));
+        RegisterWithHeartbeat(pool, "stale1", now.AddMinutes(-10));
+        RegisterWithHeartbeat(pool, "stale2", now.AddMinutes(-6));
 
         var result = pool.GetStaleWorkers(timeout);
 
@@ -125,8 +125,8 @@ public sealed class WorkerPoolTests
         var timeout = TimeSpan.FromMinutes(1);
         var now = DateTime.UtcNow;
 
-        RegisterWithHeartbeat(pool, "w1", WorkerRole.Coder, now.AddMinutes(-2));
-        RegisterWithHeartbeat(pool, "w2", WorkerRole.Reviewer, now.AddMinutes(-3));
+        RegisterWithHeartbeat(pool, "w1", now.AddMinutes(-2));
+        RegisterWithHeartbeat(pool, "w2", now.AddMinutes(-3));
 
         var result = pool.GetStaleWorkers(timeout);
 
@@ -141,7 +141,7 @@ public sealed class WorkerPoolTests
     public void GetStaleWorkers_DoesNotRemoveWorkers()
     {
         var pool = CreatePool();
-        RegisterWithHeartbeat(pool, "w1", WorkerRole.Coder,
+        RegisterWithHeartbeat(pool, "w1",
             DateTime.UtcNow.AddMinutes(-10));
 
         _ = pool.GetStaleWorkers(TimeSpan.FromMinutes(1));
@@ -176,7 +176,7 @@ public sealed class WorkerPoolTests
     public void GetWorkerStats_SingleIdleWorker_CorrectCounts()
     {
         var pool = CreatePool();
-        pool.RegisterWorker("w1", WorkerRole.Coder, []);
+        pool.RegisterWorker("w1", []);
 
         var stats = pool.GetWorkerStats();
 
@@ -193,7 +193,7 @@ public sealed class WorkerPoolTests
     public void GetWorkerStats_SingleBusyWorker_CorrectCounts()
     {
         var pool = CreatePool();
-        pool.RegisterWorker("w1", WorkerRole.Coder, []);
+        pool.RegisterWorker("w1", []);
         pool.MarkBusy("w1", "task-1");
 
         var stats = pool.GetWorkerStats();
@@ -211,9 +211,9 @@ public sealed class WorkerPoolTests
     public void GetWorkerStats_MixedBusyAndIdle_CorrectCounts()
     {
         var pool = CreatePool();
-        pool.RegisterWorker("w1", WorkerRole.Coder, []);
-        pool.RegisterWorker("w2", WorkerRole.Coder, []);
-        pool.RegisterWorker("w3", WorkerRole.Reviewer, []);
+        pool.RegisterWorker("w1", []);
+        pool.RegisterWorker("w2", []);
+        pool.RegisterWorker("w3", []);
         pool.MarkBusy("w1", "task-1");
         pool.MarkBusy("w3", "task-2");
 
@@ -229,36 +229,33 @@ public sealed class WorkerPoolTests
     #region GetWorkerStats — WorkersByRole
 
     [Fact]
-    public void GetWorkerStats_MultipleRoles_WorkersByRoleCorrect()
+    public void GetWorkerStats_MultipleWorkers_WorkersByRoleCorrect()
     {
         var pool = CreatePool();
-        pool.RegisterWorker("c1", WorkerRole.Coder, []);
-        pool.RegisterWorker("c2", WorkerRole.Coder, []);
-        pool.RegisterWorker("r1", WorkerRole.Reviewer, []);
-        pool.RegisterWorker("t1", WorkerRole.Tester, []);
+        pool.RegisterWorker("c1", []);
+        pool.RegisterWorker("c2", []);
+        pool.RegisterWorker("r1", []);
+        pool.RegisterWorker("t1", []);
 
         var stats = pool.GetWorkerStats();
 
-        var coderKey = WorkerRole.Coder.ToString();
-        var reviewerKey = WorkerRole.Reviewer.ToString();
-        var testerKey = WorkerRole.Tester.ToString();
+        var unspecifiedKey = WorkerRole.Unspecified.ToString();
 
-        Assert.Equal(2, stats.WorkersByRole[coderKey]);
-        Assert.Equal(1, stats.WorkersByRole[reviewerKey]);
-        Assert.Equal(1, stats.WorkersByRole[testerKey]);
+        Assert.Single(stats.WorkersByRole);
+        Assert.Equal(4, stats.WorkersByRole[unspecifiedKey]);
     }
 
     [Fact]
-    public void GetWorkerStats_SingleRole_WorkersByRoleHasOneEntry()
+    public void GetWorkerStats_TwoWorkers_WorkersByRoleHasOneEntry()
     {
         var pool = CreatePool();
-        pool.RegisterWorker("w1", WorkerRole.Tester, []);
-        pool.RegisterWorker("w2", WorkerRole.Tester, []);
+        pool.RegisterWorker("w1", []);
+        pool.RegisterWorker("w2", []);
 
         var stats = pool.GetWorkerStats();
 
         Assert.Single(stats.WorkersByRole);
-        Assert.Equal(2, stats.WorkersByRole[WorkerRole.Tester.ToString()]);
+        Assert.Equal(2, stats.WorkersByRole[WorkerRole.Unspecified.ToString()]);
     }
 
     #endregion
@@ -277,7 +274,6 @@ public sealed class WorkerPoolTests
         Assert.Equal(0, stats.TotalWorkers);
         Assert.Equal(0, stats.BusyWorkers);
         Assert.Equal(0, stats.IdleWorkers);
-        Assert.Equal(0, stats.GenericWorkers);
         Assert.Empty(stats.Workers);
     }
 
@@ -289,8 +285,8 @@ public sealed class WorkerPoolTests
     public void GetDetailedStats_MixedWorkers_CorrectCountsAndEntries()
     {
         var pool = CreatePool();
-        pool.RegisterWorker("c1", WorkerRole.Coder, []);
-        pool.RegisterWorker("g1", WorkerRole.Unspecified, []);
+        pool.RegisterWorker("c1", []);
+        pool.RegisterWorker("g1", []);
         pool.MarkBusy("c1", "task-1");
 
         var stats = pool.GetDetailedStats();
@@ -298,20 +294,17 @@ public sealed class WorkerPoolTests
         Assert.Equal(2, stats.TotalWorkers);
         Assert.Equal(1, stats.BusyWorkers);
         Assert.Equal(1, stats.IdleWorkers);
-        Assert.Equal(1, stats.GenericWorkers);
         Assert.Equal(2, stats.Workers.Count);
 
-        var coder = stats.Workers.First(w => w.Id == "c1");
-        Assert.Equal("Coder", coder.Role);
-        Assert.True(coder.IsBusy);
-        Assert.False(coder.IsGeneric);
-        Assert.Equal("task-1", coder.CurrentTaskId);
+        var busy = stats.Workers.First(w => w.Id == "c1");
+        Assert.Null(busy.Role);
+        Assert.True(busy.IsBusy);
+        Assert.Equal("task-1", busy.CurrentTaskId);
 
-        var generic = stats.Workers.First(w => w.Id == "g1");
-        Assert.Null(generic.Role);
-        Assert.False(generic.IsBusy);
-        Assert.True(generic.IsGeneric);
-        Assert.Null(generic.CurrentTaskId);
+        var idle = stats.Workers.First(w => w.Id == "g1");
+        Assert.Null(idle.Role);
+        Assert.False(idle.IsBusy);
+        Assert.Null(idle.CurrentTaskId);
     }
 
     #endregion
@@ -338,8 +331,8 @@ public sealed class WorkerPoolTests
     public void PurgeStaleWorkers_NoStaleWorkers_ReturnsEmptyAndPoolUnchanged()
     {
         var pool = CreatePool();
-        pool.RegisterWorker("w1", WorkerRole.Coder, []);
-        pool.RegisterWorker("w2", WorkerRole.Reviewer, []);
+        pool.RegisterWorker("w1", []);
+        pool.RegisterWorker("w2", []);
 
         var result = pool.PurgeStaleWorkers(TimeSpan.FromMinutes(5));
 
@@ -358,9 +351,9 @@ public sealed class WorkerPoolTests
         var timeout = TimeSpan.FromMinutes(5);
         var now = DateTime.UtcNow;
 
-        RegisterWithHeartbeat(pool, "fresh", WorkerRole.Coder, now.AddSeconds(-30));
-        RegisterWithHeartbeat(pool, "stale1", WorkerRole.Reviewer, now.AddMinutes(-10));
-        RegisterWithHeartbeat(pool, "stale2", WorkerRole.Tester, now.AddMinutes(-7));
+        RegisterWithHeartbeat(pool, "fresh", now.AddSeconds(-30));
+        RegisterWithHeartbeat(pool, "stale1", now.AddMinutes(-10));
+        RegisterWithHeartbeat(pool, "stale2", now.AddMinutes(-7));
 
         var result = pool.PurgeStaleWorkers(timeout);
 
@@ -389,8 +382,8 @@ public sealed class WorkerPoolTests
         var timeout = TimeSpan.FromMinutes(1);
         var now = DateTime.UtcNow;
 
-        RegisterWithHeartbeat(pool, "w1", WorkerRole.Coder, now.AddMinutes(-2));
-        RegisterWithHeartbeat(pool, "w2", WorkerRole.Reviewer, now.AddMinutes(-5));
+        RegisterWithHeartbeat(pool, "w1", now.AddMinutes(-2));
+        RegisterWithHeartbeat(pool, "w2", now.AddMinutes(-5));
 
         var result = pool.PurgeStaleWorkers(timeout);
 
@@ -409,9 +402,9 @@ public sealed class WorkerPoolTests
         var timeout = TimeSpan.FromMinutes(2);
         var now = DateTime.UtcNow;
 
-        RegisterWithHeartbeat(pool, "w1", WorkerRole.Coder, now.AddSeconds(-10));
-        RegisterWithHeartbeat(pool, "w2", WorkerRole.Coder, now.AddMinutes(-3));
-        RegisterWithHeartbeat(pool, "w3", WorkerRole.Tester, now.AddMinutes(-3));
+        RegisterWithHeartbeat(pool, "w1", now.AddSeconds(-10));
+        RegisterWithHeartbeat(pool, "w2", now.AddMinutes(-3));
+        RegisterWithHeartbeat(pool, "w3", now.AddMinutes(-3));
 
         pool.PurgeStaleWorkers(timeout);
 
@@ -430,8 +423,8 @@ public sealed class WorkerPoolTests
         var timeout = TimeSpan.FromMinutes(1);
         var now = DateTime.UtcNow;
 
-        RegisterWithHeartbeat(pool, "alpha", WorkerRole.Coder, now.AddMinutes(-2));
-        RegisterWithHeartbeat(pool, "beta", WorkerRole.Reviewer, now.AddMinutes(-3));
+        RegisterWithHeartbeat(pool, "alpha", now.AddMinutes(-2));
+        RegisterWithHeartbeat(pool, "beta", now.AddMinutes(-3));
 
         var purged = pool.PurgeStaleWorkers(timeout);
 

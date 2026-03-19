@@ -20,7 +20,7 @@ service HiveOrchestrator {
 
 message RegisterRequest {
   string worker_id = 1;       // Unique worker identifier
-  WorkerRole role = 2;        // coder, reviewer, tester, improver
+  reserved 2;                 // Removed: fixed WorkerRole (all workers are now generic)
   repeated string capabilities = 3;  // e.g., ["dotnet", "python", "nodejs"]
 }
 
@@ -30,7 +30,7 @@ message RegisterResponse {
   string assigned_worker_id = 3;  // Server may reassign ID
 }
 
-// === Worker Roles ===
+// === Worker Roles (used only in TaskAssignment for per-task role) ===
 
 enum WorkerRole {
   WORKER_ROLE_UNSPECIFIED = 0;
@@ -162,7 +162,7 @@ message TaskMetrics {
 
 message HeartbeatRequest {
   string worker_id = 1;
-  WorkerRole role = 2;
+  reserved 2;                 // Removed: fixed WorkerRole (all workers are now generic)
   bool busy = 3;
   string current_task_id = 4;     // Empty if idle
 }

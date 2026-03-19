@@ -62,7 +62,7 @@ public class WorkerPoolStatsEndpointTests : IClassFixture<HiveTestFactory>
     }
 
     [Fact]
-    public async Task GetHealth_IncludesIdleAndBusyAndGenericFields()
+    public async Task GetHealth_IncludesIdleAndBusyFields()
     {
         var wp = await GetWorkerPoolElementAsync();
 
@@ -73,10 +73,6 @@ public class WorkerPoolStatsEndpointTests : IClassFixture<HiveTestFactory>
         Assert.True(wp.TryGetProperty("busy_workers", out var busy),
             "Expected 'busy_workers' inside worker_pool");
         Assert.True(busy.GetInt32() >= 0);
-
-        Assert.True(wp.TryGetProperty("generic_workers", out var generic),
-            "Expected 'generic_workers' inside worker_pool");
-        Assert.True(generic.GetInt32() >= 0);
     }
 
     [Fact]
@@ -94,7 +90,7 @@ public class WorkerPoolStatsEndpointTests : IClassFixture<HiveTestFactory>
         var pool = _factory.Services.GetRequiredService<WorkerPool>();
         var workerId = "stats-busy-" + Guid.NewGuid();
 
-        pool.RegisterWorker(workerId, WorkerRole.Coder, []);
+        pool.RegisterWorker(workerId, []);
         pool.MarkBusy(workerId, "task-busy-test");
 
         try
@@ -131,7 +127,7 @@ public class WorkerPoolStatsEndpointTests : IClassFixture<HiveTestFactory>
         var pool = _factory.Services.GetRequiredService<WorkerPool>();
         var workerId = "stats-idle-" + Guid.NewGuid();
 
-        pool.RegisterWorker(workerId, WorkerRole.Reviewer, []);
+        pool.RegisterWorker(workerId, []);
 
         try
         {
@@ -147,49 +143,12 @@ public class WorkerPoolStatsEndpointTests : IClassFixture<HiveTestFactory>
     }
 
     [Fact]
-    public async Task GetHealth_GenericWorkerReflectedInStats()
-    {
-        var pool = _factory.Services.GetRequiredService<WorkerPool>();
-        var workerId = "stats-generic-" + Guid.NewGuid();
-
-        // Unspecified role → generic worker
-        pool.RegisterWorker(workerId, WorkerRole.Unspecified, []);
-
-        try
-        {
-            var wp = await GetWorkerPoolElementAsync();
-            var genericCount = wp.GetProperty("generic_workers").GetInt32();
-            Assert.True(genericCount >= 1,
-                $"Expected generic_workers >= 1 after registering a generic worker, got {genericCount}");
-
-            // Verify the worker entry has null role and is_generic = true
-            var workers = wp.GetProperty("workers");
-            var found = false;
-            foreach (var w in workers.EnumerateArray())
-            {
-                if (w.GetProperty("id").GetString() == workerId)
-                {
-                    Assert.True(w.GetProperty("is_generic").GetBoolean());
-                    Assert.Equal(JsonValueKind.Null, w.GetProperty("role").ValueKind);
-                    found = true;
-                    break;
-                }
-            }
-            Assert.True(found, $"Worker '{workerId}' not found in workers array");
-        }
-        finally
-        {
-            pool.RemoveWorker(workerId);
-        }
-    }
-
-    [Fact]
     public async Task GetHealth_WorkerEntryHasExpectedFields()
     {
         var pool = _factory.Services.GetRequiredService<WorkerPool>();
         var workerId = "stats-fields-" + Guid.NewGuid();
 
-        pool.RegisterWorker(workerId, WorkerRole.Coder, []);
+        pool.RegisterWorker(workerId, []);
         pool.MarkBusy(workerId, "task-xyz");
 
         try
@@ -210,9 +169,8 @@ public class WorkerPoolStatsEndpointTests : IClassFixture<HiveTestFactory>
             var entry = target.Value;
 
             Assert.Equal(workerId, entry.GetProperty("id").GetString());
-            Assert.Equal("Coder", entry.GetProperty("role").GetString());
+            Assert.Equal(JsonValueKind.Null, entry.GetProperty("role").ValueKind);
             Assert.True(entry.GetProperty("is_busy").GetBoolean());
-            Assert.False(entry.GetProperty("is_generic").GetBoolean());
             Assert.Equal("task-xyz", entry.GetProperty("current_task_id").GetString());
         }
         finally

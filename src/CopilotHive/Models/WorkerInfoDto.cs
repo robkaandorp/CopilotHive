@@ -19,10 +19,6 @@ public sealed class WorkerInfoDto
     [JsonPropertyName("is_busy")]
     public required bool IsBusy { get; init; }
 
-    /// <summary>Whether this worker registered without a fixed role.</summary>
-    [JsonPropertyName("is_generic")]
-    public required bool IsGeneric { get; init; }
-
     /// <summary>Identifier of the task the worker is executing, or <c>null</c> when idle.</summary>
     [JsonPropertyName("current_task_id")]
     public required string? CurrentTaskId { get; init; }

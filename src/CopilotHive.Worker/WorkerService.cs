@@ -3,7 +3,6 @@ using Grpc.Core;
 using Grpc.Net.Client;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
-using GrpcRole = CopilotHive.Shared.Grpc.WorkerRole;
 
 namespace CopilotHive.Worker;
 
@@ -15,7 +14,6 @@ namespace CopilotHive.Worker;
 public sealed class WorkerService(
     string orchestratorUrl,
     string workerId,
-    string role,
     string[] capabilities,
     int copilotPort) : IToolCallBridge
 {
@@ -23,7 +21,6 @@ public sealed class WorkerService(
 
     private readonly CopilotRunner _copilotRunner = new(copilotPort);
     private readonly WorkerLogger _log = new("Worker");
-    private readonly string _fixedRole = role;
 
     // Pending tool calls awaiting orchestrator responses, keyed by request_id
     private readonly ConcurrentDictionary<string, TaskCompletionSource<ToolCallResponse>> _pendingToolCalls = new();
@@ -39,8 +36,6 @@ public sealed class WorkerService(
     /// <param name="ct">Cancellation token that stops the worker.</param>
     public async Task RunAsync(CancellationToken ct)
     {
-        var workerRole = ParseRole(_fixedRole);
-
         // Connect to the local Copilot CLI via SDK before registering with orchestrator
         _log.Info("Connecting to local Copilot CLI...");
         await _copilotRunner.ConnectAsync(ct);
@@ -59,7 +54,6 @@ public sealed class WorkerService(
         var registerRequest = new RegisterRequest
         {
             WorkerId = workerId,
-            Role = workerRole,
         };
         registerRequest.Capabilities.AddRange(capabilities);
 
@@ -79,7 +73,7 @@ public sealed class WorkerService(
 
         // 2. Start heartbeat background task
         using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var heartbeatTask = RunHeartbeatAsync(client, _assignedId, workerRole, heartbeatCts.Token);
+        var heartbeatTask = RunHeartbeatAsync(client, _assignedId, heartbeatCts.Token);
 
         try
         {
@@ -91,7 +85,7 @@ public sealed class WorkerService(
             await SendWorkerReady(stream, _assignedId, ct);
 
             // 5. Main message loop
-            await ProcessMessagesAsync(stream, _assignedId, workerRole, ct);
+            await ProcessMessagesAsync(stream, _assignedId, ct);
         }
         finally
         {
@@ -104,7 +98,6 @@ public sealed class WorkerService(
     private async Task ProcessMessagesAsync(
         AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
         string assignedId,
-        GrpcRole workerRole,
         CancellationToken ct)
     {
         CancellationTokenSource? taskCts = null;
@@ -260,7 +253,6 @@ public sealed class WorkerService(
     private static async Task RunHeartbeatAsync(
         HiveOrchestrator.HiveOrchestratorClient client,
         string assignedId,
-        GrpcRole workerRole,
         CancellationToken ct)
     {
         using var timer = new PeriodicTimer(HeartbeatInterval);
@@ -272,7 +264,6 @@ public sealed class WorkerService(
                 await client.HeartbeatAsync(new HeartbeatRequest
                 {
                     WorkerId = assignedId,
-                    Role = workerRole,
                     Busy = false,
                 }, cancellationToken: ct);
             }
@@ -282,16 +273,6 @@ public sealed class WorkerService(
             }
         }
     }
-
-    private static GrpcRole ParseRole(string role) => role.ToLowerInvariant() switch
-    {
-        "coder" => GrpcRole.Coder,
-        "reviewer" => GrpcRole.Reviewer,
-        "tester" => GrpcRole.Tester,
-        "improver" => GrpcRole.Improver,
-        "docwriter" or "doc_writer" => GrpcRole.DocWriter,
-        _ => GrpcRole.Unspecified,
-    };
 
     private static async IAsyncEnumerable<T> ReadMessages<T>(
         IAsyncStreamReader<T> reader,

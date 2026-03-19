@@ -30,18 +30,13 @@ public sealed class HiveOrchestratorService(
     public override Task<RegisterResponse> Register(RegisterRequest request, ServerCallContext context)
     {
         var workerId = string.IsNullOrWhiteSpace(request.WorkerId)
-            ? $"{request.Role.ToString().ToLowerInvariant()}-{Guid.NewGuid():N}"[..24]
+            ? $"worker-{Guid.NewGuid():N}"[..24]
             : request.WorkerId;
-
-        if (request.Role == GrpcWorkerRole.Unspecified)
-        {
-            logger.LogInformation("Registering generic worker: {WorkerId} (no fixed role)", workerId);
-        }
 
         try
         {
-            workerPool.RegisterWorker(workerId, request.Role, [.. request.Capabilities]);
-            logger.LogInformation("Worker registered: {WorkerId} (role={Role})", workerId, request.Role);
+            workerPool.RegisterWorker(workerId, [.. request.Capabilities]);
+            logger.LogInformation("Worker registered: {WorkerId}", workerId);
 
             return Task.FromResult(new RegisterResponse
             {
@@ -180,31 +175,20 @@ public sealed class HiveOrchestratorService(
         CancellationToken cancellationToken)
     {
         workerPool.MarkIdle(worker.Id);
-        var isGeneric = worker.Role == GrpcWorkerRole.Unspecified;
-        logger.LogInformation("Worker {WorkerId} is ready (role={Role}, generic={IsGeneric})",
-            worker.Id, worker.Role, isGeneric);
+        logger.LogInformation("Worker {WorkerId} is ready", worker.Id);
 
-        // For fixed-role workers, send their role's agents.md on ready
-        if (!isGeneric && agentsManager is not null)
-        {
-            await SendAgentsMdAsync(worker, worker.Role, cancellationToken);
-        }
-
-        // Dequeue a matching task — generic workers accept any role
+        // Dequeue a task for this worker
         var task = taskQueue.TryDequeue(worker.Role);
         if (task is not null)
         {
-            // For generic workers, set the role from the task and send agents.md
-            if (isGeneric)
-            {
-                var taskRoleName = task.Role.ToString().ToLowerInvariant();
-                worker.Role = task.Role;
-                logger.LogInformation("Generic worker {WorkerId} assigned role {Role} for task {TaskId}",
-                    worker.Id, taskRoleName, task.TaskId);
+            // Set the worker's role from the task and send agents.md
+            var taskRoleName = task.Role.ToString().ToLowerInvariant();
+            worker.Role = task.Role;
+            logger.LogInformation("Worker {WorkerId} assigned role {Role} for task {TaskId}",
+                worker.Id, taskRoleName, task.TaskId);
 
-                if (agentsManager is not null)
-                    await SendAgentsMdAsync(worker, task.Role, cancellationToken);
-            }
+            if (agentsManager is not null)
+                await SendAgentsMdAsync(worker, task.Role, cancellationToken);
 
             taskQueue.Activate(task, worker.Id);
             workerPool.MarkBusy(worker.Id, task.TaskId);

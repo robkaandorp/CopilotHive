@@ -707,26 +707,21 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogInformation("Dispatched {Role} task {TaskId} for goal {GoalId} (branch={Branch})",
             role, task.TaskId, pipeline.GoalId, task.BranchInfo?.FeatureBranch);
 
-        // Try to push directly to an idle worker (convert to gRPC type at communication boundary)
-        var grpcRole = role.ToGrpcRole();
-        var idleWorker = _workerPool.GetIdleWorker(grpcRole);
+        // Try to push directly to an idle worker
+        var idleWorker = _workerPool.GetIdleWorker();
         if (idleWorker is not null)
         {
+            var grpcRole = role.ToGrpcRole();
             var queuedTask = _taskQueue.TryDequeue(grpcRole);
-            if (queuedTask is null && idleWorker.IsGeneric)
-                queuedTask = _taskQueue.TryDequeue(GrpcWorkerRole.Unspecified);
+            queuedTask ??= _taskQueue.TryDequeue(GrpcWorkerRole.Unspecified);
 
             if (queuedTask is not null)
             {
-                // For generic workers, set their role and send agents.md
-                if (idleWorker.IsGeneric)
-                {
-                    idleWorker.Role = queuedTask.Role;
-                    var taskRoleName = queuedTask.Role.ToString().ToLowerInvariant();
-                    _logger.LogInformation("Generic worker {WorkerId} assigned role {Role} for task {TaskId}",
-                        idleWorker.Id, taskRoleName, queuedTask.TaskId);
-                    await SendAgentsMdToWorkerAsync(idleWorker, queuedTask.Role.ToDomainRole(), ct);
-                }
+                idleWorker.Role = queuedTask.Role;
+                var taskRoleName = queuedTask.Role.ToString().ToLowerInvariant();
+                _logger.LogInformation("Worker {WorkerId} assigned role {Role} for task {TaskId}",
+                    idleWorker.Id, taskRoleName, queuedTask.TaskId);
+                await SendAgentsMdToWorkerAsync(idleWorker, queuedTask.Role.ToDomainRole(), ct);
 
                 _taskQueue.Activate(queuedTask, idleWorker.Id);
                 _workerPool.MarkBusy(idleWorker.Id, queuedTask.TaskId);

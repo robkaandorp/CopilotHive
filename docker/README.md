@@ -91,7 +91,6 @@ docker service scale copilothive_worker=8
 | Variable           | Default            | Description                                |
 |-------------------|--------------------|--------------------------------------------|
 | `ORCHESTRATOR_URL` | —                  | gRPC URL of the orchestrator               |
-| `WORKER_ROLE`      | (empty = generic)  | Optional fixed role; empty means generic pool worker |
 | `COPILOT_MODEL`    | —                  | Default AI model (overridden per task by orchestrator) |
 | `CONFIG_REPO_URL`  | —                  | Config repo URL (needed for improver tasks) |
 | `COPILOT_PORT`     | `8000`             | Port for headless Copilot CLI              |

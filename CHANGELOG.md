@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Root cause of coder no-ops — Brain was generating `git checkout -b feature/...` commands in coder prompts, causing coders to commit on wrong branches; TaskExecutor then detected 0 changes on the infrastructure branch
 - Removed conflicting `coverlet.msbuild` 6.0.2 package (conflicted with `coverlet.collector` 8.0.0)
 
+## Removed
+- WORKER_ROLE env var, workers are now always generic.
+- Update xunit nuget package to xunit.v3.
+
 ## [0.8] — Doc Writer Role
 
 ### Added

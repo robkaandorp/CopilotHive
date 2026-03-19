@@ -110,7 +110,6 @@ fi
 
 # --- Start CopilotHive Worker client (connects to orchestrator) ---
 ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-}"
-WORKER_ROLE="${WORKER_ROLE:-}"
 
 if [[ -n "${ORCHESTRATOR_URL}" ]]; then
     echo "[entrypoint] Waiting for Copilot to be ready on port ${COPILOT_PORT}..."
@@ -126,7 +125,7 @@ if [[ -n "${ORCHESTRATOR_URL}" ]]; then
         sleep 1
     done
 
-    WORKER_MODE="${WORKER_ROLE:-generic}"
+    WORKER_MODE="generic"
     echo "[entrypoint] Starting CopilotHive Worker (mode=${WORKER_MODE}, orchestrator=${ORCHESTRATOR_URL})"
     /opt/worker/CopilotHive.Worker &
     WORKER_PID=$!

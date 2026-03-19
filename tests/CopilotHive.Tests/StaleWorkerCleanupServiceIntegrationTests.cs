@@ -35,10 +35,10 @@ public sealed class StaleWorkerCleanupServiceIntegrationTests
         var now = DateTime.UtcNow;
 
         // Register workers with different heartbeat times
-        var staleWorker = pool.RegisterWorker("stale-worker", WorkerRole.Coder, []);
+        var staleWorker = pool.RegisterWorker("stale-worker", []);
         staleWorker.LastHeartbeat = now.AddMinutes(-5); // 5 minutes old = stale
 
-        var freshWorker = pool.RegisterWorker("fresh-worker", WorkerRole.Reviewer, []);
+        var freshWorker = pool.RegisterWorker("fresh-worker", []);
         freshWorker.LastHeartbeat = now.AddSeconds(-30); // 30 seconds old = fresh
 
         var svc = CreateService(pool);
@@ -62,10 +62,10 @@ public sealed class StaleWorkerCleanupServiceIntegrationTests
         var loggerMock = new Mock<ILogger<StaleWorkerCleanupService>>();
 
         var now = DateTime.UtcNow;
-        var w1 = pool.RegisterWorker("worker-1", WorkerRole.Coder, []);
+        var w1 = pool.RegisterWorker("worker-1", []);
         w1.LastHeartbeat = now.AddMinutes(-5);
 
-        var w2 = pool.RegisterWorker("worker-2", WorkerRole.Reviewer, []);
+        var w2 = pool.RegisterWorker("worker-2", []);
         w2.LastHeartbeat = now.AddMinutes(-3);
 
         var svc = CreateService(pool, loggerMock.Object);
@@ -103,8 +103,8 @@ public sealed class StaleWorkerCleanupServiceIntegrationTests
         var loggerMock = new Mock<ILogger<StaleWorkerCleanupService>>();
 
         var now = DateTime.UtcNow;
-        pool.RegisterWorker("worker-1", WorkerRole.Coder, []);
-        pool.RegisterWorker("worker-2", WorkerRole.Reviewer, []);
+        pool.RegisterWorker("worker-1", []);
+        pool.RegisterWorker("worker-2", []);
         // Both workers have recent heartbeats (default)
 
         var svc = CreateService(pool, loggerMock.Object);

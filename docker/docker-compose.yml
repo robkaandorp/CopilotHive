@@ -42,7 +42,7 @@ services:
       orchestrator:
         condition: service_healthy
     deploy:
-      replicas: ${WORKER_REPLICAS:-4}
+      replicas: ${WORKER_REPLICAS:-1}
     networks:
       - hive
 

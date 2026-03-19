@@ -6,6 +6,12 @@
     <File Path="Directory.Build.props" />
     <File Path="README.md" />
   </Folder>
+  <Folder Name="/Misc/Docker/">
+    <File Path="docker/.env" />
+    <File Path="docker/.env.example" />
+    <File Path="docker/docker-compose.yml" />
+    <File Path="docker/README.md" />
+  </Folder>
   <Folder Name="/src/">
     <Project Path="src/CopilotHive.Shared/CopilotHive.Shared.csproj" />
     <Project Path="src/CopilotHive.Worker/CopilotHive.Worker.csproj" />

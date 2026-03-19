@@ -28,7 +28,6 @@ public sealed class ConnectedWorkerTests
 
         Assert.False(worker.IsBusy);
         Assert.Null(worker.CurrentTaskId);
-        Assert.False(worker.IsGeneric);
         Assert.True(worker.LastHeartbeat >= before);
     }
 

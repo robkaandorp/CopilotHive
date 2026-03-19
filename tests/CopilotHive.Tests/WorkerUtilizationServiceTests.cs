@@ -13,9 +13,9 @@ public class WorkerUtilizationServiceTests
 {
     private static WorkerPool CreatePool() => new WorkerPool();
 
-    private static ConnectedWorker MakeWorker(WorkerPool pool, string id, WorkerRole role, bool busy)
+    private static ConnectedWorker MakeWorker(WorkerPool pool, string id, bool busy)
     {
-        var w = pool.RegisterWorker(id, role, []);
+        var w = pool.RegisterWorker(id, []);
         if (busy) pool.MarkBusy(id, "task-" + id);
         return w;
     }
@@ -37,10 +37,10 @@ public class WorkerUtilizationServiceTests
     public void GetUtilization_SomeBusy_ReturnsCorrectFraction()
     {
         var pool = CreatePool();
-        MakeWorker(pool, "w1", WorkerRole.Coder, busy: true);
-        MakeWorker(pool, "w2", WorkerRole.Coder, busy: true);
-        MakeWorker(pool, "w3", WorkerRole.Coder, busy: false);
-        MakeWorker(pool, "w4", WorkerRole.Coder, busy: false);
+        MakeWorker(pool, "w1", busy: true);
+        MakeWorker(pool, "w2", busy: true);
+        MakeWorker(pool, "w3", busy: false);
+        MakeWorker(pool, "w4", busy: false);
         var svc = new WorkerUtilizationService(pool);
 
         var result = svc.GetUtilization();
@@ -52,8 +52,8 @@ public class WorkerUtilizationServiceTests
     public void GetUtilization_AllBusy_ReturnsOne()
     {
         var pool = CreatePool();
-        MakeWorker(pool, "w1", WorkerRole.Tester, busy: true);
-        MakeWorker(pool, "w2", WorkerRole.Tester, busy: true);
+        MakeWorker(pool, "w1", busy: true);
+        MakeWorker(pool, "w2", busy: true);
         var svc = new WorkerUtilizationService(pool);
 
         var result = svc.GetUtilization();
@@ -65,16 +65,17 @@ public class WorkerUtilizationServiceTests
     public void GetUtilization_RoleBreakdown_IsAccurate()
     {
         var pool = CreatePool();
-        MakeWorker(pool, "c1", WorkerRole.Coder, busy: true);
-        MakeWorker(pool, "c2", WorkerRole.Coder, busy: false);
-        MakeWorker(pool, "t1", WorkerRole.Tester, busy: true);
-        MakeWorker(pool, "t2", WorkerRole.Tester, busy: true);
+        MakeWorker(pool, "c1", busy: true);
+        MakeWorker(pool, "c2", busy: false);
+        MakeWorker(pool, "t1", busy: true);
+        MakeWorker(pool, "t2", busy: true);
         var svc = new WorkerUtilizationService(pool);
 
         var result = svc.GetUtilization();
 
-        Assert.Equal(0.5, result.RoleBreakdown["Coder"]);
-        Assert.Equal(1.0, result.RoleBreakdown["Tester"]);
+        // All workers are Unspecified — 3 of 4 busy = 0.75
+        Assert.Single(result.RoleBreakdown);
+        Assert.Equal(0.75, result.RoleBreakdown["Unspecified"]);
     }
 
     [Fact]
@@ -83,13 +84,13 @@ public class WorkerUtilizationServiceTests
         var pool = CreatePool();
         // 9 of 10 busy → 0.9 > 0.8
         for (int i = 0; i < 9; i++)
-            MakeWorker(pool, $"c{i}", WorkerRole.Coder, busy: true);
-        MakeWorker(pool, "c9", WorkerRole.Coder, busy: false);
+            MakeWorker(pool, $"c{i}", busy: true);
+        MakeWorker(pool, "c9", busy: false);
         var svc = new WorkerUtilizationService(pool);
 
         var result = svc.GetUtilization();
 
-        Assert.Contains("Coder", result.BottleneckRoles);
+        Assert.Contains("Unspecified", result.BottleneckRoles);
     }
 
     [Fact]
@@ -98,14 +99,14 @@ public class WorkerUtilizationServiceTests
         var pool = CreatePool();
         // 4 of 5 busy → exactly 0.8 (not > 0.8)
         for (int i = 0; i < 4; i++)
-            MakeWorker(pool, $"r{i}", WorkerRole.Reviewer, busy: true);
-        MakeWorker(pool, "r4", WorkerRole.Reviewer, busy: false);
+            MakeWorker(pool, $"r{i}", busy: true);
+        MakeWorker(pool, "r4", busy: false);
         var svc = new WorkerUtilizationService(pool);
 
         var result = svc.GetUtilization();
 
-        Assert.DoesNotContain("Reviewer", result.BottleneckRoles);
-        Assert.Equal(0.8, result.RoleBreakdown["Reviewer"]);
+        Assert.DoesNotContain("Unspecified", result.BottleneckRoles);
+        Assert.Equal(0.8, result.RoleBreakdown["Unspecified"]);
     }
 }
 

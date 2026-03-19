@@ -20,10 +20,6 @@ public sealed class WorkerPoolStatsDto
     [JsonPropertyName("busy_workers")]
     public required int BusyWorkers { get; init; }
 
-    /// <summary>Number of generic (unspecified-role) workers.</summary>
-    [JsonPropertyName("generic_workers")]
-    public required int GenericWorkers { get; init; }
-
     /// <summary>Per-worker details.</summary>
     [JsonPropertyName("workers")]
     public required List<WorkerInfoDto> Workers { get; init; }

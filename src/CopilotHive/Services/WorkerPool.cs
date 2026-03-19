@@ -30,17 +30,15 @@ public sealed class WorkerPool : IWorkerPool
     /// Throws if a worker with the same ID is already registered.
     /// </summary>
     /// <param name="id">Unique identifier for the worker.</param>
-    /// <param name="role">Role of the worker.</param>
     /// <param name="capabilities">Capabilities advertised by the worker.</param>
     /// <returns>The newly created <see cref="ConnectedWorker"/>.</returns>
-    public ConnectedWorker RegisterWorker(string id, WorkerRole role, string[] capabilities)
+    public ConnectedWorker RegisterWorker(string id, string[] capabilities)
     {
         var worker = new ConnectedWorker
         {
             Id = id,
-            Role = role,
+            Role = WorkerRole.Unspecified,
             Capabilities = capabilities,
-            IsGeneric = role == WorkerRole.Unspecified,
         };
 
         if (!_workers.TryAdd(id, worker))
@@ -64,27 +62,18 @@ public sealed class WorkerPool : IWorkerPool
     }
 
     /// <summary>
-    /// Returns the first idle worker matching the specified role. Falls back to any idle
-    /// generic (unspecified) worker when no exact role match is available.
+    /// Returns the first idle worker. All workers are generic and accept any role.
     /// </summary>
-    /// <param name="role">The preferred worker role.</param>
     /// <returns>An idle <see cref="ConnectedWorker"/>, or <c>null</c>.</returns>
-    public ConnectedWorker? GetIdleWorker(WorkerRole role)
+    public ConnectedWorker? GetIdleWorker()
     {
-        ConnectedWorker? genericFallback = null;
         foreach (var kvp in _workers)
         {
-            var w = kvp.Value;
-            if (w.IsBusy) continue;
-
-            if (w.Role == role)
-                return w;
-
-            if (w.Role == WorkerRole.Unspecified && genericFallback is null)
-                genericFallback = w;
+            if (!kvp.Value.IsBusy)
+                return kvp.Value;
         }
 
-        return genericFallback;
+        return null;
     }
 
     /// <summary>Returns a read-only snapshot of all currently registered workers.</summary>
@@ -133,8 +122,7 @@ public sealed class WorkerPool : IWorkerPool
         {
             worker.IsBusy = false;
             worker.CurrentTaskId = null;
-            if (worker.IsGeneric)
-                worker.Role = WorkerRole.Unspecified;
+            worker.Role = WorkerRole.Unspecified;
         }
     }
 
@@ -183,13 +171,11 @@ public sealed class WorkerPool : IWorkerPool
             TotalWorkers = workers.Count,
             IdleWorkers = workers.Count(w => !w.IsBusy),
             BusyWorkers = workers.Count(w => w.IsBusy),
-            GenericWorkers = workers.Count(w => w.IsGeneric),
             Workers = workers.Select(w => new WorkerInfoDto
             {
                 Id = w.Id,
                 Role = w.Role == WorkerRole.Unspecified ? null : w.Role.ToString(),
                 IsBusy = w.IsBusy,
-                IsGeneric = w.IsGeneric,
                 CurrentTaskId = w.CurrentTaskId,
             }).ToList(),
         };
