@@ -5,6 +5,7 @@ using System.ComponentModel;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using CopilotHive.Shared;
@@ -95,7 +96,7 @@ public sealed class SharpCoderRunner : IAgentRunner
 
     private IChatClient CreateChatClient(string? modelOverride = null)
     {
-        var provider = Environment.GetEnvironmentVariable("LLM_PROVIDER")?.ToLowerInvariant() ?? "github";
+        var provider = Environment.GetEnvironmentVariable("LLM_PROVIDER")?.ToLowerInvariant() ?? "copilot";
 
         if (provider == "ollama-cloud")
         {
@@ -118,13 +119,13 @@ public sealed class SharpCoderRunner : IAgentRunner
             ollamaClient.SelectedModel = model;
             return ollamaClient;
         }
-        else // default to github
+        else if (provider == "github")
         {
             var token = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
             if (string.IsNullOrEmpty(token)) throw new Exception("GH_TOKEN or GITHUB_TOKEN is required for github provider");
 
-            var model = modelOverride ?? Environment.GetEnvironmentVariable("GITHUB_MODEL") ?? "gpt-4o";
-            
+            var model = modelOverride ?? Environment.GetEnvironmentVariable("GITHUB_MODEL") ?? "openai/gpt-4.1";
+
             var openAiClient = new OpenAIClient(
                 new ApiKeyCredential(token),
                 new OpenAIClientOptions { Endpoint = new Uri("https://models.github.ai") }
@@ -132,6 +133,47 @@ public sealed class SharpCoderRunner : IAgentRunner
 
             return openAiClient.GetChatClient(model).AsIChatClient();
         }
+        else // default to copilot
+        {
+            var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+            if (string.IsNullOrEmpty(ghToken)) throw new Exception("GH_TOKEN or GITHUB_TOKEN is required for copilot provider");
+
+            var model = modelOverride ?? Environment.GetEnvironmentVariable("COPILOT_MODEL") ?? "claude-sonnet-4.6";
+            var copilotToken = ExchangeForCopilotToken(ghToken);
+
+            _log.Info($"Copilot token obtained, using model: {model}");
+
+            var openAiClient = new OpenAIClient(
+                new ApiKeyCredential(copilotToken),
+                new OpenAIClientOptions { Endpoint = new Uri("https://api.githubcopilot.com") }
+            );
+
+            return openAiClient.GetChatClient(model).AsIChatClient();
+        }
+    }
+
+    private string ExchangeForCopilotToken(string ghToken)
+    {
+        using var httpClient = new HttpClient();
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("token", ghToken);
+        httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        httpClient.DefaultRequestHeaders.Add("editor-version", "vscode/1.95.0");
+        httpClient.DefaultRequestHeaders.Add("editor-plugin-version", "copilot/1.0.0");
+        httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("GithubCopilot/1.0.0");
+
+        var response = httpClient.GetAsync("https://api.github.com/copilot_internal/v2/token").Result;
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = response.Content.ReadAsStringAsync().Result;
+            throw new Exception($"Copilot token exchange failed ({response.StatusCode}): {body}");
+        }
+
+        var json = response.Content.ReadAsStringAsync().Result;
+        using var doc = JsonDocument.Parse(json);
+        var token = doc.RootElement.GetProperty("token").GetString()
+            ?? throw new Exception("Copilot token response missing 'token' field");
+
+        return token;
     }
 
     private IList<AITool> BuildCustomTools()
