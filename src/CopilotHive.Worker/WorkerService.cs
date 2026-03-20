@@ -26,6 +26,10 @@ public sealed class WorkerService(
     // Pending tool calls awaiting orchestrator responses, keyed by request_id
     private readonly ConcurrentDictionary<string, TaskCompletionSource<ToolCallResponse>> _pendingToolCalls = new();
 
+    // Current task state — read by heartbeat, written by message loop
+    private volatile string? _currentTaskId;
+    private volatile string? _currentRole;
+
     // The gRPC stream reference, set during WorkStream processing
     private AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>? _stream;
     private string? _assignedId;
@@ -116,6 +120,10 @@ public sealed class WorkerService(
                     var domainTask = GrpcMapper.ToDomain(assignment);
                     _log.Info($"Received task {domainTask.TaskId}: {domainTask.GoalDescription}");
 
+                    // Mark busy before async execution so heartbeats reflect the real state
+                    _currentTaskId = domainTask.TaskId;
+                    _currentRole = domainTask.Role.ToRoleName();
+
                     // Reset Copilot session with per-task model (if specified by orchestrator)
                     var taskModel = string.IsNullOrEmpty(domainTask.Model) ? null : domainTask.Model;
                     _log.Info($"Task model from orchestrator: '{domainTask.Model}' → resolved: '{taskModel ?? "(SDK default)"}'");
@@ -138,13 +146,19 @@ public sealed class WorkerService(
                             }, ct);
 
                             _log.Info($"Task {domainTask.TaskId} completed ({result.Status})");
-                            await SendWorkerReady(stream, assignedId, ct);
                         }
                         catch (OperationCanceledException) { }
                         catch (Exception ex)
                         {
                             _log.Error($"Task execution failed: {ex.Message}");
                         }
+                        finally
+                        {
+                            _currentTaskId = null;
+                            _currentRole = null;
+                        }
+
+                        await SendWorkerReady(stream, assignedId, ct);
                     }, ct);
                     break;
 
@@ -156,6 +170,8 @@ public sealed class WorkerService(
                     {
                         try { await activeTask; } catch (OperationCanceledException) { }
                     }
+                    _currentTaskId = null;
+                    _currentRole = null;
                     await SendWorkerReady(stream, assignedId, ct);
                     break;
 
@@ -252,7 +268,7 @@ public sealed class WorkerService(
         }, ct);
     }
 
-    private static async Task RunHeartbeatAsync(
+    private async Task RunHeartbeatAsync(
         HiveOrchestrator.HiveOrchestratorClient client,
         string assignedId,
         CancellationToken ct)
@@ -263,10 +279,13 @@ public sealed class WorkerService(
         {
             try
             {
+                var taskId = _currentTaskId;
                 await client.HeartbeatAsync(new HeartbeatRequest
                 {
                     WorkerId = assignedId,
-                    Busy = false,
+                    Busy = taskId is not null,
+                    CurrentTaskId = taskId ?? "",
+                    CurrentRole = _currentRole ?? "",
                 }, cancellationToken: ct);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)

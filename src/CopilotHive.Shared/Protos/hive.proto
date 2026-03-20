@@ -165,6 +165,7 @@ message HeartbeatRequest {
   reserved 2;                 // Removed: fixed WorkerRole (all workers are now generic)
   bool busy = 3;
   string current_task_id = 4;     // Empty if idle
+  string current_role = 5;        // Current assigned role name (e.g. "coder"), empty if idle
 }
 
 message HeartbeatResponse {
