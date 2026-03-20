@@ -5,7 +5,6 @@ using System.ComponentModel;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using CopilotHive.Shared;
@@ -139,41 +138,18 @@ public sealed class SharpCoderRunner : IAgentRunner
             if (string.IsNullOrEmpty(ghToken)) throw new Exception("GH_TOKEN or GITHUB_TOKEN is required for copilot provider");
 
             var model = modelOverride ?? Environment.GetEnvironmentVariable("COPILOT_MODEL") ?? "claude-sonnet-4.6";
-            var copilotToken = ExchangeForCopilotToken(ghToken);
 
-            _log.Info($"Copilot token obtained, using model: {model}");
+            // The GH_TOKEN (gho_ OAuth token from Copilot CLI auth) works directly
+            // as an API key with api.githubcopilot.com — no token exchange needed.
+            _log.Info($"Using Copilot API with model: {model}");
 
             var openAiClient = new OpenAIClient(
-                new ApiKeyCredential(copilotToken),
+                new ApiKeyCredential(ghToken),
                 new OpenAIClientOptions { Endpoint = new Uri("https://api.githubcopilot.com") }
             );
 
             return openAiClient.GetChatClient(model).AsIChatClient();
         }
-    }
-
-    private string ExchangeForCopilotToken(string ghToken)
-    {
-        using var httpClient = new HttpClient();
-        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("token", ghToken);
-        httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        httpClient.DefaultRequestHeaders.Add("editor-version", "vscode/1.95.0");
-        httpClient.DefaultRequestHeaders.Add("editor-plugin-version", "copilot/1.0.0");
-        httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("GithubCopilot/1.0.0");
-
-        var response = httpClient.GetAsync("https://api.github.com/copilot_internal/v2/token").Result;
-        if (!response.IsSuccessStatusCode)
-        {
-            var body = response.Content.ReadAsStringAsync().Result;
-            throw new Exception($"Copilot token exchange failed ({response.StatusCode}): {body}");
-        }
-
-        var json = response.Content.ReadAsStringAsync().Result;
-        using var doc = JsonDocument.Parse(json);
-        var token = doc.RootElement.GetProperty("token").GetString()
-            ?? throw new Exception("Copilot token response missing 'token' field");
-
-        return token;
     }
 
     private IList<AITool> BuildCustomTools()
