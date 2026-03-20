@@ -21,7 +21,6 @@ public sealed class SharpCoderRunner : IAgentRunner
 {
     private readonly WorkerLogger _log = new("SharpCoder");
     private IChatClient? _chatClient;
-    private string? _currentModel;
 
     private IToolCallBridge? _toolBridge;
     private string? _currentTaskId;
@@ -56,16 +55,8 @@ public sealed class SharpCoderRunner : IAgentRunner
     public Task ResetSessionAsync(string? model = null, CancellationToken ct = default)
     {
         _log.Info($"Resetting session. Requested model: {model ?? "default"}");
-        if (!string.IsNullOrEmpty(model))
-        {
-            _currentModel = model;
-            _chatClient = CreateChatClient(model);
-        }
-        else
-        {
-            _chatClient ??= CreateChatClient();
-        }
-
+        _chatClient?.Dispose();
+        _chatClient = CreateChatClient(model);
         return Task.CompletedTask;
     }
 
