@@ -13,6 +13,7 @@ using Microsoft.Extensions.AI;
 using OpenAI;
 using System.ClientModel;
 using SharpCoder;
+using OllamaSharp;
 
 namespace CopilotHive.Worker;
 
@@ -114,13 +115,17 @@ public sealed class SharpCoderRunner : IAgentRunner
             httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
 
             var model = modelOverride ?? Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "gpt-oss:120b";
-            return new OllamaChatClient(new Uri("https://ollama.com"), model, httpClient);
+            var ollamaClient = new OllamaApiClient(httpClient);
+            ollamaClient.SelectedModel = model;
+            return ollamaClient;
         }
         else if (provider == "ollama-local")
         {
             var url = Environment.GetEnvironmentVariable("OLLAMA_URL") ?? "http://localhost:11434";
             var model = modelOverride ?? Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "llama3";
-            return new OllamaChatClient(new Uri(url), model);
+            var ollamaClient = new OllamaApiClient(new Uri(url));
+            ollamaClient.SelectedModel = model;
+            return ollamaClient;
         }
         else // default to github
         {
@@ -134,7 +139,7 @@ public sealed class SharpCoderRunner : IAgentRunner
                 new OpenAIClientOptions { Endpoint = new Uri("https://models.inference.ai.azure.com") }
             );
 
-            return openAiClient.AsChatClient(model);
+            return openAiClient.GetChatClient(model).AsIChatClient();
         }
     }
 
