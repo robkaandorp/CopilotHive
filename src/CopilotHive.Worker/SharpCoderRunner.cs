@@ -79,6 +79,17 @@ public sealed class SharpCoderRunner : IAgentRunner
         var agent = new CodingAgent(_chatClient, options);
         var result = await agent.ExecuteAsync(prompt, ct);
 
+        _log.Info($"AgentResult: status={result.Status}, toolCalls={result.ToolCallCount}, model={result.ModelId}, finish={result.FinishReason}");
+        if (result.Messages != null)
+        {
+            _log.Info($"AgentResult: {result.Messages.Count} messages total");
+            foreach (var msg in result.Messages)
+            {
+                var textPreview = msg.Text?.Length > 200 ? msg.Text.Substring(0, 200) + "..." : msg.Text;
+                _log.Info($"  [{msg.Role}] {textPreview}");
+            }
+        }
+
         if (result.Status != "Success")
         {
             _log.Error($"Agent finished with non-success status: {result.Status} - {result.Message}");
