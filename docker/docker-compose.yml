@@ -38,6 +38,13 @@ services:
       - COPILOT_ALLOW_ALL=true
       - COPILOT_AUTO_UPDATE=true
       - CONFIG_REPO_URL=https://github.com/robkaandorp/CopilotHive-Config.git
+      - RUNNER_TYPE=${RUNNER_TYPE:-copilotcli}
+      - LLM_PROVIDER=${LLM_PROVIDER:-github}
+      - GITHUB_TOKEN
+      - OLLAMA_API_KEY
+      - OLLAMA_URL
+      - OLLAMA_MODEL
+      - GITHUB_MODEL
     depends_on:
       orchestrator:
         condition: service_healthy

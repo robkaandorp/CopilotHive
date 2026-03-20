@@ -20,8 +20,18 @@ public sealed class WorkerService(
 {
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(30);
 
-    private readonly IAgentRunner _agentRunner = new CopilotCliRunner(copilotPort);
+    private readonly IAgentRunner _agentRunner = CreateAgentRunner(copilotPort);
     private readonly WorkerLogger _log = new("Worker");
+
+    private static IAgentRunner CreateAgentRunner(int copilotPort)
+    {
+        var runnerType = Environment.GetEnvironmentVariable("RUNNER_TYPE")?.ToLowerInvariant();
+        if (runnerType == "sharpcoder")
+        {
+            return new SharpCoderRunner();
+        }
+        return new CopilotCliRunner(copilotPort);
+    }
 
     // Pending tool calls awaiting orchestrator responses, keyed by request_id
     private readonly ConcurrentDictionary<string, TaskCompletionSource<ToolCallResponse>> _pendingToolCalls = new();
