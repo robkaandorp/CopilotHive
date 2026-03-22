@@ -5,6 +5,8 @@ using System.ComponentModel;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
 using CopilotHive.Shared;
@@ -150,16 +152,81 @@ public sealed class SharpCoderRunner : IAgentRunner
 
             var model = modelOverride ?? Environment.GetEnvironmentVariable("COPILOT_MODEL") ?? "claude-sonnet-4.6";
 
-            // The GH_TOKEN (gho_ OAuth token from Copilot CLI auth) works directly
-            // as an API key with api.githubcopilot.com — no token exchange needed.
             _log.Info($"Using Copilot API with model: {model}");
+
+            // The Copilot API returns tool_calls in a separate choice from text content.
+            // The OpenAI SDK only reads choices[0], so we merge them before parsing.
+            var handler = new CopilotChoiceMergingHandler(new HttpClientHandler());
+            var httpClient = new HttpClient(handler);
 
             var openAiClient = new OpenAIClient(
                 new ApiKeyCredential(ghToken),
-                new OpenAIClientOptions { Endpoint = new Uri("https://api.githubcopilot.com") }
+                new OpenAIClientOptions
+                {
+                    Endpoint = new Uri("https://api.githubcopilot.com"),
+                    Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient)
+                }
             );
 
             return openAiClient.GetChatClient(model).AsIChatClient();
+        }
+    }
+
+    /// <summary>
+    /// The GitHub Copilot API splits tool_calls and text content into separate choices.
+    /// The OpenAI SDK only reads choices[0], losing the tool_calls. This handler
+    /// merges all choices into a single choice so the SDK sees both text and tool_calls.
+    /// </summary>
+    private sealed class CopilotChoiceMergingHandler : DelegatingHandler
+    {
+        public CopilotChoiceMergingHandler(HttpMessageHandler inner) : base(inner) { }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken ct)
+        {
+            var response = await base.SendAsync(request, ct);
+            if (!response.IsSuccessStatusCode) return response;
+
+            var body = await response.Content.ReadAsStringAsync();
+            var json = JsonNode.Parse(body);
+            var choices = json?["choices"]?.AsArray();
+
+            if (choices == null || choices.Count <= 1) return ReplaceContent(response, body);
+
+            // Merge: take the choice with tool_calls, add text from the other
+            JsonObject? toolChoice = null;
+            string? textContent = null;
+
+            foreach (var c in choices)
+            {
+                var msg = c?["message"];
+                if (msg?["tool_calls"] != null)
+                    toolChoice = c!.AsObject();
+                else if (msg?["content"]?.GetValue<string>() is { Length: > 0 } text)
+                    textContent = text;
+            }
+
+            if (toolChoice != null)
+            {
+                // Add text content to the tool_calls choice if present
+                if (textContent != null && toolChoice["message"] is JsonObject merged)
+                {
+                    merged["content"] = textContent;
+                }
+
+                // Detach from parent array before adding to new one
+                toolChoice.Parent?.AsArray().Remove(toolChoice);
+                json!["choices"] = new JsonArray(toolChoice);
+                body = json.ToJsonString();
+            }
+
+            return ReplaceContent(response, body);
+        }
+
+        private static HttpResponseMessage ReplaceContent(HttpResponseMessage response, string body)
+        {
+            response.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+            return response;
         }
     }
 
