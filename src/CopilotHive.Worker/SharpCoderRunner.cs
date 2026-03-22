@@ -1,4 +1,5 @@
 #pragma warning disable CS1591
+#pragma warning disable OPENAI001 // ResponsesClient.AsIChatClient is experimental
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -13,6 +14,7 @@ using CopilotHive.Shared;
 using CopilotHive.Workers;
 using Microsoft.Extensions.AI;
 using OpenAI;
+using OpenAI.Responses;
 using System.ClientModel;
 using SharpCoder;
 using OllamaSharp;
@@ -154,22 +156,53 @@ public sealed class SharpCoderRunner : IAgentRunner
 
             _log.Info($"Using Copilot API with model: {model}");
 
-            // The Copilot API returns tool_calls in a separate choice from text content.
-            // The OpenAI SDK only reads choices[0], so we merge them before parsing.
-            var handler = new CopilotChoiceMergingHandler(new HttpClientHandler());
-            var httpClient = new HttpClient(handler);
+            if (RequiresResponsesEndpoint(model))
+            {
+                // Models like gpt-5.4 use the /responses endpoint.
+                // The Copilot API doesn't support previous_response_id, so we
+                // inline the previous response's output into follow-up requests.
+                var handler = new CopilotResponsesHandler(new HttpClientHandler());
+                var httpClient = new HttpClient(handler);
 
-            var openAiClient = new OpenAIClient(
-                new ApiKeyCredential(ghToken),
-                new OpenAIClientOptions
-                {
-                    Endpoint = new Uri("https://api.githubcopilot.com"),
-                    Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient)
-                }
-            );
+                var openAiClient = new OpenAIClient(
+                    new ApiKeyCredential(ghToken),
+                    new OpenAIClientOptions
+                    {
+                        Endpoint = new Uri("https://api.githubcopilot.com"),
+                        Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient)
+                    }
+                );
+                return openAiClient.GetResponsesClient().AsIChatClient(model);
+            }
+            else
+            {
+                // Claude and older GPT models use /chat/completions
+                // The Copilot API returns tool_calls in a separate choice from text content.
+                // The OpenAI SDK only reads choices[0], so we merge them before parsing.
+                var handler = new CopilotChoiceMergingHandler(new HttpClientHandler());
+                var httpClient = new HttpClient(handler);
 
-            return openAiClient.GetChatClient(model).AsIChatClient();
+                var openAiClient = new OpenAIClient(
+                    new ApiKeyCredential(ghToken),
+                    new OpenAIClientOptions
+                    {
+                        Endpoint = new Uri("https://api.githubcopilot.com"),
+                        Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient)
+                    }
+                );
+                return openAiClient.GetChatClient(model).AsIChatClient();
+            }
         }
+    }
+
+    /// <summary>
+    /// Models that must use the /responses endpoint instead of /chat/completions.
+    /// </summary>
+    private static bool RequiresResponsesEndpoint(string model)
+    {
+        return model.StartsWith("gpt-5", StringComparison.OrdinalIgnoreCase)
+            || model.StartsWith("o3", StringComparison.OrdinalIgnoreCase)
+            || model.StartsWith("o4", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -226,6 +259,59 @@ public sealed class SharpCoderRunner : IAgentRunner
         private static HttpResponseMessage ReplaceContent(HttpResponseMessage response, string body)
         {
             response.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+            return response;
+        }
+    }
+
+    /// <summary>
+    /// The Copilot API doesn't support previous_response_id on the /responses endpoint.
+    /// When the SDK sends a follow-up request referencing a previous response, this handler
+    /// inlines the previous response's output (tool calls) into the input array so the API
+    /// has full conversation context without needing server-side state.
+    /// </summary>
+    private sealed class CopilotResponsesHandler : DelegatingHandler
+    {
+        private JsonNode? _lastResponseOutput;
+
+        public CopilotResponsesHandler(HttpMessageHandler inner) : base(inner) { }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken ct)
+        {
+            if (request.Content != null && request.RequestUri?.AbsolutePath?.Contains("responses") == true)
+            {
+                var body = await request.Content.ReadAsStringAsync();
+                var json = JsonNode.Parse(body);
+
+                if (json is JsonObject obj && obj.ContainsKey("previous_response_id"))
+                {
+                    obj.Remove("previous_response_id");
+
+                    if (_lastResponseOutput is JsonArray prevOutput && obj["input"] is JsonArray input)
+                    {
+                        var combined = new JsonArray();
+                        foreach (var item in prevOutput)
+                            combined.Add(item!.DeepClone());
+                        foreach (var item in input)
+                            combined.Add(item!.DeepClone());
+                        obj["input"] = combined;
+                    }
+
+                    body = obj.ToJsonString();
+                    request.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+                }
+            }
+
+            var response = await base.SendAsync(request, ct);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var respBody = await response.Content.ReadAsStringAsync();
+                var respJson = JsonNode.Parse(respBody);
+                _lastResponseOutput = respJson?["output"]?.DeepClone();
+                response.Content = new StringContent(respBody, System.Text.Encoding.UTF8, "application/json");
+            }
+
             return response;
         }
     }
