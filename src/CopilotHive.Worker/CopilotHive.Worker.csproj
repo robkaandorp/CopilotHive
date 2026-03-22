@@ -10,7 +10,7 @@
     <PackageReference Include="Google.Protobuf" Version="3.34.0" />
     <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.4.1" />
     <PackageReference Include="OllamaSharp" Version="5.4.24" />
-    <PackageReference Include="SharpCoder" Version="0.2.0-alpha.5" />
+    <PackageReference Include="SharpCoder" Version="0.2.0-alpha.6" />
   </ItemGroup>
 
   <ItemGroup>
