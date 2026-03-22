@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `WorkerLoggerTests` — xUnit test suite with 14 [Fact] tests covering `WorkerLogger.Info`, `Error`, `Debug`, and `LogBlock` output format; tests verify standard messages, empty messages, special character preservation, stdout/stderr routing, verbose mode behavior, and log block truncation logic
+- `WorkerLoggerTests` — xUnit test suite with 22 [Fact] tests covering `WorkerLogger.Info`, `Error`, `Debug`, and `LogBlock` output format; tests verify standard messages, empty messages, special character preservation, stdout/stderr routing, verbose mode behavior, log block truncation logic, and cross-method stream isolation
 - `GrpcMapperTests` — comprehensive xUnit test suite with 27 tests (21 [Fact] + 6 [Theory]) covering:
   - WorkTask and TaskResult round-trip conversions (domain → gRPC → domain) preserving all fields
   - Null/empty handling for BranchSpec, TaskMetrics, GitChangeSummary, repositories, and metadata
