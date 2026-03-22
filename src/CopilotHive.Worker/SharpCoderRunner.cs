@@ -110,88 +110,126 @@ public sealed class SharpCoderRunner : IAgentRunner
 
     private IChatClient CreateChatClient(string? modelOverride = null)
     {
-        var provider = Environment.GetEnvironmentVariable("LLM_PROVIDER")?.ToLowerInvariant() ?? "copilot";
+        // Model override can include a provider prefix: "copilot/claude-sonnet-4.6"
+        var (provider, model) = ParseProviderAndModel(modelOverride);
 
-        if (provider == "ollama-cloud")
+        _log.Info($"Creating chat client: provider={provider}, model={model ?? "default"}");
+
+        switch (provider)
         {
-            var apiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
-            if (string.IsNullOrEmpty(apiKey)) throw new Exception("OLLAMA_API_KEY is required for ollama-cloud");
-
-            var httpClient = new HttpClient { BaseAddress = new Uri("https://ollama.com") };
-            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-
-            var model = modelOverride ?? Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "gpt-oss:120b";
-            var ollamaClient = new OllamaApiClient(httpClient);
-            ollamaClient.SelectedModel = model;
-            return ollamaClient;
-        }
-        else if (provider == "ollama-local")
-        {
-            var url = Environment.GetEnvironmentVariable("OLLAMA_URL") ?? "http://localhost:11434";
-            var model = modelOverride ?? Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "llama3";
-            var ollamaClient = new OllamaApiClient(new Uri(url));
-            ollamaClient.SelectedModel = model;
-            return ollamaClient;
-        }
-        else if (provider == "github")
-        {
-            var token = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
-            if (string.IsNullOrEmpty(token)) throw new Exception("GH_TOKEN or GITHUB_TOKEN is required for github provider");
-
-            var model = modelOverride ?? Environment.GetEnvironmentVariable("GITHUB_MODEL") ?? "openai/gpt-4.1";
-
-            var openAiClient = new OpenAIClient(
-                new ApiKeyCredential(token),
-                new OpenAIClientOptions { Endpoint = new Uri("https://models.github.ai") }
-            );
-
-            return openAiClient.GetChatClient(model).AsIChatClient();
-        }
-        else // default to copilot
-        {
-            var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
-            if (string.IsNullOrEmpty(ghToken)) throw new Exception("GH_TOKEN or GITHUB_TOKEN is required for copilot provider");
-
-            var model = modelOverride ?? Environment.GetEnvironmentVariable("COPILOT_MODEL") ?? "claude-sonnet-4.6";
-
-            _log.Info($"Using Copilot API with model: {model}");
-
-            if (RequiresResponsesEndpoint(model))
+            case "ollama-cloud":
             {
-                // Models like gpt-5.4 use the /responses endpoint.
-                // The Copilot API doesn't support previous_response_id, so we
-                // inline the previous response's output into follow-up requests.
-                var handler = new CopilotResponsesHandler(new HttpClientHandler());
-                var httpClient = new HttpClient(handler);
+                var apiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
+                if (string.IsNullOrEmpty(apiKey)) throw new Exception("OLLAMA_API_KEY is required for ollama-cloud");
 
-                var openAiClient = new OpenAIClient(
-                    new ApiKeyCredential(ghToken),
-                    new OpenAIClientOptions
-                    {
-                        Endpoint = new Uri("https://api.githubcopilot.com"),
-                        Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient)
-                    }
-                );
-                return openAiClient.GetResponsesClient().AsIChatClient(model);
+                var httpClient = new HttpClient { BaseAddress = new Uri("https://ollama.com") };
+                httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+
+                model ??= Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "gpt-oss:120b";
+                var ollamaClient = new OllamaApiClient(httpClient);
+                ollamaClient.SelectedModel = model;
+                return ollamaClient;
             }
-            else
+
+            case "ollama-local":
             {
-                // Claude and older GPT models use /chat/completions
-                // The Copilot API returns tool_calls in a separate choice from text content.
-                // The OpenAI SDK only reads choices[0], so we merge them before parsing.
-                var handler = new CopilotChoiceMergingHandler(new HttpClientHandler());
-                var httpClient = new HttpClient(handler);
+                var url = Environment.GetEnvironmentVariable("OLLAMA_URL") ?? "http://localhost:11434";
+                model ??= Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "llama3";
+                var ollamaClient = new OllamaApiClient(new Uri(url));
+                ollamaClient.SelectedModel = model;
+                return ollamaClient;
+            }
+
+            case "github":
+            {
+                var token = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+                if (string.IsNullOrEmpty(token)) throw new Exception("GH_TOKEN or GITHUB_TOKEN is required for github provider");
+
+                model ??= Environment.GetEnvironmentVariable("GITHUB_MODEL") ?? "openai/gpt-4.1";
 
                 var openAiClient = new OpenAIClient(
-                    new ApiKeyCredential(ghToken),
-                    new OpenAIClientOptions
-                    {
-                        Endpoint = new Uri("https://api.githubcopilot.com"),
-                        Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient)
-                    }
+                    new ApiKeyCredential(token),
+                    new OpenAIClientOptions { Endpoint = new Uri("https://models.github.ai") }
                 );
+
                 return openAiClient.GetChatClient(model).AsIChatClient();
             }
+
+            case "copilot":
+                return CreateCopilotClient(model ?? Environment.GetEnvironmentVariable("COPILOT_MODEL") ?? "claude-sonnet-4.6");
+
+            default:
+                throw new InvalidOperationException($"Unknown LLM provider: '{provider}'");
+        }
+    }
+
+    /// <summary>
+    /// Extracts an optional provider prefix from the model string.
+    /// "copilot/claude-sonnet-4.6" → ("copilot", "claude-sonnet-4.6")
+    /// "claude-sonnet-4.6" → (env LLM_PROVIDER, "claude-sonnet-4.6")
+    /// null → (env LLM_PROVIDER, null)
+    /// </summary>
+    private static (string provider, string? model) ParseProviderAndModel(string? modelOverride)
+    {
+        var defaultProvider = Environment.GetEnvironmentVariable("LLM_PROVIDER")?.ToLowerInvariant() ?? "copilot";
+
+        if (string.IsNullOrEmpty(modelOverride))
+            return (defaultProvider, null);
+
+        var slashIndex = modelOverride.IndexOf('/');
+        if (slashIndex <= 0)
+            return (defaultProvider, modelOverride);
+
+        var prefix = modelOverride.Substring(0, slashIndex).ToLowerInvariant();
+
+        // Only treat as provider prefix if it matches a known provider.
+        // This avoids misinterpreting model names like "openai/gpt-4.1".
+        if (prefix is "copilot" or "ollama-cloud" or "ollama-local" or "github")
+            return (prefix, modelOverride.Substring(slashIndex + 1));
+
+        return (defaultProvider, modelOverride);
+    }
+
+    private IChatClient CreateCopilotClient(string model)
+    {
+        var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+        if (string.IsNullOrEmpty(ghToken)) throw new Exception("GH_TOKEN or GITHUB_TOKEN is required for copilot provider");
+
+        if (RequiresResponsesEndpoint(model))
+        {
+            // Models like gpt-5.4 use the /responses endpoint.
+            // The Copilot API doesn't support previous_response_id, so we
+            // inline the previous response's output into follow-up requests.
+            var handler = new CopilotResponsesHandler(new HttpClientHandler());
+            var httpClient = new HttpClient(handler);
+
+            var openAiClient = new OpenAIClient(
+                new ApiKeyCredential(ghToken),
+                new OpenAIClientOptions
+                {
+                    Endpoint = new Uri("https://api.githubcopilot.com"),
+                    Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient)
+                }
+            );
+            return openAiClient.GetResponsesClient().AsIChatClient(model);
+        }
+        else
+        {
+            // Claude and older GPT models use /chat/completions
+            // The Copilot API returns tool_calls in a separate choice from text content.
+            // The OpenAI SDK only reads choices[0], so we merge them before parsing.
+            var handler = new CopilotChoiceMergingHandler(new HttpClientHandler());
+            var httpClient = new HttpClient(handler);
+
+            var openAiClient = new OpenAIClient(
+                new ApiKeyCredential(ghToken),
+                new OpenAIClientOptions
+                {
+                    Endpoint = new Uri("https://api.githubcopilot.com"),
+                    Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient)
+                }
+            );
+            return openAiClient.GetChatClient(model).AsIChatClient();
         }
     }
 
