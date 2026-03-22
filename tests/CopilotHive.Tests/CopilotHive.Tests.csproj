@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <IsPackable>false</IsPackable>
@@ -27,6 +27,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\CopilotHive\CopilotHive.csproj" />
     <ProjectReference Include="..\..\src\CopilotHive.Shared\CopilotHive.Shared.csproj" />
+    <ProjectReference Include="..\..\src\CopilotHive.Worker\CopilotHive.Worker.csproj" Aliases="WorkerAssembly" />
   </ItemGroup>
 
 </Project>
