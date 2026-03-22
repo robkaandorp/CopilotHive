@@ -165,7 +165,7 @@ public sealed class IterationMetricsTests
             Verdict = TaskVerdict.Pass,
             TestReportSummary = "All good",
             ReviewIssuesFound = 2,
-            ReviewVerdict = Workers.ReviewVerdict.Approve,
+            ReviewVerdict = ReviewVerdict.Approve,
             RetryCount = 1,
             ReviewRetryCount = 1,
             TestRetryCount = 0,
@@ -188,7 +188,7 @@ public sealed class IterationMetricsTests
         Assert.Equal(TaskVerdict.Pass, m.Verdict);
         Assert.Equal("All good", m.TestReportSummary);
         Assert.Equal(2, m.ReviewIssuesFound);
-        Assert.Equal(Workers.ReviewVerdict.Approve, m.ReviewVerdict);
+        Assert.Equal(ReviewVerdict.Approve, m.ReviewVerdict);
         Assert.Equal(1, m.RetryCount);
         Assert.Equal(1, m.ReviewRetryCount);
         Assert.Equal(0, m.TestRetryCount);
