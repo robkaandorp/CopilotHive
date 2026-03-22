@@ -201,7 +201,8 @@ public sealed class WorkerService(
                     }
                     else
                     {
-                        _log.Error($"Received ToolCallResponse for unknown request: {response.RequestId}");
+                        // Expected for fire-and-forget tools like report_progress
+                        _log.Debug($"Received ToolCallResponse for untracked request: {response.RequestId}");
                     }
                     break;
 
