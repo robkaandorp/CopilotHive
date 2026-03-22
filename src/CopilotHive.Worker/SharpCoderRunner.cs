@@ -73,7 +73,7 @@ public sealed class SharpCoderRunner : IAgentRunner
         var options = new AgentOptions
         {
             WorkDirectory = workDir,
-            MaxSteps = 30,
+            MaxSteps = 100,
             SystemPrompt = _customAgentSystemPrompt,
             CustomTools = BuildCustomTools(),
             EnableBash = _currentRole != WorkerRole.Improver,
@@ -259,36 +259,45 @@ public sealed class SharpCoderRunner : IAgentRunner
             if (!response.IsSuccessStatusCode) return response;
 
             var body = await response.Content.ReadAsStringAsync();
-            var json = JsonNode.Parse(body);
-            var choices = json?["choices"]?.AsArray();
 
-            if (choices == null || choices.Count <= 1) return ReplaceContent(response, body);
-
-            // Merge: take the choice with tool_calls, add text from the other
-            JsonObject? toolChoice = null;
-            string? textContent = null;
-
-            foreach (var c in choices)
+            try
             {
-                var msg = c?["message"];
-                if (msg?["tool_calls"] != null)
-                    toolChoice = c!.AsObject();
-                else if (msg?["content"]?.GetValue<string>() is { Length: > 0 } text)
-                    textContent = text;
-            }
+                var json = JsonNode.Parse(body);
+                var choices = json?["choices"]?.AsArray();
 
-            if (toolChoice != null)
-            {
-                // Add text content to the tool_calls choice if present
-                if (textContent != null && toolChoice["message"] is JsonObject merged)
+                if (choices == null || choices.Count <= 1) return ReplaceContent(response, body);
+
+                // Merge: take the choice with tool_calls, add text from the other
+                JsonObject? toolChoice = null;
+                string? textContent = null;
+
+                foreach (var c in choices)
                 {
-                    merged["content"] = textContent;
+                    if (c == null) continue;
+                    var msg = c["message"];
+                    if (msg == null) continue;
+
+                    if (msg["tool_calls"] is JsonArray { Count: > 0 })
+                        toolChoice = c.AsObject();
+                    else if (msg["content"] is JsonValue val && val.TryGetValue<string>(out var text) && text.Length > 0)
+                        textContent = text;
                 }
 
-                // Detach from parent array before adding to new one
-                toolChoice.Parent?.AsArray().Remove(toolChoice);
-                json!["choices"] = new JsonArray(toolChoice);
-                body = json.ToJsonString();
+                if (toolChoice != null)
+                {
+                    if (textContent != null && toolChoice["message"] is JsonObject merged)
+                    {
+                        merged["content"] = textContent;
+                    }
+
+                    toolChoice.Parent?.AsArray().Remove(toolChoice);
+                    json!["choices"] = new JsonArray(toolChoice);
+                    body = json.ToJsonString();
+                }
+            }
+            catch (Exception)
+            {
+                // If merging fails, return the original response unchanged
             }
 
             return ReplaceContent(response, body);
