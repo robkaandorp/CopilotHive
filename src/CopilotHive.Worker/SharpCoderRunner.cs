@@ -73,7 +73,7 @@ public sealed class SharpCoderRunner : IAgentRunner
         var options = new AgentOptions
         {
             WorkDirectory = workDir,
-            MaxSteps = 100,
+            MaxSteps = 500,
             SystemPrompt = _customAgentSystemPrompt,
             CustomTools = BuildCustomTools(),
             EnableBash = _currentRole != WorkerRole.Improver,
