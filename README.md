@@ -153,7 +153,7 @@ goals:
 | `src/CopilotHive/` | Main orchestrator — Brain, GoalDispatcher, persistence, metrics |
 | `src/CopilotHive.Shared/` | Shared protobuf definitions and DTOs |
 | `src/CopilotHive.Worker/` | Worker process (runs inside Docker containers) |
-| `tests/` | 478 xUnit tests |
+| `tests/` | 492 xUnit tests |
 | `agents/` | Default agent templates (overridden by config repo at runtime) |
 | `docker/` | Dockerfiles and container configuration |
 
