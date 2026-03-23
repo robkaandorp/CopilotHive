@@ -56,10 +56,19 @@ public sealed class DashboardStateService : IDisposable
 
         // Merge goals from API source and active pipelines (FileGoalSource goals
         // only appear via pipelines, so we need both to get a complete list).
+        // Pipeline phase is always current, so derive status from it.
         var goalsById = apiGoals.ToDictionary(g => g.Id);
         foreach (var p in pipelines)
         {
-            goalsById.TryAdd(p.GoalId, p.Goal);
+            if (!goalsById.ContainsKey(p.GoalId))
+                goalsById[p.GoalId] = p.Goal;
+
+            goalsById[p.GoalId].Status = p.Phase switch
+            {
+                GoalPhase.Done => GoalStatus.Completed,
+                GoalPhase.Failed => GoalStatus.Failed,
+                _ => GoalStatus.InProgress,
+            };
         }
 
         var goals = goalsById.Values.ToList();

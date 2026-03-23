@@ -12,7 +12,7 @@
         <div class="label">Description</div>
         <div>@_goal.Description</div>
         <div style="margin-top:0.5rem">
-            <span class="badge @StatusBadge(_goal.Status)">@_goal.Status</span>
+            <span class="badge @StatusBadge(EffectiveStatus)">@EffectiveStatus</span>
             <span style="color:var(--text-muted);margin-left:0.5rem">Priority: @_goal.Priority</span>
         </div>
     </div>
@@ -48,6 +48,17 @@ else
 
     private Goal? _goal;
     private PipelineInfo? _pipeline;
+
+    // The Goal object from pipelines may be stale (snapshot at dispatch time).
+    // Derive status from the pipeline phase which is always current.
+    private GoalStatus EffectiveStatus => _pipeline?.Phase switch
+    {
+        "Completed" or "Done" => GoalStatus.Completed,
+        "Failed" => GoalStatus.Failed,
+        "Planning" or "Coding" or "Testing" or "Review"
+            or "DocWriting" or "Improve" or "Merging" => GoalStatus.InProgress,
+        _ => _goal?.Status ?? GoalStatus.Pending,
+    };
 
     protected override void OnInitialized()
     {
