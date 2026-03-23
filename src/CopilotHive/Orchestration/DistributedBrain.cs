@@ -195,7 +195,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _agent = new CodingAgent(_chatClient, new AgentOptions
         {
             WorkDirectory = workDir,
-            MaxSteps = 10,
+            MaxSteps = 25,
             EnableBash = false,
             EnableFileOps = _repoManager is not null,
             EnableFileWrites = false,
