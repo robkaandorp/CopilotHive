@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -25,6 +26,7 @@ public sealed class SharpCoderRunner : IAgentRunner
 {
     private readonly WorkerLogger _log = new("SharpCoder");
     private IChatClient? _chatClient;
+    private string _currentModel = "(default)";
 
     private IToolCallBridge? _toolBridge;
     private string? _currentTaskId;
@@ -68,7 +70,8 @@ public sealed class SharpCoderRunner : IAgentRunner
     {
         if (_chatClient == null) throw new InvalidOperationException("Not connected. Call ConnectAsync first.");
 
-        _log.Info($"Executing task in SharpCoder. WorkDir: {workDir}");
+        var stopwatch = Stopwatch.StartNew();
+        _log.Info($"Executing task as {_currentRole} with model {_currentModel}. WorkDir: {workDir}");
         
         var options = new AgentOptions
         {
@@ -82,6 +85,9 @@ public sealed class SharpCoderRunner : IAgentRunner
 
         var agent = new CodingAgent(_chatClient, options);
         var result = await agent.ExecuteAsync(prompt, ct);
+
+        stopwatch.Stop();
+        _log.Info($"Task finished in {stopwatch.Elapsed.TotalSeconds:F2}s (status={result.Status}, toolCalls={result.ToolCallCount})");
 
         _log.Info($"AgentResult: status={result.Status}, toolCalls={result.ToolCallCount}, model={result.ModelId}, finish={result.FinishReason}");
         if (result.Usage != null)
@@ -147,8 +153,9 @@ public sealed class SharpCoderRunner : IAgentRunner
 
     private IChatClient CreateChatClient(string? modelOverride = null)
     {
-        var (provider, _) = CopilotHive.SDK.ChatClientFactory.ParseProviderAndModel(modelOverride);
-        _log.Info($"Creating chat client: provider={provider}, model={modelOverride ?? "default"}");
+        var (provider, model) = CopilotHive.SDK.ChatClientFactory.ParseProviderAndModel(modelOverride);
+        _currentModel = model ?? "(default)";
+        _log.Info($"Creating chat client: provider={provider}, model={_currentModel}");
         return CopilotHive.SDK.ChatClientFactory.Create(modelOverride);
     }
 
