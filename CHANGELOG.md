@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **`ConnectedWorkerCount` property** on `IWorkerPool` and `WorkerPool` — returns the current number of registered workers (count of internal `_workers` dictionary); includes XML documentation and 2 xUnit tests in `WorkerPoolTests.cs` (class now has 23 total [Fact] tests)
+- **WorkerPool.ConnectedWorkerCount** — new public read-only property (also on `IWorkerPool`) that returns the current number of registered connected workers; backed by `_workers.Count`; includes XML documentation and 2 xUnit tests (class now has 23 total [Fact] tests)
 - `PrintBanner()` now prints the current UTC start time below the ASCII art in the format `Started at yyyy-MM-dd HH:mm:ss UTC`
 - **GoalDispatcher source-count startup log** — `ExecuteAsync` now logs the number of registered goal sources at startup (format: "GoalDispatcher starting with {SourceCount} goal source(s)")
 - **Brain context compaction logging** — `CompactContextAsync` logs an Information-level message before and after compaction showing token count, message count, and percentage reduction (format: "Brain context compaction: {TokensBefore} → {TokensAfter} tokens ({ReductionPercent}% reduction), {MessagesBefore} → {MessagesAfter} messages")
