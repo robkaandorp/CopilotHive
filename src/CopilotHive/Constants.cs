@@ -29,7 +29,7 @@ internal static class Constants
 
     // Config defaults
     public const int    DefaultMaxIterations    = 10;
-    public const int    DefaultBrainContextWindow = 100_000;
+    public const int    DefaultBrainContextWindow = 150_000;
     public const string DefaultModel             = "claude-opus-4.6";
 
     // Version
