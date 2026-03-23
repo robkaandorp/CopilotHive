@@ -163,6 +163,9 @@ public sealed class SharpCoderRunner : IAgentRunner
         if (_currentRole == WorkerRole.DocWriter)
             tools.Add(BuildDocChangesTool());
 
+        if (_currentRole == WorkerRole.Improver)
+            tools.Add(BuildFileSizesTool());
+
         return tools;
     }
 
@@ -272,4 +275,34 @@ public sealed class SharpCoderRunner : IAgentRunner
         },
         "report_doc_changes",
         "Report your documentation changes. REQUIRED for doc-writers after updating docs.");
+
+    private AITool BuildFileSizesTool() => AIFunctionFactory.Create(
+        ([Description("Glob pattern to match files, e.g. '*.md' or '**/*.agents.md'. Leave empty for all files.")] string pattern) =>
+        {
+            _log.Info($"Tool call: get_file_sizes(pattern={pattern})");
+            try
+            {
+                var searchPattern = string.IsNullOrWhiteSpace(pattern) ? "*" : pattern;
+                var searchOption = searchPattern.Contains("**") ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+                var normalizedPattern = searchPattern.Replace("**/", "");
+
+                var files = Directory.GetFiles("/config-repo/agents", normalizedPattern, searchOption);
+                if (files.Length == 0)
+                    return "No files matched the pattern.";
+
+                var lines = files.Select(f =>
+                {
+                    var info = new FileInfo(f);
+                    var content = File.ReadAllText(f);
+                    return $"{Path.GetFileName(f)}: {content.Length} chars, {info.Length} bytes";
+                });
+                return string.Join("\n", lines);
+            }
+            catch (Exception ex)
+            {
+                return $"Error: {ex.Message}";
+            }
+        },
+        "get_file_sizes",
+        "Get character and byte counts for files in the agents directory. Use before editing to check against the 4000-character limit.");
 }
