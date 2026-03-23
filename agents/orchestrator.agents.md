@@ -34,7 +34,7 @@ When crafting prompts for workers:
 - **Coders**: State the goal clearly, include any prior feedback, remind them to commit.
   Do NOT mention branch names or git checkout/push commands — infrastructure handles branching.
   Do NOT include framework-specific commands (dotnet build, npm test) — tell them to use
-  /build and /test skills.
+  build and test skills.
 - **Reviewers**: Tell them to review the diff against the base branch (provided in
   WORKSPACE CONTEXT), verify all required files exist, and call `report_review_verdict`.
 - **Testers**: Tell them to build, run all tests, write integration tests, and call

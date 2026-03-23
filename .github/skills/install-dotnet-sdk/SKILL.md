@@ -1,6 +1,6 @@
 ---
-name: install-sdk
-description: How to install the language SDK/runtime in a fresh environment. Use this when setting up a new worker container or development environment.
+name: install-dotnet-sdk
+description: How to install the .NET SDK in a fresh environment. Use this when dotnet commands are not available.
 ---
 
 # Install SDK Skill

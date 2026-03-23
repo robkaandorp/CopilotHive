@@ -1298,8 +1298,8 @@ public sealed class GoalDispatcher : BackgroundService
             Do NOT describe or plan changes — actually make them:
             1. Read the relevant source files
             2. Edit the files
-            3. Use the /build skill to build the project and fix any errors
-            4. Use the /test skill to run the tests and fix any failures
+            3. Use the build skill to build the project and fix any errors
+            4. Use the test skill to run the tests and fix any failures
             5. Run `git add -A && git commit` with a descriptive message
 
             A response that only describes changes without actually editing files is a FAILURE.

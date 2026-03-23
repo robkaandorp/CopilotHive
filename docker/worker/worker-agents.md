@@ -9,7 +9,7 @@ You are running inside a CopilotHive worker container.
 
 ## Build Environments (Install On Demand)
 Build tools are NOT pre-installed. Use the skills in `.github/skills/` to install them:
-- .NET SDK → `install-sdk` skill
+- .NET SDK → `install-dotnet-sdk` skill
 - Python + uv → `install-python` skill
 - Rust → `install-rust` skill
 - Zig → `install-zig` skill

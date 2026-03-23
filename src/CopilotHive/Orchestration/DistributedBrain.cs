@@ -53,7 +53,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         - When planning iterations, always call report_iteration_plan
         - When crafting prompts, respond with ONLY the prompt text — no tool calls, no JSON, no markdown formatting
         - Never include git checkout/branch/switch/push commands in prompts — infrastructure handles branching
-        - Never include framework-specific build/test commands — workers use /build and /test skills
+        - Never include framework-specific build/test commands — workers use build and test skills
         """;
 
     /// <summary>
@@ -400,7 +400,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         var roleInstruction = phase switch
         {
             GoalPhase.Coding => """
-                - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, use /build skill, use /test skill, and commit with `git add -A && git commit`. NEVER include git checkout, git branch, or git push commands. NEVER include dotnet/npm/cargo commands — only reference /build and /test skills.
+                - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, use build skill, use test skill, and commit with `git add -A && git commit`. NEVER include git checkout, git branch, or git push commands. NEVER include dotnet/npm/cargo commands — only reference build and test skills.
                 """,
             GoalPhase.Review => """
                 - For reviewers: tell them to run `git diff origin/<base-branch>...HEAD` to review ALL changes. The base branch and feature branch are provided in the workspace context. The `origin/` prefix is required because the clone only has remote tracking refs. Produce a REVIEW_REPORT.
@@ -427,13 +427,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
             {{(historyContext.Length > 0 ? $"\n{historyContext}" : "")}}
 
-            The worker has access to project skills (e.g. /build, /test) that describe how to build and test this project.
+            The worker has access to project skills (e.g. build, test) that describe how to build and test this project.
             Tell the worker to use those skills instead of hardcoding framework-specific commands.
 
             Rules for the prompt you craft:
             - The branch is already checked out by the infrastructure — do NOT mention branch names
             - NEVER include git checkout, git branch, git switch, or git push commands — the infrastructure handles all branching
-            - NEVER include framework-specific build/test commands (dotnet build, npm test, etc.) — tell workers to use /build and /test skills
+            - NEVER include framework-specific build/test commands (dotnet build, npm test, etc.) — tell workers to use build and test skills
             {{roleInstruction}}
             - Include any context from previous phases that would help the worker
 

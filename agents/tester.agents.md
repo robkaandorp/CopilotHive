@@ -44,13 +44,13 @@ What must be true for this to pass.
 
 Run the project build. This is the first gate — if it doesn't compile, stop here.
 
-Use the /build skill for project-specific build instructions.
+Use the build skill for project-specific build instructions.
 
 ### Phase 3: Run Existing Tests
 
 Run ALL existing tests (unit tests written by the coder + any prior tests).
 
-Use the /test skill for project-specific test instructions.
+Use the test skill for project-specific test instructions.
 
 Record results: total, passed, failed, skipped.
 

@@ -1,5 +1,5 @@
 ---
-name: install-sdk
+name: install-dotnet-sdk
 description: Install the .NET SDK and C# language server into the worker container
 ---
 
