@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Brain `WorkDirectory` set to `repos/` parent folder so all repositories are visible simultaneously
 - Updated `DistributedBrain` from `IChatClient` direct usage to `CodingAgent` orchestration
 - `GoalDispatcher.DispatchNextGoalAsync` now checks `GetActivePipelines()` before dispatching
+- `GoalDispatcher.DispatchNextGoalAsync` now includes the goal's priority level in the dispatch log message (e.g., "Priority=High")
 
 ### Added
 - `SharpCoderRunnerSummarizeMessageTests` — xUnit test suite with 10 [Fact] tests covering the `SummarizeMessage` helper method via reflection; tests verify tool call logging format, tool result format, argument truncation (100 chars), result preview truncation (200 chars), null handling, and plain text fallback behavior
@@ -56,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Goal ID validation in `FileGoalSource.MapToGoal()` — validates each goal ID after parsing from goals.yaml
 - Goal ID validation in `ApiGoalSource.AddGoal()` — validates goal ID when adding a new goal via API
 - `GoalIdTests` — 6 xUnit tests (5 valid cases: `fix-build-error`, `add-feature`, `abc`, `a1b2`, `a-1-b`; 8 invalid cases covering empty/null, uppercase, spaces, leading/trailing hyphens, underscores)
+- `GoalDispatcherDispatchLoggingTests` — xUnit test class with 1 [Fact] test verifying `DispatchNextGoalAsync` logs the goal's priority level (e.g., "Priority=High") in the dispatch log message
 
 ### Changed
 - Worker message logging in `SharpCoderRunner.cs` — the message loop now uses the new `SummarizeMessage` helper to produce informative summaries:
