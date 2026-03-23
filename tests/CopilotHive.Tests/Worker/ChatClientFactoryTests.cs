@@ -192,3 +192,105 @@ public sealed class ChatClientFactoryTests
 
     #endregion
 }
+
+/// <summary>
+/// Tests for <see cref="ChatClientFactory.ParseProviderModelAndReasoning"/>: verifies
+/// that reasoning effort is correctly extracted from the last colon-separated segment
+/// and that Ollama model tags (e.g. :120b) are not mistaken for reasoning levels.
+/// </summary>
+public sealed class ChatClientFactoryReasoningTests
+{
+    [Fact]
+    public void ParseReasoning_HighSuffix_ExtractsReasoningEffort()
+    {
+        var (provider, model, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning("copilot/claude-sonnet-4.6:high");
+
+        Assert.Equal("copilot", provider);
+        Assert.Equal("claude-sonnet-4.6", model);
+        Assert.Equal(Microsoft.Extensions.AI.ReasoningEffort.High, reasoning);
+    }
+
+    [Fact]
+    public void ParseReasoning_LowSuffix_ExtractsReasoningEffort()
+    {
+        var (_, model, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning("copilot/gpt-5.4:low");
+
+        Assert.Equal("gpt-5.4", model);
+        Assert.Equal(Microsoft.Extensions.AI.ReasoningEffort.Low, reasoning);
+    }
+
+    [Fact]
+    public void ParseReasoning_ExtraHighSuffix_ExtractsReasoningEffort()
+    {
+        var (_, model, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning("copilot/gpt-5.4:extra_high");
+
+        Assert.Equal("gpt-5.4", model);
+        Assert.Equal(Microsoft.Extensions.AI.ReasoningEffort.ExtraHigh, reasoning);
+    }
+
+    [Fact]
+    public void ParseReasoning_NoneSuffix_ExtractsReasoningNone()
+    {
+        var (_, model, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning("copilot/claude-sonnet-4.6:none");
+
+        Assert.Equal("claude-sonnet-4.6", model);
+        Assert.Equal(Microsoft.Extensions.AI.ReasoningEffort.None, reasoning);
+    }
+
+    [Fact]
+    public void ParseReasoning_OllamaModelTag_NotMistakenForReasoning()
+    {
+        var (provider, model, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning("ollama-cloud/gpt-oss:120b");
+
+        Assert.Equal("ollama-cloud", provider);
+        Assert.Equal("gpt-oss:120b", model);
+        Assert.Null(reasoning);
+    }
+
+    [Fact]
+    public void ParseReasoning_OllamaTagWithReasoning_ExtractsLastSegment()
+    {
+        var (provider, model, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning("ollama-cloud/gpt-oss:120b:medium");
+
+        Assert.Equal("ollama-cloud", provider);
+        Assert.Equal("gpt-oss:120b", model);
+        Assert.Equal(Microsoft.Extensions.AI.ReasoningEffort.Medium, reasoning);
+    }
+
+    [Fact]
+    public void ParseReasoning_NoSuffix_ReturnsNullReasoning()
+    {
+        var (provider, model, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning("copilot/claude-sonnet-4.6");
+
+        Assert.Equal("copilot", provider);
+        Assert.Equal("claude-sonnet-4.6", model);
+        Assert.Null(reasoning);
+    }
+
+    [Fact]
+    public void ParseReasoning_NullInput_ReturnsNullReasoning()
+    {
+        var (_, model, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(null);
+
+        Assert.Null(model);
+        Assert.Null(reasoning);
+    }
+
+    [Fact]
+    public void ParseReasoning_CaseInsensitive_ExtractsCorrectly()
+    {
+        var (_, model, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning("copilot/gpt-5.4:HIGH");
+
+        Assert.Equal("gpt-5.4", model);
+        Assert.Equal(Microsoft.Extensions.AI.ReasoningEffort.High, reasoning);
+    }
+
+    [Fact]
+    public void ParseReasoning_PlainModelNoProvider_ExtractsReasoning()
+    {
+        var (_, model, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning("gpt-5.4:medium");
+
+        Assert.Equal("gpt-5.4", model);
+        Assert.Equal(Microsoft.Extensions.AI.ReasoningEffort.Medium, reasoning);
+    }
+}

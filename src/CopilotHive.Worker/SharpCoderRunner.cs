@@ -27,6 +27,7 @@ public sealed class SharpCoderRunner : IAgentRunner
     private readonly WorkerLogger _log = new("SharpCoder");
     private IChatClient? _chatClient;
     private string _currentModel = "(default)";
+    private ReasoningEffort? _currentReasoning;
 
     /// <summary>
     /// Initializes a new <see cref="SharpCoderRunner"/>. Call <see cref="ConnectAsync"/>
@@ -99,7 +100,8 @@ public sealed class SharpCoderRunner : IAgentRunner
             SystemPrompt = _customAgentSystemPrompt,
             CustomTools = BuildCustomTools(),
             EnableBash = _currentRole != WorkerRole.Improver,
-            EnableFileWrites = _currentRole != WorkerRole.Reviewer
+            EnableFileWrites = _currentRole != WorkerRole.Reviewer,
+            ReasoningEffort = _currentReasoning,
         };
 
         var agent = new CodingAgent(_chatClient, options);
@@ -190,9 +192,11 @@ public sealed class SharpCoderRunner : IAgentRunner
 
     private IChatClient CreateChatClient(string? modelOverride = null)
     {
-        var (provider, model) = CopilotHive.SDK.ChatClientFactory.ParseProviderAndModel(modelOverride);
+        var (provider, model, reasoning) = CopilotHive.SDK.ChatClientFactory.ParseProviderModelAndReasoning(modelOverride);
         _currentModel = model ?? "(default)";
-        _log.Info($"Creating chat client: provider={provider}, model={_currentModel}");
+        _currentReasoning = reasoning;
+        _log.Info($"Creating chat client: provider={provider}, model={_currentModel}" +
+            (reasoning.HasValue ? $", reasoning={reasoning.Value}" : ""));
         return CopilotHive.SDK.ChatClientFactory.Create(modelOverride);
     }
 

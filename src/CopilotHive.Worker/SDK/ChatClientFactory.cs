@@ -22,11 +22,13 @@ public static class ChatClientFactory
 {
     /// <summary>
     /// Creates an <see cref="IChatClient"/> for the given model string.
-    /// The model string may include a provider prefix (e.g. "copilot/claude-sonnet-4.6").
+    /// The model string may include a provider prefix and reasoning suffix
+    /// (e.g. "copilot/claude-sonnet-4.6:high"). The reasoning suffix is stripped
+    /// before creating the client — reasoning is applied at the <see cref="ChatOptions"/> level.
     /// </summary>
     public static IChatClient Create(string? modelOverride = null)
     {
-        var (provider, model) = ParseProviderAndModel(modelOverride);
+        var (provider, model, _) = ParseProviderModelAndReasoning(modelOverride);
 
         switch (provider)
         {
@@ -82,6 +84,51 @@ public static class ChatClientFactory
     /// "claude-sonnet-4.6" → (env LLM_PROVIDER, "claude-sonnet-4.6")
     /// null → (env LLM_PROVIDER, null)
     /// </summary>
+    private static readonly HashSet<string> KnownReasoningLevels = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "none", "low", "medium", "high", "extra_high"
+    };
+
+    /// <summary>
+    /// Parses a model string into provider, model name, and optional reasoning effort.
+    /// <para>
+    /// Format: <c>[provider/]model[:reasoning_level]</c>
+    /// </para>
+    /// <para>
+    /// The reasoning level is extracted from the last colon-separated segment if it matches
+    /// a known level (none, low, medium, high, extra_high). This avoids ambiguity with
+    /// Ollama model tags like <c>gpt-oss:120b</c>.
+    /// </para>
+    /// </summary>
+    public static (string provider, string? model, ReasoningEffort? reasoning) ParseProviderModelAndReasoning(string? modelOverride)
+    {
+        var (provider, model) = ParseProviderAndModel(modelOverride);
+
+        if (model is null)
+            return (provider, null, null);
+
+        var lastColon = model.LastIndexOf(':');
+        if (lastColon <= 0 || lastColon == model.Length - 1)
+            return (provider, model, null);
+
+        var suffix = model.Substring(lastColon + 1);
+        if (!KnownReasoningLevels.Contains(suffix))
+            return (provider, model, null);
+
+        var cleanModel = model.Substring(0, lastColon);
+        var effort = suffix.ToLowerInvariant() switch
+        {
+            "none" => ReasoningEffort.None,
+            "low" => ReasoningEffort.Low,
+            "medium" => ReasoningEffort.Medium,
+            "high" => ReasoningEffort.High,
+            "extra_high" => ReasoningEffort.ExtraHigh,
+            _ => (ReasoningEffort?)null,
+        };
+
+        return (provider, cleanModel, effort);
+    }
+
     public static (string provider, string? model) ParseProviderAndModel(string? modelOverride)
     {
         var defaultProvider = Environment.GetEnvironmentVariable("LLM_PROVIDER")?.ToLowerInvariant() ?? "copilot";
