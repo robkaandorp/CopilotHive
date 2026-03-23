@@ -624,6 +624,28 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         }
     }
 
+    /// <inheritdoc />
+    public BrainStats? GetStats()
+    {
+        if (_agent is null) return null;
+
+        var estimatedTokens = _session.EstimatedContextTokens;
+        var usagePct = _maxContextTokens > 0 ? (int)(estimatedTokens * 100.0 / _maxContextTokens) : 0;
+
+        return new BrainStats
+        {
+            Model = _modelOverride,
+            MessageCount = _session.MessageHistory.Count,
+            EstimatedContextTokens = estimatedTokens,
+            MaxContextTokens = _maxContextTokens,
+            ContextUsagePercent = usagePct,
+            CumulativeInputTokens = _session.InputTokensUsed,
+            CumulativeOutputTokens = _session.OutputTokensUsed,
+            MaxSteps = _maxSteps,
+            IsConnected = true,
+        };
+    }
+
     /// <summary>
     /// Applies the first-non-null wins rule for model tier.
     /// </summary>

@@ -1,4 +1,5 @@
 using CopilotHive.Goals;
+using CopilotHive.Orchestration;
 using CopilotHive.Services;
 
 namespace CopilotHive.Dashboard;
@@ -14,6 +15,8 @@ public sealed class DashboardStateService : IDisposable
     private readonly GoalPipelineManager _pipelineManager;
     private readonly ApiGoalSource _goalSource;
     private readonly DashboardLogSink _logSink;
+    private readonly ProgressLog _progressLog;
+    private readonly IDistributedBrain? _brain;
     private readonly Timer _timer;
 
     /// <summary>Fired when state has been polled and components should re-render.</summary>
@@ -24,12 +27,16 @@ public sealed class DashboardStateService : IDisposable
         WorkerPool workerPool,
         GoalPipelineManager pipelineManager,
         ApiGoalSource goalSource,
-        DashboardLogSink logSink)
+        DashboardLogSink logSink,
+        ProgressLog progressLog,
+        IDistributedBrain? brain = null)
     {
         _workerPool = workerPool;
         _pipelineManager = pipelineManager;
         _goalSource = goalSource;
         _logSink = logSink;
+        _progressLog = progressLog;
+        _brain = brain;
         _timer = new Timer(_ => NotifyStateChanged(), null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(3));
     }
 
@@ -88,6 +95,12 @@ public sealed class DashboardStateService : IDisposable
 
     /// <summary>Returns recent log entries from the circular buffer.</summary>
     public IReadOnlyList<LogEntry> GetRecentLogs(int count = 500) => _logSink.GetRecent(count);
+
+    /// <summary>Returns current Brain statistics, or null if Brain is not configured.</summary>
+    public BrainStats? GetBrainStats() => _brain?.GetStats();
+
+    /// <summary>Returns recent worker progress reports.</summary>
+    public IReadOnlyList<ProgressEntry> GetRecentProgress(int count = 50) => _progressLog.GetRecent(count);
 
     private void NotifyStateChanged() => OnStateChanged?.Invoke();
 

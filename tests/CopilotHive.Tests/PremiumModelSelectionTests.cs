@@ -212,6 +212,8 @@ file sealed class CapturingBrain : IDistributedBrain
     }
 
     public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) => Task.CompletedTask;
+
+    public BrainStats? GetStats() => null;
 }
 
 file sealed class PremiumFakeGoalSource : IGoalSource

@@ -1,0 +1,127 @@
+@page "/orchestrator"
+@using CopilotHive.Dashboard
+@using CopilotHive.Orchestration
+@implements IDisposable
+@inject DashboardStateService State
+
+<h1>Orchestrator</h1>
+
+<h2>Brain</h2>
+@if (_stats is not null)
+{
+    <div class="cards">
+        <div class="card">
+            <div class="label">Model</div>
+            <div class="value" style="font-size:1rem">@_stats.Model</div>
+        </div>
+        <div class="card">
+            <div class="label">Context</div>
+            <div class="value" style="color:@ContextColor">@FormatTokens(_stats.EstimatedContextTokens)</div>
+            <div style="font-size:0.75rem;color:var(--text-muted)">
+                @_stats.ContextUsagePercent% of @FormatTokens(_stats.MaxContextTokens)
+            </div>
+        </div>
+        <div class="card">
+            <div class="label">Messages</div>
+            <div class="value">@_stats.MessageCount</div>
+        </div>
+        <div class="card">
+            <div class="label">Max Steps</div>
+            <div class="value">@_stats.MaxSteps</div>
+        </div>
+    </div>
+
+    <div class="cards" style="margin-top:0.5rem">
+        <div class="card">
+            <div class="label">Cumulative Input</div>
+            <div class="value" style="font-size:1rem">@FormatTokens(_stats.CumulativeInputTokens)</div>
+        </div>
+        <div class="card">
+            <div class="label">Cumulative Output</div>
+            <div class="value" style="font-size:1rem">@FormatTokens(_stats.CumulativeOutputTokens)</div>
+        </div>
+    </div>
+
+    <div style="margin-top:1rem;background:var(--surface);border-radius:8px;padding:0.75rem 1rem">
+        <div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:0.25rem">Context Usage</div>
+        <div style="background:var(--bg);border-radius:4px;height:1.25rem;overflow:hidden">
+            <div style="width:@(_stats.ContextUsagePercent)%;height:100%;background:@ContextColor;transition:width 0.3s"></div>
+        </div>
+    </div>
+}
+else
+{
+    <p style="color:var(--text-muted)">Brain not connected.</p>
+}
+
+<h2 style="margin-top:2rem">Worker Progress</h2>
+@if (_progress.Count > 0)
+{
+    <table>
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Worker</th>
+                <th>Goal</th>
+                <th>Status</th>
+                <th>Details</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var entry in _progress)
+            {
+                <tr>
+                    <td style="white-space:nowrap;color:var(--text-muted)">@entry.Timestamp.ToString("HH:mm:ss")</td>
+                    <td style="font-family:monospace;font-size:0.85rem">@Truncate(entry.WorkerId, 12)</td>
+                    <td><span style="color:var(--accent)">@entry.GoalId</span></td>
+                    <td><span class="badge badge-blue">@entry.Status</span></td>
+                    <td style="font-size:0.85rem">@Truncate(entry.Details, 120)</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+else
+{
+    <p style="color:var(--text-muted)">No progress reports yet.</p>
+}
+
+@code {
+    private BrainStats? _stats;
+    private IReadOnlyList<ProgressEntry> _progress = [];
+
+    protected override void OnInitialized()
+    {
+        Refresh();
+        State.OnStateChanged += RefreshState;
+    }
+
+    private void Refresh()
+    {
+        _stats = State.GetBrainStats();
+        _progress = State.GetRecentProgress(50);
+    }
+
+    private void RefreshState() => InvokeAsync(() => { Refresh(); StateHasChanged(); });
+
+    private string ContextColor => _stats?.ContextUsagePercent switch
+    {
+        >= 80 => "var(--red)",
+        >= 50 => "var(--accent)",
+        _ => "var(--green)",
+    };
+
+    private static string FormatTokens(long tokens) => tokens switch
+    {
+        >= 1_000_000 => $"{tokens / 1_000_000.0:F1}M",
+        >= 1_000 => $"{tokens / 1_000.0:F1}k",
+        _ => tokens.ToString(),
+    };
+
+    private static string FormatTokens(int tokens) => FormatTokens((long)tokens);
+
+    private static string Truncate(string s, int max) =>
+        s.Length <= max ? s : s[..max] + "…";
+
+    public void Dispose() => State.OnStateChanged -= RefreshState;
+}

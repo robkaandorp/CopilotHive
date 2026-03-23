@@ -107,6 +107,7 @@ static async Task<int> RunServerAsync(string[] args)
     // Dashboard: log capture (registered early so logger provider can reference it)
     var dashboardLogSink = new DashboardLogSink();
     builder.Services.AddSingleton(dashboardLogSink);
+    builder.Services.AddSingleton<ProgressLog>();
     builder.Logging.AddProvider(new DashboardLoggerProvider(dashboardLogSink));
 
     builder.Services.AddHostedService<StaleWorkerCleanupService>();

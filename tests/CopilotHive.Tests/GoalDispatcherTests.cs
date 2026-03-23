@@ -214,6 +214,8 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
         Task.FromResult($"Work on {pipeline.Description} as {phase}");
 
     public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) => Task.CompletedTask;
+
+    public BrainStats? GetStats() => null;
 }
 
 /// <summary>
