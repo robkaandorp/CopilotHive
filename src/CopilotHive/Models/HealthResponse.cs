@@ -28,6 +28,9 @@ public sealed class HealthResponse
     /// <summary>Assembly informational version string, e.g. <c>"1.0.0.0"</c>.</summary>
     public string Version { get; init; } = string.Empty;
 
+    /// <summary>Version string of the SharpCoder assembly loaded at runtime, e.g. <c>"0.2.0.10"</c>.</summary>
+    public string? SharpCoderVersion { get; init; }
+
     /// <summary>UTC timestamp when this response was generated.</summary>
     public DateTime ServerTime { get; init; }
 

@@ -108,6 +108,14 @@ public class HealthEndpointTests : IClassFixture<HiveTestFactory>
     }
 
     [Fact]
+    public async Task GetHealth_HasSharpCoderVersionField()
+    {
+        using var json = await GetHealthJsonAsync();
+        Assert.True(json.RootElement.TryGetProperty("sharpCoderVersion", out var val));
+        Assert.False(string.IsNullOrEmpty(val.GetString()));
+    }
+
+    [Fact]
     public async Task GetHealth_HasServerTimeField()
     {
         using var json = await GetHealthJsonAsync();

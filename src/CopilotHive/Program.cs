@@ -194,6 +194,7 @@ static async Task<int> RunServerAsync(string[] args)
             CompletedGoals = goals.Count(g => g.Status == GoalStatus.Completed),
             ConnectedWorkers = workerPool.GetAllWorkers().Count,
             Version = _version,
+            SharpCoderVersion = typeof(SharpCoder.CodingAgent).Assembly.GetName().Version?.ToString(),
             ServerTime = DateTime.UtcNow,
             CheckNumber = count,
             WorkerPool = workerPool.GetDetailedStats(),
