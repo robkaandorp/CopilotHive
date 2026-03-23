@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Brain context compaction logging** — `CompactContextAsync` logs an Information-level message before and after compaction showing token count, message count, and percentage reduction (format: "Brain context compaction: {TokensBefore} → {TokensAfter} tokens ({ReductionPercent}% reduction), {MessagesBefore} → {MessagesAfter} messages")
+- **Brain automatic compaction trigger** — context automatically compacts when usage reaches 80% of `_maxContextTokens`
 - **Brain CodingAgent migration** — Brain now uses SharpCoder's `CodingAgent` instead of raw `IChatClient`, gaining built-in file tools, session management, and automatic context compaction
 - **Single persistent Brain session** — one `AgentSession` carries context across all goals (replaces per-goal `ConcurrentDictionary<string, AgentSession>`)
 - **Brain read-only file access** — Brain can read project structure, config, and code via `read_file`, `glob`, `grep` tools on persistent repo clones
