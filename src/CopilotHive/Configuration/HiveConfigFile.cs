@@ -74,4 +74,6 @@ public sealed class OrchestratorConfig
     public bool AlwaysImprove { get; set; }
     /// <summary>When <c>true</c>, enables verbose logging of prompts, worker output, and Brain reasoning.</summary>
     public bool VerboseLogging { get; set; }
+    /// <summary>Maximum context window size in tokens for the Brain model. Used for compaction decisions.</summary>
+    public int BrainContextWindow { get; set; } = Constants.DefaultBrainContextWindow;
 }

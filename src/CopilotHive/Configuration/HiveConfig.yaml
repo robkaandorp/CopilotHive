@@ -28,3 +28,4 @@ orchestrator:
   max_retries_per_task: 3
   always_improve: true
   verbose_logging: false
+  brain_context_window: 100000  # Max tokens for the Brain model's context

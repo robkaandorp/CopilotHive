@@ -73,21 +73,36 @@ static async Task<int> RunServerAsync(string[] args)
     // Supports BRAIN_MODEL env var or falls back to OrchestratorModel from config
     var brainModel = Environment.GetEnvironmentVariable("BRAIN_MODEL")
         ?? Environment.GetEnvironmentVariable("BRAIN_COPILOT_PORT"); // backward compat: any non-empty = enable
+    var brainContextWindowEnv = Environment.GetEnvironmentVariable("BRAIN_CONTEXT_WINDOW");
     if (!string.IsNullOrEmpty(brainModel) && !int.TryParse(brainModel, out _))
     {
         // New path: BRAIN_MODEL is a model string (e.g. "copilot/claude-sonnet-4.6")
         builder.Services.AddSingleton<IDistributedBrain>(sp =>
-            new DistributedBrain(brainModel, sp.GetRequiredService<ILogger<DistributedBrain>>(),
+        {
+            var config = sp.GetService<HiveConfigFile>();
+            var maxCtx = int.TryParse(brainContextWindowEnv, out var envCtx)
+                ? envCtx
+                : config?.Orchestrator.BrainContextWindow ?? Constants.DefaultBrainContextWindow;
+            return new DistributedBrain(brainModel, sp.GetRequiredService<ILogger<DistributedBrain>>(),
                 sp.GetRequiredService<MetricsTracker>(),
-                sp.GetService<AgentsManager>()));
+                sp.GetService<AgentsManager>(),
+                maxCtx);
+        });
     }
     else if (!string.IsNullOrEmpty(brainModel))
     {
         // Legacy path: BRAIN_COPILOT_PORT is a port number — use default model
         builder.Services.AddSingleton<IDistributedBrain>(sp =>
-            new DistributedBrain("copilot/claude-sonnet-4.6", sp.GetRequiredService<ILogger<DistributedBrain>>(),
+        {
+            var config = sp.GetService<HiveConfigFile>();
+            var maxCtx = int.TryParse(brainContextWindowEnv, out var envCtx)
+                ? envCtx
+                : config?.Orchestrator.BrainContextWindow ?? Constants.DefaultBrainContextWindow;
+            return new DistributedBrain("copilot/claude-sonnet-4.6", sp.GetRequiredService<ILogger<DistributedBrain>>(),
                 sp.GetRequiredService<MetricsTracker>(),
-                sp.GetService<AgentsManager>()));
+                sp.GetService<AgentsManager>(),
+                maxCtx);
+        });
     }
 
     builder.Services.AddSingleton<WorkerUtilizationService>();

@@ -29,6 +29,8 @@ public sealed class HiveConfiguration
     public bool AlwaysImprove { get; init; }
     /// <summary>When <c>true</c>, enables verbose logging of prompts, worker output, and Brain reasoning.</summary>
     public bool VerboseLogging { get; init; }
+    /// <summary>Maximum context window size in tokens for the Brain model. Used for compaction decisions and context monitoring.</summary>
+    public int BrainContextWindow { get; init; } = Constants.DefaultBrainContextWindow;
     /// <summary>GitHub personal access token used to authenticate Docker container spawns and git operations.</summary>
     public required string GitHubToken { get; init; }
 

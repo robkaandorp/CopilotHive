@@ -19,6 +19,7 @@ namespace CopilotHive.Orchestration;
 public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 {
     private readonly string _modelOverride;
+    private readonly int _maxContextTokens;
     private readonly ILogger<DistributedBrain> _logger;
     private readonly MetricsTracker? _metricsTracker;
     private IChatClient? _chatClient;
@@ -63,10 +64,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <param name="logger">Logger instance.</param>
     /// <param name="metricsTracker">Optional tracker used to include historical metrics in prompts.</param>
     /// <param name="agentsManager">Optional manager used to load the orchestrator's AGENTS.md.</param>
+    /// <param name="maxContextTokens">Maximum context window size in tokens. Defaults to <see cref="Constants.DefaultBrainContextWindow"/>.</param>
     public DistributedBrain(string modelOverride, ILogger<DistributedBrain> logger,
-        MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null)
+        MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null,
+        int maxContextTokens = Constants.DefaultBrainContextWindow)
     {
         _modelOverride = modelOverride;
+        _maxContextTokens = maxContextTokens;
         _logger = logger;
         _metricsTracker = metricsTracker;
 
@@ -96,7 +100,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             })
             .Build();
 
-        _logger.LogInformation("Brain connected via SharpCoder (model={Model})", _modelOverride);
+        _logger.LogInformation("Brain connected via SharpCoder (model={Model}, contextWindow={ContextWindow})",
+            _modelOverride, _maxContextTokens);
         return Task.CompletedTask;
     }
 
@@ -569,6 +574,21 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 .Where(m => m.Role != ChatRole.System)
                 .ToList();
             session.LastActivityAt = DateTimeOffset.UtcNow;
+
+            // Log context size info
+            var estimatedTokens = session.EstimatedContextTokens;
+            var usagePct = _maxContextTokens > 0 ? (int)(estimatedTokens * 100.0 / _maxContextTokens) : 0;
+            _logger.LogInformation(
+                "Brain context: goal={GoalId} messages={Messages} ~tokens={EstTokens}/{Limit} ({Pct}%) cumIn={CumIn} cumOut={CumOut}",
+                session.SessionId, session.MessageHistory.Count, estimatedTokens, _maxContextTokens,
+                usagePct, session.InputTokensUsed, session.OutputTokensUsed);
+
+            if (estimatedTokens > (long)(_maxContextTokens * 0.8))
+            {
+                _logger.LogWarning(
+                    "Brain context approaching limit: {EstTokens}/{Limit} tokens ({Pct}%) for goal {GoalId}. Compaction needed.",
+                    estimatedTokens, _maxContextTokens, usagePct, session.SessionId);
+            }
 
             _logger.LogDebug("Brain response ({Length} chars), tool={Tool}",
                 responseText.Length, _lastToolCallResult?.ToolName ?? "none");

@@ -84,6 +84,10 @@ public sealed class SharpCoderRunner : IAgentRunner
         var result = await agent.ExecuteAsync(prompt, ct);
 
         _log.Info($"AgentResult: status={result.Status}, toolCalls={result.ToolCallCount}, model={result.ModelId}, finish={result.FinishReason}");
+        if (result.Usage != null)
+        {
+            _log.Info($"Context: inputTokens={result.Usage.InputTokenCount}, outputTokens={result.Usage.OutputTokenCount}, totalTokens={result.Usage.TotalTokenCount}");
+        }
         if (result.Messages != null)
         {
             _log.Info($"AgentResult: {result.Messages.Count} messages total");
