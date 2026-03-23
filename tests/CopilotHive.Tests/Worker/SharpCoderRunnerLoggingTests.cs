@@ -1,6 +1,11 @@
 extern alias WorkerAssembly;
 
+using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 using CopilotHive.Workers;
 using Microsoft.Extensions.AI;
 using WorkerAssembly::CopilotHive.Worker;
@@ -9,7 +14,7 @@ namespace CopilotHive.Tests.Worker;
 
 /// <summary>
 /// Unit tests for <see cref="SharpCoderRunner"/> logging: verifies that role, model,
-/// and elapsed time are correctly logged during task execution.
+/// elapsed time, status, and tool-call count are correctly logged during task execution.
 /// </summary>
 public sealed class SharpCoderRunnerLoggingTests : IDisposable
 {
@@ -34,33 +39,30 @@ public sealed class SharpCoderRunnerLoggingTests : IDisposable
         _stdErr.Dispose();
     }
 
-    // ── Role logging tests ─────────────────────────────────────────────────────
+    // ── Helpers ──────────────────────────────────────────────────────────────
 
-    #region SetCustomAgent stores role for logging
+    /// <summary>Creates a minimal stub <see cref="IChatClient"/> that returns a single assistant message.</summary>
+    private static IChatClient CreateStubClient(string replyText = "Task complete.")
+        => new StubChatClient(replyText);
 
     /// <summary>
-    /// <see cref="SharpCoderRunner.SetCustomAgent"/> must store the role so that
-    /// it can be logged in <see cref="SharpCoderRunner.SendPromptAsync"/>.
-    /// This test verifies the role is stored correctly without calling SendPromptAsync
-    /// (which would require a real LLM connection).
+    /// Creates a temporary directory that exists on disk, for use as WorkDirectory.
+    /// The caller is responsible for deleting it after the test.
     /// </summary>
-    [Fact]
-    public void SetCustomAgent_StoresCoderRole()
+    private static string CreateTempWorkDir()
     {
-        var runner = new SharpCoderRunner();
-        runner.SetCustomAgent(WorkerRole.Coder, "test agent content");
-
-        // Role is stored internally; we verify indirectly via logging in integration tests
-        Assert.NotNull(runner);
+        var path = Path.Combine(Path.GetTempPath(), $"sharpcoder-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(path);
+        return path;
     }
 
-    #endregion
+    // ── SetCustomAgent role validation ────────────────────────────────────────
 
     #region SetCustomAgent accepts all worker roles
 
     /// <summary>
-    /// <see cref="SharpCoderRunner.SetCustomAgent"/> must accept all defined worker roles.
-    /// This test verifies each role can be set without throwing.
+    /// <see cref="SharpCoderRunner.SetCustomAgent"/> must accept every defined
+    /// <see cref="WorkerRole"/> value without throwing.
     /// </summary>
     [Theory]
     [InlineData(WorkerRole.Coder)]
@@ -74,240 +76,215 @@ public sealed class SharpCoderRunnerLoggingTests : IDisposable
     public void SetCustomAgent_AcceptsAllRoles(WorkerRole role)
     {
         var runner = new SharpCoderRunner();
-        runner.SetCustomAgent(role, "test agent content");
-
-        Assert.NotNull(runner);
+        var ex = Record.Exception(() => runner.SetCustomAgent(role, "test agent content"));
+        Assert.Null(ex);
     }
 
     #endregion
 
-    #region SetCustomAgent stores Tester role
+    // ── Opening log line (role + model) ───────────────────────────────────────
+
+    #region SendPromptAsync logs opening line with correct role and model
 
     /// <summary>
-    /// <see cref="SharpCoderRunner.SetCustomAgent"/> must correctly store Tester role.
-    /// </summary>
-    [Fact]
-    public void SetCustomAgent_StoresTesterRole()
-    {
-        var runner = new SharpCoderRunner();
-        runner.SetCustomAgent(WorkerRole.Tester, "test agent content");
-
-        Assert.NotNull(runner);
-    }
-
-    #endregion
-
-    // ── Model capture tests ─────────────────────────────────────────────────────
-
-    #region ConnectAsync initializes default model
-
-    /// <summary>
-    /// <see cref="SharpCoderRunner.ConnectAsync"/> must initialize the model field.
-    /// Without an environment variable, the model defaults to "(default)" which
-    /// is logged when SendPromptAsync is called.
-    /// </summary>
-    [Fact]
-    public async Task ConnectAsync_InitializesDefaultModel()
-    {
-        var runner = new SharpCoderRunner();
-        await runner.ConnectAsync(TestContext.Current.CancellationToken);
-
-        // Model is captured internally; log output verification requires SendPromptAsync
-        // which needs a real IChatClient
-        await runner.DisposeAsync();
-    }
-
-    #endregion
-
-    #region ConnectAsync logs model initialization
-
-    /// <summary>
-    /// <see cref="SharpCoderRunner.ConnectAsync"/> must log the model initialization.
-    /// The log message format is: "Creating chat client: provider={provider}, model={model}"
-    /// This test verifies that the log output contains the model value.
-    /// </summary>
-    [Fact]
-    public async Task ConnectAsync_LogsModelInitialization()
-    {
-        _stdOut.GetStringBuilder().Clear();
-        var runner = new SharpCoderRunner();
-
-        try
-        {
-            await runner.ConnectAsync(TestContext.Current.CancellationToken);
-        }
-        catch (InvalidOperationException)
-        {
-            // Expected: GH_TOKEN not set for copilot provider
-            // But the log should still be emitted during the attempt
-        }
-
-        await runner.DisposeAsync();
-        var output = _stdOut.ToString();
-
-        // Verify that a log entry was emitted during initialization
-        // The WorkerLogger format is: [SharpCoder] message
-        Assert.Contains("[SharpCoder]", output);
-    }
-
-    #endregion
-
-    #region ResetSessionAsync with model override captures model name
-
-    /// <summary>
-    /// <see cref="SharpCoderRunner.ResetSessionAsync"/> with a model override must
-    /// capture the model name for logging. The model prefix (e.g., "copilot/") is
-    /// stripped by ChatClientFactory.ParseProviderAndModel.
-    /// </summary>
-    [Fact]
-    public async Task ResetSessionAsync_WithModelOverride_CapturesModelName()
-    {
-        var runner = new SharpCoderRunner();
-        await runner.ConnectAsync(TestContext.Current.CancellationToken);
-
-        // Reset with a model override - this will fail without credentials,
-        // but we can verify the model parsing logic
-        try
-        {
-            await runner.ResetSessionAsync("copilot/claude-sonnet-4.6", TestContext.Current.CancellationToken);
-        }
-        catch (InvalidOperationException)
-        {
-            // Expected: GH_TOKEN not set for copilot provider
-        }
-
-        await runner.DisposeAsync();
-    }
-
-    #endregion
-
-    // ── Integration test with mock IChatClient ───────────────────────────────────
-
-    #region SendPromptAsync logs role and model
-
-    /// <summary>
-    /// <see cref="SharpCoderRunner.SendPromptAsync"/> must log "Executing task as {role} with model {model}".
-    /// This integration test creates a SharpCoderRunner with a mock IChatClient to verify
-    /// the log format without requiring a real LLM connection.
+    /// <see cref="SharpCoderRunner.SendPromptAsync"/> must emit a log line that matches
+    /// "Executing task as {role} with model {model}. WorkDir: {workDir}"
+    /// using the role set by <see cref="SharpCoderRunner.SetCustomAgent"/> and the model
+    /// injected at construction time.
     /// </summary>
     [Fact]
     public async Task SendPromptAsync_LogsRoleAndModelInOpeningLine()
     {
-        // This test requires mocking the IChatClient, which is challenging because
-        // SharpCoder's CodingAgent requires specific IChatClient behavior.
-        // Instead, we verify the log format by checking the implementation:
-        // - _currentRole is set via SetCustomAgent
-        // - _currentModel is set via CreateChatClient (called in ConnectAsync/ResetSessionAsync)
-        // - The log message uses these fields in SendPromptAsync
+        const string ExpectedModel = "test-model-001";
+        var workDir = CreateTempWorkDir();
+        try
+        {
+            var runner = new SharpCoderRunner(CreateStubClient(), ExpectedModel);
+            runner.SetCustomAgent(WorkerRole.Tester, "you are a tester");
 
-        // The actual log format is:
-        // $"Executing task as {_currentRole} with model {_currentModel}. WorkDir: {workDir}"
+            _stdOut.GetStringBuilder().Clear();
+            await runner.SendPromptAsync("do something", workDir, CancellationToken.None);
+            await runner.DisposeAsync();
 
-        // Verify by inspecting the source that _currentRole defaults to WorkerRole.Coder (value 0)
-        // and _currentModel defaults to "(default)"
-        var runner = new SharpCoderRunner();
-        runner.SetCustomAgent(WorkerRole.Tester, "test agent");
-        await runner.ConnectAsync(TestContext.Current.CancellationToken);
-
-        // The log output would be captured if we could call SendPromptAsync,
-        // but that requires a working CodingAgent. The unit test validates
-        // that the role and model are stored correctly by verifying the fields
-        // are populated after ConnectAsync.
-        await runner.DisposeAsync();
-
-        // Verify the test infrastructure works
-        Assert.NotNull(runner);
+            var output = _stdOut.ToString();
+            var expectedLine = $"Executing task as Tester with model {ExpectedModel}. WorkDir: {workDir}";
+            Assert.Contains(expectedLine, output);
+        }
+        finally
+        {
+            Directory.Delete(workDir, recursive: true);
+        }
     }
 
     #endregion
 
-    #region SendPromptAsync logs elapsed time status and tool calls
+    #region SendPromptAsync uses role name from SetCustomAgent
 
     /// <summary>
-    /// <see cref="SharpCoderRunner.SendPromptAsync"/> must log "Task finished in {elapsed}s (status={status}, toolCalls={toolCalls})".
-    /// The elapsed time must be a non-negative number, status must match the AgentResult,
-    /// and toolCalls must match the AgentResult's ToolCallCount.
+    /// The opening log line must reflect the role that was passed to
+    /// <see cref="SharpCoderRunner.SetCustomAgent"/>. Each role name must appear exactly
+    /// as its enum member name in the log output.
     /// </summary>
-    [Fact]
-    public async Task SendPromptAsync_LogsElapsedTimeStatusAndToolCalls()
+    [Theory]
+    [InlineData(WorkerRole.Coder, "Coder")]
+    [InlineData(WorkerRole.Tester, "Tester")]
+    [InlineData(WorkerRole.Reviewer, "Reviewer")]
+    [InlineData(WorkerRole.DocWriter, "DocWriter")]
+    public async Task SendPromptAsync_OpeningLine_ContainsCorrectRoleName(WorkerRole role, string expectedRoleName)
     {
-        // This test verifies the log format structure by checking the implementation:
-        // - stopwatch.Elapsed.TotalSeconds is logged as {elapsed} with F2 format
-        // - result.Status is logged as {status}
-        // - result.ToolCallCount is logged as {toolCalls}
+        var workDir = CreateTempWorkDir();
+        try
+        {
+            var runner = new SharpCoderRunner(CreateStubClient(), "any-model");
+            runner.SetCustomAgent(role, "system prompt");
 
-        // The format is: $"Task finished in {stopwatch.Elapsed.TotalSeconds:F2}s (status={result.Status}, toolCalls={result.ToolCallCount})"
+            _stdOut.GetStringBuilder().Clear();
+            await runner.SendPromptAsync("task", workDir, CancellationToken.None);
+            await runner.DisposeAsync();
 
-        // We verify the format string structure is correct in the implementation
-        // Integration tests with a real CodingAgent would verify actual log output
-
-        var runner = new SharpCoderRunner();
-        await runner.DisposeAsync();
-
-        // Test passes if the format is correct - verified by code inspection
-        Assert.NotNull(runner);
+            var output = _stdOut.ToString();
+            Assert.Contains($"as {expectedRoleName} with model", output);
+        }
+        finally
+        {
+            Directory.Delete(workDir, recursive: true);
+        }
     }
 
     #endregion
 
-    // ── Default values tests ─────────────────────────────────────────────────────
+    // ── Closing log line (elapsed + status + toolCalls) ───────────────────────
 
-    #region Default model is placeholder
+    #region SendPromptAsync logs closing line with status and toolCalls
 
     /// <summary>
-    /// The default model value must be "(default)" as specified in the implementation.
-    /// This ensures the log message always shows a meaningful value even when no model is specified.
+    /// <see cref="SharpCoderRunner.SendPromptAsync"/> must emit a closing log line that:
+    /// (a) contains "status=" with the correct status value from the agent result,
+    /// (b) contains "toolCalls=" with the correct tool-call count,
+    /// (c) contains a non-negative elapsed time in seconds.
+    /// The stub returns Status="Success" with 0 tool calls.
     /// </summary>
     [Fact]
-    public void DefaultModel_IsPlaceholder()
+    public async Task SendPromptAsync_LogsClosingLineWithElapsedStatusAndToolCalls()
     {
-        // The field is private, but we can verify the implementation:
-        // private string _currentModel = "(default)";
-        // This test documents the expected default value.
-        const string ExpectedDefaultModel = "(default)";
-        Assert.Equal("(default)", ExpectedDefaultModel);
+        var workDir = CreateTempWorkDir();
+        try
+        {
+            var runner = new SharpCoderRunner(CreateStubClient("All done."), "stub-model");
+            runner.SetCustomAgent(WorkerRole.Coder, "system prompt");
+
+            _stdOut.GetStringBuilder().Clear();
+            await runner.SendPromptAsync("do the task", workDir, CancellationToken.None);
+            await runner.DisposeAsync();
+
+            var output = _stdOut.ToString();
+
+            // (a) status must be present
+            Assert.Contains("status=", output);
+
+            // (b) toolCalls must be present with a non-negative integer value
+            Assert.Contains("toolCalls=", output);
+
+            // (c) elapsed time must be present and non-negative
+            // Pattern: "Task finished in <number>s"
+            var elapsedMatch = Regex.Match(output, @"Task finished in (\d+\.\d+)s");
+            Assert.True(elapsedMatch.Success, $"Expected 'Task finished in <elapsed>s' in output:\n{output}");
+            var elapsed = double.Parse(elapsedMatch.Groups[1].Value);
+            Assert.True(elapsed >= 0.0, $"Elapsed time must be non-negative, got {elapsed}");
+        }
+        finally
+        {
+            Directory.Delete(workDir, recursive: true);
+        }
     }
 
     #endregion
 
-    #region Default role is Unspecified (value 0)
+    #region SendPromptAsync closing line status value matches result
 
     /// <summary>
-    /// The default role must be WorkerRole.Unspecified (value 0) as specified in the enum.
-    /// This ensures the log message shows a valid role even if SetCustomAgent is not called.
+    /// The status field in the closing log line must reflect the actual agent result status.
+    /// The stub client returns a response that causes the CodingAgent to terminate with "Success".
     /// </summary>
     [Fact]
-    public void DefaultRole_IsUnspecified()
+    public async Task SendPromptAsync_ClosingLine_ContainsSuccessStatus()
     {
-        // The field is private: private WorkerRole _currentRole;
-        // WorkerRole is an enum where Unspecified is the default (0)
-        Assert.Equal(0, (int)WorkerRole.Unspecified);
+        var workDir = CreateTempWorkDir();
+        try
+        {
+            var runner = new SharpCoderRunner(CreateStubClient(), "model-x");
+            runner.SetCustomAgent(WorkerRole.Coder, "prompt");
+
+            _stdOut.GetStringBuilder().Clear();
+            await runner.SendPromptAsync("task", workDir, CancellationToken.None);
+            await runner.DisposeAsync();
+
+            var output = _stdOut.ToString();
+            Assert.Contains("status=Success", output);
+        }
+        finally
+        {
+            Directory.Delete(workDir, recursive: true);
+        }
     }
 
     #endregion
 
-    // ── Log format verification tests ────────────────────────────────────────────
+    #region SendPromptAsync closing line toolCalls value is non-negative
+
+    /// <summary>
+    /// The toolCalls field in the closing log line must be a non-negative integer.
+    /// For the stub client (no tool calls), it must be 0.
+    /// </summary>
+    [Fact]
+    public async Task SendPromptAsync_ClosingLine_ContainsNonNegativeToolCallsCount()
+    {
+        var workDir = CreateTempWorkDir();
+        try
+        {
+            var runner = new SharpCoderRunner(CreateStubClient(), "model-y");
+            runner.SetCustomAgent(WorkerRole.Coder, "prompt");
+
+            _stdOut.GetStringBuilder().Clear();
+            await runner.SendPromptAsync("task", workDir, CancellationToken.None);
+            await runner.DisposeAsync();
+
+            var output = _stdOut.ToString();
+            var match = Regex.Match(output, @"toolCalls=(\d+)");
+            Assert.True(match.Success, $"Expected 'toolCalls=<n>' in output:\n{output}");
+            var toolCalls = int.Parse(match.Groups[1].Value);
+            Assert.True(toolCalls >= 0, $"toolCalls must be non-negative, got {toolCalls}");
+        }
+        finally
+        {
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    #endregion
+
+    // ── Log format structure ─────────────────────────────────────────────────
 
     #region Opening log message format is correct
 
     /// <summary>
     /// The opening log message must follow the exact format:
     /// "Executing task as {role} with model {model}. WorkDir: {workDir}"
-    /// This test verifies the format string structure.
+    /// This test verifies the format string structure with sample values.
     /// </summary>
     [Fact]
     public void OpeningLogMessage_HasCorrectFormat()
     {
-        // Simulate the log message format
         var role = WorkerRole.Tester;
         var model = "claude-sonnet-4.6";
         var workDir = "/workspace/repo";
 
-        var expectedFormat = $"Executing task as {role} with model {model}. WorkDir: {workDir}";
+        var logMessage = $"Executing task as {role} with model {model}. WorkDir: {workDir}";
 
-        Assert.Contains("Tester", expectedFormat);
-        Assert.Contains("claude-sonnet-4.6", expectedFormat);
-        Assert.Contains("/workspace/repo", expectedFormat);
+        Assert.Contains("Tester", logMessage);
+        Assert.Contains("claude-sonnet-4.6", logMessage);
+        Assert.Contains("/workspace/repo", logMessage);
+        Assert.StartsWith("Executing task as ", logMessage);
     }
 
     #endregion
@@ -316,7 +293,7 @@ public sealed class SharpCoderRunnerLoggingTests : IDisposable
 
     /// <summary>
     /// The opening log message must contain the role name as its enum string representation.
-    /// WorkerRole.ToString() returns the enum member name (e.g., "Coder", "Tester").
+    /// <c>WorkerRole.ToString()</c> returns the enum member name (e.g., "Coder", "Tester").
     /// </summary>
     [Theory]
     [InlineData(WorkerRole.Coder, "Coder")]
@@ -341,8 +318,7 @@ public sealed class SharpCoderRunnerLoggingTests : IDisposable
 
     /// <summary>
     /// The opening log message must contain the model name.
-    /// The model name is captured from CreateChatClient and may be a real model name
-    /// or the placeholder "(default)".
+    /// The model name may be a real model name or the placeholder "(default)".
     /// </summary>
     [Theory]
     [InlineData("claude-sonnet-4.6")]
@@ -396,12 +372,11 @@ public sealed class SharpCoderRunnerLoggingTests : IDisposable
     [InlineData(1.00, "MaxSteps", 50)]
     public void ClosingLogMessage_HasCorrectFormat(double elapsedSeconds, string status, int toolCalls)
     {
-        // Simulate the log message format
-        var expectedFormat = $"Task finished in {elapsedSeconds:F2}s (status={status}, toolCalls={toolCalls})";
+        var logMessage = $"Task finished in {elapsedSeconds:F2}s (status={status}, toolCalls={toolCalls})";
 
-        Assert.Contains($"{elapsedSeconds:F2}s", expectedFormat);
-        Assert.Contains($"status={status}", expectedFormat);
-        Assert.Contains($"toolCalls={toolCalls}", expectedFormat);
+        Assert.Contains($"{elapsedSeconds:F2}s", logMessage);
+        Assert.Contains($"status={status}", logMessage);
+        Assert.Contains($"toolCalls={toolCalls}", logMessage);
     }
 
     #endregion
@@ -432,7 +407,6 @@ public sealed class SharpCoderRunnerLoggingTests : IDisposable
 
     /// <summary>
     /// The closing log message toolCalls must reflect the AgentResult.ToolCallCount.
-    /// This test verifies various tool call counts are correctly formatted.
     /// </summary>
     [Theory]
     [InlineData(0)]
@@ -455,13 +429,13 @@ public sealed class SharpCoderRunnerLoggingTests : IDisposable
 
     /// <summary>
     /// The elapsed time must be formatted with F2 (two decimal places) to provide
-    /// consistent, readable output. Values like 0.05 or 99.99 must display correctly.
+    /// consistent, readable output.
     /// </summary>
     [Theory]
     [InlineData(0.05, "0.05")]
     [InlineData(1.0, "1.00")]
-    [InlineData(12.345, "12.35")] // Rounds to 2 decimal places
-    [InlineData(99.999, "100.00")] // Rounds to 2 decimal places
+    [InlineData(12.345, "12.35")]
+    [InlineData(99.999, "100.00")]
     public void ElapsedTime_IsFormattedWithTwoDecimalPlaces(double elapsedSeconds, string expectedOutput)
     {
         var formatted = elapsedSeconds.ToString("F2");
@@ -469,4 +443,40 @@ public sealed class SharpCoderRunnerLoggingTests : IDisposable
     }
 
     #endregion
+}
+
+/// <summary>
+/// A minimal <see cref="IChatClient"/> stub that returns a single assistant reply and then
+/// signals completion, allowing <see cref="SharpCoder.CodingAgent"/> to finish in one step.
+/// </summary>
+file sealed class StubChatClient(string replyText) : IChatClient
+{
+    /// <inheritdoc />
+    public ChatClientMetadata Metadata => new("stub", null, "stub-model");
+
+    /// <inheritdoc />
+    public Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        var response = new ChatResponse(new ChatMessage(ChatRole.Assistant, replyText))
+        {
+            FinishReason = ChatFinishReason.Stop,
+        };
+        return Task.FromResult(response);
+    }
+
+    /// <inheritdoc />
+    public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException("Streaming is not used in these tests.");
+
+    /// <inheritdoc />
+    public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+    /// <inheritdoc />
+    public void Dispose() { }
 }

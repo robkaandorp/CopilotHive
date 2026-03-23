@@ -28,6 +28,25 @@ public sealed class SharpCoderRunner : IAgentRunner
     private IChatClient? _chatClient;
     private string _currentModel = "(default)";
 
+    /// <summary>
+    /// Initializes a new <see cref="SharpCoderRunner"/>. Call <see cref="ConnectAsync"/>
+    /// before invoking <see cref="SendPromptAsync"/> to create the chat client.
+    /// </summary>
+    public SharpCoderRunner() { }
+
+    /// <summary>
+    /// Internal constructor for unit testing: injects a pre-created <see cref="IChatClient"/>
+    /// and model name, bypassing <see cref="CopilotHive.SDK.ChatClientFactory"/> so that tests
+    /// can run without real LLM credentials.
+    /// </summary>
+    /// <param name="chatClient">The chat client to use for agent execution.</param>
+    /// <param name="model">The model identifier to record in log output.</param>
+    internal SharpCoderRunner(IChatClient chatClient, string model)
+    {
+        _chatClient = chatClient;
+        _currentModel = model;
+    }
+
     private IToolCallBridge? _toolBridge;
     private string? _currentTaskId;
     private WorkerRole _currentRole;

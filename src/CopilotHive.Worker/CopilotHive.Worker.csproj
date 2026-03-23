@@ -1,8 +1,12 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
   </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CopilotHive.Tests" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Grpc.Net.Client" Version="2.76.0" />
