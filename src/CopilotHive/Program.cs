@@ -11,6 +11,7 @@ using CopilotHive.Models;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 
 // ── Server mode (only mode) ──────────────────────────────────────────────────
@@ -113,6 +114,9 @@ static async Task<int> RunServerAsync(string[] args)
     // Dashboard: Blazor Server + real-time state aggregation
     builder.Services.AddSingleton<DashboardStateService>();
     builder.Services.AddRazorComponents().AddInteractiveServerComponents();
+    // Persist data protection keys so antiforgery tokens survive container restarts
+    builder.Services.AddDataProtection()
+        .PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(stateDir, "keys")));
 
     if (!string.IsNullOrEmpty(configRepoUrl))
     {
@@ -200,7 +204,7 @@ static async Task<int> RunServerAsync(string[] args)
 
     app.MapGrpcService<HiveOrchestratorService>();
 
-    // Dashboard: Blazor Server
+    // Dashboard: Blazor Server (antiforgery keys persisted to state volume)
     app.UseStaticFiles();
     app.UseAntiforgery();
     app.MapRazorComponents<CopilotHive.Components.App>()
