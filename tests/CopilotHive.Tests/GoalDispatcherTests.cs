@@ -212,6 +212,10 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
     public Task<string> CraftPromptAsync(
         GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
         Task.FromResult($"Work on {pipeline.Description} as {phase}");
+
+    public Task CleanupGoalSessionAsync(string goalId) => Task.CompletedTask;
+
+    public Task ReprimeSessionAsync(GoalPipeline pipeline, CancellationToken ct) => Task.CompletedTask;
 }
 
 /// <summary>

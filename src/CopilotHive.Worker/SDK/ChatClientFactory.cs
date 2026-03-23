@@ -1,0 +1,268 @@
+#pragma warning disable CS1591
+#pragma warning disable OPENAI001 // ResponsesClient.AsIChatClient is experimental
+using System;
+using System.Collections.Generic;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text.Json.Nodes;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.AI;
+using OpenAI;
+using System.ClientModel;
+using OllamaSharp;
+
+namespace CopilotHive.SDK;
+
+/// <summary>
+/// Creates <see cref="IChatClient"/> instances for various LLM providers.
+/// Shared between Worker and Orchestrator (Brain).
+/// </summary>
+public static class ChatClientFactory
+{
+    /// <summary>
+    /// Creates an <see cref="IChatClient"/> for the given model string.
+    /// The model string may include a provider prefix (e.g. "copilot/claude-sonnet-4.6").
+    /// </summary>
+    public static IChatClient Create(string? modelOverride = null)
+    {
+        var (provider, model) = ParseProviderAndModel(modelOverride);
+
+        switch (provider)
+        {
+            case "ollama-cloud":
+            {
+                var apiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
+                if (string.IsNullOrEmpty(apiKey)) throw new InvalidOperationException("OLLAMA_API_KEY is required for ollama-cloud provider");
+
+                var httpClient = new HttpClient { BaseAddress = new Uri("https://ollama.com") };
+                httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+
+                model ??= Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "gpt-oss:120b";
+                var ollamaClient = new OllamaApiClient(httpClient);
+                ollamaClient.SelectedModel = model;
+                return ollamaClient;
+            }
+
+            case "ollama-local":
+            {
+                var url = Environment.GetEnvironmentVariable("OLLAMA_URL") ?? "http://localhost:11434";
+                model ??= Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "llama3";
+                var ollamaClient = new OllamaApiClient(new Uri(url));
+                ollamaClient.SelectedModel = model;
+                return ollamaClient;
+            }
+
+            case "github":
+            {
+                var token = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+                if (string.IsNullOrEmpty(token)) throw new InvalidOperationException("GH_TOKEN or GITHUB_TOKEN is required for github provider");
+
+                model ??= Environment.GetEnvironmentVariable("GITHUB_MODEL") ?? "openai/gpt-4.1";
+
+                var openAiClient = new OpenAIClient(
+                    new ApiKeyCredential(token),
+                    new OpenAIClientOptions { Endpoint = new Uri("https://models.github.ai") }
+                );
+
+                return openAiClient.GetChatClient(model).AsIChatClient();
+            }
+
+            case "copilot":
+                return CreateCopilotClient(model ?? Environment.GetEnvironmentVariable("COPILOT_MODEL") ?? "claude-sonnet-4.6");
+
+            default:
+                throw new InvalidOperationException($"Unknown LLM provider: '{provider}'");
+        }
+    }
+
+    /// <summary>
+    /// Extracts an optional provider prefix from the model string.
+    /// "copilot/claude-sonnet-4.6" → ("copilot", "claude-sonnet-4.6")
+    /// "claude-sonnet-4.6" → (env LLM_PROVIDER, "claude-sonnet-4.6")
+    /// null → (env LLM_PROVIDER, null)
+    /// </summary>
+    public static (string provider, string? model) ParseProviderAndModel(string? modelOverride)
+    {
+        var defaultProvider = Environment.GetEnvironmentVariable("LLM_PROVIDER")?.ToLowerInvariant() ?? "copilot";
+
+        if (string.IsNullOrEmpty(modelOverride))
+            return (defaultProvider, null);
+
+        var slashIndex = modelOverride.IndexOf('/');
+        if (slashIndex <= 0)
+            return (defaultProvider, modelOverride);
+
+        var prefix = modelOverride.Substring(0, slashIndex).ToLowerInvariant();
+
+        // Only treat as provider prefix if it matches a known provider.
+        if (prefix is "copilot" or "ollama-cloud" or "ollama-local" or "github")
+            return (prefix, modelOverride.Substring(slashIndex + 1));
+
+        return (defaultProvider, modelOverride);
+    }
+
+    /// <summary>
+    /// Models that must use the /responses endpoint instead of /chat/completions.
+    /// </summary>
+    public static bool RequiresResponsesEndpoint(string model)
+    {
+        return model.StartsWith("gpt-5", StringComparison.OrdinalIgnoreCase)
+            || model.StartsWith("o3", StringComparison.OrdinalIgnoreCase)
+            || model.StartsWith("o4", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static IChatClient CreateCopilotClient(string model)
+    {
+        var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+        if (string.IsNullOrEmpty(ghToken)) throw new InvalidOperationException("GH_TOKEN or GITHUB_TOKEN is required for copilot provider");
+
+        if (RequiresResponsesEndpoint(model))
+        {
+            var handler = new CopilotResponsesHandler(new HttpClientHandler());
+            var httpClient = new HttpClient(handler);
+
+            var openAiClient = new OpenAIClient(
+                new ApiKeyCredential(ghToken),
+                new OpenAIClientOptions
+                {
+                    Endpoint = new Uri("https://api.githubcopilot.com"),
+                    Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient)
+                }
+            );
+            return openAiClient.GetResponsesClient().AsIChatClient(model);
+        }
+        else
+        {
+            var handler = new CopilotChoiceMergingHandler(new HttpClientHandler());
+            var httpClient = new HttpClient(handler);
+
+            var openAiClient = new OpenAIClient(
+                new ApiKeyCredential(ghToken),
+                new OpenAIClientOptions
+                {
+                    Endpoint = new Uri("https://api.githubcopilot.com"),
+                    Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient)
+                }
+            );
+            return openAiClient.GetChatClient(model).AsIChatClient();
+        }
+    }
+
+    /// <summary>
+    /// The GitHub Copilot API splits tool_calls and text content into separate choices.
+    /// The OpenAI SDK only reads choices[0], losing the tool_calls. This handler
+    /// merges all choices into a single choice so the SDK sees both text and tool_calls.
+    /// </summary>
+    internal sealed class CopilotChoiceMergingHandler : DelegatingHandler
+    {
+        public CopilotChoiceMergingHandler(HttpMessageHandler inner) : base(inner) { }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken ct)
+        {
+            var response = await base.SendAsync(request, ct);
+            if (!response.IsSuccessStatusCode) return response;
+
+            var body = await response.Content.ReadAsStringAsync();
+
+            try
+            {
+                var json = JsonNode.Parse(body);
+                var choices = json?["choices"]?.AsArray();
+
+                if (choices == null || choices.Count <= 1) return ReplaceContent(response, body);
+
+                JsonObject? toolChoice = null;
+                string? textContent = null;
+
+                foreach (var c in choices)
+                {
+                    if (c == null) continue;
+                    var msg = c["message"];
+                    if (msg == null) continue;
+
+                    if (msg["tool_calls"] is JsonArray { Count: > 0 })
+                        toolChoice = c.AsObject();
+                    else if (msg["content"] is JsonValue val && val.TryGetValue<string>(out var text) && text.Length > 0)
+                        textContent = text;
+                }
+
+                if (toolChoice != null)
+                {
+                    if (textContent != null && toolChoice["message"] is JsonObject merged)
+                    {
+                        merged["content"] = textContent;
+                    }
+
+                    toolChoice.Parent?.AsArray().Remove(toolChoice);
+                    json!["choices"] = new JsonArray(toolChoice);
+                    body = json.ToJsonString();
+                }
+            }
+            catch (Exception)
+            {
+                // If merging fails, return the original response unchanged
+            }
+
+            return ReplaceContent(response, body);
+        }
+
+        private static HttpResponseMessage ReplaceContent(HttpResponseMessage response, string body)
+        {
+            response.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+            return response;
+        }
+    }
+
+    /// <summary>
+    /// The Copilot API doesn't support previous_response_id on the /responses endpoint.
+    /// This handler inlines the previous response's output into follow-up requests.
+    /// </summary>
+    internal sealed class CopilotResponsesHandler : DelegatingHandler
+    {
+        private JsonNode? _lastResponseOutput;
+
+        public CopilotResponsesHandler(HttpMessageHandler inner) : base(inner) { }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken ct)
+        {
+            if (request.Content != null && request.RequestUri?.AbsolutePath?.Contains("responses") == true)
+            {
+                var body = await request.Content.ReadAsStringAsync();
+                var json = JsonNode.Parse(body);
+
+                if (json is JsonObject obj && obj.ContainsKey("previous_response_id"))
+                {
+                    obj.Remove("previous_response_id");
+
+                    if (_lastResponseOutput is JsonArray prevOutput && obj["input"] is JsonArray input)
+                    {
+                        var combined = new JsonArray();
+                        foreach (var item in prevOutput)
+                            combined.Add(item!.DeepClone());
+                        foreach (var item in input)
+                            combined.Add(item!.DeepClone());
+                        obj["input"] = combined;
+                    }
+
+                    body = obj.ToJsonString();
+                    request.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+                }
+            }
+
+            var response = await base.SendAsync(request, ct);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var respBody = await response.Content.ReadAsStringAsync();
+                var respJson = JsonNode.Parse(respBody);
+                _lastResponseOutput = respJson?["output"]?.DeepClone();
+                response.Content = new StringContent(respBody, System.Text.Encoding.UTF8, "application/json");
+            }
+
+            return response;
+        }
+    }
+}

@@ -9,7 +9,7 @@ namespace CopilotHive.Orchestration;
 /// </summary>
 public interface IDistributedBrain
 {
-    /// <summary>Connect to the local Copilot CLI instance.</summary>
+    /// <summary>Connect to the LLM provider and initialise the chat client.</summary>
     Task ConnectAsync(CancellationToken ct = default);
 
     /// <summary>
@@ -28,4 +28,13 @@ public interface IDistributedBrain
         GoalPhase phase,
         string? additionalContext = null,
         CancellationToken ct = default);
+
+    /// <summary>Removes the session for a completed/failed goal and frees resources.</summary>
+    Task CleanupGoalSessionAsync(string goalId);
+
+    /// <summary>
+    /// Restores a session for an in-progress goal on restart.
+    /// Replays conversation history or loads a persisted session file.
+    /// </summary>
+    Task ReprimeSessionAsync(GoalPipeline pipeline, CancellationToken ct);
 }

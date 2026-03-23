@@ -1047,9 +1047,9 @@ public sealed class GoalDispatcher : BackgroundService
 
     private async Task CleanupBrainSessionAsync(string goalId)
     {
-        if (_brain is DistributedBrain brain)
+        if (_brain is not null)
         {
-            try { await brain.CleanupGoalSessionAsync(goalId); }
+            try { await _brain.CleanupGoalSessionAsync(goalId); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to cleanup Brain session for goal {GoalId}", goalId); }
         }
     }
@@ -1170,11 +1170,11 @@ public sealed class GoalDispatcher : BackgroundService
             _dispatchedGoals.TryAdd(pipeline.GoalId, true);
 
             // Re-prime Brain session with conversation history
-            if (_brain is DistributedBrain brain && pipeline.Conversation.Count > 0)
+            if (_brain is not null && pipeline.Conversation.Count > 0)
             {
                 try
                 {
-                    await brain.ReprimeSessionAsync(pipeline, ct);
+                    await _brain.ReprimeSessionAsync(pipeline, ct);
                     _logger.LogInformation("Re-primed Brain session for goal {GoalId} ({ConvCount} entries)",
                         pipeline.GoalId, pipeline.Conversation.Count);
                 }

@@ -6,26 +6,27 @@ using CopilotHive.Metrics;
 using CopilotHive.Services;
 using CopilotHive.Telemetry;
 using CopilotHive.Workers;
-using GitHub.Copilot.SDK;
 using Microsoft.Extensions.AI;
+using SharpCoder;
 
 namespace CopilotHive.Orchestration;
 
 /// <summary>
 /// LLM-powered brain that runs inside the orchestrator container.
 /// The Brain has two jobs: plan iteration phases and craft worker prompts.
-/// Workers report structured verdicts; the state machine drives sequencing.
+/// Uses SharpCoder's IChatClient + AgentSession for LLM communication.
 /// </summary>
 public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 {
-    private readonly int _port;
+    private readonly string _modelOverride;
     private readonly ILogger<DistributedBrain> _logger;
     private readonly MetricsTracker? _metricsTracker;
-    private CopilotClient? _copilotClient;
-    private readonly ConcurrentDictionary<string, CopilotSession> _sessions = new();
+    private IChatClient? _chatClient;
+    private IChatClient? _wrappedClient;
+    private readonly ConcurrentDictionary<string, AgentSession> _sessions = new();
 
-    private readonly CustomAgentConfig _orchestratorAgent;
-    private readonly List<AIFunction> _brainTools;
+    private readonly string _systemPrompt;
+    private readonly List<AITool> _brainTools;
 
     /// <summary>
     /// Serialises all Brain LLM calls so that <see cref="_lastToolCallResult"/> is
@@ -35,13 +36,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     /// <summary>
     /// Stores the last tool call result captured by the Brain tool lambdas.
-    /// Written by tool lambdas (from SDK thread), read by <see cref="SendToSessionCoreAsync"/>
-    /// after <see cref="SessionIdleEvent"/> fires.
+    /// Written by tool lambdas (from FunctionInvokingChatClient thread),
+    /// read after ExecuteAsync completes.
     /// Access is serialised by <see cref="_brainCallGate"/>.
     /// </summary>
     private volatile BrainToolCallResult? _lastToolCallResult;
 
-    private const string SystemPrompt = """
+    private const string DefaultSystemPrompt = """
         You are the CopilotHive Orchestrator Brain — a product owner and project manager.
         You have two jobs:
         1. Plan iteration phases using the report_iteration_plan tool
@@ -56,116 +57,54 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         """;
 
     /// <summary>
-    /// Permission handler that approves all tool calls.
-    /// Built-in tools (shell, read, write, url) are already blocked by --deny-tool CLI flags
-    /// in entrypoint.sh. Custom tools (report_iteration_plan) need approval to execute.
+    /// Initialises a new <see cref="DistributedBrain"/> that connects directly to an LLM provider.
     /// </summary>
-    private static readonly PermissionRequestHandler ApproveBrainTools =
-        (_, _) => Task.FromResult(new PermissionRequestResult
-        {
-            Kind = PermissionRequestResultKind.Approved,
-        });
-
-    /// <summary>
-    /// Initialises a new <see cref="DistributedBrain"/> that connects to the Copilot CLI on the given port.
-    /// </summary>
-    /// <param name="port">TCP port the Copilot CLI is listening on.</param>
+    /// <param name="modelOverride">Model string, optionally with provider prefix (e.g. "copilot/claude-sonnet-4.6").</param>
     /// <param name="logger">Logger instance.</param>
     /// <param name="metricsTracker">Optional tracker used to include historical metrics in prompts.</param>
     /// <param name="agentsManager">Optional manager used to load the orchestrator's AGENTS.md.</param>
-    public DistributedBrain(int port, ILogger<DistributedBrain> logger,
+    public DistributedBrain(string modelOverride, ILogger<DistributedBrain> logger,
         MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null)
     {
-        _port = port;
+        _modelOverride = modelOverride;
         _logger = logger;
         _metricsTracker = metricsTracker;
 
         _brainTools = BuildBrainTools();
 
-        // Build the orchestrator custom agent — Tools = null allows all tools.
-        // Custom tools are registered on SessionConfig.Tools (AIFunction list).
-        // Built-in tools are blocked by --deny-tool CLI flags in entrypoint.sh.
-        // Setting an explicit tool name list here causes the CLI to look up names in its
-        // built-in registry, which fails for custom tools with a JS TypeError.
         var orchestratorInstructions = agentsManager?.GetAgentsMd(WorkerRole.Orchestrator) ?? "";
-        _orchestratorAgent = new CustomAgentConfig
-        {
-            Name = "orchestrator",
-            DisplayName = "CopilotHive Orchestrator",
-            Description = "LLM-powered product owner and project manager — plans iterations and crafts prompts",
-            Prompt = string.IsNullOrWhiteSpace(orchestratorInstructions)
-                ? SystemPrompt
-                : $"{SystemPrompt}\n\n{orchestratorInstructions}",
-            Tools = null,
-            Infer = false,
-        };
+        _systemPrompt = string.IsNullOrWhiteSpace(orchestratorInstructions)
+            ? DefaultSystemPrompt
+            : $"{DefaultSystemPrompt}\n\n{orchestratorInstructions}";
     }
 
     /// <summary>
-    /// Connects to the Copilot CLI, retrying up to <see cref="Constants.DistributedBrainMaxRetries"/> times with a 5-second backoff.
+    /// Creates the IChatClient for the configured model/provider.
     /// </summary>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>A task that represents the asynchronous operation.</returns>
-    public async Task ConnectAsync(CancellationToken ct = default)
+    public Task ConnectAsync(CancellationToken ct = default)
     {
-        _copilotClient = new CopilotClient(new CopilotClientOptionsWithTelemetry
-        {
-            CliUrl = $"localhost:{_port}",
-            AutoStart = false,
-            Telemetry = new TelemetryConfig
-            {
-                FilePath = "/app/state/otel-brain.jsonl",
-                ExporterType = "file",
-                SourceName = "copilothive-brain",
-                CaptureContent = true
-            }
-        });
+        _logger.LogInformation("Brain connecting with model '{Model}'…", _modelOverride);
 
-        // Retry connection to Copilot CLI
-        Exception? lastException = null;
-        for (var attempt = 1; attempt <= Constants.DistributedBrainMaxRetries; attempt++)
-        {
-            try
-            {
-                await _copilotClient.StartAsync();
-                _logger.LogInformation("Brain connected to Copilot on port {Port} (attempt {Attempt})", _port, attempt);
-                return;
-            }
-            catch (Exception ex) when (attempt < Constants.DistributedBrainMaxRetries)
-            {
-                lastException = ex;
-                _logger.LogDebug("Brain connection attempt {Attempt}/{Max} failed: {Message}", attempt, Constants.DistributedBrainMaxRetries, ex.Message);
-                await Task.Delay(TimeSpan.FromSeconds(Constants.RetryDelaySeconds), ct);
-            }
-        }
+        _chatClient = SDK.ChatClientFactory.Create(_modelOverride);
 
-        throw new InvalidOperationException(
-            $"Brain failed to connect to Copilot on port {_port} after {Constants.DistributedBrainMaxRetries} attempts: {lastException?.Message}");
+        // Wrap with FunctionInvokingChatClient for tool auto-invocation
+        _wrappedClient = new ChatClientBuilder(_chatClient)
+            .UseFunctionInvocation(configure: fic =>
+            {
+                fic.MaximumIterationsPerRequest = 5; // Brain tools are simple, 5 iterations is plenty
+                fic.IncludeDetailedErrors = true;
+            })
+            .Build();
+
+        _logger.LogInformation("Brain connected via SharpCoder (model={Model})", _modelOverride);
+        return Task.CompletedTask;
     }
-
-    /// <summary>
-    /// Builds the standard SessionConfig for Brain sessions with InfiniteSessions enabled
-    /// to prevent context window exhaustion on complex goals.
-    /// </summary>
-    private SessionConfig BuildBrainSessionConfig() => new()
-    {
-        Streaming = false,
-        OnPermissionRequest = ApproveBrainTools,
-        CustomAgents = [_orchestratorAgent],
-        Tools = _brainTools,
-        InfiniteSessions = new InfiniteSessionConfig
-        {
-            Enabled = true,
-            BackgroundCompactionThreshold = 0.80,
-            BufferExhaustionThreshold = 0.95,
-        },
-    };
 
     /// <summary>
     /// Builds the AIFunction tools that the Brain LLM can call.
     /// Only <c>report_iteration_plan</c> — prompt crafting uses plain text responses.
     /// </summary>
-    private List<AIFunction> BuildBrainTools()
+    private List<AITool> BuildBrainTools()
     {
         var validPhases = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { "coding", "testing", "docwriting", "review", "improve", "merging" };
@@ -200,89 +139,44 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     internal sealed record BrainToolCallResult(string ToolName, Dictionary<string, object?> Arguments);
 
     /// <summary>
-    /// Gets or creates a dedicated Copilot session for a goal.
-    /// Each session maintains its own conversation history natively.
+    /// Gets or creates a dedicated AgentSession for a goal.
     /// </summary>
-    private async Task<CopilotSession> GetOrCreateSessionAsync(GoalPipeline pipeline, CancellationToken ct)
+    private AgentSession GetOrCreateSession(GoalPipeline pipeline)
     {
-        EnsureConnected();
-
-        if (_sessions.TryGetValue(pipeline.GoalId, out var existing))
-            return existing;
-
-        var session = await _copilotClient!.CreateSessionAsync(BuildBrainSessionConfig());
-
-        // Pre-select the orchestrator agent so the role-specific prompt is active
-        // from the first message — without this the runtime relies on inference.
-        try
+        return _sessions.GetOrAdd(pipeline.GoalId, _ =>
         {
-            await session.Rpc.Agent.SelectAsync(_orchestratorAgent.Name);
-            _logger.LogDebug("Pre-selected orchestrator agent via RPC for goal {GoalId}", pipeline.GoalId);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to pre-select orchestrator agent for goal {GoalId}", pipeline.GoalId);
-        }
-
-        if (_sessions.TryAdd(pipeline.GoalId, session))
-        {
-            // Prime the new session with the system prompt and goal context
-            await SendToSessionAsync(session, $"""
-                {SystemPrompt}
-
-                You are now working on goal '{pipeline.GoalId}':
-                {pipeline.Description}
-
-                Acknowledge briefly and await instructions.
-                """, ct);
-
-            _logger.LogInformation("Created new Copilot session for goal {GoalId}", pipeline.GoalId);
+            var session = AgentSession.Create(pipeline.GoalId);
+            _logger.LogInformation("Created new Brain session for goal {GoalId}", pipeline.GoalId);
             return session;
-        }
-
-        // Another thread beat us — dispose ours and use theirs
-        await session.DisposeAsync();
-        return _sessions[pipeline.GoalId];
+        });
     }
 
-    /// <summary>Removes and disposes the session for a completed/failed goal.</summary>
-    /// <param name="goalId">Identifier of the goal whose session should be removed.</param>
-    /// <returns>A task that represents the asynchronous operation.</returns>
-    public async Task CleanupGoalSessionAsync(string goalId)
+    /// <summary>Removes the session for a completed/failed goal.</summary>
+    public Task CleanupGoalSessionAsync(string goalId)
     {
-        if (_sessions.TryRemove(goalId, out var session))
-        {
-            await session.DisposeAsync();
-            _logger.LogInformation("Cleaned up Copilot session for goal {GoalId}", goalId);
-        }
+        if (_sessions.TryRemove(goalId, out _))
+            _logger.LogInformation("Cleaned up Brain session for goal {GoalId}", goalId);
+        return Task.CompletedTask;
     }
 
     /// <summary>
-    /// Re-creates a session and replays persisted conversation history into it.
-    /// Used on restart to restore Brain context for active goals.
+    /// Restores a session for an in-progress goal on restart.
+    /// Replays conversation history from the pipeline into a new session.
     /// </summary>
-    /// <param name="pipeline">The goal pipeline whose session should be re-primed.</param>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>A task that represents the asynchronous operation.</returns>
     public async Task ReprimeSessionAsync(GoalPipeline pipeline, CancellationToken ct)
     {
         EnsureConnected();
 
         // Remove any stale session
-        if (_sessions.TryRemove(pipeline.GoalId, out var stale))
-            await stale.DisposeAsync();
+        _sessions.TryRemove(pipeline.GoalId, out _);
 
-        var session = await _copilotClient!.CreateSessionAsync(BuildBrainSessionConfig());
+        var session = AgentSession.Create(pipeline.GoalId);
 
-        // Replay the conversation: alternate user/assistant messages
         var entries = pipeline.Conversation;
         if (entries.Count > 0)
         {
-            // Send the system prompt + summary of prior conversation as a single priming message
             var summary = string.Join("\n\n", entries.Select(e => $"[{e.Role}]: {e.Content}"));
-            await SendToSessionAsync(session, $"""
-                {SystemPrompt}
-
+            var primingPrompt = $"""
                 You are resuming work on goal '{pipeline.GoalId}':
                 {pipeline.Description}
 
@@ -291,33 +185,20 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
                 Continue from where we left off. The current phase is {pipeline.Phase},
                 iteration {pipeline.Iteration}. Acknowledge briefly and await instructions.
-                """, ct);
-        }
-        else
-        {
-            // No conversation — just prime with system prompt
-            await SendToSessionAsync(session, $"""
-                {SystemPrompt}
+                """;
 
-                You are resuming work on goal '{pipeline.GoalId}':
-                {pipeline.Description}
-
-                This is a resumed session. Current phase: {pipeline.Phase}, iteration {pipeline.Iteration}.
-                Acknowledge briefly and await instructions.
-                """, ct);
+            // Send priming message to populate session history
+            await SendToBrainCoreAsync(session, primingPrompt, ct);
         }
 
         _sessions[pipeline.GoalId] = session;
-        _logger.LogInformation("Re-primed Copilot session for goal {GoalId} with {Count} conversation entries",
+        _logger.LogInformation("Re-primed Brain session for goal {GoalId} with {Count} conversation entries",
             pipeline.GoalId, entries.Count);
     }
 
     /// <summary>
     /// Asks the Brain to plan which phases should run during the current iteration.
     /// </summary>
-    /// <param name="pipeline">Current goal pipeline state.</param>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>An <see cref="IterationPlan"/> with the ordered list of phases to execute.</returns>
     public async Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default)
     {
         var metricsContext = pipeline.Iteration > 1
@@ -373,11 +254,17 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - reason: why this plan
             """;
 
+        if (_wrappedClient is null)
+        {
+            _logger.LogWarning("Brain not connected — using default iteration plan for goal {GoalId}", pipeline.GoalId);
+            return IterationPlan.Default();
+        }
+
         try
         {
-            var session = await GetOrCreateSessionAsync(pipeline, ct);
+            var session = GetOrCreateSession(pipeline);
             var (response, toolCall) = await Shared.CopilotRetryPolicy.ExecuteAsync(
-                () => SendToSessionCoreAsync(session, prompt, ct),
+                () => SendToBrainCoreAsync(session, prompt, ct),
                 onRetry: (attempt, delay, ex) =>
                 {
                     _logger.LogWarning(
@@ -492,23 +379,14 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <summary>DTO for deserializing the Brain's iteration plan JSON response.</summary>
     internal sealed record IterationPlanDto
     {
-        /// <summary>Ordered list of phase names the Brain wants to execute this iteration.</summary>
         public List<string> Phases { get; init; } = [];
-        /// <summary>Per-phase instructions keyed by phase name, providing context for each phase.</summary>
         public Dictionary<string, string>? PhaseInstructions { get; init; }
-        /// <summary>The Brain's reasoning for choosing this iteration plan.</summary>
         public string? Reason { get; init; }
     }
 
     /// <summary>
     /// Asks the Brain to craft a prompt for the specified phase's worker.
-    /// Sends a message to the Brain session and returns the assistant's plain text response.
     /// </summary>
-    /// <param name="pipeline">Current goal pipeline state.</param>
-    /// <param name="phase">The phase whose worker needs a prompt.</param>
-    /// <param name="additionalContext">Optional extra context to include in the prompt.</param>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>The crafted prompt string.</returns>
     public async Task<string> CraftPromptAsync(
         GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
     {
@@ -562,9 +440,16 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Respond with ONLY the prompt text — no tool calls, no JSON, no markdown wrapping.
             """;
 
+        if (_wrappedClient is null)
+        {
+            _logger.LogWarning("Brain not connected — using fallback prompt for {GoalId} phase {Phase}",
+                pipeline.GoalId, phase);
+            return $"Work on: {pipeline.Description}";
+        }
+
         try
         {
-            var session = await GetOrCreateSessionAsync(pipeline, ct);
+            var session = GetOrCreateSession(pipeline);
 
             var craftedPrompt = await Shared.CopilotRetryPolicy.ExecuteAsync(
                 async () =>
@@ -572,7 +457,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     _logger.LogDebug("Brain craft-prompt request for {GoalId} (phase={Phase}):\n{Prompt}",
                         pipeline.GoalId, phase, Truncate(prompt, Constants.TruncationVerbose));
 
-                    var (response, _) = await SendToSessionCoreAsync(session, prompt, ct);
+                    var (response, _) = await SendToBrainCoreAsync(session, prompt, ct);
 
                     _logger.LogDebug("Brain craft-prompt response for {GoalId}:\n{Response}",
                         pipeline.GoalId, Truncate(response, Constants.TruncationVerbose));
@@ -631,90 +516,64 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
-    /// Sends a prompt to a Copilot session with exponential backoff retry.
-    /// Used for priming, status updates, and other non-tool-call calls.
+    /// Sends a prompt to the Brain LLM with tool auto-invocation.
+    /// Returns the response text and any captured tool call result.
     /// </summary>
-    private async Task<string> SendToSessionAsync(CopilotSession session, string prompt, CancellationToken ct)
+    private async Task<(string Text, BrainToolCallResult? ToolCall)> SendToBrainCoreAsync(
+        AgentSession session, string prompt, CancellationToken ct)
     {
-        var (text, _) = await Shared.CopilotRetryPolicy.ExecuteAsync(
-            () => SendToSessionCoreAsync(session, prompt, ct),
-            onRetry: (attempt, delay, ex) =>
-            {
-                _logger.LogWarning(
-                    "Brain Copilot call failed (attempt {Attempt}/{Max}): {Error}. Retrying in {Delay}s",
-                    attempt, Shared.CopilotRetryPolicy.MaxRetries + 1, ex.Message, delay.TotalSeconds);
-            },
-            ct);
-        return text;
-    }
+        EnsureConnected();
 
-    private async Task<(string Text, BrainToolCallResult? ToolCall)> SendToSessionCoreAsync(
-        CopilotSession session, string prompt, CancellationToken ct)
-    {
         await _brainCallGate.WaitAsync(ct);
         try
         {
-            var done = new TaskCompletionSource<(string, BrainToolCallResult?)>();
-            var response = "";
-
-            // Clear any previous tool call result before sending
             _lastToolCallResult = null;
 
-            using var subscription = session.On(evt =>
+            var chatOptions = new ChatOptions
             {
-                switch (evt)
-                {
-                    case AssistantMessageEvent msg:
-                        response = msg.Data.Content;
-                        _logger.LogDebug("{Source} AssistantMessage ({Length} chars)", "Brain-SDK", response.Length);
-                        break;
-                    case AssistantUsageEvent usage:
-                        _logger.LogDebug(
-                            "{Source} Usage: model={Model} in={InputTokens} out={OutputTokens} cost={Cost:F4} duration={Duration:F0}ms",
-                            "Brain-SDK", usage.Data.Model, usage.Data.InputTokens, usage.Data.OutputTokens,
-                            usage.Data.Cost, usage.Data.Duration);
-                        FileTracer.WriteUsage(usage.Data, "/app/state/traces-brain.jsonl", "brain");
-                        break;
-                    case SessionIdleEvent:
-                        _logger.LogDebug("{Source} SessionIdle", "Brain-SDK");
-                        done.TrySetResult((response, _lastToolCallResult));
-                        break;
-                    case SessionErrorEvent err:
-                        _logger.LogWarning("{Source} SessionError: {Message}", "Brain-SDK", err.Data.Message);
-                        done.TrySetException(new InvalidOperationException(err.Data.Message));
-                        break;
-                    case AssistantTurnStartEvent:
-                    case AssistantTurnEndEvent:
-                    case AssistantReasoningEvent:
-                    case SessionUsageInfoEvent:
-                    case PendingMessagesModifiedEvent:
-                    case UserMessageEvent:
-                    case SubagentSelectedEvent:
-                    case SessionInfoEvent:
-                        break;
-                    case SubagentStartedEvent:
-                        _logger.LogDebug("{Source} SubagentStarted", "Brain-SDK");
-                        break;
-                    case ToolExecutionStartEvent toolStart:
-                        _logger.LogDebug("{Source} ToolStart: {ToolName} (id={ToolCallId})",
-                            "Brain-SDK", toolStart.Data?.ToolName ?? "unknown", toolStart.Data?.ToolCallId);
-                        break;
-                    case ToolExecutionCompleteEvent toolEnd:
-                        _logger.LogDebug("{Source} ToolComplete: {ToolCallId} success={Success} error={Error}",
-                            "Brain-SDK", toolEnd.Data?.ToolCallId, toolEnd.Data?.Success, toolEnd.Data?.Error?.Message);
-                        break;
-                    default:
-                        _logger.LogDebug("{Source} {EventType}", "Brain-SDK", evt.GetType().Name);
-                        break;
-                }
-            });
+                Tools = _brainTools.Cast<AITool>().ToList(),
+                ToolMode = ChatToolMode.Auto
+            };
+
+            // Build messages: system prompt + session history + new user message
+            var messages = new List<ChatMessage>
+            {
+                new(ChatRole.System, _systemPrompt)
+            };
+
+            if (session.MessageHistory.Count > 0)
+                messages.AddRange(session.MessageHistory);
+
+            messages.Add(new ChatMessage(ChatRole.User, prompt));
 
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromMinutes(Constants.TaskTimeoutMinutes));
-            using var ctReg = cts.Token.Register(() => done.TrySetCanceled());
 
-            await session.SendAsync(new MessageOptions { Prompt = prompt });
-            return await done.Task;
+            var response = await _wrappedClient!.GetResponseAsync(messages, chatOptions, cts.Token);
+            var responseText = response.Text ?? "";
+
+            // Log usage
+            if (response.Usage is not null)
+            {
+                _logger.LogDebug(
+                    "Brain Usage: model={Model} in={InputTokens} out={OutputTokens}",
+                    response.ModelId, response.Usage.InputTokenCount, response.Usage.OutputTokenCount);
+                FileTracer.WriteBrainUsage(response, "/app/state/traces-brain.jsonl");
+
+                session.InputTokensUsed += response.Usage.InputTokenCount ?? 0;
+                session.OutputTokensUsed += response.Usage.OutputTokenCount ?? 0;
+            }
+
+            // Update session history (skip system prompt)
+            session.MessageHistory = response.Messages
+                .Where(m => m.Role != ChatRole.System)
+                .ToList();
+            session.LastActivityAt = DateTimeOffset.UtcNow;
+
+            _logger.LogDebug("Brain response ({Length} chars), tool={Tool}",
+                responseText.Length, _lastToolCallResult?.ToolName ?? "none");
+
+            return (responseText, _lastToolCallResult);
         }
         finally
         {
@@ -723,12 +582,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
-    /// Applies the first-non-null wins rule for model tier: sets <see cref="GoalPipeline.LatestModelTier"/>
-    /// only when it has not been explicitly set yet (empty string) and <paramref name="modelTier"/> is non-null.
-    /// Normalises the value to <c>"premium"</c> or <c>"standard"</c>.
+    /// Applies the first-non-null wins rule for model tier.
     /// </summary>
-    /// <param name="pipeline">The current goal pipeline whose tier may be updated.</param>
-    /// <param name="modelTier">The model tier string returned by the Brain LLM, or <c>null</c> if absent.</param>
     public static void ApplyModelTierIfNotSet(GoalPipeline pipeline, string? modelTier)
     {
         if (pipeline.LatestModelTier != ModelTier.Default || modelTier is null)
@@ -738,7 +593,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
-    /// Builds a concise metrics history summary from the last N iterations for inclusion in prompts.
+    /// Builds a concise metrics history summary from the last N iterations.
     /// </summary>
     private string BuildMetricsHistoryContext(int maxIterations = 5)
     {
@@ -757,7 +612,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 $"{m.PassedTests}/{m.TotalTests} tests, {m.CoveragePercent:F1}% coverage{issues}");
         }
 
-        // Trend analysis across the window
         if (recent.Count >= 2)
         {
             var first = recent[0];
@@ -776,7 +630,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 $"test count {(testDelta > 0 ? "growing" : testDelta < 0 ? "shrinking" : "stable")}");
         }
 
-        // Delta vs immediately previous iteration
         if (history.Count >= 2)
         {
             var comparison = _metricsTracker.CompareWithPrevious(history[^1]);
@@ -789,31 +642,20 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     private void EnsureConnected()
     {
-        if (_copilotClient is null)
+        if (_wrappedClient is null)
             throw new InvalidOperationException("Brain not connected. Call ConnectAsync first.");
     }
 
     internal static string Truncate(string text, int maxLength) =>
         text.Length <= maxLength ? text : text[..maxLength] + "...";
 
-    /// <summary>Disposes all active Copilot sessions and stops the underlying client.</summary>
-    /// <returns>A value task that represents the asynchronous dispose operation.</returns>
-    public async ValueTask DisposeAsync()
+    /// <summary>Disposes the underlying chat client.</summary>
+    public ValueTask DisposeAsync()
     {
-        // Dispose all goal sessions
-        foreach (var (goalId, session) in _sessions)
-        {
-            try { await session.DisposeAsync(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to dispose Copilot session for goal {GoalId}", goalId); }
-        }
         _sessions.Clear();
-
-        if (_copilotClient is not null)
-        {
-            await _copilotClient.StopAsync();
-            _copilotClient = null;
-        }
-
+        _wrappedClient?.Dispose();
+        _chatClient?.Dispose();
         _brainCallGate.Dispose();
+        return ValueTask.CompletedTask;
     }
 }

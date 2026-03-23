@@ -210,6 +210,10 @@ file sealed class CapturingBrain : IDistributedBrain
         pipeline.LatestModelTier = _modelTierToReturn;
         return Task.FromResult($"Work on {pipeline.Description} as {phase}");
     }
+
+    public Task CleanupGoalSessionAsync(string goalId) => Task.CompletedTask;
+
+    public Task ReprimeSessionAsync(GoalPipeline pipeline, CancellationToken ct) => Task.CompletedTask;
 }
 
 file sealed class PremiumFakeGoalSource : IGoalSource

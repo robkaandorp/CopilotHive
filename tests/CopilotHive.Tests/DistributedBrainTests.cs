@@ -59,31 +59,31 @@ public sealed class DistributedBrainTests
     [Fact]
     public void Constructor_ValidArgs_CreatesInstance()
     {
-        var brain = new DistributedBrain(9999, NullLogger<DistributedBrain>.Instance);
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         Assert.NotNull(brain);
     }
 
     [Theory]
-    [InlineData(0)]
-    [InlineData(8080)]
-    [InlineData(65535)]
-    public void Constructor_VariousPorts_CreatesInstance(int port)
+    [InlineData("copilot/model-1")]
+    [InlineData("gpt-4")]
+    [InlineData("claude-opus")]
+    public void Constructor_VariousModels_CreatesInstance(string model)
     {
-        var brain = new DistributedBrain(port, NullLogger<DistributedBrain>.Instance);
+        var brain = new DistributedBrain(model, NullLogger<DistributedBrain>.Instance);
         Assert.NotNull(brain);
     }
 
     [Fact]
     public async Task DisposeAsync_BeforeConnect_DoesNotThrow()
     {
-        var brain = new DistributedBrain(9999, NullLogger<DistributedBrain>.Instance);
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         await brain.DisposeAsync();
     }
 
     [Fact]
     public async Task CraftPromptAsync_WithoutConnect_ReturnsFallback()
     {
-        var brain = new DistributedBrain(9999, NullLogger<DistributedBrain>.Instance);
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-4", "Some goal");
 
         var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken);
@@ -203,4 +203,8 @@ file sealed class FakeDistributedBrain : IDistributedBrain
         CraftCalls++;
         return Task.FromResult($"Work on {pipeline.Description} as {phase}");
     }
+
+    public Task CleanupGoalSessionAsync(string goalId) => Task.CompletedTask;
+
+    public Task ReprimeSessionAsync(GoalPipeline pipeline, CancellationToken ct) => Task.CompletedTask;
 }

@@ -69,12 +69,23 @@ static async Task<int> RunServerAsync(string[] args)
     builder.Services.AddSingleton(sp =>
         new GoalPipelineManager(sp.GetRequiredService<PipelineStore>()));
 
-    // Brain: connect to Copilot CLI running alongside the orchestrator
-    var brainPort = int.TryParse(Environment.GetEnvironmentVariable("BRAIN_COPILOT_PORT"), out var bp) ? bp : 0;
-    if (brainPort > 0)
+    // Brain: direct LLM connection via SharpCoder (no Copilot CLI needed)
+    // Supports BRAIN_MODEL env var or falls back to OrchestratorModel from config
+    var brainModel = Environment.GetEnvironmentVariable("BRAIN_MODEL")
+        ?? Environment.GetEnvironmentVariable("BRAIN_COPILOT_PORT"); // backward compat: any non-empty = enable
+    if (!string.IsNullOrEmpty(brainModel) && !int.TryParse(brainModel, out _))
     {
+        // New path: BRAIN_MODEL is a model string (e.g. "copilot/claude-sonnet-4.6")
         builder.Services.AddSingleton<IDistributedBrain>(sp =>
-            new DistributedBrain(brainPort, sp.GetRequiredService<ILogger<DistributedBrain>>(),
+            new DistributedBrain(brainModel, sp.GetRequiredService<ILogger<DistributedBrain>>(),
+                sp.GetRequiredService<MetricsTracker>(),
+                sp.GetService<AgentsManager>()));
+    }
+    else if (!string.IsNullOrEmpty(brainModel))
+    {
+        // Legacy path: BRAIN_COPILOT_PORT is a port number — use default model
+        builder.Services.AddSingleton<IDistributedBrain>(sp =>
+            new DistributedBrain("copilot/claude-sonnet-4.6", sp.GetRequiredService<ILogger<DistributedBrain>>(),
                 sp.GetRequiredService<MetricsTracker>(),
                 sp.GetService<AgentsManager>()));
     }
@@ -137,10 +148,10 @@ static async Task<int> RunServerAsync(string[] args)
     var logger = app.Services.GetRequiredService<ILogger<Program>>();
     logger.LogInformation("Starting gRPC server on port {GrpcPort}, HTTP on port {HttpPort}", port, port + 1);
 
-    if (brainPort > 0)
-        logger.LogInformation("Brain enabled — connecting to Copilot on port {BrainPort}", brainPort);
+    if (!string.IsNullOrEmpty(brainModel))
+        logger.LogInformation("Brain enabled — model: {BrainModel}", brainModel);
     else
-        logger.LogWarning("Brain disabled — running in mechanical mode (no BRAIN_COPILOT_PORT set)");
+        logger.LogWarning("Brain disabled — running in mechanical mode (no BRAIN_MODEL set)");
 
     if (!string.IsNullOrEmpty(configRepoUrl))
     {
@@ -163,7 +174,7 @@ static async Task<int> RunServerAsync(string[] args)
     var brain = app.Services.GetService<IDistributedBrain>();
     if (brain is not null)
     {
-        logger.LogInformation("Connecting Brain to Copilot…");
+        logger.LogInformation("Connecting Brain…");
         await brain.ConnectAsync();
         logger.LogInformation("Brain connected.");
     }
