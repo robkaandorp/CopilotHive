@@ -333,6 +333,15 @@ public sealed class GoalDispatcher : BackgroundService
             return;
         }
 
+        // Snapshot the ending iteration before incrementing
+        var failedPhase = isReviewRelated ? GoalPhase.Review : GoalPhase.Testing;
+        var iterationSummary = BuildIterationSummary(pipeline, failedPhase);
+        pipeline.CompletedIterationSummaries.Add(iterationSummary);
+
+        // Persist the iteration summary to the goal source so the dashboard can read it
+        var updateMeta = new GoalUpdateMetadata { IterationSummary = iterationSummary };
+        await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.InProgress, updateMeta, ct);
+
         if (!pipeline.IncrementIteration())
         {
             pipeline.StateMachine.Fail();
@@ -340,6 +349,9 @@ public sealed class GoalDispatcher : BackgroundService
             await MarkGoalFailed(pipeline, "Exceeded max iterations", ct);
             return;
         }
+
+        // Reset metrics for the new iteration
+        pipeline.Metrics.ResetForNewIteration(pipeline.Iteration);
 
         pipeline.AdvanceTo(GoalPhase.Coding);
 

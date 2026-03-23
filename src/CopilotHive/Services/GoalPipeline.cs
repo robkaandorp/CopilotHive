@@ -128,6 +128,9 @@ public sealed class GoalPipeline
     /// <summary>Accumulated output from each completed phase, keyed by "{role}-{iteration}".</summary>
     public ConcurrentDictionary<string, string> PhaseOutputs { get; } = new();
 
+    /// <summary>In-memory iteration summaries for completed iterations (available to dashboard before goal finishes).</summary>
+    public List<IterationSummary> CompletedIterationSummaries { get; } = [];
+
     /// <summary>Metrics extracted by the Brain from worker output.</summary>
     public IterationMetrics Metrics { get; } = new() { Iteration = 1 };
 

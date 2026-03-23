@@ -87,4 +87,32 @@ public sealed class IterationMetrics
     [JsonIgnore]
     public double IntegrationPassRate => IntegrationTestsTotal > 0
         ? (double)IntegrationTestsPassed / IntegrationTestsTotal : 0;
+
+    /// <summary>
+    /// Resets phase-specific metrics for a new iteration while preserving retry counters
+    /// and agent version info that carry across iterations.
+    /// </summary>
+    public void ResetForNewIteration(int newIteration)
+    {
+        Iteration = newIteration;
+        BuildSuccess = false;
+        TotalTests = 0;
+        PassedTests = 0;
+        FailedTests = 0;
+        CoveragePercent = 0;
+        IntegrationTestsTotal = 0;
+        IntegrationTestsPassed = 0;
+        RuntimeVerified = false;
+        Verdict = null;
+        TestReportSummary = "";
+        Issues = [];
+        ReviewIssuesFound = 0;
+        ReviewIssues = [];
+        ReviewVerdict = null;
+        PhaseDurations = [];
+        PromptTokens = 0;
+        CompletionTokens = 0;
+        ImproverSkipped = false;
+        ImproverSkipReason = null;
+    }
 }

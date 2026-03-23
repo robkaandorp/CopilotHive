@@ -176,7 +176,19 @@ public sealed class DashboardStateService : IDisposable
         var iterations = new List<IterationViewInfo>();
 
         // Build views for completed iterations from IterationSummaries
-        foreach (var summary in goal.IterationSummaries)
+        // Merge persisted summaries (from goal source) with in-memory summaries (from pipeline)
+        var allSummaries = new List<IterationSummary>(goal.IterationSummaries);
+        if (pipeline is not null)
+        {
+            foreach (var inMemory in pipeline.CompletedIterationSummaries)
+            {
+                if (!allSummaries.Any(s => s.Iteration == inMemory.Iteration))
+                    allSummaries.Add(inMemory);
+            }
+        }
+        allSummaries.Sort((a, b) => a.Iteration.CompareTo(b.Iteration));
+
+        foreach (var summary in allSummaries)
         {
             var phases = new List<PhaseViewInfo>();
             foreach (var pr in summary.Phases)
