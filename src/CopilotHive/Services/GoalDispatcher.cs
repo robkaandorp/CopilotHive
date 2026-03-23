@@ -272,7 +272,7 @@ public sealed class GoalDispatcher : BackgroundService
             ? PhaseInput.Succeeded // Improve phase is non-blocking
             : verdict switch
             {
-                "FAIL" => PhaseInput.Failed,
+                "FAIL" or "CANCELLED" => PhaseInput.Failed,
                 "REQUEST_CHANGES" => PhaseInput.RequestChanges,
                 _ => PhaseInput.Succeeded, // PASS, APPROVE, or no verdict
             };

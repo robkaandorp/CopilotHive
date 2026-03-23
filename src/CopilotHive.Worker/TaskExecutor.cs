@@ -244,14 +244,33 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
                 Metrics = metrics,
             };
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            // Real cancellation (e.g., shutdown signal) — propagate as Cancelled
+            Console.Error.WriteLine($"[Task] Cancelled by token: {task.TaskId}");
             return new TaskResult
             {
                 TaskId = task.TaskId,
                 Status = TaskOutcome.Cancelled,
                 Output = "Task was cancelled.",
                 Metrics = new TaskMetrics { Verdict = "CANCELLED" },
+            };
+        }
+        catch (OperationCanceledException ex)
+        {
+            // Not a real cancellation — likely an API timeout or HTTP failure.
+            // Treat as a failure so the orchestrator can retry or fail the phase.
+            Console.Error.WriteLine($"[Task] Failed (API timeout/error): {ex}");
+            return new TaskResult
+            {
+                TaskId = task.TaskId,
+                Status = TaskOutcome.Failed,
+                Output = $"Error: API call failed or timed out: {ex.Message}",
+                Metrics = new TaskMetrics
+                {
+                    Verdict = "FAIL",
+                    Issues = [$"API timeout/error: {ex.Message}"],
+                },
             };
         }
         catch (Exception ex)
