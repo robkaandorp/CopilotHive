@@ -24,7 +24,6 @@ CopilotHive/
 ├── src/CopilotHive/                  # Main orchestrator application
 │   ├── Agents/AgentsManager.cs       # AGENTS.md versioning and rollback
 │   ├── Configuration/                # HiveConfiguration record
-│   ├── Git/GitWorkspaceManager.cs    # Bare repo, clones, branching, merging
 │   ├── Git/BrainRepoManager.cs      # Persistent Brain repo clones and merge ops
 │   ├── Metrics/                      # Per-iteration metrics tracking
 │   ├── Orchestration/DistributedBrain.cs # LLM-powered Brain for orchestration decisions
