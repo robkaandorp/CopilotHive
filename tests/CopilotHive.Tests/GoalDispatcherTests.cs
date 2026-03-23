@@ -323,26 +323,12 @@ public sealed class GoalDispatcherDispatchLoggingTests
     [Fact]
     public async Task DispatchNextGoalAsync_LogsGoalPriority()
     {
-        // Arrange - configure a repo so DispatchToRole succeeds (no idle worker, so it just enqueues)
+        // Arrange
         var logger = new CollectingLogger<GoalDispatcher>();
-        var goal = new Goal
-        {
-            Id = "goal-priority-test",
-            Description = "Priority logging test",
-            Priority = GoalPriority.High,
-            RepositoryNames = ["test-repo"],
-        };
+        var goal = new Goal { Id = "goal-priority-log-test", Description = "Priority logging test", Priority = GoalPriority.High };
         var goalSource = new FakeGoalSource(goal);
         var goalManager = new GoalManager();
         goalManager.AddSource(goalSource);
-
-        var config = new HiveConfigFile
-        {
-            Repositories =
-            [
-                new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/repo" },
-            ],
-        };
 
         var dispatcher = new GoalDispatcher(
             goalManager,
@@ -351,12 +337,17 @@ public sealed class GoalDispatcherDispatchLoggingTests
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
             logger,
-            config: config);
+            startupDelay: TimeSpan.Zero);
 
-        // Act - invoke the dispatch method directly to avoid the 10-second startup delay in ExecuteAsync
-        await dispatcher.DispatchNextGoalAsync(TestContext.Current.CancellationToken);
+        // Act - run the background service briefly so DispatchNextGoalAsync executes
+        using var cts = new CancellationTokenSource();
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, TestContext.Current.CancellationToken);
+        var executeTask = dispatcher.StartAsync(linkedCts.Token);
+        await Task.Delay(200, TestContext.Current.CancellationToken);
+        cts.Cancel();
+        await Task.WhenAny(executeTask, Task.Delay(1000, TestContext.Current.CancellationToken));
 
-        // Assert - the log message must mention the priority name "High"
+        // Assert
         Assert.Contains(logger.Logs, l => l.Message.Contains("High"));
     }
 }

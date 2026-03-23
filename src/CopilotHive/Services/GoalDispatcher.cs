@@ -38,6 +38,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly TaskBuilder _taskBuilder = new(new BranchCoordinator());
     private readonly ConcurrentDictionary<string, bool> _dispatchedGoals = new();
     private DateTime _lastAgentsSync = DateTime.MinValue;
+    private readonly TimeSpan _startupDelay;
 
     /// <summary>
     /// Initialises a new <see cref="GoalDispatcher"/> with required and optional dependencies.
@@ -55,6 +56,7 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="improvementAnalyzer">Optional analyzer that decides when to run the improver.</param>
     /// <param name="configRepo">Optional config repo manager for syncing AGENTS.md files.</param>
     /// <param name="repoManager">Optional Brain repo manager for persistent repo clones and merge operations.</param>
+    /// <param name="startupDelay">Delay before the first dispatch poll; defaults to 10 seconds to give workers time to connect.</param>
     public GoalDispatcher(
         GoalManager goalManager,
         GoalPipelineManager pipelineManager,
@@ -68,7 +70,8 @@ public sealed class GoalDispatcher : BackgroundService
         AgentsManager? agentsManager = null,
         ImprovementAnalyzer? improvementAnalyzer = null,
         ConfigRepoManager? configRepo = null,
-        BrainRepoManager? repoManager = null)
+        BrainRepoManager? repoManager = null,
+        TimeSpan? startupDelay = null)
     {
         _goalManager = goalManager;
         _pipelineManager = pipelineManager;
@@ -82,6 +85,7 @@ public sealed class GoalDispatcher : BackgroundService
         _config = config;
         _configRepo = configRepo;
         _repoManager = repoManager;
+        _startupDelay = startupDelay ?? TimeSpan.FromSeconds(10);
 
         completionNotifier.OnTaskCompleted+= result => HandleTaskCompletionAsync(result);
     }
@@ -117,7 +121,7 @@ public sealed class GoalDispatcher : BackgroundService
         await SyncAgentsFromConfigRepoAsync(stoppingToken);
 
         // Give workers time to connect before dispatching
-        await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
+        await Task.Delay(_startupDelay, stoppingToken);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -1149,7 +1153,7 @@ public sealed class GoalDispatcher : BackgroundService
             restored.Count, string.Join(", ", restored.Select(p => p.GoalId)));
     }
 
-    internal async Task DispatchNextGoalAsync(CancellationToken ct)
+    private async Task DispatchNextGoalAsync(CancellationToken ct)
     {
         // Sequential gate: only one goal runs at a time so the Brain
         // can accumulate context across goals in its single session.
