@@ -22,8 +22,8 @@ Violating these boundaries is treated as a task failure.
 
 ## Workflow
 
-1. **Examine the diff**: Run `git diff origin/<base-branch>...HEAD --stat` and `git diff origin/<base-branch>...HEAD`
-   to understand what changed.
+1. **Examine the diff**: Run `git diff <merge-base>..HEAD --stat` and `git diff <merge-base>..HEAD`
+   (merge base hash is in WORKSPACE CONTEXT) to understand what changed on the feature branch.
 2. **Update CHANGELOG.md** — this is **mandatory**, not optional (see below).
 3. **Update other documentation**: Edit the files listed below as needed.
 4. **Commit** with `git add -A && git commit`. Do NOT run `git push`.

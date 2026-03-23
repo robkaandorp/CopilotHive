@@ -87,6 +87,19 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
                 await PullConfigRepoAsync(ct);
             }
 
+            // Compute merge-base for feature branches so reviewers/testers diff only branch changes
+            string? mergeBase = null;
+            if (!isImprover && repoDirectories.Count > 0 && task.BranchInfo is { } bi1
+                && !string.IsNullOrEmpty(bi1.FeatureBranch) && !string.IsNullOrEmpty(bi1.BaseBranch))
+            {
+                var (_, targetDir) = repoDirectories[0];
+                mergeBase = await GitOperations.GetMergeBaseAsync(targetDir, bi1.BaseBranch, ct);
+                if (mergeBase != null)
+                    _log.Info($"Merge base: {mergeBase[..12]}");
+                else
+                    _log.Info("Could not compute merge-base; falling back to branch name diff");
+            }
+
             // Determine working directory for Copilot
             // Improver works in the config-repo/agents folder; others in the first cloned repo
             var primaryWorkDir = isImprover
@@ -120,6 +133,9 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
                 if (!string.IsNullOrEmpty(bi2.FeatureBranch))
                     contextLines.Add($"Feature branch: {bi2.FeatureBranch}");
             }
+
+            if (mergeBase != null)
+                contextLines.Add($"Merge base: {mergeBase}");
 
             contextLines.Add($"Working directory: {primaryWorkDir}");
             contextLines.Add("=========================");

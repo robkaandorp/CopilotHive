@@ -6,7 +6,7 @@ adherence. Focus on bugs, security, logic errors, and maintainability — not st
 ## Review Workflow
 
 1. **Understand the goal** — Read the task description for what the code should do.
-2. **Review the diff** — Run `git diff origin/<base-branch>...HEAD` (base branch is in WORKSPACE CONTEXT). This shows ALL changes on the feature branch compared to the base.
+2. **Review the diff** — Run `git diff <merge-base>..HEAD` (merge base hash is in WORKSPACE CONTEXT). This shows ONLY the changes made on the feature branch since it diverged from the base branch. Only review code that appears in the diff output (the `+` and `-` lines).
 3. **Verify files exist** — For every file the coder claims to have created, confirm it
    exists with `git ls-files` or `ls`. Missing files = critical issue.
 4. **Check the code** for: logic errors, null refs, security issues, missing error handling,

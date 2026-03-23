@@ -102,6 +102,19 @@ public static class GitOperations
     }
 
     /// <summary>
+    /// Computes the merge-base (common ancestor) between a remote branch and HEAD.
+    /// Returns the full commit hash, or null if it cannot be determined.
+    /// </summary>
+    public static async Task<string?> GetMergeBaseAsync(
+        string repoDir, string baseBranch, CancellationToken ct)
+    {
+        var remoteRef = baseBranch.StartsWith("origin/") ? baseBranch : $"origin/{baseBranch}";
+        var (exitCode, stdout, _) = await RunGitCommandAsync(
+            repoDir, $"merge-base {remoteRef} HEAD", ct);
+        return exitCode == 0 ? stdout.Trim() : null;
+    }
+
+    /// <summary>
     /// Run a git command and return (exitCode, stdout, stderr).
     /// </summary>
     public static async Task<(int ExitCode, string Stdout, string Stderr)> RunGitCommandAsync(
