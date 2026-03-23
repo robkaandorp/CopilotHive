@@ -10,20 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `SharpCoderRunnerSummarizeMessageTests` — xUnit test suite with 10 [Fact] tests covering the `SummarizeMessage` helper method via reflection; tests verify tool call logging format, tool result format, argument truncation (100 chars), result preview truncation (200 chars), null handling, and plain text fallback behavior
 - `SharpCoderRunner.SendPromptAsync` logging improvements — task execution now logs worker role and model: "Executing task as {role} with model {model}. WorkDir: {workDir}"; task completion logs elapsed time, status, and tool call count: "Task finished in {elapsed}s (status={status}, toolCalls={toolCalls})" using `System.Diagnostics.Stopwatch`
-- `SharpCoderRunnerLoggingTests` — xUnit test suite verifying `SendPromptAsync` logging: role and model in task start message, elapsed time, status, and tool call count in task completion message
-
-
-### Fixed
-- Test method name typos in `SharpCoderRunnerSummarizeMessageTests` ('Tole' → 'Tool' in several test names)
-
-### Changed
-- Worker message logging in `SharpCoderRunner.cs` — the message loop now uses the new `SummarizeMessage` helper to produce informative summaries:
-  - Messages containing `FunctionCallContent` log as `tool:{name}({key}="{value}")` with the first argument (truncated to 100 chars)
-  - Messages containing `FunctionResultContent` log as `result:{callId} → "{preview}"` with the result preview (truncated to 200 chars)
-  - Plain text messages retain existing behavior (truncated to 200 chars)
-  - Previously, `[assistant]` and `[tool]` messages with empty `msg.Text` would log empty content, making debugging difficult
-
-
+- `SharpCoderRunnerLoggingTests` — xUnit test suite with 7 [Fact] tests and 1 [Theory] (4 cases) verifying `SendPromptAsync` logging: role and model in task start message, elapsed time, status, and tool call count in task completion message
 - `GET /health` endpoint now includes a `sharpCoderVersion` field reflecting the version of the SharpCoder NuGet package loaded at runtime (e.g., `"0.2.0.10"`)
 - `HealthResponse.SharpCoderVersion` property with XML documentation
 - `HealthEndpointTests` — 2 new xUnit tests (`GetHealth_HasSharpCoderVersionField`, `GetHealth_SharpCoderVersion_MatchesSemanticVersionFormat`) to verify the SharpCoder version field presence and semantic version format (14 total tests in the class)
@@ -41,6 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Goal ID validation in `FileGoalSource.MapToGoal()` — validates each goal ID after parsing from goals.yaml
 - Goal ID validation in `ApiGoalSource.AddGoal()` — validates goal ID when adding a new goal via API
 - `GoalIdTests` — 6 xUnit tests (5 valid cases: `fix-build-error`, `add-feature`, `abc`, `a1b2`, `a-1-b`; 8 invalid cases covering empty/null, uppercase, spaces, leading/trailing hyphens, underscores)
+
+### Changed
+- Worker message logging in `SharpCoderRunner.cs` — the message loop now uses the new `SummarizeMessage` helper to produce informative summaries:
+  - Messages containing `FunctionCallContent` log as `tool:{name}({key}="{value}")` with the first argument (truncated to 100 chars)
+  - Messages containing `FunctionResultContent` log as `result:{callId} → "{preview}"` with the result preview (truncated to 200 chars)
+  - Plain text messages retain existing behavior (truncated to 200 chars)
+  - Previously, `[assistant]` and `[tool]` messages with empty `msg.Text` would log empty content, making debugging difficult
+- Test method name typos in `SharpCoderRunnerSummarizeMessageTests` ('Tole' → 'Tool' in several test names)
+- `InternalsVisibleTo` attribute in `CopilotHive.Worker.csproj` exposing internals to `CopilotHive.Tests` for unit testing
 
 ### Changed
 - Orchestrator logging migrated from `Console.WriteLine` to `ILogger` with structured properties:
@@ -98,6 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Null `Result` field in `PhaseResultEntry` from YAML now throws `InvalidOperationException` instead of silently defaulting to `"pass"`, consistent with codebase convention of no silent fallbacks (treats null Result like null Id)
 - Root cause of coder no-ops — Brain was generating `git checkout -b feature/...` commands in coder prompts, causing coders to commit on wrong branches; TaskExecutor then detected 0 changes on the infrastructure branch
 - Removed conflicting `coverlet.msbuild` 6.0.2 package (conflicted with `coverlet.collector` 8.0.0)
+- BOM removal from `CopilotHive.Worker.csproj` — file now starts with `<Project Sdk="Microsoft.NET.Sdk">` instead of `\uFEFF<Project Sdk="Microsoft.NET.Sdk">`
 
 ## Removed
 - WORKER_ROLE env var, workers are now always generic.
