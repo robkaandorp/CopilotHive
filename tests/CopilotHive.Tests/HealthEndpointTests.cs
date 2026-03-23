@@ -116,6 +116,17 @@ public class HealthEndpointTests : IClassFixture<HiveTestFactory>
     }
 
     [Fact]
+    public async Task GetHealth_SharpCoderVersion_MatchesSemanticVersionFormat()
+    {
+        using var json = await GetHealthJsonAsync();
+        Assert.True(json.RootElement.TryGetProperty("sharpCoderVersion", out var val));
+        var version = val.GetString();
+        Assert.False(string.IsNullOrEmpty(version), "sharpCoderVersion must not be empty");
+        // Semantic version format: X.Y.Z or X.Y.Z.W (e.g., "0.2.0" or "0.2.0.10")
+        Assert.Matches(@"^\d+\.\d+\.\d+(\.\d+)?$", version);
+    }
+
+    [Fact]
     public async Task GetHealth_HasServerTimeField()
     {
         using var json = await GetHealthJsonAsync();
