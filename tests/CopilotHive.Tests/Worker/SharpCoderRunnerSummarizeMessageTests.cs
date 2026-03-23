@@ -98,8 +98,8 @@ public sealed class SharpCoderRunnerSummarizeMessageTests
     // ── FunctionResultContent ────────────────────────────────────────────────
 
     /// <summary>
-    /// A message containing a FunctionResultContent should produce the
-    /// "result:callId → "preview"" format.
+    /// A message containing a FunctionResultContent should produce a compact
+    /// one-line summary instead of dumping the raw content.
     /// </summary>
     [Fact]
     public void SummarizeMessage_FunctionResult_ReturnsCallIdAndPreview()
@@ -109,14 +109,15 @@ public sealed class SharpCoderRunnerSummarizeMessageTests
 
         var result = Summarize(msg);
 
+        // Short single-line results shown inline
         Assert.Equal("result:call-99 \u2192 \"Build succeeded.\"", result);
     }
 
     /// <summary>
-    /// The preview for a FunctionResultContent should be truncated at 200 characters.
+    /// Long multi-line results should show byte count and line count, not raw content.
     /// </summary>
     [Fact]
-    public void SummarizeMessage_FunctionResult_LongResult_TruncatesAt200()
+    public void SummarizeMessage_FunctionResult_LongResult_ShowsByteAndLineCount()
     {
         var longResult = new string('r', 300);
         var content = new FunctionResultContent("call-100", longResult);
@@ -124,12 +125,12 @@ public sealed class SharpCoderRunnerSummarizeMessageTests
 
         var result = Summarize(msg);
 
-        var expected = $"result:call-100 \u2192 \"{new string('r', 200)}\"";
-        Assert.Equal(expected, result);
+        Assert.Contains("300 bytes", result);
+        Assert.Contains("1 lines", result);
     }
 
     /// <summary>
-    /// A null result should not throw; it should render as an empty preview.
+    /// A null result should not throw; it should render as "(empty)".
     /// </summary>
     [Fact]
     public void SummarizeMessage_FunctionResult_NullResult_RendersAsEmpty()
@@ -139,7 +140,23 @@ public sealed class SharpCoderRunnerSummarizeMessageTests
 
         var result = Summarize(msg);
 
-        Assert.Equal("result:call-101 \u2192 \"\"", result);
+        Assert.Equal("result:call-101 \u2192 (empty)", result);
+    }
+
+    /// <summary>
+    /// Multi-line results should summarize with line count.
+    /// </summary>
+    [Fact]
+    public void SummarizeMessage_FunctionResult_MultiLine_ShowsLineCount()
+    {
+        var multiLine = "line1\nline2\nline3\nline4\nline5";
+        var content = new FunctionResultContent("call-102", multiLine);
+        var msg = new ChatMessage(ChatRole.Tool, [content]);
+
+        var result = Summarize(msg);
+
+        Assert.Contains("5 lines", result);
+        Assert.DoesNotContain("line1", result);
     }
 
     // ── Plain text fallback ──────────────────────────────────────────────────

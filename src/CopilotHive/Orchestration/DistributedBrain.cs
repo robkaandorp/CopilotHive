@@ -206,6 +206,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             EnableAutoCompaction = true,
             AutoLoadWorkspaceInstructions = false,
             Logger = _logger,
+            // TODO: Uncomment when SharpCoder 0.3.0-alpha.1 is available on NuGet
+            // OnCompacted = r => _logger.LogInformation(
+            //     "Brain context compaction: {TokensBefore} \u2192 {TokensAfter} tokens ({ReductionPercent}% reduction), {MessagesBefore} \u2192 {MessagesAfter} messages",
+            //     r.TokensBefore, r.TokensAfter, r.ReductionPercent, r.MessagesBefore, r.MessagesAfter),
         });
 
         _logger.LogDebug("CodingAgent created with WorkDirectory={WorkDir}, FileOps={FileOps}",
@@ -574,17 +578,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     result.ToolCallCount);
             }
 
-            // Log context size
+            // Log context size (compaction is logged via OnCompacted callback)
             var estimatedTokens = _session.EstimatedContextTokens;
             var usagePct = _maxContextTokens > 0 ? (int)(estimatedTokens * 100.0 / _maxContextTokens) : 0;
             _logger.LogInformation(
                 "Brain context: messages={Messages} ~tokens={EstTokens}/{Limit} ({Pct}%) cumIn={CumIn} cumOut={CumOut}",
                 _session.MessageHistory.Count, estimatedTokens, _maxContextTokens,
                 usagePct, _session.InputTokensUsed, _session.OutputTokensUsed);
-
-            // Compact the session when context usage reaches or exceeds 80%
-            if (usagePct >= 80)
-                await CompactContextAsync(ct);
 
             _logger.LogDebug("Brain response ({Length} chars), tool={Tool}",
                 responseText.Length, _lastToolCallResult?.ToolName ?? "none");
@@ -658,39 +658,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         }
 
         return sb.ToString();
-    }
-
-    /// <summary>
-    /// Compacts the Brain context by resetting the session to a fresh state.
-    /// Logs token and message counts before and after so the reduction is observable.
-    /// Called automatically from <see cref="ExecuteBrainAsync"/> when context usage
-    /// reaches or exceeds 80 % of <see cref="_maxContextTokens"/>.
-    /// </summary>
-    /// <param name="ct">Cancellation token (unused but preserved for future async work).</param>
-    internal async Task CompactContextAsync(CancellationToken ct = default)
-    {
-        var tokensBefore = _session.EstimatedContextTokens;
-        var messagesBefore = _session.MessageHistory.Count;
-
-        _session = AgentSession.Create("brain");
-
-        // Reinitialise the agent only when the Brain is already connected
-        if (_chatClient is not null)
-            RecreateAgent();
-
-        // Satisfy the async contract; the reset itself is synchronous
-        await Task.CompletedTask;
-
-        var tokensAfter = _session.EstimatedContextTokens;
-        var messagesAfter = _session.MessageHistory.Count;
-
-        var reductionPercent = tokensBefore > 0
-            ? (int)Math.Round((1.0 - (double)tokensAfter / tokensBefore) * 100)
-            : 0;
-
-        _logger.LogInformation(
-            "Brain context compaction: {TokensBefore} \u2192 {TokensAfter} tokens ({ReductionPercent}% reduction), {MessagesBefore} \u2192 {MessagesAfter} messages",
-            tokensBefore, tokensAfter, reductionPercent, messagesBefore, messagesAfter);
     }
 
     private void EnsureConnected()

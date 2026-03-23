@@ -159,16 +159,33 @@ public sealed class SharpCoderRunner : IAgentRunner
         var functionResult = msg.Contents?.OfType<FunctionResultContent>().FirstOrDefault();
         if (functionResult != null)
         {
-            var preview = functionResult.Result?.ToString() ?? string.Empty;
-            if (preview.Length > PreviewMaxLength)
-                preview = preview.Substring(0, PreviewMaxLength);
-            return $"result:{functionResult.CallId} \u2192 \"{preview}\"";
+            var raw = functionResult.Result?.ToString() ?? string.Empty;
+            return $"result:{functionResult.CallId} \u2192 {SummarizeToolResult(raw)}";
         }
 
         var text = msg.Text;
         if (text != null && text.Length > PreviewMaxLength)
             text = text.Substring(0, PreviewMaxLength);
         return text ?? string.Empty;
+    }
+
+    /// <summary>
+    /// Produces a compact one-line summary of a tool result instead of dumping raw content.
+    /// </summary>
+    private static string SummarizeToolResult(string raw)
+    {
+        if (string.IsNullOrEmpty(raw))
+            return "(empty)";
+
+        var lines = raw.Split('\n');
+        var lineCount = lines.Length;
+        var byteCount = System.Text.Encoding.UTF8.GetByteCount(raw);
+
+        // Short single-line results can be shown inline
+        if (lineCount == 1 && raw.Length <= 120)
+            return $"\"{raw}\"";
+
+        return $"{byteCount} bytes, {lineCount} lines";
     }
 
     private IChatClient CreateChatClient(string? modelOverride = null)
