@@ -433,4 +433,32 @@ public sealed class WorkerPoolTests
     }
 
     #endregion
+
+    // ── ConnectedWorkerCount ──────────────────────────────────────────────────
+
+    #region ConnectedWorkerCount — empty pool
+
+    [Fact]
+    public void ConnectedWorkerCount_EmptyPool_ReturnsZero()
+    {
+        var pool = CreatePool();
+
+        Assert.Equal(0, pool.ConnectedWorkerCount);
+    }
+
+    #endregion
+
+    #region ConnectedWorkerCount — increments as workers are registered
+
+    [Fact]
+    public void ConnectedWorkerCount_AfterRegisteringWorkers_ReturnsCorrectCount()
+    {
+        var pool = CreatePool();
+        pool.RegisterWorker("w1", []);
+        pool.RegisterWorker("w2", []);
+
+        Assert.Equal(2, pool.ConnectedWorkerCount);
+    }
+
+    #endregion
 }
