@@ -36,7 +36,7 @@ public sealed class SharpCoderRunnerSummarizeMessageTests
     /// "tool:name(key="value")" format.
     /// </summary>
     [Fact]
-    public void SummarizeMessage_FunctionCall_ReturnsToleNameAndFirstArg()
+    public void SummarizeMessage_FunctionCall_ReturnsToolNameAndFirstArg()
     {
         var args = new Dictionary<string, object?> { ["command"] = "dotnet build src/" };
         var content = new FunctionCallContent("call-1", "execute_bash_command", args!);
@@ -52,7 +52,7 @@ public sealed class SharpCoderRunnerSummarizeMessageTests
     /// "tool:name()".
     /// </summary>
     [Fact]
-    public void SummarizeMessage_FunctionCall_NoArgs_ReturnsToleNameWithEmptyParens()
+    public void SummarizeMessage_FunctionCall_NoArgs_ReturnsToolNameWithEmptyParens()
     {
         var content = new FunctionCallContent("call-2", "get_file_sizes", null);
         var msg = new ChatMessage(ChatRole.Tool, [content]);
