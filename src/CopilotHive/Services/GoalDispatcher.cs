@@ -1175,6 +1175,12 @@ public sealed class GoalDispatcher : BackgroundService
 
     private async Task DispatchNextGoalAsync(CancellationToken ct)
     {
+        // Sequential gate: only one goal runs at a time so the Brain
+        // can accumulate context across goals in its single session.
+        var activePipelines = _pipelineManager.GetActivePipelines();
+        if (activePipelines.Count > 0)
+            return;
+
         var goal = await _goalManager.GetNextGoalAsync(ct);
         if (goal is null)
             return;
@@ -1183,6 +1189,20 @@ public sealed class GoalDispatcher : BackgroundService
             return;
 
         _logger.LogInformation("Dispatching goal '{GoalId}': {Description}", goal.Id, goal.Description);
+
+        // Ensure Brain repo clones are up-to-date before planning
+        if (_brain is not null)
+        {
+            var repos = ResolveRepositories(goal);
+            foreach (var repo in repos)
+            {
+                try { await _brain.EnsureBrainRepoAsync(repo.Name, repo.Url, repo.DefaultBranch, ct); }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to ensure Brain repo for '{RepoName}'", repo.Name);
+                }
+            }
+        }
 
         // Mark goal as in_progress with started_at timestamp
         var startedMeta = new GoalUpdateMetadata { StartedAt = DateTime.UtcNow };
