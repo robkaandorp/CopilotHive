@@ -89,7 +89,8 @@ static async Task<int> RunServerAsync(string[] args)
                 sp.GetRequiredService<MetricsTracker>(),
                 sp.GetService<AgentsManager>(),
                 maxCtx,
-                sp.GetService<BrainRepoManager>());
+                sp.GetService<BrainRepoManager>(),
+                stateDir);
         });
     }
 
