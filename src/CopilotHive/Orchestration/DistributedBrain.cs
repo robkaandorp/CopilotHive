@@ -460,13 +460,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, use build skill, use test skill, and commit with `git add -A && git commit`. NEVER include git checkout, git branch, or git push commands. NEVER include dotnet/npm/cargo commands — only reference build and test skills.
                 """,
             GoalPhase.Review => """
-                - For reviewers: tell them to run `git diff origin/<base-branch>...HEAD` to review ALL changes. The base branch and feature branch are provided in the workspace context. The `origin/` prefix is required because the clone only has remote tracking refs. Produce a REVIEW_REPORT.
+                - For reviewers: tell them to run `git diff origin/<base-branch>...HEAD` to review ALL changes. The base branch and feature branch are provided in the workspace context. The `origin/` prefix is required because the clone only has remote tracking refs. Call the report_review_verdict tool when done.
                 """,
             GoalPhase.Testing => """
-                - For testers: tell them to build, run the test skill, write integration tests, produce a TEST_REPORT
+                - For testers: tell them to build, run the test skill, write integration tests, and call the report_test_results tool when done. Do NOT tell them to create report files.
                 """,
             GoalPhase.DocWriting => """
-                - For docwriters: tell them to update README, CHANGELOG, and XML doc comments based on the code changes on the branch, build to verify, and commit. Produce a DOC_REPORT.
+                - For docwriters: tell them to update README, CHANGELOG, and XML doc comments based on the code changes on the branch, build to verify, and commit. Call the report_doc_changes tool when done.
                 """,
             GoalPhase.Improve => """
                 - For improvers: tell them to analyze iteration results and update *.agents.md files directly using file tools. Do NOT tell them to run git commands — the infrastructure commits and pushes automatically.
