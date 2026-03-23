@@ -1,0 +1,13 @@
+@inherits LayoutComponentBase
+
+<div class="hive-layout">
+    <nav class="hive-nav">
+        <div class="hive-brand">🐝 CopilotHive</div>
+        <NavLink href="/" Match="NavLinkMatch.All">Dashboard</NavLink>
+        <NavLink href="/workers">Workers</NavLink>
+        <NavLink href="/logs">Logs</NavLink>
+    </nav>
+    <main class="hive-main">
+        @Body
+    </main>
+</div>

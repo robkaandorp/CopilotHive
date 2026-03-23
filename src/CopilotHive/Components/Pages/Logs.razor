@@ -1,0 +1,54 @@
+@page "/logs"
+@using CopilotHive.Dashboard
+@implements IDisposable
+@inject DashboardStateService State
+
+<h1>Live Logs</h1>
+
+<div class="toolbar">
+    <button class="@(_level is null ? "active" : "")" @onclick="() => SetLevel(null)">All</button>
+    <button class="@(_level == LogLevel.Information ? "active" : "")" @onclick="() => SetLevel(LogLevel.Information)">Info</button>
+    <button class="@(_level == LogLevel.Warning ? "active" : "")" @onclick="() => SetLevel(LogLevel.Warning)">Warn</button>
+    <button class="@(_level == LogLevel.Error ? "active" : "")" @onclick="() => SetLevel(LogLevel.Error)">Error</button>
+    <span style="flex:1"></span>
+    <button @onclick="TogglePause">@(_paused ? "▶ Resume" : "⏸ Pause")</button>
+</div>
+
+<div class="log-view" @ref="_logDiv">
+    @foreach (var entry in FilteredEntries)
+    {
+        <div class="log-line @entry.LevelCss">@entry.Timestamp.ToString("HH:mm:ss") @entry.LevelLabel [@entry.Category] @entry.Message</div>
+    }
+</div>
+
+@code {
+    private LogLevel? _level;
+    private bool _paused;
+    private List<LogEntry> _entries = [];
+    private ElementReference _logDiv;
+
+    private IEnumerable<LogEntry> FilteredEntries => _level is null
+        ? _entries
+        : _entries.Where(e => e.Level >= _level.Value);
+
+    protected override void OnInitialized()
+    {
+        _entries = State.GetRecentLogs(500).ToList();
+        State.OnStateChanged += RefreshLogs;
+    }
+
+    private void RefreshLogs()
+    {
+        if (_paused) return;
+        InvokeAsync(() =>
+        {
+            _entries = State.GetRecentLogs(500).ToList();
+            StateHasChanged();
+        });
+    }
+
+    private void SetLevel(LogLevel? level) { _level = level; }
+    private void TogglePause() { _paused = !_paused; }
+
+    public void Dispose() => State.OnStateChanged -= RefreshLogs;
+}

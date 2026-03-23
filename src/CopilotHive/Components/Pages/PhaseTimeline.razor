@@ -1,0 +1,32 @@
+@using CopilotHive.Goals
+
+<div class="phase-bar">
+    @foreach (var (name, i) in _phases)
+    {
+        @if (i > 0)
+        {
+            <span class="phase-arrow">→</span>
+        }
+        <span class="phase-step @PhaseClass(name)">@name</span>
+    }
+</div>
+
+@code {
+    [Parameter] public string Phase { get; set; } = "";
+
+    private static readonly string[] PhaseNames =
+        ["Planning", "Coding", "Testing", "Review", "DocWriting", "Improve", "Merging", "Done"];
+
+    private IEnumerable<(string Name, int Index)> _phases =>
+        PhaseNames.Select((n, i) => (n, i));
+
+    private string PhaseClass(string name)
+    {
+        var currentIndex = Array.IndexOf(PhaseNames, Phase);
+        var thisIndex = Array.IndexOf(PhaseNames, name);
+
+        if (name == Phase) return "active";
+        if (Phase == "Failed") return thisIndex < currentIndex ? "done" : "";
+        return thisIndex < currentIndex ? "done" : "";
+    }
+}

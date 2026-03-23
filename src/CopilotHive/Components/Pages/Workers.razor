@@ -1,0 +1,93 @@
+@page "/workers"
+@using CopilotHive.Dashboard
+@implements IDisposable
+@inject DashboardStateService State
+
+<h1>Workers</h1>
+
+<div class="cards">
+    <div class="card">
+        <div class="label">Total</div>
+        <div class="value">@_snap.TotalWorkers</div>
+    </div>
+    <div class="card">
+        <div class="label">Busy</div>
+        <div class="value" style="color:var(--accent)">@_snap.BusyWorkers</div>
+    </div>
+    <div class="card">
+        <div class="label">Idle</div>
+        <div class="value" style="color:var(--green)">@_snap.IdleWorkers</div>
+    </div>
+</div>
+
+@if (_snap.Workers.Count > 0)
+{
+    <table>
+        <thead>
+            <tr>
+                <th>Worker ID</th>
+                <th>Role</th>
+                <th>Status</th>
+                <th>Current Task</th>
+                <th>Last Heartbeat</th>
+                <th>Connected</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var w in _snap.Workers)
+            {
+                <tr>
+                    <td style="font-family:monospace;font-size:0.85rem">@w.Id[..Math.Min(12, w.Id.Length)]</td>
+                    <td>
+                        @if (w.Role != "Unspecified")
+                        {
+                            <span class="badge badge-blue">@w.Role</span>
+                        }
+                        else
+                        {
+                            <span style="color:var(--text-muted)">—</span>
+                        }
+                    </td>
+                    <td>
+                        <span class="badge @(w.IsBusy ? "badge-yellow" : "badge-green")">
+                            @(w.IsBusy ? "Busy" : "Idle")
+                        </span>
+                    </td>
+                    <td style="font-size:0.85rem">@(w.CurrentTaskId ?? "—")</td>
+                    <td style="color:var(--text-muted);font-size:0.85rem">@FormatAgo(w.LastHeartbeat)</td>
+                    <td style="color:var(--text-muted);font-size:0.85rem">@FormatAgo(w.ConnectedAt)</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+else
+{
+    <p style="color:var(--text-muted)">No workers connected.</p>
+}
+
+@code {
+    private DashboardSnapshot _snap = new();
+
+    protected override void OnInitialized()
+    {
+        _snap = State.GetSnapshot();
+        State.OnStateChanged += RefreshState;
+    }
+
+    private void RefreshState() => InvokeAsync(() =>
+    {
+        _snap = State.GetSnapshot();
+        StateHasChanged();
+    });
+
+    private static string FormatAgo(DateTime utc)
+    {
+        var ago = DateTime.UtcNow - utc;
+        if (ago.TotalSeconds < 60) return $"{(int)ago.TotalSeconds}s ago";
+        if (ago.TotalMinutes < 60) return $"{(int)ago.TotalMinutes}m ago";
+        return $"{(int)ago.TotalHours}h {ago.Minutes}m ago";
+    }
+
+    public void Dispose() => State.OnStateChanged -= RefreshState;
+}

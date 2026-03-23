@@ -2,6 +2,7 @@ using System.Reflection;
 using CopilotHive;
 using CopilotHive.Agents;
 using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Improvement;
@@ -97,7 +98,16 @@ static async Task<int> RunServerAsync(string[] args)
     builder.Services.AddSingleton<WorkerUtilizationService>();
     builder.Services.AddSingleton<GoalDispatcher>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<GoalDispatcher>());
+    // Dashboard: log capture (registered early so logger provider can reference it)
+    var dashboardLogSink = new DashboardLogSink();
+    builder.Services.AddSingleton(dashboardLogSink);
+    builder.Logging.AddProvider(new DashboardLoggerProvider(dashboardLogSink));
+
     builder.Services.AddHostedService<StaleWorkerCleanupService>();
+
+    // Dashboard: Blazor Server + real-time state aggregation
+    builder.Services.AddSingleton<DashboardStateService>();
+    builder.Services.AddRazorComponents().AddInteractiveServerComponents();
 
     if (!string.IsNullOrEmpty(configRepoUrl))
     {
@@ -184,6 +194,12 @@ static async Task<int> RunServerAsync(string[] args)
     }
 
     app.MapGrpcService<HiveOrchestratorService>();
+
+    // Dashboard: Blazor Server
+    app.UseStaticFiles();
+    app.UseAntiforgery();
+    app.MapRazorComponents<CopilotHive.Components.App>()
+        .AddInteractiveServerRenderMode();
     var _serverStartTime = DateTime.UtcNow;
     var _checkCount = 0;
     var _version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown";

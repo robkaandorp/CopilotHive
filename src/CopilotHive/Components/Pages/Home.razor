@@ -1,0 +1,135 @@
+@page "/"
+@using CopilotHive.Dashboard
+@using CopilotHive.Goals
+@implements IDisposable
+@inject DashboardStateService State
+
+<h1>Dashboard</h1>
+
+<div class="cards">
+    <div class="card">
+        <div class="label">Pending</div>
+        <div class="value">@_snap.PendingGoals</div>
+    </div>
+    <div class="card">
+        <div class="label">Active</div>
+        <div class="value" style="color:var(--accent)">@_snap.ActiveGoals</div>
+    </div>
+    <div class="card">
+        <div class="label">Completed</div>
+        <div class="value" style="color:var(--green)">@_snap.CompletedGoals</div>
+    </div>
+    <div class="card">
+        <div class="label">Failed</div>
+        <div class="value" style="color:var(--red)">@_snap.FailedGoals</div>
+    </div>
+    <div class="card">
+        <div class="label">Workers</div>
+        <div class="value">@_snap.BusyWorkers / @_snap.TotalWorkers</div>
+    </div>
+</div>
+
+@if (_snap.Pipelines.Count > 0)
+{
+    <h2>Active Goals</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Goal</th>
+                <th>Phase</th>
+                <th>Iteration</th>
+                <th>Tests</th>
+                <th>Coverage</th>
+                <th>Elapsed</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var p in _snap.Pipelines)
+            {
+                <tr>
+                    <td>
+                        <a href="/goals/@p.GoalId" style="color:var(--accent);text-decoration:none">@p.GoalId</a>
+                        <div style="font-size:0.75rem;color:var(--text-muted)">@Truncate(p.Description, 80)</div>
+                    </td>
+                    <td><span class="badge badge-blue">@p.Phase</span></td>
+                    <td>@p.Iteration</td>
+                    <td>
+                        @if (p.TotalTests > 0)
+                        {
+                            <span style="color:var(--green)">@p.PassedTests</span>
+                            @if (p.FailedTests > 0)
+                            {
+                                <span> / </span><span style="color:var(--red)">@p.FailedTests</span>
+                            }
+                        }
+                        else
+                        {
+                            <span style="color:var(--text-muted)">—</span>
+                        }
+                    </td>
+                    <td>@(p.CoveragePercent > 0 ? $"{p.CoveragePercent:F1}%" : "—")</td>
+                    <td style="color:var(--text-muted)">@FormatElapsed(p.CreatedAt)</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@if (_snap.Goals.Any(g => g.Status == GoalStatus.Completed || g.Status == GoalStatus.Failed))
+{
+    <h2 style="margin-top:1.5rem">Recent Goals</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Goal</th>
+                <th>Status</th>
+                <th>Iterations</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var g in _snap.Goals.Where(g => g.Status is GoalStatus.Completed or GoalStatus.Failed).Take(20))
+            {
+                <tr>
+                    <td>
+                        <a href="/goals/@g.Id" style="color:var(--accent);text-decoration:none">@g.Id</a>
+                    </td>
+                    <td>
+                        <span class="badge @(g.Status == GoalStatus.Completed ? "badge-green" : "badge-red")">
+                            @g.Status
+                        </span>
+                    </td>
+                    <td>@g.Iterations</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private DashboardSnapshot _snap = new();
+
+    protected override void OnInitialized()
+    {
+        _snap = State.GetSnapshot();
+        State.OnStateChanged += RefreshState;
+    }
+
+    private void RefreshState() => InvokeAsync(() =>
+    {
+        _snap = State.GetSnapshot();
+        StateHasChanged();
+    });
+
+    private static string Truncate(string s, int max) =>
+        s.Length <= max ? s : s[..max] + "…";
+
+    private static string FormatElapsed(DateTime start)
+    {
+        var elapsed = DateTime.UtcNow - start;
+        return elapsed.TotalHours >= 1
+            ? $"{(int)elapsed.TotalHours}h {elapsed.Minutes}m"
+            : $"{elapsed.Minutes}m {elapsed.Seconds}s";
+    }
+
+    public void Dispose() => State.OnStateChanged -= RefreshState;
+}

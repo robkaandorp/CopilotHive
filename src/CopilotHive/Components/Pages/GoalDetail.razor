@@ -1,0 +1,79 @@
+@page "/goals/{GoalId}"
+@using CopilotHive.Dashboard
+@using CopilotHive.Goals
+@implements IDisposable
+@inject DashboardStateService State
+
+<h1>Goal: @GoalId</h1>
+
+@if (_goal is not null)
+{
+    <div class="card" style="margin-bottom:1rem">
+        <div class="label">Description</div>
+        <div>@_goal.Description</div>
+        <div style="margin-top:0.5rem">
+            <span class="badge @StatusBadge(_goal.Status)">@_goal.Status</span>
+            <span style="color:var(--text-muted);margin-left:0.5rem">Priority: @_goal.Priority</span>
+        </div>
+    </div>
+
+    @if (_pipeline is not null)
+    {
+        <div class="card" style="margin-bottom:1rem">
+            <div class="label">Current Progress</div>
+            <div style="margin-top:0.5rem">
+                <PhaseTimeline Phase="@_pipeline.Phase" />
+            </div>
+            <div style="margin-top:0.75rem;display:flex;gap:2rem">
+                <div><span class="label">Iteration:</span> @_pipeline.Iteration</div>
+                <div><span class="label">Tests:</span> @_pipeline.PassedTests/@_pipeline.TotalTests</div>
+                <div><span class="label">Coverage:</span> @(_pipeline.CoveragePercent > 0 ? $"{_pipeline.CoveragePercent:F1}%" : "—")</div>
+            </div>
+            @if (_pipeline.ActiveTaskId is not null)
+            {
+                <div style="margin-top:0.5rem;color:var(--text-muted);font-size:0.85rem">
+                    Active task: @_pipeline.ActiveTaskId
+                </div>
+            }
+        </div>
+    }
+}
+else
+{
+    <p style="color:var(--text-muted)">Goal not found.</p>
+}
+
+@code {
+    [Parameter] public string GoalId { get; set; } = "";
+
+    private Goal? _goal;
+    private PipelineInfo? _pipeline;
+
+    protected override void OnInitialized()
+    {
+        Refresh();
+        State.OnStateChanged += RefreshState;
+    }
+
+    protected override void OnParametersSet() => Refresh();
+
+    private void Refresh()
+    {
+        var snap = State.GetSnapshot();
+        _goal = snap.Goals.FirstOrDefault(g => g.Id == GoalId);
+        _pipeline = snap.Pipelines.FirstOrDefault(p => p.GoalId == GoalId);
+    }
+
+    private void RefreshState() => InvokeAsync(() => { Refresh(); StateHasChanged(); });
+
+    private static string StatusBadge(GoalStatus s) => s switch
+    {
+        GoalStatus.Completed => "badge-green",
+        GoalStatus.Failed => "badge-red",
+        GoalStatus.InProgress => "badge-blue",
+        GoalStatus.Pending => "badge-yellow",
+        _ => "badge-muted",
+    };
+
+    public void Dispose() => State.OnStateChanged -= RefreshState;
+}

@@ -1,0 +1,152 @@
+using CopilotHive.Goals;
+using CopilotHive.Services;
+
+namespace CopilotHive.Dashboard;
+
+/// <summary>
+/// Aggregates live state from WorkerPool, GoalPipelineManager, and ApiGoalSource
+/// into a snapshot that Blazor components can bind to. Polls every few seconds
+/// and fires <see cref="OnStateChanged"/> to trigger UI re-renders.
+/// </summary>
+public sealed class DashboardStateService : IDisposable
+{
+    private readonly WorkerPool _workerPool;
+    private readonly GoalPipelineManager _pipelineManager;
+    private readonly ApiGoalSource _goalSource;
+    private readonly DashboardLogSink _logSink;
+    private readonly Timer _timer;
+
+    /// <summary>Fired when state has been polled and components should re-render.</summary>
+    public event Action? OnStateChanged;
+
+    /// <summary>Creates the service with required dependencies.</summary>
+    public DashboardStateService(
+        WorkerPool workerPool,
+        GoalPipelineManager pipelineManager,
+        ApiGoalSource goalSource,
+        DashboardLogSink logSink)
+    {
+        _workerPool = workerPool;
+        _pipelineManager = pipelineManager;
+        _goalSource = goalSource;
+        _logSink = logSink;
+        _timer = new Timer(_ => NotifyStateChanged(), null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(3));
+    }
+
+    /// <summary>Creates a snapshot of current system state.</summary>
+    public DashboardSnapshot GetSnapshot()
+    {
+        var goals = _goalSource.GetAllGoals().ToList();
+        var workers = _workerPool.GetAllWorkers();
+        var pipelines = _pipelineManager.GetAllPipelines();
+
+        return new DashboardSnapshot
+        {
+            Goals = goals,
+            Workers = workers.Select(w => new WorkerInfo
+            {
+                Id = w.Id,
+                Role = w.Role.ToString(),
+                IsBusy = w.IsBusy,
+                CurrentTaskId = w.CurrentTaskId,
+                LastHeartbeat = w.LastHeartbeat,
+                ConnectedAt = w.ConnectedAt,
+            }).ToList(),
+            Pipelines = pipelines.Select(p => new PipelineInfo
+            {
+                GoalId = p.GoalId,
+                Description = p.Description,
+                Phase = p.Phase.ToString(),
+                Iteration = p.Iteration,
+                ActiveTaskId = p.ActiveTaskId,
+                CreatedAt = p.CreatedAt,
+                TotalTests = p.Metrics.TotalTests,
+                PassedTests = p.Metrics.PassedTests,
+                FailedTests = p.Metrics.FailedTests,
+                CoveragePercent = p.Metrics.CoveragePercent,
+            }).ToList(),
+            PendingGoals = goals.Count(g => g.Status == GoalStatus.Pending),
+            ActiveGoals = goals.Count(g => g.Status == GoalStatus.InProgress),
+            CompletedGoals = goals.Count(g => g.Status == GoalStatus.Completed),
+            FailedGoals = goals.Count(g => g.Status == GoalStatus.Failed),
+            TotalWorkers = workers.Count,
+            BusyWorkers = workers.Count(w => w.IsBusy),
+            IdleWorkers = workers.Count(w => !w.IsBusy),
+        };
+    }
+
+    /// <summary>Returns recent log entries from the circular buffer.</summary>
+    public IReadOnlyList<LogEntry> GetRecentLogs(int count = 500) => _logSink.GetRecent(count);
+
+    private void NotifyStateChanged() => OnStateChanged?.Invoke();
+
+    /// <inheritdoc />
+    public void Dispose() => _timer.Dispose();
+}
+
+/// <summary>Snapshot of all dashboard state at a point in time.</summary>
+public sealed class DashboardSnapshot
+{
+    /// <summary>All known goals.</summary>
+    public List<Goal> Goals { get; init; } = [];
+    /// <summary>Connected workers.</summary>
+    public List<WorkerInfo> Workers { get; init; } = [];
+    /// <summary>Active goal pipelines.</summary>
+    public List<PipelineInfo> Pipelines { get; init; } = [];
+    /// <summary>Count of pending goals.</summary>
+    public int PendingGoals { get; init; }
+    /// <summary>Count of in-progress goals.</summary>
+    public int ActiveGoals { get; init; }
+    /// <summary>Count of completed goals.</summary>
+    public int CompletedGoals { get; init; }
+    /// <summary>Count of failed goals.</summary>
+    public int FailedGoals { get; init; }
+    /// <summary>Total connected workers.</summary>
+    public int TotalWorkers { get; init; }
+    /// <summary>Workers currently executing tasks.</summary>
+    public int BusyWorkers { get; init; }
+    /// <summary>Workers waiting for work.</summary>
+    public int IdleWorkers { get; init; }
+}
+
+/// <summary>Worker state for the dashboard.</summary>
+public sealed class WorkerInfo
+{
+    /// <summary>Worker identifier.</summary>
+    public string Id { get; init; } = "";
+    /// <summary>Current role name.</summary>
+    public string Role { get; init; } = "";
+    /// <summary>Whether the worker is busy.</summary>
+    public bool IsBusy { get; init; }
+    /// <summary>Current task ID, if any.</summary>
+    public string? CurrentTaskId { get; init; }
+    /// <summary>Last heartbeat timestamp.</summary>
+    public DateTime LastHeartbeat { get; init; }
+    /// <summary>Connection timestamp.</summary>
+    public DateTime ConnectedAt { get; init; }
+}
+
+/// <summary>Pipeline state for the dashboard.</summary>
+public sealed class PipelineInfo
+{
+    /// <summary>Goal identifier.</summary>
+    public string GoalId { get; init; } = "";
+    /// <summary>Goal description.</summary>
+    public string Description { get; init; } = "";
+    /// <summary>Current phase name.</summary>
+    public string Phase { get; init; } = "";
+    /// <summary>Current iteration number.</summary>
+    public int Iteration { get; init; }
+    /// <summary>Active task ID, if any.</summary>
+    public string? ActiveTaskId { get; init; }
+    /// <summary>Pipeline creation timestamp.</summary>
+    public DateTime CreatedAt { get; init; }
+    /// <summary>Total test count.</summary>
+    public int TotalTests { get; init; }
+    /// <summary>Passed test count.</summary>
+    public int PassedTests { get; init; }
+    /// <summary>Failed test count.</summary>
+    public int FailedTests { get; init; }
+    /// <summary>Code coverage percentage.</summary>
+    public double CoveragePercent { get; init; }
+}
