@@ -4,10 +4,12 @@ using Microsoft.Extensions.Logging;
 namespace CopilotHive.Git;
 
 /// <summary>
-/// Manages persistent read-only clones of target repositories for the Brain.
-/// Each repository gets its own clone at <c>{basePath}/brain-{repoName}</c>,
-/// checked out to the default branch. Clones persist across goals and are
-/// updated (pulled) before each goal starts.
+/// Manages persistent clones of target repositories for the Brain.
+/// Each repository gets its own clone at <c>{basePath}/repos/{repoName}</c>,
+/// checked out to the default branch. The parent <c>repos/</c> directory serves
+/// as the Brain's <see cref="WorkDirectory"/> so all repos are visible to file tools.
+/// Clones persist across goals and are updated (pulled) before each goal starts.
+/// The same clone is reused for merge operations to avoid redundant temp clones.
 /// </summary>
 public sealed class BrainRepoManager
 {
@@ -18,8 +20,8 @@ public sealed class BrainRepoManager
     /// Initialises a new <see cref="BrainRepoManager"/>.
     /// </summary>
     /// <param name="basePath">
-    /// Root directory for Brain clones (e.g. <c>/app/state</c>).
-    /// Each repo clone is created at <c>{basePath}/brain-{repoName}</c>.
+    /// Root directory for Brain state (e.g. <c>/app/state</c>).
+    /// Repo clones are created at <c>{basePath}/repos/{repoName}</c>.
     /// </param>
     /// <param name="logger">Logger instance.</param>
     public BrainRepoManager(string basePath, ILogger<BrainRepoManager> logger)
@@ -27,6 +29,12 @@ public sealed class BrainRepoManager
         _basePath = Path.GetFullPath(basePath);
         _logger = logger;
     }
+
+    /// <summary>
+    /// The directory containing all repo clones. Used as the Brain's CodingAgent WorkDirectory
+    /// so the Brain can read files across all repositories via relative paths.
+    /// </summary>
+    public string WorkDirectory => Path.Combine(_basePath, "repos");
 
     /// <summary>
     /// Ensures a clone exists for the given repository and returns its path.
@@ -59,9 +67,9 @@ public sealed class BrainRepoManager
                 "Creating Brain clone for {Repo} from {Url} (branch: {Branch})",
                 repoName, repoUrl, defaultBranch);
 
-            Directory.CreateDirectory(_basePath);
-            await RunGitAsync(_basePath,
-                ["clone", "--branch", defaultBranch, repoUrl, $"brain-{repoName}"], ct);
+            Directory.CreateDirectory(WorkDirectory);
+            await RunGitAsync(WorkDirectory,
+                ["clone", "--branch", defaultBranch, repoUrl, repoName], ct);
         }
 
         return clonePath;
@@ -71,7 +79,7 @@ public sealed class BrainRepoManager
     /// Returns the clone path for a repository without performing any git operations.
     /// </summary>
     public string GetClonePath(string repoName) =>
-        Path.Combine(_basePath, $"brain-{repoName}");
+        Path.Combine(WorkDirectory, repoName);
 
     private static async Task RunGitAsync(string workingDir, string[] args, CancellationToken ct)
     {
