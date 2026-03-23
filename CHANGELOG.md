@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `GET /health` endpoint now includes a `sharpCoderVersion` field reflecting the version of the SharpCoder NuGet package loaded at runtime (e.g., `"0.2.0.10"`)
+- `HealthResponse.SharpCoderVersion` property with XML documentation
+- `HealthEndpointTests` — 2 new xUnit tests (`GetHealth_HasSharpCoderVersionField`, `GetHealth_SharpCoderVersion_MatchesSemanticVersionFormat`) to verify the SharpCoder version field presence and semantic version format (14 total tests in the class)
 - `WorkerLoggerTests` — xUnit test suite with 22 [Fact] tests covering `WorkerLogger.Info`, `Error`, `Debug`, and `LogBlock` output format; tests verify standard messages, empty messages, special character preservation, stdout/stderr routing, verbose mode behavior, log block truncation logic, and cross-method stream isolation
 - `GrpcMapperTests` — comprehensive xUnit test suite with 27 tests (21 [Fact] + 6 [Theory]) covering:
   - WorkTask and TaskResult round-trip conversions (domain → gRPC → domain) preserving all fields
