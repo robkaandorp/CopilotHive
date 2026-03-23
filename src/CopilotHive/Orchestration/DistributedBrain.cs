@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Text;
 using System.Text.Json;
+using CopilotHive.Git;
 using CopilotHive.Metrics;
 using CopilotHive.Services;
 using CopilotHive.Telemetry;
@@ -22,6 +23,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly int _maxContextTokens;
     private readonly ILogger<DistributedBrain> _logger;
     private readonly MetricsTracker? _metricsTracker;
+    private readonly BrainRepoManager? _repoManager;
     private IChatClient? _chatClient;
     private IChatClient? _wrappedClient;
     private readonly ConcurrentDictionary<string, AgentSession> _sessions = new();
@@ -65,14 +67,17 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <param name="metricsTracker">Optional tracker used to include historical metrics in prompts.</param>
     /// <param name="agentsManager">Optional manager used to load the orchestrator's AGENTS.md.</param>
     /// <param name="maxContextTokens">Maximum context window size in tokens. Defaults to <see cref="Constants.DefaultBrainContextWindow"/>.</param>
+    /// <param name="repoManager">Optional manager for persistent Brain repo clones (read-only file access).</param>
     public DistributedBrain(string modelOverride, ILogger<DistributedBrain> logger,
         MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null,
-        int maxContextTokens = Constants.DefaultBrainContextWindow)
+        int maxContextTokens = Constants.DefaultBrainContextWindow,
+        BrainRepoManager? repoManager = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
         _logger = logger;
         _metricsTracker = metricsTracker;
+        _repoManager = repoManager;
 
         _brainTools = BuildBrainTools();
 
@@ -103,6 +108,20 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _logger.LogInformation("Brain connected via SharpCoder (model={Model}, contextWindow={ContextWindow})",
             _modelOverride, _maxContextTokens);
         return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public async Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default)
+    {
+        if (_repoManager is null)
+        {
+            _logger.LogDebug("No BrainRepoManager configured — skipping repo clone for '{RepoName}'", repoName);
+            return;
+        }
+
+        await _repoManager.EnsureCloneAsync(repoName, repoUrl, defaultBranch, ct);
+        var clonePath = _repoManager.GetClonePath(repoName);
+        _logger.LogInformation("Brain repo ready for '{RepoName}' at {ClonePath}", repoName, clonePath);
     }
 
     /// <summary>

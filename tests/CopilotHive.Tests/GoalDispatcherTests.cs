@@ -216,6 +216,8 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
     public Task CleanupGoalSessionAsync(string goalId) => Task.CompletedTask;
 
     public Task ReprimeSessionAsync(GoalPipeline pipeline, CancellationToken ct) => Task.CompletedTask;
+
+    public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) => Task.CompletedTask;
 }
 
 /// <summary>

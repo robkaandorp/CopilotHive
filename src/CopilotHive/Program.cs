@@ -88,7 +88,8 @@ static async Task<int> RunServerAsync(string[] args)
             return new DistributedBrain(brainModel, sp.GetRequiredService<ILogger<DistributedBrain>>(),
                 sp.GetRequiredService<MetricsTracker>(),
                 sp.GetService<AgentsManager>(),
-                maxCtx);
+                maxCtx,
+                sp.GetService<BrainRepoManager>());
         });
     }
 

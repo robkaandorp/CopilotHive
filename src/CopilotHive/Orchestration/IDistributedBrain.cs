@@ -29,6 +29,13 @@ public interface IDistributedBrain
         string? additionalContext = null,
         CancellationToken ct = default);
 
+    /// <summary>
+    /// Ensures the Brain's read-only clone for a target repository exists and is
+    /// up-to-date. Called by GoalDispatcher before starting a goal so the Brain
+    /// has file access to the latest base branch code.
+    /// </summary>
+    Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default);
+
     /// <summary>Removes the session for a completed/failed goal and frees resources.</summary>
     Task CleanupGoalSessionAsync(string goalId);
 
