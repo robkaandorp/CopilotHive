@@ -1,0 +1,92 @@
+@page "/configuration"
+@using CopilotHive.Configuration
+@using CopilotHive.Dashboard
+@implements IDisposable
+@inject ConfigRepoManager ConfigRepo
+
+<h1>Configuration</h1>
+<p style="color:var(--text-muted);margin-bottom:1.5rem">
+    Config repo: <code style="font-size:0.85rem">@ConfigRepo.LocalPath</code>
+</p>
+
+@if (_loading)
+{
+    <p style="color:var(--text-muted)">Loading configuration files…</p>
+}
+else if (_error is not null)
+{
+    <p style="color:var(--red)">Error loading configuration: @_error</p>
+}
+else
+{
+    <div class="config-tabs">
+        @foreach (var tab in _tabs)
+        {
+            <button class="config-tab @(tab == _activeTab ? "active" : "")"
+                    @onclick="() => _activeTab = tab">@tab</button>
+        }
+    </div>
+
+    <div class="config-content">
+        <pre><code>@GetActiveContent()</code></pre>
+    </div>
+}
+
+@code {
+    private bool _loading = true;
+    private string? _error;
+    private string _activeTab = "hive-config.yaml";
+    private readonly Dictionary<string, string> _files = [];
+    private List<string> _tabs = [];
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            await LoadFilesAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private async Task LoadFilesAsync()
+    {
+        var basePath = ConfigRepo.LocalPath;
+
+        // Load hive-config.yaml
+        var configPath = Path.Combine(basePath, "hive-config.yaml");
+        if (File.Exists(configPath))
+            _files["hive-config.yaml"] = await File.ReadAllTextAsync(configPath);
+
+        // Load goals.yaml
+        var goalsPath = Path.Combine(basePath, "goals.yaml");
+        if (File.Exists(goalsPath))
+            _files["goals.yaml"] = await File.ReadAllTextAsync(goalsPath);
+
+        // Load agents/*.agents.md
+        var agentsDir = Path.Combine(basePath, "agents");
+        if (Directory.Exists(agentsDir))
+        {
+            foreach (var file in Directory.GetFiles(agentsDir, "*.agents.md").OrderBy(f => f))
+            {
+                var name = Path.GetFileName(file);
+                _files[name] = await File.ReadAllTextAsync(file);
+            }
+        }
+
+        _tabs = [.. _files.Keys];
+        if (_tabs.Count > 0 && !_tabs.Contains(_activeTab))
+            _activeTab = _tabs[0];
+    }
+
+    private string GetActiveContent() =>
+        _files.TryGetValue(_activeTab, out var content) ? content : "(empty)";
+
+    public void Dispose() { }
+}

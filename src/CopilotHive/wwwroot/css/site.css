@@ -142,3 +142,48 @@ tr:last-child td { border-bottom: none; }
 /* Utilization bar */
 .util-bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
 .util-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+
+/* Configuration tabs */
+.config-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 0;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+}
+.config-tab {
+    background: transparent;
+    border: 1px solid transparent;
+    border-bottom: none;
+    color: var(--text-muted);
+    padding: 0.5rem 1rem;
+    cursor: pointer;
+    font-size: 0.8rem;
+    font-family: monospace;
+    white-space: nowrap;
+    border-radius: 6px 6px 0 0;
+}
+.config-tab:hover { color: var(--text); background: var(--bg-card); }
+.config-tab.active {
+    color: var(--accent);
+    background: var(--bg-card);
+    border-color: var(--border);
+}
+.config-content {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-top: none;
+    border-radius: 0 0 8px 8px;
+    padding: 1rem;
+    overflow-x: auto;
+}
+.config-content pre {
+    margin: 0;
+    font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+    font-size: 0.8rem;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text);
+}
