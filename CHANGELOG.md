@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `SharpCoderRunnerSummarizeMessageTests` — xUnit test suite with 10 [Fact] tests covering the `SummarizeMessage` helper method via reflection; tests verify tool call logging format, tool result format, argument truncation (100 chars), result preview truncation (200 chars), null handling, and plain text fallback behavior
+
+### Changed
+- Worker message logging in `SharpCoderRunner.cs` — the message loop now uses the new `SummarizeMessage` helper to produce informative summaries:
+  - Messages containing `FunctionCallContent` log as `tool:{name}({key}="{value}")` with the first argument (truncated to 100 chars)
+  - Messages containing `FunctionResultContent` log as `result:{callId} → "{preview}"` with the result preview (truncated to 200 chars)
+  - Plain text messages retain existing behavior (truncated to 200 chars)
+  - Previously, `[assistant]` and `[tool]` messages with empty `msg.Text` would log empty content, making debugging difficult
+
+### Added
 - `GET /health` endpoint now includes a `sharpCoderVersion` field reflecting the version of the SharpCoder NuGet package loaded at runtime (e.g., `"0.2.0.10"`)
 - `HealthResponse.SharpCoderVersion` property with XML documentation
 - `HealthEndpointTests` — 2 new xUnit tests (`GetHealth_HasSharpCoderVersionField`, `GetHealth_SharpCoderVersion_MatchesSemanticVersionFormat`) to verify the SharpCoder version field presence and semantic version format (14 total tests in the class)
