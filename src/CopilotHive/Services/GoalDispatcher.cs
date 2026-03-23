@@ -105,6 +105,8 @@ public sealed class GoalDispatcher : BackgroundService
     /// <inheritdoc/>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        _logger.LogInformation("GoalDispatcher starting with {SourceCount} goal source(s)", _goalManager.Sources.Count);
+
         _logger.LogInformation("GoalDispatcher started — polling for goals every {Interval}s (Brain: {BrainEnabled})",
             PollInterval.TotalSeconds, _brain is not null ? "enabled" : "disabled");
 
