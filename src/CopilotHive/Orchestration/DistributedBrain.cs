@@ -296,36 +296,56 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         try
         {
-            var (response, toolCall) = await Shared.CopilotRetryPolicy.ExecuteAsync(
-                () => ExecuteBrainAsync(prompt, ct),
-                onRetry: (attempt, delay, ex) =>
+            const int maxToolAttempts = 3;
+            string currentPrompt = prompt;
+
+            for (int attempt = 1; attempt <= maxToolAttempts; attempt++)
+            {
+                var (response, toolCall) = await Shared.CopilotRetryPolicy.ExecuteAsync(
+                    () => ExecuteBrainAsync(currentPrompt, ct),
+                    onRetry: (retryAttempt, delay, ex) =>
+                    {
+                        _logger.LogWarning(
+                            "Brain iteration plan call failed (attempt {Attempt}/{Max}): {Error}. Retrying in {Delay}s",
+                            retryAttempt, Shared.CopilotRetryPolicy.MaxRetries + 1, ex.Message, delay.TotalSeconds);
+                    },
+                    ct);
+
+                pipeline.Conversation.Add(new ConversationEntry("user", currentPrompt));
+                pipeline.Conversation.Add(new ConversationEntry("assistant", response));
+
+                if (toolCall is { ToolName: "report_iteration_plan" })
+                {
+                    var plan = BuildIterationPlanFromToolCall(toolCall);
+
+                    if (plan is { Phases.Count: > 0 })
+                    {
+                        _logger.LogInformation(
+                            "Brain planned iteration {Iteration} for goal {GoalId}: [{Phases}] — {Reason}",
+                            pipeline.Iteration, pipeline.GoalId,
+                            string.Join(", ", plan.Phases), plan.Reason ?? "no reason");
+                        return plan;
+                    }
+
+                    _logger.LogWarning("Failed to parse iteration plan from Brain response: {Response}",
+                        Truncate(response, Constants.TruncationShort));
+                    break;
+                }
+
+                if (attempt < maxToolAttempts)
                 {
                     _logger.LogWarning(
-                        "Brain iteration plan call failed (attempt {Attempt}/{Max}): {Error}. Retrying in {Delay}s",
-                        attempt, Shared.CopilotRetryPolicy.MaxRetries + 1, ex.Message, delay.TotalSeconds);
-                },
-                ct);
-
-            pipeline.Conversation.Add(new ConversationEntry("user", prompt));
-            pipeline.Conversation.Add(new ConversationEntry("assistant", response));
-
-            if (toolCall is not { ToolName: "report_iteration_plan" })
-                throw new InvalidOperationException(
-                    $"Brain did not call report_iteration_plan for {pipeline.GoalId}. Tool: {toolCall?.ToolName ?? "none"}");
-
-            var plan = BuildIterationPlanFromToolCall(toolCall);
-
-            if (plan is { Phases.Count: > 0 })
-            {
-                _logger.LogInformation(
-                    "Brain planned iteration {Iteration} for goal {GoalId}: [{Phases}] — {Reason}",
-                    pipeline.Iteration, pipeline.GoalId,
-                    string.Join(", ", plan.Phases), plan.Reason ?? "no reason");
-                return plan;
+                        "Brain responded with text instead of calling report_iteration_plan (attempt {Attempt}/{Max}). Nudging.",
+                        attempt, maxToolAttempts);
+                    currentPrompt = "You must call the report_iteration_plan tool now. Do not respond with text.";
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "Brain did not call report_iteration_plan after {MaxAttempts} attempts for goal {GoalId}",
+                        maxToolAttempts, pipeline.GoalId);
+                }
             }
-
-            _logger.LogWarning("Failed to parse iteration plan from Brain response: {Response}",
-                Truncate(response, Constants.TruncationShort));
         }
         catch (Exception ex)
         {
