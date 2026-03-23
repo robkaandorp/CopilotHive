@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using CopilotHive.Agents;
 using CopilotHive.Configuration;
+using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Improvement;
 using CopilotHive.Metrics;
@@ -29,6 +30,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly AgentsManager? _agentsManager;
     private readonly MetricsTracker? _metricsTracker;
     private readonly ConfigRepoManager? _configRepo;
+    private readonly BrainRepoManager? _repoManager;
     private readonly ILogger<GoalDispatcher> _logger;
     private readonly HiveConfigFile? _config;
 
@@ -52,6 +54,7 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="agentsManager">Optional manager for per-role AGENTS.md files.</param>
     /// <param name="improvementAnalyzer">Optional analyzer that decides when to run the improver.</param>
     /// <param name="configRepo">Optional config repo manager for syncing AGENTS.md files.</param>
+    /// <param name="repoManager">Optional Brain repo manager for persistent repo clones and merge operations.</param>
     public GoalDispatcher(
         GoalManager goalManager,
         GoalPipelineManager pipelineManager,
@@ -64,7 +67,8 @@ public sealed class GoalDispatcher : BackgroundService
         MetricsTracker? metricsTracker = null,
         AgentsManager? agentsManager = null,
         ImprovementAnalyzer? improvementAnalyzer = null,
-        ConfigRepoManager? configRepo = null)
+        ConfigRepoManager? configRepo = null,
+        BrainRepoManager? repoManager = null)
     {
         _goalManager = goalManager;
         _pipelineManager = pipelineManager;
@@ -77,6 +81,7 @@ public sealed class GoalDispatcher : BackgroundService
         _logger = logger;
         _config = config;
         _configRepo = configRepo;
+        _repoManager = repoManager;
 
         completionNotifier.OnTaskCompleted+= result => HandleTaskCompletionAsync(result);
     }
@@ -620,78 +625,20 @@ public sealed class GoalDispatcher : BackgroundService
             var repos = ResolveRepositories(pipeline.Goal);
             foreach (var repo in repos)
             {
-                var tempDir = Path.Combine(Path.GetTempPath(), $"hive-merge-{Guid.NewGuid():N}");
-                try
+                if (_repoManager is not null)
                 {
-                    await RunGitAsync($"clone --branch {repo.DefaultBranch} {repo.Url} {tempDir}", ct);
-                    await RunGitAsync($"-C {tempDir} config user.email copilothive@local", ct);
-                    await RunGitAsync($"-C {tempDir} config user.name CopilotHive", ct);
-                    await RunGitAsync($"-C {tempDir} fetch origin {pipeline.CoderBranch}", ct);
-
-                    try
-                    {
-                        await RunGitAsync($"-C {tempDir} merge origin/{pipeline.CoderBranch} --no-edit", ct);
-                    }
-                    catch (Exception mergeEx)
-                    {
-                        // Merge failed — attempt automatic rebase before falling back to coder
-                        _logger.LogInformation(
-                            "Merge conflict for {GoalId} — attempting automatic rebase of {Branch} onto {Base}",
-                            pipeline.GoalId, pipeline.CoderBranch, repo.DefaultBranch);
-
-                        // Abort the failed merge, then try rebase in a fresh clone of the feature branch
-                        await RunGitAsync($"-C {tempDir} merge --abort", ct);
-
-                        var rebaseDir = Path.Combine(Path.GetTempPath(), $"hive-rebase-{Guid.NewGuid():N}");
-                        try
-                        {
-                            await RunGitAsync($"clone --branch {pipeline.CoderBranch} {repo.Url} {rebaseDir}", ct);
-                            await RunGitAsync($"-C {rebaseDir} config user.email copilothive@local", ct);
-                            await RunGitAsync($"-C {rebaseDir} config user.name CopilotHive", ct);
-                            await RunGitAsync($"-C {rebaseDir} fetch origin {repo.DefaultBranch}", ct);
-                            await RunGitAsync($"-C {rebaseDir} rebase origin/{repo.DefaultBranch}", ct);
-
-                            // Rebase succeeded — force-push the rebased branch and retry merge
-                            await RunGitAsync($"-C {rebaseDir} push origin {pipeline.CoderBranch} --force-with-lease", ct);
-                            _logger.LogInformation("Auto-rebase succeeded for {GoalId} — retrying merge", pipeline.GoalId);
-
-                            // Retry merge in the original temp dir
-                            await RunGitAsync($"-C {tempDir} fetch origin {pipeline.CoderBranch}", ct);
-                            await RunGitAsync($"-C {tempDir} merge origin/{pipeline.CoderBranch} --no-edit", ct);
-                        }
-                        catch (Exception rebaseEx)
-                        {
-                            // Auto-rebase failed — abort and fall through to coder-based resolution
-                            _logger.LogWarning(
-                                "Auto-rebase failed for {GoalId} — falling back to coder: {Error}",
-                                pipeline.GoalId, rebaseEx.Message);
-                            try { await RunGitAsync($"-C {rebaseDir} rebase --abort", ct); } catch { }
-                            throw new InvalidOperationException(
-                                $"Merge conflict (auto-rebase failed): {mergeEx.Message}", mergeEx);
-                        }
-                        finally
-                        {
-                            if (Directory.Exists(rebaseDir))
-                            {
-                                try { Directory.Delete(rebaseDir, true); }
-                                catch { /* Best effort cleanup */ }
-                            }
-                        }
-                    }
-
-                    await RunGitAsync($"-C {tempDir} push origin {repo.DefaultBranch}", ct);
-
-                    _logger.LogInformation("Merged {Branch} into {Base} for {Repo}",
-                        pipeline.CoderBranch, repo.DefaultBranch, repo.Name);
+                    // Use the persistent brain clone — no temp dirs needed.
+                    // After merge, the clone is already on the base branch with the latest code.
+                    await _repoManager.MergeFeatureBranchAsync(
+                        repo.Name, pipeline.CoderBranch, repo.DefaultBranch, ct);
                 }
-                finally
+                else
                 {
-                    if (Directory.Exists(tempDir))
-                    {
-                        try { Directory.Delete(tempDir, true); }
-                        catch { /* Best effort cleanup */ }
-                    }
+                    await MergeViaTempCloneAsync(repo, pipeline.CoderBranch, ct);
                 }
+
+                _logger.LogInformation("Merged {Branch} into {Base} for {Repo}",
+                    pipeline.CoderBranch, repo.DefaultBranch, repo.Name);
             }
 
             await MarkGoalCompleted(pipeline, ct);
@@ -706,6 +653,33 @@ public sealed class GoalDispatcher : BackgroundService
                 await HandleMergeFailureAsync(pipeline, ex.Message, ct);
             else
                 await MarkGoalFailed(pipeline, $"Unexpected merge failure effect: {mergeResult.Effect}", ct);
+        }
+    }
+
+    /// <summary>
+    /// Fallback merge path using a temporary clone directory. Used when
+    /// <see cref="BrainRepoManager"/> is not available.
+    /// </summary>
+    private async Task MergeViaTempCloneAsync(
+        TargetRepository repo, string featureBranch, CancellationToken ct)
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"hive-merge-{Guid.NewGuid():N}");
+        try
+        {
+            await RunGitAsync($"clone --branch {repo.DefaultBranch} {repo.Url} {tempDir}", ct);
+            await RunGitAsync($"-C {tempDir} config user.email copilothive@local", ct);
+            await RunGitAsync($"-C {tempDir} config user.name CopilotHive", ct);
+            await RunGitAsync($"-C {tempDir} fetch origin {featureBranch}", ct);
+            await RunGitAsync($"-C {tempDir} merge origin/{featureBranch} --no-edit", ct);
+            await RunGitAsync($"-C {tempDir} push origin {repo.DefaultBranch}", ct);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                try { Directory.Delete(tempDir, true); }
+                catch { /* Best effort cleanup */ }
+            }
         }
     }
 

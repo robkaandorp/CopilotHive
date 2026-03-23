@@ -70,9 +70,66 @@ public sealed class BrainRepoManager
             Directory.CreateDirectory(WorkDirectory);
             await RunGitAsync(WorkDirectory,
                 ["clone", "--branch", defaultBranch, repoUrl, repoName], ct);
+
+            // Configure git identity for merge commits
+            await RunGitAsync(clonePath, ["config", "user.email", "copilothive@local"], ct);
+            await RunGitAsync(clonePath, ["config", "user.name", "CopilotHive"], ct);
         }
 
         return clonePath;
+    }
+
+    /// <summary>
+    /// Merges a feature branch into the default branch and pushes.
+    /// Uses the persistent brain clone instead of creating a temporary directory.
+    /// On failure, the clone is reset to the remote state.
+    /// </summary>
+    /// <param name="repoName">Repository name (must have been cloned via <see cref="EnsureCloneAsync"/>).</param>
+    /// <param name="featureBranch">The feature branch to merge (e.g. "copilothive/add-logging").</param>
+    /// <param name="defaultBranch">The base branch to merge into.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <exception cref="InvalidOperationException">Thrown when the merge fails (after reset).</exception>
+    public async Task MergeFeatureBranchAsync(
+        string repoName, string featureBranch, string defaultBranch, CancellationToken ct = default)
+    {
+        var clonePath = GetClonePath(repoName);
+        if (!Directory.Exists(Path.Combine(clonePath, ".git")))
+            throw new InvalidOperationException(
+                $"No brain clone found for '{repoName}'. Call EnsureCloneAsync first.");
+
+        _logger.LogInformation("Merging {Branch} into {Base} for {Repo}",
+            featureBranch, defaultBranch, repoName);
+
+        // Ensure we're on the base branch with latest remote state
+        await RunGitAsync(clonePath, ["fetch", "origin"], ct);
+        await RunGitAsync(clonePath, ["checkout", defaultBranch], ct);
+        await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct);
+
+        // Fetch the feature branch and attempt merge
+        await RunGitAsync(clonePath, ["fetch", "origin", featureBranch], ct);
+
+        try
+        {
+            await RunGitAsync(clonePath,
+                ["merge", $"origin/{featureBranch}", "--no-edit"], ct);
+        }
+        catch (Exception mergeEx)
+        {
+            _logger.LogWarning(mergeEx, "Merge failed for {Repo} — resetting clone to clean state", repoName);
+
+            // Abort the merge and reset to clean state
+            try { await RunGitAsync(clonePath, ["merge", "--abort"], ct); } catch { }
+            await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct);
+            await RunGitAsync(clonePath, ["clean", "-fd"], ct);
+
+            throw;
+        }
+
+        // Push the merge
+        await RunGitAsync(clonePath, ["push", "origin", defaultBranch], ct);
+
+        _logger.LogInformation("Successfully merged {Branch} into {Base} for {Repo}",
+            featureBranch, defaultBranch, repoName);
     }
 
     /// <summary>
