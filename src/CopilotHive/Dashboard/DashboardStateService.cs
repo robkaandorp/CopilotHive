@@ -23,6 +23,7 @@ public sealed class DashboardStateService : IDisposable
     private readonly DateTime _startTime = DateTime.UtcNow;
     private readonly string _version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown";
     private readonly string? _sharpCoderVersion = typeof(SharpCoder.CodingAgent).Assembly.GetName().Version?.ToString();
+    private List<Goal> _cachedPendingGoals = [];
 
     /// <summary>Fired when state has been polled and components should re-render.</summary>
     public event Action? OnStateChanged;
@@ -44,7 +45,28 @@ public sealed class DashboardStateService : IDisposable
         _progressLog = progressLog;
         _brain = brain;
         _config = config;
-        _timer = new Timer(_ => NotifyStateChanged(), null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(3));
+        _timer = new Timer(_ => PollAndNotify(), null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(3));
+    }
+
+    private void PollAndNotify()
+    {
+        // Refresh cached pending goals on the threadpool (safe to call async here)
+        try
+        {
+            var goals = new List<Goal>();
+            foreach (var source in _goalManager.Sources)
+            {
+                var pending = source.GetPendingGoalsAsync().GetAwaiter().GetResult();
+                goals.AddRange(pending);
+            }
+            _cachedPendingGoals = goals;
+        }
+        catch
+        {
+            // Don't crash the timer on transient failures
+        }
+
+        OnStateChanged?.Invoke();
     }
 
     /// <summary>Creates a snapshot of current system state.</summary>
@@ -53,16 +75,11 @@ public sealed class DashboardStateService : IDisposable
         var workers = _workerPool.GetAllWorkers();
         var pipelines = _pipelineManager.GetAllPipelines();
 
-        // Collect goals from all sources (API + File) and active pipelines.
+        // Collect goals from cached pending goals (refreshed by timer on threadpool)
         var goalsById = new Dictionary<string, Goal>();
 
-        // Add pending goals from all registered sources
-        foreach (var source in _goalManager.Sources)
-        {
-            var pending = source.GetPendingGoalsAsync().GetAwaiter().GetResult();
-            foreach (var g in pending)
-                goalsById.TryAdd(g.Id, g);
-        }
+        foreach (var g in _cachedPendingGoals)
+            goalsById.TryAdd(g.Id, g);
 
         // Add API source goals (includes all statuses, not just pending)
         var apiSource = _goalManager.Sources.OfType<ApiGoalSource>().FirstOrDefault();
@@ -321,8 +338,6 @@ public sealed class DashboardStateService : IDisposable
             BrainModel = _brain?.GetStats()?.Model ?? "(not configured)",
         };
     }
-
-    private void NotifyStateChanged() => OnStateChanged?.Invoke();
 
     /// <inheritdoc />
     public void Dispose() => _timer.Dispose();
