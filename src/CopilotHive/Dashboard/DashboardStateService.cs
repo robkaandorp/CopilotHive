@@ -146,6 +146,165 @@ public sealed class DashboardStateService : IDisposable
             .TakeLast(count)
             .ToList();
 
+    /// <summary>Builds a rich detail view for a specific goal, including per-iteration phase info.</summary>
+    public GoalDetailInfo? GetGoalDetail(string goalId)
+    {
+        var snap = GetSnapshot();
+        var goal = snap.Goals.FirstOrDefault(g => g.Id == goalId);
+        if (goal is null)
+            return null;
+
+        var pipeline = _pipelineManager.GetByGoalId(goalId);
+        var progress = GetProgressForGoal(goalId);
+        var iterations = new List<IterationViewInfo>();
+
+        // Build views for completed iterations from IterationSummaries
+        foreach (var summary in goal.IterationSummaries)
+        {
+            var phases = new List<PhaseViewInfo>();
+            foreach (var pr in summary.Phases)
+            {
+                var roleName = PhaseNameToRoleName(pr.Name);
+                string? workerOutput = null;
+                if (!string.IsNullOrEmpty(roleName))
+                    pipeline?.PhaseOutputs.TryGetValue($"{roleName}-{summary.Iteration}", out workerOutput);
+
+                var isTestPhase = pr.Name == "Testing";
+                var isReviewPhase = pr.Name == "Review";
+
+                phases.Add(new PhaseViewInfo
+                {
+                    Name = pr.Name,
+                    RoleName = roleName,
+                    Status = pr.Result switch { "pass" => "completed", "fail" => "failed", "skip" => "skipped", _ => "completed" },
+                    DurationSeconds = pr.DurationSeconds > 0 ? pr.DurationSeconds : null,
+                    WorkerOutput = workerOutput,
+                    TotalTests = isTestPhase ? (summary.TestCounts?.Total ?? 0) : 0,
+                    PassedTests = isTestPhase ? (summary.TestCounts?.Passed ?? 0) : 0,
+                    FailedTests = isTestPhase ? (summary.TestCounts?.Failed ?? 0) : 0,
+                    ReviewVerdict = isReviewPhase ? summary.ReviewVerdict : null,
+                });
+            }
+
+            iterations.Add(new IterationViewInfo
+            {
+                Number = summary.Iteration,
+                Phases = phases,
+                IsCurrent = false,
+            });
+        }
+
+        // Build view for the current/unsummarized iteration from pipeline state
+        if (pipeline is not null && !iterations.Any(i => i.Number == pipeline.Iteration))
+        {
+            var currentIter = pipeline.Iteration;
+            var isCurrent = pipeline.Phase is not GoalPhase.Done and not GoalPhase.Failed;
+            var planPhases = pipeline.Plan?.Phases ?? [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review];
+            var currentPhases = new List<PhaseViewInfo>();
+            var failedFound = false;
+
+            foreach (var phase in planPhases)
+            {
+                string status;
+                if (pipeline.StateMachine.CompletedPhases.Contains(phase))
+                    status = "completed";
+                else if (isCurrent && phase == pipeline.Phase)
+                    status = "active";
+                else if (pipeline.Phase == GoalPhase.Failed && !failedFound)
+                    { status = "failed"; failedFound = true; }
+                else if (pipeline.Phase == GoalPhase.Done)
+                    status = "skipped";
+                else
+                    status = "pending";
+
+                var roleName = GetRoleNameSafe(phase);
+                string? workerOutput = null;
+                if (!string.IsNullOrEmpty(roleName))
+                    pipeline.PhaseOutputs.TryGetValue($"{roleName}-{currentIter}", out workerOutput);
+
+                var isTestPhase = phase == GoalPhase.Testing;
+                var isReviewPhase = phase == GoalPhase.Review;
+                var metrics = pipeline.Metrics;
+                var hasMetrics = status is "completed" or "active" or "failed";
+
+                currentPhases.Add(new PhaseViewInfo
+                {
+                    Name = phase.ToDisplayName(),
+                    RoleName = roleName,
+                    Status = status,
+                    WorkerOutput = workerOutput,
+                    DurationSeconds = metrics.PhaseDurations.TryGetValue(phase.ToString(), out var dur) ? dur.TotalSeconds : null,
+                    TotalTests = hasMetrics && isTestPhase ? metrics.TotalTests : 0,
+                    PassedTests = hasMetrics && isTestPhase ? metrics.PassedTests : 0,
+                    FailedTests = hasMetrics && isTestPhase ? metrics.FailedTests : 0,
+                    CoveragePercent = hasMetrics && isTestPhase ? metrics.CoveragePercent : 0,
+                    BuildSuccess = hasMetrics && isTestPhase && metrics.BuildSuccess,
+                    ReviewVerdict = hasMetrics && isReviewPhase ? metrics.ReviewVerdict?.ToString() : null,
+                    ReviewIssuesFound = hasMetrics && isReviewPhase ? metrics.ReviewIssuesFound : 0,
+                    Issues = hasMetrics && isReviewPhase ? metrics.ReviewIssues.ToList() :
+                             hasMetrics && isTestPhase ? metrics.Issues.ToList() : [],
+                    Verdict = hasMetrics && isTestPhase ? metrics.Verdict?.ToString() : null,
+                    ProgressReports = status == "active" && pipeline.PhaseStartedAt.HasValue
+                        ? progress.Where(p => p.Timestamp >= pipeline.PhaseStartedAt.Value).ToList()
+                        : [],
+                });
+            }
+
+            iterations.Add(new IterationViewInfo
+            {
+                Number = currentIter,
+                Phases = currentPhases,
+                IsCurrent = isCurrent,
+            });
+        }
+
+        // Derive effective status from pipeline phase
+        var effectiveStatus = pipeline?.Phase switch
+        {
+            GoalPhase.Done => GoalStatus.Completed,
+            GoalPhase.Failed => GoalStatus.Failed,
+            not null => GoalStatus.InProgress,
+            _ => goal.Status,
+        };
+
+        return new GoalDetailInfo
+        {
+            GoalId = goalId,
+            Description = goal.Description,
+            Status = effectiveStatus,
+            Priority = goal.Priority,
+            CurrentIteration = pipeline?.Iteration ?? 0,
+            CurrentPhase = pipeline?.Phase.ToDisplayName() ?? "",
+            CreatedAt = pipeline?.CreatedAt ?? goal.CreatedAt,
+            CompletedAt = pipeline?.CompletedAt ?? goal.CompletedAt,
+            ActiveTaskId = pipeline?.ActiveTaskId,
+            CoderBranch = pipeline?.CoderBranch,
+            Notes = goal.Notes,
+            Iterations = iterations,
+            Conversation = pipeline?.Conversation.ToList() ?? [],
+        };
+    }
+
+    private static string PhaseNameToRoleName(string phaseName) => phaseName switch
+    {
+        "Coding" => "coder",
+        "Testing" => "tester",
+        "Review" => "reviewer",
+        "Doc Writing" => "docwriter",
+        "Improvement" => "improver",
+        _ => "",
+    };
+
+    private static string GetRoleNameSafe(GoalPhase phase) => phase switch
+    {
+        GoalPhase.Coding => "coder",
+        GoalPhase.Testing => "tester",
+        GoalPhase.Review => "reviewer",
+        GoalPhase.DocWriting => "docwriter",
+        GoalPhase.Improve => "improver",
+        _ => "",
+    };
+
     /// <summary>Returns orchestrator info including uptime, versions, and model configuration.</summary>
     public OrchestratorInfo GetOrchestratorInfo()
     {
@@ -253,4 +412,81 @@ public sealed class OrchestratorInfo
     public string BrainModel { get; init; } = "";
     /// <summary>Model configured per worker role.</summary>
     public Dictionary<string, string> RoleModels { get; init; } = [];
+}
+
+/// <summary>Rich detail info for the goal detail page.</summary>
+public sealed class GoalDetailInfo
+{
+    /// <summary>Goal identifier.</summary>
+    public string GoalId { get; init; } = "";
+    /// <summary>Goal description.</summary>
+    public string Description { get; init; } = "";
+    /// <summary>Effective goal status (derived from pipeline phase when active).</summary>
+    public GoalStatus Status { get; init; }
+    /// <summary>Goal priority level.</summary>
+    public GoalPriority Priority { get; init; }
+    /// <summary>Current iteration number (zero if not started).</summary>
+    public int CurrentIteration { get; init; }
+    /// <summary>Name of the current pipeline phase.</summary>
+    public string CurrentPhase { get; init; } = "";
+    /// <summary>When the goal was created.</summary>
+    public DateTime CreatedAt { get; init; }
+    /// <summary>When the goal completed, if finished.</summary>
+    public DateTime? CompletedAt { get; init; }
+    /// <summary>Currently active task ID, if any.</summary>
+    public string? ActiveTaskId { get; init; }
+    /// <summary>Feature branch used by the coder.</summary>
+    public string? CoderBranch { get; init; }
+    /// <summary>Informational notes attached to the goal.</summary>
+    public List<string> Notes { get; init; } = [];
+    /// <summary>Per-iteration detail with phases.</summary>
+    public List<IterationViewInfo> Iterations { get; init; } = [];
+    /// <summary>Brain conversation log.</summary>
+    public List<ConversationEntry> Conversation { get; init; } = [];
+}
+
+/// <summary>Detail for a single iteration in the goal timeline.</summary>
+public sealed class IterationViewInfo
+{
+    /// <summary>One-based iteration number.</summary>
+    public int Number { get; init; }
+    /// <summary>Phases executed in this iteration.</summary>
+    public List<PhaseViewInfo> Phases { get; init; } = [];
+    /// <summary>Whether this is the currently executing iteration.</summary>
+    public bool IsCurrent { get; init; }
+}
+
+/// <summary>Detail for a single phase within an iteration.</summary>
+public sealed class PhaseViewInfo
+{
+    /// <summary>Display name of the phase (e.g. "Coding", "Testing").</summary>
+    public string Name { get; init; } = "";
+    /// <summary>Worker role name (e.g. "coder", "tester"), empty for non-worker phases.</summary>
+    public string RoleName { get; init; } = "";
+    /// <summary>Phase status: "completed", "failed", "active", "pending", or "skipped".</summary>
+    public string Status { get; init; } = "";
+    /// <summary>Overall verdict for this phase.</summary>
+    public string? Verdict { get; init; }
+    /// <summary>Wall-clock duration in seconds, if available.</summary>
+    public double? DurationSeconds { get; init; }
+    /// <summary>Raw worker output from PhaseOutputs.</summary>
+    public string? WorkerOutput { get; init; }
+    /// <summary>Total tests discovered (Testing phase only).</summary>
+    public int TotalTests { get; init; }
+    /// <summary>Tests that passed (Testing phase only).</summary>
+    public int PassedTests { get; init; }
+    /// <summary>Tests that failed (Testing phase only).</summary>
+    public int FailedTests { get; init; }
+    /// <summary>Code coverage percentage (Testing phase only).</summary>
+    public double CoveragePercent { get; init; }
+    /// <summary>Whether the build succeeded (Testing phase only).</summary>
+    public bool BuildSuccess { get; init; }
+    /// <summary>Review verdict string (Review phase only).</summary>
+    public string? ReviewVerdict { get; init; }
+    /// <summary>Number of issues found during review (Review phase only).</summary>
+    public int ReviewIssuesFound { get; init; }
+    /// <summary>List of issues found.</summary>
+    public List<string> Issues { get; init; } = [];
+    /// <summary>Progress reports during this phase.</summary>
+    public List<ProgressEntry> ProgressReports { get; init; } = [];
 }

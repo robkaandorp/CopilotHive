@@ -1,54 +1,214 @@
 @page "/goals/{GoalId}"
 @using CopilotHive.Dashboard
 @using CopilotHive.Goals
+@using CopilotHive.Orchestration
 @implements IDisposable
 @inject DashboardStateService State
 
 <h1>Goal: @GoalId</h1>
 
-@if (_goal is not null)
+@if (_detail is not null)
 {
+    <!-- Header -->
     <div class="card" style="margin-bottom:1rem">
         <div class="label">Description</div>
-        <div>@_goal.Description</div>
-        <div style="margin-top:0.5rem">
-            <span class="badge @StatusBadge(EffectiveStatus)">@EffectiveStatus</span>
-            <span style="color:var(--text-muted);margin-left:0.5rem">Priority: @_goal.Priority</span>
+        <div>@_detail.Description</div>
+        <div style="margin-top:0.5rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
+            <span class="badge @StatusBadge(_detail.Status)">@_detail.Status</span>
+            <span style="color:var(--text-muted)">Priority: @_detail.Priority</span>
+            @if (!string.IsNullOrEmpty(_detail.CoderBranch))
+            {
+                <span style="font-family:monospace;font-size:0.85rem;color:var(--accent)">⎇ @_detail.CoderBranch</span>
+            }
+            @if (!string.IsNullOrEmpty(_detail.CurrentPhase))
+            {
+                <span style="color:var(--text-muted)">Phase: <strong style="color:var(--text)">@_detail.CurrentPhase</strong></span>
+            }
+            @if (_detail.CurrentIteration > 0)
+            {
+                <span style="color:var(--text-muted)">Iteration: <strong style="color:var(--text)">@_detail.CurrentIteration</strong></span>
+            }
+        </div>
+        <div style="margin-top:0.5rem;font-size:0.8rem;color:var(--text-muted)">
+            Created: @_detail.CreatedAt.ToString("yyyy-MM-dd HH:mm:ss") UTC
+            @if (_detail.CompletedAt.HasValue)
+            {
+                <span style="margin-left:1rem">Completed: @_detail.CompletedAt.Value.ToString("yyyy-MM-dd HH:mm:ss") UTC</span>
+            }
+            @if (_detail.ActiveTaskId is not null)
+            {
+                <span style="margin-left:1rem">Task: <code>@Truncate(_detail.ActiveTaskId, 20)</code></span>
+            }
         </div>
     </div>
 
-    @if (_pipeline is not null)
+    @if (_detail.Notes.Count > 0)
     {
         <div class="card" style="margin-bottom:1rem">
-            <div class="label">Current Progress</div>
-            <div style="margin-top:0.5rem">
-                <PhaseTimeline Phase="@_pipeline.Phase" Phases="@_pipeline.Phases" />
-            </div>
-            <div style="margin-top:0.75rem;display:flex;gap:2rem">
-                <div><span class="label">Iteration:</span> @_pipeline.Iteration</div>
-                <div><span class="label">Tests:</span> @_pipeline.PassedTests/@_pipeline.TotalTests</div>
-                <div><span class="label">Coverage:</span> @(_pipeline.CoveragePercent > 0 ? $"{_pipeline.CoveragePercent:F1}%" : "—")</div>
-            </div>
-            @if (_pipeline.ActiveTaskId is not null)
-            {
-                <div style="margin-top:0.5rem;color:var(--text-muted);font-size:0.85rem">
-                    Active task: @_pipeline.ActiveTaskId
-                </div>
-            }
+            <div class="label">Notes</div>
+            <ul style="margin:0.5rem 0 0 1.2rem;font-size:0.85rem">
+                @foreach (var note in _detail.Notes)
+                {
+                    <li style="color:var(--text-muted)">@note</li>
+                }
+            </ul>
         </div>
     }
 
+    <!-- Iteration Timeline -->
+    <h2 style="margin-top:1.5rem">Iterations</h2>
+    @if (_detail.Iterations.Count > 0)
+    {
+        @for (int i = 0; i < _detail.Iterations.Count; i++)
+        {
+            var iteration = _detail.Iterations[i];
+            var idx = i;
+            var hasFailed = iteration.Phases.Any(p => p.Status == "failed");
+
+            <div class="iteration-section">
+                <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem">
+                    <strong>Iteration @iteration.Number</strong>
+                    @if (iteration.IsCurrent)
+                    {
+                        <span class="badge badge-blue">current</span>
+                    }
+                    else if (hasFailed)
+                    {
+                        <span class="badge badge-red">retry</span>
+                    }
+                    else
+                    {
+                        <span class="badge badge-green">done</span>
+                    }
+                </div>
+
+                <div class="phase-bar" style="margin-bottom:0.5rem">
+                    @foreach (var phase in iteration.Phases)
+                    {
+                        var phaseKey = $"{iteration.Number}-{phase.Name}";
+                        <button class="phase-box @phase.Status" @onclick="() => TogglePhase(phaseKey)">
+                            <span class="phase-box-icon">@PhaseIcon(phase.Status)</span>
+                            @phase.Name
+                            @if (phase.DurationSeconds.HasValue)
+                            {
+                                <span class="phase-box-duration">@FormatDuration(phase.DurationSeconds.Value)</span>
+                            }
+                        </button>
+                    }
+                </div>
+
+                @foreach (var phase in iteration.Phases)
+                {
+                    var phaseKey = $"{iteration.Number}-{phase.Name}";
+                    @if (_selectedPhase == phaseKey)
+                    {
+                        <div class="phase-detail">
+                            <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem">
+                                <strong>@phase.Name</strong>
+                                <span class="badge @PhaseBadge(phase.Status)">@phase.Status</span>
+                                @if (!string.IsNullOrEmpty(phase.Verdict))
+                                {
+                                    <span style="color:var(--text-muted)">Verdict: @phase.Verdict</span>
+                                }
+                                @if (phase.DurationSeconds.HasValue)
+                                {
+                                    <span style="color:var(--text-muted)">Duration: @FormatDuration(phase.DurationSeconds.Value)</span>
+                                }
+                            </div>
+
+                            @if (phase.TotalTests > 0)
+                            {
+                                <table style="margin-bottom:0.75rem;max-width:400px">
+                                    <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+                                    <tbody>
+                                        <tr><td>Build</td><td style="color:@(phase.BuildSuccess ? "var(--green)" : "var(--red)")">@(phase.BuildSuccess ? "✓ Success" : "✗ Failed")</td></tr>
+                                        <tr><td>Total Tests</td><td>@phase.TotalTests</td></tr>
+                                        <tr><td>Passed</td><td style="color:var(--green)">@phase.PassedTests</td></tr>
+                                        <tr><td>Failed</td><td style="color:@(phase.FailedTests > 0 ? "var(--red)" : "var(--text)")">@phase.FailedTests</td></tr>
+                                        @if (phase.CoveragePercent > 0)
+                                        {
+                                            <tr><td>Coverage</td><td>@($"{phase.CoveragePercent:F1}%")</td></tr>
+                                        }
+                                    </tbody>
+                                </table>
+                            }
+
+                            @if (!string.IsNullOrEmpty(phase.ReviewVerdict))
+                            {
+                                <div style="margin-bottom:0.5rem">
+                                    <span class="label">Review:</span>
+                                    <span class="badge @ReviewBadge(phase.ReviewVerdict)">@phase.ReviewVerdict</span>
+                                    @if (phase.ReviewIssuesFound > 0)
+                                    {
+                                        <span style="margin-left:0.5rem;color:var(--text-muted)">@phase.ReviewIssuesFound issue(s)</span>
+                                    }
+                                </div>
+                            }
+
+                            @if (phase.Issues.Count > 0)
+                            {
+                                <div style="margin-bottom:0.75rem">
+                                    <div class="label" style="margin-bottom:0.25rem">Issues</div>
+                                    <ul style="margin:0 0 0 1.2rem;font-size:0.85rem">
+                                        @foreach (var issue in phase.Issues)
+                                        {
+                                            <li style="color:var(--red)">@issue</li>
+                                        }
+                                    </ul>
+                                </div>
+                            }
+
+                            @if (phase.ProgressReports.Count > 0)
+                            {
+                                <div style="margin-bottom:0.75rem">
+                                    <div class="label" style="margin-bottom:0.25rem">Progress Reports</div>
+                                    <table style="font-size:0.85rem">
+                                        <thead><tr><th>Time</th><th>Worker</th><th>Status</th><th>Details</th></tr></thead>
+                                        <tbody>
+                                            @foreach (var rpt in phase.ProgressReports)
+                                            {
+                                                <tr>
+                                                    <td style="white-space:nowrap;color:var(--text-muted)">@rpt.Timestamp.ToString("HH:mm:ss")</td>
+                                                    <td style="font-family:monospace;font-size:0.85rem">@Truncate(rpt.WorkerId, 12)</td>
+                                                    <td><span class="badge badge-blue">@rpt.Status</span></td>
+                                                    <td>@Truncate(rpt.Details, 200)</td>
+                                                </tr>
+                                            }
+                                        </tbody>
+                                    </table>
+                                </div>
+                            }
+
+                            @if (!string.IsNullOrEmpty(phase.WorkerOutput))
+                            {
+                                <details class="collapsible-output">
+                                    <summary>Worker Output (@phase.RoleName)</summary>
+                                    <pre>@phase.WorkerOutput</pre>
+                                </details>
+                            }
+                        </div>
+                    }
+                }
+
+                @if (hasFailed && idx < _detail.Iterations.Count - 1)
+                {
+                    <div class="iteration-arrow">↻ Retry — iteration failed, advancing to next</div>
+                }
+            </div>
+        }
+    }
+    else
+    {
+        <p style="color:var(--text-muted)">No iterations yet — goal is pending.</p>
+    }
+
+    <!-- Progress Reports -->
     <h2 style="margin-top:1.5rem">Progress Reports</h2>
     @if (_progress.Count > 0)
     {
         <table>
             <thead>
-                <tr>
-                    <th>Time</th>
-                    <th>Worker</th>
-                    <th>Status</th>
-                    <th>Details</th>
-                </tr>
+                <tr><th>Time</th><th>Worker</th><th>Status</th><th>Details</th></tr>
             </thead>
             <tbody>
                 @foreach (var entry in _progress)
@@ -69,6 +229,23 @@
     {
         <p style="color:var(--text-muted)">No progress reports for this goal yet.</p>
     }
+
+    <!-- Conversation Log -->
+    @if (_detail.Conversation.Count > 0)
+    {
+        <h2 style="margin-top:1.5rem">Brain Conversation</h2>
+        <details style="margin-bottom:1rem">
+            <summary style="cursor:pointer;color:var(--accent)">Show @_detail.Conversation.Count message(s)</summary>
+            <div class="log-view" style="margin-top:0.5rem">
+                @foreach (var msg in _detail.Conversation)
+                {
+                    <div class="log-line @(msg.Role == "assistant" ? "log-info" : "log-debug")">
+                        <strong>[@msg.Role]</strong> @msg.Content
+                    </div>
+                }
+            </div>
+        </details>
+    }
 }
 else
 {
@@ -78,20 +255,9 @@ else
 @code {
     [Parameter] public string GoalId { get; set; } = "";
 
-    private Goal? _goal;
-    private PipelineInfo? _pipeline;
+    private GoalDetailInfo? _detail;
     private IReadOnlyList<ProgressEntry> _progress = [];
-
-    // The Goal object from pipelines may be stale (snapshot at dispatch time).
-    // Derive status from the pipeline phase which is always current.
-    private GoalStatus EffectiveStatus => _pipeline?.Phase switch
-    {
-        "Completed" or "Done" => GoalStatus.Completed,
-        "Failed" => GoalStatus.Failed,
-        "Planning" or "Coding" or "Testing" or "Review"
-            or "DocWriting" or "Improve" or "Merging" => GoalStatus.InProgress,
-        _ => _goal?.Status ?? GoalStatus.Pending,
-    };
+    private string? _selectedPhase;
 
     protected override void OnInitialized()
     {
@@ -103,13 +269,16 @@ else
 
     private void Refresh()
     {
-        var snap = State.GetSnapshot();
-        _goal = snap.Goals.FirstOrDefault(g => g.Id == GoalId);
-        _pipeline = snap.Pipelines.FirstOrDefault(p => p.GoalId == GoalId);
+        _detail = State.GetGoalDetail(GoalId);
         _progress = State.GetProgressForGoal(GoalId);
     }
 
     private void RefreshState() => InvokeAsync(() => { Refresh(); StateHasChanged(); });
+
+    private void TogglePhase(string phaseKey)
+    {
+        _selectedPhase = _selectedPhase == phaseKey ? null : phaseKey;
+    }
 
     private static string StatusBadge(GoalStatus s) => s switch
     {
@@ -119,6 +288,30 @@ else
         GoalStatus.Pending => "badge-yellow",
         _ => "badge-muted",
     };
+
+    private static string PhaseBadge(string status) => status switch
+    {
+        "completed" => "badge-green",
+        "failed" => "badge-red",
+        "active" => "badge-blue",
+        _ => "badge-muted",
+    };
+
+    private static string PhaseIcon(string status) => status switch
+    {
+        "completed" => "✓",
+        "failed" => "✗",
+        "active" => "●",
+        "pending" => "○",
+        "skipped" => "~",
+        _ => "○",
+    };
+
+    private static string ReviewBadge(string? verdict) =>
+        string.Equals(verdict, "Approve", StringComparison.OrdinalIgnoreCase) ? "badge-green" : "badge-red";
+
+    private static string FormatDuration(double seconds) =>
+        seconds >= 60 ? $"{seconds / 60:F1}m" : $"{seconds:F0}s";
 
     private static string Truncate(string s, int max) =>
         s.Length <= max ? s : s[..max] + "…";

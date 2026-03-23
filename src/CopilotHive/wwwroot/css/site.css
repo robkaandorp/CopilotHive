@@ -187,3 +187,108 @@ tr:last-child td { border-bottom: none; }
     word-break: break-word;
     color: var(--text);
 }
+
+/* Goal detail: iteration sections */
+.iteration-section {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    margin-bottom: 0.75rem;
+}
+
+/* Goal detail: clickable phase boxes */
+.phase-box {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.3rem 0.7rem;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-weight: 500;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text-muted);
+    transition: border-color 0.15s, background 0.15s;
+    font-family: inherit;
+}
+.phase-box:hover { border-color: var(--accent); }
+.phase-box.completed {
+    background: rgba(63,185,80,0.1);
+    border-color: var(--green);
+    color: var(--green);
+}
+.phase-box.failed {
+    background: rgba(248,81,73,0.1);
+    border-color: var(--red);
+    color: var(--red);
+}
+.phase-box.active {
+    background: rgba(88,166,255,0.15);
+    border-color: var(--accent);
+    color: var(--accent);
+    animation: pulse-glow 2s ease-in-out infinite;
+}
+.phase-box.pending {
+    background: var(--bg);
+    border-color: var(--border);
+    color: var(--text-muted);
+}
+.phase-box.skipped {
+    background: var(--bg);
+    border-color: var(--border);
+    color: var(--text-muted);
+    font-style: italic;
+    opacity: 0.6;
+}
+.phase-box-icon { font-size: 0.7rem; }
+.phase-box-duration { font-size: 0.65rem; color: var(--text-muted); margin-left: 0.25rem; }
+
+@keyframes pulse-glow {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(88,166,255,0.3); }
+    50% { box-shadow: 0 0 8px 2px rgba(88,166,255,0.15); }
+}
+
+/* Goal detail: expanded phase panel */
+.phase-detail {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem;
+    margin-top: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+/* Goal detail: retry arrow between iterations */
+.iteration-arrow {
+    color: var(--red);
+    font-size: 0.85rem;
+    text-align: center;
+    padding: 0.5rem 0;
+    font-weight: 500;
+}
+
+/* Goal detail: collapsible worker output */
+.collapsible-output { margin-top: 0.5rem; }
+.collapsible-output summary {
+    cursor: pointer;
+    color: var(--accent);
+    font-size: 0.85rem;
+    padding: 0.25rem 0;
+}
+.collapsible-output pre {
+    background: #000;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.75rem;
+    margin-top: 0.5rem;
+    font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    max-height: 400px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: var(--text);
+}
