@@ -31,6 +31,8 @@ public sealed class HiveConfiguration
     public bool VerboseLogging { get; init; }
     /// <summary>Maximum context window size in tokens for the Brain model. Used for compaction decisions and context monitoring.</summary>
     public int BrainContextWindow { get; init; } = Constants.DefaultBrainContextWindow;
+    /// <summary>Maximum tool-call steps the Brain agent may take per request.</summary>
+    public int BrainMaxSteps { get; init; } = Constants.DefaultBrainMaxSteps;
     /// <summary>GitHub personal access token used to authenticate Docker container spawns and git operations.</summary>
     public required string GitHubToken { get; init; }
 

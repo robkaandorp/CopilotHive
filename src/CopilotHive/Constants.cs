@@ -28,9 +28,10 @@ internal static class Constants
     public const int TruncationFull     = 8000;
 
     // Config defaults
-    public const int    DefaultMaxIterations    = 10;
+    public const int    DefaultMaxIterations      = 10;
     public const int    DefaultBrainContextWindow = 150_000;
-    public const string DefaultModel             = "claude-opus-4.6";
+    public const int    DefaultBrainMaxSteps      = 50;
+    public const string DefaultModel              = "claude-opus-4.6";
 
     // Version
     /// <summary>Current orchestrator version reported to workers on registration.</summary>

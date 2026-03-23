@@ -76,4 +76,6 @@ public sealed class OrchestratorConfig
     public bool VerboseLogging { get; set; }
     /// <summary>Maximum context window size in tokens for the Brain model. Used for compaction decisions.</summary>
     public int BrainContextWindow { get; set; } = Constants.DefaultBrainContextWindow;
+    /// <summary>Maximum tool-call steps the Brain agent may take per request.</summary>
+    public int BrainMaxSteps { get; set; } = Constants.DefaultBrainMaxSteps;
 }

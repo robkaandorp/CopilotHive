@@ -29,3 +29,4 @@ orchestrator:
   always_improve: true
   verbose_logging: false
   brain_context_window: 150000  # Max tokens for the Brain model's context
+  brain_max_steps: 50           # Max tool-call steps per Brain request

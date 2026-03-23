@@ -78,6 +78,7 @@ static async Task<int> RunServerAsync(string[] args)
     // Brain: direct LLM connection via SharpCoder
     var brainModel = Environment.GetEnvironmentVariable("BRAIN_MODEL");
     var brainContextWindowEnv = Environment.GetEnvironmentVariable("BRAIN_CONTEXT_WINDOW");
+    var brainMaxStepsEnv = Environment.GetEnvironmentVariable("BRAIN_MAX_STEPS");
     if (!string.IsNullOrEmpty(brainModel))
     {
         builder.Services.AddSingleton<IDistributedBrain>(sp =>
@@ -86,10 +87,14 @@ static async Task<int> RunServerAsync(string[] args)
             var maxCtx = int.TryParse(brainContextWindowEnv, out var envCtx)
                 ? envCtx
                 : config?.Orchestrator.BrainContextWindow ?? Constants.DefaultBrainContextWindow;
+            var maxSteps = int.TryParse(brainMaxStepsEnv, out var envSteps)
+                ? envSteps
+                : config?.Orchestrator.BrainMaxSteps ?? Constants.DefaultBrainMaxSteps;
             return new DistributedBrain(brainModel, sp.GetRequiredService<ILogger<DistributedBrain>>(),
                 sp.GetRequiredService<MetricsTracker>(),
                 sp.GetService<AgentsManager>(),
                 maxCtx,
+                maxSteps,
                 sp.GetService<BrainRepoManager>(),
                 stateDir);
         });

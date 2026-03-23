@@ -22,6 +22,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 {
     private readonly string _modelOverride;
     private readonly int _maxContextTokens;
+    private readonly int _maxSteps;
     private readonly ILogger<DistributedBrain> _logger;
     private readonly MetricsTracker? _metricsTracker;
     private readonly BrainRepoManager? _repoManager;
@@ -72,16 +73,19 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <param name="metricsTracker">Optional tracker used to include historical metrics in prompts.</param>
     /// <param name="agentsManager">Optional manager used to load the orchestrator's AGENTS.md.</param>
     /// <param name="maxContextTokens">Maximum context window size in tokens. Defaults to <see cref="Constants.DefaultBrainContextWindow"/>.</param>
+    /// <param name="maxSteps">Maximum tool-call steps per Brain request. Defaults to <see cref="Constants.DefaultBrainMaxSteps"/>.</param>
     /// <param name="repoManager">Optional manager for persistent Brain repo clones (read-only file access).</param>
     /// <param name="stateDir">Directory for persistent state (session files). Defaults to <c>/app/state</c>.</param>
     public DistributedBrain(string modelOverride, ILogger<DistributedBrain> logger,
         MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null,
         int maxContextTokens = Constants.DefaultBrainContextWindow,
+        int maxSteps = Constants.DefaultBrainMaxSteps,
         BrainRepoManager? repoManager = null,
         string? stateDir = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
+        _maxSteps = maxSteps;
         _logger = logger;
         _metricsTracker = metricsTracker;
         _repoManager = repoManager;
@@ -195,7 +199,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _agent = new CodingAgent(_chatClient, new AgentOptions
         {
             WorkDirectory = workDir,
-            MaxSteps = 25,
+            MaxSteps = _maxSteps,
             EnableBash = false,
             EnableFileOps = _repoManager is not null,
             EnableFileWrites = false,
