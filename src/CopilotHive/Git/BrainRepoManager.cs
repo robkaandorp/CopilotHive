@@ -28,6 +28,7 @@ public sealed class BrainRepoManager
     {
         _basePath = Path.GetFullPath(basePath);
         _logger = logger;
+        Directory.CreateDirectory(WorkDirectory);
     }
 
     /// <summary>
