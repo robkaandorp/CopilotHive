@@ -1149,7 +1149,7 @@ public sealed class GoalDispatcher : BackgroundService
             restored.Count, string.Join(", ", restored.Select(p => p.GoalId)));
     }
 
-    private async Task DispatchNextGoalAsync(CancellationToken ct)
+    internal async Task DispatchNextGoalAsync(CancellationToken ct)
     {
         // Sequential gate: only one goal runs at a time so the Brain
         // can accumulate context across goals in its single session.
@@ -1164,7 +1164,7 @@ public sealed class GoalDispatcher : BackgroundService
         if (!_dispatchedGoals.TryAdd(goal.Id, true))
             return;
 
-        _logger.LogInformation("Dispatching goal '{GoalId}': {Description}", goal.Id, goal.Description);
+        _logger.LogInformation("Dispatching goal '{GoalId}': {Description} (Priority={Priority})", goal.Id, goal.Description, goal.Priority);
 
         // Ensure Brain repo clones are up-to-date before planning
         if (_brain is not null)

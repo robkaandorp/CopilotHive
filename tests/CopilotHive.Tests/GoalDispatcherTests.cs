@@ -316,6 +316,52 @@ public sealed class GoalDispatcherStartupLogTests
 }
 
 /// <summary>
+/// Tests that the dispatch log message includes the goal's Priority.
+/// </summary>
+public sealed class GoalDispatcherDispatchLoggingTests
+{
+    [Fact]
+    public async Task DispatchNextGoalAsync_LogsGoalPriority()
+    {
+        // Arrange - configure a repo so DispatchToRole succeeds (no idle worker, so it just enqueues)
+        var logger = new CollectingLogger<GoalDispatcher>();
+        var goal = new Goal
+        {
+            Id = "goal-priority-test",
+            Description = "Priority logging test",
+            Priority = GoalPriority.High,
+            RepositoryNames = ["test-repo"],
+        };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+
+        var config = new HiveConfigFile
+        {
+            Repositories =
+            [
+                new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/repo" },
+            ],
+        };
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            new GoalPipelineManager(),
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            config: config);
+
+        // Act - invoke the dispatch method directly to avoid the 10-second startup delay in ExecuteAsync
+        await dispatcher.DispatchNextGoalAsync(TestContext.Current.CancellationToken);
+
+        // Assert - the log message must mention the priority name "High"
+        Assert.Contains(logger.Logs, l => l.Message.Contains("High"));
+    }
+}
+
+/// <summary>
 /// Minimal <see cref="IGoalSource"/> that returns a single pre-configured goal.
 /// </summary>
 file sealed class FakeGoalSource : IGoalSource
