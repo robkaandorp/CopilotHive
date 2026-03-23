@@ -2,7 +2,7 @@
 
 # CopilotHive
 
-CopilotHive is a **self-improving multi-agent orchestration system** powered by the **GitHub Copilot SDK**. A pool of generic worker agents collaborate autonomously inside Docker containers — dynamically taking on roles (coder, tester, doc-writer, reviewer, improver) per task — to implement software goals without human intervention.
+CopilotHive is a **self-improving multi-agent orchestration system** powered by **SharpCoder** (an autonomous coding agent library). A pool of generic worker agents collaborate autonomously inside Docker containers — dynamically taking on roles (coder, tester, doc-writer, reviewer, improver) per task — to implement software goals without human intervention.
 
 ## Architecture
 
@@ -39,7 +39,7 @@ Goals flow through a structured pipeline:
 
 If testing or review fails, the pipeline retries the coding step (up to a configured limit).
 
-The **Brain** (`DistributedBrain`) plans iteration phases and crafts worker prompts using the GitHub Copilot SDK (JSON-RPC). Workers report structured verdicts via tool calls, and the pipeline state machine (`PipelineStateMachine`) drives sequencing — retrying, advancing, or failing based on those verdicts. Pipeline state is persisted to **SQLite** (`PipelineStore`) with auto-migration, so the server can resume after restarts. Metrics feed into the **improver** for self-improvement: the system tunes its own `agents.md` instructions over time.
+The **Brain** (`DistributedBrain`) plans iteration phases and crafts worker prompts using SharpCoder's `IChatClient` for LLM communication. Workers report structured verdicts via tool calls, and the pipeline state machine (`PipelineStateMachine`) drives sequencing — retrying, advancing, or failing based on those verdicts. Pipeline state is persisted to **SQLite** (`PipelineStore`) with auto-migration, so the server can resume after restarts. Metrics feed into the **improver** for self-improvement: the system tunes its own `agents.md` instructions over time.
 
 ## Getting Started
 
@@ -47,7 +47,7 @@ The **Brain** (`DistributedBrain`) plans iteration phases and crafts worker prom
 
 - [Docker](https://www.docker.com/) (latest stable)
 - [.NET 10 SDK](https://dotnet.microsoft.com/)
-- [GitHub Copilot](https://github.com/features/copilot) subscription with API access
+- A GitHub token (`GH_TOKEN`) or LLM provider API key for model access
 - A **config repo** containing `agents/*.agents.md` and `goals.yaml` (see below)
 
 ### Setup
@@ -70,7 +70,7 @@ The **Brain** (`DistributedBrain`) plans iteration phases and crafts worker prom
 
    This starts a **gRPC server** on port 9000 and an **HTTP health endpoint** on port 9001.
 
-   Set `BRAIN_COPILOT_PORT` to override the port the Brain uses to reach the Copilot CLI process.
+   Set `BRAIN_CONTEXT_WINDOW` to configure the Brain's maximum context window in tokens (default: 100,000). Different models have different limits (e.g. Claude 200k, GPT-4 128k).
 
 ### Configuring Goals
 
@@ -153,14 +153,14 @@ goals:
 | `src/CopilotHive/` | Main orchestrator — Brain, GoalDispatcher, persistence, metrics |
 | `src/CopilotHive.Shared/` | Shared protobuf definitions and DTOs |
 | `src/CopilotHive.Worker/` | Worker process (runs inside Docker containers) |
-| `tests/` | 492 xUnit tests |
+| `tests/` | 606 xUnit tests |
 | `agents/` | Default agent templates (overridden by config repo at runtime) |
 | `docker/` | Dockerfiles and container configuration |
 
 ## Current Features
 
 - **Server-only mode** — gRPC server + HTTP health endpoint (no CLI mode)
-- **LLM-powered Brain** — `DistributedBrain` uses GitHub Copilot SDK for orchestration decisions
+- **LLM-powered Brain** — `DistributedBrain` uses SharpCoder's `IChatClient` for orchestration decisions, with configurable context window (`BRAIN_CONTEXT_WINDOW`)
 - **Worker utilization metrics** — `GET /health/utilization` endpoint provides per-role worker utilization and bottleneck detection
 - **Self-improvement loop** — the improver modifies `agents.md` based on accumulated metrics
 - **SQLite persistence** — `PipelineStore` with auto-migration for pipeline state
@@ -171,6 +171,8 @@ goals:
 - **Fallback metrics parsing** — robust parsing handles varied worker output formats
 - **Duplicate goal completion guards** — prevents re-processing of already-completed goals
 - **Telemetry** — per-run metrics aggregated and fed into the improver
+- **Context and token logging** — Brain and workers log estimated/actual token usage per LLM call for cost tracking and context management
+- **Rich worker logging** — tool calls logged as `tool:name(arg="value")`, results as `result:id → "preview"`, with role, model, and elapsed time per task
 - **Dirty-worktree safety net** — automatically re-prompts Copilot if uncommitted changes remain after task execution
 - **Brain retry mechanism** — automatic retries on LLM timeout or transient failures (up to 2 retries with 5-second backoff)
 - **Non-blocking improve phase** — improver failures don't prevent goal completion; recorded in goal notes and metrics

@@ -29,17 +29,16 @@ CopilotHive/
 │   ├── Services/GoalDispatcher.cs    # Pipeline state machine with phase sequencing
 │   ├── Workers/DockerWorkerManager.cs # Docker container lifecycle
 │   └── Program.cs                    # CLI entrypoint
-├── tests/CopilotHive.Tests/         # 436 xUnit tests
+├── tests/CopilotHive.Tests/         # 606+ xUnit tests
 ├── agents/                           # AGENTS.md templates per role
 │   ├── orchestrator.agents.md
 │   ├── coder.agents.md
 │   ├── tester.agents.md
 │   ├── docwriter.agents.md
 │   └── reviewer.agents.md
-├── docs/                              # Design documents and research
-│   ├── VISION.md                      # Architecture and design document
-│   ├── TOOL_ANALYSIS.md               # SDK tool handling analysis
-│   └── COPILOT_PERMISSIONS.md         # CLI/SDK permissions research
+├── docs/                              # Design documents
+│   ├── VISION.md                      # Architecture and future roadmap
+│   └── ARCHITECTURE_ALTERNATIVES.md   # Agent runtime evaluation
 └── docker/                            # Container definitions
 ```
 

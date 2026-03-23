@@ -4,7 +4,7 @@
 
 - [Docker](https://docs.docker.com/get-docker/) 24+
 - [Docker Compose](https://docs.docker.com/compose/install/) v2+
-- A GitHub Personal Access Token (PAT) with Copilot permissions
+- A GitHub Personal Access Token (PAT) or LLM provider API key
 
 ## Quick Start
 
@@ -48,7 +48,7 @@ Workers register without a fixed role and accept any role (coder, tester, review
 ```
 
 Workers register with the orchestrator over gRPC, receive tasks via bidirectional
-streaming, and execute them using the local Copilot CLI running in headless mode.
+streaming, and execute them using SharpCoder, which communicates directly with LLM providers.
 
 ## Scaling Workers
 
@@ -91,13 +91,17 @@ docker service scale copilothive_worker=8
 | Variable           | Default            | Description                                |
 |-------------------|--------------------|--------------------------------------------|
 | `ORCHESTRATOR_URL` | —                  | gRPC URL of the orchestrator               |
-| `COPILOT_MODEL`    | —                  | Default AI model (overridden per task by orchestrator) |
+| `LLM_PROVIDER`     | —                  | LLM provider (e.g. `copilot`, `openai`, `ollama`) |
 | `CONFIG_REPO_URL`  | —                  | Config repo URL (needed for improver tasks) |
-| `COPILOT_PORT`     | `8000`             | Port for headless Copilot CLI              |
-| `COPILOT_LOG_LEVEL`| `info`             | Copilot CLI log level                      |
-| `COPILOT_RESUME`   | `false`            | Resume previous Copilot session            |
 | `WORKER_ID`        | auto-generated     | Unique identifier for the worker           |
 | `WORKER_CAPABILITIES` | —              | Comma-separated list of extra capabilities |
+
+### Orchestrator Configuration
+
+| Variable                | Default   | Description                                       |
+|------------------------|-----------|---------------------------------------------------|
+| `BRAIN_MODEL`          | —         | LLM model for the orchestrator Brain              |
+| `BRAIN_CONTEXT_WINDOW` | `100000`  | Max context window in tokens for the Brain        |
 
 ## Volumes
 
