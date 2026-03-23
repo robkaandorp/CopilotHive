@@ -68,7 +68,7 @@ public sealed class DockerWorkerManager : IWorkerManager
     /// <param name="role">Worker role (coder, reviewer, tester, etc.).</param>
     /// <param name="clonePath">Host path to the worker's git clone, mounted into the container.</param>
     /// <param name="agentsMdPath">Host path to the AGENTS.md directory, mounted into the container.</param>
-    /// <param name="model">Model identifier passed to the Copilot CLI inside the container.</param>
+    /// <param name="model">Model identifier passed to the worker container.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>A <see cref="WorkerInfo"/> describing the spawned container.</returns>
     public async Task<WorkerInfo> SpawnWorkerAsync(
@@ -88,17 +88,9 @@ public sealed class DockerWorkerManager : IWorkerManager
                 Name = id,
                 Env =
                 [
-                    "COPILOT_MODE=headless",
-                    $"COPILOT_PORT={Constants.DefaultAgentPort}",
                     $"GH_TOKEN={_config.GitHubToken}",
-                    $"COPILOT_MODEL={model}",
-                    "COPILOT_ALLOW_ALL=true",
-                    "COPILOT_AUTO_UPDATE=true",
+                    $"LLM_PROVIDER=copilot",
                 ],
-                ExposedPorts = new Dictionary<string, EmptyStruct>
-                {
-                    [$"{Constants.DefaultAgentPort}/tcp"] = default,
-                },
                 HostConfig = new HostConfig
                 {
                     Binds =
@@ -106,10 +98,6 @@ public sealed class DockerWorkerManager : IWorkerManager
                         $"{Path.GetFullPath(clonePath)}:/copilot-home",
                         $"{Path.GetFullPath(agentsMdPath)}:/opt/copilot-env/AGENTS.md",
                     ],
-                    PortBindings = new Dictionary<string, IList<PortBinding>>
-                    {
-                        [$"{Constants.DefaultAgentPort}/tcp"] = [new PortBinding { HostPort = port.ToString() }],
-                    },
                 },
             },
             ct);

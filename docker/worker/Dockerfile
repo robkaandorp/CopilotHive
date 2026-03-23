@@ -20,7 +20,7 @@ RUN dotnet publish src/CopilotHive.Worker/CopilotHive.Worker.csproj \
     --self-contained \
     -o /worker/publish
 
-# ── Runtime stage: slim worker with Copilot CLI + Worker binary ───────────────
+# ── Runtime stage: slim worker with SharpCoder agent engine ───────────────────
 FROM ubuntu:24.04
 
 LABEL maintainer="CopilotHive" \
@@ -29,7 +29,7 @@ LABEL maintainer="CopilotHive" \
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install system packages, GitHub CLI, Node.js, and Copilot CLI
+# Install system packages and GitHub CLI (no Node.js/npm needed — SharpCoder handles LLM directly)
 RUN apt-get update \
     && apt-get install -y \
         git curl wget jq openssh-client ca-certificates gnupg \
@@ -41,13 +41,8 @@ RUN apt-get update \
        | gpg --dearmor -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
        > /etc/apt/sources.list.d/github-cli.list \
-    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-       | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
-    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" \
-       > /etc/apt/sources.list.d/nodesource.list \
     && apt-get update \
-    && apt-get install -y gh nodejs \
-    && npm install -g @github/copilot \
+    && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/* /tmp/*
 
 # Create workspace and config directories
@@ -65,13 +60,8 @@ COPY docker/worker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 # Environment variables
-ENV COPILOT_MODE=headless \
-    COPILOT_PORT=8000 \
-    COPILOT_LOG_LEVEL=info \
-    COPILOT_CUSTOM_INSTRUCTIONS_DIRS=/opt/copilot-env
+ENV LLM_PROVIDER=copilot
 
 WORKDIR /copilot-home
-
-EXPOSE 8000
 
 ENTRYPOINT ["entrypoint.sh"]

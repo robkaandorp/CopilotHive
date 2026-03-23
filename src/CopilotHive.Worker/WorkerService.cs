@@ -9,29 +9,18 @@ namespace CopilotHive.Worker;
 
 /// <summary>
 /// Core worker lifecycle: register, heartbeat, stream tasks, execute, report.
-/// Implements <see cref="IToolCallBridge"/> so custom Copilot tools can communicate
+/// Implements <see cref="IToolCallBridge"/> so custom tools can communicate
 /// with the orchestrator mid-task via the existing bidirectional gRPC stream.
 /// </summary>
 public sealed class WorkerService(
     string orchestratorUrl,
     string workerId,
-    string[] capabilities,
-    int copilotPort) : IToolCallBridge
+    string[] capabilities) : IToolCallBridge
 {
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(30);
 
-    private readonly IAgentRunner _agentRunner = CreateAgentRunner(copilotPort);
+    private readonly IAgentRunner _agentRunner = new SharpCoderRunner();
     private readonly WorkerLogger _log = new("Worker");
-
-    private static IAgentRunner CreateAgentRunner(int copilotPort)
-    {
-        var runnerType = Environment.GetEnvironmentVariable("RUNNER_TYPE")?.ToLowerInvariant();
-        if (runnerType == "sharpcoder")
-        {
-            return new SharpCoderRunner();
-        }
-        return new CopilotCliRunner(copilotPort);
-    }
 
     // Pending tool calls awaiting orchestrator responses, keyed by request_id
     private readonly ConcurrentDictionary<string, TaskCompletionSource<ToolCallResponse>> _pendingToolCalls = new();
@@ -51,8 +40,8 @@ public sealed class WorkerService(
     /// <param name="ct">Cancellation token that stops the worker.</param>
     public async Task RunAsync(CancellationToken ct)
     {
-        // Connect to the local Copilot CLI via SDK before registering with orchestrator
-        _log.Info("Connecting to local Copilot CLI...");
+        // Connect to the AI agent engine before registering with orchestrator
+        _log.Info("Connecting to SharpCoder agent engine...");
         await _agentRunner.ConnectAsync(ct);
 
         // Enable HTTP/2 over plaintext (required for gRPC without TLS in Docker network)

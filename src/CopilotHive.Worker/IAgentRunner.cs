@@ -4,9 +4,8 @@ namespace CopilotHive.Worker;
 
 /// <summary>
 /// Abstracts the AI agent engine used by workers. The default implementation
-/// (<see cref="CopilotCliRunner"/>) communicates with the Copilot CLI via the
-/// GitHub.Copilot.SDK. Alternative implementations could use direct API calls
-/// or other agent frameworks.
+/// (<see cref="SharpCoderRunner"/>) uses SharpCoder's CodingAgent with direct
+/// LLM API calls. Alternative implementations could use other agent frameworks.
 /// </summary>
 public interface IAgentRunner : IAsyncDisposable
 {

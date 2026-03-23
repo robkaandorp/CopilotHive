@@ -17,8 +17,6 @@ var capabilities = Environment.GetEnvironmentVariable("WORKER_CAPABILITIES")
     ?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
     ?? [];
 
-var copilotPort = int.TryParse(Environment.GetEnvironmentVariable("COPILOT_PORT"), out var p) ? p : WorkerConstants.DefaultAgentPort;
-
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) =>
 {
@@ -34,8 +32,7 @@ Console.WriteLine($"[Worker] Orchestrator: {orchestratorUrl}");
 var service = new WorkerService(
     orchestratorUrl: orchestratorUrl,
     workerId: workerId,
-    capabilities: capabilities,
-    copilotPort: copilotPort);
+    capabilities: capabilities);
 
 try
 {

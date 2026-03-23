@@ -69,14 +69,11 @@ static async Task<int> RunServerAsync(string[] args)
     builder.Services.AddSingleton(sp =>
         new GoalPipelineManager(sp.GetRequiredService<PipelineStore>()));
 
-    // Brain: direct LLM connection via SharpCoder (no Copilot CLI needed)
-    // Supports BRAIN_MODEL env var or falls back to OrchestratorModel from config
-    var brainModel = Environment.GetEnvironmentVariable("BRAIN_MODEL")
-        ?? Environment.GetEnvironmentVariable("BRAIN_COPILOT_PORT"); // backward compat: any non-empty = enable
+    // Brain: direct LLM connection via SharpCoder
+    var brainModel = Environment.GetEnvironmentVariable("BRAIN_MODEL");
     var brainContextWindowEnv = Environment.GetEnvironmentVariable("BRAIN_CONTEXT_WINDOW");
-    if (!string.IsNullOrEmpty(brainModel) && !int.TryParse(brainModel, out _))
+    if (!string.IsNullOrEmpty(brainModel))
     {
-        // New path: BRAIN_MODEL is a model string (e.g. "copilot/claude-sonnet-4.6")
         builder.Services.AddSingleton<IDistributedBrain>(sp =>
         {
             var config = sp.GetService<HiveConfigFile>();
@@ -84,21 +81,6 @@ static async Task<int> RunServerAsync(string[] args)
                 ? envCtx
                 : config?.Orchestrator.BrainContextWindow ?? Constants.DefaultBrainContextWindow;
             return new DistributedBrain(brainModel, sp.GetRequiredService<ILogger<DistributedBrain>>(),
-                sp.GetRequiredService<MetricsTracker>(),
-                sp.GetService<AgentsManager>(),
-                maxCtx);
-        });
-    }
-    else if (!string.IsNullOrEmpty(brainModel))
-    {
-        // Legacy path: BRAIN_COPILOT_PORT is a port number — use default model
-        builder.Services.AddSingleton<IDistributedBrain>(sp =>
-        {
-            var config = sp.GetService<HiveConfigFile>();
-            var maxCtx = int.TryParse(brainContextWindowEnv, out var envCtx)
-                ? envCtx
-                : config?.Orchestrator.BrainContextWindow ?? Constants.DefaultBrainContextWindow;
-            return new DistributedBrain("copilot/claude-sonnet-4.6", sp.GetRequiredService<ILogger<DistributedBrain>>(),
                 sp.GetRequiredService<MetricsTracker>(),
                 sp.GetService<AgentsManager>(),
                 maxCtx);

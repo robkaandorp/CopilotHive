@@ -3,15 +3,15 @@
 ## Project Overview
 
 CopilotHive is a self-improving multi-agent orchestration system. A C# orchestrator
-(the "Product Owner") manages a pool of generic Docker containers running GitHub Copilot
-in headless mode. Workers dynamically accept any role (coder, tester, doc-writer, reviewer,
-improver) per task. They communicate via the Copilot .NET SDK over JSON-RPC and operate on
-isolated git clones.
+(the "Product Owner") manages a pool of generic Docker containers running SharpCoder
+as their AI agent engine. Workers dynamically accept any role (coder, tester, doc-writer,
+reviewer, improver) per task. They communicate via direct LLM API calls (SharpCoder)
+and operate on isolated git clones.
 
 ## Technology Stack
 
 - **Runtime:** .NET 10 (C# 14)
-- **Copilot SDK:** `GitHub.Copilot.SDK` (NuGet) — headless JSON-RPC communication
+- **Agent Engine:** `SharpCoder` (NuGet) — autonomous coding agent loop
 - **Docker:** `Docker.DotNet` — container lifecycle management
 - **Git:** CLI (`git`) — branch/merge operations via `Process.Start`
 - **Testing:** xUnit
@@ -65,7 +65,8 @@ dotnet test CopilotHive.slnx
 ## Key Design Patterns
 
 - Workers are generic Docker containers that accept any role per task via dynamic agent selection
-- The orchestrator communicates via `CopilotClient` from `GitHub.Copilot.SDK`
+- The orchestrator Brain uses SharpCoder's `IChatClient` for LLM communication
+- Workers use `SharpCoderRunner` with `CodingAgent` for autonomous task execution
 - Git operations shell out to `git` CLI (not LibGit2Sharp) for simplicity
 - The coder↔tester feedback loop retries up to `MaxRetriesPerTask` times
 

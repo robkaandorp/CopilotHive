@@ -6,7 +6,6 @@
 
   <ItemGroup>
     <PackageReference Include="Docker.DotNet" Version="3.125.15" />
-    <PackageReference Include="GitHub.Copilot.SDK" Version="0.1.32" />
     <PackageReference Include="Grpc.AspNetCore" Version="2.76.0" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.5" />
     <PackageReference Include="OllamaSharp" Version="5.4.24" />
@@ -20,7 +19,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Compile Include="..\CopilotHive.Worker\SDK\TelemetrySupport.cs" Link="SDK\TelemetrySupport.cs" />
     <Compile Include="..\CopilotHive.Worker\SDK\ChatClientFactory.cs" Link="SDK\ChatClientFactory.cs" />
   </ItemGroup>
 
