@@ -288,6 +288,13 @@ public sealed class GoalDispatcher : BackgroundService
                 _ => PhaseInput.Succeeded, // PASS, APPROVE, or no verdict
             };
 
+        var phaseDurationSeconds = pipeline.PhaseStartedAt.HasValue
+            ? (DateTime.UtcNow - pipeline.PhaseStartedAt.Value).TotalSeconds
+            : 0;
+        _logger.LogInformation(
+            "Phase {Phase} for goal {GoalId} completed in {DurationSeconds:F1}s",
+            pipeline.Phase, pipeline.GoalId, phaseDurationSeconds);
+
         _logger.LogInformation("Verdict for {GoalId} phase {Phase}: {Verdict} → {PhaseInput}",
             pipeline.GoalId, pipeline.Phase, verdict, phaseInput);
 

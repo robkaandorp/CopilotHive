@@ -180,6 +180,7 @@ goals:
 - **Three-dot diff comparison** — accurate detection of all changes on feature branches using `origin/{baseBranch}...HEAD`
 - **Goal notes** — non-fatal observations tracked in goals.yaml (e.g. "Improver skipped: timeout")
 - **Iteration summaries** — structured per-iteration metrics (phases, test counts, review verdicts) recorded in goals.yaml for observability without reading logs
+- **Phase duration logging** — each pipeline phase logs its wall-clock duration in seconds when it completes (e.g., "Phase Testing for goal X completed in 45.2s")
 
 ## Contributing
 
