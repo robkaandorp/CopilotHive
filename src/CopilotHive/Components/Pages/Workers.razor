@@ -27,6 +27,7 @@
             <tr>
                 <th>Worker ID</th>
                 <th>Role</th>
+                <th>Model</th>
                 <th>Status</th>
                 <th>Current Task</th>
                 <th>Last Heartbeat</th>
@@ -48,6 +49,9 @@
                             <span style="color:var(--text-muted)">—</span>
                         }
                     </td>
+                    <td style="font-family:monospace;font-size:0.85rem;color:var(--text-muted)">
+                        @(w.Role != "Unspecified" && _info.RoleModels.TryGetValue(w.Role.ToLowerInvariant(), out var m) ? m : "—")
+                    </td>
                     <td>
                         <span class="badge @(w.IsBusy ? "badge-yellow" : "badge-green")">
                             @(w.IsBusy ? "Busy" : "Idle")
@@ -68,16 +72,19 @@ else
 
 @code {
     private DashboardSnapshot _snap = new();
+    private OrchestratorInfo _info = new();
 
     protected override void OnInitialized()
     {
         _snap = State.GetSnapshot();
+        _info = State.GetOrchestratorInfo();
         State.OnStateChanged += RefreshState;
     }
 
     private void RefreshState() => InvokeAsync(() =>
     {
         _snap = State.GetSnapshot();
+        _info = State.GetOrchestratorInfo();
         StateHasChanged();
     });
 

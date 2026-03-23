@@ -6,14 +6,49 @@
 
 <h1>Orchestrator</h1>
 
-<h2>Brain</h2>
+<div class="cards">
+    <div class="card">
+        <div class="label">Uptime</div>
+        <div class="value" style="font-size:1rem">@FormatUptime(_info.Uptime)</div>
+    </div>
+    <div class="card">
+        <div class="label">Version</div>
+        <div class="value" style="font-size:1rem">@_info.Version</div>
+    </div>
+    <div class="card">
+        <div class="label">SharpCoder</div>
+        <div class="value" style="font-size:1rem">@(_info.SharpCoderVersion ?? "—")</div>
+    </div>
+    <div class="card">
+        <div class="label">Server Time</div>
+        <div class="value" style="font-size:1rem">@_info.ServerTime.ToString("HH:mm:ss") UTC</div>
+    </div>
+</div>
+
+<h2 style="margin-top:1.5rem">Model Configuration</h2>
+<table>
+    <thead>
+        <tr><th>Role</th><th>Model</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><span class="badge badge-yellow">brain</span></td>
+            <td style="font-family:monospace;font-size:0.85rem">@_info.BrainModel</td>
+        </tr>
+        @foreach (var (role, model) in _info.RoleModels)
+        {
+            <tr>
+                <td><span class="badge badge-blue">@role</span></td>
+                <td style="font-family:monospace;font-size:0.85rem">@model</td>
+            </tr>
+        }
+    </tbody>
+</table>
+
+<h2 style="margin-top:1.5rem">Brain</h2>
 @if (_stats is not null)
 {
     <div class="cards">
-        <div class="card">
-            <div class="label">Model</div>
-            <div class="value" style="font-size:1rem">@_stats.Model</div>
-        </div>
         <div class="card">
             <div class="label">Context</div>
             <div class="value" style="color:@ContextColor">@FormatTokens(_stats.EstimatedContextTokens)</div>
@@ -89,6 +124,7 @@ else
 @code {
     private BrainStats? _stats;
     private IReadOnlyList<ProgressEntry> _progress = [];
+    private OrchestratorInfo _info = new();
 
     protected override void OnInitialized()
     {
@@ -100,6 +136,7 @@ else
     {
         _stats = State.GetBrainStats();
         _progress = State.GetRecentProgress(50);
+        _info = State.GetOrchestratorInfo();
     }
 
     private void RefreshState() => InvokeAsync(() => { Refresh(); StateHasChanged(); });
@@ -119,6 +156,10 @@ else
     };
 
     private static string FormatTokens(int tokens) => FormatTokens((long)tokens);
+
+    private static string FormatUptime(TimeSpan ts) => ts.TotalHours >= 1
+        ? $"{(int)ts.TotalHours}h {ts.Minutes}m {ts.Seconds}s"
+        : $"{ts.Minutes}m {ts.Seconds}s";
 
     private static string Truncate(string s, int max) =>
         s.Length <= max ? s : s[..max] + "…";

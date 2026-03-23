@@ -1,3 +1,4 @@
+using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
@@ -17,7 +18,11 @@ public sealed class DashboardStateService : IDisposable
     private readonly DashboardLogSink _logSink;
     private readonly ProgressLog _progressLog;
     private readonly IDistributedBrain? _brain;
+    private readonly HiveConfigFile? _config;
     private readonly Timer _timer;
+    private readonly DateTime _startTime = DateTime.UtcNow;
+    private readonly string _version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown";
+    private readonly string? _sharpCoderVersion = typeof(SharpCoder.CodingAgent).Assembly.GetName().Version?.ToString();
 
     /// <summary>Fired when state has been polled and components should re-render.</summary>
     public event Action? OnStateChanged;
@@ -29,7 +34,8 @@ public sealed class DashboardStateService : IDisposable
         ApiGoalSource goalSource,
         DashboardLogSink logSink,
         ProgressLog progressLog,
-        IDistributedBrain? brain = null)
+        IDistributedBrain? brain = null,
+        HiveConfigFile? config = null)
     {
         _workerPool = workerPool;
         _pipelineManager = pipelineManager;
@@ -37,6 +43,7 @@ public sealed class DashboardStateService : IDisposable
         _logSink = logSink;
         _progressLog = progressLog;
         _brain = brain;
+        _config = config;
         _timer = new Timer(_ => NotifyStateChanged(), null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(3));
     }
 
@@ -101,6 +108,23 @@ public sealed class DashboardStateService : IDisposable
 
     /// <summary>Returns recent worker progress reports.</summary>
     public IReadOnlyList<ProgressEntry> GetRecentProgress(int count = 50) => _progressLog.GetRecent(count);
+
+    /// <summary>Returns orchestrator info including uptime, versions, and model configuration.</summary>
+    public OrchestratorInfo GetOrchestratorInfo()
+    {
+        var uptime = DateTime.UtcNow - _startTime;
+        var roles = new[] { "coder", "tester", "reviewer", "docwriter", "improver" };
+
+        return new OrchestratorInfo
+        {
+            Uptime = uptime,
+            Version = _version,
+            SharpCoderVersion = _sharpCoderVersion,
+            ServerTime = DateTime.UtcNow,
+            RoleModels = roles.ToDictionary(r => r, r => _config?.GetModelForRole(r) ?? Constants.DefaultModel),
+            BrainModel = _brain?.GetStats()?.Model ?? "(not configured)",
+        };
+    }
 
     private void NotifyStateChanged() => OnStateChanged?.Invoke();
 
@@ -175,4 +199,21 @@ public sealed class PipelineInfo
     public int FailedTests { get; init; }
     /// <summary>Code coverage percentage.</summary>
     public double CoveragePercent { get; init; }
+}
+
+/// <summary>Orchestrator system info for the dashboard.</summary>
+public sealed class OrchestratorInfo
+{
+    /// <summary>Server uptime.</summary>
+    public TimeSpan Uptime { get; init; }
+    /// <summary>CopilotHive assembly version.</summary>
+    public string Version { get; init; } = "";
+    /// <summary>SharpCoder assembly version.</summary>
+    public string? SharpCoderVersion { get; init; }
+    /// <summary>Current UTC server time.</summary>
+    public DateTime ServerTime { get; init; }
+    /// <summary>Model configured for the Brain.</summary>
+    public string BrainModel { get; init; } = "";
+    /// <summary>Model configured per worker role.</summary>
+    public Dictionary<string, string> RoleModels { get; init; } = [];
 }
