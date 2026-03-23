@@ -337,8 +337,12 @@ public sealed class GoalDispatcher : BackgroundService
             return;
         }
 
-        // Snapshot the ending iteration before incrementing
+        // Advance to Coding — this records the duration of the just-ended phase
+        // (Review or Testing) into Metrics.PhaseDurations via AdvanceTo.
         var failedPhase = isReviewRelated ? GoalPhase.Review : GoalPhase.Testing;
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        // Snapshot the ending iteration (PhaseDurations now includes the failed phase)
         var iterationSummary = BuildIterationSummary(pipeline, failedPhase);
         pipeline.CompletedIterationSummaries.Add(iterationSummary);
 
@@ -354,10 +358,13 @@ public sealed class GoalDispatcher : BackgroundService
             return;
         }
 
+        // Capture review feedback before resetting metrics
+        var reviewIssues = isReviewRelated && pipeline.Metrics.ReviewIssues is { Count: > 0 }
+            ? pipeline.Metrics.ReviewIssues.ToList()
+            : null;
+
         // Reset metrics for the new iteration
         pipeline.Metrics.ResetForNewIteration(pipeline.Iteration);
-
-        pipeline.AdvanceTo(GoalPhase.Coding);
 
         // Re-plan the iteration with failure context
         IterationPlan newPlan;
@@ -385,9 +392,9 @@ public sealed class GoalDispatcher : BackgroundService
         var feedbackKind = isReviewRelated ? "Reviewer feedback" : "Test failures";
         var context = $"{feedbackKind}: see previous output.";
 
-        if (isReviewRelated && pipeline.Metrics.ReviewIssues is { Count: > 0 })
+        if (reviewIssues is { Count: > 0 })
         {
-            var allIssues = string.Join("\n", pipeline.Metrics.ReviewIssues);
+            var allIssues = string.Join("\n", reviewIssues);
             context += $"\n\nAccumulated issues from all review rounds (fix ALL of these):\n{allIssues}";
         }
 
