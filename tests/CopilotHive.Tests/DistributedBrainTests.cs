@@ -2,6 +2,7 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 using WorkerRole = CopilotHive.Workers.WorkerRole;
@@ -241,6 +242,61 @@ public sealed class DistributedBrainTests
         Assert.NotNull(plan);
         Assert.NotEmpty(plan.Phases);
     }
+
+    // -- CompactContextAsync Tests --
+
+    [Fact]
+    public async Task CompactContextAsync_WithoutConnect_ResetsSessionAndLogs()
+    {
+        var capturing = new CapturingLogger<DistributedBrain>();
+        var brain = new DistributedBrain("copilot/test-model", capturing, stateDir: Path.GetTempPath());
+
+        await brain.CompactContextAsync(TestContext.Current.CancellationToken);
+
+        var message = Assert.Single(capturing.Messages,
+            m => m.Contains("Brain context compaction:"));
+        Assert.Contains("tokens", message);
+        Assert.Contains("messages", message);
+        Assert.Contains("reduction", message);
+    }
+
+    [Fact]
+    public async Task CompactContextAsync_LogsArrowFormat()
+    {
+        var capturing = new CapturingLogger<DistributedBrain>();
+        var brain = new DistributedBrain("copilot/test-model", capturing, stateDir: Path.GetTempPath());
+
+        await brain.CompactContextAsync(TestContext.Current.CancellationToken);
+
+        var message = capturing.Messages.First(m => m.Contains("Brain context compaction:"));
+        // The log template uses {TokensBefore} → {TokensAfter}; the logger renders the values
+        Assert.Contains("→", message);
+    }
+
+    [Fact]
+    public async Task CompactContextAsync_WhenTokensBeforeIsZero_ReportsZeroReduction()
+    {
+        var capturing = new CapturingLogger<DistributedBrain>();
+        // A brand-new session has 0 estimated tokens
+        var brain = new DistributedBrain("copilot/test-model", capturing, stateDir: Path.GetTempPath());
+
+        await brain.CompactContextAsync(TestContext.Current.CancellationToken);
+
+        var message = capturing.Messages.First(m => m.Contains("Brain context compaction:"));
+        // tokensBefore == 0 → reductionPercent == 0
+        Assert.Contains("0% reduction", message);
+    }
+
+    [Fact]
+    public async Task CompactContextAsync_CancellationToken_CompletesSuccessfully()
+    {
+        using var cts = new CancellationTokenSource();
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            stateDir: Path.GetTempPath());
+
+        // Should not throw even when a non-cancelled token is passed
+        await brain.CompactContextAsync(cts.Token);
+    }
 }
 
 /// <summary>
@@ -268,4 +324,23 @@ file sealed class FakeDistributedBrain : IDistributedBrain
     }
 
     public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) => Task.CompletedTask;
+}
+
+/// <summary>
+/// A minimal <see cref="ILogger{T}"/> that accumulates rendered log messages for assertion.
+/// </summary>
+file sealed class CapturingLogger<T> : ILogger<T>
+{
+    private readonly List<string> _messages = [];
+
+    /// <summary>All log messages rendered so far.</summary>
+    public IReadOnlyList<string> Messages => _messages;
+
+    IDisposable? ILogger.BeginScope<TState>(TState state) => null;
+    bool ILogger.IsEnabled(LogLevel logLevel) => true;
+
+    void ILogger.Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        _messages.Add(formatter(state, exception));
+    }
 }
