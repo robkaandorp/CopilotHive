@@ -297,6 +297,7 @@ static void PrintBanner()
                              ██║  ██║██║ ╚████╔╝ ███████╗
                              ╚═╝  ╚═╝╚═╝  ╚═══╝  ╚══════╝
         """);
+    Console.WriteLine($"Started at {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC");
 }
 
 /// <summary>Request body for updating the status of a goal via the HTTP API.</summary>
