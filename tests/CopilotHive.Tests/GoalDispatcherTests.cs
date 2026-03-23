@@ -3,6 +3,7 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 using WorkerRole = CopilotHive.Workers.WorkerRole;
@@ -267,6 +268,52 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
 }
 
 /// <summary>
+/// Tests for GoalDispatcher startup logging.
+/// </summary>
+public sealed class GoalDispatcherStartupLogTests
+{
+    [Fact]
+    public async Task ExecuteAsync_Startup_LogsGoalSourceCount()
+    {
+        // Arrange
+        var logger = new CollectingLogger<GoalDispatcher>();
+        var goal1 = new Goal { Id = "test-goal-1", Description = "Test 1" };
+        var goal2 = new Goal { Id = "test-goal-2", Description = "Test 2" };
+        var goalSource1 = new FakeGoalSource(goal1);
+        var goalSource2 = new FakeGoalSource(goal2);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource1);
+        goalManager.AddSource(goalSource2);
+
+        var pipelineManager = new GoalPipelineManager();
+        var notifier = new TaskCompletionNotifier();
+        using var cts = new CancellationTokenSource();
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            notifier,
+            logger);
+
+        // Act - start the background service and cancel immediately after startup log
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, TestContext.Current.CancellationToken);
+        var executeTask = dispatcher.StartAsync(linkedCts.Token);
+        await Task.Delay(100, TestContext.Current.CancellationToken); // Allow startup logs to emit
+        cts.Cancel();
+        await Task.WhenAny(executeTask, Task.Delay(1000, TestContext.Current.CancellationToken));
+
+        // Assert
+        var startupLog = logger.Logs.FirstOrDefault(l =>
+            l.Message.Contains("GoalDispatcher starting with") && l.Message.Contains("goal source"));
+
+        Assert.True(startupLog != default, $"Expected startup log with goal source count. Logs: {string.Join(", ", logger.Logs.Select(l => l.Message))}");
+        Assert.Contains("2 goal source(s)", startupLog.Message);
+    }
+}
+
+/// <summary>
 /// Minimal <see cref="IGoalSource"/> that returns a single pre-configured goal.
 /// </summary>
 file sealed class FakeGoalSource : IGoalSource
@@ -283,4 +330,21 @@ file sealed class FakeGoalSource : IGoalSource
     public Task UpdateGoalStatusAsync(
         string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
         Task.CompletedTask;
+}
+
+/// <summary>
+/// Collecting logger for verifying log output in tests.
+/// </summary>
+file sealed class CollectingLogger<T> : ILogger<T>
+{
+    public List<(LogLevel Level, string Message)> Logs { get; } = [];
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        Logs.Add((logLevel, formatter(state, exception)));
+    }
 }
