@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `SharpCoderRunnerSummarizeMessageTests` — xUnit test suite with 10 [Fact] tests covering the `SummarizeMessage` helper method via reflection; tests verify tool call logging format, tool result format, argument truncation (100 chars), result preview truncation (200 chars), null handling, and plain text fallback behavior
 - `SharpCoderRunner.SendPromptAsync` logging improvements — task execution now logs worker role and model: "Executing task as {role} with model {model}. WorkDir: {workDir}"; task completion logs elapsed time, status, and tool call count: "Task finished in {elapsed}s (status={status}, toolCalls={toolCalls})" using `System.Diagnostics.Stopwatch`
-- `SharpCoderRunnerLoggingTests` — comprehensive xUnit test suite with 34 [Fact] + 15 [Theory] tests (472 lines) verifying logging format, role/model capture, elapsed time formatting, and default values
+- `SharpCoderRunnerLoggingTests` — xUnit test suite verifying `SendPromptAsync` logging: role and model in task start message, elapsed time, status, and tool call count in task completion message
 
 
 ### Fixed
