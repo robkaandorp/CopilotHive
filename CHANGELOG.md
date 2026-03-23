@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Brain `WorkDirectory` set to `repos/` parent folder so all repositories are visible simultaneously
 - Updated `DistributedBrain` from `IChatClient` direct usage to `CodingAgent` orchestration
 - `GoalDispatcher.DispatchNextGoalAsync` now checks `GetActivePipelines()` before dispatching
+- `GoalDispatcher.DispatchNextGoalAsync` now includes the goal's priority level in the dispatch log message (e.g., "Priority=High")
 
 ### Added
 - `SharpCoderRunnerSummarizeMessageTests` — xUnit test suite with 10 [Fact] tests covering the `SummarizeMessage` helper method via reflection; tests verify tool call logging format, tool result format, argument truncation (100 chars), result preview truncation (200 chars), null handling, and plain text fallback behavior
