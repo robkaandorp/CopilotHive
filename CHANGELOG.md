@@ -58,6 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Goal ID validation in `ApiGoalSource.AddGoal()` — validates goal ID when adding a new goal via API
 - `GoalIdTests` — 6 xUnit tests (5 valid cases: `fix-build-error`, `add-feature`, `abc`, `a1b2`, `a-1-b`; 8 invalid cases covering empty/null, uppercase, spaces, leading/trailing hyphens, underscores)
 - `GoalDispatcherDispatchLoggingTests` — xUnit test class with 1 [Fact] test verifying `DispatchNextGoalAsync` logs the goal's priority level (e.g., "Priority=High") in the dispatch log message
+- **Phase duration logging in GoalDispatcher** — `DriveNextPhaseAsync` now logs the wall-clock duration of each phase in seconds when it completes (format: "Phase {Phase} for goal {GoalId} completed in {DurationSeconds:F1}s"); uses the pipeline's `PhaseStartedAt` timestamp compared to `DateTime.UtcNow` to calculate the duration
+- `GoalDispatcherPhaseDurationLoggingTests` — xUnit test class with 1 [Fact] test verifying the phase duration log message is emitted when a phase completes
 
 ### Changed
 - Worker message logging in `SharpCoderRunner.cs` — the message loop now uses the new `SummarizeMessage` helper to produce informative summaries:
