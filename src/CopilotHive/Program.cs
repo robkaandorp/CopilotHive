@@ -2,6 +2,7 @@ using System.Reflection;
 using CopilotHive;
 using CopilotHive.Agents;
 using CopilotHive.Configuration;
+using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Improvement;
 using CopilotHive.Metrics;
@@ -65,6 +66,10 @@ static async Task<int> RunServerAsync(string[] args)
     Directory.CreateDirectory(metricsDir);
     builder.Services.AddSingleton(sp =>
         new MetricsTracker(metricsDir, sp.GetRequiredService<ILogger<MetricsTracker>>()));
+
+    // Brain repo manager: persistent read-only clones for Brain file access
+    builder.Services.AddSingleton(sp =>
+        new BrainRepoManager(stateDir, sp.GetRequiredService<ILogger<BrainRepoManager>>()));
 
     builder.Services.AddSingleton(sp =>
         new GoalPipelineManager(sp.GetRequiredService<PipelineStore>()));
