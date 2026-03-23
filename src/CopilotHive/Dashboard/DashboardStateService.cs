@@ -67,6 +67,7 @@ public sealed class DashboardStateService : IDisposable
                 GoalId = p.GoalId,
                 Description = p.Description,
                 Phase = p.Phase.ToString(),
+                Phases = p.Plan?.Phases.Select(ph => ph.ToString()).ToList() ?? [],
                 Iteration = p.Iteration,
                 ActiveTaskId = p.ActiveTaskId,
                 CreatedAt = p.CreatedAt,
@@ -145,6 +146,8 @@ public sealed class PipelineInfo
     public string Description { get; init; } = "";
     /// <summary>Current phase name.</summary>
     public string Phase { get; init; } = "";
+    /// <summary>Ordered phase names from the iteration plan.</summary>
+    public List<string> Phases { get; init; } = [];
     /// <summary>Current iteration number.</summary>
     public int Iteration { get; init; }
     /// <summary>Active task ID, if any.</summary>

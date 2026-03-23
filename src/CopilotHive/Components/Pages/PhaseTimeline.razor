@@ -1,32 +1,37 @@
 @using CopilotHive.Goals
 
 <div class="phase-bar">
-    @foreach (var (name, i) in _phases)
+    @foreach (var (name, i) in DisplayPhases)
     {
         @if (i > 0)
         {
             <span class="phase-arrow">→</span>
         }
-        <span class="phase-step @PhaseClass(name)">@name</span>
+        <span class="phase-step @PhaseClass(name, i)">@name</span>
     }
 </div>
 
 @code {
     [Parameter] public string Phase { get; set; } = "";
+    [Parameter] public List<string>? Phases { get; set; }
 
-    private static readonly string[] PhaseNames =
-        ["Planning", "Coding", "Testing", "Review", "DocWriting", "Improve", "Merging", "Done"];
+    private static readonly string[] DefaultPhaseNames =
+        ["Planning", "Coding", "Testing", "DocWriting", "Review", "Improve", "Merging", "Done"];
 
-    private IEnumerable<(string Name, int Index)> _phases =>
-        PhaseNames.Select((n, i) => (n, i));
+    private string[] EffectivePhases => Phases is { Count: > 0 }
+        ? ["Planning", .. Phases, "Done"]
+        : DefaultPhaseNames;
 
-    private string PhaseClass(string name)
+    private IEnumerable<(string Name, int Index)> DisplayPhases =>
+        EffectivePhases.Select((n, i) => (n, i));
+
+    private string PhaseClass(string name, int index)
     {
-        var currentIndex = Array.IndexOf(PhaseNames, Phase);
-        var thisIndex = Array.IndexOf(PhaseNames, name);
+        var phases = EffectivePhases;
+        var currentIndex = Array.IndexOf(phases, Phase);
 
         if (name == Phase) return "active";
-        if (Phase == "Failed") return thisIndex < currentIndex ? "done" : "";
-        return thisIndex < currentIndex ? "done" : "";
+        if (currentIndex < 0) return "";
+        return index < currentIndex ? "done" : "";
     }
 }
