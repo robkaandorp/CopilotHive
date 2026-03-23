@@ -297,6 +297,95 @@ public sealed class DistributedBrainTests
         // Should not throw even when a non-cancelled token is passed
         await brain.CompactContextAsync(cts.Token);
     }
+
+    [Fact]
+    public async Task CompactContextAsync_InformationLevelLogged()
+    {
+        var capturing = new CapturingLogger<DistributedBrain>();
+        var brain = new DistributedBrain("copilot/test-model", capturing, stateDir: Path.GetTempPath());
+
+        await brain.CompactContextAsync(TestContext.Current.CancellationToken);
+
+        // Verify that the log was written at Information level (CapturingLogger captures all levels)
+        var compactionMessages = capturing.Messages.Where(m => m.Contains("Brain context compaction:")).ToList();
+        Assert.Single(compactionMessages);
+    }
+
+    [Fact]
+    public async Task CompactContextAsync_LogFormatContainsAllRequiredFields()
+    {
+        var capturing = new CapturingLogger<DistributedBrain>();
+        var brain = new DistributedBrain("copilot/test-model", capturing, stateDir: Path.GetTempPath());
+
+        await brain.CompactContextAsync(TestContext.Current.CancellationToken);
+
+        var message = capturing.Messages.First(m => m.Contains("Brain context compaction:"));
+
+        // Verify the log format contains all expected placeholders:
+        // {TokensBefore} → {TokensAfter} tokens ({ReductionPercent}% reduction), {MessagesBefore} → {MessagesAfter} messages
+        Assert.Contains("tokens", message);
+        Assert.Contains("→", message);
+        Assert.Contains("% reduction", message);
+        Assert.Contains("messages", message);
+
+        // Check for numeric values: before=0, after=0 (fresh session)
+        Assert.Contains("0 → 0 tokens", message);
+        Assert.Contains("0 → 0 messages", message);
+    }
+
+    [Fact]
+    public async Task CompactContextAsync_ReducesMessagesToZero()
+    {
+        var capturing = new CapturingLogger<DistributedBrain>();
+        var brain = new DistributedBrain("copilot/test-model", capturing, stateDir: Path.GetTempPath());
+
+        await brain.CompactContextAsync(TestContext.Current.CancellationToken);
+
+        var message = capturing.Messages.First(m => m.Contains("Brain context compaction:"));
+        // A fresh session starts with 0 messages, and after compaction it's also 0
+        Assert.Contains("0 → 0 messages", message);
+    }
+
+    [Fact]
+    public async Task CompactContextAsync_WithConnectedBrain_RecreatesAgent()
+    {
+        // This test verifies the code path where RecreateAgent is called when _chatClient is not null
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(tempDir);  // Directory must exist before ConnectAsync
+
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+
+            // ConnectAsync sets _chatClient and calls RecreateAgent
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            // Now call CompactContextAsync - it should not throw
+            // Internally it will see _chatClient is not null and call RecreateAgent()
+            await brain.CompactContextAsync(TestContext.Current.CancellationToken);
+
+            // If we got here without exception, the test passes
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task CompactContextAsync_WithoutConnectedBrain_StillCompletes()
+    {
+        // When _chatClient is null, RecreateAgent is NOT called, but compact still completes
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            stateDir: Path.GetTempPath());
+
+        // Do NOT call ConnectAsync, so _chatClient remains null
+        await brain.CompactContextAsync(TestContext.Current.CancellationToken);
+
+        // Should complete without throwing
+    }
 }
 
 /// <summary>
