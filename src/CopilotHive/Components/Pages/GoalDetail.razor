@@ -37,6 +37,38 @@
             }
         </div>
     }
+
+    <h2 style="margin-top:1.5rem">Progress Reports</h2>
+    @if (_progress.Count > 0)
+    {
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Worker</th>
+                    <th>Status</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var entry in _progress)
+                {
+                    <tr>
+                        <td style="white-space:nowrap;color:var(--text-muted)">@entry.Timestamp.ToString("HH:mm:ss")</td>
+                        <td style="font-family:monospace;font-size:0.85rem">
+                            <a href="/workers/@entry.WorkerId" style="color:var(--accent);text-decoration:none">@Truncate(entry.WorkerId, 12)</a>
+                        </td>
+                        <td><span class="badge badge-blue">@entry.Status</span></td>
+                        <td style="font-size:0.85rem">@Truncate(entry.Details, 200)</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+    else
+    {
+        <p style="color:var(--text-muted)">No progress reports for this goal yet.</p>
+    }
 }
 else
 {
@@ -48,6 +80,7 @@ else
 
     private Goal? _goal;
     private PipelineInfo? _pipeline;
+    private IReadOnlyList<ProgressEntry> _progress = [];
 
     // The Goal object from pipelines may be stale (snapshot at dispatch time).
     // Derive status from the pipeline phase which is always current.
@@ -73,6 +106,7 @@ else
         var snap = State.GetSnapshot();
         _goal = snap.Goals.FirstOrDefault(g => g.Id == GoalId);
         _pipeline = snap.Pipelines.FirstOrDefault(p => p.GoalId == GoalId);
+        _progress = State.GetProgressForGoal(GoalId);
     }
 
     private void RefreshState() => InvokeAsync(() => { Refresh(); StateHasChanged(); });
@@ -85,6 +119,9 @@ else
         GoalStatus.Pending => "badge-yellow",
         _ => "badge-muted",
     };
+
+    private static string Truncate(string s, int max) =>
+        s.Length <= max ? s : s[..max] + "…";
 
     public void Dispose() => State.OnStateChanged -= RefreshState;
 }

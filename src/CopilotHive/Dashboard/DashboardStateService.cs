@@ -139,6 +139,13 @@ public sealed class DashboardStateService : IDisposable
             .TakeLast(count)
             .ToList();
 
+    /// <summary>Returns recent progress reports for a specific goal.</summary>
+    public IReadOnlyList<ProgressEntry> GetProgressForGoal(string goalId, int count = 100) =>
+        _progressLog.GetRecent(500)
+            .Where(e => e.GoalId == goalId)
+            .TakeLast(count)
+            .ToList();
+
     /// <summary>Returns orchestrator info including uptime, versions, and model configuration.</summary>
     public OrchestratorInfo GetOrchestratorInfo()
     {
