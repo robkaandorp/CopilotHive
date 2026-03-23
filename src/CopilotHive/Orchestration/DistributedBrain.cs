@@ -260,6 +260,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         var prompt = $$"""
             Plan the workflow for iteration {{pipeline.Iteration}} of goal: {{pipeline.Description}}
 
+            Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
+            (You can browse the code under these folder names in your working directory)
+
             {{metricsContext}}
             {{historyContext}}
             {{failureContext}}
@@ -450,6 +453,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Goal: {{pipeline.Description}}
             Iteration: {{pipeline.Iteration}}
             Current phase: {{phase}}
+            Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
             {{phaseInstructions}}
             {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
             {{(historyContext.Length > 0 ? $"\n{historyContext}" : "")}}
