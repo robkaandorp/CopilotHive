@@ -93,8 +93,7 @@ public sealed class SharpCoderRunner : IAgentRunner
             _log.Info($"AgentResult: {result.Messages.Count} messages total");
             foreach (var msg in result.Messages)
             {
-                var textPreview = msg.Text?.Length > 200 ? msg.Text.Substring(0, 200) + "..." : msg.Text;
-                _log.Info($"  [{msg.Role}] {textPreview}");
+                _log.Info($"  [{msg.Role}] {SummarizeMessage(msg)}");
             }
         }
 
@@ -110,6 +109,40 @@ public sealed class SharpCoderRunner : IAgentRunner
     {
         _chatClient?.Dispose();
         return ValueTask.CompletedTask;
+    }
+
+    private static string SummarizeMessage(ChatMessage msg)
+    {
+        const int ArgValueMaxLength = 100;
+        const int PreviewMaxLength = 200;
+
+        var functionCall = msg.Contents?.OfType<FunctionCallContent>().FirstOrDefault();
+        if (functionCall != null)
+        {
+            var firstArg = functionCall.Arguments?.FirstOrDefault();
+            if (firstArg.HasValue)
+            {
+                var argValue = firstArg.Value.Value?.ToString() ?? string.Empty;
+                if (argValue.Length > ArgValueMaxLength)
+                    argValue = argValue.Substring(0, ArgValueMaxLength);
+                return $"tool:{functionCall.Name}({firstArg.Value.Key}=\"{argValue}\")";
+            }
+            return $"tool:{functionCall.Name}()";
+        }
+
+        var functionResult = msg.Contents?.OfType<FunctionResultContent>().FirstOrDefault();
+        if (functionResult != null)
+        {
+            var preview = functionResult.Result?.ToString() ?? string.Empty;
+            if (preview.Length > PreviewMaxLength)
+                preview = preview.Substring(0, PreviewMaxLength);
+            return $"result:{functionResult.CallId} \u2192 \"{preview}\"";
+        }
+
+        var text = msg.Text;
+        if (text != null && text.Length > PreviewMaxLength)
+            text = text.Substring(0, PreviewMaxLength);
+        return text ?? string.Empty;
     }
 
     private IChatClient CreateChatClient(string? modelOverride = null)
