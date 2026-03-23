@@ -206,10 +206,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             EnableAutoCompaction = true,
             AutoLoadWorkspaceInstructions = false,
             Logger = _logger,
-            // TODO: Uncomment when SharpCoder 0.3.0-alpha.1 is available on NuGet
-            // OnCompacted = r => _logger.LogInformation(
-            //     "Brain context compaction: {TokensBefore} \u2192 {TokensAfter} tokens ({ReductionPercent}% reduction), {MessagesBefore} \u2192 {MessagesAfter} messages",
-            //     r.TokensBefore, r.TokensAfter, r.ReductionPercent, r.MessagesBefore, r.MessagesAfter),
+            OnCompacted = r => _logger.LogInformation(
+                "Brain context compaction: {TokensBefore} \u2192 {TokensAfter} tokens ({ReductionPercent}% reduction), {MessagesBefore} \u2192 {MessagesAfter} messages",
+                r.TokensBefore, r.TokensAfter, r.ReductionPercent, r.MessagesBefore, r.MessagesAfter),
         });
 
         _logger.LogDebug("CodingAgent created with WorkDirectory={WorkDir}, FileOps={FileOps}",
