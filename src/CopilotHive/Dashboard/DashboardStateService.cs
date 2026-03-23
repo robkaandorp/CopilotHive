@@ -36,9 +36,19 @@ public sealed class DashboardStateService : IDisposable
     /// <summary>Creates a snapshot of current system state.</summary>
     public DashboardSnapshot GetSnapshot()
     {
-        var goals = _goalSource.GetAllGoals().ToList();
+        var apiGoals = _goalSource.GetAllGoals();
         var workers = _workerPool.GetAllWorkers();
         var pipelines = _pipelineManager.GetAllPipelines();
+
+        // Merge goals from API source and active pipelines (FileGoalSource goals
+        // only appear via pipelines, so we need both to get a complete list).
+        var goalsById = apiGoals.ToDictionary(g => g.Id);
+        foreach (var p in pipelines)
+        {
+            goalsById.TryAdd(p.GoalId, p.Goal);
+        }
+
+        var goals = goalsById.Values.ToList();
 
         return new DashboardSnapshot
         {

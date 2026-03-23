@@ -2,6 +2,7 @@
 @using CopilotHive.Dashboard
 @implements IDisposable
 @inject DashboardStateService State
+@inject IJSRuntime JS
 
 <h1>Live Logs</h1>
 
@@ -14,7 +15,7 @@
     <button @onclick="TogglePause">@(_paused ? "▶ Resume" : "⏸ Pause")</button>
 </div>
 
-<div class="log-view" @ref="_logDiv">
+<div class="log-view" id="logContainer" @ref="_logDiv">
     @foreach (var entry in FilteredEntries)
     {
         <div class="log-line @entry.LevelCss">@entry.Timestamp.ToString("HH:mm:ss") @entry.LevelLabel [@entry.Category] @entry.Message</div>
@@ -35,6 +36,14 @@
     {
         _entries = State.GetRecentLogs(500).ToList();
         State.OnStateChanged += RefreshLogs;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!_paused)
+        {
+            await JS.InvokeVoidAsync("eval", "document.getElementById('logContainer')?.scrollTo(0, document.getElementById('logContainer').scrollHeight)");
+        }
     }
 
     private void RefreshLogs()
