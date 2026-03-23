@@ -212,20 +212,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             workDir, _repoManager is not null);
     }
 
-    /// <summary>Single-session Brain: no per-goal cleanup needed.</summary>
-    public Task CleanupGoalSessionAsync(string goalId)
-    {
-        _logger.LogDebug("Brain single-session mode — no cleanup for goal {GoalId}", goalId);
-        return Task.CompletedTask;
-    }
-
-    /// <summary>Single-session Brain: session persists across goals, no re-priming needed.</summary>
-    public Task ReprimeSessionAsync(GoalPipeline pipeline, CancellationToken ct)
-    {
-        _logger.LogDebug("Brain single-session mode — no repriming for goal {GoalId}", pipeline.GoalId);
-        return Task.CompletedTask;
-    }
-
     /// <summary>Returns the file path for persisting the Brain session.</summary>
     private string GetSessionFilePath() => Path.Combine(_stateDir, "brain-session.json");
 

@@ -4,12 +4,13 @@ namespace CopilotHive.Orchestration;
 
 /// <summary>
 /// LLM-powered brain for the distributed orchestrator.
-/// The Brain has two jobs: plan iteration phases and craft worker prompts.
-/// Workers report structured verdicts; the state machine drives sequencing.
+/// The Brain maintains a single persistent session across all goals, using
+/// CodingAgent for LLM communication with automatic context compaction.
+/// It has two jobs: plan iteration phases and craft worker prompts.
 /// </summary>
 public interface IDistributedBrain
 {
-    /// <summary>Connect to the LLM provider and initialise the chat client.</summary>
+    /// <summary>Connect to the LLM provider, create the CodingAgent, and load any persisted session.</summary>
     Task ConnectAsync(CancellationToken ct = default);
 
     /// <summary>
@@ -35,13 +36,4 @@ public interface IDistributedBrain
     /// has file access to the latest base branch code.
     /// </summary>
     Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default);
-
-    /// <summary>Removes the session for a completed/failed goal and frees resources.</summary>
-    Task CleanupGoalSessionAsync(string goalId);
-
-    /// <summary>
-    /// Restores a session for an in-progress goal on restart.
-    /// Replays conversation history or loads a persisted session file.
-    /// </summary>
-    Task ReprimeSessionAsync(GoalPipeline pipeline, CancellationToken ct);
 }

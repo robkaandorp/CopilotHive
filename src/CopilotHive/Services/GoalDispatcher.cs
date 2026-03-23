@@ -883,7 +883,6 @@ public sealed class GoalDispatcher : BackgroundService
         };
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Completed, completedMeta, ct);
         await CommitGoalsToConfigRepoAsync($"Goal '{pipeline.GoalId}' completed", ct);
-        await CleanupBrainSessionAsync(pipeline.GoalId);
 
         var duration = pipeline.CompletedAt.HasValue
             ? pipeline.CompletedAt.Value - pipeline.CreatedAt
@@ -966,7 +965,6 @@ public sealed class GoalDispatcher : BackgroundService
         };
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Failed, failedMeta, ct);
         await CommitGoalsToConfigRepoAsync($"Goal '{pipeline.GoalId}' failed: {reason}", ct);
-        await CleanupBrainSessionAsync(pipeline.GoalId);
 
         var duration = pipeline.CompletedAt.HasValue
             ? pipeline.CompletedAt.Value - pipeline.CreatedAt
@@ -1043,15 +1041,6 @@ public sealed class GoalDispatcher : BackgroundService
             ReviewVerdict = reviewVerdict,
             Notes = notes,
         };
-    }
-
-    private async Task CleanupBrainSessionAsync(string goalId)
-    {
-        if (_brain is not null)
-        {
-            try { await _brain.CleanupGoalSessionAsync(goalId); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to cleanup Brain session for goal {GoalId}", goalId); }
-        }
     }
 
     /// <summary>
@@ -1169,20 +1158,8 @@ public sealed class GoalDispatcher : BackgroundService
         {
             _dispatchedGoals.TryAdd(pipeline.GoalId, true);
 
-            // Re-prime Brain session with conversation history
-            if (_brain is not null && pipeline.Conversation.Count > 0)
-            {
-                try
-                {
-                    await _brain.ReprimeSessionAsync(pipeline, ct);
-                    _logger.LogInformation("Re-primed Brain session for goal {GoalId} ({ConvCount} entries)",
-                        pipeline.GoalId, pipeline.Conversation.Count);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to re-prime Brain session for goal {GoalId}", pipeline.GoalId);
-                }
-            }
+            // Brain session is loaded from file at startup (single persistent session),
+            // so no per-goal re-priming is needed.
 
             // If the pipeline was mid-task (has ActiveTaskId), re-enqueue the task for reassignment
             if (pipeline.ActiveTaskId is not null && pipeline.Phase is not (GoalPhase.Done or GoalPhase.Failed))
