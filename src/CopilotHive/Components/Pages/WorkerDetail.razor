@@ -1,0 +1,135 @@
+@page "/workers/{WorkerId}"
+@using CopilotHive.Dashboard
+@implements IDisposable
+@inject DashboardStateService State
+
+<div style="margin-bottom:1rem">
+    <a href="/workers" style="color:var(--accent);text-decoration:none">← Back to Workers</a>
+</div>
+
+@if (_worker is null)
+{
+    <h1>Worker Not Found</h1>
+    <p style="color:var(--text-muted)">Worker <code>@WorkerId</code> is not connected.</p>
+}
+else
+{
+    <h1>Worker @_worker.Id[..Math.Min(12, _worker.Id.Length)]</h1>
+
+    <div class="cards">
+        <div class="card">
+            <div class="label">Status</div>
+            <div class="value">
+                <span class="badge @(_worker.IsBusy ? "badge-yellow" : "badge-green")">
+                    @(_worker.IsBusy ? "Busy" : "Idle")
+                </span>
+            </div>
+        </div>
+        <div class="card">
+            <div class="label">Role</div>
+            <div class="value" style="font-size:1rem">
+                @if (_worker.Role != "Unspecified")
+                {
+                    <span class="badge badge-blue">@_worker.Role</span>
+                }
+                else
+                {
+                    <span style="color:var(--text-muted)">—</span>
+                }
+            </div>
+        </div>
+        <div class="card">
+            <div class="label">Model</div>
+            <div class="value" style="font-size:0.9rem;font-family:monospace">
+                @(_worker.Role != "Unspecified" && _info.RoleModels.TryGetValue(_worker.Role.ToLowerInvariant(), out var m) ? m : "—")
+            </div>
+        </div>
+        <div class="card">
+            <div class="label">Current Task</div>
+            <div class="value" style="font-size:1rem">@(_worker.CurrentTaskId ?? "—")</div>
+        </div>
+    </div>
+
+    <div class="cards" style="margin-top:0.5rem">
+        <div class="card">
+            <div class="label">Connected</div>
+            <div class="value" style="font-size:1rem">@FormatAgo(_worker.ConnectedAt)</div>
+        </div>
+        <div class="card">
+            <div class="label">Last Heartbeat</div>
+            <div class="value" style="font-size:1rem">@FormatAgo(_worker.LastHeartbeat)</div>
+        </div>
+        <div class="card">
+            <div class="label">Worker ID</div>
+            <div class="value" style="font-size:0.7rem;font-family:monospace;word-break:break-all">@_worker.Id</div>
+        </div>
+    </div>
+
+    <h2 style="margin-top:2rem">Progress Reports</h2>
+    @if (_progress.Count > 0)
+    {
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Goal</th>
+                    <th>Status</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var entry in _progress)
+                {
+                    <tr>
+                        <td style="white-space:nowrap;color:var(--text-muted)">@entry.Timestamp.ToString("HH:mm:ss")</td>
+                        <td><span style="color:var(--accent)">@entry.GoalId</span></td>
+                        <td><span class="badge badge-blue">@entry.Status</span></td>
+                        <td style="font-size:0.85rem">@Truncate(entry.Details, 200)</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+    else
+    {
+        <p style="color:var(--text-muted)">No progress reports from this worker yet.</p>
+    }
+}
+
+@code {
+    [Parameter]
+    public string WorkerId { get; set; } = "";
+
+    private WorkerInfo? _worker;
+    private IReadOnlyList<ProgressEntry> _progress = [];
+    private OrchestratorInfo _info = new();
+
+    protected override void OnInitialized()
+    {
+        Refresh();
+        State.OnStateChanged += RefreshState;
+    }
+
+    private void Refresh()
+    {
+        var snap = State.GetSnapshot();
+        _worker = snap.Workers.FirstOrDefault(w => w.Id == WorkerId);
+        _progress = State.GetProgressForWorker(WorkerId);
+        _info = State.GetOrchestratorInfo();
+    }
+
+    private void RefreshState() => InvokeAsync(() => { Refresh(); StateHasChanged(); });
+
+    private static string FormatAgo(DateTime utc)
+    {
+        var ago = DateTime.UtcNow - utc;
+        if (ago.TotalSeconds < 60) return $"{(int)ago.TotalSeconds}s ago";
+        if (ago.TotalMinutes < 60) return $"{(int)ago.TotalMinutes}m ago";
+        return $"{(int)ago.TotalHours}h {ago.Minutes}m ago";
+    }
+
+    private static string Truncate(string s, int max) =>
+        s.Length <= max ? s : s[..max] + "…";
+
+    public void Dispose() => State.OnStateChanged -= RefreshState;
+}

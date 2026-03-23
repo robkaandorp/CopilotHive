@@ -38,7 +38,9 @@
             @foreach (var w in _snap.Workers)
             {
                 <tr>
-                    <td style="font-family:monospace;font-size:0.85rem">@w.Id[..Math.Min(12, w.Id.Length)]</td>
+                    <td style="font-family:monospace;font-size:0.85rem">
+                        <a href="/workers/@w.Id" style="color:var(--accent);text-decoration:none">@w.Id[..Math.Min(12, w.Id.Length)]</a>
+                    </td>
                     <td>
                         @if (w.Role != "Unspecified")
                         {

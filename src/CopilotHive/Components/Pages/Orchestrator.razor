@@ -89,41 +89,8 @@ else
     <p style="color:var(--text-muted)">Brain not connected.</p>
 }
 
-<h2 style="margin-top:2rem">Worker Progress</h2>
-@if (_progress.Count > 0)
-{
-    <table>
-        <thead>
-            <tr>
-                <th>Time</th>
-                <th>Worker</th>
-                <th>Goal</th>
-                <th>Status</th>
-                <th>Details</th>
-            </tr>
-        </thead>
-        <tbody>
-            @foreach (var entry in _progress)
-            {
-                <tr>
-                    <td style="white-space:nowrap;color:var(--text-muted)">@entry.Timestamp.ToString("HH:mm:ss")</td>
-                    <td style="font-family:monospace;font-size:0.85rem">@Truncate(entry.WorkerId, 12)</td>
-                    <td><span style="color:var(--accent)">@entry.GoalId</span></td>
-                    <td><span class="badge badge-blue">@entry.Status</span></td>
-                    <td style="font-size:0.85rem">@Truncate(entry.Details, 120)</td>
-                </tr>
-            }
-        </tbody>
-    </table>
-}
-else
-{
-    <p style="color:var(--text-muted)">No progress reports yet.</p>
-}
-
 @code {
     private BrainStats? _stats;
-    private IReadOnlyList<ProgressEntry> _progress = [];
     private OrchestratorInfo _info = new();
 
     protected override void OnInitialized()
@@ -135,7 +102,6 @@ else
     private void Refresh()
     {
         _stats = State.GetBrainStats();
-        _progress = State.GetRecentProgress(50);
         _info = State.GetOrchestratorInfo();
     }
 
@@ -160,9 +126,6 @@ else
     private static string FormatUptime(TimeSpan ts) => ts.TotalHours >= 1
         ? $"{(int)ts.TotalHours}h {ts.Minutes}m {ts.Seconds}s"
         : $"{ts.Minutes}m {ts.Seconds}s";
-
-    private static string Truncate(string s, int max) =>
-        s.Length <= max ? s : s[..max] + "…";
 
     public void Dispose() => State.OnStateChanged -= RefreshState;
 }

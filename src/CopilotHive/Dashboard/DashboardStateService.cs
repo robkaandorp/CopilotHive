@@ -132,6 +132,13 @@ public sealed class DashboardStateService : IDisposable
     /// <summary>Returns recent worker progress reports.</summary>
     public IReadOnlyList<ProgressEntry> GetRecentProgress(int count = 50) => _progressLog.GetRecent(count);
 
+    /// <summary>Returns recent progress reports for a specific worker.</summary>
+    public IReadOnlyList<ProgressEntry> GetProgressForWorker(string workerId, int count = 100) =>
+        _progressLog.GetRecent(500)
+            .Where(e => e.WorkerId == workerId)
+            .TakeLast(count)
+            .ToList();
+
     /// <summary>Returns orchestrator info including uptime, versions, and model configuration.</summary>
     public OrchestratorInfo GetOrchestratorInfo()
     {
