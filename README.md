@@ -39,7 +39,7 @@ Goals flow through a structured pipeline:
 
 If testing or review fails, the pipeline retries the coding step (up to a configured limit).
 
-The **Brain** (`DistributedBrain`) plans iteration phases and crafts worker prompts using SharpCoder's `IChatClient` for LLM communication. Workers report structured verdicts via tool calls, and the pipeline state machine (`PipelineStateMachine`) drives sequencing — retrying, advancing, or failing based on those verdicts. Pipeline state is persisted to **SQLite** (`PipelineStore`) with auto-migration, so the server can resume after restarts. Metrics feed into the **improver** for self-improvement: the system tunes its own `agents.md` instructions over time.
+The **Brain** (`DistributedBrain`) plans iteration phases and crafts worker prompts using SharpCoder's `CodingAgent` for LLM communication. The Brain maintains a **single persistent session** across all goals with automatic context compaction (infinite context), and has **read-only file access** to target repositories for informed decision-making. Goals are processed **sequentially** so the Brain accumulates learnings from one goal to the next. Workers report structured verdicts via tool calls, and the pipeline state machine (`PipelineStateMachine`) drives sequencing — retrying, advancing, or failing based on those verdicts. Pipeline state is persisted to **SQLite** (`PipelineStore`) with auto-migration, and the Brain session is persisted to `brain-session.json`, so the server can resume after restarts. Metrics feed into the **improver** for self-improvement: the system tunes its own `agents.md` instructions over time.
 
 ## Getting Started
 
@@ -153,21 +153,22 @@ goals:
 | `src/CopilotHive/` | Main orchestrator — Brain, GoalDispatcher, persistence, metrics |
 | `src/CopilotHive.Shared/` | Shared protobuf definitions and DTOs |
 | `src/CopilotHive.Worker/` | Worker process (runs inside Docker containers) |
-| `tests/` | 606 xUnit tests |
+| `tests/` | 616 xUnit tests |
 | `agents/` | Default agent templates (overridden by config repo at runtime) |
 | `docker/` | Dockerfiles and container configuration |
 
 ## Current Features
 
 - **Server-only mode** — gRPC server + HTTP health endpoint (no CLI mode)
-- **LLM-powered Brain** — `DistributedBrain` uses SharpCoder's `IChatClient` for orchestration decisions, with configurable context window (`BRAIN_CONTEXT_WINDOW`)
+- **LLM-powered Brain** — `DistributedBrain` uses SharpCoder's `CodingAgent` with a single persistent session, read-only file access to repos, automatic context compaction, and configurable context window (`BRAIN_CONTEXT_WINDOW`)
+- **Sequential goal processing** — goals process one at a time so the Brain accumulates context across goals
 - **Worker utilization metrics** — `GET /health/utilization` endpoint provides per-role worker utilization and bottleneck detection
 - **Self-improvement loop** — the improver modifies `agents.md` based on accumulated metrics
 - **SQLite persistence** — `PipelineStore` with auto-migration for pipeline state
 - **Config repo** — externalized agent instructions and goals (`CopilotHive-Config`)
 - **Multi-repo goal support** — goals can target any accessible Git repository
 - **Per-role model selection** — assign different LLM models to each worker type
-- **Auto-rebase on merge conflicts** — the pipeline automatically rebases and retries
+- **Auto-rebase on merge conflicts** — the pipeline automatically retries merges
 - **Fallback metrics parsing** — robust parsing handles varied worker output formats
 - **Duplicate goal completion guards** — prevents re-processing of already-completed goals
 - **Telemetry** — per-run metrics aggregated and fed into the improver

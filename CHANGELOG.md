@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Brain CodingAgent migration** — Brain now uses SharpCoder's `CodingAgent` instead of raw `IChatClient`, gaining built-in file tools, session management, and automatic context compaction
+- **Single persistent Brain session** — one `AgentSession` carries context across all goals (replaces per-goal `ConcurrentDictionary<string, AgentSession>`)
+- **Brain read-only file access** — Brain can read project structure, config, and code via `read_file`, `glob`, `grep` tools on persistent repo clones
+- **Sequential goal processing** — goals process one at a time so the Brain accumulates learnings across goals
+- **Brain session persistence** — session saved to `brain-session.json` after each Brain call, loaded on startup for crash recovery
+- **BrainRepoManager** — manages persistent repo clones at `{stateDir}/repos/{repoName}` for Brain file access and merge operations
+- **Merge via brain clone** — `PerformMergeAsync` reuses the brain clone instead of creating temp directories; on failure, clone is reset to clean state
+- `BrainRepoManager.MergeFeatureBranchAsync` — fetch, merge, push in the persistent brain clone
+
+### Removed
+- `CleanupGoalSessionAsync` and `ReprimeSessionAsync` from `IDistributedBrain` — no longer needed with single persistent session
+- Per-goal `AgentSession` management (`GetOrCreateSession`, `_sessions` dictionary)
+- `SendToBrainCoreAsync` — replaced by `ExecuteBrainAsync` which delegates to CodingAgent
+- `FunctionInvokingChatClient` wrapping in Brain — CodingAgent handles tool invocation internally
+- Auto-rebase complexity in merge flow (sequential processing makes conflicts unlikely)
+
+### Changed
+- Brain system prompt updated to allow file reading (was "do NOT run tools or file operations")
+- Brain `WorkDirectory` set to `repos/` parent folder so all repositories are visible simultaneously
+- Updated `DistributedBrain` from `IChatClient` direct usage to `CodingAgent` orchestration
+- `GoalDispatcher.DispatchNextGoalAsync` now checks `GetActivePipelines()` before dispatching
+
+### Added
 - `SharpCoderRunnerSummarizeMessageTests` — xUnit test suite with 10 [Fact] tests covering the `SummarizeMessage` helper method via reflection; tests verify tool call logging format, tool result format, argument truncation (100 chars), result preview truncation (200 chars), null handling, and plain text fallback behavior
 - `SharpCoderRunner.SendPromptAsync` logging improvements — task execution now logs worker role and model: "Executing task as {role} with model {model}. WorkDir: {workDir}"; task completion logs elapsed time, status, and tool call count: "Task finished in {elapsed}s (status={status}, toolCalls={toolCalls})" using `System.Diagnostics.Stopwatch`
 - `SharpCoderRunnerLoggingTests` — xUnit test suite with 7 [Fact] tests and 1 [Theory] (4 cases) verifying `SendPromptAsync` logging: role and model in task start message, elapsed time, status, and tool call count in task completion message

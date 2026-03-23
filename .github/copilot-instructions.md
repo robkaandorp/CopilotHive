@@ -6,7 +6,8 @@ CopilotHive is a self-improving multi-agent orchestration system. A C# orchestra
 (the "Product Owner") manages a pool of generic Docker containers running SharpCoder
 as their AI agent engine. Workers dynamically accept any role (coder, tester, doc-writer,
 reviewer, improver) per task. They communicate via direct LLM API calls (SharpCoder)
-and operate on isolated git clones.
+and operate on isolated git clones. The orchestrator Brain uses SharpCoder's `CodingAgent`
+with a single persistent session that carries context across all goals.
 
 ## Technology Stack
 
@@ -24,12 +25,13 @@ CopilotHive/
 │   ├── Agents/AgentsManager.cs       # AGENTS.md versioning and rollback
 │   ├── Configuration/                # HiveConfiguration record
 │   ├── Git/GitWorkspaceManager.cs    # Bare repo, clones, branching, merging
+│   ├── Git/BrainRepoManager.cs      # Persistent Brain repo clones and merge ops
 │   ├── Metrics/                      # Per-iteration metrics tracking
 │   ├── Orchestration/DistributedBrain.cs # LLM-powered Brain for orchestration decisions
 │   ├── Services/GoalDispatcher.cs    # Pipeline state machine with phase sequencing
 │   ├── Workers/DockerWorkerManager.cs # Docker container lifecycle
 │   └── Program.cs                    # CLI entrypoint
-├── tests/CopilotHive.Tests/         # 606+ xUnit tests
+├── tests/CopilotHive.Tests/         # 616+ xUnit tests
 ├── agents/                           # AGENTS.md templates per role
 │   ├── orchestrator.agents.md
 │   ├── coder.agents.md
@@ -56,6 +58,10 @@ dotnet test CopilotHive.slnx
 - **Strategy in AGENTS.md** — Delegation heuristics, priorities, and communication style
   are self-modifiable by the orchestrator, one update per iteration max.
 - **Separate git clones per worker** — Each task gets its own clone for full isolation.
+- **Brain repo clones** — The Brain has persistent read-only clones at `{stateDir}/repos/{repoName}`,
+  used for file access during planning/prompting and for merge operations.
+- **Sequential goal processing** — Goals process one at a time so the Brain can accumulate
+  context across goals via its single persistent session.
 - **Metrics-driven improvement** — Every iteration records metrics. Regressions trigger
   automatic rollback of AGENTS.md changes.
 - **No `Directory.Delete` without retry** — On Windows, use `ForceDeleteDirectoryAsync`
@@ -64,7 +70,8 @@ dotnet test CopilotHive.slnx
 ## Key Design Patterns
 
 - Workers are generic Docker containers that accept any role per task via dynamic agent selection
-- The orchestrator Brain uses SharpCoder's `IChatClient` for LLM communication
+- The orchestrator Brain uses SharpCoder's `CodingAgent` with a single persistent session
+- The Brain has read-only file access to target repos and auto-compacts its context
 - Workers use `SharpCoderRunner` with `CodingAgent` for autonomous task execution
 - Git operations shell out to `git` CLI (not LibGit2Sharp) for simplicity
 - The coder↔tester feedback loop retries up to `MaxRetriesPerTask` times

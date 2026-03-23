@@ -1,6 +1,6 @@
 # Architecture Alternatives -- Agent Runtime
 
-CopilotHive uses **SharpCoder** for worker agent orchestration and **direct LLM API calls** (via `IChatClient`) for Brain orchestration. This document evaluates alternatives and explains the selection rationale.
+CopilotHive uses **SharpCoder** for both worker agent orchestration and Brain orchestration. Both use `CodingAgent` — workers for code execution, the Brain for intelligent planning with read-only file access.
 
 ## Current Architecture
 
@@ -10,11 +10,12 @@ Key features used:
 
 | Feature | Purpose |
 |---------|---------|
-| `CodingAgent` | Autonomous agent loop with tool execution for workers |
+| `CodingAgent` | Autonomous agent loop with tool execution for workers and Brain |
 | `AgentOptions` | Role-specific config (system prompts, tool permissions, work directory) |
+| `AgentSession` | Persistent session with save/load for Brain crash recovery |
 | `EnableBash` / `EnableFileWrites` | Sandboxing for reviewer (no writes) and improver (no bash) |
 | `AIFunctionFactory.Create()` | Custom tools (report_progress, report_test_results, report_verdict) |
-| `IChatClient` | Brain uses direct LLM access for orchestration decisions |
+| `ContextCompactor` | Auto-compacts Brain context at 80% capacity for infinite sessions |
 | Token tracking | `AgentResult.Usage` provides InputTokenCount, OutputTokenCount |
 
 ## Evaluated Alternatives
@@ -79,7 +80,7 @@ Key features used:
 | **Native .NET** | Yes | No | No | No (Python) | Via provider |
 | **Open Source** | Yes | Yes | No | Yes | N/A |
 | **Multi-provider** | Yes (any IChatClient) | Yes (75+) | No (Claude only) | Yes | Yes |
-| **Autonomous Agent** | Yes (CodingAgent) | Yes | Yes | Yes | Build yourself |
+| **Autonomous Agent** | Yes (CodingAgent for workers+Brain) | Yes | Yes | Yes | Build yourself |
 | **Custom Tools** | Yes (AIFunction) | Yes (tools dir) | Limited | Yes | Build yourself |
 | **Permission Control** | Yes (EnableBash/EnableFileWrites) | Yes (agent config) | Limited | `--yes` | Build yourself |
 | **Cost** | Pay-per-use (model cost) | Pay-per-use | $20-200/mo | Pay-per-use | Pay-per-use |
@@ -92,7 +93,9 @@ Key features used:
 4. **Role-based Sandboxing** -- `EnableBash` and `EnableFileWrites` flags per role
 5. **Custom Tools** -- `AIFunctionFactory.Create()` registers structured tools with validation
 6. **Token Tracking** -- Built-in usage tracking for cost and context management
-7. **No External Dependencies** -- No Node.js, no CLI binaries, just a NuGet package
+7. **Context Compaction** -- Automatic summarization keeps infinite sessions manageable
+8. **Session Persistence** -- Save/load sessions for crash recovery
+9. **No External Dependencies** -- No Node.js, no CLI binaries, just a NuGet package
 
 ### Historical Note
 
@@ -104,7 +107,7 @@ CopilotHive originally used the GitHub Copilot SDK (`GitHub.Copilot.SDK` NuGet) 
 |--------|----------|--------|------|
 | **OpenCode HTTP** | Build `OpenCodeRunner.cs` with `HttpClient` | 2 weeks | Low |
 | **OpenCode ACP** | Build .NET JSON-RPC client over stdio | 3-4 weeks | Medium |
-| **Direct LLM** | Already partially done (Brain uses `IChatClient`) | 4-6 weeks | Medium |
+| **Direct LLM** | SharpCoder already handles this via CodingAgent | N/A | N/A |
 | **Aider** | Python subprocess orchestration | 2-3 weeks | Medium |
 
 ## References
