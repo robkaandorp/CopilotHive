@@ -106,7 +106,8 @@ public sealed class SharpCoderRunner : IAgentRunner
         var result = await agent.ExecuteAsync(prompt, ct);
 
         stopwatch.Stop();
-        _log.Info($"Task finished in {stopwatch.Elapsed.TotalSeconds:F2}s (status={result.Status}, toolCalls={result.ToolCallCount})");
+        var elapsedSecs = stopwatch.Elapsed.TotalSeconds.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+        _log.Info($"Task finished in {elapsedSecs}s (status={result.Status}, toolCalls={result.ToolCallCount})");
 
         _log.Info($"AgentResult: status={result.Status}, toolCalls={result.ToolCallCount}, model={result.ModelId}, finish={result.FinishReason}");
         if (result.Usage != null)
