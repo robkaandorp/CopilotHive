@@ -372,6 +372,56 @@ file sealed class FakeGoalSource : IGoalSource
 }
 
 /// <summary>
+/// Tests for phase duration logging in GoalDispatcher.
+/// </summary>
+public sealed class GoalDispatcherPhaseDurationLoggingTests
+{
+    [Fact]
+    public async Task DriveNextPhaseAsync_LogsPhaseDuration_WhenPhaseCompletes()
+    {
+        // Arrange
+        var logger = new CollectingLogger<GoalDispatcher>();
+        var brain = new FakeDispatcherBrain();
+        var goal = new Goal { Id = "goal-duration-log-test", Description = "Test phase duration logging" };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken); // Populate internal map
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Testing); // Use Testing phase to avoid no-op detection in Coding
+
+        var taskId = $"task-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            brain);
+
+        // Act
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "Testing completed successfully.",
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.Contains(logger.Logs, l =>
+            l.Message.Contains("completed in") &&
+            l.Message.Contains(goal.Id) &&
+            l.Message.Contains("Testing"));
+    }
+}
+
+/// <summary>
 /// Collecting logger for verifying log output in tests.
 /// </summary>
 file sealed class CollectingLogger<T> : ILogger<T>
