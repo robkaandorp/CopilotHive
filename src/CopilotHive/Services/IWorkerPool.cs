@@ -7,6 +7,12 @@ namespace CopilotHive.Services;
 public interface IWorkerPool
 {
     /// <summary>
+    /// Gets the number of workers currently registered in the pool.
+    /// </summary>
+    /// <returns>The count of entries in the internal worker dictionary.</returns>
+    int ConnectedWorkerCount { get; }
+
+    /// <summary>
     /// Returns workers whose last heartbeat exceeds the given timeout.
     /// </summary>
     /// <param name="timeout">Maximum acceptable time since the last heartbeat.</param>
