@@ -14,7 +14,7 @@ public sealed class DashboardStateService : IDisposable
 {
     private readonly WorkerPool _workerPool;
     private readonly GoalPipelineManager _pipelineManager;
-    private readonly ApiGoalSource _goalSource;
+    private readonly GoalManager _goalManager;
     private readonly DashboardLogSink _logSink;
     private readonly ProgressLog _progressLog;
     private readonly IDistributedBrain? _brain;
@@ -31,7 +31,7 @@ public sealed class DashboardStateService : IDisposable
     public DashboardStateService(
         WorkerPool workerPool,
         GoalPipelineManager pipelineManager,
-        ApiGoalSource goalSource,
+        GoalManager goalManager,
         DashboardLogSink logSink,
         ProgressLog progressLog,
         IDistributedBrain? brain = null,
@@ -39,7 +39,7 @@ public sealed class DashboardStateService : IDisposable
     {
         _workerPool = workerPool;
         _pipelineManager = pipelineManager;
-        _goalSource = goalSource;
+        _goalManager = goalManager;
         _logSink = logSink;
         _progressLog = progressLog;
         _brain = brain;
@@ -50,18 +50,32 @@ public sealed class DashboardStateService : IDisposable
     /// <summary>Creates a snapshot of current system state.</summary>
     public DashboardSnapshot GetSnapshot()
     {
-        var apiGoals = _goalSource.GetAllGoals();
         var workers = _workerPool.GetAllWorkers();
         var pipelines = _pipelineManager.GetAllPipelines();
 
-        // Merge goals from API source and active pipelines (FileGoalSource goals
-        // only appear via pipelines, so we need both to get a complete list).
-        // Pipeline phase is always current, so derive status from it.
-        var goalsById = apiGoals.ToDictionary(g => g.Id);
+        // Collect goals from all sources (API + File) and active pipelines.
+        var goalsById = new Dictionary<string, Goal>();
+
+        // Add pending goals from all registered sources
+        foreach (var source in _goalManager.Sources)
+        {
+            var pending = source.GetPendingGoalsAsync().GetAwaiter().GetResult();
+            foreach (var g in pending)
+                goalsById.TryAdd(g.Id, g);
+        }
+
+        // Add API source goals (includes all statuses, not just pending)
+        var apiSource = _goalManager.Sources.OfType<ApiGoalSource>().FirstOrDefault();
+        if (apiSource is not null)
+        {
+            foreach (var g in apiSource.GetAllGoals())
+                goalsById.TryAdd(g.Id, g);
+        }
+
+        // Merge pipeline goals and derive status from pipeline phase
         foreach (var p in pipelines)
         {
-            if (!goalsById.ContainsKey(p.GoalId))
-                goalsById[p.GoalId] = p.Goal;
+            goalsById.TryAdd(p.GoalId, p.Goal);
 
             goalsById[p.GoalId].Status = p.Phase switch
             {
