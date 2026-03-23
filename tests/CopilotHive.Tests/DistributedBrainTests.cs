@@ -178,6 +178,69 @@ public sealed class DistributedBrainTests
 
     private static GoalPipeline CreatePipeline(string goalId, string description) =>
         new(new Goal { Id = goalId, Description = description });
+
+    // -- Single Session Tests --
+
+    [Fact]
+    public void Constructor_WithStateDir_CreatesInstance()
+    {
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            stateDir: "/tmp/test-state");
+        Assert.NotNull(brain);
+    }
+
+    [Fact]
+    public void Constructor_WithRepoManager_CreatesInstance()
+    {
+        var repoManager = new Git.BrainRepoManager("/tmp/test", NullLogger<Git.BrainRepoManager>.Instance);
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            repoManager: repoManager);
+        Assert.NotNull(brain);
+    }
+
+    [Fact]
+    public async Task EnsureBrainRepoAsync_NoRepoManager_DoesNotThrow()
+    {
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        await brain.EnsureBrainRepoAsync("myrepo", "https://example.com/repo.git", "main",
+            TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task SaveSessionAsync_CreatesFile()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+
+            await brain.SaveSessionAsync(TestContext.Current.CancellationToken);
+
+            var sessionFile = Path.Combine(tempDir, "brain-session.json");
+            Assert.True(File.Exists(sessionFile), $"Session file should exist at {sessionFile}");
+
+            var content = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
+            Assert.Contains("brain", content);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task PlanIterationAsync_WithoutConnect_ReturnsDefaultPlan()
+    {
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-plan", "Test plan");
+
+        var plan = await brain.PlanIterationAsync(pipeline, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(plan);
+        Assert.NotEmpty(plan.Phases);
+    }
 }
 
 /// <summary>
