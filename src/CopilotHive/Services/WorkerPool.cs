@@ -89,6 +89,12 @@ public sealed class WorkerPool : IWorkerPool
         _workers.GetValueOrDefault(id);
 
     /// <summary>
+    /// Gets the number of workers currently registered in the pool.
+    /// </summary>
+    /// <returns>The count of entries in the internal worker dictionary.</returns>
+    public int ConnectedWorkerCount => _workers.Count;
+
+    /// <summary>
     /// Updates the last heartbeat timestamp for the specified worker.
     /// </summary>
     /// <param name="id">Identifier of the worker.</param>
