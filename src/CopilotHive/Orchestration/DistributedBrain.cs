@@ -465,13 +465,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, use build skill, use test skill, and commit with `git add -A && git commit`. NEVER include git checkout, git branch, or git push commands. NEVER include dotnet/npm/cargo commands — only reference build and test skills.
                 """,
             GoalPhase.Review => """
-                - For reviewers: tell them to run the exact `Diff command` from their WORKSPACE CONTEXT header (it contains the real merge-base commit hash). They must ONLY review code that appears in the diff output (the + and - lines), not pre-existing code. Call the report_review_verdict tool when done.
+                - For reviewers: Do NOT include any git diff commands in your prompt — the worker's WORKSPACE CONTEXT already provides the correct diff command with the exact merge-base hash. Just tell them to review the branch changes using the diff command from their workspace context, focus only on the diff lines (+ and -), and call the report_review_verdict tool when done.
                 """,
             GoalPhase.Testing => """
                 - For testers: tell them to build, run the test skill, write integration tests, and call the report_test_results tool when done. Do NOT tell them to create report files.
                 """,
             GoalPhase.DocWriting => """
-                - For docwriters: tell them to run the exact `Diff command` from their WORKSPACE CONTEXT header to see what changed on the branch, then update README, CHANGELOG, and XML doc comments. Build to verify and commit. Call the report_doc_changes tool when done.
+                - For docwriters: Do NOT include any git diff commands in your prompt — the worker's WORKSPACE CONTEXT already provides the correct diff command. Tell them to use the diff command from their workspace context to see what changed, then update README, CHANGELOG, and XML doc comments. Build to verify and commit. Call the report_doc_changes tool when done.
                 """,
             GoalPhase.Improve => """
                 - For improvers: tell them to analyze iteration results and update *.agents.md files directly using file tools. Do NOT tell them to run git commands — the infrastructure commits and pushes automatically.
