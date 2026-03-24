@@ -23,6 +23,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly string _modelOverride;
     private readonly int _maxContextTokens;
     private readonly int _maxSteps;
+    private readonly ReasoningEffort? _reasoningEffort;
     private readonly ILogger<DistributedBrain> _logger;
     private readonly MetricsTracker? _metricsTracker;
     private readonly BrainRepoManager? _repoManager;
@@ -91,6 +92,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _repoManager = repoManager;
         _stateDir = stateDir ?? "/app/state";
         _session = AgentSession.Create("brain");
+
+        var (_, _, reasoning) = SDK.ChatClientFactory.ParseProviderModelAndReasoning(modelOverride);
+        _reasoningEffort = reasoning;
 
         _brainTools = BuildBrainTools();
 
@@ -209,6 +213,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             MaxContextTokens = _maxContextTokens,
             EnableAutoCompaction = true,
             AutoLoadWorkspaceInstructions = false,
+            ReasoningEffort = _reasoningEffort,
             Logger = _logger,
             OnCompacted = r => _logger.LogInformation(
                 "Brain context compaction: {TokensBefore} \u2192 {TokensAfter} tokens ({ReductionPercent}% reduction), {MessagesBefore} \u2192 {MessagesAfter} messages",
