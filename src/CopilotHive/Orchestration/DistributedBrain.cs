@@ -589,7 +589,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     internal static string FormatContextUsageMessage(long inputTokens, int contextWindow, string callerName)
     {
         var pct = contextWindow > 0 ? inputTokens * 100.0 / contextWindow : 0.0;
-        return $"Brain context usage: {pct:F1}% ({inputTokens}/{contextWindow} tokens) after {callerName}";
+        return $"Brain context usage: {pct.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)}% ({inputTokens}/{contextWindow} tokens) after {callerName}";
     }
 
     private async Task<(string Text, BrainToolCallResult? ToolCall)> ExecuteBrainAsync(
