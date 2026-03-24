@@ -17,6 +17,7 @@ namespace CopilotHive.Tests.Worker;
 /// Every test invokes <see cref="SharpCoderRunner.SendPromptAsync"/> and asserts on
 /// the actual log output emitted to stdout.
 /// </summary>
+[Collection("ConsoleOutput")]
 public sealed class SharpCoderRunnerLoggingTests : IDisposable
 {
     private readonly StringWriter _stdOut = new();

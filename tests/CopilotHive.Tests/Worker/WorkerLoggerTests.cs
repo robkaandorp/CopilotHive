@@ -10,6 +10,7 @@ namespace CopilotHive.Tests.Worker;
 /// and LogBlock methods write output in the expected format, including exact
 /// prefixes, log-level labels, stream routing, and structural elements.
 /// </summary>
+[Collection("ConsoleOutput")]
 public sealed class WorkerLoggerTests : IDisposable
 {
     private readonly StringWriter _stdOut = new();

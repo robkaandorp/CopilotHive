@@ -5,6 +5,7 @@ using Xunit;
 namespace CopilotHive.Tests;
 
 /// <summary>Tests for the <c>PrintBanner()</c> static method in <c>Program.cs</c>.</summary>
+[Collection("ConsoleOutput")]
 public sealed class PrintBannerTests
 {
     /// <summary>
