@@ -105,6 +105,9 @@ public sealed class SharpCoderRunner : IAgentRunner
             ReasoningEffort = _currentReasoning,
         };
 
+        // Write pre-execution diagnostics so we can inspect inputs even if the LLM call hangs or is killed
+        WriteDiagnosticsFile(null, prompt, TimeSpan.Zero, options, "pre");
+
         var agent = new CodingAgent(_chatClient, options);
         var result = await agent.ExecuteAsync(prompt, ct);
 
@@ -119,9 +122,10 @@ public sealed class SharpCoderRunner : IAgentRunner
                       $"historyMessages={diag.SessionHistoryCount}, totalMessages={diag.TotalMessageCount}");
             _log.Info($"Diagnostics: tools=[{string.Join(", ", diag.ToolNames)}], bash={diag.EnableBash}, " +
                       $"fileWrites={diag.EnableFileWrites}, skills={diag.SkillsEnabled}, autoWorkspace={diag.AutoLoadedWorkspaceInstructions}");
-
-            WriteDiagnosticsFile(result, prompt, stopwatch.Elapsed);
         }
+
+        // Write post-execution diagnostics with full result
+        WriteDiagnosticsFile(result, prompt, stopwatch.Elapsed, options, "post");
 
         _log.Info($"AgentResult: status={result.Status}, toolCalls={result.ToolCallCount}, model={result.ModelId}, finish={result.FinishReason}");
         if (result.Usage != null)
@@ -205,7 +209,7 @@ public sealed class SharpCoderRunner : IAgentRunner
     private static readonly string DiagnosticsDir =
         Environment.GetEnvironmentVariable("DIAGNOSTICS_DIR") ?? "/app/diagnostics";
 
-    private void WriteDiagnosticsFile(AgentResult result, string userPrompt, TimeSpan elapsed)
+    private void WriteDiagnosticsFile(AgentResult? result, string userPrompt, TimeSpan elapsed, AgentOptions options, string phase)
     {
         try
         {
@@ -213,22 +217,28 @@ public sealed class SharpCoderRunner : IAgentRunner
 
             var taskId = _currentTaskId ?? "unknown";
             var timestamp = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmss");
-            var fileName = $"{timestamp}_{taskId}.json";
+            var fileName = $"{timestamp}_{taskId}_{phase}.json";
             var filePath = Path.Combine(DiagnosticsDir, fileName);
 
-            var diag = result.Diagnostics!;
+            var toolNames = options.CustomTools
+                .Select(t => t is AIFunction f ? f.Name : t.GetType().Name)
+                .ToList();
+
+            // For pre-execution: use options directly; for post: use diagnostics from result
+            var diag = result?.Diagnostics;
             var doc = new
             {
+                phase,
                 taskId,
                 role = _currentRole.ToString(),
                 model = _currentModel,
                 reasoning = _currentReasoning?.ToString(),
                 timestamp = DateTimeOffset.UtcNow,
                 elapsedSeconds = elapsed.TotalSeconds,
-                status = result.Status,
-                toolCallCount = result.ToolCallCount,
-                finishReason = result.FinishReason?.ToString(),
-                usage = result.Usage is { } u ? new
+                status = result?.Status,
+                toolCallCount = result?.ToolCallCount,
+                finishReason = result?.FinishReason?.ToString(),
+                usage = result?.Usage is { } u ? new
                 {
                     inputTokens = u.InputTokenCount,
                     outputTokens = u.OutputTokenCount,
@@ -236,20 +246,21 @@ public sealed class SharpCoderRunner : IAgentRunner
                 } : null,
                 session = new
                 {
-                    diag.SessionHistoryCount,
-                    diag.TotalMessageCount,
-                    diag.MaxSteps,
-                    diag.EnableBash,
-                    diag.EnableFileWrites,
-                    diag.AutoLoadedWorkspaceInstructions,
-                    diag.SkillsEnabled,
-                    diag.ReasoningEffort,
-                    diag.WorkDirectory,
-                    toolNames = diag.ToolNames
+                    sessionHistoryCount = diag?.SessionHistoryCount ?? 0,
+                    totalMessageCount = diag?.TotalMessageCount ?? 0,
+                    maxSteps = options.MaxSteps,
+                    enableBash = options.EnableBash,
+                    enableFileWrites = options.EnableFileWrites,
+                    autoLoadedWorkspaceInstructions = options.AutoLoadWorkspaceInstructions,
+                    skillsEnabled = options.EnableSkills,
+                    reasoningEffort = options.ReasoningEffort?.ToString(),
+                    workDirectory = options.WorkDirectory,
+                    customToolNames = toolNames,
+                    allToolNames = diag?.ToolNames ?? (IReadOnlyList<string>)toolNames
                 },
-                systemPrompt = diag.SystemPrompt,
+                systemPrompt = diag?.SystemPrompt ?? options.SystemPrompt ?? "(not yet assembled)",
                 userMessage = userPrompt,
-                agentResponse = result.Message
+                agentResponse = result?.Message
             };
 
             var json = JsonSerializer.Serialize(doc, new JsonSerializerOptions
@@ -258,7 +269,7 @@ public sealed class SharpCoderRunner : IAgentRunner
                 DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
             });
             File.WriteAllText(filePath, json);
-            _log.Info($"Diagnostics written to {filePath} ({json.Length} bytes)");
+            _log.Info($"Diagnostics ({phase}) written to {filePath} ({json.Length} bytes)");
         }
         catch (Exception ex)
         {
