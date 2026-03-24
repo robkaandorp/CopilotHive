@@ -107,6 +107,30 @@ static async Task<int> RunServerAsync(string[] args)
     builder.Services.AddSingleton<WorkerUtilizationService>();
     builder.Services.AddSingleton<GoalDispatcher>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<GoalDispatcher>());
+
+    // Composer agent (optional — enabled when config has a composer section or BRAIN_MODEL is set)
+    builder.Services.AddSingleton<Composer>(sp =>
+    {
+        var config = sp.GetService<HiveConfigFile>();
+        var composerConfig = config?.Orchestrator.Composer;
+
+        // Model: composer-specific override → orchestrator model → env var
+        var model = composerConfig?.Model;
+        if (string.IsNullOrEmpty(model))
+            model = config?.Orchestrator.Model;
+        if (string.IsNullOrEmpty(model))
+            model = brainModel ?? Constants.DefaultWorkerModel;
+
+        var maxCtx = composerConfig?.ContextWindow ?? config?.Orchestrator.BrainContextWindow ?? Constants.DefaultBrainContextWindow;
+        var maxSteps = composerConfig?.MaxSteps ?? config?.Orchestrator.BrainMaxSteps ?? Constants.DefaultBrainMaxSteps;
+
+        return new Composer(model, sp.GetRequiredService<ILogger<Composer>>(),
+            sp.GetRequiredService<IGoalStore>(),
+            maxCtx, maxSteps,
+            sp.GetService<BrainRepoManager>(),
+            stateDir);
+    });
+
     // Dashboard: log capture (registered early so logger provider can reference it)
     var dashboardLogSink = new DashboardLogSink();
     builder.Services.AddSingleton(dashboardLogSink);
@@ -206,6 +230,22 @@ static async Task<int> RunServerAsync(string[] args)
         logger.LogInformation("Connecting Brain…");
         await brain.ConnectAsync();
         logger.LogInformation("Brain connected.");
+    }
+
+    // Wire up Composer
+    var composer = app.Services.GetService<Composer>();
+    if (composer is not null)
+    {
+        try
+        {
+            logger.LogInformation("Connecting Composer…");
+            await composer.ConnectAsync();
+            logger.LogInformation("Composer connected.");
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Composer failed to connect — chat will be unavailable");
+        }
     }
 
     // Bootstrap: import goals from YAML file into SQLite (one-time migration)

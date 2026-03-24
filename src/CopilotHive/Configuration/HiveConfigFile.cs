@@ -78,4 +78,19 @@ public sealed class OrchestratorConfig
     public int BrainContextWindow { get; set; } = Constants.DefaultBrainContextWindow;
     /// <summary>Maximum tool-call steps the Brain agent may take per request.</summary>
     public int BrainMaxSteps { get; set; } = Constants.DefaultBrainMaxSteps;
+    /// <summary>Composer agent configuration. When set, the Composer is enabled.</summary>
+    public ComposerConfig? Composer { get; set; }
+}
+
+/// <summary>
+/// Configuration for the Composer conversational agent.
+/// </summary>
+public sealed class ComposerConfig
+{
+    /// <summary>Model used by the Composer (e.g. "copilot/claude-sonnet-4.6"). Falls back to orchestrator model if empty.</summary>
+    public string? Model { get; set; }
+    /// <summary>Maximum context window size in tokens.</summary>
+    public int ContextWindow { get; set; } = Constants.DefaultBrainContextWindow;
+    /// <summary>Maximum tool-call steps per Composer request.</summary>
+    public int MaxSteps { get; set; } = Constants.DefaultBrainMaxSteps;
 }
