@@ -2,13 +2,18 @@
 #pragma warning disable OPENAI001 // ResponsesClient.AsIChatClient is experimental
 using System;
 using System.Collections.Generic;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Http.Resilience;
 using OpenAI;
+using Polly;
+using Polly.Retry;
+using Polly.Timeout;
 using System.ClientModel;
 using OllamaSharp;
 
@@ -37,7 +42,11 @@ public static class ChatClientFactory
                 var apiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
                 if (string.IsNullOrEmpty(apiKey)) throw new InvalidOperationException("OLLAMA_API_KEY is required for ollama-cloud provider");
 
-                var httpClient = new HttpClient { BaseAddress = new Uri("https://ollama.com"), Timeout = TimeSpan.FromMinutes(10) };
+                var httpClient = new HttpClient(CreateResilientHandler())
+                {
+                    BaseAddress = new Uri("https://ollama.com"),
+                    Timeout = Timeout.InfiniteTimeSpan,
+                };
                 httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
 
                 model ??= Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "gpt-oss:120b";
@@ -159,6 +168,45 @@ public static class ChatClientFactory
             || model.StartsWith("o4", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// Creates a resilient <see cref="HttpMessageHandler"/> chain with per-attempt timeout
+    /// and retry policy. Wraps the given outer handler (if any) around the resilience handler.
+    /// </summary>
+    /// <param name="outerHandler">Optional handler (e.g. CopilotChoiceMergingHandler) that wraps
+    /// the resilience handler. Its <c>InnerHandler</c> will be set to the resilience handler.</param>
+    internal static HttpMessageHandler CreateResilientHandler(DelegatingHandler? outerHandler = null)
+    {
+        var retryPipeline = new ResiliencePipelineBuilder<HttpResponseMessage>()
+            .AddRetry(new HttpRetryStrategyOptions
+            {
+                MaxRetryAttempts = 3,
+                Delay = TimeSpan.FromSeconds(5),
+                BackoffType = DelayBackoffType.Exponential,
+                OnRetry = static args =>
+                {
+                    Console.Error.WriteLine(
+                        $"[Resilience] HTTP retry #{args.AttemptNumber} after {args.RetryDelay.TotalSeconds:F0}s — " +
+                        (args.Outcome.Exception?.Message ?? $"HTTP {(int?)args.Outcome.Result?.StatusCode}"));
+                    return default;
+                },
+            })
+            .AddTimeout(TimeSpan.FromMinutes(2))
+            .Build();
+
+        var resilienceHandler = new ResilienceHandler(retryPipeline)
+        {
+            InnerHandler = new HttpClientHandler()
+        };
+
+        if (outerHandler is not null)
+        {
+            outerHandler.InnerHandler = resilienceHandler;
+            return outerHandler;
+        }
+
+        return resilienceHandler;
+    }
+
     private static IChatClient CreateCopilotClient(string model)
     {
         var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
@@ -166,8 +214,8 @@ public static class ChatClientFactory
 
         if (RequiresResponsesEndpoint(model))
         {
-            var handler = new CopilotResponsesHandler(new HttpClientHandler());
-            var httpClient = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(10) };
+            var handler = CreateResilientHandler(new CopilotResponsesHandler());
+            var httpClient = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
 
             var openAiClient = new OpenAIClient(
                 new ApiKeyCredential(ghToken),
@@ -181,8 +229,8 @@ public static class ChatClientFactory
         }
         else
         {
-            var handler = new CopilotChoiceMergingHandler(new HttpClientHandler());
-            var httpClient = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(10) };
+            var handler = CreateResilientHandler(new CopilotChoiceMergingHandler());
+            var httpClient = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
 
             var openAiClient = new OpenAIClient(
                 new ApiKeyCredential(ghToken),
@@ -207,6 +255,7 @@ public static class ChatClientFactory
         private static readonly string CompletionsLogDir =
             Environment.GetEnvironmentVariable("DIAGNOSTICS_DIR") ?? "/app/diagnostics";
 
+        public CopilotChoiceMergingHandler() { }
         public CopilotChoiceMergingHandler(HttpMessageHandler inner) : base(inner) { }
 
         protected override async Task<HttpResponseMessage> SendAsync(
@@ -323,6 +372,7 @@ public static class ChatClientFactory
         private static readonly string ResponsesLogDir =
             Environment.GetEnvironmentVariable("DIAGNOSTICS_DIR") ?? "/app/diagnostics";
 
+        public CopilotResponsesHandler() { }
         public CopilotResponsesHandler(HttpMessageHandler inner) : base(inner) { }
 
         protected override async Task<HttpResponseMessage> SendAsync(
