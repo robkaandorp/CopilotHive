@@ -117,7 +117,6 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
             {
                 var (primaryRepo, _) = repoDirectories[0];
                 contextLines.Add($"Repository: {primaryRepo.Name}");
-                contextLines.Add($"Default branch: {primaryRepo.DefaultBranch}");
             }
 
             if (isImprover)
@@ -126,16 +125,16 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
                 contextLines.Add("Files: *.agents.md (edit these directly)");
             }
 
-            if (task.BranchInfo is { } bi2)
-            {
-                if (!string.IsNullOrEmpty(bi2.BaseBranch))
-                    contextLines.Add($"Base branch: {bi2.BaseBranch}");
-                if (!string.IsNullOrEmpty(bi2.FeatureBranch))
-                    contextLines.Add($"Feature branch: {bi2.FeatureBranch}");
-            }
-
             if (mergeBase != null)
-                contextLines.Add($"Merge base: {mergeBase}");
+            {
+                contextLines.Add($"Merge base commit: {mergeBase}");
+                contextLines.Add($"Diff command: git diff {mergeBase}..HEAD");
+                contextLines.Add("IMPORTANT: Use the diff command above to see changes. Do NOT diff against branch names.");
+            }
+            else if (task.BranchInfo is { } bi2 && !string.IsNullOrEmpty(bi2.BaseBranch))
+            {
+                contextLines.Add($"Base branch: {bi2.BaseBranch}");
+            }
 
             contextLines.Add($"Working directory: {primaryWorkDir}");
             contextLines.Add("=========================");
