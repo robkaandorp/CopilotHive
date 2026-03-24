@@ -10,6 +10,8 @@ services:
       - GH_TOKEN
       - BRAIN_MODEL=${BRAIN_MODEL:-copilot/claude-sonnet-4.6}
       - GRPC_PORT=5000
+      - OLLAMA_API_KEY
+      - OLLAMA_URL
     command: ["--config-repo=https://github.com/robkaandorp/CopilotHive-Config.git"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
