@@ -117,6 +117,7 @@ public sealed class PipelineStore : IAsyncDisposable
         ("pipelines", "active_task_id",   "TEXT"),
         ("pipelines", "coder_branch",     "TEXT"),
         ("pipelines", "completed_at",     "TEXT"),
+        ("pipelines", "goal_started_at",  "TEXT"),
     ];
 
     /// <summary>
@@ -245,7 +246,7 @@ public sealed class PipelineStore : IAsyncDisposable
                 SELECT goal_id, description, goal_json, phase, iteration,
                        review_retries, test_retries, max_retries, max_iterations,
                        active_task_id, coder_branch, phase_outputs, metrics_json,
-                       created_at, completed_at
+                       created_at, completed_at, goal_started_at
                 FROM pipelines
                 WHERE phase NOT IN ('Done', 'Failed')
                 """;
@@ -271,6 +272,7 @@ public sealed class PipelineStore : IAsyncDisposable
                     Metrics = JsonSerializer.Deserialize<IterationMetrics>(reader.GetString(12), JsonOptions) ?? new() { Iteration = 1 },
                     CreatedAt = DateTime.Parse(reader.GetString(13), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
                     CompletedAt = reader.IsDBNull(14) ? null : DateTime.Parse(reader.GetString(14), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+                    GoalStartedAt = reader.IsDBNull(15) ? null : DateTime.Parse(reader.GetString(15), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
                     Conversation = LoadConversationCore(goalId),
                 });
             }
@@ -292,12 +294,12 @@ public sealed class PipelineStore : IAsyncDisposable
                 (goal_id, description, goal_json, phase, iteration,
                  review_retries, test_retries, max_retries, max_iterations,
                  active_task_id, coder_branch, phase_outputs, metrics_json,
-                 created_at, completed_at)
+                 created_at, completed_at, goal_started_at)
             VALUES
                 (@goalId, @desc, @goalJson, @phase, @iteration,
                  @reviewRetries, @testRetries, @maxRetries, @maxIterations,
                  @activeTaskId, @coderBranch, @phaseOutputs, @metricsJson,
-                 @createdAt, @completedAt)
+                 @createdAt, @completedAt, @goalStartedAt)
             """;
         cmd.Parameters.AddWithValue("@goalId", pipeline.GoalId);
         cmd.Parameters.AddWithValue("@desc", pipeline.Description);
@@ -315,6 +317,8 @@ public sealed class PipelineStore : IAsyncDisposable
         cmd.Parameters.AddWithValue("@createdAt", pipeline.CreatedAt.ToString("O"));
         cmd.Parameters.AddWithValue("@completedAt",
             pipeline.CompletedAt.HasValue ? pipeline.CompletedAt.Value.ToString("O") : DBNull.Value);
+        cmd.Parameters.AddWithValue("@goalStartedAt",
+            pipeline.GoalStartedAt.HasValue ? pipeline.GoalStartedAt.Value.ToString("O") : DBNull.Value);
         cmd.ExecuteNonQuery();
     }
 
@@ -416,6 +420,8 @@ public sealed class PipelineSnapshot
     public DateTime CreatedAt { get; init; }
     /// <summary>UTC timestamp when the pipeline completed, or <c>null</c> if still active.</summary>
     public DateTime? CompletedAt { get; init; }
+    /// <summary>UTC timestamp when the goal was started (captured at dispatch time).</summary>
+    public DateTime? GoalStartedAt { get; init; }
     /// <summary>Conversation history for the Brain session associated with this pipeline.</summary>
     public List<ConversationEntry> Conversation { get; init; } = [];
     /// <summary>List of (TaskId, GoalId) pairs for task-to-goal resolution.</summary>

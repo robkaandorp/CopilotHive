@@ -499,4 +499,64 @@ public sealed class GoalPipelineManagerTests
     }
 
     #endregion
+
+    #region GoalPipeline — GoalStartedAt
+
+    [Fact]
+    public void GoalStartedAt_DefaultsToNull()
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+
+        Assert.Null(pipeline.GoalStartedAt);
+    }
+
+    [Fact]
+    public void GoalStartedAt_CanBeSetAndRetrieved()
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+        var startedAt = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
+
+        pipeline.GoalStartedAt = startedAt;
+
+        Assert.Equal(startedAt, pipeline.GoalStartedAt);
+    }
+
+    [Fact]
+    public void GoalStartedAt_RestoredFromSnapshot()
+    {
+        var goal = CreateGoal();
+        var startedAt = new DateTime(2025, 3, 15, 8, 30, 0, DateTimeKind.Utc);
+        var snapshot = new CopilotHive.Persistence.PipelineSnapshot
+        {
+            GoalId = goal.Id,
+            Description = goal.Description,
+            Goal = goal,
+            GoalStartedAt = startedAt,
+            CreatedAt = DateTime.UtcNow,
+        };
+
+        var pipeline = new GoalPipeline(snapshot);
+
+        Assert.Equal(startedAt, pipeline.GoalStartedAt);
+    }
+
+    [Fact]
+    public void GoalStartedAt_NullInSnapshot_RemainsNull()
+    {
+        var goal = CreateGoal();
+        var snapshot = new CopilotHive.Persistence.PipelineSnapshot
+        {
+            GoalId = goal.Id,
+            Description = goal.Description,
+            Goal = goal,
+            GoalStartedAt = null,
+            CreatedAt = DateTime.UtcNow,
+        };
+
+        var pipeline = new GoalPipeline(snapshot);
+
+        Assert.Null(pipeline.GoalStartedAt);
+    }
+
+    #endregion
 }

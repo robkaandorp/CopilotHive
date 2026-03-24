@@ -880,6 +880,11 @@ public sealed class GoalDispatcher : BackgroundService
 
         pipeline.AdvanceTo(GoalPhase.Done);
 
+        var goalStartedAt = pipeline.GoalStartedAt ?? pipeline.Goal.StartedAt ?? pipeline.CreatedAt;
+        var duration = pipeline.CompletedAt.HasValue
+            ? pipeline.CompletedAt.Value - goalStartedAt
+            : TimeSpan.Zero;
+
         var completedMeta = new GoalUpdateMetadata
         {
             CompletedAt = pipeline.CompletedAt ?? DateTime.UtcNow,
@@ -888,13 +893,10 @@ public sealed class GoalDispatcher : BackgroundService
                 ? pipeline.Metrics.PhaseDurations.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.TotalSeconds)
                 : null,
             IterationSummary = BuildIterationSummary(pipeline, failedPhase: null),
+            TotalDurationSeconds = duration.TotalSeconds,
         };
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Completed, completedMeta, ct);
         await CommitGoalsToConfigRepoAsync($"Goal '{pipeline.GoalId}' completed", ct);
-
-        var duration = pipeline.CompletedAt.HasValue
-            ? pipeline.CompletedAt.Value - pipeline.CreatedAt
-            : TimeSpan.Zero;
 
         pipeline.Metrics.Iteration = pipeline.Iteration;
         pipeline.Metrics.Duration = duration;
@@ -948,6 +950,7 @@ public sealed class GoalDispatcher : BackgroundService
             }
         }
 
+        _logger.LogInformation("Goal {GoalId} completed in {Elapsed}", pipeline.GoalId, DurationFormatter.FormatDuration(duration));
         _logger.LogInformation(
             "🎉 Goal {GoalId} completed! Iterations={Iterations}, Duration={Duration:F1}min, " +
             "Tests={Passed}/{Total}, Coverage={Coverage:F1}%",
@@ -1221,6 +1224,7 @@ public sealed class GoalDispatcher : BackgroundService
         var maxRetries = _config?.Orchestrator?.MaxRetriesPerTask ?? Constants.DefaultMaxRetriesPerTask;
         var maxIterations = _config?.Orchestrator?.MaxIterations ?? Constants.DefaultMaxIterations;
         var pipeline = _pipelineManager.CreatePipeline(goal, maxRetries, maxIterations);
+        pipeline.GoalStartedAt = startedMeta.StartedAt;
 
         // Plan iteration phases
         IterationPlan iterationPlan;

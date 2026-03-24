@@ -33,6 +33,8 @@ public sealed class Goal
     public Dictionary<string, double>? PhaseDurations { get; set; }
     /// <summary>Structured summaries written after each iteration completes.</summary>
     public List<IterationSummary> IterationSummaries { get; set; } = [];
+    /// <summary>Total wall-clock duration of the goal from start to completion, in seconds.</summary>
+    public double? TotalDurationSeconds { get; set; }
 }
 
 /// <summary>Structured summary of a single completed (or failed) pipeline iteration.</summary>
