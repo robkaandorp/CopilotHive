@@ -510,10 +510,21 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         if (pipeline.Plan?.PhaseInstructions.TryGetValue(phase, out var instructions) == true)
             phaseInstructions = $"\nPhase instructions from the plan:\n{instructions}";
 
+        // Check if docwriting preceded review in this iteration's plan, so the
+        // reviewer knows that CHANGELOG/README changes are expected and in-scope.
+        var docWritingPrecededReview = pipeline.Plan?.Phases is { } phases
+            && phases.IndexOf(GoalPhase.DocWriting) is >= 0 and var dwIdx
+            && phases.IndexOf(GoalPhase.Review) is >= 0 and var rvIdx
+            && dwIdx < rvIdx;
+
         var roleInstruction = phase switch
         {
             GoalPhase.Coding => """
                 - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, use build skill, use test skill, and commit with `git add -A && git commit`. NEVER include git checkout, git branch, or git push commands. NEVER include dotnet/npm/cargo commands — only reference build and test skills.
+                """,
+            GoalPhase.Review when docWritingPrecededReview => """
+                - For reviewers: Do NOT include any git diff commands in your prompt — the worker's WORKSPACE CONTEXT already provides the correct diff command with the exact merge-base hash. Just tell them to review the branch changes using the diff command from their workspace context, focus only on the diff lines (+ and -), and call the report_review_verdict tool when done.
+                - IMPORTANT: The docwriting phase already ran before this review. Changes to CHANGELOG.md, README.md, and XML doc comments are EXPECTED and should NOT be flagged as scope violations.
                 """,
             GoalPhase.Review => """
                 - For reviewers: Do NOT include any git diff commands in your prompt — the worker's WORKSPACE CONTEXT already provides the correct diff command with the exact merge-base hash. Just tell them to review the branch changes using the diff command from their workspace context, focus only on the diff lines (+ and -), and call the report_review_verdict tool when done.
