@@ -1,0 +1,205 @@
+@page "/composer"
+@using CopilotHive.Orchestration
+@using SharpCoder
+@implements IDisposable
+@inject Composer Composer
+
+<h1>💬 Composer</h1>
+
+@if (!Composer.IsConnected)
+{
+    <div class="chat-status chat-status-error">
+        Composer is not connected. Check orchestrator logs.
+    </div>
+}
+else
+{
+    <div class="chat-container">
+        <div class="chat-messages" id="chat-messages">
+            @if (_messages.Count == 0)
+            {
+                <div class="chat-empty">
+                    <p><strong>Welcome to the Composer.</strong></p>
+                    <p>Describe what you'd like to build or improve, and I'll help break it into goals.</p>
+                    <p class="text-muted">Try: <em>"I want to add user authentication to the API"</em></p>
+                </div>
+            }
+
+            @foreach (var msg in _messages)
+            {
+                <div class="chat-msg chat-msg-@msg.Role">
+                    <div class="chat-msg-role">@(msg.Role == "user" ? "You" : "Composer")</div>
+                    <div class="chat-msg-content">@((MarkupString)FormatContent(msg.Content))</div>
+                </div>
+            }
+
+            @if (_isStreaming)
+            {
+                <div class="chat-msg chat-msg-assistant">
+                    <div class="chat-msg-role">Composer</div>
+                    <div class="chat-msg-content">
+                        @((MarkupString)FormatContent(_streamingContent))
+                        <span class="chat-cursor">▊</span>
+                    </div>
+                </div>
+            }
+        </div>
+
+        <div class="chat-input-area">
+            <textarea @bind="_inputText" @bind:event="oninput"
+                      @onkeydown="HandleKeyDown"
+                      placeholder="Describe what you want to build…"
+                      disabled="@_isStreaming"
+                      rows="2"
+                      class="chat-input"></textarea>
+            <button @onclick="SendMessage" disabled="@(_isStreaming || string.IsNullOrWhiteSpace(_inputText))"
+                    class="chat-send">
+                @if (_isStreaming)
+                {
+                    <span>Thinking…</span>
+                }
+                else
+                {
+                    <span>Send</span>
+                }
+            </button>
+        </div>
+
+        <div class="chat-actions">
+            <button @onclick="ResetSession" disabled="@_isStreaming" class="chat-action-btn">
+                🔄 New Session
+            </button>
+            <span class="text-muted chat-hint">
+                @(_messages.Count) messages
+                @if (_lastToolCalls > 0)
+                {
+                    <text> · @_lastToolCalls tool calls</text>
+                }
+            </span>
+        </div>
+    </div>
+}
+
+@code {
+    private sealed class ChatMessage
+    {
+        public required string Role { get; init; }
+        public string Content { get; set; } = "";
+    }
+
+    private readonly List<ChatMessage> _messages = [];
+    private string _inputText = "";
+    private string _streamingContent = "";
+    private bool _isStreaming;
+    private int _lastToolCalls;
+    private CancellationTokenSource? _streamCts;
+
+    private async Task SendMessage()
+    {
+        var text = _inputText.Trim();
+        if (string.IsNullOrEmpty(text) || _isStreaming) return;
+
+        _messages.Add(new ChatMessage { Role = "user", Content = text });
+        _inputText = "";
+        _streamingContent = "";
+        _isStreaming = true;
+        _lastToolCalls = 0;
+        StateHasChanged();
+
+        _streamCts = new CancellationTokenSource();
+
+        try
+        {
+            await foreach (var update in Composer.StreamAsync(text, _streamCts.Token))
+            {
+                switch (update.Kind)
+                {
+                    case StreamingUpdateKind.TextDelta:
+                        _streamingContent += update.Text;
+                        await InvokeAsync(StateHasChanged);
+                        break;
+
+                    case StreamingUpdateKind.Completed:
+                        _lastToolCalls = update.Result?.ToolCallCount ?? 0;
+                        _messages.Add(new ChatMessage
+                        {
+                            Role = "assistant",
+                            Content = update.Result?.Message ?? _streamingContent,
+                        });
+                        break;
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            if (!string.IsNullOrEmpty(_streamingContent))
+            {
+                _messages.Add(new ChatMessage { Role = "assistant", Content = _streamingContent + "\n\n_(cancelled)_" });
+            }
+        }
+        catch (Exception ex)
+        {
+            _messages.Add(new ChatMessage { Role = "assistant", Content = $"❌ Error: {ex.Message}" });
+        }
+        finally
+        {
+            _streamingContent = "";
+            _isStreaming = false;
+            _streamCts?.Dispose();
+            _streamCts = null;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async Task ResetSession()
+    {
+        if (_isStreaming) return;
+        await Composer.ResetSessionAsync();
+        _messages.Clear();
+        _lastToolCalls = 0;
+        StateHasChanged();
+    }
+
+    private void HandleKeyDown(KeyboardEventArgs e)
+    {
+        // Enter without Shift sends the message
+        if (e.Key == "Enter" && !e.ShiftKey)
+        {
+            _ = SendMessage();
+        }
+    }
+
+    private static string FormatContent(string content)
+    {
+        if (string.IsNullOrEmpty(content)) return "";
+
+        // Escape HTML
+        content = content
+            .Replace("&", "&amp;")
+            .Replace("<", "&lt;")
+            .Replace(">", "&gt;");
+
+        // Inline code: `code`
+        content = System.Text.RegularExpressions.Regex.Replace(
+            content, @"`([^`]+)`", "<code>$1</code>");
+
+        // Bold: **text**
+        content = System.Text.RegularExpressions.Regex.Replace(
+            content, @"\*\*(.+?)\*\*", "<strong>$1</strong>");
+
+        // Italic: _text_
+        content = System.Text.RegularExpressions.Regex.Replace(
+            content, @"(?<!\w)_(.+?)_(?!\w)", "<em>$1</em>");
+
+        // Line breaks
+        content = content.Replace("\n", "<br />");
+
+        return content;
+    }
+
+    public void Dispose()
+    {
+        _streamCts?.Cancel();
+        _streamCts?.Dispose();
+    }
+}
