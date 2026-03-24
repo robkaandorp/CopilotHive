@@ -269,12 +269,17 @@ public static class ChatClientFactory
     internal sealed class CopilotResponsesHandler : DelegatingHandler
     {
         private JsonNode? _lastResponseOutput;
+        private int _requestCount;
+        private static readonly string ResponsesLogDir =
+            Environment.GetEnvironmentVariable("DIAGNOSTICS_DIR") ?? "/app/diagnostics";
 
         public CopilotResponsesHandler(HttpMessageHandler inner) : base(inner) { }
 
         protected override async Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request, CancellationToken ct)
         {
+            var seq = Interlocked.Increment(ref _requestCount);
+
             if (request.Content != null && request.RequestUri?.AbsolutePath?.Contains("responses") == true)
             {
                 var body = await request.Content.ReadAsStringAsync();
@@ -297,6 +302,8 @@ public static class ChatClientFactory
                     body = obj.ToJsonString();
                     request.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
                 }
+
+                LogResponsesExchange(seq, "request", body);
             }
 
             var response = await base.SendAsync(request, ct);
@@ -307,9 +314,28 @@ public static class ChatClientFactory
                 var respJson = JsonNode.Parse(respBody);
                 _lastResponseOutput = respJson?["output"]?.DeepClone();
                 response.Content = new StringContent(respBody, System.Text.Encoding.UTF8, "application/json");
+
+                LogResponsesExchange(seq, "response", respBody);
+            }
+            else
+            {
+                var errBody = await response.Content.ReadAsStringAsync();
+                LogResponsesExchange(seq, "error", $"HTTP {(int)response.StatusCode}: {errBody}");
             }
 
             return response;
+        }
+
+        private static void LogResponsesExchange(int seq, string phase, string content)
+        {
+            try
+            {
+                var dir = Path.Combine(ResponsesLogDir, "responses-api");
+                Directory.CreateDirectory(dir);
+                var fileName = $"{seq:D4}_{phase}.json";
+                File.WriteAllText(Path.Combine(dir, fileName), content);
+            }
+            catch { /* best-effort logging */ }
         }
     }
 }
