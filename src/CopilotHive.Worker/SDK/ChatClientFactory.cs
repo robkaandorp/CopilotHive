@@ -266,9 +266,15 @@ public static class ChatClientFactory
     /// The Copilot API doesn't support previous_response_id on the /responses endpoint.
     /// This handler inlines the previous response's output into follow-up requests.
     /// </summary>
+    /// <summary>
+    /// Handles Responses API requests for Copilot, which doesn't support previous_response_id.
+    /// Strips previous_response_id and reconstructs the full conversation by carrying forward
+    /// the original input messages (system + user) and all turn history (outputs + tool results).
+    /// </summary>
     internal sealed class CopilotResponsesHandler : DelegatingHandler
     {
-        private JsonNode? _lastResponseOutput;
+        private JsonArray? _baseInput;
+        private readonly List<JsonNode> _turnHistory = new();
         private int _requestCount;
         private static readonly string ResponsesLogDir =
             Environment.GetEnvironmentVariable("DIAGNOSTICS_DIR") ?? "/app/diagnostics";
@@ -289,18 +295,36 @@ public static class ChatClientFactory
                 {
                     obj.Remove("previous_response_id");
 
-                    if (_lastResponseOutput is JsonArray prevOutput && obj["input"] is JsonArray input)
+                    var combined = new JsonArray();
+
+                    // 1. Original system + user messages from the first request
+                    if (_baseInput is not null)
+                        foreach (var item in _baseInput)
+                            combined.Add(item!.DeepClone());
+
+                    // 2. All accumulated turn history (previous outputs + tool results)
+                    foreach (var item in _turnHistory)
+                        combined.Add(item.DeepClone());
+
+                    // 3. Current input (new tool results from FunctionInvokingChatClient)
+                    if (obj["input"] is JsonArray currentInput)
                     {
-                        var combined = new JsonArray();
-                        foreach (var item in prevOutput)
-                            combined.Add(item!.DeepClone());
-                        foreach (var item in input)
-                            combined.Add(item!.DeepClone());
-                        obj["input"] = combined;
+                        foreach (var item in currentInput)
+                        {
+                            var clone = item!.DeepClone();
+                            combined.Add(clone);
+                            _turnHistory.Add(item.DeepClone());
+                        }
                     }
 
+                    obj["input"] = combined;
                     body = obj.ToJsonString();
                     request.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+                }
+                else if (json is JsonObject firstObj)
+                {
+                    // First request — save the original input as the base context
+                    _baseInput = firstObj["input"]?.DeepClone() as JsonArray;
                 }
 
                 LogResponsesExchange(seq, "request", body);
@@ -312,7 +336,12 @@ public static class ChatClientFactory
             {
                 var respBody = await response.Content.ReadAsStringAsync();
                 var respJson = JsonNode.Parse(respBody);
-                _lastResponseOutput = respJson?["output"]?.DeepClone();
+
+                // Accumulate response output into turn history
+                if (respJson?["output"] is JsonArray outputArray)
+                    foreach (var item in outputArray)
+                        _turnHistory.Add(item!.DeepClone());
+
                 response.Content = new StringContent(respBody, System.Text.Encoding.UTF8, "application/json");
 
                 LogResponsesExchange(seq, "response", respBody);
