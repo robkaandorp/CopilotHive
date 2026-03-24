@@ -203,15 +203,36 @@ public static class ChatClientFactory
     /// </summary>
     internal sealed class CopilotChoiceMergingHandler : DelegatingHandler
     {
+        private int _requestCount;
+        private static readonly string CompletionsLogDir =
+            Environment.GetEnvironmentVariable("DIAGNOSTICS_DIR") ?? "/app/diagnostics";
+
         public CopilotChoiceMergingHandler(HttpMessageHandler inner) : base(inner) { }
 
         protected override async Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request, CancellationToken ct)
         {
+            var seq = Interlocked.Increment(ref _requestCount);
+
+            if (request.Content != null)
+            {
+                var reqBody = await request.Content.ReadAsStringAsync();
+                LogCompletionsExchange(seq, "request", reqBody);
+                // Restore consumed content
+                request.Content = new StringContent(reqBody, System.Text.Encoding.UTF8, "application/json");
+            }
+
             var response = await base.SendAsync(request, ct);
-            if (!response.IsSuccessStatusCode) return response;
+            if (!response.IsSuccessStatusCode)
+            {
+                var errBody = await response.Content.ReadAsStringAsync();
+                LogCompletionsExchange(seq, "error", $"HTTP {(int)response.StatusCode}: {errBody}");
+                response.Content = new StringContent(errBody, System.Text.Encoding.UTF8, "application/json");
+                return response;
+            }
 
             var body = await response.Content.ReadAsStringAsync();
+            LogCompletionsExchange(seq, "response", body);
 
             try
             {
@@ -259,6 +280,18 @@ public static class ChatClientFactory
         {
             response.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
             return response;
+        }
+
+        private static void LogCompletionsExchange(int seq, string phase, string content)
+        {
+            try
+            {
+                var dir = Path.Combine(CompletionsLogDir, "chat-completions");
+                Directory.CreateDirectory(dir);
+                var fileName = $"{seq:D4}_{phase}.json";
+                File.WriteAllText(Path.Combine(dir, fileName), content);
+            }
+            catch { /* best-effort logging */ }
         }
     }
 
