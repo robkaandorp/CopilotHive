@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **SQLite goal store** — `SqliteGoalStore` as the primary source of truth for goals, replacing `FileGoalSource` and `ApiGoalSource` in the orchestrator pipeline; full CRUD, text search, status filtering, iteration tracking, and import from goals.yaml (one-time bootstrap migration on startup)
+- `IGoalStore` interface — extends `IGoalSource` with `GetAllGoalsAsync`, `GetGoalAsync`, `CreateGoalAsync`, `UpdateGoalAsync`, `DeleteGoalAsync`, `SearchGoalsAsync`, `GetGoalsByStatusAsync`, `AddIterationAsync`, `GetIterationsAsync`, `ImportGoalsAsync`
+- **Goals REST API** — expanded endpoints: `GET /api/goals/{id}`, `DELETE /api/goals/{id}`, `GET /api/goals/search?q=…&status=…`; existing `GET/POST/PATCH` endpoints now backed by SQLite
+- **Goals Browser dashboard** — new `/goals` page with search bar, status/priority filter dropdowns, and sortable table linking to goal detail
+- **GoalDetail SQLite fallback** — goal detail page now shows full iteration history, phase results, test counts, failure reasons, and phase durations for completed/failed goals (loaded from SQLite when no active pipeline exists)
+- **Worker output in Brain conversation** — `GoalDispatcher.BuildWorkerOutputSummary` creates structured summaries (verdict, git stats, test metrics, issues, truncated raw output) injected into the Brain conversation after each worker completion, enabling informed replanning after failures
+- **Docwriting-aware reviewer prompts** — `DistributedBrain.CraftPromptAsync` detects when docwriting preceded review in the iteration plan and instructs the reviewer that doc changes are expected
+- **Empty choices array handling** — `CopilotChoiceMergingHandler` synthesizes a minimal stop choice when Copilot API returns `"choices": []` (end-of-conversation signal), preventing SDK crash
+- **HTTP resilience** — `Microsoft.Extensions.Http.Resilience` added to both Worker and Orchestrator; all LLM API calls use 3 retries with exponential backoff (5s base) and 2-minute per-attempt timeout
+- 21 new `SqliteGoalStoreTests` covering CRUD, search, status queries, iteration tracking, import, and metadata roundtrip
+- 3 new `CopilotChoiceMergingHandlerTests` for empty choices, passthrough, and merging
+- 6 new `GoalDispatcherBuildWorkerOutputSummaryTests`
+
+### Changed
+- `GoalManager` now uses `SqliteGoalStore` as its sole goal source (was `ApiGoalSource` + `FileGoalSource`)
+- `DashboardStateService` uses `IGoalStore` for goal enumeration (was `ApiGoalSource`)
+- Health endpoint (`GET /health`) backed by `SqliteGoalStore` (was `ApiGoalSource`)
+- Smoke test skill preserves persistent volumes (`docker compose down` without `-v`)
+
+### Added
 - **Model name in completion logs** — task and phase completion logs now include the model name that was used by the worker; `HiveOrchestratorService.HandleTaskComplete` logs "Task {TaskId} completed by {WorkerId}: {Status} (model={Model})"; `GoalDispatcher` logs "Pipeline {GoalId} task completed (phase={Phase}, status={Status}, model={Model})" and "Phase {Phase} for goal {GoalId} completed in {DurationSeconds:F1}s (model={Model})"; includes 3 xUnit tests verifying model name appears in both task completed and phase completed log messages, and "unknown" is logged when model is empty
 - **Goal elapsed time logging** — when a goal completes, `GoalDispatcher` logs the total elapsed time as "Goal {goalId} completed in {elapsed}" (e.g., "Goal abc-123 completed in 4m 32s"); elapsed time is formatted with the new `DurationFormatter` utility which outputs human-readable durations like "45s", "4m 32s", or "1h 12m 5s"; `total_duration_seconds` field is now written to goals.yaml on goal completion alongside `completed_at`
 - `DurationFormatter` — new utility class with 9 xUnit tests for human-readable duration formatting; formats `TimeSpan` or seconds values into concise strings (e.g., "32s", "4m 32s", "1h 12m 5s")

@@ -74,7 +74,9 @@ The **Brain** (`DistributedBrain`) plans iteration phases and crafts worker prom
 
 ### Configuring Goals
 
-Goals are defined in `goals.yaml` (typically stored in the config repo). Each goal specifies what to build and optionally which model to use per role:
+Goals are stored in **SQLite** (`goals.db`) as the primary source of truth. On first startup, goals are automatically imported from `goals.yaml` (if present in the config repo). Goals can also be created via the REST API (`POST /api/goals`) or the dashboard.
+
+The `goals.yaml` format (used for initial bootstrap):
 
 ```yaml
 goals:
@@ -154,7 +156,7 @@ goals:
 | `src/CopilotHive/` | Main orchestrator — Brain, GoalDispatcher, persistence, metrics |
 | `src/CopilotHive.Shared/` | Shared protobuf definitions and DTOs |
 | `src/CopilotHive.Worker/` | Worker process (runs inside Docker containers) |
-| `tests/` | 630+ xUnit tests |
+| `tests/` | 680+ xUnit tests |
 | `agents/` | Default agent templates (overridden by config repo at runtime) |
 | `docker/` | Dockerfiles and container configuration |
 
@@ -165,7 +167,9 @@ goals:
 - **Sequential goal processing** — goals process one at a time so the Brain accumulates context across goals
 - **Worker utilization metrics** — `GET /health/utilization` endpoint provides per-role worker utilization and bottleneck detection
 - **Self-improvement loop** — the improver modifies `agents.md` based on accumulated metrics
-- **SQLite persistence** — `PipelineStore` with auto-migration for pipeline state
+- **SQLite persistence** — `PipelineStore` with auto-migration for pipeline state; `SqliteGoalStore` as the primary source of truth for goals with full CRUD, search, and iteration history
+- **Goals REST API** — `GET/POST/PATCH/DELETE /api/goals`, `GET /api/goals/{id}`, `GET /api/goals/search?q=…&status=…`
+- **Dashboard** — Blazor Server UI with goals browser (filterable/searchable), goal detail with iteration timeline, worker status, orchestrator view, live logs, and configuration
 - **Config repo** — externalized agent instructions and goals (`CopilotHive-Config`)
 - **Multi-repo goal support** — goals can target any accessible Git repository
 - **Per-role model selection** — assign different LLM models to each worker type
@@ -179,6 +183,8 @@ goals:
 - **Brain retry mechanism** — automatic retries on LLM timeout or transient failures (up to 2 retries with 5-second backoff)
 - **Non-blocking improve phase** — improver failures don't prevent goal completion; recorded in goal notes and metrics
 - **Three-dot diff comparison** — accurate detection of all changes on feature branches using `origin/{baseBranch}...HEAD`
+- **HTTP resilience** — all LLM API calls use `Microsoft.Extensions.Http.Resilience` with 3 retries, exponential backoff, and 2-minute per-attempt timeout
+- **Worker feedback in Brain context** — worker output (verdicts, test metrics, issues) is injected into the Brain conversation for informed replanning after failures
 - **Goal notes** — non-fatal observations tracked in goals.yaml (e.g. "Improver skipped: timeout")
 - **Iteration summaries** — structured per-iteration metrics (phases, test counts, review verdicts) recorded in goals.yaml for observability without reading logs
 - **Phase duration logging** — each pipeline phase logs its wall-clock duration in seconds when it completes (e.g., "Phase Testing for goal X completed in 45.2s")
