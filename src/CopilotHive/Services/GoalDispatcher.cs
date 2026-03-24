@@ -424,12 +424,12 @@ public sealed class GoalDispatcher : BackgroundService
                 var prompt = _brain is not null
                     ? await _brain.CraftPromptAsync(pipeline, phase, phaseInstructions, ct)
                     : $"Work on: {pipeline.Description} (phase: {phase})";
-                await DispatchToRole(pipeline, phase.ToWorkerRole(), prompt, ct, phase);
+                await DispatchToRole(pipeline, phase.ToWorkerRole(), prompt, ct);
                 break;
 
             case GoalPhase.DocWriting:
                 var docPrompt = BuildDocWriterPrompt(pipeline, phaseInstructions);
-                await DispatchToRole(pipeline, WorkerRole.DocWriter, docPrompt, ct, phase);
+                await DispatchToRole(pipeline, WorkerRole.DocWriter, docPrompt, ct);
                 break;
 
             case GoalPhase.Improve:
@@ -540,7 +540,7 @@ public sealed class GoalDispatcher : BackgroundService
         return plan;
     }
 
-    private async Task DispatchToRole(GoalPipeline pipeline, WorkerRole role, string? prompt, CancellationToken ct, GoalPhase? phase = null)
+    private async Task DispatchToRole(GoalPipeline pipeline, WorkerRole role, string? prompt, CancellationToken ct)
     {
         prompt ??= $"Work on: {pipeline.Description}";
 
@@ -565,20 +565,18 @@ public sealed class GoalDispatcher : BackgroundService
             return;
         }
 
-        // Resolve per-role model from config; upgrade to premium when the Brain requested it for this phase
+        // Resolve per-role model from config; upgrade to premium when the Brain requested it
         var roleName = role.ToRoleName();
         var model = _config?.GetModelForRole(roleName);
-        var phaseTier = phase is not null
-            ? pipeline.Plan?.PhaseTiers.GetValueOrDefault(phase.Value, ModelTier.Default) ?? ModelTier.Default
-            : ModelTier.Default;
-        if (phaseTier == ModelTier.Premium && _config is not null)
+        var roleTier = pipeline.Plan?.RoleTiers.GetValueOrDefault(role, ModelTier.Default) ?? ModelTier.Default;
+        if (roleTier == ModelTier.Premium && _config is not null)
         {
             var premiumModel = _config.GetPremiumModelForRole(roleName);
             if (premiumModel is not null)
                 model = premiumModel;
         }
         _logger.LogDebug("Model for {Role}: {Model} (tier={Tier}, configLoaded={ConfigLoaded})",
-            roleName, model ?? "(null)", phaseTier, _config is not null);
+            roleName, model ?? "(null)", roleTier, _config is not null);
 
         var task = _taskBuilder.Build(
             goalId: pipeline.GoalId,

@@ -43,8 +43,8 @@ public sealed class IterationPlan
     /// <summary>Per-phase instructions/context from the Brain.</summary>
     public Dictionary<GoalPhase, string> PhaseInstructions { get; init; } = [];
 
-    /// <summary>Per-phase model tier overrides from the Brain (e.g. escalate coding to premium).</summary>
-    public Dictionary<GoalPhase, ModelTier> PhaseTiers { get; init; } = [];
+    /// <summary>Per-role model tier overrides from the Brain (e.g. escalate coder to premium).</summary>
+    public Dictionary<WorkerRole, ModelTier> RoleTiers { get; init; } = [];
 
     /// <summary>Brain's reasoning for this plan.</summary>
     public string? Reason { get; init; }
