@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Brain context-usage logging** — after each Brain call (`CraftPromptAsync`, `InterpretResultAsync`, `PlanIterationAsync`), logs the session context usage as a percentage: "Brain context usage: 45.2% (58000/128000 tokens) after <method-name>"; computed from `InputTokensUsed` vs `_maxContextTokens`; includes 4 xUnit tests verifying percentage calculation, zero-context-window handling, caller name inclusion, and exact message format
 - **WorkerPool.ConnectedWorkerCount** — new public read-only property (also on `IWorkerPool`) that returns the current number of registered connected workers; backed by `_workers.Count`; includes XML documentation and 2 xUnit tests (class now has 23 total [Fact] tests)
 - `PrintBanner()` now prints the current UTC start time below the ASCII art in the format `Started at yyyy-MM-dd HH:mm:ss UTC`
 - **GoalDispatcher source-count startup log** — `ExecuteAsync` now logs the number of registered goal sources at startup (format: "GoalDispatcher starting with {SourceCount} goal source(s)")
