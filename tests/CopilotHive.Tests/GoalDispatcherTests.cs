@@ -524,6 +524,195 @@ public sealed class GoalDispatcherPhaseDurationLoggingTests
 }
 
 /// <summary>
+/// Tests for model name appearing in GoalDispatcher log messages.
+/// </summary>
+public sealed class GoalDispatcherModelLoggingTests
+{
+    [Fact]
+    public async Task HandleTaskCompletionAsync_LogsModelName_InTaskCompletedMessage()
+    {
+        // Arrange
+        var logger = new CollectingLogger<GoalDispatcher>();
+        var brain = new FakeDispatcherBrain();
+        var taskQueue = new TaskQueue();
+        var goal = new Goal { Id = "goal-model-log-test", Description = "Test model logging" };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken); // Populate internal map
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        var taskId = $"task-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+        pipeline.SetActiveTask(taskId);
+
+        // Create a task with a specific model and activate it in the queue
+        var workTask = new WorkTask
+        {
+            TaskId = taskId,
+            GoalId = goal.Id,
+            GoalDescription = goal.Description,
+            Prompt = "Test prompt",
+            Role = WorkerRole.Coder,
+            Model = "claude-sonnet-4-20250514",
+            Repositories = [],
+            Iteration = 1,
+        };
+        taskQueue.Activate(workTask, "test-worker");
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            brain);
+
+        // Act
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "Work completed.",
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert - verify "model=claude-sonnet-4-20250514" appears in the task completed log
+        var taskCompletedLog = logger.Logs.FirstOrDefault(l =>
+            l.Message.Contains("task completed") &&
+            l.Message.Contains(goal.Id));
+        Assert.True(taskCompletedLog != default, $"Expected task completed log. Logs: {string.Join(", ", logger.Logs.Select(l => l.Message))}");
+        Assert.Contains("model=claude-sonnet-4-20250514", taskCompletedLog.Message);
+    }
+
+    [Fact]
+    public async Task HandleTaskCompletionAsync_LogsModelName_InPhaseCompletedMessage()
+    {
+        // Arrange
+        var logger = new CollectingLogger<GoalDispatcher>();
+        var brain = new FakeDispatcherBrain();
+        var taskQueue = new TaskQueue();
+        var goal = new Goal { Id = "goal-phase-model-test", Description = "Test phase model logging" };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Testing);
+
+        var taskId = $"task-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+        pipeline.SetActiveTask(taskId);
+
+        var workTask = new WorkTask
+        {
+            TaskId = taskId,
+            GoalId = goal.Id,
+            GoalDescription = goal.Description,
+            Prompt = "Test prompt",
+            Role = WorkerRole.Tester,
+            Model = "claude-sonnet-4-20250514",
+            Repositories = [],
+            Iteration = 1,
+        };
+        taskQueue.Activate(workTask, "test-worker");
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            brain);
+
+        // Act
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "Testing passed.",
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert - verify "model=claude-sonnet-4-20250514" appears in the phase completed log
+        var phaseCompletedLog = logger.Logs.FirstOrDefault(l =>
+            l.Message.Contains("completed in") &&
+            l.Message.Contains(goal.Id) &&
+            l.Message.Contains("Testing"));
+        Assert.True(phaseCompletedLog != default, $"Expected phase completed log. Logs: {string.Join(", ", logger.Logs.Select(l => l.Message))}");
+        Assert.Contains("model=claude-sonnet-4-20250514", phaseCompletedLog.Message);
+    }
+
+    [Fact]
+    public async Task HandleTaskCompletionAsync_WhenModelIsEmpty_LogsUnknownModel()
+    {
+        // Arrange
+        var logger = new CollectingLogger<GoalDispatcher>();
+        var brain = new FakeDispatcherBrain();
+        var taskQueue = new TaskQueue();
+        var goal = new Goal { Id = "goal-unknown-model-test", Description = "Test unknown model logging" };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        var taskId = $"task-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+        pipeline.SetActiveTask(taskId);
+
+        // Create a task with an empty model
+        var workTask = new WorkTask
+        {
+            TaskId = taskId,
+            GoalId = goal.Id,
+            GoalDescription = goal.Description,
+            Prompt = "Test prompt",
+            Role = WorkerRole.Coder,
+            Model = "", // Empty model
+            Repositories = [],
+            Iteration = 1,
+        };
+        taskQueue.Activate(workTask, "test-worker");
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            brain);
+
+        // Act
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "Work completed.",
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert - verify "model=unknown" appears when model is empty
+        var taskCompletedLog = logger.Logs.FirstOrDefault(l =>
+            l.Message.Contains("task completed") &&
+            l.Message.Contains(goal.Id));
+        Assert.True(taskCompletedLog != default, $"Expected task completed log. Logs: {string.Join(", ", logger.Logs.Select(l => l.Message))}");
+        Assert.Contains("model=unknown", taskCompletedLog.Message);
+    }
+}
+
+/// <summary>
 /// Collecting logger for verifying log output in tests.
 /// </summary>
 file sealed class CollectingLogger<T> : ILogger<T>
