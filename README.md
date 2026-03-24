@@ -172,7 +172,7 @@ goals:
 - **Fallback metrics parsing** — robust parsing handles varied worker output formats
 - **Duplicate goal completion guards** — prevents re-processing of already-completed goals
 - **Telemetry** — per-run metrics aggregated and fed into the improver
-- **Context and token logging** — Brain and workers log estimated/actual token usage per LLM call for cost tracking and context management
+- **Context and token logging** — Brain and workers log estimated/actual token usage per LLM call for cost tracking and context management; Brain logs context usage percentage after each call (e.g., "Brain context usage: 45.2% (58000/128000 tokens) after PlanIterationAsync")
 - **Rich worker logging** — tool calls logged as `tool:name(arg="value")`, results as `result:id → "preview"`, with role, model, and elapsed time per task
 - **Dirty-worktree safety net** — automatically re-prompts Copilot if uncommitted changes remain after task execution
 - **Brain retry mechanism** — automatic retries on LLM timeout or transient failures (up to 2 retries with 5-second backoff)
