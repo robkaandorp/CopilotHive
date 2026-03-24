@@ -239,6 +239,17 @@ public static class ChatClientFactory
                 var json = JsonNode.Parse(body);
                 var choices = json?["choices"]?.AsArray();
 
+                // Empty choices array: Copilot API sometimes returns this after the final
+                // tool result is sent back. Synthesize a minimal stop choice so the SDK
+                // doesn't crash with "Index was out of range" on choices[0].
+                if (choices is { Count: 0 } && json is not null)
+                {
+                    json["choices"] = new JsonArray(
+                        JsonNode.Parse("""{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}"""));
+                    body = json.ToJsonString();
+                    return ReplaceContent(response, body);
+                }
+
                 if (choices == null || choices.Count <= 1) return ReplaceContent(response, body);
 
                 JsonObject? toolChoice = null;
