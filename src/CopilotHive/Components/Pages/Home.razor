@@ -8,8 +8,12 @@
 
 <div class="cards">
     <div class="card">
+        <div class="label">Draft</div>
+        <div class="value" style="color:var(--text-muted)">@_snap.DraftGoals</div>
+    </div>
+    <div class="card">
         <div class="label">Pending</div>
-        <div class="value">@_snap.PendingGoals</div>
+        <div class="value" style="color:var(--yellow)">@_snap.PendingGoals</div>
     </div>
     <div class="card">
         <div class="label">Active</div>
@@ -75,7 +79,7 @@
     </table>
 }
 
-@if (_snap.Goals.Any(g => g.Status == GoalStatus.Completed || g.Status == GoalStatus.Failed))
+@if (_snap.Goals.Any(g => g.Status is GoalStatus.Completed or GoalStatus.Failed or GoalStatus.Draft))
 {
     <h2 style="margin-top:1.5rem">Recent Goals</h2>
     <table>
@@ -87,18 +91,21 @@
             </tr>
         </thead>
         <tbody>
-            @foreach (var g in _snap.Goals.Where(g => g.Status is GoalStatus.Completed or GoalStatus.Failed).Take(20))
+            @foreach (var g in _snap.Goals
+                .Where(g => g.Status is GoalStatus.Completed or GoalStatus.Failed or GoalStatus.Draft)
+                .OrderByDescending(g => g.CreatedAt)
+                .Take(20))
             {
                 <tr>
                     <td>
                         <a href="/goals/@g.Id" style="color:var(--accent);text-decoration:none">@g.Id</a>
                     </td>
                     <td>
-                        <span class="badge @(g.Status == GoalStatus.Completed ? "badge-green" : "badge-red")">
+                        <span class="badge @StatusBadge(g.Status)">
                             @g.Status
                         </span>
                     </td>
-                    <td>@g.Iterations</td>
+                    <td>@(g.Iterations?.ToString() ?? "—")</td>
                 </tr>
             }
         </tbody>
@@ -122,6 +129,16 @@
 
     private static string Truncate(string s, int max) =>
         s.Length <= max ? s : s[..max] + "…";
+
+    private static string StatusBadge(GoalStatus s) => s switch
+    {
+        GoalStatus.Completed => "badge-green",
+        GoalStatus.Failed => "badge-red",
+        GoalStatus.InProgress => "badge-blue",
+        GoalStatus.Pending => "badge-yellow",
+        GoalStatus.Draft => "badge-muted",
+        _ => "badge-muted",
+    };
 
     private static string FormatElapsed(DateTime start)
     {

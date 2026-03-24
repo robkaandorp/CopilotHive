@@ -133,6 +133,7 @@ public sealed class DashboardStateService : IDisposable
                 FailedTests = p.Metrics.FailedTests,
                 CoveragePercent = p.Metrics.CoveragePercent,
             }).ToList(),
+            DraftGoals = goals.Count(g => g.Status == GoalStatus.Draft),
             PendingGoals = goals.Count(g => g.Status == GoalStatus.Pending),
             ActiveGoals = goals.Count(g => g.Status == GoalStatus.InProgress),
             CompletedGoals = goals.Count(g => g.Status == GoalStatus.Completed),
@@ -367,6 +368,8 @@ public sealed class DashboardSnapshot
     public List<WorkerInfo> Workers { get; init; } = [];
     /// <summary>Active goal pipelines.</summary>
     public List<PipelineInfo> Pipelines { get; init; } = [];
+    /// <summary>Count of draft goals.</summary>
+    public int DraftGoals { get; init; }
     /// <summary>Count of pending goals.</summary>
     public int PendingGoals { get; init; }
     /// <summary>Count of in-progress goals.</summary>
