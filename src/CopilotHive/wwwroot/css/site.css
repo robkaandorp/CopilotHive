@@ -292,3 +292,85 @@ tr:last-child td { border-bottom: none; }
     word-break: break-all;
     color: var(--text);
 }
+
+/* Goals Browser: filter bar */
+.filter-bar {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+}
+.filter-bar input[type="text"] {
+    flex: 1;
+    min-width: 200px;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 0.9rem;
+}
+.filter-bar input[type="text"]::placeholder { color: var(--text-muted); }
+.filter-bar input[type="text"]:focus { outline: none; border-color: var(--accent); }
+.filter-bar select {
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 0.9rem;
+    cursor: pointer;
+}
+.filter-bar select:focus { outline: none; border-color: var(--accent); }
+.filter-count {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    white-space: nowrap;
+}
+
+/* Goals Browser: goal row styling */
+.goal-link {
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 500;
+}
+.goal-link:hover { text-decoration: underline; }
+.goal-desc {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 0.15rem;
+}
+.goal-repos {
+    display: flex;
+    gap: 0.35rem;
+    margin-top: 0.25rem;
+    flex-wrap: wrap;
+}
+.repo-tag {
+    font-size: 0.7rem;
+    font-family: monospace;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.1rem 0.4rem;
+    color: var(--text-muted);
+}
+
+/* Goal detail: failure reason callout */
+.failure-callout {
+    background: rgba(248, 81, 73, 0.1);
+    border: 1px solid var(--red);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin-bottom: 1rem;
+}
+.failure-callout .label { color: var(--red); }
+
+/* Goal detail: iteration summary cards */
+.iter-summary-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+}

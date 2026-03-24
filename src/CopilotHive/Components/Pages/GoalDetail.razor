@@ -4,6 +4,7 @@
 @using CopilotHive.Orchestration
 @implements IDisposable
 @inject DashboardStateService State
+@inject IGoalStore GoalStore
 
 <h1>Goal: @GoalId</h1>
 
@@ -247,6 +248,162 @@
         </details>
     }
 }
+else if (_storedGoal is not null)
+{
+    <!-- Stored Goal (from SQLite — no active pipeline) -->
+    <div class="card" style="margin-bottom:1rem">
+        <div class="label">Description</div>
+        <div>@_storedGoal.Description</div>
+        <div style="margin-top:0.5rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
+            <span class="badge @StatusBadge(_storedGoal.Status)">@_storedGoal.Status</span>
+            <span style="color:var(--text-muted)">Priority: @_storedGoal.Priority</span>
+            @if (_storedGoal.Iterations.HasValue)
+            {
+                <span style="color:var(--text-muted)">Iterations: <strong style="color:var(--text)">@_storedGoal.Iterations</strong></span>
+            }
+        </div>
+        <div style="margin-top:0.5rem;font-size:0.8rem;color:var(--text-muted)">
+            Created: @_storedGoal.CreatedAt.ToString("yyyy-MM-dd HH:mm:ss") UTC
+            @if (_storedGoal.StartedAt.HasValue)
+            {
+                <span style="margin-left:1rem">Started: @_storedGoal.StartedAt.Value.ToString("yyyy-MM-dd HH:mm:ss") UTC</span>
+            }
+            @if (_storedGoal.CompletedAt.HasValue)
+            {
+                <span style="margin-left:1rem">Completed: @_storedGoal.CompletedAt.Value.ToString("yyyy-MM-dd HH:mm:ss") UTC</span>
+            }
+        </div>
+        @if (_storedGoal.TotalDurationSeconds.HasValue)
+        {
+            <div style="margin-top:0.25rem;font-size:0.8rem;color:var(--text-muted)">
+                Total duration: @FormatTotalDuration(_storedGoal.TotalDurationSeconds.Value)
+            </div>
+        }
+    </div>
+
+    @if (!string.IsNullOrEmpty(_storedGoal.FailureReason))
+    {
+        <div class="failure-callout">
+            <div class="label">Failure Reason</div>
+            <div style="margin-top:0.25rem">@_storedGoal.FailureReason</div>
+        </div>
+    }
+
+    @if (_storedGoal.Notes.Count > 0)
+    {
+        <div class="card" style="margin-bottom:1rem">
+            <div class="label">Notes</div>
+            <ul style="margin:0.5rem 0 0 1.2rem;font-size:0.85rem">
+                @foreach (var note in _storedGoal.Notes)
+                {
+                    <li style="color:var(--text-muted)">@note</li>
+                }
+            </ul>
+        </div>
+    }
+
+    @if (_storedGoal.PhaseDurations is { Count: > 0 })
+    {
+        <div class="card" style="margin-bottom:1rem">
+            <div class="label">Phase Durations</div>
+            <table style="margin-top:0.5rem;max-width:400px">
+                <thead><tr><th>Phase</th><th>Duration</th></tr></thead>
+                <tbody>
+                    @foreach (var kvp in _storedGoal.PhaseDurations)
+                    {
+                        <tr>
+                            <td>@kvp.Key</td>
+                            <td style="color:var(--text-muted)">@FormatDuration(kvp.Value)</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    }
+
+    <!-- SQLite Iteration History -->
+    @if (_storedIterations.Count > 0)
+    {
+        <h2 style="margin-top:1.5rem">Iterations</h2>
+        @foreach (var iter in _storedIterations)
+        {
+            <div class="iteration-section">
+                <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem">
+                    <strong>Iteration @iter.Iteration</strong>
+                    @if (!string.IsNullOrEmpty(iter.ReviewVerdict))
+                    {
+                        <span class="badge @ReviewBadge(iter.ReviewVerdict)">@iter.ReviewVerdict</span>
+                    }
+                </div>
+
+                @if (iter.Phases.Count > 0)
+                {
+                    <div class="phase-bar" style="margin-bottom:0.5rem">
+                        @foreach (var phase in iter.Phases)
+                        {
+                            <span class="phase-box @(phase.Result == "pass" ? "completed" : phase.Result == "fail" ? "failed" : "skipped")">
+                                <span class="phase-box-icon">@(phase.Result == "pass" ? "✓" : phase.Result == "fail" ? "✗" : "~")</span>
+                                @phase.Name
+                                @if (phase.DurationSeconds > 0)
+                                {
+                                    <span class="phase-box-duration">@FormatDuration(phase.DurationSeconds)</span>
+                                }
+                            </span>
+                        }
+                    </div>
+                }
+
+                @if (iter.TestCounts is { } tc)
+                {
+                    <div class="iter-summary-cards">
+                        <div class="card">
+                            <div class="label">Tests</div>
+                            <div class="value">@tc.Total</div>
+                        </div>
+                        <div class="card">
+                            <div class="label">Passed</div>
+                            <div class="value" style="color:var(--green)">@tc.Passed</div>
+                        </div>
+                        @if (tc.Failed > 0)
+                        {
+                            <div class="card">
+                                <div class="label">Failed</div>
+                                <div class="value" style="color:var(--red)">@tc.Failed</div>
+                            </div>
+                        }
+                    </div>
+                }
+
+                @if (iter.Notes.Count > 0)
+                {
+                    <ul style="margin:0 0 0.5rem 1.2rem;font-size:0.85rem">
+                        @foreach (var note in iter.Notes)
+                        {
+                            <li style="color:var(--text-muted)">@note</li>
+                        }
+                    </ul>
+                }
+            </div>
+        }
+    }
+    else
+    {
+        <p style="color:var(--text-muted);margin-top:1rem">No iteration history recorded.</p>
+    }
+
+    @if (_storedGoal.RepositoryNames.Count > 0)
+    {
+        <div class="card" style="margin-top:1rem">
+            <div class="label">Repositories</div>
+            <div class="goal-repos" style="margin-top:0.25rem">
+                @foreach (var repo in _storedGoal.RepositoryNames)
+                {
+                    <span class="repo-tag">@repo</span>
+                }
+            </div>
+        </div>
+    }
+}
 else
 {
     <p style="color:var(--text-muted)">Goal not found.</p>
@@ -256,6 +413,8 @@ else
     [Parameter] public string GoalId { get; set; } = "";
 
     private GoalDetailInfo? _detail;
+    private Goal? _storedGoal;
+    private IReadOnlyList<IterationSummary> _storedIterations = [];
     private IReadOnlyList<ProgressEntry> _progress = [];
     private string? _selectedPhase;
 
@@ -271,6 +430,20 @@ else
     {
         _detail = State.GetGoalDetail(GoalId);
         _progress = State.GetProgressForGoal(GoalId);
+
+        // Fallback: load from SQLite for completed/failed goals not in active pipelines
+        if (_detail is null)
+        {
+            _storedGoal = GoalStore.GetGoalAsync(GoalId).GetAwaiter().GetResult();
+            _storedIterations = _storedGoal is not null
+                ? GoalStore.GetIterationsAsync(GoalId).GetAwaiter().GetResult()
+                : [];
+        }
+        else
+        {
+            _storedGoal = null;
+            _storedIterations = [];
+        }
     }
 
     private void RefreshState() => InvokeAsync(() => { Refresh(); StateHasChanged(); });
@@ -312,6 +485,13 @@ else
 
     private static string FormatDuration(double seconds) =>
         seconds >= 60 ? $"{seconds / 60:F1}m" : $"{seconds:F0}s";
+
+    private static string FormatTotalDuration(double seconds)
+    {
+        if (seconds >= 3600) return $"{seconds / 3600:F1}h";
+        if (seconds >= 60) return $"{seconds / 60:F1}m";
+        return $"{seconds:F0}s";
+    }
 
     private static string Truncate(string s, int max) =>
         s.Length <= max ? s : s[..max] + "…";

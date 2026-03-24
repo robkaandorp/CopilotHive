@@ -1,0 +1,156 @@
+@page "/goals"
+@using CopilotHive.Goals
+@inject IGoalStore GoalStore
+
+<h1>Goals</h1>
+
+<!-- Filter Bar -->
+<div class="filter-bar">
+    <input type="text" placeholder="Search goals…" @bind="_searchText" @bind:event="oninput" @bind:after="ApplyFilters" />
+
+    <select @bind="_statusFilter" @bind:after="ApplyFilters">
+        <option value="">All statuses</option>
+        @foreach (var s in Enum.GetValues<GoalStatus>())
+        {
+            <option value="@s">@s</option>
+        }
+    </select>
+
+    <select @bind="_priorityFilter" @bind:after="ApplyFilters">
+        <option value="">All priorities</option>
+        @foreach (var p in Enum.GetValues<GoalPriority>())
+        {
+            <option value="@p">@p</option>
+        }
+    </select>
+
+    <span class="filter-count">@_filtered.Count goal(s)</span>
+</div>
+
+<!-- Goals Table -->
+@if (_filtered.Count > 0)
+{
+    <table>
+        <thead>
+            <tr>
+                <th>Goal</th>
+                <th>Status</th>
+                <th>Priority</th>
+                <th>Iterations</th>
+                <th>Duration</th>
+                <th>Created</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var g in _filtered)
+            {
+                <tr>
+                    <td>
+                        <a href="/goals/@g.Id" class="goal-link">@g.Id</a>
+                        <div class="goal-desc">@Truncate(g.Description, 100)</div>
+                        @if (g.RepositoryNames.Count > 0)
+                        {
+                            <div class="goal-repos">
+                                @foreach (var repo in g.RepositoryNames)
+                                {
+                                    <span class="repo-tag">@repo</span>
+                                }
+                            </div>
+                        }
+                    </td>
+                    <td><span class="badge @StatusBadge(g.Status)">@g.Status</span></td>
+                    <td><span class="badge @PriorityBadge(g.Priority)">@g.Priority</span></td>
+                    <td>@(g.Iterations?.ToString() ?? "—")</td>
+                    <td style="color:var(--text-muted);white-space:nowrap">@FormatDuration(g)</td>
+                    <td style="color:var(--text-muted);white-space:nowrap">@g.CreatedAt.ToString("yyyy-MM-dd HH:mm")</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+else if (_loaded)
+{
+    <p style="color:var(--text-muted);margin-top:1rem">No goals match the current filters.</p>
+}
+
+@code {
+    private List<Goal> _allGoals = [];
+    private List<Goal> _filtered = [];
+    private string _searchText = "";
+    private string _statusFilter = "";
+    private string _priorityFilter = "";
+    private bool _loaded;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _allGoals = (await GoalStore.GetAllGoalsAsync()).ToList();
+        _loaded = true;
+        ApplyFilters();
+    }
+
+    private void ApplyFilters()
+    {
+        var query = _allGoals.AsEnumerable();
+
+        if (!string.IsNullOrWhiteSpace(_statusFilter) && Enum.TryParse<GoalStatus>(_statusFilter, out var status))
+            query = query.Where(g => g.Status == status);
+
+        if (!string.IsNullOrWhiteSpace(_priorityFilter) && Enum.TryParse<GoalPriority>(_priorityFilter, out var priority))
+            query = query.Where(g => g.Priority == priority);
+
+        if (!string.IsNullOrWhiteSpace(_searchText))
+        {
+            var term = _searchText.Trim();
+            query = query.Where(g =>
+                g.Id.Contains(term, StringComparison.OrdinalIgnoreCase) ||
+                g.Description.Contains(term, StringComparison.OrdinalIgnoreCase) ||
+                (g.FailureReason?.Contains(term, StringComparison.OrdinalIgnoreCase) ?? false));
+        }
+
+        _filtered = query
+            .OrderByDescending(g => g.Status == GoalStatus.InProgress)
+            .ThenByDescending(g => g.Status == GoalStatus.Pending)
+            .ThenByDescending(g => g.CreatedAt)
+            .ToList();
+    }
+
+    private static string StatusBadge(GoalStatus s) => s switch
+    {
+        GoalStatus.Completed => "badge-green",
+        GoalStatus.Failed => "badge-red",
+        GoalStatus.InProgress => "badge-blue",
+        GoalStatus.Pending => "badge-yellow",
+        GoalStatus.Cancelled => "badge-muted",
+        _ => "badge-muted",
+    };
+
+    private static string PriorityBadge(GoalPriority p) => p switch
+    {
+        GoalPriority.Critical => "badge-red",
+        GoalPriority.High => "badge-yellow",
+        GoalPriority.Normal => "badge-muted",
+        GoalPriority.Low => "badge-muted",
+        _ => "badge-muted",
+    };
+
+    private static string FormatDuration(Goal g)
+    {
+        if (g.TotalDurationSeconds is { } secs)
+        {
+            if (secs >= 3600) return $"{secs / 3600:F1}h";
+            if (secs >= 60) return $"{secs / 60:F1}m";
+            return $"{secs:F0}s";
+        }
+        if (g.StartedAt.HasValue && g.Status == GoalStatus.InProgress)
+        {
+            var elapsed = DateTime.UtcNow - g.StartedAt.Value;
+            return elapsed.TotalHours >= 1
+                ? $"{(int)elapsed.TotalHours}h {elapsed.Minutes}m"
+                : $"{elapsed.Minutes}m";
+        }
+        return "—";
+    }
+
+    private static string Truncate(string s, int max) =>
+        s.Length <= max ? s : s[..max] + "…";
+}
