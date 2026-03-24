@@ -7,56 +7,46 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace CopilotHive.Tests;
 
 /// <summary>
-/// Verifies the "first non-null wins" model-tier propagation rule across all Brain dispatch methods.
+/// Verifies per-phase model tier parsing from the Brain's report_iteration_plan tool call.
 /// </summary>
 public sealed class ModelTierPropagationTests
 {
-    // -- ApplyModelTierIfNotSet unit tests --
-
     [Fact]
-    public void ApplyModelTierIfNotSet_PipelineTierEmpty_SetsToStandard()
+    public void BuildIterationPlan_WithModelTiers_ParsesPerPhaseTiers()
     {
-        var pipeline = CreatePipeline();
-        DistributedBrain.ApplyModelTierIfNotSet(pipeline, "standard");
-        Assert.Equal(ModelTier.Standard, pipeline.LatestModelTier);
+        var toolCall = MakeToolCall(modelTiers: """{"coding":"premium","review":"premium"}""");
+        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+
+        Assert.Equal(ModelTier.Premium, plan.PhaseTiers[GoalPhase.Coding]);
+        Assert.Equal(ModelTier.Premium, plan.PhaseTiers[GoalPhase.Review]);
+        Assert.DoesNotContain(GoalPhase.Testing, plan.PhaseTiers.Keys);
     }
 
     [Fact]
-    public void ApplyModelTierIfNotSet_PipelineTierEmpty_SetsToPremium()
+    public void BuildIterationPlan_WithoutModelTiers_PhaseTiersEmpty()
     {
-        var pipeline = CreatePipeline();
-        DistributedBrain.ApplyModelTierIfNotSet(pipeline, "premium");
-        Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
+        var toolCall = MakeToolCall(modelTiers: null);
+        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+
+        Assert.Empty(plan.PhaseTiers);
     }
 
     [Fact]
-    public void ApplyModelTierIfNotSet_PipelineTierEmpty_NullModelTier_DoesNotSet()
+    public void BuildIterationPlan_StandardTier_ParsesCorrectly()
     {
-        var pipeline = CreatePipeline();
-        DistributedBrain.ApplyModelTierIfNotSet(pipeline, null);
-        Assert.Equal(ModelTier.Default, pipeline.LatestModelTier);
+        var toolCall = MakeToolCall(modelTiers: """{"coding":"standard"}""");
+        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+
+        Assert.Equal(ModelTier.Standard, plan.PhaseTiers[GoalPhase.Coding]);
     }
 
     [Fact]
-    public void ApplyModelTierIfNotSet_PipelineTierAlreadyPremium_StandardDoesNotOverwrite()
+    public void BuildIterationPlan_InvalidModelTiersJson_ReturnsEmptyTiers()
     {
-        var pipeline = CreatePipeline();
-        DistributedBrain.ApplyModelTierIfNotSet(pipeline, "premium");
-        Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
+        var toolCall = MakeToolCall(modelTiers: "not-valid-json");
+        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
 
-        DistributedBrain.ApplyModelTierIfNotSet(pipeline, "standard");
-        Assert.Equal(ModelTier.Premium, pipeline.LatestModelTier);
-    }
-
-    [Fact]
-    public void ApplyModelTierIfNotSet_PipelineTierAlreadyStandard_PremiumDoesNotOverwrite()
-    {
-        var pipeline = CreatePipeline();
-        DistributedBrain.ApplyModelTierIfNotSet(pipeline, "standard");
-        Assert.Equal(ModelTier.Standard, pipeline.LatestModelTier);
-
-        DistributedBrain.ApplyModelTierIfNotSet(pipeline, "premium");
-        Assert.Equal(ModelTier.Standard, pipeline.LatestModelTier);
+        Assert.Empty(plan.PhaseTiers);
     }
 
     [Theory]
@@ -65,15 +55,32 @@ public sealed class ModelTierPropagationTests
     [InlineData("STANDARD", ModelTier.Standard)]
     [InlineData("Standard", ModelTier.Standard)]
     [InlineData("unknown-tier", ModelTier.Default)]
-    public void ApplyModelTierIfNotSet_NormalisesToLowerCaseKnownValues(string input, ModelTier expected)
+    public void BuildIterationPlan_NormalisesModelTierCasing(string tierValue, ModelTier expected)
     {
-        var pipeline = CreatePipeline();
-        DistributedBrain.ApplyModelTierIfNotSet(pipeline, input);
-        Assert.Equal(expected, pipeline.LatestModelTier);
+        var toolCall = MakeToolCall(modelTiers: $$"""{"coding":"{{tierValue}}"}""");
+        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+
+        Assert.Equal(expected, plan.PhaseTiers[GoalPhase.Coding]);
+    }
+
+    [Fact]
+    public void PhaseTiers_GetValueOrDefault_ReturnsDefaultForUnsetPhases()
+    {
+        var toolCall = MakeToolCall(modelTiers: """{"coding":"premium"}""");
+        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+
+        Assert.Equal(ModelTier.Premium, plan.PhaseTiers.GetValueOrDefault(GoalPhase.Coding, ModelTier.Default));
+        Assert.Equal(ModelTier.Default, plan.PhaseTiers.GetValueOrDefault(GoalPhase.Testing, ModelTier.Default));
     }
 
     // -- Helpers --
 
-    private static GoalPipeline CreatePipeline() =>
-        new(new Goal { Id = "test-goal", Description = "Test goal" });
+    private static DistributedBrain.BrainToolCallResult MakeToolCall(string? modelTiers) =>
+        new("report_iteration_plan", new Dictionary<string, object?>
+        {
+            ["phases"] = new[] { "coding", "testing", "review", "merging" },
+            ["phase_instructions"] = """{"coding":"do the work"}""",
+            ["reason"] = "test plan",
+            ["model_tiers"] = modelTiers,
+        });
 }

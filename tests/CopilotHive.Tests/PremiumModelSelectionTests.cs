@@ -162,8 +162,8 @@ public class PremiumModelSelectionTests
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries);
         pipeline.AdvanceTo(phase);
 
-        // Initialize state machine so transitions work
-        var plan = IterationPlan.Default();
+        // Use the brain's plan so per-phase model tiers are applied
+        var plan = brain.PlanIterationAsync(pipeline).GetAwaiter().GetResult();
         pipeline.SetPlan(plan);
         pipeline.StateMachine.StartIteration(plan.Phases);
 
@@ -187,8 +187,8 @@ public class PremiumModelSelectionTests
 }
 
 /// <summary>
-/// A brain stub that returns a configurable <c>model_tier</c> by setting
-/// <see cref="GoalPipeline.LatestModelTier"/> directly, mirroring what the real brain does.
+/// A brain stub that returns an iteration plan with configurable per-phase model tiers.
+/// Sets the requested tier on ALL phases so the dispatcher picks it up regardless of which phase runs next.
 /// </summary>
 file sealed class CapturingBrain : IDistributedBrain
 {
@@ -201,13 +201,20 @@ file sealed class CapturingBrain : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
-    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
-        Task.FromResult(IterationPlan.Default());
+    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default)
+    {
+        var plan = IterationPlan.Default();
+
+        // Set the requested tier on all phases
+        foreach (var phase in plan.Phases)
+            plan.PhaseTiers[phase] = _modelTierToReturn;
+
+        return Task.FromResult(plan);
+    }
 
     public Task<string> CraftPromptAsync(
         GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
     {
-        pipeline.LatestModelTier = _modelTierToReturn;
         return Task.FromResult($"Work on {pipeline.Description} as {phase}");
     }
 

@@ -165,7 +165,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             AIFunctionFactory.Create(
                 ([Description("Ordered phase names, e.g. [\"coding\",\"testing\",\"docwriting\",\"review\",\"merging\"]")] string[] phases,
                  [Description("JSON-encoded dict of phase name to instruction, e.g. {\"coding\":\"focus on...\",\"review\":\"check...\"}")] string phase_instructions,
-                 [Description("Why you chose this iteration plan")] string reason) =>
+                 [Description("Why you chose this iteration plan")] string reason,
+                 [Description("Optional JSON-encoded dict of phase name to model tier (\"standard\" or \"premium\"), e.g. {\"coding\":\"premium\"}. Omitted phases use the default tier.")] string? model_tiers = null) =>
                 {
                     var invalidPhases = phases?.Where(p => !validPhases.Contains(p)).ToList() ?? [];
                     var error = Shared.ToolValidation.Check(
@@ -178,6 +179,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     _lastToolCallResult = new BrainToolCallResult("report_iteration_plan", new Dictionary<string, object?>
                     {
                         ["phases"] = phases, ["phase_instructions"] = phase_instructions, ["reason"] = reason,
+                        ["model_tiers"] = model_tiers,
                     });
                     return "Iteration plan recorded.";
                 },
@@ -295,6 +297,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - phases: ordered list of phase names
             - phase_instructions: JSON object with per-phase instructions (e.g. {"coding": "focus on...", "review": "check..."})
             - reason: why this plan
+            - model_tiers: (optional) JSON object to escalate specific phases to premium tier
+              (e.g. {"coding": "premium"}). Only use premium when previous iterations failed
+              and you believe the task requires stronger reasoning. Omitted phases use default tier.
             """;
 
         if (_agent is null)
@@ -388,10 +393,21 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             }
         }
 
+        var phaseTiers = new Dictionary<GoalPhase, ModelTier>();
+        if (dto.ModelTiers is not null)
+        {
+            foreach (var (key, value) in dto.ModelTiers)
+            {
+                if (Enum.TryParse<GoalPhase>(key, ignoreCase: true, out var phase) && value is not null)
+                    phaseTiers[phase] = ModelTierExtensions.ParseModelTier(value);
+            }
+        }
+
         return new IterationPlan
         {
             Phases = phases,
             PhaseInstructions = instructions,
+            PhaseTiers = phaseTiers,
             Reason = dto.Reason,
         };
     }
@@ -432,6 +448,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             Phases = phaseNames,
             PhaseInstructions = phaseInstructions,
+            ModelTiers = ParseJsonDictArg(args, "model_tiers"),
             Reason = GetStringArg(args, "reason"),
         };
 
@@ -443,6 +460,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     {
         public List<string> Phases { get; init; } = [];
         public Dictionary<string, string>? PhaseInstructions { get; init; }
+        public Dictionary<string, string>? ModelTiers { get; init; }
         public string? Reason { get; init; }
     }
 
@@ -576,11 +594,23 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         return null;
     }
 
-    /// <summary>
-    /// Sends a prompt to the Brain via CodingAgent and returns the response.
-    /// CodingAgent handles tool invocation (including file tools and custom tools),
-    /// session management, and context compaction automatically.
-    /// </summary>
+    /// <summary>Extracts a JSON-encoded string→string dictionary from tool call arguments.</summary>
+    internal static Dictionary<string, string>? ParseJsonDictArg(Dictionary<string, object?> args, string key)
+    {
+        var str = GetStringArg(args, key);
+        if (string.IsNullOrEmpty(str))
+            return null;
+
+        try
+        {
+            return JsonSerializer.Deserialize<Dictionary<string, string>>(str, ProtocolJson.Options);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>Formats a context-usage log message for the Brain LLM call.</summary>
     /// <param name="inputTokens">Cumulative input tokens used so far.</param>
     /// <param name="contextWindow">Maximum context window size in tokens.</param>
@@ -663,17 +693,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             MaxSteps = _maxSteps,
             IsConnected = true,
         };
-    }
-
-    /// <summary>
-    /// Applies the first-non-null wins rule for model tier.
-    /// </summary>
-    public static void ApplyModelTierIfNotSet(GoalPipeline pipeline, string? modelTier)
-    {
-        if (pipeline.LatestModelTier != ModelTier.Default || modelTier is null)
-            return;
-
-        pipeline.LatestModelTier = ModelTierExtensions.ParseModelTier(modelTier);
     }
 
     /// <summary>

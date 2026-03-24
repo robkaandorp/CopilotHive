@@ -43,6 +43,9 @@ public sealed class IterationPlan
     /// <summary>Per-phase instructions/context from the Brain.</summary>
     public Dictionary<GoalPhase, string> PhaseInstructions { get; init; } = [];
 
+    /// <summary>Per-phase model tier overrides from the Brain (e.g. escalate coding to premium).</summary>
+    public Dictionary<GoalPhase, ModelTier> PhaseTiers { get; init; } = [];
+
     /// <summary>Brain's reasoning for this plan.</summary>
     public string? Reason { get; init; }
 
@@ -144,13 +147,6 @@ public sealed class GoalPipeline
     public DateTime CreatedAt { get; private init; } = DateTime.UtcNow;
     /// <summary>UTC timestamp when this pipeline completed (Done or Failed), or <c>null</c> if still active.</summary>
     public DateTime? CompletedAt { get; private set; }
-
-    /// <summary>
-    /// Model tier requested by the Brain for the most recently dispatched task.
-    /// <see cref="ModelTier.Default"/> means no tier has been explicitly set yet — the first Brain method
-    /// that returns a non-null model_tier will populate this (first non-null wins).
-    /// </summary>
-    public ModelTier LatestModelTier { get; set; } = ModelTier.Default;
 
     /// <summary>
     /// Creates a new pipeline for the specified goal.
