@@ -69,6 +69,8 @@ public sealed class FileGoalSource : IGoalSource
                     goal.PhaseDurations = metadata.PhaseDurations;
                 if (metadata.IterationSummary is not null)
                     goal.IterationSummaries.Add(metadata.IterationSummary);
+                if (metadata.TotalDurationSeconds.HasValue)
+                    goal.TotalDurationSeconds = metadata.TotalDurationSeconds.Value;
             }
 
             await WriteGoalsAsync(goals, ct);
@@ -117,6 +119,7 @@ public sealed class FileGoalSource : IGoalSource
                 Failure_reason = g.FailureReason,
                 Notes = g.Notes.Count > 0 ? g.Notes : null,
                 PhaseDurations = g.PhaseDurations is { Count: > 0 } ? g.PhaseDurations : null,
+                Total_duration_seconds = g.TotalDurationSeconds,
                 IterationSummaries = g.IterationSummaries.Count > 0
                     ? g.IterationSummaries.Select(MapIterationSummaryEntry).ToList()
                     : null,
@@ -150,6 +153,7 @@ public sealed class FileGoalSource : IGoalSource
             FailureReason = entry.Failure_reason,
             Notes = entry.Notes ?? [],
             PhaseDurations = entry.PhaseDurations,
+            TotalDurationSeconds = entry.Total_duration_seconds,
             IterationSummaries = entry.IterationSummaries?.Select(MapIterationSummary).ToList() ?? [],
         };
     }
@@ -242,6 +246,8 @@ public sealed class FileGoalSource : IGoalSource
         public List<string>? Notes { get; set; }
         /// <summary>Per-phase wall-clock durations in seconds.</summary>
         public Dictionary<string, double>? PhaseDurations { get; set; }
+        /// <summary>Total wall-clock duration of the goal from start to completion, in seconds.</summary>
+        public double? Total_duration_seconds { get; set; }
         /// <summary>Structured summaries for each completed iteration.</summary>
         public List<IterationSummaryEntry>? IterationSummaries { get; set; }
     }

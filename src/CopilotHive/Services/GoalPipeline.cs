@@ -143,6 +143,9 @@ public sealed class GoalPipeline
     /// <summary>UTC timestamp when the current phase started (for phase duration tracking).</summary>
     public DateTime? PhaseStartedAt { get; private set; }
 
+    /// <summary>UTC timestamp when the goal was started (captured at dispatch time, before the pipeline is created).</summary>
+    public DateTime? GoalStartedAt { get; internal set; }
+
     /// <summary>UTC timestamp when this pipeline was created.</summary>
     public DateTime CreatedAt { get; private init; } = DateTime.UtcNow;
     /// <summary>UTC timestamp when this pipeline completed (Done or Failed), or <c>null</c> if still active.</summary>
@@ -180,6 +183,7 @@ public sealed class GoalPipeline
         Plan = snapshot.Plan;
         CreatedAt = snapshot.CreatedAt;
         CompletedAt = snapshot.CompletedAt;
+        GoalStartedAt = snapshot.GoalStartedAt;
 
         foreach (var (key, value) in snapshot.PhaseOutputs)
             PhaseOutputs[key] = value;
