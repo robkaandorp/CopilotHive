@@ -90,7 +90,7 @@ goals:
 
 **Goal ID Format**: Goal IDs must be non-empty, lowercase kebab-case identifiers containing only letters (a–z), digits (0–9), and hyphens (–). IDs must not start or end with a hyphen (e.g., `fix-build-error`, `add-feature`, `release-v1-0`). This format mirrors git branch naming conventions (e.g., `copilothive/{goal-id}`). Invalid goal IDs will throw an `ArgumentException` with a descriptive error message.
 
-When a goal completes (success or failure), the Orchestrator updates the goal entry with metadata including `phase_durations` — a map of phase names to wall-clock durations in seconds — and `iteration_summaries` — an array of structured summaries (one per iteration) capturing phases, test results, and review verdicts:
+When a goal completes (success or failure), the Orchestrator updates the goal entry with metadata including `total_duration_seconds` — total wall-clock duration from start to completion — `phase_durations` — a map of phase names to wall-clock durations in seconds — and `iteration_summaries` — an array of structured summaries (one per iteration) capturing phases, test results, and review verdicts:
 
 ```yaml
 goals:
@@ -98,6 +98,7 @@ goals:
     # ... (input fields above)
     started_at: "2026-03-17T19:38:37Z"
     completed_at: "2026-03-17T19:42:15Z"
+    total_duration_seconds: 218
     iterations: 2
     status: completed
     phase_durations:
