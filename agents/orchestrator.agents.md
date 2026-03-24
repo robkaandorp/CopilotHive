@@ -21,6 +21,7 @@ in your response text.
 Call this tool when planning which phases to run in an iteration:
 - `phases`: ordered list of phase names (e.g. ["coding", "testing", "docwriting", "review", "improve", "merging"])
 - `phase_instructions`: JSON object with per-phase context (e.g. {"coding": "focus on...", "review": "check..."})
+- `model_tiers` (optional): JSON object mapping phase names to model tiers. Use `"premium"` to escalate a phase to the premium model when standard quality is insufficient (e.g. after repeated failures or for complex tasks). Only phases that run workers can be escalated: coding, testing, docwriting, review, improve. Example: `{"coding": "premium", "review": "premium"}`. Omitted phases default to `"standard"`.
 - `reason`: why this plan
 
 When crafting worker prompts, respond with ONLY the prompt text — no tool calls, no JSON,
