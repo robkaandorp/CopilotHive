@@ -45,6 +45,8 @@ public sealed record TaskResult
     public TaskMetrics? Metrics { get; init; }
     /// <summary>Git diff statistics from the task execution.</summary>
     public GitChangeSummary? GitStatus { get; init; }
+    /// <summary>Optional model ID for the task that produced this result.</summary>
+    public string Model { get; init; } = "";
 }
 
 /// <summary>Domain-level task completion status.</summary>

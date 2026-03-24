@@ -171,10 +171,9 @@ public sealed class GoalDispatcher : BackgroundService
             return;
         }
 
-        var pipelineTaskModel = _taskQueue.GetActiveTask(pipeline.ActiveTaskId ?? "")?.Model;
         _logger.LogInformation("Pipeline {GoalId} task completed (phase={Phase}, status={Status}, model={Model})",
             pipeline.GoalId, pipeline.Phase, result.Status,
-            string.IsNullOrEmpty(pipelineTaskModel) ? "unknown" : pipelineTaskModel);
+            string.IsNullOrEmpty(result.Model) ? "unknown" : result.Model);
 
         if (_brain is null)
         {
@@ -300,11 +299,10 @@ public sealed class GoalDispatcher : BackgroundService
         var phaseDurationSeconds = pipeline.PhaseStartedAt.HasValue
             ? (DateTime.UtcNow - pipeline.PhaseStartedAt.Value).TotalSeconds
             : 0;
-        var phaseTaskModel = _taskQueue.GetActiveTask(pipeline.ActiveTaskId ?? "")?.Model;
         _logger.LogInformation(
             "Phase {Phase} for goal {GoalId} completed in {DurationSeconds:F1}s (model={Model})",
             pipeline.Phase, pipeline.GoalId, phaseDurationSeconds,
-            string.IsNullOrEmpty(phaseTaskModel) ? "unknown" : phaseTaskModel);
+            string.IsNullOrEmpty(result.Model) ? "unknown" : result.Model);
 
         _logger.LogInformation("Verdict for {GoalId} phase {Phase}: {Verdict} → {PhaseInput}",
             pipeline.GoalId, pipeline.Phase, verdict, phaseInput);

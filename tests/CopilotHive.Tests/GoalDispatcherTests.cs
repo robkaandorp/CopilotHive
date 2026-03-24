@@ -549,20 +549,6 @@ public sealed class GoalDispatcherModelLoggingTests
         pipelineManager.RegisterTask(taskId, goal.Id);
         pipeline.SetActiveTask(taskId);
 
-        // Create a task with a specific model and activate it in the queue
-        var workTask = new WorkTask
-        {
-            TaskId = taskId,
-            GoalId = goal.Id,
-            GoalDescription = goal.Description,
-            Prompt = "Test prompt",
-            Role = WorkerRole.Coder,
-            Model = "claude-sonnet-4-20250514",
-            Repositories = [],
-            Iteration = 1,
-        };
-        taskQueue.Activate(workTask, "test-worker");
-
         var dispatcher = new GoalDispatcher(
             goalManager,
             pipelineManager,
@@ -572,13 +558,14 @@ public sealed class GoalDispatcherModelLoggingTests
             logger,
             brain);
 
-        // Act
+        // Act — Model is carried directly on the TaskResult (populated by HiveOrchestratorService)
         await dispatcher.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
             Status = TaskOutcome.Completed,
             Output = "Work completed.",
             Metrics = new TaskMetrics { Verdict = "PASS" },
+            Model = "claude-sonnet-4-20250514",
         }, TestContext.Current.CancellationToken);
 
         // Assert - verify "model=claude-sonnet-4-20250514" appears in the task completed log
@@ -610,19 +597,6 @@ public sealed class GoalDispatcherModelLoggingTests
         pipelineManager.RegisterTask(taskId, goal.Id);
         pipeline.SetActiveTask(taskId);
 
-        var workTask = new WorkTask
-        {
-            TaskId = taskId,
-            GoalId = goal.Id,
-            GoalDescription = goal.Description,
-            Prompt = "Test prompt",
-            Role = WorkerRole.Tester,
-            Model = "claude-sonnet-4-20250514",
-            Repositories = [],
-            Iteration = 1,
-        };
-        taskQueue.Activate(workTask, "test-worker");
-
         var dispatcher = new GoalDispatcher(
             goalManager,
             pipelineManager,
@@ -632,13 +606,14 @@ public sealed class GoalDispatcherModelLoggingTests
             logger,
             brain);
 
-        // Act
+        // Act — Model is carried directly on the TaskResult
         await dispatcher.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
             Status = TaskOutcome.Completed,
             Output = "Testing passed.",
             Metrics = new TaskMetrics { Verdict = "PASS" },
+            Model = "claude-sonnet-4-20250514",
         }, TestContext.Current.CancellationToken);
 
         // Assert - verify "model=claude-sonnet-4-20250514" appears in the phase completed log
@@ -671,20 +646,6 @@ public sealed class GoalDispatcherModelLoggingTests
         pipelineManager.RegisterTask(taskId, goal.Id);
         pipeline.SetActiveTask(taskId);
 
-        // Create a task with an empty model
-        var workTask = new WorkTask
-        {
-            TaskId = taskId,
-            GoalId = goal.Id,
-            GoalDescription = goal.Description,
-            Prompt = "Test prompt",
-            Role = WorkerRole.Coder,
-            Model = "", // Empty model
-            Repositories = [],
-            Iteration = 1,
-        };
-        taskQueue.Activate(workTask, "test-worker");
-
         var dispatcher = new GoalDispatcher(
             goalManager,
             pipelineManager,
@@ -694,7 +655,7 @@ public sealed class GoalDispatcherModelLoggingTests
             logger,
             brain);
 
-        // Act
+        // Act — Model defaults to "" when not set on TaskResult
         await dispatcher.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,

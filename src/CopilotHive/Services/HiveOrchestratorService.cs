@@ -331,8 +331,8 @@ public sealed class HiveOrchestratorService(
             }
         }
 
-        // Convert to domain type at the boundary and notify GoalDispatcher
-        var result = GrpcMapper.ToDomain(complete);
+        // Convert to domain type at the boundary, injecting the model retrieved above
+        var result = GrpcMapper.ToDomain(complete) with { Model = completedTaskModel ?? "" };
         _ = Task.Run(async () =>
         {
             try
