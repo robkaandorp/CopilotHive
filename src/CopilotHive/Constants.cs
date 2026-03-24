@@ -11,7 +11,7 @@ internal static class Constants
     // Retry delays
     public const int RetryDelaySeconds      = 5;
     public const int WorkerBootDelaySeconds = 10;
-    public const int TaskTimeoutMinutes     = 3;
+    public const int TaskTimeoutMinutes     = 10;
 
     // Ports
     public const int DefaultHttpPort  = 5000;
