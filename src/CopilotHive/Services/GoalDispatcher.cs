@@ -270,6 +270,13 @@ public sealed class GoalDispatcher : BackgroundService
                 pipeline.Metrics.Issues.AddRange(metrics.Issues);
         }
 
+        // Record worker output in the conversation so the Brain sees it when replanning.
+        // This is critical: without this, the Brain knows "2 review retries" but not WHY
+        // the reviewer rejected. Use a structured summary to stay within token budget.
+        var workerRole = pipeline.Phase.ToWorkerRole().ToRoleName();
+        var outputSummary = BuildWorkerOutputSummary(pipeline.Phase, verdict, result);
+        pipeline.Conversation.Add(new ConversationEntry(workerRole, outputSummary));
+
         // After Improver: sync config repo to pick up the changes it pushed directly
         if (pipeline.Phase == GoalPhase.Improve)
         {
@@ -992,6 +999,46 @@ public sealed class GoalDispatcher : BackgroundService
         await CommitMetricsToConfigRepoAsync(pipeline, ct);
 
         _logger.LogWarning("Goal {GoalId} failed: {Reason}", pipeline.GoalId, reason);
+    }
+
+    /// <summary>
+    /// Builds a concise summary of worker output for the pipeline conversation.
+    /// The Brain uses this to understand what each phase produced — especially
+    /// WHY a reviewer rejected or what tests failed.
+    /// </summary>
+    internal static string BuildWorkerOutputSummary(GoalPhase phase, string verdict, TaskResult result)
+    {
+        var parts = new List<string> { $"Phase {phase} completed — verdict: {verdict}" };
+
+        if (result.GitStatus is { } git && git.FilesChanged > 0)
+            parts.Add($"Files changed: {git.FilesChanged} (+{git.Insertions} -{git.Deletions})");
+
+        if (result.Metrics is { } m)
+        {
+            if (m.TotalTests > 0)
+                parts.Add($"Tests: {m.PassedTests}/{m.TotalTests} passed, {m.FailedTests} failed");
+
+            if (m.Issues is { Count: > 0 })
+            {
+                parts.Add("Issues found:");
+                foreach (var issue in m.Issues)
+                    parts.Add($"  - {issue}");
+            }
+        }
+
+        // Include a truncated portion of the raw output for additional context
+        // (e.g. reviewer's detailed explanation, test failure stack traces)
+        var rawOutput = result.Output;
+        if (!string.IsNullOrWhiteSpace(rawOutput))
+        {
+            const int maxOutputChars = 1500;
+            var truncated = rawOutput.Length > maxOutputChars
+                ? rawOutput[..maxOutputChars] + "..."
+                : rawOutput;
+            parts.Add($"Worker output:\n{truncated}");
+        }
+
+        return string.Join("\n", parts);
     }
 
     /// <summary>

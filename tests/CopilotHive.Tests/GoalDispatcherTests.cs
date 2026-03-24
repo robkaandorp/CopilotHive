@@ -270,6 +270,108 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
 }
 
 /// <summary>
+/// Tests for <see cref="GoalDispatcher.BuildWorkerOutputSummary"/> logic.
+/// </summary>
+public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
+{
+    [Fact]
+    public void IncludesVerdictAndPhase()
+    {
+        var result = new TaskResult { TaskId = "t1", Status = TaskOutcome.Completed };
+        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Review, "REQUEST_CHANGES", result);
+
+        Assert.Contains("Phase Review completed", summary);
+        Assert.Contains("verdict: REQUEST_CHANGES", summary);
+    }
+
+    [Fact]
+    public void IncludesReviewIssues()
+    {
+        var result = new TaskResult
+        {
+            TaskId = "t1",
+            Status = TaskOutcome.Completed,
+            Metrics = new TaskMetrics
+            {
+                Verdict = "REQUEST_CHANGES",
+                Issues = ["GetActiveTask called after MarkComplete", "Missing null check on branch name"],
+            },
+        };
+
+        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Review, "REQUEST_CHANGES", result);
+
+        Assert.Contains("GetActiveTask called after MarkComplete", summary);
+        Assert.Contains("Missing null check on branch name", summary);
+        Assert.Contains("Issues found:", summary);
+    }
+
+    [Fact]
+    public void IncludesTestMetrics()
+    {
+        var result = new TaskResult
+        {
+            TaskId = "t1",
+            Status = TaskOutcome.Completed,
+            Metrics = new TaskMetrics
+            {
+                Verdict = "FAIL",
+                TotalTests = 50,
+                PassedTests = 47,
+                FailedTests = 3,
+            },
+        };
+
+        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Testing, "FAIL", result);
+
+        Assert.Contains("Tests: 47/50 passed, 3 failed", summary);
+    }
+
+    [Fact]
+    public void IncludesGitStats()
+    {
+        var result = new TaskResult
+        {
+            TaskId = "t1",
+            Status = TaskOutcome.Completed,
+            GitStatus = new GitChangeSummary { FilesChanged = 3, Insertions = 42, Deletions = 10 },
+        };
+
+        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.Contains("Files changed: 3 (+42 -10)", summary);
+    }
+
+    [Fact]
+    public void TruncatesLongOutput()
+    {
+        var longOutput = new string('x', 3000);
+        var result = new TaskResult
+        {
+            TaskId = "t1",
+            Status = TaskOutcome.Completed,
+            Output = longOutput,
+        };
+
+        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.Contains("Worker output:", summary);
+        Assert.Contains("...", summary);
+        // Should be significantly shorter than 3000 chars of raw output
+        Assert.True(summary.Length < 2000);
+    }
+
+    [Fact]
+    public void SkipsEmptyOutput()
+    {
+        var result = new TaskResult { TaskId = "t1", Status = TaskOutcome.Completed, Output = "" };
+
+        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.DoesNotContain("Worker output:", summary);
+    }
+}
+
+/// <summary>
 /// Tests for GoalDispatcher startup logging.
 /// </summary>
 public sealed class GoalDispatcherStartupLogTests
