@@ -23,14 +23,17 @@ git status --short
 # If there are changes, stage and commit them with a descriptive message
 ```
 
-### 2. Stop and remove containers + volumes
+### 2. Stop and remove containers (preserve volumes)
 
 ```powershell
 cd C:\Projects\Personal\CopilotHive\docker
-docker compose down -v
+docker compose down
 ```
 
 Wait for full removal before proceeding.
+
+> **Do NOT use `-v`** — persistent volumes contain `goals.db`, Brain/Composer session state,
+> and pipeline history that must survive restarts.
 
 ### 3. Sync CopilotHive repo
 
@@ -105,7 +108,9 @@ docker logs docker-orchestrator-1 2>&1 | Select-String -Pattern "goal|Goal" | Se
 
 ## Notes
 
-- The orchestrator picks up goals from `goals.yaml` on startup and periodically syncs
+- Goals are stored in SQLite (`goals.db`) on a persistent volume — they survive container restarts
+- On first startup, goals are imported from `goals.yaml` into SQLite (one-time bootstrap)
 - Workers register with the orchestrator via gRPC and receive task assignments
 - Rate limits can cause failures — if hit, wait the indicated time and re-run
 - The `seq` container (logging) persists across resets — no need to restart it
+- To fully reset state (goals, sessions, pipelines), use `docker compose down -v` then re-create
