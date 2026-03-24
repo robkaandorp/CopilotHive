@@ -36,8 +36,18 @@ public sealed class HiveTestFactory : WebApplicationFactory<Program>
     protected override void Dispose(bool disposing)
     {
         base.Dispose(disposing);
-        if (disposing && Directory.Exists(_stateDir))
-            Directory.Delete(_stateDir, recursive: true);
         Environment.SetEnvironmentVariable("STATE_DIR", null);
+
+        if (!disposing || !Directory.Exists(_stateDir))
+            return;
+
+        // Best-effort cleanup — SQLite may still hold file locks briefly after host shutdown.
+        // Files are in the OS temp directory and will be cleaned up eventually.
+        try
+        {
+            Directory.Delete(_stateDir, recursive: true);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 }
