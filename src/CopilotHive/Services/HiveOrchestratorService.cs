@@ -306,8 +306,10 @@ public sealed class HiveOrchestratorService(
 
     private void HandleTaskComplete(ConnectedWorker worker, TaskComplete complete)
     {
-        logger.LogInformation("Task {TaskId} completed by {WorkerId}: {Status}",
-            complete.TaskId, worker.Id, complete.Status);
+        var completedTaskModel = taskQueue.GetActiveTask(complete.TaskId)?.Model;
+        logger.LogInformation("Task {TaskId} completed by {WorkerId}: {Status} (model={Model})",
+            complete.TaskId, worker.Id, complete.Status,
+            string.IsNullOrEmpty(completedTaskModel) ? "unknown" : completedTaskModel);
 
         // Capture role before MarkIdle resets it to Unspecified
         var workerRole = worker.Role;
