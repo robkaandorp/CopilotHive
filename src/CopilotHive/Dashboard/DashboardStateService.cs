@@ -6,7 +6,7 @@ using CopilotHive.Services;
 namespace CopilotHive.Dashboard;
 
 /// <summary>
-/// Aggregates live state from WorkerPool, GoalPipelineManager, and ApiGoalSource
+/// Aggregates live state from WorkerPool, GoalPipelineManager, and SqliteGoalStore
 /// into a snapshot that Blazor components can bind to. Polls every few seconds
 /// and fires <see cref="OnStateChanged"/> to trigger UI re-renders.
 /// </summary>
@@ -15,6 +15,7 @@ public sealed class DashboardStateService : IDisposable
     private readonly WorkerPool _workerPool;
     private readonly GoalPipelineManager _pipelineManager;
     private readonly GoalManager _goalManager;
+    private readonly IGoalStore? _goalStore;
     private readonly DashboardLogSink _logSink;
     private readonly ProgressLog _progressLog;
     private readonly IDistributedBrain? _brain;
@@ -36,7 +37,8 @@ public sealed class DashboardStateService : IDisposable
         DashboardLogSink logSink,
         ProgressLog progressLog,
         IDistributedBrain? brain = null,
-        HiveConfigFile? config = null)
+        HiveConfigFile? config = null,
+        IGoalStore? goalStore = null)
     {
         _workerPool = workerPool;
         _pipelineManager = pipelineManager;
@@ -45,6 +47,7 @@ public sealed class DashboardStateService : IDisposable
         _progressLog = progressLog;
         _brain = brain;
         _config = config;
+        _goalStore = goalStore;
         _timer = new Timer(_ => PollAndNotify(), null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(3));
     }
 
@@ -81,11 +84,11 @@ public sealed class DashboardStateService : IDisposable
         foreach (var g in _cachedPendingGoals)
             goalsById.TryAdd(g.Id, g);
 
-        // Add API source goals (includes all statuses, not just pending)
-        var apiSource = _goalManager.Sources.OfType<ApiGoalSource>().FirstOrDefault();
-        if (apiSource is not null)
+        // Add all goals from SQLite store (includes all statuses)
+        if (_goalStore is not null)
         {
-            foreach (var g in apiSource.GetAllGoals())
+            var allGoals = _goalStore.GetAllGoalsAsync().GetAwaiter().GetResult();
+            foreach (var g in allGoals)
                 goalsById.TryAdd(g.Id, g);
         }
 

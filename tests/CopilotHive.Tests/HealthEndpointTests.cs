@@ -141,9 +141,9 @@ public class HealthEndpointTests : IClassFixture<HiveTestFactory>
         using var before = await GetHealthJsonAsync();
         var baselineActive = before.RootElement.GetProperty("activeGoals").GetInt32();
 
-        // Add a pending goal via the singleton ApiGoalSource.
-        var goalSource = _factory.Services.GetRequiredService<ApiGoalSource>();
-        goalSource.AddGoal(new Goal { Id = "test-goal-" + Guid.NewGuid(), Description = "behavior test goal" });
+        // Add a pending goal via the singleton SqliteGoalStore.
+        var goalStore = _factory.Services.GetRequiredService<SqliteGoalStore>();
+        await goalStore.CreateGoalAsync(new Goal { Id = "test-goal-" + Guid.NewGuid(), Description = "behavior test goal" }, TestContext.Current.CancellationToken);
 
         // Verify the count increased.
         using var after = await GetHealthJsonAsync();

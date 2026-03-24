@@ -46,7 +46,6 @@ static async Task<int> RunServerAsync(string[] args)
     builder.Services.AddSingleton<GrpcWorkerGateway>();
     builder.Services.AddSingleton<IWorkerGateway>(sp => sp.GetRequiredService<GrpcWorkerGateway>());
     builder.Services.AddSingleton<TaskQueue>();
-    builder.Services.AddSingleton<ApiGoalSource>();
     builder.Services.AddSingleton<TaskCompletionNotifier>();
     builder.Services.AddSingleton<ImprovementAnalyzer>();
 
@@ -149,14 +148,16 @@ static async Task<int> RunServerAsync(string[] args)
             builder.Logging.AddFilter("Grpc", LogLevel.Warning);
         }
     }
+    // Goals: SQLite-backed goal store (primary source of truth)
+    var goalsDbPath = Path.Combine(stateDir, "goals.db");
+    builder.Services.AddSingleton(sp =>
+        new SqliteGoalStore(goalsDbPath, sp.GetRequiredService<ILogger<SqliteGoalStore>>()));
+    builder.Services.AddSingleton<IGoalStore>(sp => sp.GetRequiredService<SqliteGoalStore>());
+
     builder.Services.AddSingleton(sp =>
     {
         var manager = new GoalManager();
-        manager.AddSource(sp.GetRequiredService<ApiGoalSource>());
-
-        if (!string.IsNullOrEmpty(goalsFile))
-            manager.AddSource(new FileGoalSource(goalsFile));
-
+        manager.AddSource(sp.GetRequiredService<SqliteGoalStore>());
         return manager;
     });
 
@@ -207,6 +208,20 @@ static async Task<int> RunServerAsync(string[] args)
         logger.LogInformation("Brain connected.");
     }
 
+    // Bootstrap: import goals from YAML file into SQLite (one-time migration)
+    if (!string.IsNullOrEmpty(goalsFile) && File.Exists(goalsFile))
+    {
+        var goalStore = app.Services.GetRequiredService<SqliteGoalStore>();
+        var fileSource = new FileGoalSource(goalsFile);
+        var yamlGoals = await fileSource.ReadGoalsAsync();
+        if (yamlGoals.Count > 0)
+        {
+            var imported = await goalStore.ImportGoalsAsync(yamlGoals);
+            if (imported > 0)
+                logger.LogInformation("Imported {Count} goals from {GoalsFile} into SQLite", imported, goalsFile);
+        }
+    }
+
     app.MapGrpcService<HiveOrchestratorService>();
 
     // Dashboard: Blazor Server (antiforgery keys persisted to state volume)
@@ -217,11 +232,11 @@ static async Task<int> RunServerAsync(string[] args)
     var _serverStartTime = DateTime.UtcNow;
     var _checkCount = 0;
     var _version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown";
-    app.MapGet("/health", (ApiGoalSource goalSource, WorkerPool workerPool) =>
+    app.MapGet("/health", async (SqliteGoalStore goalStore, WorkerPool workerPool) =>
     {
         var count = Interlocked.Increment(ref _checkCount);
         var uptime = DateTime.UtcNow - _serverStartTime;
-        var goals = goalSource.GetAllGoals();
+        var goals = await goalStore.GetAllGoalsAsync();
         return Results.Ok(new HealthResponse
         {
             Status = "Healthy",
@@ -243,13 +258,20 @@ static async Task<int> RunServerAsync(string[] args)
     // ── Goals REST API ───────────────────────────────────────────────────────
     var goalsApi = app.MapGroup("/api/goals");
 
-    goalsApi.MapGet("/", (ApiGoalSource source) => Results.Ok(source.GetAllGoals()));
+    goalsApi.MapGet("/", async (SqliteGoalStore store) =>
+        Results.Ok(await store.GetAllGoalsAsync()));
 
-    goalsApi.MapPost("/", (Goal goal, ApiGoalSource source) =>
+    goalsApi.MapGet("/{id}", async (string id, SqliteGoalStore store) =>
+    {
+        var goal = await store.GetGoalAsync(id);
+        return goal is null ? Results.NotFound(new { error = $"Goal '{id}' not found." }) : Results.Ok(goal);
+    });
+
+    goalsApi.MapPost("/", async (Goal goal, SqliteGoalStore store) =>
     {
         try
         {
-            var created = source.AddGoal(goal);
+            var created = await store.CreateGoalAsync(goal);
             return Results.Created($"/api/goals/{created.Id}", created);
         }
         catch (InvalidOperationException ex)
@@ -258,17 +280,14 @@ static async Task<int> RunServerAsync(string[] args)
         }
     });
 
-    goalsApi.MapPatch("/{id}/status", async (string id, GoalStatusUpdate update, GoalManager manager) =>
+    goalsApi.MapPatch("/{id}/status", async (string id, GoalStatusUpdate update, SqliteGoalStore store) =>
     {
         try
         {
             var status = Enum.Parse<GoalStatus>(update.Status, ignoreCase: true);
-            var source = manager.Sources.FirstOrDefault(s => s.Name == "api") as ApiGoalSource;
-            if (source is null)
-                return Results.Problem("API goal source not configured.");
-
-            await source.UpdateGoalStatusAsync(id, status);
-            return Results.Ok(source.GetGoal(id));
+            await store.UpdateGoalStatusAsync(id, status);
+            var goal = await store.GetGoalAsync(id);
+            return Results.Ok(goal);
         }
         catch (KeyNotFoundException)
         {
@@ -278,6 +297,21 @@ static async Task<int> RunServerAsync(string[] args)
         {
             return Results.BadRequest(new { error = $"Invalid status '{update.Status}'." });
         }
+    });
+
+    goalsApi.MapDelete("/{id}", async (string id, SqliteGoalStore store) =>
+    {
+        var deleted = await store.DeleteGoalAsync(id);
+        return deleted ? Results.NoContent() : Results.NotFound(new { error = $"Goal '{id}' not found." });
+    });
+
+    goalsApi.MapGet("/search", async (string q, string? status, SqliteGoalStore store) =>
+    {
+        GoalStatus? statusFilter = null;
+        if (!string.IsNullOrEmpty(status) && Enum.TryParse<GoalStatus>(status, ignoreCase: true, out var s))
+            statusFilter = s;
+        var results = await store.SearchGoalsAsync(q, statusFilter);
+        return Results.Ok(results);
     });
 
     await app.RunAsync();
