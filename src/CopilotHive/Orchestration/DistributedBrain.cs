@@ -581,8 +581,20 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// CodingAgent handles tool invocation (including file tools and custom tools),
     /// session management, and context compaction automatically.
     /// </summary>
+    /// <summary>Formats a context-usage log message for the Brain LLM call.</summary>
+    /// <param name="inputTokens">Cumulative input tokens used so far.</param>
+    /// <param name="contextWindow">Maximum context window size in tokens.</param>
+    /// <param name="callerName">Name of the calling method (populated by <see cref="System.Runtime.CompilerServices.CallerMemberNameAttribute"/>).</param>
+    /// <returns>A human-readable context-usage message.</returns>
+    internal static string FormatContextUsageMessage(long inputTokens, int contextWindow, string callerName)
+    {
+        var pct = contextWindow > 0 ? inputTokens * 100.0 / contextWindow : 0.0;
+        return $"Brain context usage: {pct:F1}% ({inputTokens}/{contextWindow} tokens) after {callerName}";
+    }
+
     private async Task<(string Text, BrainToolCallResult? ToolCall)> ExecuteBrainAsync(
-        string prompt, CancellationToken ct)
+        string prompt, CancellationToken ct,
+        [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         EnsureConnected();
 
@@ -613,6 +625,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 "Brain context: messages={Messages} ~tokens={EstTokens}/{Limit} ({Pct}%) cumIn={CumIn} cumOut={CumOut}",
                 _session.MessageHistory.Count, estimatedTokens, _maxContextTokens,
                 usagePct, _session.InputTokensUsed, _session.OutputTokensUsed);
+
+            _logger.LogInformation("{Message}", FormatContextUsageMessage(_session.InputTokensUsed, _maxContextTokens, callerName));
 
             _logger.LogDebug("Brain response ({Length} chars), tool={Tool}",
                 responseText.Length, _lastToolCallResult?.ToolName ?? "none");

@@ -174,6 +174,43 @@ public sealed class DistributedBrainTests
         Assert.Equal(GoalPhase.Testing, plan.Phases[1]);
     }
 
+    // -- FormatContextUsageMessage Tests --
+
+    [Fact]
+    public void FormatContextUsageMessage_ComputesCorrectPercentage()
+    {
+        var result = DistributedBrain.FormatContextUsageMessage(58000, 128000, "CraftPromptAsync");
+
+        Assert.StartsWith("Brain context usage:", result);
+        Assert.Contains("45.3%", result);
+        Assert.Contains("58000/128000 tokens", result);
+        Assert.EndsWith("after CraftPromptAsync", result);
+    }
+
+    [Fact]
+    public void FormatContextUsageMessage_ZeroContextWindow_DoesNotThrow()
+    {
+        var result = DistributedBrain.FormatContextUsageMessage(1000, 0, "SomeMethod");
+
+        Assert.Contains("Brain context usage:", result);
+    }
+
+    [Fact]
+    public void FormatContextUsageMessage_ContainsCallerName()
+    {
+        var result = DistributedBrain.FormatContextUsageMessage(10000, 150000, "PlanIterationAsync");
+
+        Assert.Contains("after PlanIterationAsync", result);
+    }
+
+    [Fact]
+    public void FormatContextUsageMessage_ExactFormat_MatchesExpectedString()
+    {
+        var result = DistributedBrain.FormatContextUsageMessage(75000, 150000, "PlanIterationAsync");
+
+        Assert.Equal("Brain context usage: 50.0% (75000/150000 tokens) after PlanIterationAsync", result);
+    }
+
     // -- Helpers --
 
     private static GoalPipeline CreatePipeline(string goalId, string description) =>
