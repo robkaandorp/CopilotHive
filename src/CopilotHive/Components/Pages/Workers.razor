@@ -52,7 +52,16 @@
                         }
                     </td>
                     <td style="font-family:monospace;font-size:0.85rem;color:var(--text-muted)">
-                        @(w.Role != "Unspecified" && _info.RoleModels.TryGetValue(w.Role.ToLowerInvariant(), out var m) ? m : "—")
+                        @{ var modelStr = w.Role != "Unspecified" && _info.RoleModels.TryGetValue(w.Role.ToLowerInvariant(), out var m) ? m : null; }
+                        @if (modelStr is not null)
+                        {
+                            @StripReasoning(modelStr)
+                            @ReasoningBadge(modelStr)
+                        }
+                        else
+                        {
+                            <text>—</text>
+                        }
                     </td>
                     <td>
                         <span class="badge @(w.IsBusy ? "badge-yellow" : "badge-green")">
@@ -97,6 +106,39 @@ else
         if (ago.TotalMinutes < 60) return $"{(int)ago.TotalMinutes}m ago";
         return $"{(int)ago.TotalHours}h {ago.Minutes}m ago";
     }
+
+    private static readonly HashSet<string> KnownReasoningLevels = new(StringComparer.OrdinalIgnoreCase)
+        { "none", "low", "medium", "high", "extra_high" };
+
+    private static string StripReasoning(string model)
+    {
+        var lastColon = model.LastIndexOf(':');
+        if (lastColon <= 0 || lastColon == model.Length - 1) return model;
+        var suffix = model[(lastColon + 1)..];
+        return KnownReasoningLevels.Contains(suffix) ? model[..lastColon] : model;
+    }
+
+    private static RenderFragment ReasoningBadge(string model) => builder =>
+    {
+        var lastColon = model.LastIndexOf(':');
+        if (lastColon <= 0 || lastColon == model.Length - 1) return;
+        var suffix = model[(lastColon + 1)..];
+        if (!KnownReasoningLevels.Contains(suffix)) return;
+
+        var color = suffix.ToLowerInvariant() switch
+        {
+            "extra_high" => "var(--red)",
+            "high" => "var(--accent)",
+            "medium" => "var(--green)",
+            "low" => "var(--text-muted)",
+            _ => "var(--text-muted)",
+        };
+        builder.OpenElement(0, "span");
+        builder.AddAttribute(1, "class", "badge");
+        builder.AddAttribute(2, "style", $"background:{color};color:#fff;font-size:0.7rem;margin-left:0.5rem");
+        builder.AddContent(3, suffix);
+        builder.CloseElement();
+    };
 
     public void Dispose() => State.OnStateChanged -= RefreshState;
 }

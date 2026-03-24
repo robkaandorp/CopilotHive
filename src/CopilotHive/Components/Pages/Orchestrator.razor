@@ -28,18 +28,20 @@
 <h2 style="margin-top:1.5rem">Model Configuration</h2>
 <table>
     <thead>
-        <tr><th>Role</th><th>Model</th></tr>
+        <tr><th>Role</th><th>Model</th><th>Reasoning</th></tr>
     </thead>
     <tbody>
         <tr>
             <td><span class="badge badge-yellow">brain</span></td>
-            <td style="font-family:monospace;font-size:0.85rem">@_info.BrainModel</td>
+            <td style="font-family:monospace;font-size:0.85rem">@StripReasoning(_info.BrainModel)</td>
+            <td>@ReasoningBadge(_info.BrainModel)</td>
         </tr>
         @foreach (var (role, model) in _info.RoleModels)
         {
             <tr>
                 <td><span class="badge badge-blue">@role</span></td>
-                <td style="font-family:monospace;font-size:0.85rem">@model</td>
+                <td style="font-family:monospace;font-size:0.85rem">@StripReasoning(model)</td>
+                <td>@ReasoningBadge(model)</td>
             </tr>
         }
     </tbody>
@@ -126,6 +128,39 @@ else
     private static string FormatUptime(TimeSpan ts) => ts.TotalHours >= 1
         ? $"{(int)ts.TotalHours}h {ts.Minutes}m {ts.Seconds}s"
         : $"{ts.Minutes}m {ts.Seconds}s";
+
+    private static readonly HashSet<string> KnownReasoningLevels = new(StringComparer.OrdinalIgnoreCase)
+        { "none", "low", "medium", "high", "extra_high" };
+
+    private static string StripReasoning(string model)
+    {
+        var lastColon = model.LastIndexOf(':');
+        if (lastColon <= 0 || lastColon == model.Length - 1) return model;
+        var suffix = model[(lastColon + 1)..];
+        return KnownReasoningLevels.Contains(suffix) ? model[..lastColon] : model;
+    }
+
+    private static RenderFragment ReasoningBadge(string model) => builder =>
+    {
+        var lastColon = model.LastIndexOf(':');
+        if (lastColon <= 0 || lastColon == model.Length - 1) return;
+        var suffix = model[(lastColon + 1)..];
+        if (!KnownReasoningLevels.Contains(suffix)) return;
+
+        var color = suffix.ToLowerInvariant() switch
+        {
+            "extra_high" => "var(--red)",
+            "high" => "var(--accent)",
+            "medium" => "var(--green)",
+            "low" => "var(--text-muted)",
+            _ => "var(--text-muted)",
+        };
+        builder.OpenElement(0, "span");
+        builder.AddAttribute(1, "class", "badge");
+        builder.AddAttribute(2, "style", $"background:{color};color:#fff;font-size:0.7rem");
+        builder.AddContent(3, suffix);
+        builder.CloseElement();
+    };
 
     public void Dispose() => State.OnStateChanged -= RefreshState;
 }
