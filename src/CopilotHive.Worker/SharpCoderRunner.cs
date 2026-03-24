@@ -119,10 +119,8 @@ public sealed class SharpCoderRunner : IAgentRunner
                       $"historyMessages={diag.SessionHistoryCount}, totalMessages={diag.TotalMessageCount}");
             _log.Info($"Diagnostics: tools=[{string.Join(", ", diag.ToolNames)}], bash={diag.EnableBash}, " +
                       $"fileWrites={diag.EnableFileWrites}, skills={diag.SkillsEnabled}, autoWorkspace={diag.AutoLoadedWorkspaceInstructions}");
-            if (_verboseLogging)
-            {
-                _log.Info($"SYSTEM PROMPT ({diag.SystemPrompt.Length} chars):\n{diag.SystemPrompt}");
-            }
+
+            WriteDiagnosticsFile(result, prompt, stopwatch.Elapsed);
         }
 
         _log.Info($"AgentResult: status={result.Status}, toolCalls={result.ToolCallCount}, model={result.ModelId}, finish={result.FinishReason}");
@@ -202,6 +200,70 @@ public sealed class SharpCoderRunner : IAgentRunner
             return $"\"{raw}\"";
 
         return $"{byteCount} bytes, {lineCount} lines";
+    }
+
+    private static readonly string DiagnosticsDir =
+        Environment.GetEnvironmentVariable("DIAGNOSTICS_DIR") ?? "/app/diagnostics";
+
+    private void WriteDiagnosticsFile(AgentResult result, string userPrompt, TimeSpan elapsed)
+    {
+        try
+        {
+            Directory.CreateDirectory(DiagnosticsDir);
+
+            var taskId = _currentTaskId ?? "unknown";
+            var timestamp = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmss");
+            var fileName = $"{timestamp}_{taskId}.json";
+            var filePath = Path.Combine(DiagnosticsDir, fileName);
+
+            var diag = result.Diagnostics!;
+            var doc = new
+            {
+                taskId,
+                role = _currentRole.ToString(),
+                model = _currentModel,
+                reasoning = _currentReasoning?.ToString(),
+                timestamp = DateTimeOffset.UtcNow,
+                elapsedSeconds = elapsed.TotalSeconds,
+                status = result.Status,
+                toolCallCount = result.ToolCallCount,
+                finishReason = result.FinishReason?.ToString(),
+                usage = result.Usage is { } u ? new
+                {
+                    inputTokens = u.InputTokenCount,
+                    outputTokens = u.OutputTokenCount,
+                    totalTokens = u.TotalTokenCount
+                } : null,
+                session = new
+                {
+                    diag.SessionHistoryCount,
+                    diag.TotalMessageCount,
+                    diag.MaxSteps,
+                    diag.EnableBash,
+                    diag.EnableFileWrites,
+                    diag.AutoLoadedWorkspaceInstructions,
+                    diag.SkillsEnabled,
+                    diag.ReasoningEffort,
+                    diag.WorkDirectory,
+                    toolNames = diag.ToolNames
+                },
+                systemPrompt = diag.SystemPrompt,
+                userMessage = userPrompt,
+                agentResponse = result.Message
+            };
+
+            var json = JsonSerializer.Serialize(doc, new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+            });
+            File.WriteAllText(filePath, json);
+            _log.Info($"Diagnostics written to {filePath} ({json.Length} bytes)");
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"Failed to write diagnostics file: {ex.Message}");
+        }
     }
 
     private IChatClient CreateChatClient(string? modelOverride = null)

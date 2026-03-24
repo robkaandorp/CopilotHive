@@ -42,11 +42,14 @@ services:
         condition: service_healthy
     deploy:
       replicas: ${WORKER_REPLICAS:-1}
+    volumes:
+      - diagnostics:/app/diagnostics
     networks:
       - hive
 
 volumes:
   orchestrator-state:
+  diagnostics:
 
 networks:
   hive:
