@@ -37,7 +37,7 @@ public static class ChatClientFactory
                 var apiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
                 if (string.IsNullOrEmpty(apiKey)) throw new InvalidOperationException("OLLAMA_API_KEY is required for ollama-cloud provider");
 
-                var httpClient = new HttpClient { BaseAddress = new Uri("https://ollama.com") };
+                var httpClient = new HttpClient { BaseAddress = new Uri("https://ollama.com"), Timeout = TimeSpan.FromMinutes(10) };
                 httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
 
                 model ??= Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "gpt-oss:120b";
@@ -167,7 +167,7 @@ public static class ChatClientFactory
         if (RequiresResponsesEndpoint(model))
         {
             var handler = new CopilotResponsesHandler(new HttpClientHandler());
-            var httpClient = new HttpClient(handler);
+            var httpClient = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(10) };
 
             var openAiClient = new OpenAIClient(
                 new ApiKeyCredential(ghToken),
@@ -182,7 +182,7 @@ public static class ChatClientFactory
         else
         {
             var handler = new CopilotChoiceMergingHandler(new HttpClientHandler());
-            var httpClient = new HttpClient(handler);
+            var httpClient = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(10) };
 
             var openAiClient = new OpenAIClient(
                 new ApiKeyCredential(ghToken),
