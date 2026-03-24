@@ -205,12 +205,12 @@ file sealed class CapturingBrain : IDistributedBrain
     {
         var plan = IterationPlan.Default();
 
-        // Set the requested tier on roles that have workers
+        // Set the requested tier on phases that have workers
         foreach (var phase in plan.Phases)
         {
             if (phase is GoalPhase.Planning or GoalPhase.Merging or GoalPhase.Done or GoalPhase.Failed)
                 continue;
-            plan.RoleTiers[phase.ToWorkerRole()] = _modelTierToReturn;
+            plan.PhaseTiers[phase] = _modelTierToReturn;
         }
 
         return Task.FromResult(plan);

@@ -565,18 +565,19 @@ public sealed class GoalDispatcher : BackgroundService
             return;
         }
 
-        // Resolve per-role model from config; upgrade to premium when the Brain requested it
+        // Resolve per-role model from config; upgrade to premium when the Brain requested it for this phase
         var roleName = role.ToRoleName();
         var model = _config?.GetModelForRole(roleName);
-        var roleTier = pipeline.Plan?.RoleTiers.GetValueOrDefault(role, ModelTier.Default) ?? ModelTier.Default;
-        if (roleTier == ModelTier.Premium && _config is not null)
+        var currentPhase = pipeline.StateMachine.Phase;
+        var phaseTier = pipeline.Plan?.PhaseTiers.GetValueOrDefault(currentPhase, ModelTier.Default) ?? ModelTier.Default;
+        if (phaseTier == ModelTier.Premium && _config is not null)
         {
             var premiumModel = _config.GetPremiumModelForRole(roleName);
             if (premiumModel is not null)
                 model = premiumModel;
         }
         _logger.LogDebug("Model for {Role}: {Model} (tier={Tier}, configLoaded={ConfigLoaded})",
-            roleName, model ?? "(null)", roleTier, _config is not null);
+            roleName, model ?? "(null)", phaseTier, _config is not null);
 
         var task = _taskBuilder.Build(
             goalId: pipeline.GoalId,

@@ -159,8 +159,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     {
         var validPhases = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { "coding", "testing", "docwriting", "review", "improve", "merging" };
-        var validRoles = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "coder", "tester", "reviewer", "docwriter", "improver" };
+        var tierablePhases = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "coding", "testing", "docwriting", "review", "improve" };
         var validTiers = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { "standard", "premium" };
 
@@ -170,7 +170,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 ([Description("Ordered phase names, e.g. [\"coding\",\"testing\",\"docwriting\",\"review\",\"merging\"]")] string[] phases,
                  [Description("JSON-encoded dict of phase name to instruction, e.g. {\"coding\":\"focus on...\",\"review\":\"check...\"}")] string phase_instructions,
                  [Description("Why you chose this iteration plan")] string reason,
-                 [Description("Optional JSON-encoded dict of worker role to model tier, e.g. {\"coder\":\"premium\"}. Valid roles: coder, tester, reviewer, docwriter, improver. Valid tiers: standard, premium. Omitted roles use the default tier.")] string? model_tiers = null) =>
+                 [Description("Optional JSON-encoded dict of phase name to model tier, e.g. {\"coding\":\"premium\"}. Valid phases: coding, testing, docwriting, review, improve. Valid tiers: standard, premium. Omitted phases use the default tier.")] string? model_tiers = null) =>
                 {
                     var invalidPhases = phases?.Where(p => !validPhases.Contains(p)).ToList() ?? [];
 
@@ -190,9 +190,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
                         if (parsedTiers is not null)
                         {
-                            var invalidRoles = parsedTiers.Keys.Where(k => !validRoles.Contains(k)).ToList();
-                            if (invalidRoles.Count > 0)
-                                tierErrors.Add($"invalid role names in model_tiers: {string.Join(", ", invalidRoles)}. Valid: {string.Join(", ", validRoles)}");
+                            var invalidTierPhases = parsedTiers.Keys.Where(k => !tierablePhases.Contains(k)).ToList();
+                            if (invalidTierPhases.Count > 0)
+                                tierErrors.Add($"invalid phase names in model_tiers: {string.Join(", ", invalidTierPhases)}. Valid: {string.Join(", ", tierablePhases)}");
 
                             var invalidTierValues = parsedTiers.Values.Where(v => !validTiers.Contains(v)).ToList();
                             if (invalidTierValues.Count > 0)
@@ -329,10 +329,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - phases: ordered list of phase names
             - phase_instructions: JSON object with per-phase instructions (e.g. {"coding": "focus on...", "review": "check..."})
             - reason: why this plan
-            - model_tiers: (optional) JSON object to escalate specific roles to premium tier
-              (e.g. {"coder": "premium"}). Valid roles: coder, tester, reviewer, docwriter, improver.
+            - model_tiers: (optional) JSON object to escalate specific phases to premium tier
+              (e.g. {"coding": "premium"}). Valid phases: coding, testing, docwriting, review, improve.
               Only use premium when previous iterations failed and you believe the task requires
-              stronger reasoning. Omitted roles use the default tier.
+              stronger reasoning. Omitted phases use the default tier.
             """;
 
         if (_agent is null)
@@ -426,14 +426,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             }
         }
 
-        var roleTiers = new Dictionary<WorkerRole, ModelTier>();
+        var phaseTiers = new Dictionary<GoalPhase, ModelTier>();
         if (dto.ModelTiers is not null)
         {
             foreach (var (key, value) in dto.ModelTiers)
             {
-                var role = WorkerRoleExtensions.ParseRole(key);
-                if (role is not null && value is not null)
-                    roleTiers[role.Value] = ModelTierExtensions.ParseModelTier(value);
+                if (Enum.TryParse<GoalPhase>(key, ignoreCase: true, out var phase) && value is not null)
+                    phaseTiers[phase] = ModelTierExtensions.ParseModelTier(value);
             }
         }
 
@@ -441,7 +440,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             Phases = phases,
             PhaseInstructions = instructions,
-            RoleTiers = roleTiers,
+            PhaseTiers = phaseTiers,
             Reason = dto.Reason,
         };
     }
