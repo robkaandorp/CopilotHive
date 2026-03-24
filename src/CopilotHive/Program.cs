@@ -85,13 +85,17 @@ static async Task<int> RunServerAsync(string[] args)
         builder.Services.AddSingleton<IDistributedBrain>(sp =>
         {
             var config = sp.GetService<HiveConfigFile>();
+            // Config file model takes precedence over env var default (includes reasoning suffix)
+            var effectiveModel = !string.IsNullOrEmpty(config?.Orchestrator.Model)
+                ? config.Orchestrator.Model
+                : brainModel;
             var maxCtx = int.TryParse(brainContextWindowEnv, out var envCtx)
                 ? envCtx
                 : config?.Orchestrator.BrainContextWindow ?? Constants.DefaultBrainContextWindow;
             var maxSteps = int.TryParse(brainMaxStepsEnv, out var envSteps)
                 ? envSteps
                 : config?.Orchestrator.BrainMaxSteps ?? Constants.DefaultBrainMaxSteps;
-            return new DistributedBrain(brainModel, sp.GetRequiredService<ILogger<DistributedBrain>>(),
+            return new DistributedBrain(effectiveModel, sp.GetRequiredService<ILogger<DistributedBrain>>(),
                 sp.GetRequiredService<MetricsTracker>(),
                 sp.GetService<AgentsManager>(),
                 maxCtx,
