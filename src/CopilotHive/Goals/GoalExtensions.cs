@@ -22,6 +22,7 @@ public static class GoalExtensions
     /// <returns>A display name string for the given status.</returns>
     public static string ToDisplayName(this GoalStatus status) => status switch
     {
+        GoalStatus.Draft => "Draft",
         GoalStatus.Pending => "Pending",
         GoalStatus.InProgress => "In Progress",
         GoalStatus.Completed => "Completed",

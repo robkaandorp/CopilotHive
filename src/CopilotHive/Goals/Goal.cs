@@ -90,6 +90,8 @@ public enum GoalPriority
 /// <summary>Lifecycle status values for a goal.</summary>
 public enum GoalStatus
 {
+    /// <summary>Goal is a draft — proposed but not yet approved for execution.</summary>
+    Draft,
     /// <summary>Goal has not yet been started.</summary>
     Pending,
     /// <summary>Goal is currently being worked on.</summary>

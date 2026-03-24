@@ -168,6 +168,7 @@ public sealed class FileGoalSource : IGoalSource
 
     private static GoalStatus ParseStatus(string? value) => value?.ToLowerInvariant().Replace("_", "") switch
     {
+        "draft" => GoalStatus.Draft,
         "inprogress" => GoalStatus.InProgress,
         "completed" => GoalStatus.Completed,
         "failed" => GoalStatus.Failed,
