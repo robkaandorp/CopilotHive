@@ -25,6 +25,7 @@ namespace CopilotHive.Worker;
 public sealed class SharpCoderRunner : IAgentRunner
 {
     private readonly WorkerLogger _log = new("SharpCoder");
+    private readonly bool _verboseLogging = Environment.GetEnvironmentVariable("VERBOSE_LOGGING") == "true";
     private IChatClient? _chatClient;
     private string _currentModel = "(default)";
     private ReasoningEffort? _currentReasoning;
@@ -110,6 +111,19 @@ public sealed class SharpCoderRunner : IAgentRunner
         stopwatch.Stop();
         var elapsedSecs = stopwatch.Elapsed.TotalSeconds.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
         _log.Info($"Task finished in {elapsedSecs}s (status={result.Status}, toolCalls={result.ToolCallCount})");
+
+        // Log diagnostics when available
+        if (result.Diagnostics is { } diag)
+        {
+            _log.Info($"Diagnostics: systemPrompt={diag.SystemPrompt.Length} chars, userMessage={diag.UserMessage.Length} chars, " +
+                      $"historyMessages={diag.SessionHistoryCount}, totalMessages={diag.TotalMessageCount}");
+            _log.Info($"Diagnostics: tools=[{string.Join(", ", diag.ToolNames)}], bash={diag.EnableBash}, " +
+                      $"fileWrites={diag.EnableFileWrites}, skills={diag.SkillsEnabled}, autoWorkspace={diag.AutoLoadedWorkspaceInstructions}");
+            if (_verboseLogging)
+            {
+                _log.Info($"SYSTEM PROMPT ({diag.SystemPrompt.Length} chars):\n{diag.SystemPrompt}");
+            }
+        }
 
         _log.Info($"AgentResult: status={result.Status}, toolCalls={result.ToolCallCount}, model={result.ModelId}, finish={result.FinishReason}");
         if (result.Usage != null)
@@ -238,7 +252,7 @@ public sealed class SharpCoderRunner : IAgentRunner
         if (_currentRole == WorkerRole.Reviewer)
             tools.Add(BuildReviewVerdictTool());
 
-        if (_currentRole == WorkerRole.Coder || _currentRole == WorkerRole.Reviewer)
+        if (_currentRole == WorkerRole.Coder)
             tools.Add(BuildCodeChangesTool());
 
         if (_currentRole == WorkerRole.DocWriter)
