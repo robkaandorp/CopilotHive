@@ -880,8 +880,9 @@ public sealed class GoalDispatcher : BackgroundService
 
         pipeline.AdvanceTo(GoalPhase.Done);
 
-        var duration = (pipeline.CompletedAt.HasValue && pipeline.Goal.StartedAt.HasValue)
-            ? pipeline.CompletedAt.Value - pipeline.Goal.StartedAt.Value
+        var goalStartedAt = pipeline.GoalStartedAt ?? pipeline.Goal.StartedAt ?? pipeline.CreatedAt;
+        var duration = pipeline.CompletedAt.HasValue
+            ? pipeline.CompletedAt.Value - goalStartedAt
             : TimeSpan.Zero;
 
         var completedMeta = new GoalUpdateMetadata
@@ -1223,6 +1224,7 @@ public sealed class GoalDispatcher : BackgroundService
         var maxRetries = _config?.Orchestrator?.MaxRetriesPerTask ?? Constants.DefaultMaxRetriesPerTask;
         var maxIterations = _config?.Orchestrator?.MaxIterations ?? Constants.DefaultMaxIterations;
         var pipeline = _pipelineManager.CreatePipeline(goal, maxRetries, maxIterations);
+        pipeline.GoalStartedAt = startedMeta.StartedAt;
 
         // Plan iteration phases
         IterationPlan iterationPlan;
