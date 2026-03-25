@@ -30,7 +30,7 @@ CopilotHive/
 │   ├── Services/GoalDispatcher.cs    # Pipeline state machine with phase sequencing
 │   ├── Workers/DockerWorkerManager.cs # Docker container lifecycle
 │   └── Program.cs                    # CLI entrypoint
-├── tests/CopilotHive.Tests/         # 616+ xUnit tests
+├── tests/CopilotHive.Tests/         # 636+ xUnit tests
 ├── agents/                           # AGENTS.md templates per role
 │   ├── orchestrator.agents.md
 │   ├── coder.agents.md
