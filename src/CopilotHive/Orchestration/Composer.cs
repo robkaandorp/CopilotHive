@@ -42,6 +42,7 @@ public sealed class Composer : IAsyncDisposable
         - Create goals as drafts for user review (create_goal)
         - Approve drafts to queue them for execution (approve_goal)
         - Update existing goals (update_goal)
+        - Delete draft or failed goals (delete_goal)
 
         Guidelines for goal creation:
         - Each goal should be completable in 1-3 iterations (small, focused)
@@ -265,6 +266,8 @@ public sealed class Composer : IAsyncDisposable
                 "List goals, optionally filtered by status."),
             AIFunctionFactory.Create(SearchGoalsAsync, "search_goals",
                 "Search goals by text query across ID, description, and failure reason."),
+            AIFunctionFactory.Create(DeleteGoalAsync, "delete_goal",
+                "Permanently delete a goal. Only Draft or Failed goals can be deleted."),
         ];
     }
 
@@ -335,6 +338,29 @@ public sealed class Composer : IAsyncDisposable
         _logger.LogInformation("Composer approved goal '{GoalId}' → Pending", id);
 
         return $"✅ Goal '{id}' approved — status changed to Pending. It will be dispatched in the next cycle.";
+    }
+
+    [Description("Permanently delete a goal. Only Draft or Failed goals can be deleted.")]
+    internal async Task<string> DeleteGoalAsync(
+        [Description("Goal ID to delete")] string id)
+    {
+        var error = Shared.ToolValidation.Check(
+            (!string.IsNullOrWhiteSpace(id), "id is required"));
+        if (error is not null) return error;
+
+        var goal = await _goalStore.GetGoalAsync(id);
+        if (goal is null)
+            return $"❌ Goal '{id}' not found.";
+
+        if (goal.Status is not (GoalStatus.Draft or GoalStatus.Failed))
+            return $"❌ Goal '{id}' is {goal.Status.ToDisplayName()}. Only Draft or Failed goals can be deleted.";
+
+        var deleted = await _goalStore.DeleteGoalAsync(id);
+        if (!deleted)
+            return $"❌ Failed to delete goal '{id}'.";
+
+        _logger.LogInformation("Composer deleted goal '{GoalId}'", id);
+        return $"✅ Goal '{id}' has been permanently deleted.";
     }
 
     [Description("Update a field on an existing goal.")]

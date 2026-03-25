@@ -317,5 +317,59 @@ public sealed class ComposerToolTests : IDisposable
 
         Assert.Contains("ERROR", result);
     }
+
+    // ── delete_goal ──
+
+    [Fact]
+    public async Task DeleteGoal_DraftGoal_Deletes()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateGoalAsync("del-draft", "To be deleted");
+
+        var result = await _composer.DeleteGoalAsync("del-draft");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("deleted", result);
+        var goal = await _store.GetGoalAsync("del-draft", ct);
+        Assert.Null(goal);
+    }
+
+    [Fact]
+    public async Task DeleteGoal_FailedGoal_Deletes()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateGoalAsync("del-failed", "Will fail");
+        var goal = (await _store.GetGoalAsync("del-failed", ct))!;
+        goal.Status = GoalStatus.Failed;
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.DeleteGoalAsync("del-failed");
+
+        Assert.Contains("✅", result);
+    }
+
+    [Fact]
+    public async Task DeleteGoal_PendingGoal_Rejected()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateGoalAsync("del-pending", "Active goal");
+        await _composer.ApproveGoalAsync("del-pending");
+
+        var result = await _composer.DeleteGoalAsync("del-pending");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Pending", result);
+        var goal = await _store.GetGoalAsync("del-pending", ct);
+        Assert.NotNull(goal);
+    }
+
+    [Fact]
+    public async Task DeleteGoal_NotFound_ReturnsError()
+    {
+        var result = await _composer.DeleteGoalAsync("nonexistent");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not found", result);
+    }
 }
 
