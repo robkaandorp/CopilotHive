@@ -2,6 +2,7 @@
 @using CopilotHive.Dashboard
 @using CopilotHive.Goals
 @using CopilotHive.Orchestration
+@using Markdig
 @implements IDisposable
 @inject DashboardStateService State
 @inject IGoalStore GoalStore
@@ -13,7 +14,7 @@
     <!-- Header -->
     <div class="card" style="margin-bottom:1rem">
         <div class="label">Description</div>
-        <div>@_detail.Description</div>
+        <div class="chat-msg-content">@((MarkupString)RenderMarkdown(_detail.Description))</div>
         <div style="margin-top:0.5rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
             <span class="badge @StatusBadge(_detail.Status)">@_detail.Status</span>
             <span style="color:var(--text-muted)">Priority: @_detail.Priority</span>
@@ -253,7 +254,7 @@ else if (_storedGoal is not null)
     <!-- Stored Goal (from SQLite — no active pipeline) -->
     <div class="card" style="margin-bottom:1rem">
         <div class="label">Description</div>
-        <div>@_storedGoal.Description</div>
+        <div class="chat-msg-content">@((MarkupString)RenderMarkdown(_storedGoal.Description))</div>
         <div style="margin-top:0.5rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
             <span class="badge @StatusBadge(_storedGoal.Status)">@_storedGoal.Status</span>
             <span style="color:var(--text-muted)">Priority: @_storedGoal.Priority</span>
@@ -496,6 +497,16 @@ else
 
     private static string Truncate(string s, int max) =>
         s.Length <= max ? s : s[..max] + "…";
+
+    private static readonly MarkdownPipeline MdPipeline = new MarkdownPipelineBuilder()
+        .UseAdvancedExtensions()
+        .Build();
+
+    private static string RenderMarkdown(string content)
+    {
+        if (string.IsNullOrEmpty(content)) return "";
+        return Markdown.ToHtml(content, MdPipeline);
+    }
 
     public void Dispose() => State.OnStateChanged -= RefreshState;
 }
