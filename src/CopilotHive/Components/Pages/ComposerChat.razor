@@ -4,6 +4,7 @@
 @using Markdig
 @implements IDisposable
 @inject Composer Composer
+@inject IJSRuntime JS
 
 <h1>💬 Composer</h1>
 
@@ -44,6 +45,8 @@ else
                     </div>
                 </div>
             }
+
+            <div id="chat-anchor"></div>
         </div>
 
         <div class="chat-input-area">
@@ -104,6 +107,12 @@ else
                 _messages.Add(new ChatMessage { Role = role, Content = content });
             }
         }
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        await JS.InvokeVoidAsync("eval",
+            "document.getElementById('chat-anchor')?.scrollIntoView()");
     }
 
     private async Task SendMessage()
