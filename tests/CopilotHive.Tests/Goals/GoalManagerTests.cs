@@ -265,7 +265,48 @@ public sealed class GoalManagerDependencyTests
         Assert.Equal("high-prio", result.Id);
     }
 
-    // ── Test 8: Debug log emitted when a goal is blocked ────────────────────
+    // ── Test 9: Dependency completed before first poll is resolved ───────────
+
+    /// <summary>
+    /// When a dependency is already <see cref="GoalStatus.Completed"/> before the first
+    /// dispatch poll (i.e., it never appears in <c>GetPendingGoalsAsync</c> and is therefore
+    /// never added to the internal source map), <see cref="GoalManager.GetNextGoalAsync"/>
+    /// must still resolve it via the fallback <see cref="IGoalStore.GetGoalAsync"/> search
+    /// and return the child goal.
+    /// </summary>
+    [Fact]
+    public async Task DependencyCompletedBeforeFirstPoll_IsResolved()
+    {
+        // Arrange: parent is already Completed in the store (never pending)
+        var parentGoal = new Goal
+        {
+            Id = "pre-completed-parent",
+            Description = "Parent goal that was completed before any poll",
+            Status = GoalStatus.Completed,
+        };
+        var childGoal = new Goal
+        {
+            Id = "pre-completed-child",
+            Description = "Child goal depending on pre-completed parent",
+            DependsOn = ["pre-completed-parent"],
+        };
+
+        var store = new DependencyTestGoalStore("store");
+        // Add parent with Completed status — it will NOT appear in GetPendingGoalsAsync
+        store.AddGoal(parentGoal);
+        store.AddGoal(childGoal);
+
+        var manager = new GoalManager();
+        manager.AddSource(store);
+
+        // Act: first (and only) call — parent is Completed and not pending, child is pending
+        var result = await manager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+
+        // Assert: child must be returned because parent is already Completed
+        Assert.NotNull(result);
+        Assert.Equal("pre-completed-child", result.Id);
+    }
+
 
     /// <summary>
     /// When a goal is blocked by an unsatisfied dependency, a Debug log is emitted

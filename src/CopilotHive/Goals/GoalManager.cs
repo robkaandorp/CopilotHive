@@ -92,19 +92,19 @@ public sealed class GoalManager
                 continue;
             }
 
-            var unsatisfied = await GetUnsatisfiedDependenciesAsync(goal.DependsOn, ct);
+            var unsatisfied = await GetUnsatisfiedDependenciesAsync(goal.DependsOn, snapshot, ct);
 
             if (unsatisfied.Count > 0)
             {
                 _logger.LogDebug(
-                    "Goal '{GoalId}' has unsatisfied dependencies: {UnsatisfiedIds}. Checking...",
+                    "Goal '{GoalId}' blocked — unsatisfied dependencies: {Unsatisfied}",
                     goal.Id, string.Join(", ", unsatisfied));
                 continue; // blocked — skip this goal
             }
 
             // All dependencies satisfied
             _logger.LogDebug(
-                "Goal '{GoalId}' is eligible for dispatch (all dependencies satisfied)",
+                "Goal '{GoalId}' eligible — all dependencies satisfied",
                 goal.Id);
 
             if (best is null || ComparePriority(goal.Priority, best.Priority) > 0)
@@ -159,12 +159,16 @@ public sealed class GoalManager
     /// Returns the list of dependency IDs from <paramref name="dependsOn"/> that are not yet
     /// satisfied.  A dependency is considered satisfied only when the backing source knows about
     /// it and reports its status as <see cref="GoalStatus.Completed"/>.
+    /// When a dependency has never been seen as pending (not in the source map), all registered
+    /// <see cref="IGoalStore"/> sources are searched as a fallback so that goals already
+    /// completed before the first poll are correctly resolved.
     /// </summary>
     /// <param name="dependsOn">Dependency goal IDs to check.</param>
+    /// <param name="snapshot">Snapshot of all registered sources used for fallback lookups.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>IDs of dependencies that are not yet completed.</returns>
     private async Task<List<string>> GetUnsatisfiedDependenciesAsync(
-        IReadOnlyList<string> dependsOn, CancellationToken ct)
+        IReadOnlyList<string> dependsOn, IReadOnlyList<IGoalSource> snapshot, CancellationToken ct)
     {
         var unsatisfied = new List<string>();
 
@@ -173,26 +177,47 @@ public sealed class GoalManager
             IGoalSource? depSource;
             lock (_lock) { _goalSourceMap.TryGetValue(depId, out depSource); }
 
-            if (depSource is null)
+            if (depSource is not null)
             {
-                // Dependency has never been seen by any source — treat as unsatisfied
-                unsatisfied.Add(depId);
+                // Source is known — check status via IGoalStore if available
+                if (depSource is IGoalStore knownStore)
+                {
+                    var dep = await knownStore.GetGoalAsync(depId, ct);
+                    if (dep is null || dep.Status != GoalStatus.Completed)
+                        unsatisfied.Add(depId);
+                }
+                else
+                {
+                    // Source is not an IGoalStore — cannot query individual goal status.
+                    // Fall back to conservative: treat as unsatisfied.
+                    unsatisfied.Add(depId);
+                }
                 continue;
             }
 
-            // Try to look up the goal's current status
-            if (depSource is IGoalStore store)
+            // Dependency was never seen as pending (not in source map).
+            // It may have been completed before the first poll.
+            // Search all registered IGoalStore sources as a fallback.
+            var foundSatisfied = false;
+            foreach (var source in snapshot)
             {
-                var dep = await store.GetGoalAsync(depId, ct);
-                if (dep is null || dep.Status != GoalStatus.Completed)
-                    unsatisfied.Add(depId);
+                if (source is IGoalStore fallbackStore)
+                {
+                    var dep = await fallbackStore.GetGoalAsync(depId, ct);
+                    if (dep is not null)
+                    {
+                        lock (_lock) { _goalSourceMap.TryAdd(depId, source); }
+                        if (dep.Status == GoalStatus.Completed)
+                        {
+                            foundSatisfied = true;
+                        }
+                        break;
+                    }
+                }
             }
-            else
-            {
-                // Source is not an IGoalStore — cannot query individual goal status.
-                // Fall back to conservative: treat as unsatisfied.
+
+            if (!foundSatisfied)
                 unsatisfied.Add(depId);
-            }
         }
 
         return unsatisfied;
