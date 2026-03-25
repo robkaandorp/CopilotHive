@@ -63,6 +63,38 @@ public sealed class PipelineStateMachine
     public IReadOnlyList<GoalPhase> RemainingPhases => [.. _remainingPhases];
 
     /// <summary>
+    /// Restore the state machine mid-iteration from a persisted plan and current phase.
+    /// Phases before <paramref name="currentPhase"/> in the plan are marked completed;
+    /// the current phase becomes active; phases after it are queued.
+    /// </summary>
+    public void RestoreFromPlan(IReadOnlyList<GoalPhase> phases, GoalPhase currentPhase)
+    {
+        _remainingPhases.Clear();
+        _completedPhases.Clear();
+
+        var found = false;
+        foreach (var phase in phases)
+        {
+            if (phase == currentPhase)
+            {
+                Phase = phase;
+                found = true;
+            }
+            else if (!found)
+            {
+                _completedPhases.Add(phase);
+            }
+            else
+            {
+                _remainingPhases.Enqueue(phase);
+            }
+        }
+
+        if (!found)
+            Phase = currentPhase;
+    }
+
+    /// <summary>
     /// Initialize the state machine for a new iteration with the given phase plan.
     /// Resets the phase queue and sets Phase to Coding (the first phase).
     /// </summary>

@@ -238,7 +238,7 @@ public sealed class DashboardStateService : IDisposable
         {
             var currentIter = pipeline.Iteration;
             var isCurrent = pipeline.Phase is not GoalPhase.Done and not GoalPhase.Failed;
-            var planPhases = pipeline.Plan?.Phases ?? [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review];
+            var planPhases = pipeline.Plan?.Phases ?? [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging];
             var currentPhases = new List<PhaseViewInfo>();
             var failedFound = false;
 

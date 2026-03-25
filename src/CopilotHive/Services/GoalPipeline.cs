@@ -199,6 +199,11 @@ public sealed class GoalPipeline
 
         foreach (var entry in snapshot.Conversation)
             Conversation.Add(entry);
+
+        // Rebuild the state machine from the persisted plan so the dashboard
+        // can correctly show completed / active / pending phases.
+        if (Plan is not null)
+            StateMachine.RestoreFromPlan(Plan.Phases, Phase);
     }
 
     /// <summary>Advance to the next phase, recording timing for the previous phase.</summary>
