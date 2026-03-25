@@ -99,6 +99,14 @@ public sealed class SqliteGoalStore : IGoalStore
             alter.ExecuteNonQuery();
             _logger.LogInformation("Migrated goals table: added 'depends_on' column");
         }
+
+        if (!existingColumns.Contains("merge_commit_hash"))
+        {
+            using var alter = _db.CreateCommand();
+            alter.CommandText = "ALTER TABLE goals ADD COLUMN merge_commit_hash TEXT";
+            alter.ExecuteNonQuery();
+            _logger.LogInformation("Migrated goals table: added 'merge_commit_hash' column");
+        }
     }
 
     /// <summary>
@@ -176,6 +184,11 @@ public sealed class SqliteGoalStore : IGoalStore
                         cmd.CommandText += ", total_duration_seconds = @totalDuration";
                         cmd.Parameters.AddWithValue("@totalDuration", metadata.TotalDurationSeconds.Value);
                     }
+                    if (metadata.MergeCommitHash is not null)
+                    {
+                        cmd.CommandText += ", merge_commit_hash = @mergeCommitHash";
+                        cmd.Parameters.AddWithValue("@mergeCommitHash", metadata.MergeCommitHash);
+                    }
                 }
 
                 cmd.CommandText += " WHERE id = @id";
@@ -237,8 +250,8 @@ public sealed class SqliteGoalStore : IGoalStore
         {
             using var cmd = _db.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO goals (id, description, title, status, priority, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id, depends_on)
-                VALUES (@id, @desc, @title, @status, @priority, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId, @dependsOn)
+                INSERT INTO goals (id, description, title, status, priority, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id, depends_on, merge_commit_hash)
+                VALUES (@id, @desc, @title, @status, @priority, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId, @dependsOn, @mergeCommitHash)
                 """;
             BindGoalParams(cmd, goal);
             cmd.ExecuteNonQuery();
@@ -262,7 +275,7 @@ public sealed class SqliteGoalStore : IGoalStore
                     iterations = @iterations, failure_reason = @failureReason,
                     notes = @notes, phase_durations = @phaseDurations,
                     total_duration_seconds = @totalDuration, source_conversation_id = @sourceConvId,
-                    depends_on = @dependsOn
+                    depends_on = @dependsOn, merge_commit_hash = @mergeCommitHash
                 WHERE id = @id
                 """;
             BindGoalParams(cmd, goal);
@@ -376,8 +389,8 @@ public sealed class SqliteGoalStore : IGoalStore
                     using var cmd = _db.CreateCommand();
                     cmd.Transaction = tx;
                     cmd.CommandText = """
-                        INSERT INTO goals (id, description, title, status, priority, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id, depends_on)
-                        VALUES (@id, @desc, @title, @status, @priority, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId, @dependsOn)
+                        INSERT INTO goals (id, description, title, status, priority, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id, depends_on, merge_commit_hash)
+                        VALUES (@id, @desc, @title, @status, @priority, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId, @dependsOn, @mergeCommitHash)
                         """;
                     BindGoalParams(cmd, goal);
                     cmd.ExecuteNonQuery();
@@ -482,6 +495,10 @@ public sealed class SqliteGoalStore : IGoalStore
                 goal.DependsOn.AddRange(deps);
         }
 
+        // merge_commit_hash may be absent in databases created before migration
+        if (TryGetOrdinal(reader, "merge_commit_hash", out var mergeHashOrd) && !reader.IsDBNull(mergeHashOrd))
+            goal.MergeCommitHash = reader.GetString(mergeHashOrd);
+
         return goal;
     }
 
@@ -509,6 +526,7 @@ public sealed class SqliteGoalStore : IGoalStore
         cmd.Parameters.AddWithValue("@sourceConvId", (object?)null ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@dependsOn", goal.DependsOn.Count > 0
             ? JsonSerializer.Serialize(goal.DependsOn, JsonOptions) : (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("@mergeCommitHash", (object?)goal.MergeCommitHash ?? DBNull.Value);
     }
 
     private void InsertIterationCore(string goalId, IterationSummary summary, SqliteTransaction? transaction)

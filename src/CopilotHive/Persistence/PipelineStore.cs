@@ -431,4 +431,6 @@ public sealed class PipelineSnapshot
     public List<ConversationEntry> Conversation { get; init; } = [];
     /// <summary>List of (TaskId, GoalId) pairs for task-to-goal resolution.</summary>
     public List<(string TaskId, string GoalId)> TaskMappings { get; set; } = [];
+    /// <summary>SHA-1 hash of the merge commit for this pipeline's changes, or <c>null</c> if not yet merged.</summary>
+    public string? MergeCommitHash { get; init; }
 }

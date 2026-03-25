@@ -89,8 +89,9 @@ public sealed class BrainRepoManager
     /// <param name="featureBranch">The feature branch to merge (e.g. "copilothive/add-logging").</param>
     /// <param name="defaultBranch">The base branch to merge into.</param>
     /// <param name="ct">Cancellation token.</param>
+    /// <returns>The full SHA-1 hash of the resulting merge commit on the default branch.</returns>
     /// <exception cref="InvalidOperationException">Thrown when the merge fails (after reset).</exception>
-    public async Task MergeFeatureBranchAsync(
+    public async Task<string> MergeFeatureBranchAsync(
         string repoName, string featureBranch, string defaultBranch, CancellationToken ct = default)
     {
         var clonePath = GetClonePath(repoName);
@@ -131,6 +132,31 @@ public sealed class BrainRepoManager
 
         _logger.LogInformation("Successfully merged {Branch} into {Base} for {Repo}",
             featureBranch, defaultBranch, repoName);
+
+        var hashResult = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct);
+        return hashResult.Trim();
+    }
+
+    /// <summary>
+    /// Runs a git command and returns the standard output as a string.
+    /// Does not throw on non-zero exit codes.
+    /// </summary>
+    /// <param name="workingDir">Working directory for the git process.</param>
+    /// <param name="args">Arguments to pass to git.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The standard output of the git command.</returns>
+    private static async Task<string> RunGitWithOutputAsync(string workingDir, string[] args, CancellationToken ct)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo("git", string.Join(" ", args))
+        {
+            WorkingDirectory = workingDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        using var process = System.Diagnostics.Process.Start(psi)!;
+        await process.WaitForExitAsync(ct);
+        return await process.StandardOutput.ReadToEndAsync(ct);
     }
 
     /// <summary>

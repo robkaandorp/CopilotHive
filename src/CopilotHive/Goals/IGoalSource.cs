@@ -21,6 +21,8 @@ public sealed record GoalUpdateMetadata
     public IterationSummary? IterationSummary { get; init; }
     /// <summary>Total wall-clock duration of the goal from start to completion, in seconds.</summary>
     public double? TotalDurationSeconds { get; init; }
+    /// <summary>SHA-1 hash of the merge commit that landed this goal's changes.</summary>
+    public string? MergeCommitHash { get; init; }
 }
 
 /// <summary>

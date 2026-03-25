@@ -380,6 +380,150 @@ public sealed class SqliteGoalStoreTests : IDisposable
         Assert.Empty(fetched.DependsOn);
     }
 
+    // ── MergeCommitHash ───────────────────────────────────────────────────
+
+    [Fact]
+    public async Task CreateGoal_WithMergeCommitHash_RoundTrips()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = MakeGoal();
+        goal.MergeCommitHash = "abc123def456";
+        await _store.CreateGoalAsync(goal, ct);
+
+        var fetched = await _store.GetGoalAsync("test-goal", ct);
+        Assert.NotNull(fetched);
+        Assert.Equal("abc123def456", fetched.MergeCommitHash);
+    }
+
+    [Fact]
+    public async Task UpdateGoalAsync_WithMergeCommitHash_Persists()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = MakeGoal();
+        await _store.CreateGoalAsync(goal, ct);
+
+        goal.MergeCommitHash = "deadbeef00112233";
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var fetched = await _store.GetGoalAsync("test-goal", ct);
+        Assert.NotNull(fetched);
+        Assert.Equal("deadbeef00112233", fetched.MergeCommitHash);
+    }
+
+    [Fact]
+    public async Task UpdateGoalStatusAsync_WithMergeCommitHash_Persists()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateGoalAsync(MakeGoal(), ct);
+
+        await _store.UpdateGoalStatusAsync("test-goal", GoalStatus.Completed, new GoalUpdateMetadata
+        {
+            MergeCommitHash = "cafebabe1234",
+        }, ct);
+
+        var fetched = await _store.GetGoalAsync("test-goal", ct);
+        Assert.NotNull(fetched);
+        Assert.Equal("cafebabe1234", fetched.MergeCommitHash);
+    }
+
+    [Fact]
+    public async Task UpdateGoalStatusAsync_NullMergeCommitHash_DoesNotOverwrite()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = MakeGoal();
+        goal.MergeCommitHash = "original-hash";
+        await _store.CreateGoalAsync(goal, ct);
+
+        // Update without providing MergeCommitHash — should not overwrite existing value
+        await _store.UpdateGoalStatusAsync("test-goal", GoalStatus.Completed, new GoalUpdateMetadata
+        {
+            MergeCommitHash = null,
+        }, ct);
+
+        // The existing hash should be preserved (SQL UPDATE only runs when not null)
+        var fetched = await _store.GetGoalAsync("test-goal", ct);
+        Assert.NotNull(fetched);
+        Assert.Equal("original-hash", fetched.MergeCommitHash);
+    }
+
+    [Fact]
+    public async Task CreateGoal_WithoutMergeCommitHash_ReturnsNull()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateGoalAsync(MakeGoal(), ct);
+
+        var fetched = await _store.GetGoalAsync("test-goal", ct);
+        Assert.NotNull(fetched);
+        Assert.Null(fetched.MergeCommitHash);
+    }
+
+    [Fact]
+    public async Task Migration_AddsMergeCommitHashColumnToExistingDatabase()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        using var oldConn = new SqliteConnection("Data Source=:memory:");
+        oldConn.Open();
+
+        // Create old schema WITHOUT merge_commit_hash column
+        using (var createCmd = oldConn.CreateCommand())
+        {
+            createCmd.CommandText = """
+                CREATE TABLE goals (
+                    id                    TEXT PRIMARY KEY,
+                    description           TEXT NOT NULL,
+                    title                 TEXT,
+                    status                TEXT NOT NULL DEFAULT 'pending',
+                    priority              TEXT NOT NULL DEFAULT 'normal',
+                    repositories          TEXT,
+                    metadata              TEXT,
+                    created_at            TEXT NOT NULL,
+                    started_at            TEXT,
+                    completed_at          TEXT,
+                    iterations            INTEGER,
+                    failure_reason        TEXT,
+                    notes                 TEXT,
+                    phase_durations       TEXT,
+                    total_duration_seconds REAL,
+                    source_conversation_id TEXT,
+                    depends_on             TEXT
+                );
+                """;
+            createCmd.ExecuteNonQuery();
+        }
+
+        // Insert a goal using old schema
+        using (var insertCmd = oldConn.CreateCommand())
+        {
+            insertCmd.CommandText = """
+                INSERT INTO goals (id, description, status, priority, created_at)
+                VALUES ('old-goal', 'Pre-migration goal', 'pending', 'normal', '2025-01-01T00:00:00Z')
+                """;
+            insertCmd.ExecuteNonQuery();
+        }
+
+        // Create store — triggers migration
+        var store = new SqliteGoalStore(oldConn, NullLogger<SqliteGoalStore>.Instance);
+
+        // Old goal should have null merge_commit_hash
+        var oldGoal = await store.GetGoalAsync("old-goal", ct);
+        Assert.NotNull(oldGoal);
+        Assert.Null(oldGoal.MergeCommitHash);
+
+        // New goal with hash should round-trip
+        var newGoal = new Goal
+        {
+            Id = "new-goal",
+            Description = "Post-migration goal",
+            MergeCommitHash = "post-migration-hash",
+            CreatedAt = new DateTime(2025, 6, 1, 0, 0, 0, DateTimeKind.Utc),
+        };
+        await store.CreateGoalAsync(newGoal, ct);
+
+        var fetched = await store.GetGoalAsync("new-goal", ct);
+        Assert.NotNull(fetched);
+        Assert.Equal("post-migration-hash", fetched.MergeCommitHash);
+    }
+
     // ── Name property ─────────────────────────────────────────────────────
 
     [Fact]

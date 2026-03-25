@@ -690,20 +690,17 @@ public sealed class GoalDispatcher : BackgroundService
             var repos = ResolveRepositories(pipeline.Goal);
             foreach (var repo in repos)
             {
-                if (_repoManager is not null)
-                {
-                    // Use the persistent brain clone — no temp dirs needed.
-                    // After merge, the clone is already on the base branch with the latest code.
-                    await _repoManager.MergeFeatureBranchAsync(
-                        repo.Name, pipeline.CoderBranch, repo.DefaultBranch, ct);
-                }
-                else
-                {
-                    await MergeViaTempCloneAsync(repo, pipeline.CoderBranch, ct);
-                }
+                if (_repoManager is null)
+                    throw new InvalidOperationException("BrainRepoManager is not configured. Cannot perform merge.");
 
-                _logger.LogInformation("Merged {Branch} into {Base} for {Repo}",
-                    pipeline.CoderBranch, repo.DefaultBranch, repo.Name);
+                // Use the persistent brain clone — no temp dirs needed.
+                // After merge, the clone is already on the base branch with the latest code.
+                var mergeCommitHash = await _repoManager.MergeFeatureBranchAsync(
+                    repo.Name, pipeline.CoderBranch, repo.DefaultBranch, ct);
+                pipeline.MergeCommitHash = mergeCommitHash;
+
+                _logger.LogInformation("Merged {Branch} into {Base} for {Repo} (commit={Hash})",
+                    pipeline.CoderBranch, repo.DefaultBranch, repo.Name, mergeCommitHash);
             }
 
             await MarkGoalCompleted(pipeline, ct);
@@ -718,33 +715,6 @@ public sealed class GoalDispatcher : BackgroundService
                 await HandleMergeFailureAsync(pipeline, ex.Message, ct);
             else
                 await MarkGoalFailed(pipeline, $"Unexpected merge failure effect: {mergeResult.Effect}", ct);
-        }
-    }
-
-    /// <summary>
-    /// Fallback merge path using a temporary clone directory. Used when
-    /// <see cref="BrainRepoManager"/> is not available.
-    /// </summary>
-    private async Task MergeViaTempCloneAsync(
-        TargetRepository repo, string featureBranch, CancellationToken ct)
-    {
-        var tempDir = Path.Combine(Path.GetTempPath(), $"hive-merge-{Guid.NewGuid():N}");
-        try
-        {
-            await RunGitAsync($"clone --branch {repo.DefaultBranch} {repo.Url} {tempDir}", ct);
-            await RunGitAsync($"-C {tempDir} config user.email copilothive@local", ct);
-            await RunGitAsync($"-C {tempDir} config user.name CopilotHive", ct);
-            await RunGitAsync($"-C {tempDir} fetch origin {featureBranch}", ct);
-            await RunGitAsync($"-C {tempDir} merge origin/{featureBranch} --no-edit", ct);
-            await RunGitAsync($"-C {tempDir} push origin {repo.DefaultBranch}", ct);
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-            {
-                try { Directory.Delete(tempDir, true); }
-                catch { /* Best effort cleanup */ }
-            }
         }
     }
 
@@ -816,23 +786,6 @@ public sealed class GoalDispatcher : BackgroundService
             ? await _brain.CraftPromptAsync(pipeline, GoalPhase.Coding, rebaseContext, ct)
             : rebaseContext;
         await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
-    }
-
-    private static async Task RunGitAsync(string arguments, CancellationToken ct)
-    {
-        var psi = new System.Diagnostics.ProcessStartInfo("git", arguments)
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        };
-        using var process = System.Diagnostics.Process.Start(psi)!;
-        await process.WaitForExitAsync(ct);
-        if (process.ExitCode != 0)
-        {
-            var stderr = await process.StandardError.ReadToEndAsync(ct);
-            throw new InvalidOperationException($"git {arguments} failed: {stderr}");
-        }
     }
 
     /// <summary>
@@ -925,6 +878,7 @@ public sealed class GoalDispatcher : BackgroundService
                 : null,
             IterationSummary = BuildIterationSummary(pipeline, failedPhase: null),
             TotalDurationSeconds = duration.TotalSeconds,
+            MergeCommitHash = pipeline.MergeCommitHash,
         };
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Completed, completedMeta, ct);
         await CommitGoalsToConfigRepoAsync($"Goal '{pipeline.GoalId}' completed", ct);

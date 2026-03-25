@@ -322,6 +322,7 @@ public sealed class DashboardStateService : IDisposable
             DependsOn = goal.DependsOn,
             Iterations = iterations,
             Conversation = pipeline?.Conversation.ToList() ?? [],
+            MergeCommitHash = pipeline?.MergeCommitHash ?? goal.MergeCommitHash,
         };
     }
 
@@ -488,6 +489,8 @@ public sealed class GoalDetailInfo
     public List<IterationViewInfo> Iterations { get; init; } = [];
     /// <summary>Brain conversation log.</summary>
     public List<ConversationEntry> Conversation { get; init; } = [];
+    /// <summary>SHA-1 hash of the merge commit that landed this goal's changes, or <c>null</c> if not yet merged.</summary>
+    public string? MergeCommitHash { get; init; }
 }
 
 /// <summary>Detail for a single iteration in the goal timeline.</summary>

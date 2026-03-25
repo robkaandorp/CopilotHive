@@ -37,6 +37,8 @@ public sealed class Goal
     public List<IterationSummary> IterationSummaries { get; set; } = [];
     /// <summary>Total wall-clock duration of the goal from start to completion, in seconds.</summary>
     public double? TotalDurationSeconds { get; set; }
+    /// <summary>SHA-1 hash of the merge commit that landed this goal's changes, or <c>null</c> if not yet merged.</summary>
+    public string? MergeCommitHash { get; set; }
 }
 
 /// <summary>Structured summary of a single completed (or failed) pipeline iteration.</summary>

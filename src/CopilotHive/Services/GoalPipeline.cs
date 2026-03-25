@@ -150,6 +150,8 @@ public sealed class GoalPipeline
     public DateTime CreatedAt { get; private init; } = DateTime.UtcNow;
     /// <summary>UTC timestamp when this pipeline completed (Done or Failed), or <c>null</c> if still active.</summary>
     public DateTime? CompletedAt { get; private set; }
+    /// <summary>SHA-1 hash of the merge commit produced when the feature branch was merged, or <c>null</c> if not yet merged.</summary>
+    public string? MergeCommitHash { get; set; }
 
     /// <summary>
     /// Creates a new pipeline for the specified goal.

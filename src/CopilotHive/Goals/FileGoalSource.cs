@@ -71,6 +71,8 @@ public sealed class FileGoalSource : IGoalSource
                     goal.IterationSummaries.Add(metadata.IterationSummary);
                 if (metadata.TotalDurationSeconds.HasValue)
                     goal.TotalDurationSeconds = metadata.TotalDurationSeconds.Value;
+                if (metadata.MergeCommitHash is not null)
+                    goal.MergeCommitHash = metadata.MergeCommitHash;
             }
 
             await WriteGoalsAsync(goals, ct);

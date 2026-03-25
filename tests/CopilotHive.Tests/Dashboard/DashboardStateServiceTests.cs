@@ -155,4 +155,89 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.NotNull(detail);
         Assert.Empty(detail.DependsOn);
     }
+
+    /// <summary>
+    /// Verifies that <see cref="GoalDetailInfo.MergeCommitHash"/> is populated from
+    /// the <see cref="Goal.MergeCommitHash"/> stored in the <see cref="IGoalStore"/>
+    /// when no active pipeline exists.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_PopulatesMergeCommitHash_FromStoredGoal()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "merged-goal",
+            Description = "Goal that was merged",
+            MergeCommitHash = "cafebabe0123",
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store);
+
+        var detail = service.GetGoalDetail("merged-goal");
+
+        Assert.NotNull(detail);
+        Assert.Equal("cafebabe0123", detail.MergeCommitHash);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="GoalDetailInfo.MergeCommitHash"/> is null when
+    /// the stored goal has no merge commit hash.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_MergeCommitHash_NullWhenNotMerged()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "unmerged-goal",
+            Description = "Goal not yet merged",
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store);
+
+        var detail = service.GetGoalDetail("unmerged-goal");
+
+        Assert.NotNull(detail);
+        Assert.Null(detail.MergeCommitHash);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="GoalDetailInfo"/> exposes a <c>MergeCommitHash</c>
+    /// property that can be set via object initialization.
+    /// </summary>
+    [Fact]
+    public void GoalDetailInfo_MergeCommitHash_CanBeSet()
+    {
+        var detail = new GoalDetailInfo
+        {
+            GoalId = "test-goal",
+            Description = "Test",
+            MergeCommitHash = "deadbeef1234",
+        };
+
+        Assert.Equal("deadbeef1234", detail.MergeCommitHash);
+    }
 }
