@@ -13,6 +13,8 @@ public sealed class HiveConfigFile
     public Dictionary<string, WorkerConfig> Workers { get; set; } = [];
     /// <summary>Orchestrator-level configuration.</summary>
     public OrchestratorConfig Orchestrator { get; set; } = new();
+    /// <summary>Composer agent configuration. When set, the Composer is enabled.</summary>
+    public ComposerConfig? Composer { get; set; }
 
     /// <summary>
     /// Resolves the model to use for a given role.
@@ -78,8 +80,6 @@ public sealed class OrchestratorConfig
     public int BrainContextWindow { get; set; } = Constants.DefaultBrainContextWindow;
     /// <summary>Maximum tool-call steps the Brain agent may take per request.</summary>
     public int BrainMaxSteps { get; set; } = Constants.DefaultBrainMaxSteps;
-    /// <summary>Composer agent configuration. When set, the Composer is enabled.</summary>
-    public ComposerConfig? Composer { get; set; }
 }
 
 /// <summary>

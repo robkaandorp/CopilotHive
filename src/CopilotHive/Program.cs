@@ -112,7 +112,7 @@ static async Task<int> RunServerAsync(string[] args)
     builder.Services.AddSingleton<Composer>(sp =>
     {
         var config = sp.GetService<HiveConfigFile>();
-        var composerConfig = config?.Orchestrator.Composer;
+        var composerConfig = config?.Composer;
 
         // Model: composer-specific override → orchestrator model → env var
         var model = composerConfig?.Model;
