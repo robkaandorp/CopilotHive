@@ -14,7 +14,7 @@
     <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.4.1" />
     <PackageReference Include="Microsoft.Extensions.Http.Resilience" Version="10.4.0" />
     <PackageReference Include="OllamaSharp" Version="5.4.24" />
-    <PackageReference Include="SharpCoder" Version="0.4.0-alpha.1" />
+    <PackageReference Include="SharpCoder" Version="0.4.0" />
   </ItemGroup>
 
   <ItemGroup>
