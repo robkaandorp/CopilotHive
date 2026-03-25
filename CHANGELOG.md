@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Composer agent** — `Composer` class for conversational goal decomposition and management; uses SharpCoder `CodingAgent` with a persistent session, streaming responses, and 7 LLM-callable tools: `create_goal` (creates as Draft), `approve_goal` (Draft→Pending), `update_goal`, `delete_goal` (Draft/Failed only), `get_goal`, `list_goals`, `search_goals`; includes codebase tools (`read_file`, `glob`, `grep`) for informed goal creation; configurable independently via top-level `composer:` block in hive-config.yaml
+- **Composer Chat UI** — Blazor Server page at `/composer` with streaming chat interface; real-time text deltas via `IAsyncEnumerable<StreamingUpdate>`, Enter-to-send, session reset, cancel support; full Markdown rendering using **Markdig** (`UseAdvancedExtensions`) for tables, code blocks, lists, blockquotes; chat history restored from persistent session on page navigation; auto-scroll to bottom; modern thin scrollbar
+- **Composer dashboard stats** — Orchestrator page shows Composer model in the Model Configuration table and a dedicated Composer section with context usage, message count, cumulative tokens, and progress bar
+- **SharpCoder streaming** — `ExecuteStreamingAsync` on `CodingAgent` returning `IAsyncEnumerable<StreamingUpdate>` with `TextDelta` and `Completed` variants; `BuildResponseFromUpdates` reconstructs `ChatResponse` from accumulated updates; `BuildDiagnostics` extracted for reuse (SharpCoder 0.4.0-alpha.1)
+- **Tool call argument fix** — `CopilotChoiceMergingHandler.FixToolCallArguments` sanitises outgoing requests: replaces `"null"` or `""` tool_call arguments with `"{}"` to fix Claude models via Copilot API (Anthropic `tool_use.input` requires a valid dictionary)
+- 32 `ComposerToolTests` covering all 7 Composer tools, validation, and error cases
+- 4 `FixToolCallArguments` tests for null, empty, valid, and no-tool-call cases
 - **SQLite goal store** — `SqliteGoalStore` as the primary source of truth for goals, replacing `FileGoalSource` and `ApiGoalSource` in the orchestrator pipeline; full CRUD, text search, status filtering, iteration tracking, and import from goals.yaml (one-time bootstrap migration on startup)
 - `IGoalStore` interface — extends `IGoalSource` with `GetAllGoalsAsync`, `GetGoalAsync`, `CreateGoalAsync`, `UpdateGoalAsync`, `DeleteGoalAsync`, `SearchGoalsAsync`, `GetGoalsByStatusAsync`, `AddIterationAsync`, `GetIterationsAsync`, `ImportGoalsAsync`
 - **Goals REST API** — expanded endpoints: `GET /api/goals/{id}`, `DELETE /api/goals/{id}`, `GET /api/goals/search?q=…&status=…`; existing `GET/POST/PATCH` endpoints now backed by SQLite
@@ -23,9 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `GoalManager` now uses `SqliteGoalStore` as its sole goal source (was `ApiGoalSource` + `FileGoalSource`)
-- `DashboardStateService` uses `IGoalStore` for goal enumeration (was `ApiGoalSource`)
+- `DashboardStateService` uses `IGoalStore` for goal enumeration (was `ApiGoalSource`); now also injects `Composer` for stats
 - Health endpoint (`GET /health`) backed by `SqliteGoalStore` (was `ApiGoalSource`)
-- Smoke test skill preserves persistent volumes (`docker compose down` without `-v`)
+- Smoke test skill preserves persistent volumes (`docker compose down` without `-v`); no longer references goals.yaml or CopilotHive-Config for goal setting (goals created via Composer)
+- `ComposerConfig` moved to top-level in `HiveConfigFile` (sibling of `Orchestrator`/`Workers`, not nested under `Orchestrator`)
 
 ### Added
 - **Model name in completion logs** — task and phase completion logs now include the model name that was used by the worker; `HiveOrchestratorService.HandleTaskComplete` logs "Task {TaskId} completed by {WorkerId}: {Status} (model={Model})"; `GoalDispatcher` logs "Pipeline {GoalId} task completed (phase={Phase}, status={Status}, model={Model})" and "Phase {Phase} for goal {GoalId} completed in {DurationSeconds:F1}s (model={Model})"; includes 3 xUnit tests verifying model name appears in both task completed and phase completed log messages, and "unknown" is logged when model is empty

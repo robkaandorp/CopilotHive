@@ -2,11 +2,11 @@
 
 # CopilotHive
 
-CopilotHive is a **self-improving multi-agent orchestration system** powered by **SharpCoder** (an autonomous coding agent library). A pool of generic worker agents collaborate autonomously inside Docker containers — dynamically taking on roles (coder, tester, doc-writer, reviewer, improver) per task — to implement software goals without human intervention.
+CopilotHive is a **self-improving multi-agent orchestration system** powered by **SharpCoder** (an autonomous coding agent library). A pool of generic worker agents collaborate autonomously inside Docker containers — dynamically taking on roles (coder, tester, doc-writer, reviewer, improver) per task — to implement software goals without human intervention. A conversational **Composer** agent helps decompose high-level intent into actionable goals through a streaming chat interface.
 
 ## Architecture
 
-The Orchestrator Brain (an LLM-powered decision engine) receives goals and dispatches work to a pool of generic workers. Each worker runs in an isolated Docker container and accepts any role (coder, tester, doc-writer, reviewer, improver) per task.
+The Orchestrator Brain (an LLM-powered decision engine) receives goals and dispatches work to a pool of generic workers. Each worker runs in an isolated Docker container and accepts any role (coder, tester, doc-writer, reviewer, improver) per task. The **Composer** provides a conversational interface for goal decomposition and management.
 
 ```
                     ┌─────────────────┐
@@ -22,6 +22,11 @@ The Orchestrator Brain (an LLM-powered decision engine) receives goals and dispa
    │  (Docker)  │ │  (Docker)  │ │ (Docker) │ │ (Docker)  │
    └────────────┘ └────────────┘ └──────────┘ └───────────┘
         any role       any role      any role      any role
+
+   ┌─────────────────────────────────────────────────────────┐
+   │  Composer (Chat UI at /composer)                       │
+   │  Streaming LLM conversation for goal decomposition     │
+   └─────────────────────────────────────────────────────────┘
 ```
 
 ## How It Works
@@ -48,7 +53,7 @@ The **Brain** (`DistributedBrain`) plans iteration phases and crafts worker prom
 - [Docker](https://www.docker.com/) (latest stable)
 - [.NET 10 SDK](https://dotnet.microsoft.com/)
 - A GitHub token (`GH_TOKEN`) or LLM provider API key for model access
-- A **config repo** containing `agents/*.agents.md` and `goals.yaml` (see below)
+- A **config repo** containing `hive-config.yaml` with model and worker configuration (see below)
 
 ### Setup
 
@@ -74,7 +79,7 @@ The **Brain** (`DistributedBrain`) plans iteration phases and crafts worker prom
 
 ### Configuring Goals
 
-Goals are stored in **SQLite** (`goals.db`) as the primary source of truth. On first startup, goals are automatically imported from `goals.yaml` (if present in the config repo). Goals can also be created via the REST API (`POST /api/goals`) or the dashboard.
+Goals are stored in **SQLite** (`goals.db`) as the primary source of truth. The recommended way to create goals is through the **Composer Chat UI** at `/composer`, which provides a conversational interface for decomposing high-level intent into well-scoped goals. Goals can also be created via the REST API (`POST /api/goals`) or imported from `goals.yaml` on first startup.
 
 The `goals.yaml` format (used for initial bootstrap):
 
@@ -156,7 +161,7 @@ goals:
 | `src/CopilotHive/` | Main orchestrator — Brain, GoalDispatcher, persistence, metrics |
 | `src/CopilotHive.Shared/` | Shared protobuf definitions and DTOs |
 | `src/CopilotHive.Worker/` | Worker process (runs inside Docker containers) |
-| `tests/` | 680+ xUnit tests |
+| `tests/` | 716+ xUnit tests |
 | `agents/` | Default agent templates (overridden by config repo at runtime) |
 | `docker/` | Dockerfiles and container configuration |
 
@@ -164,12 +169,13 @@ goals:
 
 - **Server-only mode** — gRPC server + HTTP health endpoint (no CLI mode)
 - **LLM-powered Brain** — `DistributedBrain` uses SharpCoder's `CodingAgent` with a single persistent session, read-only file access to repos, automatic context compaction, and configurable context window (`BRAIN_CONTEXT_WINDOW`)
+- **Composer** — conversational agent for goal decomposition and management with streaming chat UI (`/composer`); uses a persistent SharpCoder session with 7 LLM-callable tools (`create_goal`, `approve_goal`, `update_goal`, `delete_goal`, `get_goal`, `list_goals`, `search_goals`) plus codebase tools (`read_file`, `glob`, `grep`); full Markdown rendering (Markdig) and chat history persistence across page navigations
 - **Sequential goal processing** — goals process one at a time so the Brain accumulates context across goals
 - **Worker utilization metrics** — `GET /health/utilization` endpoint provides per-role worker utilization and bottleneck detection
 - **Self-improvement loop** — the improver modifies `agents.md` based on accumulated metrics
 - **SQLite persistence** — `PipelineStore` with auto-migration for pipeline state; `SqliteGoalStore` as the primary source of truth for goals with full CRUD, search, and iteration history
 - **Goals REST API** — `GET/POST/PATCH/DELETE /api/goals`, `GET /api/goals/{id}`, `GET /api/goals/search?q=…&status=…`
-- **Dashboard** — Blazor Server UI with goals browser (filterable/searchable), goal detail with iteration timeline, worker status, orchestrator view, live logs, and configuration
+- **Dashboard** — Blazor Server UI with goals browser (filterable/searchable), goal detail with iteration timeline, worker status, orchestrator view (Brain + Composer stats), live logs, and configuration
 - **Config repo** — externalized agent instructions and goals (`CopilotHive-Config`)
 - **Multi-repo goal support** — goals can target any accessible Git repository
 - **Per-role model selection** — assign different LLM models to each worker type
