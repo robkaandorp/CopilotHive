@@ -85,6 +85,28 @@ public sealed class Composer : IAsyncDisposable
     /// <summary>Whether the Composer has connected and is ready for streaming.</summary>
     public bool IsConnected => _agent is not null;
 
+    /// <summary>Returns current Composer session statistics.</summary>
+    public BrainStats? GetStats()
+    {
+        if (_agent is null) return null;
+
+        var estimatedTokens = _session.EstimatedContextTokens;
+        var usagePct = _maxContextTokens > 0 ? (int)(estimatedTokens * 100.0 / _maxContextTokens) : 0;
+
+        return new BrainStats
+        {
+            Model = _model,
+            MessageCount = _session.MessageHistory.Count,
+            EstimatedContextTokens = estimatedTokens,
+            MaxContextTokens = _maxContextTokens,
+            ContextUsagePercent = usagePct,
+            CumulativeInputTokens = _session.InputTokensUsed,
+            CumulativeOutputTokens = _session.OutputTokensUsed,
+            MaxSteps = _maxSteps,
+            IsConnected = true,
+        };
+    }
+
     /// <summary>
     /// Creates the IChatClient and CodingAgent, and loads any persisted session.
     /// </summary>

@@ -36,6 +36,11 @@
             <td style="font-family:monospace;font-size:0.85rem">@StripReasoning(_info.BrainModel)</td>
             <td>@ReasoningBadge(_info.BrainModel)</td>
         </tr>
+        <tr>
+            <td><span class="badge badge-yellow">composer</span></td>
+            <td style="font-family:monospace;font-size:0.85rem">@StripReasoning(_info.ComposerModel)</td>
+            <td>@ReasoningBadge(_info.ComposerModel)</td>
+        </tr>
         @foreach (var (role, model) in _info.RoleModels)
         {
             <tr>
@@ -91,8 +96,53 @@ else
     <p style="color:var(--text-muted)">Brain not connected.</p>
 }
 
+<h2 style="margin-top:1.5rem">Composer</h2>
+@if (_composerStats is not null)
+{
+    <div class="cards">
+        <div class="card">
+            <div class="label">Context</div>
+            <div class="value" style="color:@ComposerContextColor">@FormatTokens(_composerStats.EstimatedContextTokens)</div>
+            <div style="font-size:0.75rem;color:var(--text-muted)">
+                @_composerStats.ContextUsagePercent% of @FormatTokens(_composerStats.MaxContextTokens)
+            </div>
+        </div>
+        <div class="card">
+            <div class="label">Messages</div>
+            <div class="value">@_composerStats.MessageCount</div>
+        </div>
+        <div class="card">
+            <div class="label">Max Steps</div>
+            <div class="value">@_composerStats.MaxSteps</div>
+        </div>
+    </div>
+
+    <div class="cards" style="margin-top:0.5rem">
+        <div class="card">
+            <div class="label">Cumulative Input</div>
+            <div class="value" style="font-size:1rem">@FormatTokens(_composerStats.CumulativeInputTokens)</div>
+        </div>
+        <div class="card">
+            <div class="label">Cumulative Output</div>
+            <div class="value" style="font-size:1rem">@FormatTokens(_composerStats.CumulativeOutputTokens)</div>
+        </div>
+    </div>
+
+    <div style="margin-top:1rem;background:var(--surface);border-radius:8px;padding:0.75rem 1rem">
+        <div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:0.25rem">Context Usage</div>
+        <div style="background:var(--bg);border-radius:4px;height:1.25rem;overflow:hidden">
+            <div style="width:@(_composerStats.ContextUsagePercent)%;height:100%;background:@ComposerContextColor;transition:width 0.3s"></div>
+        </div>
+    </div>
+}
+else
+{
+    <p style="color:var(--text-muted)">Composer not connected.</p>
+}
+
 @code {
     private BrainStats? _stats;
+    private BrainStats? _composerStats;
     private OrchestratorInfo _info = new();
 
     protected override void OnInitialized()
@@ -104,12 +154,20 @@ else
     private void Refresh()
     {
         _stats = State.GetBrainStats();
+        _composerStats = State.GetComposerStats();
         _info = State.GetOrchestratorInfo();
     }
 
     private void RefreshState() => InvokeAsync(() => { Refresh(); StateHasChanged(); });
 
     private string ContextColor => _stats?.ContextUsagePercent switch
+    {
+        >= 80 => "var(--red)",
+        >= 50 => "var(--accent)",
+        _ => "var(--green)",
+    };
+
+    private string ComposerContextColor => _composerStats?.ContextUsagePercent switch
     {
         >= 80 => "var(--red)",
         >= 50 => "var(--accent)",

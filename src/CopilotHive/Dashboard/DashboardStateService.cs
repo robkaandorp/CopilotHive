@@ -19,6 +19,7 @@ public sealed class DashboardStateService : IDisposable
     private readonly DashboardLogSink _logSink;
     private readonly ProgressLog _progressLog;
     private readonly IDistributedBrain? _brain;
+    private readonly Composer? _composer;
     private readonly HiveConfigFile? _config;
     private readonly Timer _timer;
     private readonly DateTime _startTime = DateTime.UtcNow;
@@ -37,6 +38,7 @@ public sealed class DashboardStateService : IDisposable
         DashboardLogSink logSink,
         ProgressLog progressLog,
         IDistributedBrain? brain = null,
+        Composer? composer = null,
         HiveConfigFile? config = null,
         IGoalStore? goalStore = null)
     {
@@ -46,6 +48,7 @@ public sealed class DashboardStateService : IDisposable
         _logSink = logSink;
         _progressLog = progressLog;
         _brain = brain;
+        _composer = composer;
         _config = config;
         _goalStore = goalStore;
         _timer = new Timer(_ => PollAndNotify(), null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(3));
@@ -149,6 +152,9 @@ public sealed class DashboardStateService : IDisposable
 
     /// <summary>Returns current Brain statistics, or null if Brain is not configured.</summary>
     public BrainStats? GetBrainStats() => _brain?.GetStats();
+
+    /// <summary>Returns current Composer statistics, or null if Composer is not configured.</summary>
+    public BrainStats? GetComposerStats() => _composer?.GetStats();
 
     /// <summary>Returns recent worker progress reports.</summary>
     public IReadOnlyList<ProgressEntry> GetRecentProgress(int count = 50) => _progressLog.GetRecent(count);
@@ -352,6 +358,7 @@ public sealed class DashboardStateService : IDisposable
             ServerTime = DateTime.UtcNow,
             RoleModels = roles.ToDictionary(r => r, r => _config?.GetModelForRole(r) ?? Constants.DefaultModel),
             BrainModel = _brain?.GetStats()?.Model ?? "(not configured)",
+            ComposerModel = _composer?.GetStats()?.Model ?? "(not configured)",
         };
     }
 
@@ -443,6 +450,8 @@ public sealed class OrchestratorInfo
     public DateTime ServerTime { get; init; }
     /// <summary>Model configured for the Brain.</summary>
     public string BrainModel { get; init; } = "";
+    /// <summary>Model configured for the Composer.</summary>
+    public string ComposerModel { get; init; } = "";
     /// <summary>Model configured per worker role.</summary>
     public Dictionary<string, string> RoleModels { get; init; } = [];
 }
