@@ -157,6 +157,31 @@ public sealed class Composer : IAsyncDisposable
         await Task.CompletedTask; // keep async signature for future use
     }
 
+    /// <summary>
+    /// Returns the recent user/assistant message pairs from the persistent session.
+    /// Tool-call and tool-result messages are excluded.
+    /// </summary>
+    /// <param name="maxMessages">Maximum number of messages to return.</param>
+    public IReadOnlyList<(string Role, string Content)> GetChatHistory(int maxMessages = 50)
+    {
+        var result = new List<(string Role, string Content)>();
+        foreach (var msg in _session.MessageHistory)
+        {
+            if (msg.Role == Microsoft.Extensions.AI.ChatRole.User ||
+                msg.Role == Microsoft.Extensions.AI.ChatRole.Assistant)
+            {
+                var text = msg.Text;
+                if (!string.IsNullOrWhiteSpace(text))
+                    result.Add((msg.Role == Microsoft.Extensions.AI.ChatRole.User ? "user" : "assistant", text));
+            }
+        }
+
+        if (result.Count > maxMessages)
+            return result.GetRange(result.Count - maxMessages, maxMessages);
+
+        return result;
+    }
+
     /// <summary>Returns the file path for persisting the Composer session.</summary>
     private string GetSessionFilePath() => Path.Combine(_stateDir, "composer-session.json");
 

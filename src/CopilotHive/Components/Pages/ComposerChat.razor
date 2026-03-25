@@ -95,6 +95,17 @@ else
     private int _lastToolCalls;
     private CancellationTokenSource? _streamCts;
 
+    protected override void OnInitialized()
+    {
+        if (Composer.IsConnected)
+        {
+            foreach (var (role, content) in Composer.GetChatHistory())
+            {
+                _messages.Add(new ChatMessage { Role = role, Content = content });
+            }
+        }
+    }
+
     private async Task SendMessage()
     {
         var text = _inputText.Trim();
