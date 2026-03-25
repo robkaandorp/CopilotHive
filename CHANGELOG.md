@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **Dead merge code path** — Removed `MergeViaTempCloneAsync` method and its standalone `RunGitAsync` helper from `GoalDispatcher` (the temp-clone fallback was dead code — `BrainRepoManager` is always registered in `Program.cs`); `_repoManager` field is now non-nullable
+
 ### Added
+- **Merge commit hash capture and persistence** — After successful merges, the SHA-1 hash is now captured and stored throughout the goal lifecycle:
+  - `BrainRepoManager.MergeFeatureBranchAsync` returns `Task<string>` with the 40-character hex SHA of the merge commit
+  - `Goal.MergeCommitHash` property stores the hash on the goal entity
+  - `GoalUpdateMetadata.MergeCommitHash` propagates the hash during goal completion
+  - `PipelineSnapshot.MergeCommitHash` persists the hash for restart recovery
+  - `GoalDetailInfo.MergeCommitHash` exposes the hash in dashboard goal details
+  - `SqliteGoalStore` includes schema migration for new `merge_commit_hash` column; includes 6 xUnit tests for round-trip persistence, null handling, and schema migration
+  - `FileGoalSource` propagates `MergeCommitHash` via `UpdateGoalStatusAsync`; includes 2 xUnit tests
+  - `DashboardStateService` populates `GoalDetailInfo.MergeCommitHash` from pipeline or stored goal; includes 3 xUnit tests (class now has 23 total [Fact] tests)
 - **Dependency-aware goal dispatch** — `GoalManager.GetNextGoalAsync` now filters out pending goals whose `DependsOn` dependencies are not yet `Completed`; blocked goals are skipped and logged at Debug level with their unsatisfied dependency IDs; includes 9 xUnit tests covering blocked goal skipping, unblocked goal dispatching, multi-dependency scenarios, non-existent dependency blocking, empty dependencies, priority ordering among eligible goals, and debug logging verification
 - **Cross-source dependency resolution** — `GoalManager` dependency filtering now resolves dependencies from all registered sources, not just pending goals, so goals depending on already-completed prerequisites are correctly unblocked on startup
 - **DependsOn support** — goals can now declare dependencies on other goals via a list of goal IDs that must complete before this goal becomes eligible for dispatch; persisted across SQLite (`depends_on` JSON column), FileGoalSource YAML (`depends_on` field), Composer's `create_goal` tool (optional `depends_on` parameter), and dashboard `GoalDetailInfo`; includes 10 xUnit tests for round-trip persistence, parameter parsing, and schema migration
