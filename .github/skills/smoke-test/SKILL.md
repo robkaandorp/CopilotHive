@@ -1,6 +1,6 @@
 ---
 name: smoke-test
-description: Full reset, rebuild, and launch a smoke test with specified goals.
+description: Full reset, rebuild, and launch a smoke test.
 ---
 
 # Smoke Test Skill
@@ -11,7 +11,6 @@ Performs a complete environment reset and launches a smoke test. **Order and tim
 
 - Docker must be running
 - CopilotHive repo at `C:\Projects\Personal\CopilotHive`
-- CopilotHive-Config repo at `C:\Projects\Personal\CopilotHive-Config`
 
 ## Steps (execute in order)
 
@@ -53,19 +52,7 @@ Remove any `copilothive/*` remote branches for goals being re-queued:
 git push origin --delete copilothive/<goal-id>
 ```
 
-### 5. Sync config repo and set goals
-
-```powershell
-cd C:\Projects\Personal\CopilotHive-Config
-git pull
-```
-
-Edit `goals.yaml`:
-- Remove all completed/failed goals (or keep for history)
-- Add new goals with `status: pending`
-- Commit and push
-
-### 6. Build the project
+### 5. Build the project
 
 ```powershell
 cd C:\Projects\Personal\CopilotHive
@@ -74,7 +61,7 @@ dotnet build CopilotHive.slnx
 
 Must succeed with 0 errors before proceeding.
 
-### 7. Rebuild containers
+### 6. Rebuild containers
 
 ```powershell
 cd C:\Projects\Personal\CopilotHive\docker
@@ -83,14 +70,14 @@ docker compose build
 
 This ensures containers have the latest code.
 
-### 8. Start containers
+### 7. Start containers
 
 ```powershell
 cd C:\Projects\Personal\CopilotHive\docker
 docker compose up -d
 ```
 
-### 9. Verify
+### 8. Verify
 
 ```powershell
 docker ps --format "table {{.Names}}\t{{.Status}}"
@@ -98,18 +85,20 @@ docker ps --format "table {{.Names}}\t{{.Status}}"
 
 All containers should show "Up" status. The orchestrator should show "(healthy)".
 
-### 10. Monitor
+### 9. Monitor
 
-Check orchestrator logs for goal pickup:
+Check orchestrator logs for startup:
 
 ```powershell
-docker logs docker-orchestrator-1 2>&1 | Select-String -Pattern "goal|Goal" | Select-Object -Last 10
+docker logs docker-orchestrator-1 2>&1 | Select-String -Pattern "Composer|Brain|goal|Goal" | Select-Object -Last 15
 ```
+
+Verify the Composer connected successfully. Then open the dashboard at `http://localhost:5001/composer` to interact with the Composer chat UI.
 
 ## Notes
 
 - Goals are stored in SQLite (`goals.db`) on a persistent volume — they survive container restarts
-- On first startup, goals are imported from `goals.yaml` into SQLite (one-time bootstrap)
+- Use the Composer chat UI at `/composer` to create and approve goals
 - Workers register with the orchestrator via gRPC and receive task assignments
 - Rate limits can cause failures — if hit, wait the indicated time and re-run
 - The `seq` container (logging) persists across resets — no need to restart it
