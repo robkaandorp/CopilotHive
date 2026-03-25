@@ -391,6 +391,25 @@ tr:last-child td { border-bottom: none; }
     display: flex;
     flex-direction: column;
     gap: 1rem;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(110, 118, 129, 0.4) transparent;
+}
+
+.chat-messages::-webkit-scrollbar {
+    width: 6px;
+}
+
+.chat-messages::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.chat-messages::-webkit-scrollbar-thumb {
+    background: rgba(110, 118, 129, 0.4);
+    border-radius: 3px;
+}
+
+.chat-messages::-webkit-scrollbar-thumb:hover {
+    background: rgba(110, 118, 129, 0.6);
 }
 
 .chat-empty {
