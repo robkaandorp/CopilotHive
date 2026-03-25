@@ -88,6 +88,55 @@ public sealed class CopilotChoiceMergingHandlerTests
         Assert.NotNull(merged["tool_calls"]);
     }
 
+    /// <summary>
+    /// When an assistant message has tool_calls with arguments "null",
+    /// FixToolCallArguments must replace them with "{}".
+    /// </summary>
+    [Fact]
+    public void FixToolCallArguments_NullString_ReplacedWithEmptyObject()
+    {
+        var body = """{"messages":[{"role":"assistant","tool_calls":[{"id":"tc1","type":"function","function":{"name":"list_goals","arguments":"null"}}]}]}""";
+        var result = CopilotChoiceMergingHandler.FixToolCallArguments(body);
+        var json = JsonNode.Parse(result);
+        var args = json?["messages"]?[0]?["tool_calls"]?[0]?["function"]?["arguments"]?.GetValue<string>();
+        Assert.Equal("{}", args);
+    }
+
+    /// <summary>
+    /// When arguments is an empty string, it must be replaced with "{}".
+    /// </summary>
+    [Fact]
+    public void FixToolCallArguments_EmptyString_ReplacedWithEmptyObject()
+    {
+        var body = """{"messages":[{"role":"assistant","tool_calls":[{"id":"tc1","type":"function","function":{"name":"list_goals","arguments":""}}]}]}""";
+        var result = CopilotChoiceMergingHandler.FixToolCallArguments(body);
+        var json = JsonNode.Parse(result);
+        var args = json?["messages"]?[0]?["tool_calls"]?[0]?["function"]?["arguments"]?.GetValue<string>();
+        Assert.Equal("{}", args);
+    }
+
+    /// <summary>
+    /// When arguments is a valid JSON object string, it must pass through unchanged.
+    /// </summary>
+    [Fact]
+    public void FixToolCallArguments_ValidArgs_PassesThrough()
+    {
+        var body = """{"messages":[{"role":"assistant","tool_calls":[{"id":"tc1","type":"function","function":{"name":"get_goal","arguments":"{\"id\":\"my-goal\"}"}}]}]}""";
+        var result = CopilotChoiceMergingHandler.FixToolCallArguments(body);
+        Assert.Equal(body, result); // No modification
+    }
+
+    /// <summary>
+    /// Messages without tool_calls are left untouched.
+    /// </summary>
+    [Fact]
+    public void FixToolCallArguments_NoToolCalls_PassesThrough()
+    {
+        var body = """{"messages":[{"role":"user","content":"hello"}]}""";
+        var result = CopilotChoiceMergingHandler.FixToolCallArguments(body);
+        Assert.Equal(body, result);
+    }
+
     private static CopilotChoiceMergingHandler CreateHandler(string responseBody) =>
         new(new FakeResponseHandler(responseBody));
 

@@ -267,7 +267,11 @@ public static class ChatClientFactory
             {
                 var reqBody = await request.Content.ReadAsStringAsync();
                 LogCompletionsExchange(seq, "request", reqBody);
-                // Restore consumed content
+                // Fix tool_call arguments that the Copilot API proxy can't parse.
+                // Claude streaming returns empty arguments ("") for parameterless calls,
+                // which the SDK accumulates as the string "null". The Copilot→Anthropic
+                // proxy needs a valid JSON object string for tool_use.input.
+                reqBody = FixToolCallArguments(reqBody);
                 request.Content = new StringContent(reqBody, System.Text.Encoding.UTF8, "application/json");
             }
 
@@ -352,6 +356,49 @@ public static class ChatClientFactory
                 File.WriteAllText(Path.Combine(dir, fileName), content);
             }
             catch { /* best-effort logging */ }
+        }
+
+        /// <summary>
+        /// Fixes tool_call arguments in outgoing request messages.
+        /// When Claude streams a tool call with no arguments, the SDK accumulates
+        /// the empty argument chunks as the literal string "null". The Copilot API
+        /// proxy expects a valid JSON object for Anthropic's tool_use.input field.
+        /// </summary>
+        internal static string FixToolCallArguments(string requestBody)
+        {
+            try
+            {
+                var json = JsonNode.Parse(requestBody);
+                var messages = json?["messages"]?.AsArray();
+                if (messages is null) return requestBody;
+
+                bool modified = false;
+                foreach (var msg in messages)
+                {
+                    var toolCalls = msg?["tool_calls"]?.AsArray();
+                    if (toolCalls is null) continue;
+
+                    foreach (var tc in toolCalls)
+                    {
+                        var func = tc?["function"];
+                        if (func is null) continue;
+
+                        var argsNode = func["arguments"];
+                        var argsStr = argsNode?.GetValue<string>();
+                        if (argsStr is null or "" or "null")
+                        {
+                            func["arguments"] = "{}";
+                            modified = true;
+                        }
+                    }
+                }
+
+                return modified ? json!.ToJsonString() : requestBody;
+            }
+            catch
+            {
+                return requestBody;
+            }
         }
     }
 
