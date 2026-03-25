@@ -275,28 +275,19 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// </summary>
     public async Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default)
     {
-        var metricsContext = pipeline.Iteration > 1
+        var previousIterationContext = BuildPreviousIterationContext(pipeline);
+
+        var retryContext = pipeline.Iteration > 1
             ? $"""
-              Previous iteration metrics:
-              - Tests: {pipeline.Metrics.PassedTests}/{pipeline.Metrics.TotalTests} passed
-              - Coverage: {pipeline.Metrics.CoveragePercent}%
+              Retry context:
+              - This is iteration {pipeline.Iteration} (previous attempts: {pipeline.Iteration - 1})
               - Review retries: {pipeline.ReviewRetries}
               - Test retries: {pipeline.TestRetries}
-              - Issues: {string.Join(", ", pipeline.Metrics.Issues)}
+              This is a retry — use the feedback above to plan which phases need re-running.
               """
-            : "This is the first iteration — no previous metrics.";
+            : "This is the first iteration — no previous feedback.";
 
         var historyContext = BuildMetricsHistoryContext();
-
-        var failureContext = pipeline.Phase == GoalPhase.Failed || pipeline.TestRetries > 0 || pipeline.ReviewRetries > 0
-            ? $"""
-              Failure context:
-              - Current phase: {pipeline.Phase}
-              - Review retries so far: {pipeline.ReviewRetries}
-              - Test retries so far: {pipeline.TestRetries}
-              This is a retry — consider which phases need re-running and which can be skipped.
-              """
-            : "";
 
         var conversationSummary = pipeline.Conversation.Count > 0
             ? $"Conversation history ({pipeline.Conversation.Count} messages): " +
@@ -309,9 +300,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
             (You can browse the code under these folder names in your working directory)
 
-            {{metricsContext}}
+            {{retryContext}}
+            {{previousIterationContext}}
             {{historyContext}}
-            {{failureContext}}
             {{conversationSummary}}
 
             Decide the ordered phases for this iteration. Consider:
@@ -541,6 +532,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _ => throw new InvalidOperationException($"Unhandled phase in CraftPromptAsync: '{phase}'"),
         };
 
+        // When retrying after review/test rejection, include the specific feedback
+        // so the coder/tester knows exactly what to fix.
+        var previousFeedback = (phase is GoalPhase.Coding or GoalPhase.Testing && pipeline.Iteration > 1)
+            ? BuildPreviousIterationContext(pipeline)
+            : "";
+
         var prompt = $$"""
             Craft a prompt for the {{roleName}} worker.
 
@@ -549,6 +546,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Current phase: {{phase}}
             Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
             {{phaseInstructions}}
+            {{(previousFeedback.Length > 0 ? $"\n{previousFeedback}" : "")}}
             {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
             {{(historyContext.Length > 0 ? $"\n{historyContext}" : "")}}
 
@@ -795,6 +793,60 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     internal static string Truncate(string text, int maxLength) =>
         text.Length <= maxLength ? text : text[..maxLength] + "...";
+
+    /// <summary>
+    /// Builds a summary of the previous iteration's reviewer/tester feedback
+    /// from <see cref="GoalPipeline.PhaseOutputs"/>. Returns an empty string
+    /// for the first iteration.
+    /// </summary>
+    internal static string BuildPreviousIterationContext(GoalPipeline pipeline)
+    {
+        if (pipeline.Iteration <= 1)
+            return "";
+
+        var prevIteration = pipeline.Iteration - 1;
+        var sb = new StringBuilder();
+        sb.AppendLine($"Previous iteration ({prevIteration}) feedback:");
+
+        var hasAnyFeedback = false;
+
+        // Include reviewer feedback — the most critical signal for replanning
+        var reviewerKey = $"reviewer-{prevIteration}";
+        if (pipeline.PhaseOutputs.TryGetValue(reviewerKey, out var reviewerOutput)
+            && !string.IsNullOrWhiteSpace(reviewerOutput))
+        {
+            hasAnyFeedback = true;
+            sb.AppendLine("  REVIEWER feedback (this is why the iteration was rejected):");
+            sb.AppendLine($"  {Truncate(reviewerOutput, Constants.TruncationConversationSummary)}");
+        }
+
+        // Include tester feedback if tests failed
+        var testerKey = $"tester-{prevIteration}";
+        if (pipeline.PhaseOutputs.TryGetValue(testerKey, out var testerOutput)
+            && !string.IsNullOrWhiteSpace(testerOutput))
+        {
+            hasAnyFeedback = true;
+            sb.AppendLine("  TESTER feedback:");
+            sb.AppendLine($"  {Truncate(testerOutput, Constants.TruncationConversationSummary)}");
+        }
+
+        // Include coder output for context on what was attempted
+        var coderKey = $"coder-{prevIteration}";
+        if (pipeline.PhaseOutputs.TryGetValue(coderKey, out var coderOutput)
+            && !string.IsNullOrWhiteSpace(coderOutput))
+        {
+            hasAnyFeedback = true;
+            sb.AppendLine("  CODER output (what was attempted):");
+            sb.AppendLine($"  {Truncate(coderOutput, Constants.TruncationMedium)}");
+        }
+
+        if (!hasAnyFeedback)
+        {
+            sb.AppendLine("  (No phase outputs recorded for the previous iteration)");
+        }
+
+        return sb.ToString();
+    }
 
     /// <summary>Saves the session and disposes the underlying chat client.</summary>
     public async ValueTask DisposeAsync()

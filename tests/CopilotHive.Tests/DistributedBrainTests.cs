@@ -211,6 +211,116 @@ public sealed class DistributedBrainTests
         Assert.Equal("Brain context usage: 50.0% (75000/150000 tokens) after PlanIterationAsync", result);
     }
 
+    // -- BuildPreviousIterationContext Tests --
+
+    [Fact]
+    public void BuildPreviousIterationContext_FirstIteration_ReturnsEmpty()
+    {
+        var pipeline = CreatePipeline("g-ctx-1", "First iteration goal");
+        // Iteration defaults to 1
+        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+        Assert.Equal("", result);
+    }
+
+    [Fact]
+    public void BuildPreviousIterationContext_SecondIteration_IncludesReviewerFeedback()
+    {
+        var pipeline = CreatePipeline("g-ctx-2", "Review rejected goal");
+        pipeline.RecordOutput(WorkerRole.Reviewer, 1, "FAIL: Missing null check in UserService.GetById()");
+        pipeline.IncrementIteration(); // Now iteration 2
+
+        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+
+        Assert.Contains("Previous iteration (1) feedback:", result);
+        Assert.Contains("REVIEWER feedback", result);
+        Assert.Contains("Missing null check", result);
+    }
+
+    [Fact]
+    public void BuildPreviousIterationContext_SecondIteration_IncludesTesterFeedback()
+    {
+        var pipeline = CreatePipeline("g-ctx-3", "Test failed goal");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "3 tests failed: TestAuth, TestLogin, TestLogout");
+        pipeline.IncrementIteration();
+
+        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+
+        Assert.Contains("TESTER feedback", result);
+        Assert.Contains("3 tests failed", result);
+    }
+
+    [Fact]
+    public void BuildPreviousIterationContext_SecondIteration_IncludesCoderOutput()
+    {
+        var pipeline = CreatePipeline("g-ctx-4", "Coder context goal");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "Added UserService with CRUD operations");
+        pipeline.IncrementIteration();
+
+        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+
+        Assert.Contains("CODER output", result);
+        Assert.Contains("Added UserService", result);
+    }
+
+    [Fact]
+    public void BuildPreviousIterationContext_AllPhaseOutputs_IncludesAll()
+    {
+        var pipeline = CreatePipeline("g-ctx-5", "Full feedback goal");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "Implemented feature X");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "All 50 tests pass");
+        pipeline.RecordOutput(WorkerRole.Reviewer, 1, "FAIL: Variable naming inconsistent");
+        pipeline.IncrementIteration();
+
+        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+
+        Assert.Contains("REVIEWER feedback", result);
+        Assert.Contains("TESTER feedback", result);
+        Assert.Contains("CODER output", result);
+    }
+
+    [Fact]
+    public void BuildPreviousIterationContext_NoOutputsRecorded_ShowsFallbackMessage()
+    {
+        var pipeline = CreatePipeline("g-ctx-6", "No outputs goal");
+        pipeline.IncrementIteration();
+
+        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+
+        Assert.Contains("Previous iteration (1) feedback:", result);
+        Assert.Contains("No phase outputs recorded", result);
+    }
+
+    [Fact]
+    public void BuildPreviousIterationContext_ThirdIteration_UsesIterationTwoOutputs()
+    {
+        var pipeline = CreatePipeline("g-ctx-7", "Multi-iteration goal");
+        pipeline.RecordOutput(WorkerRole.Reviewer, 1, "FAIL: Iteration 1 issue");
+        pipeline.IncrementIteration(); // Now iteration 2
+        pipeline.RecordOutput(WorkerRole.Reviewer, 2, "FAIL: Iteration 2 issue");
+        pipeline.IncrementIteration(); // Now iteration 3
+
+        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+
+        Assert.Contains("Previous iteration (2) feedback:", result);
+        Assert.Contains("Iteration 2 issue", result);
+        Assert.DoesNotContain("Iteration 1 issue", result);
+    }
+
+    [Fact]
+    public void BuildPreviousIterationContext_LongOutput_TruncatesReviewer()
+    {
+        var pipeline = CreatePipeline("g-ctx-8", "Long output goal");
+        var longOutput = new string('X', 5000);
+        pipeline.RecordOutput(WorkerRole.Reviewer, 1, longOutput);
+        pipeline.IncrementIteration();
+
+        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+
+        // Reviewer uses TruncationConversationSummary (2000) so output should be truncated
+        Assert.True(result.Length < 5000 + 200); // Some overhead for labels
+        Assert.Contains("...", result);
+    }
+
     // -- Helpers --
 
     private static GoalPipeline CreatePipeline(string goalId, string description) =>
