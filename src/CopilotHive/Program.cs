@@ -13,6 +13,7 @@ using CopilotHive.Persistence;
 using CopilotHive.Services;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.Data.Sqlite;
 
 // ── Server mode (only mode) ──────────────────────────────────────────────────
 return await RunServerAsync(args);
@@ -313,6 +314,14 @@ static async Task<int> RunServerAsync(string[] args)
         {
             var created = await store.CreateGoalAsync(goal);
             return Results.Created($"/api/goals/{created.Id}", created);
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == 19) // SQLITE_CONSTRAINT (duplicate primary key)
+        {
+            return Results.Conflict(new { error = $"Goal '{goal.Id}' already exists." });
         }
         catch (InvalidOperationException ex)
         {
