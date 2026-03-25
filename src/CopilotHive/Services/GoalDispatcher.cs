@@ -132,6 +132,7 @@ public sealed class GoalDispatcher : BackgroundService
                     await SyncAgentsFromConfigRepoAsync(stoppingToken);
                 }
 
+                await RedispatchOrphanedPipelinesAsync(stoppingToken);
                 await DispatchNextGoalAsync(stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -1221,16 +1222,63 @@ public sealed class GoalDispatcher : BackgroundService
             // Brain session is loaded from file at startup (single persistent session),
             // so no per-goal re-priming is needed.
 
-            // If the pipeline was mid-task (has ActiveTaskId), re-enqueue the task for reassignment
+            // If the pipeline was mid-task (has ActiveTaskId), the old worker is gone
+            // after a restart. Clear the active task and re-dispatch immediately.
             if (pipeline.ActiveTaskId is not null && pipeline.Phase is not (GoalPhase.Done or GoalPhase.Failed))
             {
-                _logger.LogInformation("Pipeline {GoalId} was mid-task ({TaskId}) — will await worker reconnection",
+                _logger.LogInformation("Pipeline {GoalId} was mid-task ({TaskId}) — clearing stale task for re-dispatch",
                     pipeline.GoalId, pipeline.ActiveTaskId);
+
+                var staleTaskId = pipeline.ActiveTaskId;
+                _taskQueue.MarkComplete(staleTaskId);
+                pipeline.ClearActiveTask();
             }
         }
 
         _logger.LogInformation("Restored {Count} pipeline(s): {GoalIds}",
             restored.Count, string.Join(", ", restored.Select(p => p.GoalId)));
+    }
+
+    /// <summary>
+    /// Checks active pipelines for ones that have no active task (e.g., after a worker
+    /// died or a restart). Re-dispatches the current phase for any orphaned pipeline.
+    /// </summary>
+    private async Task RedispatchOrphanedPipelinesAsync(CancellationToken ct)
+    {
+        var activePipelines = _pipelineManager.GetActivePipelines();
+        foreach (var pipeline in activePipelines)
+        {
+            if (pipeline.ActiveTaskId is not null) continue;
+            if (pipeline.Phase is GoalPhase.Done or GoalPhase.Failed) continue;
+
+            var role = pipeline.Phase switch
+            {
+                GoalPhase.Coding => WorkerRole.Coder,
+                GoalPhase.Testing => WorkerRole.Tester,
+                GoalPhase.Review => WorkerRole.Reviewer,
+                GoalPhase.DocWriting => WorkerRole.DocWriter,
+                GoalPhase.Improve => WorkerRole.Improver,
+                _ => (WorkerRole?)null,
+            };
+
+            if (role is null)
+            {
+                _logger.LogWarning("Pipeline {GoalId} orphaned in phase {Phase} — no role mapping, skipping",
+                    pipeline.GoalId, pipeline.Phase);
+                continue;
+            }
+
+            _logger.LogInformation("Re-dispatching orphaned pipeline {GoalId} (phase={Phase}, role={Role})",
+                pipeline.GoalId, pipeline.Phase, role);
+
+            var prompt = _brain is not null
+                ? await _brain.CraftPromptAsync(pipeline, pipeline.Phase,
+                    "This task is being re-dispatched after the previous worker was lost. Continue from where the previous worker left off.",
+                    ct)
+                : $"Continue task for: {pipeline.Description}";
+
+            await DispatchToRole(pipeline, role.Value, prompt, ct);
+        }
     }
 
     private async Task DispatchNextGoalAsync(CancellationToken ct)

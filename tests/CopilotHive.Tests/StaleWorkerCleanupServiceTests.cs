@@ -22,7 +22,9 @@ public sealed class StaleWorkerCleanupServiceTests
         ILogger<StaleWorkerCleanupService>? logger = null)
     {
         logger ??= Mock.Of<ILogger<StaleWorkerCleanupService>>();
-        return new StaleWorkerCleanupService(pool, logger);
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+        return new StaleWorkerCleanupService(pool, taskQueue, pipelineManager, logger);
     }
 
     // ── (a) No stale workers → nothing removed ────────────────────────────────

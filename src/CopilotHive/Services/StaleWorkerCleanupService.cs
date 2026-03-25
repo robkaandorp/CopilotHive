@@ -6,11 +6,14 @@ namespace CopilotHive.Services;
 /// <summary>
 /// Hosted background service that periodically scans the worker pool for stale workers
 /// (workers whose heartbeat has not been received within <see cref="CleanupDefaults.StaleTimeoutMinutes"/>
-/// minutes) and removes them.
+/// minutes) and removes them. When a stale worker had an active task, the task is
+/// re-enqueued for reassignment to another worker.
 /// </summary>
 public sealed class StaleWorkerCleanupService : BackgroundService
 {
     private readonly IWorkerPool _workerPool;
+    private readonly TaskQueue _taskQueue;
+    private readonly GoalPipelineManager _pipelineManager;
     private readonly ILogger<StaleWorkerCleanupService> _logger;
 
     /// <summary>
@@ -20,15 +23,17 @@ public sealed class StaleWorkerCleanupService : BackgroundService
     internal TimeSpan CleanupDelay { get; set; } = TimeSpan.FromSeconds(CleanupDefaults.CleanupIntervalSeconds);
 
     /// <summary>
-    /// Initialises the service with the worker pool and a logger.
+    /// Initialises the service with the worker pool, task queue, pipeline manager, and a logger.
     /// </summary>
-    /// <param name="workerPool">The pool from which stale workers are removed.</param>
-    /// <param name="logger">Logger used to emit warnings for each evicted worker.</param>
     public StaleWorkerCleanupService(
         IWorkerPool workerPool,
+        TaskQueue taskQueue,
+        GoalPipelineManager pipelineManager,
         ILogger<StaleWorkerCleanupService> logger)
     {
         _workerPool = workerPool;
+        _taskQueue = taskQueue;
+        _pipelineManager = pipelineManager;
         _logger = logger;
     }
 
@@ -71,8 +76,42 @@ public sealed class StaleWorkerCleanupService : BackgroundService
         var removed = _workerPool.PurgeStaleWorkers(TimeSpan.FromMinutes(CleanupDefaults.StaleTimeoutMinutes));
 
         foreach (var worker in removed)
-            _logger.LogWarning("Removing stale worker {WorkerId}", worker.Id);
+        {
+            _logger.LogWarning("Removing stale worker {WorkerId} (lastHeartbeat={LastHeartbeat})",
+                worker.Id, worker.LastHeartbeat);
+
+            if (worker.IsBusy && worker.CurrentTaskId is not null)
+            {
+                RescheduleAbandonedTask(worker.Id, worker.CurrentTaskId);
+            }
+        }
 
         return Task.CompletedTask;
+    }
+
+    private void RescheduleAbandonedTask(string workerId, string taskId)
+    {
+        var task = _taskQueue.GetActiveTask(taskId);
+        if (task is null)
+        {
+            _logger.LogWarning("Stale worker {WorkerId} had task {TaskId} but it is not in the active queue — clearing pipeline",
+                workerId, taskId);
+        }
+        else
+        {
+            _taskQueue.MarkComplete(taskId);
+            _taskQueue.Enqueue(task);
+            _logger.LogWarning("Re-enqueued task {TaskId} from dead worker {WorkerId} for reassignment",
+                taskId, workerId);
+        }
+
+        // Clear the pipeline's active task so GoalDispatcher doesn't think it's still running
+        var pipeline = _pipelineManager.GetByTaskId(taskId);
+        if (pipeline is not null)
+        {
+            pipeline.ClearActiveTask();
+            _logger.LogInformation("Cleared active task on pipeline {GoalId} — will be re-dispatched",
+                pipeline.GoalId);
+        }
     }
 }
