@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Goals API error handling** — `POST /api/goals` endpoint now properly handles `ArgumentException` (invalid goal ID format) with 400 Bad Request and `SqliteException` with constraint violation (duplicate ID) with 409 Conflict, instead of returning 500 Internal Server Error
+- **Goals API integration tests** — `GoalsApiEndpointTests` class with 20 xUnit tests covering all Goals REST API endpoints (`GET /api/goals`, `POST /api/goals`, `GET /api/goals/{id}`, `PATCH /api/goals/{id}/status`, `DELETE /api/goals/{id}`, `GET /api/goals/search`); tests verify HTTP status codes, response bodies, error handling, and end-to-end integration with `HiveTestFactory`
+
 ### Removed
 - **Dead merge code path** — Removed `MergeViaTempCloneAsync` method and its standalone `RunGitAsync` helper from `GoalDispatcher` (the temp-clone fallback was dead code — `BrainRepoManager` is always registered in `Program.cs`); `_repoManager` field is now non-nullable
 
