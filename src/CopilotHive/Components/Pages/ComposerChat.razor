@@ -40,7 +40,7 @@ else
                 <div class="chat-msg chat-msg-assistant">
                     <div class="chat-msg-role">Composer</div>
                     <div class="chat-msg-content">
-                        @((MarkupString)FormatContent(_streamingContent))
+                        @((MarkupString)FormatStreamingContent(_streamingContent))
                         <span class="chat-cursor">▊</span>
                     </div>
                 </div>
@@ -198,6 +198,12 @@ else
     {
         if (string.IsNullOrEmpty(content)) return "";
         return Markdown.ToHtml(content, MarkdownPipeline);
+    }
+
+    private static string FormatStreamingContent(string content)
+    {
+        if (string.IsNullOrEmpty(content)) return "";
+        return System.Net.WebUtility.HtmlEncode(content).Replace("\n", "<br />");
     }
 
     public void Dispose()
