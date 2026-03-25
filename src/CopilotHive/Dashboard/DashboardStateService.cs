@@ -319,6 +319,7 @@ public sealed class DashboardStateService : IDisposable
             ActiveTaskId = pipeline?.ActiveTaskId,
             CoderBranch = pipeline?.CoderBranch,
             Notes = goal.Notes,
+            DependsOn = goal.DependsOn,
             Iterations = iterations,
             Conversation = pipeline?.Conversation.ToList() ?? [],
         };
@@ -481,6 +482,8 @@ public sealed class GoalDetailInfo
     public string? CoderBranch { get; init; }
     /// <summary>Informational notes attached to the goal.</summary>
     public List<string> Notes { get; init; } = [];
+    /// <summary>IDs of goals that must complete before this goal can be dispatched.</summary>
+    public List<string> DependsOn { get; init; } = [];
     /// <summary>Per-iteration detail with phases.</summary>
     public List<IterationViewInfo> Iterations { get; init; } = [];
     /// <summary>Brain conversation log.</summary>

@@ -57,7 +57,8 @@ public sealed class SqliteGoalStore : IGoalStore
                 notes                 TEXT,
                 phase_durations       TEXT,
                 total_duration_seconds REAL,
-                source_conversation_id TEXT
+                source_conversation_id TEXT,
+                depends_on             TEXT
             );
 
             CREATE TABLE IF NOT EXISTS goal_iterations (
@@ -200,8 +201,8 @@ public sealed class SqliteGoalStore : IGoalStore
         {
             using var cmd = _db.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO goals (id, description, title, status, priority, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id)
-                VALUES (@id, @desc, @title, @status, @priority, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId)
+                INSERT INTO goals (id, description, title, status, priority, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id, depends_on)
+                VALUES (@id, @desc, @title, @status, @priority, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId, @dependsOn)
                 """;
             BindGoalParams(cmd, goal);
             cmd.ExecuteNonQuery();
@@ -224,7 +225,8 @@ public sealed class SqliteGoalStore : IGoalStore
                     started_at = @startedAt, completed_at = @completedAt,
                     iterations = @iterations, failure_reason = @failureReason,
                     notes = @notes, phase_durations = @phaseDurations,
-                    total_duration_seconds = @totalDuration, source_conversation_id = @sourceConvId
+                    total_duration_seconds = @totalDuration, source_conversation_id = @sourceConvId,
+                    depends_on = @dependsOn
                 WHERE id = @id
                 """;
             BindGoalParams(cmd, goal);
@@ -338,8 +340,8 @@ public sealed class SqliteGoalStore : IGoalStore
                     using var cmd = _db.CreateCommand();
                     cmd.Transaction = tx;
                     cmd.CommandText = """
-                        INSERT INTO goals (id, description, title, status, priority, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id)
-                        VALUES (@id, @desc, @title, @status, @priority, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId)
+                        INSERT INTO goals (id, description, title, status, priority, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id, depends_on)
+                        VALUES (@id, @desc, @title, @status, @priority, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId, @dependsOn)
                         """;
                     BindGoalParams(cmd, goal);
                     cmd.ExecuteNonQuery();
@@ -436,6 +438,14 @@ public sealed class SqliteGoalStore : IGoalStore
         if (!reader.IsDBNull(totalDurOrd))
             goal.TotalDurationSeconds = reader.GetDouble(totalDurOrd);
 
+        var dependsOnOrd = reader.GetOrdinal("depends_on");
+        if (!reader.IsDBNull(dependsOnOrd))
+        {
+            var deps = JsonSerializer.Deserialize<List<string>>(reader.GetString(dependsOnOrd), JsonOptions);
+            if (deps is not null)
+                goal.DependsOn.AddRange(deps);
+        }
+
         return goal;
     }
 
@@ -461,6 +471,8 @@ public sealed class SqliteGoalStore : IGoalStore
             ? JsonSerializer.Serialize(goal.PhaseDurations, JsonOptions) : (object)DBNull.Value);
         cmd.Parameters.AddWithValue("@totalDuration", goal.TotalDurationSeconds.HasValue ? goal.TotalDurationSeconds.Value : (object)DBNull.Value);
         cmd.Parameters.AddWithValue("@sourceConvId", (object?)null ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@dependsOn", goal.DependsOn.Count > 0
+            ? JsonSerializer.Serialize(goal.DependsOn, JsonOptions) : (object)DBNull.Value);
     }
 
     private void InsertIterationCore(string goalId, IterationSummary summary, SqliteTransaction? transaction)

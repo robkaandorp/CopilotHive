@@ -5,6 +5,8 @@ namespace CopilotHive.Goals;
 
 /// <summary>
 /// In-memory goal source backed by a concurrent dictionary; used by the HTTP API to inject goals at runtime.
+/// No code changes needed for DependsOn — Goal objects are stored directly in the ConcurrentDictionary
+/// and the DependsOn property is carried through automatically.
 /// </summary>
 public sealed class ApiGoalSource : IGoalSource
 {

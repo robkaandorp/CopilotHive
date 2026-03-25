@@ -15,6 +15,8 @@ public sealed class Goal
     public GoalStatus Status { get; set; } = GoalStatus.Pending;
     /// <summary>Names of repositories this goal applies to.</summary>
     public List<string> RepositoryNames { get; init; } = [];
+    /// <summary>IDs of goals that must complete before this goal can be dispatched.</summary>
+    public List<string> DependsOn { get; init; } = [];
     /// <summary>Arbitrary key/value metadata associated with the goal.</summary>
     public Dictionary<string, string> Metadata { get; init; } = [];
     /// <summary>UTC timestamp when the goal was created.</summary>

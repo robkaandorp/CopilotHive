@@ -92,4 +92,37 @@ public sealed class FileGoalSourceTests : IDisposable
         Assert.NotNull(goal.StartedAt);
         Assert.Equal(startedAt, goal.StartedAt.Value);
     }
+
+    /// <summary>
+    /// Verifies that <c>depends_on</c> is round-tripped correctly through
+    /// the YAML file and survives serialization/deserialization.
+    /// </summary>
+    [Fact]
+    public async Task DependsOn_FileGoalSourceRoundTrip()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var path = WriteTempYaml(
+            """
+            goals:
+              - id: dep-test
+                description: Test dependencies
+                depends_on:
+                  - goal-x
+            """);
+
+        var source = new FileGoalSource(path);
+        var goals = await source.ReadGoalsAsync(ct);
+        var goal = Assert.Single(goals);
+        Assert.Single(goal.DependsOn);
+        Assert.Contains("goal-x", goal.DependsOn);
+
+        // Now update and re-read to verify round-trip through write
+        await source.UpdateGoalStatusAsync("dep-test", GoalStatus.InProgress, ct: ct);
+
+        var source2 = new FileGoalSource(path);
+        var goals2 = await source2.ReadGoalsAsync(ct);
+        var goal2 = Assert.Single(goals2);
+        Assert.Single(goal2.DependsOn);
+        Assert.Contains("goal-x", goal2.DependsOn);
+    }
 }

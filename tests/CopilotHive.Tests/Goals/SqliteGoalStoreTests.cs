@@ -344,6 +344,42 @@ public sealed class SqliteGoalStoreTests : IDisposable
         Assert.Equal("3", fetched.Metadata["iteration_target"]);
     }
 
+    // ── DependsOn round-trip ───────────────────────────────────────────────
+
+    [Fact]
+    public async Task DependsOn_SqliteRoundTrip()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = new Goal
+        {
+            Id = "dep-goal",
+            Description = "Goal with dependencies",
+            DependsOn = ["goal-a", "goal-b"],
+            CreatedAt = new DateTime(2025, 1, 15, 10, 0, 0, DateTimeKind.Utc),
+        };
+
+        await _store.CreateGoalAsync(goal, ct);
+        var fetched = await _store.GetGoalAsync("dep-goal", ct);
+
+        Assert.NotNull(fetched);
+        Assert.Equal(2, fetched.DependsOn.Count);
+        Assert.Contains("goal-a", fetched.DependsOn);
+        Assert.Contains("goal-b", fetched.DependsOn);
+    }
+
+    [Fact]
+    public async Task DependsOn_EmptyList_RoundTrips()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = MakeGoal();
+
+        await _store.CreateGoalAsync(goal, ct);
+        var fetched = await _store.GetGoalAsync("test-goal", ct);
+
+        Assert.NotNull(fetched);
+        Assert.Empty(fetched.DependsOn);
+    }
+
     // ── Name property ─────────────────────────────────────────────────────
 
     [Fact]
