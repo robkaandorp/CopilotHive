@@ -694,7 +694,9 @@ public sealed class GoalDispatcher : BackgroundService
                 // After merge, the clone is already on the base branch with the latest code.
                 var mergeCommitHash = await _repoManager.MergeFeatureBranchAsync(
                     repo.Name, pipeline.CoderBranch, repo.DefaultBranch, ct);
-                pipeline.MergeCommitHash = mergeCommitHash;
+                pipeline.MergeCommitHash = pipeline.MergeCommitHash is null
+                    ? mergeCommitHash
+                    : $"{pipeline.MergeCommitHash},{mergeCommitHash}";
 
                 _logger.LogInformation("Merged {Branch} into {Base} for {Repo} (commit={Hash})",
                     pipeline.CoderBranch, repo.DefaultBranch, repo.Name, mergeCommitHash);

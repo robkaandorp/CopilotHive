@@ -139,7 +139,7 @@ public sealed class BrainRepoManager
 
     /// <summary>
     /// Runs a git command and returns the standard output as a string.
-    /// Does not throw on non-zero exit codes.
+    /// Throws <see cref="InvalidOperationException"/> with stderr on non-zero exit codes.
     /// </summary>
     /// <param name="workingDir">Working directory for the git process.</param>
     /// <param name="args">Arguments to pass to git.</param>
