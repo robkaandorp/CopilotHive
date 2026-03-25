@@ -364,6 +364,35 @@ public sealed class ComposerToolTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateGoal_WithDependsOn_StoresDependencies()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.CreateGoalAsync("dep-goal", "Goal with deps", depends_on: "goal-a, goal-b");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("Dependencies: goal-a, goal-b", result);
+
+        var goal = await _store.GetGoalAsync("dep-goal", ct);
+        Assert.NotNull(goal);
+        Assert.Equal(2, goal!.DependsOn.Count);
+        Assert.Contains("goal-a", goal.DependsOn);
+        Assert.Contains("goal-b", goal.DependsOn);
+    }
+
+    [Fact]
+    public async Task CreateGoal_WithoutDependsOn_EmptyList()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("no-dep-goal", "Goal without deps");
+
+        var goal = await _store.GetGoalAsync("no-dep-goal", ct);
+        Assert.NotNull(goal);
+        Assert.Empty(goal!.DependsOn);
+    }
+
+    [Fact]
     public async Task DeleteGoal_NotFound_ReturnsError()
     {
         var result = await _composer.DeleteGoalAsync("nonexistent");

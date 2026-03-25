@@ -342,7 +342,8 @@ public sealed class Composer : IAsyncDisposable
         [Description("Unique goal ID in lowercase-kebab-case (e.g. 'add-user-auth')")] string id,
         [Description("Clear description including acceptance criteria")] string description,
         [Description("Comma-separated repository names this goal applies to")] string? repositories = null,
-        [Description("Priority: Low, Normal, High, or Critical. Default: Normal")] string? priority = null)
+        [Description("Priority: Low, Normal, High, or Critical. Default: Normal")] string? priority = null,
+        [Description("Comma-separated goal IDs this goal depends on")] string? depends_on = null)
     {
         var isValidId = IsValidGoalId(id);
         var error = Shared.ToolValidation.Check(
@@ -363,6 +364,10 @@ public sealed class Composer : IAsyncDisposable
             ? new List<string>()
             : repositories.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
 
+        var deps = string.IsNullOrWhiteSpace(depends_on)
+            ? new List<string>()
+            : depends_on.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+
         var goal = new Goal
         {
             Id = id,
@@ -370,6 +375,7 @@ public sealed class Composer : IAsyncDisposable
             Priority = goalPriority,
             Status = GoalStatus.Draft,
             RepositoryNames = repos,
+            DependsOn = deps,
         };
 
         await _goalStore.CreateGoalAsync(goal);
@@ -380,6 +386,7 @@ public sealed class Composer : IAsyncDisposable
             - ID: {id}
             - Priority: {goalPriority}
             - Repositories: {(repos.Count > 0 ? string.Join(", ", repos) : "(none)")}
+            - Dependencies: {(deps.Count > 0 ? string.Join(", ", deps) : "(none)")}
             - Status: Draft (not yet dispatched — use approve_goal to queue it)
             """;
     }

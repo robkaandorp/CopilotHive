@@ -344,11 +344,117 @@ public sealed class SqliteGoalStoreTests : IDisposable
         Assert.Equal("3", fetched.Metadata["iteration_target"]);
     }
 
+    // ── DependsOn round-trip ───────────────────────────────────────────────
+
+    [Fact]
+    public async Task DependsOn_SqliteRoundTrip()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = new Goal
+        {
+            Id = "dep-goal",
+            Description = "Goal with dependencies",
+            DependsOn = ["goal-a", "goal-b"],
+            CreatedAt = new DateTime(2025, 1, 15, 10, 0, 0, DateTimeKind.Utc),
+        };
+
+        await _store.CreateGoalAsync(goal, ct);
+        var fetched = await _store.GetGoalAsync("dep-goal", ct);
+
+        Assert.NotNull(fetched);
+        Assert.Equal(2, fetched.DependsOn.Count);
+        Assert.Contains("goal-a", fetched.DependsOn);
+        Assert.Contains("goal-b", fetched.DependsOn);
+    }
+
+    [Fact]
+    public async Task DependsOn_EmptyList_RoundTrips()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = MakeGoal();
+
+        await _store.CreateGoalAsync(goal, ct);
+        var fetched = await _store.GetGoalAsync("test-goal", ct);
+
+        Assert.NotNull(fetched);
+        Assert.Empty(fetched.DependsOn);
+    }
+
     // ── Name property ─────────────────────────────────────────────────────
 
     [Fact]
     public void Name_IsSqlite()
     {
         Assert.Equal("sqlite", _store.Name);
+    }
+
+    // ── Schema migration ──────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Migration_AddsColumnToExistingDatabase()
+    {
+        // Simulate an older database that doesn't have the depends_on column
+        var ct = TestContext.Current.CancellationToken;
+        using var oldConn = new SqliteConnection("Data Source=:memory:");
+        oldConn.Open();
+
+        // Create old schema WITHOUT depends_on
+        using (var createCmd = oldConn.CreateCommand())
+        {
+            createCmd.CommandText = """
+                CREATE TABLE goals (
+                    id                    TEXT PRIMARY KEY,
+                    description           TEXT NOT NULL,
+                    title                 TEXT,
+                    status                TEXT NOT NULL DEFAULT 'pending',
+                    priority              TEXT NOT NULL DEFAULT 'normal',
+                    repositories          TEXT,
+                    metadata              TEXT,
+                    created_at            TEXT NOT NULL,
+                    started_at            TEXT,
+                    completed_at          TEXT,
+                    iterations            INTEGER,
+                    failure_reason        TEXT,
+                    notes                 TEXT,
+                    phase_durations       TEXT,
+                    total_duration_seconds REAL,
+                    source_conversation_id TEXT
+                );
+                """;
+            createCmd.ExecuteNonQuery();
+        }
+
+        // Insert a goal using old schema
+        using (var insertCmd = oldConn.CreateCommand())
+        {
+            insertCmd.CommandText = """
+                INSERT INTO goals (id, description, status, priority, created_at)
+                VALUES ('old-goal', 'Pre-migration goal', 'pending', 'normal', '2025-01-01T00:00:00Z')
+                """;
+            insertCmd.ExecuteNonQuery();
+        }
+
+        // Now create a SqliteGoalStore which triggers InitSchema + MigrateSchema
+        var store = new SqliteGoalStore(oldConn, NullLogger<SqliteGoalStore>.Instance);
+
+        // Verify old goal can still be read (depends_on should be empty)
+        var oldGoal = await store.GetGoalAsync("old-goal", ct);
+        Assert.NotNull(oldGoal);
+        Assert.Empty(oldGoal.DependsOn);
+
+        // Verify new goals with depends_on work
+        var newGoal = new Goal
+        {
+            Id = "new-goal",
+            Description = "Post-migration goal",
+            DependsOn = ["old-goal"],
+            CreatedAt = new DateTime(2025, 6, 1, 0, 0, 0, DateTimeKind.Utc),
+        };
+        await store.CreateGoalAsync(newGoal, ct);
+
+        var fetched = await store.GetGoalAsync("new-goal", ct);
+        Assert.NotNull(fetched);
+        Assert.Single(fetched.DependsOn);
+        Assert.Contains("old-goal", fetched.DependsOn);
     }
 }

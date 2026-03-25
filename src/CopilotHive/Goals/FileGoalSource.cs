@@ -113,6 +113,7 @@ public sealed class FileGoalSource : IGoalSource
                 Priority = g.Priority.ToString().ToLowerInvariant(),
                 Status = FormatStatus(g.Status),
                 Repositories = g.RepositoryNames,
+                Depends_on = g.DependsOn.Count > 0 ? g.DependsOn : null,
                 Started_at = g.StartedAt?.ToString("o"),
                 Completed_at = g.CompletedAt?.ToString("o"),
                 Iterations = g.Iterations,
@@ -147,6 +148,7 @@ public sealed class FileGoalSource : IGoalSource
             Priority = ParsePriority(entry.Priority),
             Status = ParseStatus(entry.Status),
             RepositoryNames = entry.Repositories ?? [],
+            DependsOn = entry.Depends_on ?? [],
             StartedAt = ParseTimestamp(entry.Started_at),
             CompletedAt = ParseTimestamp(entry.Completed_at),
             Iterations = entry.Iterations,
@@ -240,6 +242,7 @@ public sealed class FileGoalSource : IGoalSource
         public string? Priority { get; set; }
         public string? Status { get; set; }
         public List<string>? Repositories { get; set; }
+        public List<string>? Depends_on { get; set; }
         public string? Started_at { get; set; }
         public string? Completed_at { get; set; }
         public int? Iterations { get; set; }
