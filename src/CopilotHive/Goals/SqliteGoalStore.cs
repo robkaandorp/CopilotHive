@@ -79,6 +79,42 @@ public sealed class SqliteGoalStore : IGoalStore
             CREATE INDEX IF NOT EXISTS idx_goal_iterations_goal ON goal_iterations(goal_id);
             """;
         cmd.ExecuteNonQuery();
+
+        MigrateSchema();
+    }
+
+    /// <summary>
+    /// Inspects existing table columns and adds any missing columns introduced
+    /// after the initial schema. This handles the case where <c>CREATE TABLE IF NOT EXISTS</c>
+    /// skips creation because the table already exists from an older version.
+    /// </summary>
+    private void MigrateSchema()
+    {
+        var existingColumns = GetTableColumns("goals");
+
+        if (!existingColumns.Contains("depends_on"))
+        {
+            using var alter = _db.CreateCommand();
+            alter.CommandText = "ALTER TABLE goals ADD COLUMN depends_on TEXT";
+            alter.ExecuteNonQuery();
+            _logger.LogInformation("Migrated goals table: added 'depends_on' column");
+        }
+    }
+
+    /// <summary>
+    /// Returns the set of column names for the specified table using <c>PRAGMA table_info</c>.
+    /// </summary>
+    /// <param name="tableName">Name of the SQLite table to inspect.</param>
+    /// <returns>A set of column names present in the table.</returns>
+    private HashSet<string> GetTableColumns(string tableName)
+    {
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = $"PRAGMA table_info({tableName})";
+        using var reader = cmd.ExecuteReader();
+        var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        while (reader.Read())
+            columns.Add(reader.GetString(1)); // column name is at index 1
+        return columns;
     }
 
     // ── IGoalSource ──────────────────────────────────────────────────────
@@ -438,8 +474,8 @@ public sealed class SqliteGoalStore : IGoalStore
         if (!reader.IsDBNull(totalDurOrd))
             goal.TotalDurationSeconds = reader.GetDouble(totalDurOrd);
 
-        var dependsOnOrd = reader.GetOrdinal("depends_on");
-        if (!reader.IsDBNull(dependsOnOrd))
+        // depends_on may be absent in databases created before migration
+        if (TryGetOrdinal(reader, "depends_on", out var dependsOnOrd) && !reader.IsDBNull(dependsOnOrd))
         {
             var deps = JsonSerializer.Deserialize<List<string>>(reader.GetString(dependsOnOrd), JsonOptions);
             if (deps is not null)
@@ -542,4 +578,26 @@ public sealed class SqliteGoalStore : IGoalStore
 
     private static string Truncate(string text, int maxLength) =>
         text.Length <= maxLength ? text : text[..maxLength] + "...";
+
+    /// <summary>
+    /// Attempts to get the ordinal for a column by name without throwing if the column is absent.
+    /// Used for backward compatibility when reading from databases that predate schema migrations.
+    /// </summary>
+    /// <param name="reader">The data reader to inspect.</param>
+    /// <param name="columnName">Name of the column to look up.</param>
+    /// <param name="ordinal">The ordinal of the column, if found.</param>
+    /// <returns><c>true</c> if the column was found; <c>false</c> otherwise.</returns>
+    private static bool TryGetOrdinal(SqliteDataReader reader, string columnName, out int ordinal)
+    {
+        for (var i = 0; i < reader.FieldCount; i++)
+        {
+            if (string.Equals(reader.GetName(i), columnName, StringComparison.OrdinalIgnoreCase))
+            {
+                ordinal = i;
+                return true;
+            }
+        }
+        ordinal = -1;
+        return false;
+    }
 }

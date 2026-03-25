@@ -368,7 +368,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        var result = await _composer.CreateGoalAsync("dep-goal", "Goal with deps", dependsOn: "goal-a, goal-b");
+        var result = await _composer.CreateGoalAsync("dep-goal", "Goal with deps", depends_on: "goal-a, goal-b");
 
         Assert.Contains("✅", result);
         Assert.Contains("Dependencies: goal-a, goal-b", result);
