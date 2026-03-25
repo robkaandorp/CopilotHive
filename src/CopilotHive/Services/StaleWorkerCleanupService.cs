@@ -14,6 +14,7 @@ public sealed class StaleWorkerCleanupService : BackgroundService
     private readonly IWorkerPool _workerPool;
     private readonly TaskQueue _taskQueue;
     private readonly GoalPipelineManager _pipelineManager;
+    private readonly GoalDispatcher? _goalDispatcher;
     private readonly ILogger<StaleWorkerCleanupService> _logger;
 
     /// <summary>
@@ -29,12 +30,14 @@ public sealed class StaleWorkerCleanupService : BackgroundService
         IWorkerPool workerPool,
         TaskQueue taskQueue,
         GoalPipelineManager pipelineManager,
-        ILogger<StaleWorkerCleanupService> logger)
+        ILogger<StaleWorkerCleanupService> logger,
+        GoalDispatcher? goalDispatcher = null)
     {
         _workerPool = workerPool;
         _taskQueue = taskQueue;
         _pipelineManager = pipelineManager;
         _logger = logger;
+        _goalDispatcher = goalDispatcher;
     }
 
     /// <summary>
@@ -105,12 +108,13 @@ public sealed class StaleWorkerCleanupService : BackgroundService
                 taskId, workerId);
         }
 
-        // Clear the pipeline's active task so GoalDispatcher doesn't think it's still running
+        // Clear the pipeline's active task and signal the dispatcher to re-dispatch
         var pipeline = _pipelineManager.GetByTaskId(taskId);
         if (pipeline is not null)
         {
             pipeline.ClearActiveTask();
-            _logger.LogInformation("Cleared active task on pipeline {GoalId} — will be re-dispatched",
+            _goalDispatcher?.EnqueueRedispatch(pipeline.GoalId);
+            _logger.LogInformation("Cleared active task on pipeline {GoalId} — queued for re-dispatch",
                 pipeline.GoalId);
         }
     }

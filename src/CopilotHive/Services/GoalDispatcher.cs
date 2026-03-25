@@ -37,6 +37,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly BranchCoordinator _branchCoordinator = new();
     private readonly TaskBuilder _taskBuilder = new(new BranchCoordinator());
     private readonly ConcurrentDictionary<string, bool> _dispatchedGoals = new();
+    private readonly ConcurrentQueue<string> _redispatchQueue = new();
     private DateTime _lastAgentsSync = DateTime.MinValue;
     private readonly TimeSpan _startupDelay;
 
@@ -90,6 +91,16 @@ public sealed class GoalDispatcher : BackgroundService
         completionNotifier.OnTaskCompleted+= result => HandleTaskCompletionAsync(result);
     }
 
+    /// <summary>
+    /// Enqueue a goal for re-dispatch. Called by <see cref="StaleWorkerCleanupService"/>
+    /// when a dead worker's task is cleared, or by <see cref="RestoreActivePipelinesAsync"/>
+    /// when a stale mid-task pipeline is found on startup.
+    /// </summary>
+    public void EnqueueRedispatch(string goalId)
+    {
+        _redispatchQueue.Enqueue(goalId);
+    }
+
     /// <inheritdoc/>
     /// <summary>
     /// Handles a question from a worker tool call by routing it to the Brain.
@@ -132,7 +143,7 @@ public sealed class GoalDispatcher : BackgroundService
                     await SyncAgentsFromConfigRepoAsync(stoppingToken);
                 }
 
-                await RedispatchOrphanedPipelinesAsync(stoppingToken);
+                await DrainRedispatchQueueAsync(stoppingToken);
                 await DispatchNextGoalAsync(stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -169,6 +180,16 @@ public sealed class GoalDispatcher : BackgroundService
             _logger.LogInformation(
                 "Task {TaskId} completed but goal {GoalId} already {Phase} — ignoring duplicate",
                 result.TaskId, pipeline.GoalId, pipeline.Phase);
+            return;
+        }
+
+        // Guard: ignore completions from tasks that are no longer the active task
+        // (e.g., a stale task from a previous phase completing after the pipeline advanced)
+        if (pipeline.ActiveTaskId is not null && pipeline.ActiveTaskId != result.TaskId)
+        {
+            _logger.LogWarning(
+                "Task {TaskId} completed but pipeline {GoalId} active task is {ActiveTaskId} — ignoring stale completion",
+                result.TaskId, pipeline.GoalId, pipeline.ActiveTaskId);
             return;
         }
 
@@ -1223,7 +1244,7 @@ public sealed class GoalDispatcher : BackgroundService
             // so no per-goal re-priming is needed.
 
             // If the pipeline was mid-task (has ActiveTaskId), the old worker is gone
-            // after a restart. Clear the active task and re-dispatch immediately.
+            // after a restart. Clear the active task and enqueue for re-dispatch.
             if (pipeline.ActiveTaskId is not null && pipeline.Phase is not (GoalPhase.Done or GoalPhase.Failed))
             {
                 _logger.LogInformation("Pipeline {GoalId} was mid-task ({TaskId}) — clearing stale task for re-dispatch",
@@ -1232,6 +1253,7 @@ public sealed class GoalDispatcher : BackgroundService
                 var staleTaskId = pipeline.ActiveTaskId;
                 _taskQueue.MarkComplete(staleTaskId);
                 pipeline.ClearActiveTask();
+                _redispatchQueue.Enqueue(pipeline.GoalId);
             }
         }
 
@@ -1240,14 +1262,16 @@ public sealed class GoalDispatcher : BackgroundService
     }
 
     /// <summary>
-    /// Checks active pipelines for ones that have no active task (e.g., after a worker
-    /// died or a restart). Re-dispatches the current phase for any orphaned pipeline.
+    /// Drains the re-dispatch queue and dispatches the current phase for each
+    /// queued pipeline. Called from the main poll loop — all dispatching happens here,
+    /// avoiding race conditions from polling-based orphan detection.
     /// </summary>
-    private async Task RedispatchOrphanedPipelinesAsync(CancellationToken ct)
+    private async Task DrainRedispatchQueueAsync(CancellationToken ct)
     {
-        var activePipelines = _pipelineManager.GetActivePipelines();
-        foreach (var pipeline in activePipelines)
+        while (_redispatchQueue.TryDequeue(out var goalId))
         {
+            var pipeline = _pipelineManager.GetByGoalId(goalId);
+            if (pipeline is null) continue;
             if (pipeline.ActiveTaskId is not null) continue;
             if (pipeline.Phase is GoalPhase.Done or GoalPhase.Failed) continue;
 
@@ -1263,12 +1287,12 @@ public sealed class GoalDispatcher : BackgroundService
 
             if (role is null)
             {
-                _logger.LogWarning("Pipeline {GoalId} orphaned in phase {Phase} — no role mapping, skipping",
+                _logger.LogWarning("Pipeline {GoalId} queued for re-dispatch in phase {Phase} — no role mapping, skipping",
                     pipeline.GoalId, pipeline.Phase);
                 continue;
             }
 
-            _logger.LogInformation("Re-dispatching orphaned pipeline {GoalId} (phase={Phase}, role={Role})",
+            _logger.LogInformation("Re-dispatching pipeline {GoalId} (phase={Phase}, role={Role})",
                 pipeline.GoalId, pipeline.Phase, role);
 
             var prompt = _brain is not null
