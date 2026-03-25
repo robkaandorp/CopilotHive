@@ -1,6 +1,7 @@
 @page "/composer"
 @using CopilotHive.Orchestration
 @using SharpCoder
+@using Markdig
 @implements IDisposable
 @inject Composer Composer
 
@@ -169,32 +170,14 @@ else
         }
     }
 
+    private static readonly MarkdownPipeline MarkdownPipeline = new MarkdownPipelineBuilder()
+        .UseAdvancedExtensions()
+        .Build();
+
     private static string FormatContent(string content)
     {
         if (string.IsNullOrEmpty(content)) return "";
-
-        // Escape HTML
-        content = content
-            .Replace("&", "&amp;")
-            .Replace("<", "&lt;")
-            .Replace(">", "&gt;");
-
-        // Inline code: `code`
-        content = System.Text.RegularExpressions.Regex.Replace(
-            content, @"`([^`]+)`", "<code>$1</code>");
-
-        // Bold: **text**
-        content = System.Text.RegularExpressions.Regex.Replace(
-            content, @"\*\*(.+?)\*\*", "<strong>$1</strong>");
-
-        // Italic: _text_
-        content = System.Text.RegularExpressions.Regex.Replace(
-            content, @"(?<!\w)_(.+?)_(?!\w)", "<em>$1</em>");
-
-        // Line breaks
-        content = content.Replace("\n", "<br />");
-
-        return content;
+        return Markdown.ToHtml(content, MarkdownPipeline);
     }
 
     public void Dispose()
