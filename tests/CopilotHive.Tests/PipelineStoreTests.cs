@@ -563,6 +563,7 @@ public sealed class PipelineStoreSchemaMigrationTests
             Assert.Contains("phase_outputs", columns);
             Assert.Contains("metrics_json", columns);
             Assert.Contains("completed_at", columns);
+            Assert.Contains("merge_commit_hash", columns);
         }
     }
 
@@ -643,4 +644,60 @@ public sealed class PipelineStoreSchemaMigrationTests
             Assert.Equal(7, snap.Metrics.PassedTests);
         }
     }
+
+    #region MergeCommitHash round-trip
+
+    [Fact]
+    public void SavePipeline_WithMergeCommitHash_RoundTrips()
+    {
+        var pipeline = CreatePipeline("g-hash-1");
+        pipeline.AdvanceTo(GoalPhase.Merging);
+        pipeline.MergeCommitHash = "abc123def456";
+
+        _store.SavePipeline(pipeline);
+        var snap = Assert.Single(_store.LoadActivePipelines());
+
+        Assert.Equal("abc123def456", snap.MergeCommitHash);
+    }
+
+    [Fact]
+    public void SavePipeline_WithNullMergeCommitHash_RoundTripsAsNull()
+    {
+        var pipeline = CreatePipeline("g-hash-2");
+
+        _store.SavePipeline(pipeline);
+        var snap = Assert.Single(_store.LoadActivePipelines());
+
+        Assert.Null(snap.MergeCommitHash);
+    }
+
+    [Fact]
+    public void SavePipelineState_UpdatesMergeCommitHash()
+    {
+        var pipeline = CreatePipeline("g-hash-3");
+        _store.SavePipeline(pipeline);
+
+        pipeline.AdvanceTo(GoalPhase.Merging);
+        pipeline.MergeCommitHash = "updated-merge-hash";
+        _store.SavePipelineState(pipeline);
+
+        var snap = Assert.Single(_store.LoadActivePipelines());
+        Assert.Equal("updated-merge-hash", snap.MergeCommitHash);
+    }
+
+    [Fact]
+    public void GoalPipeline_RestoredFromSnapshot_PreservesMergeCommitHash()
+    {
+        var pipeline = CreatePipeline("g-hash-4");
+        pipeline.AdvanceTo(GoalPhase.Merging);
+        pipeline.MergeCommitHash = "cafebabe9876";
+
+        _store.SavePipeline(pipeline);
+        var snap = Assert.Single(_store.LoadActivePipelines());
+        var restored = new GoalPipeline(snap);
+
+        Assert.Equal("cafebabe9876", restored.MergeCommitHash);
+    }
+
+    #endregion
 }

@@ -111,15 +111,16 @@ public sealed class PipelineStore : IAsyncDisposable
     // are automatically brought up to date on startup.
     private static readonly (string Table, string Column, string Definition)[] SchemaColumns =
     [
-        ("pipelines", "max_iterations",   "INTEGER NOT NULL DEFAULT 10"),
-        ("pipelines", "improver_retries", "INTEGER NOT NULL DEFAULT 0"),
-        ("pipelines", "phase_outputs",    "TEXT NOT NULL DEFAULT '{}'"),
-        ("pipelines", "metrics_json",     "TEXT NOT NULL DEFAULT '{}'"),
-        ("pipelines", "active_task_id",   "TEXT"),
-        ("pipelines", "coder_branch",     "TEXT"),
-        ("pipelines", "completed_at",     "TEXT"),
-        ("pipelines", "goal_started_at",  "TEXT"),
-        ("pipelines", "plan_json",        "TEXT"),
+        ("pipelines", "max_iterations",    "INTEGER NOT NULL DEFAULT 10"),
+        ("pipelines", "improver_retries",  "INTEGER NOT NULL DEFAULT 0"),
+        ("pipelines", "phase_outputs",     "TEXT NOT NULL DEFAULT '{}'"),
+        ("pipelines", "metrics_json",      "TEXT NOT NULL DEFAULT '{}'"),
+        ("pipelines", "active_task_id",    "TEXT"),
+        ("pipelines", "coder_branch",      "TEXT"),
+        ("pipelines", "completed_at",      "TEXT"),
+        ("pipelines", "goal_started_at",   "TEXT"),
+        ("pipelines", "plan_json",         "TEXT"),
+        ("pipelines", "merge_commit_hash", "TEXT"),
     ];
 
     /// <summary>
@@ -248,7 +249,7 @@ public sealed class PipelineStore : IAsyncDisposable
                 SELECT goal_id, description, goal_json, phase, iteration,
                        review_retries, test_retries, max_retries, max_iterations,
                        active_task_id, coder_branch, phase_outputs, metrics_json,
-                       created_at, completed_at, goal_started_at, plan_json
+                       created_at, completed_at, goal_started_at, plan_json, merge_commit_hash
                 FROM pipelines
                 WHERE phase NOT IN ('Done', 'Failed')
                 """;
@@ -276,6 +277,7 @@ public sealed class PipelineStore : IAsyncDisposable
                     CompletedAt = reader.IsDBNull(14) ? null : DateTime.Parse(reader.GetString(14), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
                     GoalStartedAt = reader.IsDBNull(15) ? null : DateTime.Parse(reader.GetString(15), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
                     Plan = reader.IsDBNull(16) ? null : JsonSerializer.Deserialize<IterationPlan>(reader.GetString(16), JsonOptions),
+                    MergeCommitHash = reader.IsDBNull(17) ? null : reader.GetString(17),
                     Conversation = LoadConversationCore(goalId),
                 });
             }
@@ -297,12 +299,12 @@ public sealed class PipelineStore : IAsyncDisposable
                 (goal_id, description, goal_json, phase, iteration,
                  review_retries, test_retries, max_retries, max_iterations,
                  active_task_id, coder_branch, plan_json, phase_outputs, metrics_json,
-                 created_at, completed_at, goal_started_at)
+                 created_at, completed_at, goal_started_at, merge_commit_hash)
             VALUES
                 (@goalId, @desc, @goalJson, @phase, @iteration,
                  @reviewRetries, @testRetries, @maxRetries, @maxIterations,
                  @activeTaskId, @coderBranch, @planJson, @phaseOutputs, @metricsJson,
-                 @createdAt, @completedAt, @goalStartedAt)
+                 @createdAt, @completedAt, @goalStartedAt, @mergeCommitHash)
             """;
         cmd.Parameters.AddWithValue("@goalId", pipeline.GoalId);
         cmd.Parameters.AddWithValue("@desc", pipeline.Description);
@@ -324,6 +326,7 @@ public sealed class PipelineStore : IAsyncDisposable
             pipeline.CompletedAt.HasValue ? pipeline.CompletedAt.Value.ToString("O") : DBNull.Value);
         cmd.Parameters.AddWithValue("@goalStartedAt",
             pipeline.GoalStartedAt.HasValue ? pipeline.GoalStartedAt.Value.ToString("O") : DBNull.Value);
+        cmd.Parameters.AddWithValue("@mergeCommitHash", (object?)pipeline.MergeCommitHash ?? DBNull.Value);
         cmd.ExecuteNonQuery();
     }
 

@@ -128,7 +128,7 @@ public sealed class FileGoalSourceTests : IDisposable
 
     /// <summary>
     /// Verifies that <see cref="FileGoalSource.UpdateGoalStatusAsync"/> propagates
-    /// <see cref="GoalUpdateMetadata.MergeCommitHash"/> to the in-memory goal object.
+    /// <see cref="GoalUpdateMetadata.MergeCommitHash"/> to the YAML file (round-trip).
     /// </summary>
     [Fact]
     public async Task UpdateGoalStatusAsync_PropagatesMergeCommitHash()
@@ -147,14 +147,10 @@ public sealed class FileGoalSourceTests : IDisposable
             MergeCommitHash = "abc123merge",
         }, ct);
 
-        // Re-read: FileGoalSource doesn't persist MergeCommitHash to YAML (no YAML field),
-        // but the in-memory goal is updated during the call.
-        // We verify the in-memory object was updated by checking via ReadGoalsAsync on a new instance
-        // after calling UpdateGoalStatusAsync doesn't throw.
-        // The important thing is the property is set on the goal before WriteGoalsAsync is called.
+        // Re-read: MergeCommitHash is persisted to YAML and should survive a round-trip.
         var goals = await source.ReadGoalsAsync(ct);
-        // The hash is not serialized to YAML — the test verifies no error is thrown
-        Assert.Single(goals);
+        var goal = Assert.Single(goals);
+        Assert.Equal("abc123merge", goal.MergeCommitHash);
     }
 
     /// <summary>
@@ -170,16 +166,18 @@ public sealed class FileGoalSourceTests : IDisposable
             goals:
               - id: hash-noop-test
                 description: Test null hash
+                merge_commit_hash: existing-hash
             """);
 
         var source = new FileGoalSource(path);
-        // Should not throw when MergeCommitHash is null
+        // Passing null MergeCommitHash must not overwrite the existing value
         await source.UpdateGoalStatusAsync("hash-noop-test", GoalStatus.Completed, new GoalUpdateMetadata
         {
             MergeCommitHash = null,
         }, ct);
 
         var goals = await source.ReadGoalsAsync(ct);
-        Assert.Single(goals);
+        var goal = Assert.Single(goals);
+        Assert.Equal("existing-hash", goal.MergeCommitHash);
     }
 }

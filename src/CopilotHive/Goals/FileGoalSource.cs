@@ -126,6 +126,7 @@ public sealed class FileGoalSource : IGoalSource
                 IterationSummaries = g.IterationSummaries.Count > 0
                     ? g.IterationSummaries.Select(MapIterationSummaryEntry).ToList()
                     : null,
+                MergeCommitHash = g.MergeCommitHash,
             }).ToList(),
         };
 
@@ -159,6 +160,7 @@ public sealed class FileGoalSource : IGoalSource
             PhaseDurations = entry.PhaseDurations,
             TotalDurationSeconds = entry.Total_duration_seconds,
             IterationSummaries = entry.IterationSummaries?.Select(MapIterationSummary).ToList() ?? [],
+            MergeCommitHash = entry.MergeCommitHash,
         };
     }
 
@@ -256,6 +258,8 @@ public sealed class FileGoalSource : IGoalSource
         public double? Total_duration_seconds { get; set; }
         /// <summary>Structured summaries for each completed iteration.</summary>
         public List<IterationSummaryEntry>? IterationSummaries { get; set; }
+        /// <summary>SHA-1 hash of the merge commit that landed this goal's changes.</summary>
+        public string? MergeCommitHash { get; set; }
     }
 
     /// <summary>YAML-serializable representation of an <see cref="IterationSummary"/>.</summary>
