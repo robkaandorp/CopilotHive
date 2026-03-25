@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
@@ -179,6 +180,7 @@ public class PremiumModelSelectionTests
             new GrpcWorkerGateway(new WorkerPool()),
             notifier,
             NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             brain,
             configFile);
 

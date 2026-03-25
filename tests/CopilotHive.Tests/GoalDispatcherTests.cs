@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
@@ -109,6 +110,7 @@ public sealed class GoalDispatcherReviewVerdictTests
             new GrpcWorkerGateway(new WorkerPool()),
             notifier,
             NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             brain);
 
         return (dispatcher, pipeline, taskId);
@@ -193,6 +195,7 @@ public sealed class GoalDispatcherResolveRepositoriesTests
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
             NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             config: config);
     }
 }
@@ -399,7 +402,8 @@ public sealed class GoalDispatcherStartupLogTests
             new TaskQueue(),
             new GrpcWorkerGateway(new WorkerPool()),
             notifier,
-            logger);
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
 
         // Act - start the background service and cancel immediately after startup log
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, TestContext.Current.CancellationToken);
@@ -439,6 +443,7 @@ public sealed class GoalDispatcherDispatchLoggingTests
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
             logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             startupDelay: TimeSpan.Zero);
 
         // Act - run the background service briefly so DispatchNextGoalAsync executes
@@ -504,6 +509,7 @@ public sealed class GoalDispatcherPhaseDurationLoggingTests
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
             logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             brain);
 
         // Act
@@ -556,6 +562,7 @@ public sealed class GoalDispatcherModelLoggingTests
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
             logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             brain);
 
         // Act — Model is carried directly on the TaskResult (populated by HiveOrchestratorService)
@@ -604,6 +611,7 @@ public sealed class GoalDispatcherModelLoggingTests
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
             logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             brain);
 
         // Act — Model is carried directly on the TaskResult
@@ -653,6 +661,7 @@ public sealed class GoalDispatcherModelLoggingTests
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
             logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             brain);
 
         // Act — Model defaults to "" when not set on TaskResult

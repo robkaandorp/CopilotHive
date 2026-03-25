@@ -156,6 +156,11 @@ public sealed class BrainRepoManager
         };
         using var process = System.Diagnostics.Process.Start(psi)!;
         await process.WaitForExitAsync(ct);
+        if (process.ExitCode != 0)
+        {
+            var stderr = await process.StandardError.ReadToEndAsync(ct);
+            throw new InvalidOperationException($"git rev-parse HEAD failed: {stderr}");
+        }
         return await process.StandardOutput.ReadToEndAsync(ct);
     }
 

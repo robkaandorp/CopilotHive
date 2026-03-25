@@ -1,8 +1,10 @@
+using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests;
 
@@ -38,7 +40,8 @@ public sealed class GoalDispatcherElapsedTimeTests
             new TaskQueue(),
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
-            logger);
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
 
         // Act - use reflection to call private MarkGoalCompleted
         var method = typeof(GoalDispatcher).GetMethod("MarkGoalCompleted",
@@ -80,7 +83,8 @@ public sealed class GoalDispatcherElapsedTimeTests
             new TaskQueue(),
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
-            logger);
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
 
         // Act
         var method = typeof(GoalDispatcher).GetMethod("MarkGoalCompleted",
@@ -127,7 +131,8 @@ public sealed class GoalDispatcherElapsedTimeTests
             new TaskQueue(),
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
-            logger);
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
 
         // Act
         var method = typeof(GoalDispatcher).GetMethod("MarkGoalCompleted",
@@ -175,7 +180,8 @@ public sealed class GoalDispatcherElapsedTimeTests
             new TaskQueue(),
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
-            logger);
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
 
         // Act
         var method = typeof(GoalDispatcher).GetMethod("MarkGoalCompleted",
@@ -219,7 +225,8 @@ public sealed class GoalDispatcherElapsedTimeTests
             new TaskQueue(),
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
-            logger);
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
 
         // Act
         var method = typeof(GoalDispatcher).GetMethod("MarkGoalCompleted",

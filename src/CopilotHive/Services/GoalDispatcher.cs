@@ -30,7 +30,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly AgentsManager? _agentsManager;
     private readonly MetricsTracker? _metricsTracker;
     private readonly ConfigRepoManager? _configRepo;
-    private readonly BrainRepoManager? _repoManager;
+    private readonly BrainRepoManager _repoManager;
     private readonly ILogger<GoalDispatcher> _logger;
     private readonly HiveConfigFile? _config;
 
@@ -56,7 +56,7 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="agentsManager">Optional manager for per-role AGENTS.md files.</param>
     /// <param name="improvementAnalyzer">Optional analyzer that decides when to run the improver.</param>
     /// <param name="configRepo">Optional config repo manager for syncing AGENTS.md files.</param>
-    /// <param name="repoManager">Optional Brain repo manager for persistent repo clones and merge operations.</param>
+    /// <param name="repoManager">Brain repo manager for persistent repo clones and merge operations.</param>
     /// <param name="startupDelay">Delay before the first dispatch poll; defaults to 10 seconds to give workers time to connect.</param>
     public GoalDispatcher(
         GoalManager goalManager,
@@ -65,15 +65,16 @@ public sealed class GoalDispatcher : BackgroundService
         IWorkerGateway workerGateway,
         TaskCompletionNotifier completionNotifier,
         ILogger<GoalDispatcher> logger,
+        BrainRepoManager repoManager,
         IDistributedBrain? brain = null,
         HiveConfigFile? config = null,
         MetricsTracker? metricsTracker = null,
         AgentsManager? agentsManager = null,
         ImprovementAnalyzer? improvementAnalyzer = null,
         ConfigRepoManager? configRepo = null,
-        BrainRepoManager? repoManager = null,
         TimeSpan? startupDelay = null)
     {
+        _repoManager = repoManager ?? throw new ArgumentNullException(nameof(repoManager));
         _goalManager = goalManager;
         _pipelineManager = pipelineManager;
         _taskQueue = taskQueue;
@@ -85,7 +86,6 @@ public sealed class GoalDispatcher : BackgroundService
         _logger = logger;
         _config = config;
         _configRepo = configRepo;
-        _repoManager = repoManager;
         _startupDelay = startupDelay ?? TimeSpan.FromSeconds(10);
 
         completionNotifier.OnTaskCompleted+= result => HandleTaskCompletionAsync(result);
@@ -690,9 +690,6 @@ public sealed class GoalDispatcher : BackgroundService
             var repos = ResolveRepositories(pipeline.Goal);
             foreach (var repo in repos)
             {
-                if (_repoManager is null)
-                    throw new InvalidOperationException("BrainRepoManager is not configured. Cannot perform merge.");
-
                 // Use the persistent brain clone — no temp dirs needed.
                 // After merge, the clone is already on the base branch with the latest code.
                 var mergeCommitHash = await _repoManager.MergeFeatureBranchAsync(
