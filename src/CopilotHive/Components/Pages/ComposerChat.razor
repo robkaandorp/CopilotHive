@@ -1,6 +1,5 @@
 @page "/composer"
 @using CopilotHive.Orchestration
-@using SharpCoder
 @using Markdig
 @implements IDisposable
 @inject Composer Composer
@@ -18,7 +17,7 @@ else
 {
     <div class="chat-container">
         <div class="chat-messages" id="chat-messages">
-            @if (_messages.Count == 0)
+            @if (_messages.Count == 0 && !Composer.IsStreaming)
             {
                 <div class="chat-empty">
                     <p><strong>Welcome to the Composer.</strong></p>
@@ -35,12 +34,12 @@ else
                 </div>
             }
 
-            @if (_isStreaming)
+            @if (Composer.IsStreaming)
             {
                 <div class="chat-msg chat-msg-assistant">
                     <div class="chat-msg-role">Composer</div>
                     <div class="chat-msg-content">
-                        @((MarkupString)FormatStreamingContent(_streamingContent))
+                        @((MarkupString)FormatStreamingContent(Composer.StreamingContent))
                         <span class="chat-cursor">▊</span>
                     </div>
                 </div>
@@ -53,12 +52,12 @@ else
             <textarea @bind="_inputText" @bind:event="oninput"
                       @onkeydown="HandleKeyDown"
                       placeholder="Describe what you want to build…"
-                      disabled="@_isStreaming"
+                      disabled="@Composer.IsStreaming"
                       rows="2"
                       class="chat-input"></textarea>
-            <button @onclick="SendMessage" disabled="@(_isStreaming || string.IsNullOrWhiteSpace(_inputText))"
+            <button @onclick="SendMessage" disabled="@(Composer.IsStreaming || string.IsNullOrWhiteSpace(_inputText))"
                     class="chat-send">
-                @if (_isStreaming)
+                @if (Composer.IsStreaming)
                 {
                     <span>Thinking…</span>
                 }
@@ -70,14 +69,14 @@ else
         </div>
 
         <div class="chat-actions">
-            <button @onclick="ResetSession" disabled="@_isStreaming" class="chat-action-btn">
+            <button @onclick="ResetSession" disabled="@Composer.IsStreaming" class="chat-action-btn">
                 🔄 New Session
             </button>
             <span class="text-muted chat-hint">
                 @(_messages.Count) messages
-                @if (_lastToolCalls > 0)
+                @if (Composer.LastToolCalls > 0)
                 {
-                    <text> · @_lastToolCalls tool calls</text>
+                    <text> · @Composer.LastToolCalls tool calls</text>
                 }
             </span>
         </div>
@@ -93,20 +92,14 @@ else
 
     private readonly List<ChatMessage> _messages = [];
     private string _inputText = "";
-    private string _streamingContent = "";
-    private bool _isStreaming;
-    private int _lastToolCalls;
-    private CancellationTokenSource? _streamCts;
 
     protected override void OnInitialized()
     {
         if (Composer.IsConnected)
         {
-            foreach (var (role, content) in Composer.GetChatHistory())
-            {
-                _messages.Add(new ChatMessage { Role = role, Content = content });
-            }
+            LoadHistory();
         }
+        Composer.OnStreamingUpdate += HandleStreamingUpdate;
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -115,78 +108,52 @@ else
             "document.getElementById('chat-anchor')?.scrollIntoView()");
     }
 
-    private async Task SendMessage()
+    private void LoadHistory()
+    {
+        _messages.Clear();
+        foreach (var (role, content) in Composer.GetChatHistory())
+        {
+            _messages.Add(new ChatMessage { Role = role, Content = content });
+        }
+    }
+
+    private void HandleStreamingUpdate()
+    {
+        InvokeAsync(() =>
+        {
+            // When streaming finishes, reload history to get the final message
+            if (!Composer.IsStreaming)
+            {
+                LoadHistory();
+            }
+            StateHasChanged();
+        });
+    }
+
+    private void SendMessage()
     {
         var text = _inputText.Trim();
-        if (string.IsNullOrEmpty(text) || _isStreaming) return;
+        if (string.IsNullOrEmpty(text) || Composer.IsStreaming) return;
 
         _messages.Add(new ChatMessage { Role = "user", Content = text });
         _inputText = "";
-        _streamingContent = "";
-        _isStreaming = true;
-        _lastToolCalls = 0;
+        Composer.SendMessage(text);
         StateHasChanged();
-
-        _streamCts = new CancellationTokenSource();
-
-        try
-        {
-            await foreach (var update in Composer.StreamAsync(text, _streamCts.Token))
-            {
-                switch (update.Kind)
-                {
-                    case StreamingUpdateKind.TextDelta:
-                        _streamingContent += update.Text;
-                        await InvokeAsync(StateHasChanged);
-                        break;
-
-                    case StreamingUpdateKind.Completed:
-                        _lastToolCalls = update.Result?.ToolCallCount ?? 0;
-                        _messages.Add(new ChatMessage
-                        {
-                            Role = "assistant",
-                            Content = update.Result?.Message ?? _streamingContent,
-                        });
-                        break;
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            if (!string.IsNullOrEmpty(_streamingContent))
-            {
-                _messages.Add(new ChatMessage { Role = "assistant", Content = _streamingContent + "\n\n_(cancelled)_" });
-            }
-        }
-        catch (Exception ex)
-        {
-            _messages.Add(new ChatMessage { Role = "assistant", Content = $"❌ Error: {ex.Message}" });
-        }
-        finally
-        {
-            _streamingContent = "";
-            _isStreaming = false;
-            _streamCts?.Dispose();
-            _streamCts = null;
-            await InvokeAsync(StateHasChanged);
-        }
     }
 
     private async Task ResetSession()
     {
-        if (_isStreaming) return;
+        if (Composer.IsStreaming) return;
         await Composer.ResetSessionAsync();
         _messages.Clear();
-        _lastToolCalls = 0;
         StateHasChanged();
     }
 
     private void HandleKeyDown(KeyboardEventArgs e)
     {
-        // Enter without Shift sends the message
         if (e.Key == "Enter" && !e.ShiftKey)
         {
-            _ = SendMessage();
+            SendMessage();
         }
     }
 
@@ -208,7 +175,6 @@ else
 
     public void Dispose()
     {
-        _streamCts?.Cancel();
-        _streamCts?.Dispose();
+        Composer.OnStreamingUpdate -= HandleStreamingUpdate;
     }
 }

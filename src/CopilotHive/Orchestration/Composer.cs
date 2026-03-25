@@ -31,6 +31,24 @@ public sealed class Composer : IAsyncDisposable
     private readonly string _systemPrompt = DefaultSystemPrompt;
     private readonly List<AITool> _composerTools;
 
+    // Streaming state owned by the service (survives component navigation)
+    private string _streamingContent = "";
+    private bool _isStreaming;
+    private int _lastToolCalls;
+    private CancellationTokenSource? _streamCts;
+
+    /// <summary>Whether the Composer is currently streaming a response.</summary>
+    public bool IsStreaming => _isStreaming;
+
+    /// <summary>The accumulated streaming text (partial response in progress).</summary>
+    public string StreamingContent => _streamingContent;
+
+    /// <summary>Tool call count from the last completed response.</summary>
+    public int LastToolCalls => _lastToolCalls;
+
+    /// <summary>Raised when streaming state changes (new text, completion, error).</summary>
+    public event Action? OnStreamingUpdate;
+
     private const string DefaultSystemPrompt = """
         You are the Composer — a strategic advisor for the CopilotHive multi-agent system.
         You help the user decompose high-level intent into well-scoped, actionable goals.
@@ -140,25 +158,73 @@ public sealed class Composer : IAsyncDisposable
     }
 
     /// <summary>
-    /// Streams a response to the user's message, yielding text deltas in real-time.
-    /// The session is persisted after the stream completes.
+    /// Sends a message and streams the response in the background.
+    /// The streaming state is owned by the Composer service and survives component navigation.
+    /// Subscribe to <see cref="OnStreamingUpdate"/> to receive updates.
     /// </summary>
-    public async IAsyncEnumerable<StreamingUpdate> StreamAsync(
-        string userMessage,
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    public void SendMessage(string userMessage)
     {
         if (_agent is null)
             throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
+        if (_isStreaming)
+            throw new InvalidOperationException("Composer is already streaming a response.");
 
+        _streamingContent = "";
+        _isStreaming = true;
+        _lastToolCalls = 0;
+        _streamCts = new CancellationTokenSource();
+
+        _ = RunStreamingAsync(userMessage, _streamCts.Token);
+    }
+
+    private async Task RunStreamingAsync(string userMessage, CancellationToken ct)
+    {
         _logger.LogInformation("Composer streaming response for: {Message}",
             userMessage.Length > 100 ? userMessage[..100] + "…" : userMessage);
 
-        await foreach (var update in _agent.ExecuteStreamingAsync(_session, userMessage, ct))
+        try
         {
-            yield return update;
-        }
+            await foreach (var update in _agent!.ExecuteStreamingAsync(_session, userMessage, ct))
+            {
+                switch (update.Kind)
+                {
+                    case StreamingUpdateKind.TextDelta:
+                        _streamingContent += update.Text;
+                        OnStreamingUpdate?.Invoke();
+                        break;
 
-        await SaveSessionAsync(ct);
+                    case StreamingUpdateKind.Completed:
+                        _lastToolCalls = update.Result?.ToolCallCount ?? 0;
+                        break;
+                }
+            }
+
+            await SaveSessionAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("Composer streaming cancelled");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Composer streaming failed");
+            _streamingContent += $"\n\n❌ Error: {ex.Message}";
+        }
+        finally
+        {
+            _isStreaming = false;
+            _streamCts?.Dispose();
+            _streamCts = null;
+            OnStreamingUpdate?.Invoke();
+        }
+    }
+
+    /// <summary>
+    /// Cancels the current streaming response if one is in progress.
+    /// </summary>
+    public void CancelStreaming()
+    {
+        _streamCts?.Cancel();
     }
 
     /// <summary>
