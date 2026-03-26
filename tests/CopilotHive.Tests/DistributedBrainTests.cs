@@ -504,6 +504,38 @@ public sealed class DistributedBrainTests
         Assert.Equal(2, fake.ResetCalls);
     }
 
+    [Fact]
+    public async Task ResetSessionAsync_WithAgentsManager_RebuildSystemPromptIncludesCustomInstructions()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-reset-test-{Guid.NewGuid():N}");
+        var agentsDir = Path.Combine(tempDir, "agents");
+        Directory.CreateDirectory(agentsDir);
+        try
+        {
+            // Write a custom orchestrator agents file
+            var customInstructions = "Always prioritise stability over speed.";
+            var agentsFile = Path.Combine(agentsDir, "orchestrator.agents.md");
+            await File.WriteAllTextAsync(agentsFile, customInstructions, TestContext.Current.CancellationToken);
+
+            var agentsManager = new Agents.AgentsManager(agentsDir);
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                agentsManager: agentsManager, stateDir: tempDir);
+
+            await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+            // Verify the session file includes the custom instructions
+            var sessionFile = Path.Combine(tempDir, "brain-session.json");
+            var content = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
+            Assert.Contains("CopilotHive Orchestrator Brain", content);
+            Assert.Contains(customInstructions, content);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, true);
+        }
+    }
+
 }
 
 /// <summary>

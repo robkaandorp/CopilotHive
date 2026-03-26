@@ -281,34 +281,42 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <inheritdoc />
     public async Task ResetSessionAsync(CancellationToken ct = default)
     {
-        // Clear session message history
-        _session.MessageHistory.Clear();
-
-        // Re-read orchestrator instructions and rebuild system prompt
-        var orchestratorInstructions = _agentsManager?.GetAgentsMd(WorkerRole.Orchestrator) ?? "";
-        _systemPrompt = string.IsNullOrWhiteSpace(orchestratorInstructions)
-            ? DefaultSystemPrompt
-            : $"{DefaultSystemPrompt}\n\n{orchestratorInstructions}";
-
-        // Recreate agent with fresh system prompt (applies new _systemPrompt)
-        if (_chatClient is not null)
-            RecreateAgent();
-
-        // Add system message to session so the new prompt is part of the conversation
-        _session.MessageHistory.Add(new ChatMessage(ChatRole.System, _systemPrompt));
-
-        // Delete the persisted session file so the old context is not reloaded on restart
-        var sessionFile = GetSessionFilePath();
-        if (File.Exists(sessionFile))
+        await _brainCallGate.WaitAsync(ct);
+        try
         {
-            File.Delete(sessionFile);
-            _logger.LogInformation("Deleted previous Brain session file");
+            // Clear session message history
+            _session.MessageHistory.Clear();
+
+            // Re-read orchestrator instructions and rebuild system prompt
+            var orchestratorInstructions = _agentsManager?.GetAgentsMd(WorkerRole.Orchestrator) ?? "";
+            _systemPrompt = string.IsNullOrWhiteSpace(orchestratorInstructions)
+                ? DefaultSystemPrompt
+                : $"{DefaultSystemPrompt}\n\n{orchestratorInstructions}";
+
+            // Recreate agent with fresh system prompt (applies new _systemPrompt)
+            if (_chatClient is not null)
+                RecreateAgent();
+
+            // Add system message to session so the new prompt is part of the conversation
+            _session.MessageHistory.Add(new ChatMessage(ChatRole.System, _systemPrompt));
+
+            // Delete the persisted session file so the old context is not reloaded on restart
+            var sessionFile = GetSessionFilePath();
+            if (File.Exists(sessionFile))
+            {
+                File.Delete(sessionFile);
+                _logger.LogInformation("Deleted previous Brain session file");
+            }
+
+            // Save the reset session
+            await SaveSessionAsync(ct);
+
+            _logger.LogInformation("Brain session reset — system prompt rebuilt with latest orchestrator instructions");
         }
-
-        // Save the reset session
-        await SaveSessionAsync(ct);
-
-        _logger.LogInformation("Brain session reset — system prompt rebuilt with latest orchestrator instructions");
+        finally
+        {
+            _brainCallGate.Release();
+        }
     }
 
     /// <summary>Persists the current Brain session to disk.</summary>
