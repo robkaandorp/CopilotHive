@@ -392,7 +392,7 @@ public sealed class DistributedBrainTests
     // -- ResetSessionAsync Tests --
 
     [Fact]
-    public async Task ResetSessionAsync_BeforeConnect_DoesNotThrow()
+    public async Task ResetSessionAsync_BeforeConnect_SavesFreshSessionFile()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"brain-reset-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
@@ -402,6 +402,12 @@ public sealed class DistributedBrainTests
                 stateDir: tempDir);
             // Should not throw even when not connected (no agent to recreate)
             await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+            // Verify observable behavior: session file exists and contains the default system prompt
+            var sessionFile = Path.Combine(tempDir, "brain-session.json");
+            Assert.True(File.Exists(sessionFile), "Session file should exist after reset even before ConnectAsync");
+            var content = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
+            Assert.Contains("CopilotHive Orchestrator Brain", content);
         }
         finally
         {
@@ -528,6 +534,47 @@ public sealed class DistributedBrainTests
             var content = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
             Assert.Contains("CopilotHive Orchestrator Brain", content);
             Assert.Contains(customInstructions, content);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_ReReadsAgentsManagerOnReset_PicksUpUpdatedInstructions()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-reload-test-{Guid.NewGuid():N}");
+        var agentsDir = Path.Combine(tempDir, "agents");
+        Directory.CreateDirectory(agentsDir);
+        try
+        {
+            var agentsFile = Path.Combine(agentsDir, "orchestrator.agents.md");
+
+            // Write initial instructions before constructing the brain
+            var initialInstructions = "INITIAL: Focus on correctness.";
+            await File.WriteAllTextAsync(agentsFile, initialInstructions, TestContext.Current.CancellationToken);
+
+            var agentsManager = new Agents.AgentsManager(agentsDir);
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                agentsManager: agentsManager, stateDir: tempDir);
+
+            // First reset — session should contain initial instructions
+            await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+            var sessionFile = Path.Combine(tempDir, "brain-session.json");
+            var contentAfterFirstReset = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
+            Assert.Contains(initialInstructions, contentAfterFirstReset);
+
+            // Update the agents file on disk to simulate an AGENTS.md change
+            var updatedInstructions = "UPDATED: Prioritise test coverage above all.";
+            await File.WriteAllTextAsync(agentsFile, updatedInstructions, TestContext.Current.CancellationToken);
+
+            // Second reset — AgentsManager re-reads from disk, so the updated content should appear
+            await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+            var contentAfterSecondReset = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
+            Assert.Contains(updatedInstructions, contentAfterSecondReset);
+            Assert.DoesNotContain(initialInstructions, contentAfterSecondReset);
         }
         finally
         {
