@@ -44,15 +44,7 @@ git push origin develop
 
 If push is rejected, pull first then push. Accept default merge messages.
 
-### 4. Delete old smoke test branches
-
-Remove any `copilothive/*` remote branches for goals being re-queued:
-
-```powershell
-git push origin --delete copilothive/<goal-id>
-```
-
-### 5. Build the project
+### 4. Build the project
 
 ```powershell
 cd C:\Projects\Personal\CopilotHive
@@ -61,7 +53,7 @@ dotnet build CopilotHive.slnx
 
 Must succeed with 0 errors before proceeding.
 
-### 6. Rebuild containers
+### 5. Rebuild containers
 
 ```powershell
 cd C:\Projects\Personal\CopilotHive\docker
@@ -70,14 +62,14 @@ docker compose build
 
 This ensures containers have the latest code.
 
-### 7. Start containers
+### 6. Start containers
 
 ```powershell
 cd C:\Projects\Personal\CopilotHive\docker
 docker compose up -d
 ```
 
-### 8. Verify
+### 7. Verify
 
 ```powershell
 docker ps --format "table {{.Names}}\t{{.Status}}"
@@ -85,7 +77,7 @@ docker ps --format "table {{.Names}}\t{{.Status}}"
 
 All containers should show "Up" status. The orchestrator should show "(healthy)".
 
-### 9. Monitor
+### 8. Monitor
 
 Check orchestrator logs for startup:
 
