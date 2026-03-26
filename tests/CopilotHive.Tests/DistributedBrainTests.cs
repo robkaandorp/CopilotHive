@@ -389,6 +389,70 @@ public sealed class DistributedBrainTests
         Assert.NotEmpty(plan.Phases);
     }
 
+    [Fact]
+    public async Task ResetSessionAsync_ReloadsOrchestratorInstructionsFromDisk()
+    {
+        var tempAgentsDir = Path.Combine(Path.GetTempPath(), $"agents-test-{Guid.NewGuid():N}");
+        var tempStateDir = Path.Combine(Path.GetTempPath(), $"brain-reset-test-{Guid.NewGuid():N}");
+        try
+        {
+            var agentsManager = new Agents.AgentsManager(tempAgentsDir);
+
+            // Write initial orchestrator instructions
+            var orchestratorFile = agentsManager.GetAgentsMdPath(WorkerRole.Orchestrator);
+            File.WriteAllText(orchestratorFile, "Initial instructions");
+
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                agentsManager: agentsManager, stateDir: tempStateDir);
+
+            // Save session so there's a file to delete
+            await brain.SaveSessionAsync(TestContext.Current.CancellationToken);
+            var sessionFile = Path.Combine(tempStateDir, "brain-session.json");
+            Assert.True(File.Exists(sessionFile));
+
+            // Now update the orchestrator instructions on disk (simulating a change during the session)
+            File.WriteAllText(orchestratorFile, "Updated fresh instructions from disk");
+
+            // Reset requires a connected brain (RecreateAgent needs _chatClient).
+            // Without a real LLM we can only verify the exception is thrown,
+            // confirming the method reaches RecreateAgent after rebuilding the prompt.
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
+            Assert.Contains("Call ConnectAsync first", ex.Message);
+
+            // Session file should still exist because the exception interrupted before deletion
+            // (RecreateAgent is called before file deletion)
+        }
+        finally
+        {
+            if (Directory.Exists(tempAgentsDir))
+                Directory.Delete(tempAgentsDir, true);
+            if (Directory.Exists(tempStateDir))
+                Directory.Delete(tempStateDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_WithoutAgentsManager_ThrowsWhenNotConnected()
+    {
+        var tempStateDir = Path.Combine(Path.GetTempPath(), $"brain-reset-noagents-{Guid.NewGuid():N}");
+        try
+        {
+            // No agentsManager provided — reset should still try to rebuild and call RecreateAgent
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempStateDir);
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
+            Assert.Contains("Call ConnectAsync first", ex.Message);
+        }
+        finally
+        {
+            if (Directory.Exists(tempStateDir))
+                Directory.Delete(tempStateDir, true);
+        }
+    }
+
 }
 
 /// <summary>

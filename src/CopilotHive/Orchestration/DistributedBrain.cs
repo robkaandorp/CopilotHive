@@ -33,7 +33,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private CodingAgent? _agent;
     private AgentSession _session;
 
-    private readonly string _systemPrompt;
+    private string _systemPrompt;
     private readonly List<AITool> _brainTools;
     private readonly AgentsManager? _agentsManager;
 
@@ -776,6 +776,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         await _brainCallGate.WaitAsync(ct);
         try
         {
+            // Re-read orchestrator instructions from disk so the system prompt
+            // reflects the latest orchestrator.agents.md content.
+            var freshInstructions = _agentsManager?.GetAgentsMd(WorkerRole.Orchestrator) ?? "";
+            _systemPrompt = string.IsNullOrWhiteSpace(freshInstructions)
+                ? DefaultSystemPrompt
+                : $"{DefaultSystemPrompt}\n\n{freshInstructions}";
+
             _session = AgentSession.Create("brain");
             RecreateAgent();
 
@@ -783,7 +790,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             if (File.Exists(sessionFile))
                 File.Delete(sessionFile);
 
-            _logger.LogInformation("Brain session reset — conversation history cleared and session file deleted.");
+            _logger.LogInformation("Brain session reset — conversation history cleared, orchestrator instructions reloaded from disk, and session file deleted.");
         }
         finally
         {
