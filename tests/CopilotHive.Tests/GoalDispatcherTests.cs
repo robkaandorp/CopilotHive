@@ -210,6 +210,8 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
+    public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
     public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
         Task.FromResult(IterationPlan.Default());
 

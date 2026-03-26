@@ -389,6 +389,74 @@ public sealed class DistributedBrainTests
         Assert.NotEmpty(plan.Phases);
     }
 
+    // -- ResetSessionAsync Tests --
+
+    [Fact]
+    public async Task ResetSessionAsync_BeforeConnect_DoesNotThrow()
+    {
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        // Should not throw even when not connected (no agent to recreate)
+        await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_DeletesPersistedSessionFile()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-reset-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var sessionFile = Path.Combine(tempDir, "brain-session.json");
+            // Create a fake session file to simulate a persisted session
+            await File.WriteAllTextAsync(sessionFile, "{}", TestContext.Current.CancellationToken);
+
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+
+            await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+            Assert.False(File.Exists(sessionFile), "Session file should be deleted after reset");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_NoSessionFile_DoesNotThrow()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-reset-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+
+            // Should not throw even if session file does not exist
+            await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task FakeDistributedBrain_ResetSessionAsync_TracksResetCalls()
+    {
+        var fake = new FakeDistributedBrain();
+        Assert.Equal(0, fake.ResetCalls);
+
+        await fake.ResetSessionAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(1, fake.ResetCalls);
+
+        await fake.ResetSessionAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(2, fake.ResetCalls);
+    }
+
 }
 
 /// <summary>
@@ -399,8 +467,11 @@ file sealed class FakeDistributedBrain : IDistributedBrain
     public bool Connected { get; private set; }
     public int PlanIterationCalls { get; private set; }
     public int CraftCalls { get; private set; }
+    public int ResetCalls { get; private set; }
 
     public Task ConnectAsync(CancellationToken ct = default) { Connected = true; return Task.CompletedTask; }
+
+    public Task ResetSessionAsync(CancellationToken ct = default) { ResetCalls++; return Task.CompletedTask; }
 
     public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default)
     {

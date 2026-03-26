@@ -44,6 +44,12 @@ public interface IDistributedBrain
     /// </summary>
     Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default);
 
+    /// <summary>
+    /// Resets the Brain session by clearing the conversation history and deleting the persisted
+    /// session file. The Brain remains connected and ready for new goals after the reset.
+    /// </summary>
+    Task ResetSessionAsync(CancellationToken ct = default);
+
     /// <summary>Returns current Brain context and usage statistics, or null if not connected.</summary>
     BrainStats? GetStats();
 }

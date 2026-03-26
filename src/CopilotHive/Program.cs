@@ -304,6 +304,18 @@ static async Task<int> RunServerAsync(string[] args)
     // ── Goals REST API ───────────────────────────────────────────────────────
     var goalsApi = app.MapGroup("/api/goals");
 
+    // ── Orchestrator REST API ─────────────────────────────────────────────────
+    var orchestratorApi = app.MapGroup("/api/orchestrator");
+
+    orchestratorApi.MapPost("/reset", async (IDistributedBrain? brain) =>
+    {
+        if (brain is null)
+            return Results.Problem("Brain is not enabled on this orchestrator.", statusCode: 503);
+
+        await brain.ResetSessionAsync();
+        return Results.Ok();
+    });
+
     goalsApi.MapGet("/", async (SqliteGoalStore store) =>
         Results.Ok(await store.GetAllGoalsAsync()));
 

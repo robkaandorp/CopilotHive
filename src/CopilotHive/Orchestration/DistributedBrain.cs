@@ -278,6 +278,27 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <summary>Returns the file path for persisting the Brain session.</summary>
     private string GetSessionFilePath() => Path.Combine(_stateDir, "brain-session.json");
 
+    /// <inheritdoc />
+    public async Task ResetSessionAsync(CancellationToken ct = default)
+    {
+        _session = AgentSession.Create("brain");
+
+        // Delete the persisted session file so the old context is not reloaded on restart
+        var sessionFile = GetSessionFilePath();
+        if (File.Exists(sessionFile))
+        {
+            File.Delete(sessionFile);
+            _logger.LogInformation("Deleted previous Brain session file");
+        }
+
+        // Recreate the agent with the fresh session (only possible when connected)
+        if (_agent is not null)
+            RecreateAgent();
+
+        _logger.LogInformation("Brain session reset");
+        await Task.CompletedTask; // keep async signature for future use
+    }
+
     /// <summary>Persists the current Brain session to disk.</summary>
     internal async Task SaveSessionAsync(CancellationToken ct = default)
     {

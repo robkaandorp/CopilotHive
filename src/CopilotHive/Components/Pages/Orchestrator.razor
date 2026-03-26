@@ -3,6 +3,8 @@
 @using CopilotHive.Orchestration
 @implements IDisposable
 @inject DashboardStateService State
+@inject HttpClient Http
+@inject IJSRuntime JS
 
 <h1>Orchestrator</h1>
 
@@ -52,7 +54,18 @@
     </tbody>
 </table>
 
-<h2 style="margin-top:1.5rem">Brain</h2>
+<h2 style="margin-top:1.5rem">Brain
+    @if (_stats is not null)
+    {
+        <button @onclick="ResetBrainSession" title="Reset Brain Session" class="chat-action-btn" style="margin-left:1rem;font-size:0.85rem;vertical-align:middle">
+            🔄 Reset Session
+        </button>
+    }
+</h2>
+@if (_resetMessage is not null)
+{
+    <p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:0.5rem">@_resetMessage</p>
+}
 @if (_stats is not null)
 {
     <div class="cards">
@@ -144,6 +157,7 @@ else
     private BrainStats? _stats;
     private BrainStats? _composerStats;
     private OrchestratorInfo _info = new();
+    private string? _resetMessage;
 
     protected override void OnInitialized()
     {
@@ -159,6 +173,21 @@ else
     }
 
     private void RefreshState() => InvokeAsync(() => { Refresh(); StateHasChanged(); });
+
+    private async Task ResetBrainSession()
+    {
+        var confirmed = await JS.InvokeAsync<bool>("confirm",
+            "Are you sure you want to reset the Brain session? All conversation history will be cleared.");
+        if (!confirmed) return;
+
+        var response = await Http.PostAsync("/api/orchestrator/reset", null);
+        _resetMessage = response.IsSuccessStatusCode
+            ? "✅ Brain session reset successfully."
+            : $"❌ Reset failed: {response.StatusCode}";
+
+        Refresh();
+        StateHasChanged();
+    }
 
     private string ContextColor => _stats?.ContextUsagePercent switch
     {
