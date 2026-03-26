@@ -602,3 +602,173 @@ public sealed class SqliteGoalStoreTests : IDisposable
         Assert.Contains("old-goal", fetched.DependsOn);
     }
 }
+
+/// <summary>
+/// Tests that verify IterationSummary round-trip serialization with worker outputs
+/// through the SQLite JSON path.
+/// </summary>
+public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
+{
+    private readonly SqliteConnection _connection;
+    private readonly SqliteGoalStore _store;
+
+    public SqliteGoalStoreWorkerOutputTests()
+    {
+        _connection = new SqliteConnection("Data Source=:memory:");
+        _connection.Open();
+        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+    }
+
+    public void Dispose() => _connection.Dispose();
+
+    private static Goal MakeGoal(string id = "worker-output-goal") => new()
+    {
+        Id = id,
+        Description = "Goal for worker output test",
+        CreatedAt = new DateTime(2025, 6, 1, 0, 0, 0, DateTimeKind.Utc),
+    };
+
+    /// <summary>
+    /// PhaseResult.WorkerOutput round-trips through the SQLite JSON column (phases_json).
+    /// </summary>
+    [Fact]
+    public async Task SqliteGoalStore_PhaseResultWorkerOutput_RoundTrips()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateGoalAsync(MakeGoal(), ct);
+
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = "Coding",
+                    Result = "pass",
+                    DurationSeconds = 75.0,
+                    WorkerOutput = "Coder: Implemented feature X.",
+                },
+                new PhaseResult
+                {
+                    Name = "Testing",
+                    Result = "pass",
+                    DurationSeconds = 30.0,
+                    WorkerOutput = null,
+                },
+            ],
+        };
+
+        await _store.UpdateGoalStatusAsync("worker-output-goal", GoalStatus.Completed,
+            new GoalUpdateMetadata { Iterations = 1, IterationSummary = summary }, ct);
+
+        var goal = await _store.GetGoalAsync("worker-output-goal", ct);
+        Assert.NotNull(goal);
+        Assert.Single(goal.IterationSummaries);
+        var s = goal.IterationSummaries[0];
+        Assert.Equal(2, s.Phases.Count);
+        Assert.Equal("Coder: Implemented feature X.", s.Phases[0].WorkerOutput);
+        Assert.Null(s.Phases[1].WorkerOutput);
+    }
+
+    /// <summary>
+    /// IterationSummary.PhaseOutputs dictionary round-trips through the SQLite phase_outputs_json column.
+    /// </summary>
+    [Fact]
+    public async Task SqliteGoalStore_PhaseOutputsDictionary_RoundTrips()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateGoalAsync(MakeGoal("dict-goal"), ct);
+
+        var summary = new IterationSummary
+        {
+            Iteration = 3,
+            Phases =
+            [
+                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 50.0 },
+            ],
+            PhaseOutputs = new Dictionary<string, string>
+            {
+                ["coder-3"] = "Coder output text.",
+                ["reviewer-3"] = "Reviewer approved.",
+            },
+        };
+
+        await _store.UpdateGoalStatusAsync("dict-goal", GoalStatus.Completed,
+            new GoalUpdateMetadata { Iterations = 3, IterationSummary = summary }, ct);
+
+        var goal = await _store.GetGoalAsync("dict-goal", ct);
+        Assert.NotNull(goal);
+        Assert.Single(goal.IterationSummaries);
+        var s = goal.IterationSummaries[0];
+        Assert.Equal(2, s.PhaseOutputs.Count);
+        Assert.Equal("Coder output text.", s.PhaseOutputs["coder-3"]);
+        Assert.Equal("Reviewer approved.", s.PhaseOutputs["reviewer-3"]);
+    }
+
+    /// <summary>
+    /// When IterationSummary.PhaseOutputs is empty, it round-trips as an empty dictionary.
+    /// </summary>
+    [Fact]
+    public async Task SqliteGoalStore_EmptyPhaseOutputs_RoundTripsAsEmpty()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateGoalAsync(MakeGoal("empty-goal"), ct);
+
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 10.0 }],
+            PhaseOutputs = [],
+        };
+
+        await _store.UpdateGoalStatusAsync("empty-goal", GoalStatus.Completed,
+            new GoalUpdateMetadata { Iterations = 1, IterationSummary = summary }, ct);
+
+        var goal = await _store.GetGoalAsync("empty-goal", ct);
+        Assert.NotNull(goal);
+        Assert.Single(goal.IterationSummaries);
+        Assert.Empty(goal.IterationSummaries[0].PhaseOutputs);
+    }
+
+    /// <summary>
+    /// AddIterationAsync persists PhaseResult.WorkerOutput and PhaseOutputs,
+    /// and GetIterationsAsync retrieves them correctly.
+    /// </summary>
+    [Fact]
+    public async Task SqliteGoalStore_AddAndGetIterations_PreservesWorkerOutput()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateGoalAsync(MakeGoal("iter-goal"), ct);
+
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = "Review",
+                    Result = "fail",
+                    DurationSeconds = 15.0,
+                    WorkerOutput = "Reviewer: Missing null checks.",
+                },
+            ],
+            PhaseOutputs = new Dictionary<string, string>
+            {
+                ["reviewer-1"] = "Reviewer: Missing null checks.",
+            },
+            ReviewVerdict = "reject",
+        };
+
+        await _store.AddIterationAsync("iter-goal", summary, ct);
+
+        var iterations = await _store.GetIterationsAsync("iter-goal", ct);
+        Assert.Single(iterations);
+        var s = iterations[0];
+        Assert.Equal("Reviewer: Missing null checks.", s.Phases[0].WorkerOutput);
+        Assert.Equal("reject", s.ReviewVerdict);
+        Assert.Single(s.PhaseOutputs);
+        Assert.Equal("Reviewer: Missing null checks.", s.PhaseOutputs["reviewer-1"]);
+    }
+}

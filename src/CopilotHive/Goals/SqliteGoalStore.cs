@@ -107,6 +107,16 @@ public sealed class SqliteGoalStore : IGoalStore
             alter.ExecuteNonQuery();
             _logger.LogInformation("Migrated goals table: added 'merge_commit_hash' column");
         }
+
+        var iterationColumns = GetTableColumns("goal_iterations");
+
+        if (!iterationColumns.Contains("phase_outputs_json"))
+        {
+            using var alter = _db.CreateCommand();
+            alter.CommandText = "ALTER TABLE goal_iterations ADD COLUMN phase_outputs_json TEXT";
+            alter.ExecuteNonQuery();
+            _logger.LogInformation("Migrated goal_iterations table: added 'phase_outputs_json' column");
+        }
     }
 
     /// <summary>
@@ -534,8 +544,8 @@ public sealed class SqliteGoalStore : IGoalStore
         using var cmd = _db.CreateCommand();
         cmd.Transaction = transaction;
         cmd.CommandText = """
-            INSERT OR REPLACE INTO goal_iterations (goal_id, iteration, phases_json, test_total, test_passed, test_failed, review_verdict, notes_json, created_at)
-            VALUES (@goalId, @iteration, @phases, @testTotal, @testPassed, @testFailed, @reviewVerdict, @notes, @createdAt)
+            INSERT OR REPLACE INTO goal_iterations (goal_id, iteration, phases_json, test_total, test_passed, test_failed, review_verdict, notes_json, phase_outputs_json, created_at)
+            VALUES (@goalId, @iteration, @phases, @testTotal, @testPassed, @testFailed, @reviewVerdict, @notes, @phaseOutputs, @createdAt)
             """;
         cmd.Parameters.AddWithValue("@goalId", goalId);
         cmd.Parameters.AddWithValue("@iteration", summary.Iteration);
@@ -546,6 +556,8 @@ public sealed class SqliteGoalStore : IGoalStore
         cmd.Parameters.AddWithValue("@reviewVerdict", (object?)summary.ReviewVerdict ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@notes", summary.Notes.Count > 0
             ? JsonSerializer.Serialize(summary.Notes, JsonOptions) : (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("@phaseOutputs", summary.PhaseOutputs.Count > 0
+            ? JsonSerializer.Serialize(summary.PhaseOutputs, JsonOptions) : (object)DBNull.Value);
         cmd.Parameters.AddWithValue("@createdAt", DateTime.UtcNow.ToString("O"));
         cmd.ExecuteNonQuery();
     }
@@ -581,6 +593,15 @@ public sealed class SqliteGoalStore : IGoalStore
                 : JsonSerializer.Deserialize<List<string>>(reader.GetString(notesOrd), JsonOptions) ?? [];
 
             var rvOrd = reader.GetOrdinal("review_verdict");
+
+            // phase_outputs_json may be absent in databases created before migration
+            Dictionary<string, string> phaseOutputs = [];
+            if (TryGetOrdinal(reader, "phase_outputs_json", out var poOrd) && !reader.IsDBNull(poOrd))
+            {
+                phaseOutputs = JsonSerializer.Deserialize<Dictionary<string, string>>(
+                    reader.GetString(poOrd), JsonOptions) ?? [];
+            }
+
             summaries.Add(new IterationSummary
             {
                 Iteration = reader.GetInt32(reader.GetOrdinal("iteration")),
@@ -588,6 +609,7 @@ public sealed class SqliteGoalStore : IGoalStore
                 TestCounts = testCounts,
                 ReviewVerdict = reader.IsDBNull(rvOrd) ? null : reader.GetString(rvOrd),
                 Notes = notes,
+                PhaseOutputs = phaseOutputs,
             });
         }
 

@@ -1037,11 +1037,19 @@ public sealed class GoalDispatcher : BackgroundService
         var metrics = pipeline.Metrics;
 
         var phases = metrics.PhaseDurations
-            .Select(kvp => new PhaseResult
+            .Select(kvp =>
             {
-                Name = kvp.Key,
-                Result = failedPhase.HasValue && kvp.Key == failedPhase.Value.ToString() ? "fail" : "pass",
-                DurationSeconds = kvp.Value.TotalSeconds,
+                // Determine role key from phase name to look up output
+                var roleName = PhaseNameToRoleName(kvp.Key);
+                pipeline.PhaseOutputs.TryGetValue($"{roleName}-{pipeline.Iteration}", out var output);
+
+                return new PhaseResult
+                {
+                    Name = kvp.Key,
+                    Result = failedPhase.HasValue && kvp.Key == failedPhase.Value.ToString() ? "fail" : "pass",
+                    DurationSeconds = kvp.Value.TotalSeconds,
+                    WorkerOutput = string.IsNullOrEmpty(output) ? null : output,
+                };
             })
             .ToList();
 
@@ -1074,6 +1082,15 @@ public sealed class GoalDispatcher : BackgroundService
         if (metrics.ImproverSkipped && !string.IsNullOrWhiteSpace(metrics.ImproverSkipReason))
             notes.Add($"improver skipped: {metrics.ImproverSkipReason}");
 
+        // Build PhaseOutputs dictionary for the iteration summary (keyed by "{role}-{iteration}")
+        var phaseOutputs = new Dictionary<string, string>();
+        foreach (var (key, output) in pipeline.PhaseOutputs)
+        {
+            // Only include outputs for the current iteration (key format: "{role}-{iteration}")
+            if (key.EndsWith($"-{pipeline.Iteration}"))
+                phaseOutputs[key] = output;
+        }
+
         return new IterationSummary
         {
             Iteration = pipeline.Iteration,
@@ -1081,8 +1098,20 @@ public sealed class GoalDispatcher : BackgroundService
             TestCounts = testCounts,
             ReviewVerdict = reviewVerdict,
             Notes = notes,
+            PhaseOutputs = phaseOutputs,
         };
     }
+
+    /// <summary>Maps a phase name string to its worker role name for output lookup.</summary>
+    private static string PhaseNameToRoleName(string phaseName) => phaseName switch
+    {
+        "Coding" => "coder",
+        "Testing" => "tester",
+        "Review" => "reviewer",
+        "DocWriting" => "docwriter",
+        "Improve" => "improver",
+        _ => "",
+    };
 
     /// <summary>
     /// Commits and pushes the updated goals.yaml back to the config repo so external

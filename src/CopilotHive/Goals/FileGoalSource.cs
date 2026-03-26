@@ -201,6 +201,7 @@ public sealed class FileGoalSource : IGoalSource
             Name = p.Name ?? string.Empty,
             Result = p.Result ?? throw new InvalidOperationException("PhaseResultEntry.Result must not be null"),
             DurationSeconds = p.DurationSeconds,
+            WorkerOutput = p.WorkerOutput,
         }).ToList() ?? [],
         TestCounts = e.TestCounts is null ? null : new TestCounts
         {
@@ -210,6 +211,7 @@ public sealed class FileGoalSource : IGoalSource
         },
         ReviewVerdict = e.ReviewVerdict,
         Notes = e.Notes ?? [],
+        PhaseOutputs = e.PhaseOutputs ?? [],
     };
 
     private static IterationSummaryEntry MapIterationSummaryEntry(IterationSummary s) => new()
@@ -221,6 +223,7 @@ public sealed class FileGoalSource : IGoalSource
                 Name = p.Name,
                 Result = p.Result,
                 DurationSeconds = p.DurationSeconds,
+                WorkerOutput = p.WorkerOutput,
             }).ToList()
             : null,
         TestCounts = s.TestCounts is null ? null : new TestCountEntry
@@ -231,6 +234,7 @@ public sealed class FileGoalSource : IGoalSource
         },
         ReviewVerdict = s.ReviewVerdict,
         Notes = s.Notes.Count > 0 ? s.Notes : null,
+        PhaseOutputs = s.PhaseOutputs.Count > 0 ? s.PhaseOutputs : null,
     };
 
     internal sealed class GoalFileDocument
@@ -270,6 +274,8 @@ public sealed class FileGoalSource : IGoalSource
         public TestCountEntry? TestCounts { get; set; }
         public string? ReviewVerdict { get; set; }
         public List<string>? Notes { get; set; }
+        /// <summary>Raw worker outputs keyed by <c>{role}-{iteration}</c>.</summary>
+        public Dictionary<string, string>? PhaseOutputs { get; set; }
     }
 
     /// <summary>YAML-serializable representation of a <see cref="PhaseResult"/>.</summary>
@@ -278,6 +284,8 @@ public sealed class FileGoalSource : IGoalSource
         public string? Name { get; set; }
         public string? Result { get; set; }
         public double DurationSeconds { get; set; }
+        /// <summary>Raw worker output for this phase, or <c>null</c> if not recorded.</summary>
+        public string? WorkerOutput { get; set; }
     }
 
     /// <summary>YAML-serializable representation of <see cref="TestCounts"/>.</summary>

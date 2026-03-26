@@ -204,8 +204,11 @@ public sealed class DashboardStateService : IDisposable
             foreach (var pr in summary.Phases)
             {
                 var roleName = PhaseNameToRoleName(pr.Name);
-                string? workerOutput = null;
-                if (!string.IsNullOrEmpty(roleName))
+
+                // Prefer PhaseResult.WorkerOutput (persisted) over live pipeline PhaseOutputs.
+                // This ensures completed goals (no pipeline) still display output correctly.
+                string? workerOutput = pr.WorkerOutput;
+                if (string.IsNullOrEmpty(workerOutput) && !string.IsNullOrEmpty(roleName))
                     pipeline?.PhaseOutputs.TryGetValue($"{roleName}-{summary.Iteration}", out workerOutput);
 
                 var isTestPhase = pr.Name == "Testing";

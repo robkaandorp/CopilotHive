@@ -337,4 +337,161 @@ public sealed class IterationSummaryTests : IDisposable
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => source.ReadGoalsAsync(TestContext.Current.CancellationToken));
     }
+
+    // ── WorkerOutput round-trip (YAML path) ─────────────────────────────────
+
+    /// <summary>
+    /// PhaseResult.WorkerOutput is serialised to YAML and survives a round-trip.
+    /// </summary>
+    [Fact]
+    public async Task FileGoalSource_PhaseResultWorkerOutput_RoundTrips()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: output-goal
+                description: "Goal with worker output"
+            """);
+
+        var source = new FileGoalSource(path);
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = "Coding",
+                    Result = "pass",
+                    DurationSeconds = 60.0,
+                    WorkerOutput = "Coder completed task successfully.",
+                },
+                new PhaseResult
+                {
+                    Name = "Testing",
+                    Result = "pass",
+                    DurationSeconds = 20.0,
+                    WorkerOutput = null, // no output for this phase
+                },
+            ],
+        };
+
+        await source.UpdateGoalStatusAsync("output-goal", GoalStatus.Completed,
+            new GoalUpdateMetadata { Iterations = 1, IterationSummary = summary },
+            TestContext.Current.CancellationToken);
+
+        var goals = await source.ReadGoalsAsync(TestContext.Current.CancellationToken);
+        Assert.Single(goals);
+        var g = goals[0];
+        Assert.Single(g.IterationSummaries);
+        var s = g.IterationSummaries[0];
+        Assert.Equal(2, s.Phases.Count);
+        Assert.Equal("Coder completed task successfully.", s.Phases[0].WorkerOutput);
+        Assert.Null(s.Phases[1].WorkerOutput);
+    }
+
+    /// <summary>
+    /// IterationSummary.PhaseOutputs is serialised to YAML and survives a round-trip.
+    /// </summary>
+    [Fact]
+    public async Task FileGoalSource_PhaseOutputsDictionary_RoundTrips()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: dict-goal
+                description: "Goal with phase outputs dict"
+            """);
+
+        var source = new FileGoalSource(path);
+        var summary = new IterationSummary
+        {
+            Iteration = 2,
+            Phases =
+            [
+                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 30.0 },
+            ],
+            PhaseOutputs = new Dictionary<string, string>
+            {
+                ["coder-2"] = "Coder output for iteration 2.",
+                ["tester-2"] = "Tester found 10 tests passing.",
+            },
+        };
+
+        await source.UpdateGoalStatusAsync("dict-goal", GoalStatus.Completed,
+            new GoalUpdateMetadata { Iterations = 2, IterationSummary = summary },
+            TestContext.Current.CancellationToken);
+
+        var goals = await source.ReadGoalsAsync(TestContext.Current.CancellationToken);
+        Assert.Single(goals);
+        var s = goals[0].IterationSummaries[0];
+        Assert.Equal(2, s.PhaseOutputs.Count);
+        Assert.Equal("Coder output for iteration 2.", s.PhaseOutputs["coder-2"]);
+        Assert.Equal("Tester found 10 tests passing.", s.PhaseOutputs["tester-2"]);
+    }
+
+    /// <summary>
+    /// When IterationSummary.PhaseOutputs is empty, no phase_outputs key is written to YAML.
+    /// </summary>
+    [Fact]
+    public async Task FileGoalSource_EmptyPhaseOutputs_OmittedFromYaml()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: no-outputs-goal
+                description: "Goal with no phase outputs"
+            """);
+
+        var source = new FileGoalSource(path);
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 10.0 }],
+            PhaseOutputs = [],
+        };
+
+        await source.UpdateGoalStatusAsync("no-outputs-goal", GoalStatus.Completed,
+            new GoalUpdateMetadata { Iterations = 1, IterationSummary = summary },
+            TestContext.Current.CancellationToken);
+
+        var yaml = await File.ReadAllTextAsync(path, TestContext.Current.CancellationToken);
+        Assert.DoesNotContain("phase_outputs", yaml);
+    }
+
+    /// <summary>
+    /// GoalFileEntry.IterationSummaryEntry with PhaseResultEntry.WorkerOutput round-trips via YAML.
+    /// </summary>
+    [Fact]
+    public void GoalFileEntry_PhaseResultEntryWorkerOutput_RoundTripsViaYaml()
+    {
+        var serializer = new SerializerBuilder()
+            .WithNamingConvention(UnderscoredNamingConvention.Instance)
+            .ConfigureDefaultValuesHandling(DefaultValuesHandling.OmitNull)
+            .Build();
+
+        var deserializer = new DeserializerBuilder()
+            .WithNamingConvention(UnderscoredNamingConvention.Instance)
+            .IgnoreUnmatchedProperties()
+            .Build();
+
+        var entry = new FileGoalSource.IterationSummaryEntry
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new FileGoalSource.PhaseResultEntry
+                {
+                    Name = "Coding",
+                    Result = "pass",
+                    DurationSeconds = 55.0,
+                    WorkerOutput = "Implemented the feature.",
+                },
+            ],
+        };
+
+        var yaml = serializer.Serialize(entry);
+        var roundTripped = deserializer.Deserialize<FileGoalSource.IterationSummaryEntry>(yaml);
+
+        Assert.NotNull(roundTripped.Phases);
+        Assert.Single(roundTripped.Phases);
+        Assert.Equal("Implemented the feature.", roundTripped.Phases[0].WorkerOutput);
+    }
 }

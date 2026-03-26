@@ -272,6 +272,77 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
         Assert.Single(improvePhases);
         Assert.Equal("skip", improvePhases[0].Result);
     }
+
+    /// <summary>
+    /// BuildIterationSummary populates PhaseResult.WorkerOutput from pipeline.PhaseOutputs
+    /// using the {role}-{iteration} key format.
+    /// </summary>
+    [Fact]
+    public void BuildIterationSummary_PopulatesPhaseResultWorkerOutput()
+    {
+        var goal = new Goal { Id = "output-goal", Description = "Test" };
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
+
+        pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(60);
+        pipeline.Metrics.PhaseDurations["Testing"] = TimeSpan.FromSeconds(30);
+
+        // RecordOutput uses "{role}-{iteration}" format (iteration = 1 by default)
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "Coder finished the task.");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "All 5 tests pass.");
+
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+
+        var codingPhase = summary.Phases.FirstOrDefault(p => p.Name == "Coding");
+        var testingPhase = summary.Phases.FirstOrDefault(p => p.Name == "Testing");
+
+        Assert.NotNull(codingPhase);
+        Assert.Equal("Coder finished the task.", codingPhase.WorkerOutput);
+
+        Assert.NotNull(testingPhase);
+        Assert.Equal("All 5 tests pass.", testingPhase.WorkerOutput);
+    }
+
+    /// <summary>
+    /// BuildIterationSummary populates IterationSummary.PhaseOutputs with entries
+    /// keyed by {role}-{iteration} matching the current iteration.
+    /// </summary>
+    [Fact]
+    public void BuildIterationSummary_PopulatesPhaseOutputsDictionary()
+    {
+        var goal = new Goal { Id = "dict-goal", Description = "Test" };
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
+
+        pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(45);
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "Coder output.");
+
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+
+        Assert.True(summary.PhaseOutputs.ContainsKey("coder-1"));
+        Assert.Equal("Coder output.", summary.PhaseOutputs["coder-1"]);
+    }
+
+    /// <summary>
+    /// BuildIterationSummary does not include outputs from other iterations
+    /// (e.g., outputs from iteration 2 are excluded when summarizing iteration 1).
+    /// </summary>
+    [Fact]
+    public void BuildIterationSummary_ExcludesOutputsFromOtherIterations()
+    {
+        var goal = new Goal { Id = "multi-iter-goal", Description = "Test" };
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
+
+        pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(30);
+        // Simulate outputs from multiple iterations coexisting in PhaseOutputs
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "Iteration 1 output.");
+        pipeline.RecordOutput(WorkerRole.Coder, 2, "Iteration 2 output.");
+
+        // Summary is built for iteration 1 (pipeline.Iteration = 1)
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+
+        Assert.True(summary.PhaseOutputs.ContainsKey("coder-1"));
+        Assert.False(summary.PhaseOutputs.ContainsKey("coder-2"),
+            "Outputs from a different iteration must not appear in the summary.");
+    }
 }
 
 /// <summary>

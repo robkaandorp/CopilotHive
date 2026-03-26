@@ -54,6 +54,11 @@ public sealed class IterationSummary
     public string? ReviewVerdict { get; init; }
     /// <summary>Notable events such as "improver skipped due to timeout".</summary>
     public List<string> Notes { get; init; } = [];
+    /// <summary>
+    /// Raw worker outputs keyed by <c>{role}-{iteration}</c> (e.g. "coder-1").
+    /// Populated when the iteration summary is built so outputs survive goal completion.
+    /// </summary>
+    public Dictionary<string, string> PhaseOutputs { get; set; } = [];
 }
 
 /// <summary>Result of a single pipeline phase within one iteration.</summary>
@@ -65,6 +70,8 @@ public sealed class PhaseResult
     public required string Result { get; init; }
     /// <summary>Wall-clock duration of the phase in seconds.</summary>
     public double DurationSeconds { get; init; }
+    /// <summary>Raw worker output captured for this phase, or <c>null</c> if not recorded.</summary>
+    public string? WorkerOutput { get; set; }
 }
 
 /// <summary>Aggregate test counts from a tester run.</summary>
