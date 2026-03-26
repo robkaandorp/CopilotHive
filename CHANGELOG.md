@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `POST /api/orchestrator/reset` REST endpoint enables external reset invocation
   - Dashboard button shows browser confirmation dialog before executing ("Are you sure you want to reset the Brain session?")
   - On success, the UI displays a success message and refreshes Brain stats; failure displays the HTTP status code
-  - 9 xUnit tests covering reset behavior (before connect, session file replacement, fresh creation, system prompt rebuild, fake brain tracking, API endpoint existence, 503 when Brain disabled, and custom orchestrator instructions)
+  - 10 xUnit tests covering reset behavior (before connect, session file replacement, fresh creation, system prompt rebuild, fake brain tracking, API endpoint existence, 503 when Brain disabled, custom orchestrator instructions, and live instruction updates)
 - **Goal dependency visualization in dashboard** — Goals and Goal Detail pages now display dependency relationships:
   - `GoalDetail.razor` shows a "Dependencies" section listing each dependency goal ID as a clickable link with status indicator (✅ Completed, ⏳ Pending, 🔄 InProgress, ❌ Failed, ❓ Unknown)
   - `Goals.razor` shows a 🔗 icon for goals with all dependencies completed, or ⏳ icon if any dependency is unsatisfied
