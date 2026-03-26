@@ -27,6 +27,9 @@ If any caller still references deleted member → [CRITICAL].
 
 Review is scoped to the original goal only.
 - **In scope**: Issues related to the goal (missing changes, bugs, broken contracts)
+- **In scope**: Documentation updates (README.md, CHANGELOG.md, XML doc comments) that
+  describe functionality added or changed by this goal. These are a natural part of
+  feature work, not scope violations.
 - **Out of scope**: Pre-existing issues unrelated to goal → [MINOR] observation only,
   never REQUEST_CHANGES
 
