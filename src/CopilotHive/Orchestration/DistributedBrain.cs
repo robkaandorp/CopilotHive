@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Text;
 using System.Text.Json;
+using CopilotHive.Agents;
 using CopilotHive.Git;
 using CopilotHive.Metrics;
 using CopilotHive.Services;
@@ -34,6 +35,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     private readonly string _systemPrompt;
     private readonly List<AITool> _brainTools;
+    private readonly AgentsManager? _agentsManager;
 
     /// <summary>
     /// Serialises all Brain LLM calls so that <see cref="_lastToolCallResult"/> is
@@ -90,6 +92,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _logger = logger;
         _metricsTracker = metricsTracker;
         _repoManager = repoManager;
+        _agentsManager = agentsManager;
         _stateDir = stateDir ?? "/app/state";
         _session = AgentSession.Create("brain");
 
@@ -249,9 +252,23 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             AutoLoadWorkspaceInstructions = false,
             ReasoningEffort = _reasoningEffort,
             Logger = _logger,
-            OnCompacted = r => _logger.LogInformation(
-                "Brain context compaction: {TokensBefore} \u2192 {TokensAfter} tokens ({ReductionPercent}% reduction), {MessagesBefore} \u2192 {MessagesAfter} messages",
-                r.TokensBefore, r.TokensAfter, r.ReductionPercent, r.MessagesBefore, r.MessagesAfter),
+            OnCompacted = r =>
+            {
+                _logger.LogInformation(
+                    "Brain context compaction: {TokensBefore} \u2192 {TokensAfter} tokens ({ReductionPercent}% reduction), {MessagesBefore} \u2192 {MessagesAfter} messages",
+                    r.TokensBefore, r.TokensAfter, r.ReductionPercent, r.MessagesBefore, r.MessagesAfter);
+
+                // Re-inject orchestrator instructions after compaction so they survive summarization
+                var instructions = _agentsManager?.GetAgentsMd(WorkerRole.Orchestrator);
+                if (!string.IsNullOrWhiteSpace(instructions))
+                {
+                    _session.MessageHistory.Add(new ChatMessage(ChatRole.User,
+                        $"ORCHESTRATOR INSTRUCTIONS (re-injected after context compaction):\n\n{instructions}"));
+                    _session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
+                        "Acknowledged. Orchestrator instructions refreshed."));
+                    _logger.LogInformation("Re-injected orchestrator instructions after compaction");
+                }
+            },
         });
 
         _logger.LogDebug("CodingAgent created with WorkDirectory={WorkDir}, FileOps={FileOps}",
@@ -268,6 +285,22 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         await _session.SaveAsync(path, ct);
         _logger.LogDebug("Brain session saved ({Count} messages)", _session.MessageHistory.Count);
+    }
+
+    /// <inheritdoc/>
+    public async Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(instructions)) return;
+
+        _session.MessageHistory.Add(new ChatMessage(ChatRole.User,
+            $"ORCHESTRATOR INSTRUCTIONS UPDATE:\n\n{instructions}"));
+        _session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
+            "Acknowledged. I will follow the updated orchestrator instructions for all future goals."));
+
+        _logger.LogInformation("Injected orchestrator instructions into Brain session ({Chars} chars)",
+            instructions.Length);
+
+        await SaveSessionAsync(ct);
     }
 
     /// <summary>

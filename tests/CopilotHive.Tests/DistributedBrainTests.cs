@@ -417,5 +417,7 @@ file sealed class FakeDistributedBrain : IDistributedBrain
 
     public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) => Task.CompletedTask;
 
+    public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) => Task.CompletedTask;
+
     public BrainStats? GetStats() => null;
 }

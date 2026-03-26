@@ -37,6 +37,13 @@ public interface IDistributedBrain
     /// </summary>
     Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default);
 
+    /// <summary>
+    /// Injects the orchestrator AGENTS.md instructions into the Brain session as a
+    /// policy-update message. Called when the config repo agents file changes and
+    /// after context compaction to ensure the Brain always has fresh rules.
+    /// </summary>
+    Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default);
+
     /// <summary>Returns current Brain context and usage statistics, or null if not connected.</summary>
     BrainStats? GetStats();
 }
