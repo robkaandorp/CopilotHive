@@ -221,6 +221,8 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
 
     public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) => Task.CompletedTask;
 
+    public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
     public BrainStats? GetStats() => null;
 }
 

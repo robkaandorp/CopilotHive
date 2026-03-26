@@ -770,6 +770,27 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         };
     }
 
+    /// <inheritdoc />
+    public async Task ResetSessionAsync(CancellationToken ct = default)
+    {
+        await _brainCallGate.WaitAsync(ct);
+        try
+        {
+            _session = AgentSession.Create("brain");
+            RecreateAgent();
+
+            var sessionFile = GetSessionFilePath();
+            if (File.Exists(sessionFile))
+                File.Delete(sessionFile);
+
+            _logger.LogInformation("Brain session reset — conversation history cleared and session file deleted.");
+        }
+        finally
+        {
+            _brainCallGate.Release();
+        }
+    }
+
     /// <summary>
     /// Builds a concise metrics history summary from the last N iterations.
     /// </summary>

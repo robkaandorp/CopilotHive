@@ -3,6 +3,7 @@
 @using CopilotHive.Orchestration
 @implements IDisposable
 @inject DashboardStateService State
+@inject IJSRuntime JS
 
 <h1>Orchestrator</h1>
 
@@ -90,6 +91,12 @@
             <div style="width:@(_stats.ContextUsagePercent)%;height:100%;background:@ContextColor;transition:width 0.3s"></div>
         </div>
     </div>
+
+    <div style="margin-top:1rem">
+        <button class="btn btn-danger" disabled="@_resettingBrain" @onclick="ResetBrainSessionAsync">
+            @(_resettingBrain ? "Resetting…" : "Reset Brain Session")
+        </button>
+    </div>
 }
 else
 {
@@ -144,6 +151,7 @@ else
     private BrainStats? _stats;
     private BrainStats? _composerStats;
     private OrchestratorInfo _info = new();
+    private bool _resettingBrain;
 
     protected override void OnInitialized()
     {
@@ -221,4 +229,25 @@ else
     };
 
     public void Dispose() => State.OnStateChanged -= RefreshState;
+
+    private async Task ResetBrainSessionAsync()
+    {
+        var confirmed = await JS.InvokeAsync<bool>("confirm",
+            "Are you sure you want to reset the Brain session? This will clear all conversation history and start a fresh session. The system prompt and orchestrator instructions will be reloaded.");
+        if (!confirmed)
+            return;
+
+        _resettingBrain = true;
+        StateHasChanged();
+        try
+        {
+            await State.ResetBrainSessionAsync();
+            Refresh();
+        }
+        finally
+        {
+            _resettingBrain = false;
+            StateHasChanged();
+        }
+    }
 }

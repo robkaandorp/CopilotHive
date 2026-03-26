@@ -156,6 +156,16 @@ public sealed class DashboardStateService : IDisposable
     /// <summary>Returns current Composer statistics, or null if Composer is not configured.</summary>
     public BrainStats? GetComposerStats() => _composer?.GetStats();
 
+    /// <summary>
+    /// Resets the Brain's conversation session, clearing all history and deleting the session file.
+    /// Does nothing if the Brain is not configured.
+    /// </summary>
+    public async Task ResetBrainSessionAsync(CancellationToken ct = default)
+    {
+        if (_brain is not null)
+            await _brain.ResetSessionAsync(ct);
+    }
+
     /// <summary>Returns recent worker progress reports.</summary>
     public IReadOnlyList<ProgressEntry> GetRecentProgress(int count = 50) => _progressLog.GetRecent(count);
 

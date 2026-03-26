@@ -46,6 +46,13 @@ public interface IDistributedBrain
 
     /// <summary>Returns current Brain context and usage statistics, or null if not connected.</summary>
     BrainStats? GetStats();
+
+    /// <summary>
+    /// Resets the Brain's conversation session, creating a fresh <see cref="SharpCoder.AgentSession"/>
+    /// and deleting the persisted session file. Thread-safe via the Brain call gate.
+    /// The system prompt (including orchestrator instructions) is preserved from construction.
+    /// </summary>
+    Task ResetSessionAsync(CancellationToken ct = default);
 }
 
 /// <summary>Snapshot of the Brain's context and usage state.</summary>
