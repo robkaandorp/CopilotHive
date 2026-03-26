@@ -692,3 +692,20 @@ tr:last-child td { border-bottom: none; }
 }
 .config-markdown strong { color: #f0f6fc; }
 .config-markdown em { color: #8b949e; }
+.yaml-highlighted code {
+    font-family: monospace;
+    color: var(--text);
+}
+.yaml-key {
+    color: var(--accent);
+}
+.yaml-comment {
+    color: var(--text-muted);
+    font-style: italic;
+}
+.yaml-bool {
+    color: #79c0ff;
+}
+.yaml-number {
+    color: #f2cc60;
+}
