@@ -2,6 +2,7 @@
 @using CopilotHive.Goals
 @inject IGoalStore GoalStore
 @inject IJSRuntime JS
+@inject HttpClient HttpClient
 
 <h1>Goals</h1>
 
@@ -173,8 +174,11 @@ else if (_loaded)
 
     private async Task DeleteGoal(string goalId)
     {
-        await GoalStore.DeleteGoalAsync(goalId);
-        _allGoals.RemoveAll(g => g.Id == goalId);
-        ApplyFilters();
+        var response = await HttpClient.DeleteAsync($"/api/goals/{goalId}");
+        if (response.IsSuccessStatusCode)
+        {
+            _allGoals.RemoveAll(g => g.Id == goalId);
+            ApplyFilters();
+        }
     }
 }

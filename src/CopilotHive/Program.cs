@@ -143,6 +143,11 @@ static async Task<int> RunServerAsync(string[] args)
     // Dashboard: Blazor Server + real-time state aggregation
     builder.Services.AddSingleton<DashboardStateService>();
     builder.Services.AddRazorComponents().AddInteractiveServerComponents();
+    // HttpClient for Blazor Server components to call the local REST API
+    builder.Services.AddScoped<HttpClient>(_ => new HttpClient
+    {
+        BaseAddress = new Uri($"http://localhost:{port + 1}")
+    });
     // Persist data protection keys so antiforgery tokens survive container restarts
     builder.Services.AddDataProtection()
         .PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(stateDir, "keys")));

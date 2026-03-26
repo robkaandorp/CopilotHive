@@ -8,6 +8,7 @@
 @inject IGoalStore GoalStore
 @inject IJSRuntime JS
 @inject NavigationManager Nav
+@inject HttpClient HttpClient
 
 <h1>Goal: @GoalId</h1>
 
@@ -533,7 +534,10 @@ else
         var confirmed = await JS.InvokeAsync<bool>("confirm", $"Are you sure you want to delete goal '{GoalId}'?");
         if (!confirmed) return;
 
-        await GoalStore.DeleteGoalAsync(GoalId);
-        Nav.NavigateTo("/goals");
+        var response = await HttpClient.DeleteAsync($"/api/goals/{GoalId}");
+        if (response.IsSuccessStatusCode)
+        {
+            Nav.NavigateTo("/goals");
+        }
     }
 }
