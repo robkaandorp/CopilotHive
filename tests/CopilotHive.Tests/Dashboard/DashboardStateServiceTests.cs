@@ -59,6 +59,46 @@ public sealed class DashboardStateServiceTests : IDisposable
     }
 
     /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetGoalDetail"/> populates
+    /// <see cref="GoalDetailInfo.DependsOn"/> with the correct dependency IDs
+    /// for a goal that was stored with dependencies.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_GoalWithDependencies_PopulatesDependsOn()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Arrange: persist a goal that depends on two other goals
+        var dependencyGoalId = "dep-goal-alpha";
+        var parentGoal = new Goal
+        {
+            Id = "parent-goal-beta",
+            Description = "Parent goal depending on another",
+            DependsOn = [dependencyGoalId],
+        };
+        await _store.CreateGoalAsync(parentGoal, ct);
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store);
+
+        // Act
+        var detail = service.GetGoalDetail("parent-goal-beta");
+
+        // Assert
+        Assert.NotNull(detail);
+        Assert.Single(detail.DependsOn);
+        Assert.Contains(dependencyGoalId, detail.DependsOn);
+    }
+
+    /// <summary>
     /// Verifies that <see cref="GoalDetailInfo.DependsOn"/> defaults to an
     /// empty list when the goal has no dependencies.
     /// </summary>
