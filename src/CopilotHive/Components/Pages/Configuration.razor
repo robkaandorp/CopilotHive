@@ -64,11 +64,6 @@ else
         if (File.Exists(configPath))
             _files["hive-config.yaml"] = await File.ReadAllTextAsync(configPath);
 
-        // Load goals.yaml
-        var goalsPath = Path.Combine(basePath, "goals.yaml");
-        if (File.Exists(goalsPath))
-            _files["goals.yaml"] = await File.ReadAllTextAsync(goalsPath);
-
         // Load agents/*.agents.md
         var agentsDir = Path.Combine(basePath, "agents");
         if (Directory.Exists(agentsDir))
