@@ -1,6 +1,7 @@
 @page "/configuration"
 @using CopilotHive.Configuration
 @using CopilotHive.Dashboard
+@using Markdig
 @implements IDisposable
 @inject ConfigRepoManager ConfigRepo
 
@@ -28,7 +29,16 @@ else
     </div>
 
     <div class="config-content">
-        <pre><code>@GetActiveContent()</code></pre>
+        @if (ActiveTab?.EndsWith(".md") == true)
+        {
+            <div class="config-markdown">
+                @((MarkupString)RenderMarkdown(GetActiveContent() ?? ""))
+            </div>
+        }
+        else
+        {
+            <pre><code>@GetActiveContent()</code></pre>
+        }
     </div>
 }
 
@@ -82,6 +92,15 @@ else
 
     private string GetActiveContent() =>
         _files.TryGetValue(_activeTab, out var content) ? content : "(empty)";
+
+    private string? ActiveTab => _activeTab;
+
+    private static readonly MarkdownPipeline MarkdownPipeline = new MarkdownPipelineBuilder()
+        .UseAdvancedExtensions()
+        .Build();
+
+    private static string RenderMarkdown(string content) =>
+        Markdown.ToHtml(content, MarkdownPipeline);
 
     public void Dispose() { }
 }

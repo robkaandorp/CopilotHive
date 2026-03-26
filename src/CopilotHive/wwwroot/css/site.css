@@ -650,3 +650,45 @@ tr:last-child td { border-bottom: none; }
     display: block;
     margin-top: 0.2rem;
 }
+
+/* Markdown rendering for .md config files */
+.config-markdown {
+    color: #e6edf3;
+    line-height: 1.6;
+}
+.config-markdown h1, .config-markdown h2, .config-markdown h3 {
+    color: #f0f6fc;
+    margin-top: 1.5em;
+    margin-bottom: 0.5em;
+}
+.config-markdown h1 { font-size: 1.5rem; }
+.config-markdown h2 { font-size: 1.25rem; }
+.config-markdown h3 { font-size: 1.1rem; }
+.config-markdown p { margin: 0.75em 0; }
+.config-markdown ul, .config-markdown ol { padding-left: 1.5em; margin: 0.5em 0; }
+.config-markdown code {
+    font-family: monospace;
+    background: rgba(110, 118, 129, 0.2);
+    padding: 0.1em 0.3em;
+    border-radius: 3px;
+    font-size: 0.9em;
+}
+.config-markdown pre {
+    background: rgba(110, 118, 129, 0.15);
+    padding: 1em;
+    border-radius: 6px;
+    overflow-x: auto;
+}
+.config-markdown pre code {
+    background: transparent;
+    padding: 0;
+}
+.config-markdown a {
+    color: var(--accent);
+    text-decoration: none;
+}
+.config-markdown a:hover {
+    text-decoration: underline;
+}
+.config-markdown strong { color: #f0f6fc; }
+.config-markdown em { color: #8b949e; }
