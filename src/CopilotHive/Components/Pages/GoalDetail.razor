@@ -87,6 +87,29 @@
         </div>
     }
 
+    @if (_detail.DependsOn.Count > 0)
+    {
+        <div class="card goal-dependencies" style="margin-bottom:1rem">
+            <div class="label">Dependencies</div>
+            <ul style="margin:0.5rem 0 0 1.2rem;font-size:0.9rem">
+                @foreach (var depId in _detail.DependsOn)
+                {
+                    <li>
+                        <a href="/goals/@depId">@depId</a>
+                        @if (_dependencyStatuses.TryGetValue(depId, out var depStatus))
+                        {
+                            <span style="margin-left:0.4rem">@GetStatusIcon(depStatus)</span>
+                        }
+                        else
+                        {
+                            <span style="margin-left:0.4rem">@GetStatusIcon(null)</span>
+                        }
+                    </li>
+                }
+            </ul>
+        </div>
+    }
+
     <!-- Iteration Timeline -->
     <h2 style="margin-top:1.5rem">Iterations</h2>
     @if (_detail.Iterations.Count > 0)
@@ -359,6 +382,29 @@ else if (_storedGoal is not null)
         </div>
     }
 
+    @if (_storedGoal.DependsOn.Count > 0)
+    {
+        <div class="card goal-dependencies" style="margin-bottom:1rem">
+            <div class="label">Dependencies</div>
+            <ul style="margin:0.5rem 0 0 1.2rem;font-size:0.9rem">
+                @foreach (var depId in _storedGoal.DependsOn)
+                {
+                    <li>
+                        <a href="/goals/@depId">@depId</a>
+                        @if (_dependencyStatuses.TryGetValue(depId, out var depStatus))
+                        {
+                            <span style="margin-left:0.4rem">@GetStatusIcon(depStatus)</span>
+                        }
+                        else
+                        {
+                            <span style="margin-left:0.4rem">@GetStatusIcon(null)</span>
+                        }
+                    </li>
+                }
+            </ul>
+        </div>
+    }
+
     @if (_storedGoal.PhaseDurations is { Count: > 0 })
     {
         <div class="card" style="margin-bottom:1rem">
@@ -483,6 +529,7 @@ else
     private IReadOnlyList<ProgressEntry> _progress = [];
     private string? _selectedPhase;
     private string? _approveError;
+    private Dictionary<string, GoalStatus> _dependencyStatuses = new();
 
     protected override void OnInitialized()
     {
@@ -509,6 +556,32 @@ else
         {
             _storedGoal = null;
             _storedIterations = [];
+        }
+
+        // Pre-fetch dependency statuses for display
+        var depIds = _detail?.DependsOn ?? _storedGoal?.DependsOn ?? [];
+        if (depIds.Count > 0)
+        {
+            var statuses = new Dictionary<string, GoalStatus>();
+            foreach (var depId in depIds)
+            {
+                var depDetail = State.GetGoalDetail(depId);
+                if (depDetail is not null)
+                {
+                    statuses[depId] = depDetail.Status;
+                }
+                else
+                {
+                    var stored = GoalStore.GetGoalAsync(depId).GetAwaiter().GetResult();
+                    if (stored is not null)
+                        statuses[depId] = stored.Status;
+                }
+            }
+            _dependencyStatuses = statuses;
+        }
+        else
+        {
+            _dependencyStatuses = new();
         }
     }
 
@@ -573,6 +646,15 @@ else
         if (string.IsNullOrEmpty(content)) return "";
         return Markdown.ToHtml(content, MdPipeline);
     }
+
+    private static string GetStatusIcon(GoalStatus? status) => status switch
+    {
+        GoalStatus.Completed => "✅",
+        GoalStatus.Pending => "⏳",
+        GoalStatus.InProgress => "🔄",
+        GoalStatus.Failed => "❌",
+        _ => "❓",
+    };
 
     public void Dispose() => State.OnStateChanged -= RefreshState;
 

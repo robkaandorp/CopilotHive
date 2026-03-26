@@ -62,7 +62,16 @@
                             </div>
                         }
                     </td>
-                    <td><span class="badge @StatusBadge(g.Status)">@g.Status</span></td>
+                    <td><span class="badge @StatusBadge(g.Status)">@g.Status</span>
+                        @if (g.DependsOn.Count > 0)
+                        {
+                            var hasBlocked = g.DependsOn.Any(depId => !IsDependencyCompleted(depId));
+                            <span title="Dependencies: @string.Join(", ", g.DependsOn)"
+                                  style="color: @(hasBlocked ? "orange" : "green"); margin-left: 0.5rem;">
+                                @(hasBlocked ? "⏳" : "🔗")
+                            </span>
+                        }
+                    </td>
                     <td><span class="badge @PriorityBadge(g.Priority)">@g.Priority</span></td>
                     <td>@(g.Iterations?.ToString() ?? "—")</td>
                     <td style="color:var(--text-muted);white-space:nowrap">@FormatDuration(g)</td>
@@ -100,10 +109,12 @@ else if (_loaded)
     private string _priorityFilter = "";
     private bool _loaded;
     private Dictionary<string, string> _approveErrors = new();
+    private Dictionary<string, GoalStatus> _goalStatusById = new();
 
     protected override async Task OnInitializedAsync()
     {
         _allGoals = (await GoalStore.GetAllGoalsAsync()).ToList();
+        _goalStatusById = _allGoals.ToDictionary(g => g.Id, g => g.Status);
         _loaded = true;
         ApplyFilters();
     }
@@ -173,6 +184,9 @@ else if (_loaded)
 
     private static string Truncate(string s, int max) =>
         s.Length <= max ? s : s[..max] + "…";
+
+    private bool IsDependencyCompleted(string depId) =>
+        _goalStatusById.TryGetValue(depId, out var status) && status == GoalStatus.Completed;
 
     private async Task ConfirmAndDeleteGoal(string goalId)
     {
