@@ -56,10 +56,12 @@
             }
             @if (!string.IsNullOrEmpty(_detail.MergeCommitHash))
             {
-                var shortHash = _detail.MergeCommitHash[..7];
+                var hashes = _detail.MergeCommitHash!.Split(',');
+                var commitHash = hashes[0];
+                var shortHash = commitHash[..7];
                 @if (!string.IsNullOrEmpty(_detail.RepositoryUrl))
                 {
-                    var commitUrl = $"{_detail.RepositoryUrl}/commit/{_detail.MergeCommitHash}";
+                    var commitUrl = $"{_detail.RepositoryUrl}/commit/{commitHash}";
                     <span style="margin-left:1rem;display:inline-flex;align-items:center;gap:0.5rem;">
                         🔗 <a href="@commitUrl" target="_blank" style="font-family:monospace;color:var(--accent)">@shortHash</a>
                     </span>
@@ -312,11 +314,13 @@ else if (_storedGoal is not null)
         </div>
         @if (!string.IsNullOrEmpty(_storedGoal.MergeCommitHash))
         {
-            var shortHash = _storedGoal.MergeCommitHash[..7];
+            var hashes = _storedGoal.MergeCommitHash!.Split(',');
+            var commitHash = hashes[0];
+            var shortHash = commitHash[..7];
             var storedRepoUrl = State.GetRepositoryUrl(_storedGoal);
             @if (!string.IsNullOrEmpty(storedRepoUrl))
             {
-                var commitUrl = $"{storedRepoUrl}/commit/{_storedGoal.MergeCommitHash}";
+                var commitUrl = $"{storedRepoUrl}/commit/{commitHash}";
                 <div style="margin-top:0.25rem;font-size:0.8rem;display:inline-flex;align-items:center;gap:0.5rem;">
                     🔗 <a href="@commitUrl" target="_blank" style="font-family:monospace;color:var(--accent)">@shortHash</a>
                 </div>
