@@ -39,7 +39,7 @@ Goals flow through a structured pipeline:
 2. **Testing**: A worker (assigned the tester role) builds the project and runs all tests.
 3. **Doc Writing**: A worker (assigned the doc-writer role) updates documentation to reflect the changes.
 4. **Review**: A worker (assigned the reviewer role) inspects the diff, tests, and documentation.
-5. **Merge**: The Brain decides when quality is sufficient and merges the branch.
+5. **Merge**: The Brain decides when quality is sufficient and squash-merges the branch, combining all feature branch commits into a single descriptive commit.
 6. **Improve** *(non-blocking)*: A worker (assigned the improver role) updates `agents.md` based on metrics. If improvement fails, the pipeline still completes — the failure is recorded in goal notes and metrics.
 
 If testing or review fails, the pipeline retries the coding step (up to a configured limit).
@@ -184,6 +184,7 @@ goals:
 - **Config repo** — externalized agent instructions and goals (`CopilotHive-Config`)
 - **Multi-repo goal support** — goals can target any accessible Git repository
 - **Per-role model selection** — assign different LLM models to each worker type
+- **Squash merge** — feature branches are squash-merged into the base branch, producing a single descriptive commit per goal
 - **Auto-rebase on merge conflicts** — the pipeline automatically retries merges
 - **Fallback metrics parsing** — robust parsing handles varied worker output formats
 - **Duplicate goal completion guards** — prevents re-processing of already-completed goals

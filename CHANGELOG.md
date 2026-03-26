@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Squash merge for feature branches** — `BrainRepoManager.MergeFeatureBranchAsync` now performs squash merges instead of standard merge commits:
+  - All commits from a feature branch are combined into a single commit on the base branch
+  - Commit message follows the format `Goal: {goalId} — {summary}` (e.g., `Goal: add-user-auth — Add user authentication with JWT tokens`)
+  - The `commitMessage` parameter was added to `MergeFeatureBranchAsync` signature for the squash commit message
+  - `GoalDispatcher.BuildSquashCommitMessage` helper builds the commit message from goal ID and description
+  - Subject line is truncated to 120 characters when needed; full description appears in commit body
+  - Handles empty squash results gracefully (logs and returns current HEAD)
+  - Merge conflict handling via `git merge --abort` continues to work correctly with `--squash`
+  - Includes 8 xUnit tests for `BuildSquashCommitMessage` covering short descriptions, long descriptions (truncation), multi-line descriptions, empty descriptions, and edge cases
+
 ### Added
 - **Reset Brain Session button** — Orchestrator dashboard page now includes a "Reset Brain Session" button in the Brain section:
   - Button appears only when the Brain is connected (stats available)
