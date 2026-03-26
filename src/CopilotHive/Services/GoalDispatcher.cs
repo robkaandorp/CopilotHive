@@ -1196,9 +1196,25 @@ public sealed class GoalDispatcher : BackgroundService
             // Brain session is loaded from file at startup (single persistent session),
             // so no per-goal re-priming is needed.
 
+            if (pipeline.Phase is GoalPhase.Done or GoalPhase.Failed)
+                continue;
+
+            // If the pipeline was mid-planning (no ActiveTaskId and at Planning/Merging phase),
+            // discard it and reset the goal so DispatchNextGoalAsync picks it up fresh.
+            if (pipeline.ActiveTaskId is null && pipeline.Phase is GoalPhase.Planning or GoalPhase.Merging)
+            {
+                _logger.LogInformation("Pipeline {GoalId} was mid-{Phase} — discarding stale pipeline for fresh dispatch",
+                    pipeline.GoalId, pipeline.Phase);
+
+                _pipelineManager.RemovePipeline(pipeline.GoalId);
+                _dispatchedGoals.TryRemove(pipeline.GoalId, out _);
+                await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Pending, null, ct);
+                continue;
+            }
+
             // If the pipeline was mid-task (has ActiveTaskId), the old worker is gone
             // after a restart. Clear the active task and enqueue for re-dispatch.
-            if (pipeline.ActiveTaskId is not null && pipeline.Phase is not (GoalPhase.Done or GoalPhase.Failed))
+            if (pipeline.ActiveTaskId is not null)
             {
                 _logger.LogInformation("Pipeline {GoalId} was mid-task ({TaskId}) — clearing stale task for re-dispatch",
                     pipeline.GoalId, pipeline.ActiveTaskId);
