@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Disabled during reset operation to prevent double-clicks
   - Resets the Brain's persistent `AgentSession`, clearing all conversation history
   - Deletes the persisted session file (`brain-session.json`)
-  - Rebuilds the `CodingAgent` with the original system prompt (including orchestrator instructions from `orchestrator.agents.md`)
+  - Rebuilds the `CodingAgent` with fresh system prompt — re-reads `orchestrator.agents.md` from disk so edits take effect immediately
   - Thread-safe via `_brainCallGate` semaphore
   - Dashboard stats update automatically after reset to show new session state
 - **Worker output persistence** — worker outputs are now captured and persist through goal completion:
