@@ -35,6 +35,10 @@ else
                 @((MarkupString)RenderMarkdown(GetActiveContent() ?? ""))
             </div>
         }
+        else if (ActiveTab?.Contains("hive-config.yaml") == true)
+        {
+            <pre class="yaml-highlighted"><code>@((MarkupString)HighlightYaml(GetActiveContent() ?? ""))</code></pre>
+        }
         else
         {
             <pre><code>@GetActiveContent()</code></pre>
@@ -102,6 +106,30 @@ else
 
     private static string RenderMarkdown(string content) =>
         Markdown.ToHtml(content, MarkdownPipeline);
+
+    private static string HighlightYaml(string content)
+    {
+        if (string.IsNullOrEmpty(content)) return "";
+        // Escape HTML first
+        content = System.Net.WebUtility.HtmlEncode(content);
+        // Comments (# ...) - muted color
+        content = System.Text.RegularExpressions.Regex.Replace(
+            content, @"(#.*)$", "<span class=\"yaml-comment\">$1</span>",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+        // Booleans (true/false, case-insensitive) - distinct color
+        content = System.Text.RegularExpressions.Regex.Replace(
+            content, @"\b(true|false)\b", "<span class=\"yaml-bool\">$1</span>",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        // Numbers - distinct color
+        content = System.Text.RegularExpressions.Regex.Replace(
+            content, @"\b(\d+\.?\d*)\b", "<span class=\"yaml-number\">$1</span>");
+        // Keys (before colon, not indented with -) - accent color
+        content = System.Text.RegularExpressions.Regex.Replace(
+            content, @"^(\s*)([a-zA-Z_][a-zA-Z0-9_-]*)\s*:",
+            "$1<span class=\"yaml-key\">$2</span>:",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+        return content;
+    }
 
     public void Dispose() { }
 }

@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **YAML syntax highlighting for hive-config.yaml on Configuration page** — the `hive-config.yaml` tab now renders with CSS-based syntax highlighting:
+  - `Configuration.razor` uses `@((MarkupString)HighlightYaml(content))` for YAML files
+  - Regex-based highlighting wraps keys, comments, booleans, and numbers in `<span>` elements with CSS classes
+  - Dark-theme CSS styling in `site.css` using existing variables: keys (`--accent`), comments (`--text-muted`), booleans (`#79c0ff`), numbers (`#f2cc60`)
+  - Agent `.md` files continue to render as Markdown (unchanged)
 - **Markdown rendering for agent files on Configuration page** — `.agents.md` files are now rendered as formatted HTML using Markdig (`UseAdvancedExtensions`) instead of plain text:
   - `Configuration.razor` detects `.md` files and renders them with `@((MarkupString)RenderMarkdown(content))`
   - Static `MarkdownPipeline` field using same pattern as `GoalDetail.razor` and `ComposerChat.razor`
