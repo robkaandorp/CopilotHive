@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Rebuilds the `CodingAgent` with fresh system prompt — re-reads `orchestrator.agents.md` from disk so edits take effect immediately
   - Thread-safe via `_brainCallGate` semaphore
   - Dashboard stats update automatically after reset to show new session state
+  - Includes 2 xUnit tests for `ResetSessionAsync` (reload from disk, without agents manager)
 - **Worker output persistence** — worker outputs are now captured and persist through goal completion:
   - `PhaseResult.WorkerOutput` property stores the raw worker output for each phase inline with its result
   - `IterationSummary.PhaseOutputs` dictionary keyed by `{role}-{iteration}` (e.g., "coder-1") stores all outputs for the iteration
