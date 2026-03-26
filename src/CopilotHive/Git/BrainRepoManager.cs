@@ -81,25 +81,28 @@ public sealed class BrainRepoManager
     }
 
     /// <summary>
-    /// Merges a feature branch into the default branch and pushes.
+    /// Squash-merges a feature branch into the default branch and pushes.
+    /// All commits from the feature branch are combined into a single commit on the base branch.
     /// Uses the persistent brain clone instead of creating a temporary directory.
     /// On failure, the clone is reset to the remote state.
     /// </summary>
     /// <param name="repoName">Repository name (must have been cloned via <see cref="EnsureCloneAsync"/>).</param>
     /// <param name="featureBranch">The feature branch to merge (e.g. "copilothive/add-logging").</param>
     /// <param name="defaultBranch">The base branch to merge into.</param>
+    /// <param name="commitMessage">The commit message for the resulting squash commit.</param>
     /// <param name="ct">Cancellation token.</param>
-    /// <returns>The full SHA-1 hash of the resulting merge commit on the default branch.</returns>
+    /// <returns>The full SHA-1 hash of the resulting squash commit on the default branch.</returns>
     /// <exception cref="InvalidOperationException">Thrown when the merge fails (after reset).</exception>
     public async Task<string> MergeFeatureBranchAsync(
-        string repoName, string featureBranch, string defaultBranch, CancellationToken ct = default)
+        string repoName, string featureBranch, string defaultBranch, string commitMessage,
+        CancellationToken ct = default)
     {
         var clonePath = GetClonePath(repoName);
         if (!Directory.Exists(Path.Combine(clonePath, ".git")))
             throw new InvalidOperationException(
                 $"No brain clone found for '{repoName}'. Call EnsureCloneAsync first.");
 
-        _logger.LogInformation("Merging {Branch} into {Base} for {Repo}",
+        _logger.LogInformation("Squash-merging {Branch} into {Base} for {Repo}",
             featureBranch, defaultBranch, repoName);
 
         // Ensure we're on the base branch with latest remote state
@@ -107,17 +110,17 @@ public sealed class BrainRepoManager
         await RunGitAsync(clonePath, ["checkout", defaultBranch], ct);
         await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct);
 
-        // Fetch the feature branch and attempt merge
+        // Fetch the feature branch and attempt squash merge
         await RunGitAsync(clonePath, ["fetch", "origin", featureBranch], ct);
 
         try
         {
             await RunGitAsync(clonePath,
-                ["merge", $"origin/{featureBranch}", "--no-edit"], ct);
+                ["merge", "--squash", $"origin/{featureBranch}"], ct);
         }
         catch (Exception mergeEx)
         {
-            _logger.LogWarning(mergeEx, "Merge failed for {Repo} — resetting clone to clean state", repoName);
+            _logger.LogWarning(mergeEx, "Squash merge failed for {Repo} — resetting clone to clean state", repoName);
 
             // Abort the merge and reset to clean state
             try { await RunGitAsync(clonePath, ["merge", "--abort"], ct); } catch { }
@@ -127,10 +130,26 @@ public sealed class BrainRepoManager
             throw;
         }
 
-        // Push the merge
+        // Check whether the squash produced any staged changes before committing
+        var statusResult = await RunGitWithOutputAsync(clonePath, ["status", "--porcelain"], ct);
+        if (string.IsNullOrWhiteSpace(statusResult))
+        {
+            _logger.LogInformation(
+                "Squash merge of {Branch} into {Base} for {Repo} produced no changes — skipping commit",
+                featureBranch, defaultBranch, repoName);
+
+            // Return the current HEAD since nothing new was committed
+            var currentHash = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct);
+            return currentHash.Trim();
+        }
+
+        // Commit the squashed changes as a single commit
+        await RunGitAsync(clonePath, ["commit", "-m", commitMessage], ct);
+
+        // Push the squash commit
         await RunGitAsync(clonePath, ["push", "origin", defaultBranch], ct);
 
-        _logger.LogInformation("Successfully merged {Branch} into {Base} for {Repo}",
+        _logger.LogInformation("Successfully squash-merged {Branch} into {Base} for {Repo}",
             featureBranch, defaultBranch, repoName);
 
         var hashResult = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct);

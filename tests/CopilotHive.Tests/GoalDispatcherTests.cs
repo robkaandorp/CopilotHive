@@ -758,6 +758,97 @@ public sealed class GoalDispatcherModelLoggingTests
 }
 
 /// <summary>
+/// Tests for <see cref="GoalDispatcher.BuildSquashCommitMessage"/> logic.
+/// </summary>
+public sealed class GoalDispatcherBuildSquashCommitMessageTests
+{
+    [Fact]
+    public void BuildSquashCommitMessage_ShortDescription_ReturnsSingleLineMessage()
+    {
+        var result = GoalDispatcher.BuildSquashCommitMessage("goal-123", "Add logging support");
+
+        Assert.Equal("Goal: goal-123 \u2014 Add logging support", result);
+    }
+
+    [Fact]
+    public void BuildSquashCommitMessage_SubjectStartsWithGoalIdAndEmdash()
+    {
+        var result = GoalDispatcher.BuildSquashCommitMessage("abc-42", "Fix the bug");
+
+        Assert.StartsWith("Goal: abc-42 \u2014", result);
+    }
+
+    [Fact]
+    public void BuildSquashCommitMessage_LongDescription_TruncatesSubjectTo120Chars()
+    {
+        var longDescription = new string('x', 200);
+
+        var result = GoalDispatcher.BuildSquashCommitMessage("goal-1", longDescription);
+
+        var subjectLine = result.Split('\n')[0];
+        Assert.True(subjectLine.Length <= 120,
+            $"Subject line length {subjectLine.Length} exceeds 120 characters: {subjectLine}");
+    }
+
+    [Fact]
+    public void BuildSquashCommitMessage_LongDescription_IncludesFullDescriptionInBody()
+    {
+        var longDescription = new string('x', 200);
+
+        var result = GoalDispatcher.BuildSquashCommitMessage("goal-1", longDescription);
+
+        Assert.Contains(longDescription.Trim(), result);
+    }
+
+    [Fact]
+    public void BuildSquashCommitMessage_MultiLineDescription_UsesOnlyFirstLineInSubject()
+    {
+        var description = "First line summary\nSecond line details\nThird line more details";
+
+        var result = GoalDispatcher.BuildSquashCommitMessage("goal-99", description);
+
+        var subjectLine = result.Split('\n')[0];
+        Assert.Contains("First line summary", subjectLine);
+        Assert.DoesNotContain("Second line", subjectLine);
+    }
+
+    [Fact]
+    public void BuildSquashCommitMessage_MultiLineDescription_IncludesFullBodyAfterBlankLine()
+    {
+        var description = "First line\nSecond line";
+
+        var result = GoalDispatcher.BuildSquashCommitMessage("goal-5", description);
+
+        // Subject + blank line + body
+        Assert.Contains("\n\n", result);
+        Assert.Contains("Second line", result);
+    }
+
+    [Fact]
+    public void BuildSquashCommitMessage_ExactlyAtLimit_ReturnsSingleLineMessage()
+    {
+        // Build a description such that "Goal: id — {desc}" is exactly 120 chars
+        var prefix = "Goal: id \u2014 ";
+        var descLength = 120 - prefix.Length;
+        var description = new string('a', descLength);
+
+        var result = GoalDispatcher.BuildSquashCommitMessage("id", description);
+
+        // Should be a single line (no body needed)
+        Assert.Equal($"Goal: id \u2014 {description}", result);
+        Assert.DoesNotContain("\n", result);
+    }
+
+    [Fact]
+    public void BuildSquashCommitMessage_EmptyDescription_HandledGracefully()
+    {
+        var result = GoalDispatcher.BuildSquashCommitMessage("goal-0", "");
+
+        Assert.StartsWith("Goal: goal-0 \u2014", result);
+    }
+}
+
+/// <summary>
 /// Collecting logger for verifying log output in tests.
 /// </summary>
 file sealed class CollectingLogger<T> : ILogger<T>

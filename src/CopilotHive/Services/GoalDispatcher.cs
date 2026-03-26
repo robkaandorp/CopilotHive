@@ -688,17 +688,18 @@ public sealed class GoalDispatcher : BackgroundService
         try
         {
             var repos = ResolveRepositories(pipeline.Goal);
+            var commitMessage = BuildSquashCommitMessage(pipeline.GoalId, pipeline.Description);
             foreach (var repo in repos)
             {
                 // Use the persistent brain clone — no temp dirs needed.
                 // After merge, the clone is already on the base branch with the latest code.
                 var mergeCommitHash = await _repoManager.MergeFeatureBranchAsync(
-                    repo.Name, pipeline.CoderBranch, repo.DefaultBranch, ct);
+                    repo.Name, pipeline.CoderBranch, repo.DefaultBranch, commitMessage, ct);
                 pipeline.MergeCommitHash = pipeline.MergeCommitHash is null
                     ? mergeCommitHash
                     : $"{pipeline.MergeCommitHash},{mergeCommitHash}";
 
-                _logger.LogInformation("Merged {Branch} into {Base} for {Repo} (commit={Hash})",
+                _logger.LogInformation("Squash-merged {Branch} into {Base} for {Repo} (commit={Hash})",
                     pipeline.CoderBranch, repo.DefaultBranch, repo.Name, mergeCommitHash);
             }
 
@@ -1483,5 +1484,35 @@ public sealed class GoalDispatcher : BackgroundService
             return url;
 
         return url.Replace("https://github.com/", $"https://x-access-token:{token}@github.com/");
+    }
+
+    /// <summary>
+    /// Builds a squash-merge commit message from a goal ID and description.
+    /// The first line is formatted as <c>Goal: {goalId} — {summary}</c> and truncated to 120 characters.
+    /// When the description exceeds the truncation limit, the full description is appended as the commit body.
+    /// </summary>
+    /// <param name="goalId">The goal identifier.</param>
+    /// <param name="description">The goal description (may be multi-line or very long).</param>
+    /// <returns>A commit message suitable for a squash merge commit.</returns>
+    internal static string BuildSquashCommitMessage(string goalId, string description)
+    {
+        const int MaxSummaryLength = 120;
+
+        // Use only the first line of the description as the summary
+        var firstLine = description.Split('\n', StringSplitOptions.None)[0].Trim();
+        var subject = $"Goal: {goalId} \u2014 {firstLine}";
+
+        if (subject.Length <= MaxSummaryLength && firstLine == description.Trim())
+        {
+            // Short single-line description — subject only
+            return subject;
+        }
+
+        // Truncate the subject line if needed
+        if (subject.Length > MaxSummaryLength)
+            subject = subject[..MaxSummaryLength];
+
+        // Append the full description as the commit body
+        return $"{subject}\n\n{description.Trim()}";
     }
 }
