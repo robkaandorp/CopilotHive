@@ -340,6 +340,69 @@ public sealed class GoalManagerDependencyTests
         Assert.True(debugLog != default,
             $"Expected debug log for blocked goal. Logs: {string.Join("; ", logger.Entries.Select(e => e.Message))}");
     }
+
+    // ── GetSourceForGoalAsync fallback Tests ────────────────────────────────
+
+    /// <summary>
+    /// When a goal transitions from Pending to InProgress, it's no longer in
+    /// GetPendingGoalsAsync results. Status updates (FailGoalAsync, CompleteGoalAsync)
+    /// must still find the goal's source by searching IGoalStore instances.
+    /// </summary>
+    [Fact]
+    public async Task FailGoalAsync_InProgressGoalNotInPendingCache_FindsViaStore()
+    {
+        var goal = new Goal { Id = "inflight-1", Description = "In-progress goal" };
+        var store = new DependencyTestGoalStore("store");
+        store.AddGoal(goal);
+
+        var manager = new GoalManager();
+        manager.AddSource(store);
+
+        // Simulate dispatch: move to InProgress without calling GetNextGoalAsync first
+        // (so _goalSourceMap is empty)
+        store.SetStatus("inflight-1", GoalStatus.InProgress);
+
+        // This used to throw KeyNotFoundException
+        await manager.FailGoalAsync("inflight-1", "timeout", ct: TestContext.Current.CancellationToken);
+
+        var updated = await store.GetGoalAsync("inflight-1", TestContext.Current.CancellationToken);
+        Assert.Equal(GoalStatus.Failed, updated!.Status);
+    }
+
+    [Fact]
+    public async Task CompleteGoalAsync_InProgressGoalNotInPendingCache_FindsViaStore()
+    {
+        var goal = new Goal { Id = "inflight-2", Description = "In-progress goal" };
+        var store = new DependencyTestGoalStore("store");
+        store.AddGoal(goal);
+
+        var manager = new GoalManager();
+        manager.AddSource(store);
+
+        store.SetStatus("inflight-2", GoalStatus.InProgress);
+
+        await manager.CompleteGoalAsync("inflight-2", ct: TestContext.Current.CancellationToken);
+
+        var updated = await store.GetGoalAsync("inflight-2", TestContext.Current.CancellationToken);
+        Assert.Equal(GoalStatus.Completed, updated!.Status);
+    }
+
+    [Fact]
+    public async Task UpdateGoalStatusAsync_GoalNeverPolled_FindsViaStore()
+    {
+        var goal = new Goal { Id = "never-polled", Description = "Goal added after startup" };
+        var store = new DependencyTestGoalStore("store");
+        store.AddGoal(goal);
+
+        var manager = new GoalManager();
+        manager.AddSource(store);
+
+        // Directly update without ever calling GetNextGoalAsync
+        await manager.UpdateGoalStatusAsync("never-polled", GoalStatus.Cancelled, ct: TestContext.Current.CancellationToken);
+
+        var updated = await store.GetGoalAsync("never-polled", TestContext.Current.CancellationToken);
+        Assert.Equal(GoalStatus.Cancelled, updated!.Status);
+    }
 }
 
 // ── Test helpers ─────────────────────────────────────────────────────────────

@@ -122,7 +122,7 @@ public sealed class GoalManager
     /// <param name="ct">Cancellation token.</param>
     public async Task CompleteGoalAsync(string goalId, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
     {
-        var source = GetSourceForGoal(goalId);
+        var source = await GetSourceForGoalAsync(goalId, ct);
         await source.UpdateGoalStatusAsync(goalId, GoalStatus.Completed, metadata, ct);
     }
 
@@ -138,7 +138,7 @@ public sealed class GoalManager
         var enriched = metadata is not null
             ? metadata with { FailureReason = reason }
             : new GoalUpdateMetadata { FailureReason = reason };
-        var source = GetSourceForGoal(goalId);
+        var source = await GetSourceForGoalAsync(goalId, ct);
         await source.UpdateGoalStatusAsync(goalId, GoalStatus.Failed, enriched, ct);
     }
 
@@ -151,7 +151,7 @@ public sealed class GoalManager
     /// <param name="ct">Cancellation token.</param>
     public async Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
     {
-        var source = GetSourceForGoal(goalId);
+        var source = await GetSourceForGoalAsync(goalId, ct);
         await source.UpdateGoalStatusAsync(goalId, status, metadata, ct);
     }
 
@@ -223,12 +223,31 @@ public sealed class GoalManager
         return unsatisfied;
     }
 
-    private IGoalSource GetSourceForGoal(string goalId)
+    private async Task<IGoalSource> GetSourceForGoalAsync(string goalId, CancellationToken ct = default)
     {
         lock (_lock)
         {
-            if (_goalSourceMap.TryGetValue(goalId, out var source))
-                return source;
+            if (_goalSourceMap.TryGetValue(goalId, out var cached))
+                return cached;
+        }
+
+        // Goal not in the pending-only cache. Search all IGoalStore sources
+        // (the goal may have moved to InProgress/Failed/Completed since the
+        // last GetPendingGoalsAsync poll).
+        List<IGoalSource> snapshot;
+        lock (_lock) { snapshot = [.. _sources]; }
+
+        foreach (var source in snapshot)
+        {
+            if (source is IGoalStore store)
+            {
+                var goal = await store.GetGoalAsync(goalId, ct);
+                if (goal is not null)
+                {
+                    lock (_lock) { _goalSourceMap.TryAdd(goalId, source); }
+                    return source;
+                }
+            }
         }
 
         throw new KeyNotFoundException($"Goal '{goalId}' not found in any source.");
