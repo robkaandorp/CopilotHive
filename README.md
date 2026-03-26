@@ -120,15 +120,20 @@ goals:
           - name: Coding
             result: pass
             duration_seconds: 60.0
+            worker_output: "Coder: Implemented feature X."
           - name: Testing
             result: fail
             duration_seconds: 20.5
+            worker_output: "Tester: 2 tests failed."
         test_counts:
           total: 10
           passed: 8
           failed: 2
         review_verdict: null
         notes: []
+        phase_outputs:
+          coder-1: "Coder: Implemented feature X."
+          tester-1: "Tester: 2 tests failed."
       - iteration: 2
         phases:
           - name: Coding

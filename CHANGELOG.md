@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Worker output persistence** — worker outputs are now captured and persist through goal completion:
+  - `PhaseResult.WorkerOutput` property stores the raw worker output for each phase inline with its result
+  - `IterationSummary.PhaseOutputs` dictionary keyed by `{role}-{iteration}` (e.g., "coder-1") stores all outputs for the iteration
+  - `GoalDispatcher.BuildIterationSummary()` populates `WorkerOutput` from live pipeline outputs and builds the `PhaseOutputs` dictionary
+  - `FileGoalSource` serializes worker outputs to YAML and round-trips them through `goals.yaml`
+  - `SqliteGoalStore` persists outputs via `phase_outputs_json` column with automatic schema migration
+  - `DashboardStateService.GetGoalDetail()` prefers persisted `PhaseResult.WorkerOutput` over live pipeline data, ensuring completed goals display output correctly
+  - Includes 15 xUnit tests for `PhaseResult.WorkerOutput` and `IterationSummary.PhaseOutputs` round-trip through SQLite, YAML, and the dashboard
+
+### Added
 - **Goal dependency visualization in dashboard** — Goals and Goal Detail pages now display dependency relationships:
   - `GoalDetail.razor` shows a "Dependencies" section listing each dependency goal ID as a clickable link with status indicator (✅ Completed, ⏳ Pending, 🔄 InProgress, ❌ Failed, ❓ Unknown)
   - `Goals.razor` shows a 🔗 icon for goals with all dependencies completed, or ⏳ icon if any dependency is unsatisfied
