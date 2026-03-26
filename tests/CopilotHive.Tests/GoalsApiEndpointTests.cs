@@ -249,6 +249,10 @@ public class GoalsApiEndpointTests : IClassFixture<HiveTestFactory>
     {
         var id = UniqueId();
         await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+        // Patch to Draft so deletion is allowed
+        await _client.PatchAsync($"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Draft" }, JsonOpts), Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
 
         var response = await _client.DeleteAsync($"/api/goals/{id}",
             TestContext.Current.CancellationToken);
@@ -263,6 +267,21 @@ public class GoalsApiEndpointTests : IClassFixture<HiveTestFactory>
             TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task DeleteGoal_PendingGoal_Returns400BadRequest()
+    {
+        var id = UniqueId();
+        // Default status is Pending
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        var response = await _client.DeleteAsync($"/api/goals/{id}",
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.Contains("Only Draft or Failed goals can be deleted", body);
     }
 
     // ── GET /api/goals/search ─────────────────────────────────────────────

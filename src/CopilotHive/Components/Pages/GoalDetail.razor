@@ -6,6 +6,8 @@
 @implements IDisposable
 @inject DashboardStateService State
 @inject IGoalStore GoalStore
+@inject IJSRuntime JS
+@inject NavigationManager Nav
 
 <h1>Goal: @GoalId</h1>
 
@@ -248,6 +250,14 @@
             </div>
         </details>
     }
+
+    @if (_detail.Status == GoalStatus.Draft || _detail.Status == GoalStatus.Failed)
+    {
+        <div style="margin-top:1.5rem">
+            <button style="background:var(--red);color:#fff;border:none;padding:0.4rem 1rem;border-radius:4px;cursor:pointer;font-size:0.9rem"
+                @onclick="DeleteCurrentGoal">🗑️ Delete Goal</button>
+        </div>
+    }
 }
 else if (_storedGoal is not null)
 {
@@ -404,6 +414,14 @@ else if (_storedGoal is not null)
             </div>
         </div>
     }
+
+    @if (_storedGoal.Status == GoalStatus.Draft || _storedGoal.Status == GoalStatus.Failed)
+    {
+        <div style="margin-top:1.5rem">
+            <button style="background:var(--red);color:#fff;border:none;padding:0.4rem 1rem;border-radius:4px;cursor:pointer;font-size:0.9rem"
+                @onclick="DeleteCurrentGoal">🗑️ Delete Goal</button>
+        </div>
+    }
 }
 else
 {
@@ -509,4 +527,13 @@ else
     }
 
     public void Dispose() => State.OnStateChanged -= RefreshState;
+
+    private async Task DeleteCurrentGoal()
+    {
+        var confirmed = await JS.InvokeAsync<bool>("confirm", $"Are you sure you want to delete goal '{GoalId}'?");
+        if (!confirmed) return;
+
+        await GoalStore.DeleteGoalAsync(GoalId);
+        Nav.NavigateTo("/goals");
+    }
 }
