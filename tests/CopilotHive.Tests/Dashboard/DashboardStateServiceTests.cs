@@ -493,26 +493,26 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: _store);
 
-        // NOTE: GetAllGoalsAsync() doesn't load IterationSummaries, but GetGoalAsync() does.
-        // GetGoalDetail uses GetSnapshot() which uses GetAllGoalsAsync(), so we need to
-        // verify that the goal from GetGoalAsync has the summaries loaded.
-        // The DashboardStateService should be using GetGoalAsync internally for detail views.
-        // Let's first verify the iteration is persisted correctly:
+        // Verify the iteration is persisted correctly in the store
         var storedGoal = await _store.GetGoalAsync("completed-goal", ct);
         Assert.NotNull(storedGoal);
         Assert.Single(storedGoal.IterationSummaries);
         Assert.Equal("Persisted coder output from database.", storedGoal.IterationSummaries[0].Phases[0].WorkerOutput);
 
-        // Now test GetGoalDetail - note: it uses GetAllGoalsAsync() which doesn't include summaries.
-        // This is a known limitation; the dashboard shows summaries from goal.IterationSummaries.
-        // For completed goals without an active pipeline, summaries come from the goal store.
+        // GetGoalDetail must load IterationSummaries from the store for completed goals
         var detail = service.GetGoalDetail("completed-goal");
 
         Assert.NotNull(detail);
-        // IterationSummaries are not loaded by GetAllGoalsAsync(), so iterations will be empty.
-        // This test documents the current behavior. If WorkerOutput is needed for completed
-        // goals in the dashboard, the goal store should be queried for the specific goal.
-        // The WorkerOutput persistence is tested separately via SqliteGoalStoreWorkerOutputTests.
+        Assert.Single(detail.Iterations);
+        var iteration = detail.Iterations[0];
+        Assert.Equal(1, iteration.Number);
+        Assert.Equal(2, iteration.Phases.Count);
+
+        var codingPhase = iteration.Phases.First(p => p.Name == "Coding");
+        Assert.Equal("Persisted coder output from database.", codingPhase.WorkerOutput);
+
+        var testingPhase = iteration.Phases.First(p => p.Name == "Testing");
+        Assert.Equal("All tests passed.", testingPhase.WorkerOutput);
     }
 
     /// <summary>
@@ -584,9 +584,17 @@ public sealed class DashboardStateServiceTests : IDisposable
         var detail = service.GetGoalDetail("prefers-persisted-goal");
 
         Assert.NotNull(detail);
-        // Pipeline's iteration 2 is active and shown as current iteration
-        // The persisted iteration 1 is not shown (GetAllGoalsAsync doesn't load summaries)
-        // This test verifies the pipeline lookup path works correctly
+
+        // Iteration 1 from persisted summaries should show the persisted WorkerOutput
+        var iteration1 = detail.Iterations.FirstOrDefault(i => i.Number == 1);
+        Assert.NotNull(iteration1);
+        var codingPhaseIter1 = iteration1.Phases.FirstOrDefault(p => p.Name == "Coding");
+        Assert.NotNull(codingPhaseIter1);
+        Assert.Equal("Persisted output (authoritative).", codingPhaseIter1.WorkerOutput);
+
+        // Iteration 2 from the live pipeline should be a separate iteration
+        var iteration2 = detail.Iterations.FirstOrDefault(i => i.Number == 2);
+        Assert.NotNull(iteration2);
     }
 
     /// <summary>

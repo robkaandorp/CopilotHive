@@ -181,6 +181,15 @@ public sealed class DashboardStateService : IDisposable
         if (goal is null)
             return null;
 
+        // GetSnapshot uses GetAllGoalsAsync which does NOT populate IterationSummaries.
+        // For the detail view we need the full goal with summaries loaded from the store.
+        if (goal.IterationSummaries.Count == 0 && _goalStore is not null)
+        {
+            var fullGoal = _goalStore.GetGoalAsync(goalId).GetAwaiter().GetResult();
+            if (fullGoal is not null)
+                goal = fullGoal;
+        }
+
         var pipeline = _pipelineManager.GetByGoalId(goalId);
         var progress = GetProgressForGoal(goalId);
         var iterations = new List<IterationViewInfo>();
@@ -551,7 +560,7 @@ public sealed class PhaseViewInfo
     public string? Verdict { get; init; }
     /// <summary>Wall-clock duration in seconds, if available.</summary>
     public double? DurationSeconds { get; init; }
-    /// <summary>Raw worker output from PhaseOutputs.</summary>
+    /// <summary>Worker output for the phase, preferring persisted PhaseResult.WorkerOutput when available, falling back to pipeline PhaseOutputs.</summary>
     public string? WorkerOutput { get; init; }
     /// <summary>Total tests discovered (Testing phase only).</summary>
     public int TotalTests { get; init; }
