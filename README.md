@@ -180,7 +180,7 @@ goals:
 - **Self-improvement loop** — the improver modifies `agents.md` based on accumulated metrics
 - **SQLite persistence** — `PipelineStore` with auto-migration for pipeline state; `SqliteGoalStore` as the primary source of truth for goals with full CRUD, search, and iteration history
 - **Goals REST API** — `GET/POST/PATCH/DELETE /api/goals`, `GET /api/goals/{id}`, `GET /api/goals/search?q=…&status=…`
-- **Dashboard** — Blazor Server UI with goals browser (filterable/searchable), goal detail with iteration timeline and dependency visualization, worker status, orchestrator view (Brain + Composer stats), live logs, and configuration; configuration page displays `hive-config.yaml` with YAML syntax highlighting (keys, comments, booleans, numbers)
+- **Dashboard** — Blazor Server UI with goals browser (filterable/searchable), goal detail with iteration timeline and dependency visualization, worker status, orchestrator view (Brain + Composer stats, with Reset Brain Session button), live logs, and configuration; configuration page displays `hive-config.yaml` with YAML syntax highlighting (keys, comments, booleans, numbers)
 - **Config repo** — externalized agent instructions and goals (`CopilotHive-Config`)
 - **Multi-repo goal support** — goals can target any accessible Git repository
 - **Per-role model selection** — assign different LLM models to each worker type

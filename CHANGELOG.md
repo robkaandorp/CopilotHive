@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Reset Brain Session button** — Orchestrator dashboard page now includes a "Reset Brain Session" button in the Brain section:
+  - Button appears only when the Brain is connected (stats available)
+  - Shows browser confirmation dialog with clear warning before resetting
+  - Disabled during reset operation to prevent double-clicks
+  - Resets the Brain's persistent `AgentSession`, clearing all conversation history
+  - Deletes the persisted session file (`brain-session.json`)
+  - Rebuilds the `CodingAgent` with the original system prompt (including orchestrator instructions from `orchestrator.agents.md`)
+  - Thread-safe via `_brainCallGate` semaphore
+  - Dashboard stats update automatically after reset to show new session state
 - **Worker output persistence** — worker outputs are now captured and persist through goal completion:
   - `PhaseResult.WorkerOutput` property stores the raw worker output for each phase inline with its result
   - `IterationSummary.PhaseOutputs` dictionary keyed by `{role}-{iteration}` (e.g., "coder-1") stores all outputs for the iteration
