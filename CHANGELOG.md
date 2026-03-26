@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Goal dependency visualization in dashboard** — Goals and Goal Detail pages now display dependency relationships:
+  - `GoalDetail.razor` shows a "Dependencies" section listing each dependency goal ID as a clickable link with status indicator (✅ Completed, ⏳ Pending, 🔄 InProgress, ❌ Failed, ❓ Unknown)
+  - `Goals.razor` shows a 🔗 icon for goals with all dependencies completed, or ⏳ icon if any dependency is unsatisfied
+  - Goals with no dependencies show no indicator in the list view and hide the Dependencies section in detail view
+  - Dependency status is fetched from `DashboardStateService` and `GoalStore` for real-time display
 - **YAML syntax highlighting for hive-config.yaml on Configuration page** — the `hive-config.yaml` tab now renders with CSS-based syntax highlighting:
   - `Configuration.razor` uses `@((MarkupString)HighlightYaml(content))` for YAML files
   - Regex-based highlighting wraps keys, comments, booleans, and numbers in `<span>` elements with CSS classes
