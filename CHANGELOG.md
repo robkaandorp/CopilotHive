@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Markdown rendering for agent files on Configuration page** — `.agents.md` files are now rendered as formatted HTML using Markdig (`UseAdvancedExtensions`) instead of plain text:
+  - `Configuration.razor` detects `.md` files and renders them with `@((MarkupString)RenderMarkdown(content))`
+  - Static `MarkdownPipeline` field using same pattern as `GoalDetail.razor` and `ComposerChat.razor`
+  - Dark-theme CSS styling in `site.css` for headings, lists, code blocks, links, and paragraphs (`.config-markdown` class)
+  - `hive-config.yaml` and other non-`.md` files continue to render as `<pre><code>` (unchanged)
+
 ### Changed
 - **Configuration page UI** — removed the `goals.yaml` tab from `Configuration.razor`; goals are now managed exclusively via the Goals page and API
 - **Global scrollbar styling** — extracted thin scrollbar CSS from `.chat-messages` in `site.css` and applied globally to all scrollable elements (config content, config tabs, composer chat, goal detail, goals list); uses consistent `rgba(110, 118, 129, 0.4)` color scheme across the dashboard
