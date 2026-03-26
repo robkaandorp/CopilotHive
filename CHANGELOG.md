@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Merge commit link in goal detail page** — completed goals now display their merge commit hash as a clickable GitHub link in the dashboard (`GoalDetail.razor`):
+  - Shows short hash (7 characters) with 🔗 prefix, e.g., "🔗 a1b2c3d"
+  - Links to `https://github.com/{owner}/{repo}/commit/{full-hash}` in a new tab
+  - Falls back to plain text when repository URL is unavailable
+  - `.git` suffix is automatically stripped from repository URLs
+  - Appears in both active-pipeline view and stored-goal fallback view
+  - `GoalDetailInfo.RepositoryUrl` property added to expose the resolved repository URL (with 8 xUnit tests for `GetRepositoryUrl`)
 - **Goal approval from dashboard UI** — goals in Draft status can now be approved (scheduled) directly from the Goals Browser, transitioning their status from Draft to Pending:
   - **Goals list view (`Goals.razor`)** — added "Actions" column with an "▶ Approve" button for goals with `Draft` status; clicking calls `PATCH /api/goals/{id}/status` with `{ "status": "Pending" }` and immediately updates the UI without page reload; inline error messages displayed on failure
   - **Goal detail view (`GoalDetail.razor`)** — added "▶ Approve" button in the header, positioned to the right of the goal title, only visible for Draft goals; same PATCH API call and immediate UI refresh behavior; button disappears after successful approval
