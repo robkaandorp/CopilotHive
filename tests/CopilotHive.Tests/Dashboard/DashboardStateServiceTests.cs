@@ -1,3 +1,4 @@
+using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Goals;
 using CopilotHive.Services;
@@ -239,5 +240,175 @@ public sealed class DashboardStateServiceTests : IDisposable
         };
 
         Assert.Equal("deadbeef1234", detail.MergeCommitHash);
+    }
+
+    // ── RepositoryUrl / GetRepositoryUrl ─────────────────────────────────
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetRepositoryUrl"/> strips the
+    /// <c>.git</c> suffix from a repository URL.
+    /// </summary>
+    [Fact]
+    public void GetRepositoryUrl_StripsGitSuffix_WhenPresent()
+    {
+        var config = new HiveConfigFile
+        {
+            Repositories = [new RepositoryConfig { Name = "my-repo", Url = "https://github.com/org/my-repo.git" }],
+        };
+
+        var goal = new Goal { Id = "g1", Description = "desc", RepositoryNames = ["my-repo"] };
+
+        using var service = BuildService(config: config);
+        var url = service.GetRepositoryUrl(goal);
+
+        Assert.Equal("https://github.com/org/my-repo", url);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetRepositoryUrl"/> returns
+    /// the URL unchanged when it does not end with <c>.git</c>.
+    /// </summary>
+    [Fact]
+    public void GetRepositoryUrl_NoGitSuffix_ReturnsUrlUnchanged()
+    {
+        var config = new HiveConfigFile
+        {
+            Repositories = [new RepositoryConfig { Name = "my-repo", Url = "https://github.com/org/my-repo" }],
+        };
+
+        var goal = new Goal { Id = "g2", Description = "desc", RepositoryNames = ["my-repo"] };
+
+        using var service = BuildService(config: config);
+        var url = service.GetRepositoryUrl(goal);
+
+        Assert.Equal("https://github.com/org/my-repo", url);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetRepositoryUrl"/> returns
+    /// <c>null</c> when the goal has no repository names.
+    /// </summary>
+    [Fact]
+    public void GetRepositoryUrl_NoRepositoryNames_ReturnsNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Repositories = [new RepositoryConfig { Name = "my-repo", Url = "https://github.com/org/my-repo.git" }],
+        };
+
+        var goal = new Goal { Id = "g3", Description = "desc" };
+
+        using var service = BuildService(config: config);
+        var url = service.GetRepositoryUrl(goal);
+
+        Assert.Null(url);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetRepositoryUrl"/> returns
+    /// <c>null</c> when the goal's repository name is not found in config.
+    /// </summary>
+    [Fact]
+    public void GetRepositoryUrl_UnknownRepoName_ReturnsNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Repositories = [new RepositoryConfig { Name = "known-repo", Url = "https://github.com/org/known-repo.git" }],
+        };
+
+        var goal = new Goal { Id = "g4", Description = "desc", RepositoryNames = ["unknown-repo"] };
+
+        using var service = BuildService(config: config);
+        var url = service.GetRepositoryUrl(goal);
+
+        Assert.Null(url);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetRepositoryUrl"/> returns
+    /// <c>null</c> when no config is provided.
+    /// </summary>
+    [Fact]
+    public void GetRepositoryUrl_NullConfig_ReturnsNull()
+    {
+        var goal = new Goal { Id = "g5", Description = "desc", RepositoryNames = ["my-repo"] };
+
+        using var service = BuildService(config: null);
+        var url = service.GetRepositoryUrl(goal);
+
+        Assert.Null(url);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="GoalDetailInfo.RepositoryUrl"/> is populated from
+    /// the hive config when a stored goal has a matching repository name.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_PopulatesRepositoryUrl_FromConfig()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var config = new HiveConfigFile
+        {
+            Repositories = [new RepositoryConfig { Name = "target-repo", Url = "https://github.com/org/target-repo.git" }],
+        };
+
+        var goal = new Goal
+        {
+            Id = "repo-url-goal",
+            Description = "Goal with repository",
+            RepositoryNames = ["target-repo"],
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        using var service = BuildService(config: config);
+
+        var detail = service.GetGoalDetail("repo-url-goal");
+
+        Assert.NotNull(detail);
+        Assert.Equal("https://github.com/org/target-repo", detail.RepositoryUrl);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="GoalDetailInfo.RepositoryUrl"/> is <c>null</c>
+    /// when no config is provided to the service.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_RepositoryUrl_NullWhenNoConfig()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "no-config-goal",
+            Description = "Goal without config",
+            RepositoryNames = ["some-repo"],
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        using var service = BuildService(config: null);
+
+        var detail = service.GetGoalDetail("no-config-goal");
+
+        Assert.NotNull(detail);
+        Assert.Null(detail.RepositoryUrl);
+    }
+
+    /// <summary>
+    /// Helper that constructs a <see cref="DashboardStateService"/> with the given
+    /// optional config and an in-memory SQLite goal store.
+    /// </summary>
+    private DashboardStateService BuildService(HiveConfigFile? config)
+    {
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        return new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store, config: config);
     }
 }

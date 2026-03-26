@@ -54,6 +54,21 @@
             {
                 <span style="margin-left:1rem">Task: <code>@Truncate(_detail.ActiveTaskId, 20)</code></span>
             }
+            @if (!string.IsNullOrEmpty(_detail.MergeCommitHash))
+            {
+                var shortHash = _detail.MergeCommitHash[..7];
+                @if (!string.IsNullOrEmpty(_detail.RepositoryUrl))
+                {
+                    var commitUrl = $"{_detail.RepositoryUrl}/commit/{_detail.MergeCommitHash}";
+                    <span style="margin-left:1rem;display:inline-flex;align-items:center;gap:0.5rem;">
+                        🔗 <a href="@commitUrl" target="_blank" style="font-family:monospace;color:var(--accent)">@shortHash</a>
+                    </span>
+                }
+                else
+                {
+                    <span style="margin-left:1rem;font-family:monospace;font-size:0.85rem;color:var(--accent)">🔗 @shortHash</span>
+                }
+            }
         </div>
     </div>
 
@@ -295,6 +310,22 @@ else if (_storedGoal is not null)
                 <span style="margin-left:1rem">Completed: @_storedGoal.CompletedAt.Value.ToString("yyyy-MM-dd HH:mm:ss") UTC</span>
             }
         </div>
+        @if (!string.IsNullOrEmpty(_storedGoal.MergeCommitHash))
+        {
+            var shortHash = _storedGoal.MergeCommitHash[..7];
+            var storedRepoUrl = State.GetRepositoryUrl(_storedGoal);
+            @if (!string.IsNullOrEmpty(storedRepoUrl))
+            {
+                var commitUrl = $"{storedRepoUrl}/commit/{_storedGoal.MergeCommitHash}";
+                <div style="margin-top:0.25rem;font-size:0.8rem;display:inline-flex;align-items:center;gap:0.5rem;">
+                    🔗 <a href="@commitUrl" target="_blank" style="font-family:monospace;color:var(--accent)">@shortHash</a>
+                </div>
+            }
+            else
+            {
+                <div style="margin-top:0.25rem;font-size:0.8rem;font-family:monospace;color:var(--accent)">🔗 @shortHash</div>
+            }
+        }
         @if (_storedGoal.TotalDurationSeconds.HasValue)
         {
             <div style="margin-top:0.25rem;font-size:0.8rem;color:var(--text-muted)">
