@@ -171,7 +171,7 @@ else
     private static string FormatStreamingContent(string content)
     {
         if (string.IsNullOrEmpty(content)) return "";
-        return System.Net.WebUtility.HtmlEncode(content).Replace("\n", "<br />");
+        return Markdown.ToHtml(content, MarkdownPipeline);
     }
 
     public void Dispose()
