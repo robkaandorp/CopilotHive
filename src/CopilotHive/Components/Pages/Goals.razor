@@ -41,7 +41,7 @@
                 <th>Iterations</th>
                 <th>Duration</th>
                 <th>Created</th>
-                <th></th>
+                <th>Actions</th>
             </tr>
         </thead>
         <tbody>
@@ -67,7 +67,15 @@
                     <td>@(g.Iterations?.ToString() ?? "—")</td>
                     <td style="color:var(--text-muted);white-space:nowrap">@FormatDuration(g)</td>
                     <td style="color:var(--text-muted);white-space:nowrap">@g.CreatedAt.ToString("yyyy-MM-dd HH:mm")</td>
-                    <td style="white-space:nowrap">
+                    <td style="text-align:center">
+                        @if (g.Status == GoalStatus.Draft)
+                        {
+                            <button class="approve-btn" @onclick="() => ApproveGoal(g.Id)">▶ Approve</button>
+                            @if (_approveErrors.ContainsKey(g.Id))
+                            {
+                                <span class="error-msg">@_approveErrors[g.Id]</span>
+                            }
+                        }
                         @if (g.Status == GoalStatus.Draft || g.Status == GoalStatus.Failed)
                         {
                             <button title="Delete goal" style="background:none;border:none;cursor:pointer;font-size:1rem;color:var(--red)"
@@ -91,6 +99,7 @@ else if (_loaded)
     private string _statusFilter = "";
     private string _priorityFilter = "";
     private bool _loaded;
+    private Dictionary<string, string> _approveErrors = new();
 
     protected override async Task OnInitializedAsync()
     {
@@ -179,6 +188,28 @@ else if (_loaded)
         {
             _allGoals.RemoveAll(g => g.Id == goalId);
             ApplyFilters();
+        }
+    }
+
+    private async Task ApproveGoal(string goalId)
+    {
+        _approveErrors.Remove(goalId);
+        var body = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new { status = "Pending" }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+        var response = await HttpClient.PatchAsync($"/api/goals/{goalId}/status", body);
+        if (response.IsSuccessStatusCode)
+        {
+            var goal = _allGoals.FirstOrDefault(g => g.Id == goalId);
+            if (goal is not null)
+                goal.Status = GoalStatus.Pending;
+            ApplyFilters();
+        }
+        else
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            _approveErrors[goalId] = $"Error {(int)response.StatusCode}: {errorContent}";
         }
     }
 }
