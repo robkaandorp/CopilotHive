@@ -323,7 +323,36 @@ public sealed class DashboardStateService : IDisposable
             Iterations = iterations,
             Conversation = pipeline?.Conversation.ToList() ?? [],
             MergeCommitHash = pipeline?.MergeCommitHash ?? goal.MergeCommitHash,
+            RepositoryUrl = ResolveRepositoryUrl(goal),
         };
+    }
+
+    private string? ResolveRepositoryUrl(Goal goal) => GetRepositoryUrl(goal);
+
+    /// <summary>
+    /// Resolves the URL of the first repository associated with a goal,
+    /// stripping any <c>.git</c> suffix. Returns <c>null</c> if the goal has no
+    /// repository names or the repository is not found in the configuration.
+    /// </summary>
+    /// <param name="goal">The goal whose primary repository URL is needed.</param>
+    /// <returns>The repository base URL, or <c>null</c> if unavailable.</returns>
+    public string? GetRepositoryUrl(Goal goal)
+    {
+        if (_config is null || goal.RepositoryNames.Count == 0)
+            return null;
+
+        var firstName = goal.RepositoryNames[0];
+        var repoConfig = _config.Repositories.FirstOrDefault(r =>
+            string.Equals(r.Name, firstName, StringComparison.OrdinalIgnoreCase));
+
+        if (repoConfig is null)
+            return null;
+
+        var url = repoConfig.Url;
+        if (url.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
+            url = url[..^4];
+
+        return url;
     }
 
     private static string PhaseNameToRoleName(string phaseName) => phaseName switch
@@ -491,6 +520,8 @@ public sealed class GoalDetailInfo
     public List<ConversationEntry> Conversation { get; init; } = [];
     /// <summary>SHA-1 hash of the merge commit that landed this goal's changes, or <c>null</c> if not yet merged.</summary>
     public string? MergeCommitHash { get; init; }
+    /// <summary>URL of the primary repository for this goal (with .git suffix removed), or <c>null</c> if not resolved.</summary>
+    public string? RepositoryUrl { get; init; }
 }
 
 /// <summary>Detail for a single iteration in the goal timeline.</summary>
