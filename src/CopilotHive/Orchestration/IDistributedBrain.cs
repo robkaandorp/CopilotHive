@@ -48,9 +48,9 @@ public interface IDistributedBrain
     BrainStats? GetStats();
 
     /// <summary>
-    /// Resets the Brain's conversation session, creating a fresh <see cref="SharpCoder.AgentSession"/>
-    /// and deleting the persisted session file. Thread-safe via the Brain call gate.
-    /// The system prompt (including orchestrator instructions) is preserved from construction.
+    /// Resets the Brain session by reloading orchestrator instructions from disk,
+    /// clearing message history, and creating a fresh <see cref="SharpCoder.AgentSession"/>.
+    /// Also deletes the persisted session file. Thread-safe via the Brain call gate.
     /// </summary>
     Task ResetSessionAsync(CancellationToken ct = default);
 }

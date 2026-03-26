@@ -400,28 +400,33 @@ public sealed class DistributedBrainTests
 
             // Write initial orchestrator instructions
             var orchestratorFile = agentsManager.GetAgentsMdPath(WorkerRole.Orchestrator);
-            File.WriteAllText(orchestratorFile, "Initial instructions");
+            File.WriteAllText(orchestratorFile, "INITIAL_INSTRUCTIONS_CONTENT");
 
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
                 agentsManager: agentsManager, stateDir: tempStateDir);
 
-            // Save session so there's a file to delete
-            await brain.SaveSessionAsync(TestContext.Current.CancellationToken);
-            var sessionFile = Path.Combine(tempStateDir, "brain-session.json");
-            Assert.True(File.Exists(sessionFile));
+            // Verify _systemPrompt contains the initial instructions after construction
+            var systemPromptField = typeof(DistributedBrain)
+                .GetField("_systemPrompt", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var initialPrompt = (string)systemPromptField.GetValue(brain)!;
+            Assert.Contains("INITIAL_INSTRUCTIONS_CONTENT", initialPrompt);
 
-            // Now update the orchestrator instructions on disk (simulating a change during the session)
-            File.WriteAllText(orchestratorFile, "Updated fresh instructions from disk");
+            // Update the orchestrator instructions on disk (simulating a change during the session)
+            File.WriteAllText(orchestratorFile, "UPDATED_FRESH_INSTRUCTIONS_FROM_DISK");
 
-            // Reset requires a connected brain (RecreateAgent needs _chatClient).
-            // Without a real LLM we can only verify the exception is thrown,
-            // confirming the method reaches RecreateAgent after rebuilding the prompt.
-            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            // ResetSessionAsync should reload from disk and update _systemPrompt
+            // before calling RecreateAgent. The InvalidOperationException is thrown by
+            // RecreateAgent because there's no real chat client — but _systemPrompt
+            // must already have been updated at that point.
+            await Assert.ThrowsAsync<InvalidOperationException>(
                 () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
-            Assert.Contains("Call ConnectAsync first", ex.Message);
 
-            // Session file should still exist because the exception interrupted before deletion
-            // (RecreateAgent is called before file deletion)
+            // Verify _systemPrompt now contains the NEW content, not the original.
+            // This test fails with the buggy implementation (stale _systemPrompt from construction)
+            // and passes with the fix (which reloads from disk inside ResetSessionAsync).
+            var updatedPrompt = (string)systemPromptField.GetValue(brain)!;
+            Assert.Contains("UPDATED_FRESH_INSTRUCTIONS_FROM_DISK", updatedPrompt);
+            Assert.DoesNotContain("INITIAL_INSTRUCTIONS_CONTENT", updatedPrompt);
         }
         finally
         {
