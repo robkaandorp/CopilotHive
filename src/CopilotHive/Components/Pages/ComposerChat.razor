@@ -159,6 +159,7 @@ else
 
     private static readonly MarkdownPipeline MarkdownPipeline = new MarkdownPipelineBuilder()
         .UseAdvancedExtensions()
+        .DisableHtml()
         .Build();
 
     private static string FormatContent(string content)

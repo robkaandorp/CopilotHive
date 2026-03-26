@@ -97,6 +97,7 @@ else
 
     private static readonly MarkdownPipeline MarkdownPipeline = new MarkdownPipelineBuilder()
         .UseAdvancedExtensions()
+        .DisableHtml()
         .Build();
 
     private static string RenderMarkdown(string content) =>

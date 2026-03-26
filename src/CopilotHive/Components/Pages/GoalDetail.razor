@@ -565,6 +565,7 @@ else
 
     private static readonly MarkdownPipeline MdPipeline = new MarkdownPipelineBuilder()
         .UseAdvancedExtensions()
+        .DisableHtml()
         .Build();
 
     private static string RenderMarkdown(string content)
