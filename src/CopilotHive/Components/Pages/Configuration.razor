@@ -114,7 +114,8 @@ else
         content = System.Net.WebUtility.HtmlEncode(content);
         // Comments (# ...) - muted color
         content = System.Text.RegularExpressions.Regex.Replace(
-            content, @"(&lt;#.*)", "<span class=\"yaml-comment\">$1</span>");
+            content, @"(#.*)$", "<span class=\"yaml-comment\">$1</span>",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
         // Booleans (true/false, case-insensitive) - distinct color
         content = System.Text.RegularExpressions.Regex.Replace(
             content, @"\b(true|false)\b", "<span class=\"yaml-bool\">$1</span>",
