@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Goal approval from dashboard UI** — goals in Draft status can now be approved (scheduled) directly from the Goals Browser, transitioning their status from Draft to Pending:
+  - **Goals list view (`Goals.razor`)** — added "Actions" column with an "▶ Approve" button for goals with `Draft` status; clicking calls `PATCH /api/goals/{id}/status` with `{ "status": "Pending" }` and immediately updates the UI without page reload; inline error messages displayed on failure
+  - **Goal detail view (`GoalDetail.razor`)** — added "▶ Approve" button in the header, positioned to the right of the goal title, only visible for Draft goals; same PATCH API call and immediate UI refresh behavior; button disappears after successful approval
 - **Goal deletion from dashboard UI** — goals in Draft or Failed status can now be deleted directly from the Goals Browser:
   - **Goals list view (`Goals.razor`)** — added 🗑️ trash can icon button on each row for goals with `Draft` or `Failed` status; clicking shows a browser confirmation dialog ("Are you sure you want to delete goal '{id}'?") and refreshes the list on confirm
   - **Goal detail view (`GoalDetail.razor`)** — added red-styled "🗑️ Delete Goal" button at the bottom of the detail page, only visible for Draft or Failed goals; shows the same confirmation dialog and navigates back to the goals list on successful deletion
