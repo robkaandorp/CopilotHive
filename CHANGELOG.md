@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Configuration page UI** — removed the `goals.yaml` tab from `Configuration.razor`; goals are now managed exclusively via the Goals page and API
+- **Global scrollbar styling** — extracted thin scrollbar CSS from `.chat-messages` in `site.css` and applied globally to all scrollable elements (config content, config tabs, composer chat, goal detail, goals list); uses consistent `rgba(110, 118, 129, 0.4)` color scheme across the dashboard
+
 ### Added
 - **Merge commit link in goal detail page** — completed goals now display their merge commit hash as a clickable GitHub link in the dashboard (`GoalDetail.razor`):
   - Shows short hash (7 characters) with 🔗 prefix, e.g., "🔗 a1b2c3d"
