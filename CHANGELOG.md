@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Goal deletion from dashboard UI** — goals in Draft or Failed status can now be deleted directly from the Goals Browser:
+  - **Goals list view (`Goals.razor`)** — added 🗑️ trash can icon button on each row for goals with `Draft` or `Failed` status; clicking shows a browser confirmation dialog ("Are you sure you want to delete goal '{id}'?") and refreshes the list on confirm
+  - **Goal detail view (`GoalDetail.razor`)** — added red-styled "🗑️ Delete Goal" button at the bottom of the detail page, only visible for Draft or Failed goals; shows the same confirmation dialog and navigates back to the goals list on successful deletion
 - **Goals API error handling** — `POST /api/goals` endpoint now properly handles `ArgumentException` (invalid goal ID format) with 400 Bad Request and `SqliteException` with constraint violation (duplicate ID) with 409 Conflict, instead of returning 500 Internal Server Error
 - **Goals API integration tests** — `GoalsApiEndpointTests` class with 20 xUnit tests covering all Goals REST API endpoints (`GET /api/goals`, `POST /api/goals`, `GET /api/goals/{id}`, `PATCH /api/goals/{id}/status`, `DELETE /api/goals/{id}`, `GET /api/goals/search`); tests verify HTTP status codes, response bodies, error handling, and end-to-end integration with `HiveTestFactory`
 
@@ -176,6 +179,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Coverage collection switched from `coverlet.msbuild` to `--collect:"XPlat Code Coverage"` collector approach (resolves package conflict)
 
 ### Fixed
+- **DELETE `/api/goals/{id}` endpoint validation** — endpoint now returns `400 Bad Request` with message "Only Draft or Failed goals can be deleted" when attempting to delete goals with statuses other than Draft or Failed (previously allowed deletion regardless of status, which was inconsistent with `Composer.DeleteGoalAsync` restrictions); `404 Not Found` returned when goal does not exist; includes 1 xUnit test (`DeleteGoal_PendingGoal_Returns400BadRequest`)
 - Duplicate "Improve" phase entries in `BuildIterationSummary()` — when `ImproverSkipped=true` and PhaseDurations already contained an "Improve" entry, the summary would produce two entries for the same phase; now explicitly removes any existing "Improve" entry before appending the skipped one
 - Null `Result` field in `PhaseResultEntry` from YAML now throws `InvalidOperationException` instead of silently defaulting to `"pass"`, consistent with codebase convention of no silent fallbacks (treats null Result like null Id)
 - Root cause of coder no-ops — Brain was generating `git checkout -b feature/...` commands in coder prompts, causing coders to commit on wrong branches; TaskExecutor then detected 0 changes on the infrastructure branch
