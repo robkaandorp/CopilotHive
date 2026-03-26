@@ -174,8 +174,8 @@ goals:
 - **Worker utilization metrics** — `GET /health/utilization` endpoint provides per-role worker utilization and bottleneck detection
 - **Self-improvement loop** — the improver modifies `agents.md` based on accumulated metrics
 - **SQLite persistence** — `PipelineStore` with auto-migration for pipeline state; `SqliteGoalStore` as the primary source of truth for goals with full CRUD, search, and iteration history
-- **Goals REST API** — `GET/POST/PATCH/DELETE /api/goals`, `GET /api/goals/{id}`, `GET /api/goals/search?q=…&status=…`
-- **Dashboard** — Blazor Server UI with goals browser (filterable/searchable), goal detail with iteration timeline, worker status, orchestrator view (Brain + Composer stats), live logs, and configuration
+- **Goals REST API** — `GET/POST/PATCH/DELETE /api/goals`, `GET /api/goals/{id}`, `GET /api/goals/search?q=…&status=…`; `DELETE /api/goals/{id}` enforces that only Draft or Failed goals can be deleted
+- **Dashboard** — Blazor Server UI with goals browser (filterable/searchable), goal detail with iteration timeline, worker status, orchestrator view (Brain + Composer stats), live logs, and configuration; goals in **Draft** or **Failed** status can be deleted directly from the goals list (🗑️ icon) or detail view with confirmation prompts
 - **Config repo** — externalized agent instructions and goals (`CopilotHive-Config`)
 - **Multi-repo goal support** — goals can target any accessible Git repository
 - **Per-role model selection** — assign different LLM models to each worker type
