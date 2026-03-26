@@ -20,6 +20,10 @@ public sealed class WorkerLogger(string category)
     public void Error(string message) =>
         Console.Error.WriteLine($"[{category}] ERROR: {message}");
 
+    /// <summary>Logs a warning message (always visible).</summary>
+    public void Warn(string message) =>
+        Console.WriteLine($"[{category}] WARN: {message}");
+
     /// <summary>Logs a debug message (only visible when VERBOSE_LOGGING=true).</summary>
     public void Debug(string message)
     {

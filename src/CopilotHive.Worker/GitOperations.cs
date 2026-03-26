@@ -11,31 +11,38 @@ public static class GitOperations
 {
     /// <summary>
     /// Clones a remote repository into the specified target directory.
+    /// Throws <see cref="GitOperationException"/> on failure.
     /// </summary>
     /// <param name="url">Remote URL of the repository to clone.</param>
     /// <param name="targetDir">Local path where the repository will be cloned.</param>
     /// <param name="ct">Cancellation token.</param>
     public static async Task CloneRepositoryAsync(string url, string targetDir, CancellationToken ct)
     {
-        await RunGitCommandAsync(
+        var (exitCode, _, stderr) = await RunGitCommandAsync(
             Path.GetDirectoryName(targetDir) ?? ".",
             $"clone {url} {Path.GetFileName(targetDir)}",
             ct);
+        if (exitCode != 0)
+            throw new GitOperationException($"Failed to clone '{url}': {stderr.Trim()}");
     }
 
     /// <summary>
     /// Checks out an existing branch in the specified repository directory.
+    /// Throws <see cref="GitOperationException"/> if the branch does not exist.
     /// </summary>
     /// <param name="repoDir">Path to the local git repository.</param>
     /// <param name="branch">Name of the branch to check out.</param>
     /// <param name="ct">Cancellation token.</param>
     public static async Task CheckoutBranchAsync(string repoDir, string branch, CancellationToken ct)
     {
-        await RunGitCommandAsync(repoDir, $"checkout {branch}", ct);
+        var (exitCode, _, stderr) = await RunGitCommandAsync(repoDir, $"checkout {branch}", ct);
+        if (exitCode != 0)
+            throw new GitOperationException($"Failed to checkout branch '{branch}': {stderr.Trim()}");
     }
 
     /// <summary>
     /// Creates a new branch from the given base branch.
+    /// Throws <see cref="GitOperationException"/> on failure.
     /// </summary>
     /// <param name="repoDir">Path to the local git repository.</param>
     /// <param name="branchName">Name of the new branch to create.</param>
@@ -44,19 +51,27 @@ public static class GitOperations
     public static async Task CreateBranchAsync(
         string repoDir, string branchName, string baseBranch, CancellationToken ct)
     {
-        await RunGitCommandAsync(repoDir, $"checkout {baseBranch}", ct);
-        await RunGitCommandAsync(repoDir, $"checkout -b {branchName}", ct);
+        var (exitCode1, _, stderr1) = await RunGitCommandAsync(repoDir, $"checkout {baseBranch}", ct);
+        if (exitCode1 != 0)
+            throw new GitOperationException($"Failed to checkout base branch '{baseBranch}': {stderr1.Trim()}");
+
+        var (exitCode2, _, stderr2) = await RunGitCommandAsync(repoDir, $"checkout -b {branchName}", ct);
+        if (exitCode2 != 0)
+            throw new GitOperationException($"Failed to create branch '{branchName}': {stderr2.Trim()}");
     }
 
     /// <summary>
     /// Force-pushes the specified branch to the remote origin.
+    /// Throws <see cref="GitOperationException"/> on failure.
     /// </summary>
     /// <param name="repoDir">Path to the local git repository.</param>
     /// <param name="branch">Name of the branch to push.</param>
     /// <param name="ct">Cancellation token.</param>
     public static async Task PushBranchAsync(string repoDir, string branch, CancellationToken ct)
     {
-        await RunGitCommandAsync(repoDir, $"push origin {branch} --force", ct);
+        var (exitCode, _, stderr) = await RunGitCommandAsync(repoDir, $"push origin {branch} --force", ct);
+        if (exitCode != 0)
+            throw new GitOperationException($"Failed to push branch '{branch}': {stderr.Trim()}");
     }
 
     /// <summary>
@@ -187,3 +202,8 @@ public static class GitOperations
         }
     }
 }
+
+/// <summary>
+/// Exception thrown when a git CLI command fails.
+/// </summary>
+public sealed class GitOperationException(string message) : Exception(message);

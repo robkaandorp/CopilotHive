@@ -56,19 +56,28 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
                     // Handle branch operations
                     if (task.BranchInfo is { } branchInfo && !string.IsNullOrEmpty(branchInfo.FeatureBranch))
                     {
+                        var baseBranch = string.IsNullOrEmpty(branchInfo.BaseBranch)
+                            ? repo.DefaultBranch
+                            : branchInfo.BaseBranch;
+
                         switch (branchInfo.Action)
                         {
                             case BranchAction.Create:
-                                var baseBranch = string.IsNullOrEmpty(branchInfo.BaseBranch)
-                                    ? repo.DefaultBranch
-                                    : branchInfo.BaseBranch;
                                 _log.Info($"Creating branch {branchInfo.FeatureBranch} from {baseBranch}");
                                 await GitOperations.CreateBranchAsync(targetDir, branchInfo.FeatureBranch, baseBranch, ct);
                                 break;
 
                             case BranchAction.Checkout:
-                                _log.Info($"Checking out branch {branchInfo.FeatureBranch}");
-                                await GitOperations.CheckoutBranchAsync(targetDir, branchInfo.FeatureBranch, ct);
+                                try
+                                {
+                                    _log.Info($"Checking out branch {branchInfo.FeatureBranch}");
+                                    await GitOperations.CheckoutBranchAsync(targetDir, branchInfo.FeatureBranch, ct);
+                                }
+                                catch (GitOperationException ex)
+                                {
+                                    _log.Warn($"Checkout failed ({ex.Message}), creating branch from {baseBranch}");
+                                    await GitOperations.CreateBranchAsync(targetDir, branchInfo.FeatureBranch, baseBranch, ct);
+                                }
                                 break;
 
                             case BranchAction.Merge:
