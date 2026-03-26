@@ -231,6 +231,42 @@ public class GoalsApiEndpointTests : IClassFixture<HiveTestFactory>
     }
 
     [Fact]
+    public async Task UpdateGoalStatus_DraftGoal_ReturnsPendingStatus()
+    {
+        // Arrange: create a goal (starts in Pending) then move it to Draft
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+        await _client.PatchAsync(
+            $"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Draft" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        // Act: transition Draft → Pending
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Pending" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        // Assert: endpoint returns success
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // Assert: goal status is now Pending (1 as integer, or "Pending" as string)
+        var getResponse = await _client.GetAsync($"/api/goals/{id}",
+            TestContext.Current.CancellationToken);
+        getResponse.EnsureSuccessStatusCode();
+        var body = await getResponse.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        using var doc = JsonDocument.Parse(body);
+        var statusElement = doc.RootElement.GetProperty("status");
+        // GoalStatus.Pending = 1 when serialized as integer; may also be "Pending" as string
+        var isPending = statusElement.ValueKind == JsonValueKind.Number
+            ? statusElement.GetInt32() == (int)GoalStatus.Pending
+            : string.Equals(statusElement.GetString(), "Pending", StringComparison.OrdinalIgnoreCase);
+        Assert.True(isPending, $"Expected status to be Pending but got: {statusElement}");
+    }
+
+    [Fact]
     public async Task PatchGoalStatus_NonExistentGoal_Returns404()
     {
         var response = await _client.PatchAsync(
@@ -249,6 +285,10 @@ public class GoalsApiEndpointTests : IClassFixture<HiveTestFactory>
     {
         var id = UniqueId();
         await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+        // Patch to Draft so deletion is allowed
+        await _client.PatchAsync($"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Draft" }, JsonOpts), Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
 
         var response = await _client.DeleteAsync($"/api/goals/{id}",
             TestContext.Current.CancellationToken);
@@ -263,6 +303,21 @@ public class GoalsApiEndpointTests : IClassFixture<HiveTestFactory>
             TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task DeleteGoal_PendingGoal_Returns400BadRequest()
+    {
+        var id = UniqueId();
+        // Default status is Pending
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        var response = await _client.DeleteAsync($"/api/goals/{id}",
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.Contains("Only Draft or Failed goals can be deleted", body);
     }
 
     // ── GET /api/goals/search ─────────────────────────────────────────────

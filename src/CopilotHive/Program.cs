@@ -143,6 +143,11 @@ static async Task<int> RunServerAsync(string[] args)
     // Dashboard: Blazor Server + real-time state aggregation
     builder.Services.AddSingleton<DashboardStateService>();
     builder.Services.AddRazorComponents().AddInteractiveServerComponents();
+    // HttpClient for Blazor Server components to call the local REST API
+    builder.Services.AddScoped<HttpClient>(_ => new HttpClient
+    {
+        BaseAddress = new Uri($"http://localhost:{port + 1}")
+    });
     // Persist data protection keys so antiforgery tokens survive container restarts
     builder.Services.AddDataProtection()
         .PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(stateDir, "keys")));
@@ -350,6 +355,13 @@ static async Task<int> RunServerAsync(string[] args)
 
     goalsApi.MapDelete("/{id}", async (string id, SqliteGoalStore store) =>
     {
+        var goal = await store.GetGoalAsync(id);
+        if (goal is null)
+            return Results.NotFound(new { error = $"Goal '{id}' not found." });
+
+        if (goal.Status is not (GoalStatus.Draft or GoalStatus.Failed))
+            return Results.BadRequest(new { error = "Only Draft or Failed goals can be deleted" });
+
         var deleted = await store.DeleteGoalAsync(id);
         return deleted ? Results.NoContent() : Results.NotFound(new { error = $"Goal '{id}' not found." });
     });

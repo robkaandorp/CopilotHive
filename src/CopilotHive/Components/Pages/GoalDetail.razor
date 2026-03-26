@@ -6,8 +6,21 @@
 @implements IDisposable
 @inject DashboardStateService State
 @inject IGoalStore GoalStore
+@inject IJSRuntime JS
+@inject NavigationManager Nav
+@inject HttpClient HttpClient
 
-<h1>Goal: @GoalId</h1>
+<div class="goal-header" style="display:flex;align-items:center;gap:1rem;">
+    <h1>Goal: @GoalId</h1>
+    @if (_detail?.Status == GoalStatus.Draft || _storedGoal?.Status == GoalStatus.Draft)
+    {
+        <button class="approve-btn" @onclick="ApproveGoal">▶ Approve</button>
+        @if (!string.IsNullOrEmpty(_approveError))
+        {
+            <span class="error-msg">@_approveError</span>
+        }
+    }
+</div>
 
 @if (_detail is not null)
 {
@@ -248,6 +261,14 @@
             </div>
         </details>
     }
+
+    @if (_detail.Status == GoalStatus.Draft || _detail.Status == GoalStatus.Failed)
+    {
+        <div style="margin-top:1.5rem">
+            <button style="background:var(--red);color:#fff;border:none;padding:0.4rem 1rem;border-radius:4px;cursor:pointer;font-size:0.9rem"
+                @onclick="DeleteCurrentGoal">🗑️ Delete Goal</button>
+        </div>
+    }
 }
 else if (_storedGoal is not null)
 {
@@ -404,6 +425,14 @@ else if (_storedGoal is not null)
             </div>
         </div>
     }
+
+    @if (_storedGoal.Status == GoalStatus.Draft || _storedGoal.Status == GoalStatus.Failed)
+    {
+        <div style="margin-top:1.5rem">
+            <button style="background:var(--red);color:#fff;border:none;padding:0.4rem 1rem;border-radius:4px;cursor:pointer;font-size:0.9rem"
+                @onclick="DeleteCurrentGoal">🗑️ Delete Goal</button>
+        </div>
+    }
 }
 else
 {
@@ -418,6 +447,7 @@ else
     private IReadOnlyList<IterationSummary> _storedIterations = [];
     private IReadOnlyList<ProgressEntry> _progress = [];
     private string? _selectedPhase;
+    private string? _approveError;
 
     protected override void OnInitialized()
     {
@@ -509,4 +539,39 @@ else
     }
 
     public void Dispose() => State.OnStateChanged -= RefreshState;
+
+    private async Task ApproveGoal()
+    {
+        _approveError = null;
+        var body = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new { status = "Pending" }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+        var response = await HttpClient.PatchAsync($"/api/goals/{GoalId}/status", body);
+        if (response.IsSuccessStatusCode)
+        {
+            Refresh();
+            // Update local state if loaded from SQLite (no active pipeline)
+            if (_storedGoal is not null)
+                _storedGoal.Status = GoalStatus.Pending;
+            StateHasChanged();
+        }
+        else
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            _approveError = $"Error {(int)response.StatusCode}: {errorContent}";
+        }
+    }
+
+    private async Task DeleteCurrentGoal()
+    {
+        var confirmed = await JS.InvokeAsync<bool>("confirm", $"Are you sure you want to delete goal '{GoalId}'?");
+        if (!confirmed) return;
+
+        var response = await HttpClient.DeleteAsync($"/api/goals/{GoalId}");
+        if (response.IsSuccessStatusCode)
+        {
+            Nav.NavigateTo("/goals");
+        }
+    }
 }
