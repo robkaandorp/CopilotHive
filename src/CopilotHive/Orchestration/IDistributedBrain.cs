@@ -45,8 +45,9 @@ public interface IDistributedBrain
     Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default);
 
     /// <summary>
-    /// Resets the Brain session by clearing the conversation history and deleting the persisted
-    /// session file. The Brain remains connected and ready for new goals after the reset.
+    /// Resets the Brain session by clearing message history, rebuilding the system prompt
+    /// from latest orchestrator instructions, and reinitializing the agent. The persisted
+    /// session file is deleted and a fresh session is saved.
     /// </summary>
     Task ResetSessionAsync(CancellationToken ct = default);
 

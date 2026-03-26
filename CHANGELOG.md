@@ -9,11 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Brain session reset from dashboard** — the Orchestrator page now includes a 🔄 Reset Session button to clear and reinitialize the Brain's chat session:
-  - `DistributedBrain.ResetSessionAsync()` clears conversation history, deletes the persisted `brain-session.json` file, and recreates the CodingAgent with a fresh session
+  - `DistributedBrain.ResetSessionAsync()` clears conversation history, rebuilds the system prompt from latest `orchestrator.agents.md` instructions, reinitializes the agent, and saves a fresh session
   - `POST /api/orchestrator/reset` REST endpoint enables external reset invocation
   - Dashboard button shows browser confirmation dialog before executing ("Are you sure you want to reset the Brain session?")
   - On success, the UI displays a success message and refreshes Brain stats; failure displays the HTTP status code
-  - 6 xUnit tests covering reset behavior (before connect, session file deletion, missing file handling, fake brain tracking, API endpoint existence, and 503 when Brain disabled)
+  - 7 xUnit tests covering reset behavior (before connect, session file replacement, fresh creation, system prompt rebuild, fake brain tracking, API endpoint existence, and 503 when Brain disabled)
 - **Goal dependency visualization in dashboard** — Goals and Goal Detail pages now display dependency relationships:
   - `GoalDetail.razor` shows a "Dependencies" section listing each dependency goal ID as a clickable link with status indicator (✅ Completed, ⏳ Pending, 🔄 InProgress, ❌ Failed, ❓ Unknown)
   - `Goals.razor` shows a 🔗 icon for goals with all dependencies completed, or ⏳ icon if any dependency is unsatisfied

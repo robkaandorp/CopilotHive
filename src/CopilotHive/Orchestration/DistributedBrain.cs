@@ -33,7 +33,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private CodingAgent? _agent;
     private AgentSession _session;
 
-    private readonly string _systemPrompt;
+    private string _systemPrompt;
     private readonly List<AITool> _brainTools;
     private readonly AgentsManager? _agentsManager;
 
@@ -281,7 +281,21 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <inheritdoc />
     public async Task ResetSessionAsync(CancellationToken ct = default)
     {
-        _session = AgentSession.Create("brain");
+        // Clear session message history
+        _session.MessageHistory.Clear();
+
+        // Re-read orchestrator instructions and rebuild system prompt
+        var orchestratorInstructions = _agentsManager?.GetAgentsMd(WorkerRole.Orchestrator) ?? "";
+        _systemPrompt = string.IsNullOrWhiteSpace(orchestratorInstructions)
+            ? DefaultSystemPrompt
+            : $"{DefaultSystemPrompt}\n\n{orchestratorInstructions}";
+
+        // Recreate agent with fresh system prompt (applies new _systemPrompt)
+        if (_chatClient is not null)
+            RecreateAgent();
+
+        // Add system message to session so the new prompt is part of the conversation
+        _session.MessageHistory.Add(new ChatMessage(ChatRole.System, _systemPrompt));
 
         // Delete the persisted session file so the old context is not reloaded on restart
         var sessionFile = GetSessionFilePath();
@@ -291,12 +305,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _logger.LogInformation("Deleted previous Brain session file");
         }
 
-        // Recreate the agent with the fresh session (only possible when connected)
-        if (_agent is not null)
-            RecreateAgent();
+        // Save the reset session
+        await SaveSessionAsync(ct);
 
-        _logger.LogInformation("Brain session reset");
-        await Task.CompletedTask; // keep async signature for future use
+        _logger.LogInformation("Brain session reset — system prompt rebuilt with latest orchestrator instructions");
     }
 
     /// <summary>Persists the current Brain session to disk.</summary>

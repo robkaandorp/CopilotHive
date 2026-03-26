@@ -394,28 +394,14 @@ public sealed class DistributedBrainTests
     [Fact]
     public async Task ResetSessionAsync_BeforeConnect_DoesNotThrow()
     {
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
-        // Should not throw even when not connected (no agent to recreate)
-        await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
-    }
-
-    [Fact]
-    public async Task ResetSessionAsync_DeletesPersistedSessionFile()
-    {
         var tempDir = Path.Combine(Path.GetTempPath(), $"brain-reset-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
         try
         {
-            var sessionFile = Path.Combine(tempDir, "brain-session.json");
-            // Create a fake session file to simulate a persisted session
-            await File.WriteAllTextAsync(sessionFile, "{}", TestContext.Current.CancellationToken);
-
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
                 stateDir: tempDir);
-
+            // Should not throw even when not connected (no agent to recreate)
             await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
-
-            Assert.False(File.Exists(sessionFile), "Session file should be deleted after reset");
         }
         finally
         {
@@ -425,17 +411,78 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task ResetSessionAsync_NoSessionFile_DoesNotThrow()
+    public async Task ResetSessionAsync_ReplacesOldSessionFileWithFresh()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"brain-reset-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
         try
         {
+            var sessionFile = Path.Combine(tempDir, "brain-session.json");
+            // Create a fake session file with known content to simulate a stale persisted session
+            var staleContent = "{\"stale\":true}";
+            await File.WriteAllTextAsync(sessionFile, staleContent, TestContext.Current.CancellationToken);
+
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+
+            await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+            // Reset saves a fresh session, so the file should exist but with different content
+            Assert.True(File.Exists(sessionFile), "Session file should exist after reset (fresh save)");
+            var newContent = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
+            Assert.NotEqual(staleContent, newContent);
+            // The fresh session should contain the system prompt (CopilotHive Orchestrator Brain)
+            Assert.Contains("brain", newContent);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_NoSessionFile_CreatesNewSessionFile()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-reset-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var sessionFile = Path.Combine(tempDir, "brain-session.json");
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
                 stateDir: tempDir);
 
             // Should not throw even if session file does not exist
             await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+            // A fresh session file should have been created by SaveSessionAsync
+            Assert.True(File.Exists(sessionFile), "Session file should be created after reset");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_RebuildSystemPromptFromDefaultWhenNoAgentsManager()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-reset-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            // No agentsManager — system prompt should be the default
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+
+            await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+            // Verify the session file was saved with the system prompt
+            var sessionFile = Path.Combine(tempDir, "brain-session.json");
+            var content = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
+            // The default system prompt contains "CopilotHive Orchestrator Brain"
+            Assert.Contains("CopilotHive Orchestrator Brain", content);
         }
         finally
         {
