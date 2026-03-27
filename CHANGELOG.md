@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Tests added: `IncludesPushFailureWarning_WhenFilesChangedButNotPushed`, `OmitsPushFailureWarning_WhenPushedSuccessfully`, `OmitsPushFailureWarning_WhenNoFilesChanged`, `HandleTaskCompletionAsync_LogsWarning_WhenFilesChangedButNotPushed`, `HandleTaskCompletionAsync_NoWarning_WhenPushedSuccessfully`
 
 ### Fixed
+- **QEMU segfault when building arm64 Docker images in CI** — fixed segfault during multi-architecture container builds by cross-compiling instead of emulating:
+  - Both `docker/orchestrator/Dockerfile` and `docker/worker/Dockerfile` now use `--platform=$BUILDPLATFORM` on the build stage `FROM` line
+  - The build stage runs natively on the host architecture (amd64), using .NET's cross-compilation to produce arm64 binaries via the `-r` flag
+  - The runtime stage continues to use the target platform's base image (no `--platform` flag), correctly pulling arm64 variants when targeting arm64
+  - This avoids running the .NET SDK under QEMU emulation, which causes JIT segfaults on arm64 builds
+
+### Fixed
 - **SQLite "readonly database" error in CI** — fixed `GoalsApiEndpointTests` and other `HiveTestFactory`-based tests that failed in GitHub Actions with `SQLite Error 8: 'attempt to write a readonly database'`:
   - Root cause: Multiple test classes using `IClassFixture<HiveTestFactory>` created separate factory instances that raced on the process-wide `STATE_DIR` environment variable, causing one factory to delete another's temp directory while SQLite was still writing to it
   - Solution: Replaced `IClassFixture<HiveTestFactory>` with `[Collection("HiveIntegration")]` on all 5 test classes (`GoalsApiEndpointTests`, `HealthCheckTests`, `HealthEndpointTests`, `WorkerPoolStatsEndpointTests`, `UtilizationEndpointTests`)
