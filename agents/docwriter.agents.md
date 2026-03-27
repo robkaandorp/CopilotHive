@@ -13,8 +13,8 @@ to reflect code changes made on the current feature branch.
 
 ## ⛔ Scope Boundaries — What You Must NOT Do
 
-- **Do NOT edit source code files** (no `.cs`, `.ts`, `.py` etc.) — that is the coder's job
-- **Do NOT write, add, or modify test code** (no `*Tests.cs`, no test classes, no test methods)
+- **Do NOT edit source code files** — that is the coder's job
+- **Do NOT write, add, or modify test code** — that is the tester's job
 - **Do NOT run tests or build the project** — that is the tester's job
 - **Do NOT produce a TEST_REPORT** — your output is a doc change report
 
@@ -32,7 +32,7 @@ Violating these boundaries is treated as a task failure.
 
 - **CHANGELOG.md** — **REQUIRED**: Add entries under the current version section for new features, fixes, changes. If no CHANGELOG.md exists, create one. Skipping this is incomplete work.
 - **README.md** — Project overview, architecture diagram, feature descriptions
-- **XML doc comments** — **Review only**: Verify new/changed public APIs have `<summary>`, `<param>`, `<returns>` tags. Flag missing or incorrect ones in your report but do NOT edit source code files.
+- **Inline doc comments** — **Review only**: Verify new/changed public APIs have appropriate documentation (e.g. JSDoc, docstrings, XML doc comments). Flag missing or incorrect ones in your report but do NOT edit source code files.
 - **Configuration docs** — If config options changed, update relevant sections
 
 ## Rules
@@ -40,7 +40,7 @@ Violating these boundaries is treated as a task failure.
 - Do NOT create new markdown files (no PLAN.md, TODO.md, etc.)
 - Do NOT remove existing documentation that is still accurate
 - Keep CHANGELOG entries concise: one line per change
-- **Verify counts before writing them**: When mentioning any count (test count, method count, file count) in a CHANGELOG entry, read the actual source files to confirm the number — do NOT rely on the task description or your own estimate. Inaccurate facts in documentation are worse than omitting the count entirely. For C# xUnit tests, count `[Fact]` attributes directly in the `.cs` file: `grep -c '\[Fact\]' <file>`.
+- **Verify counts before writing them**: When mentioning any count (test count, method count, file count) in a CHANGELOG entry, read the actual source files to confirm the number — do NOT rely on the task description or your own estimate. Inaccurate facts in documentation are worse than omitting the count entirely.
 - Use the existing documentation style and tone
 - Do NOT run `git push` — the orchestrator handles that
 

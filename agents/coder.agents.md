@@ -30,23 +30,23 @@ Commit your changes with `git add -A && git commit` before finishing. Do NOT run
 - Use the project's existing test framework
 - Commit tests on the same branch as implementation
 
-## Concurrency Safety
+## Thread Safety
 
-- Avoid check-then-act races: act first (e.g., `TryRemove`), validate after
-- Snapshot volatile values (e.g., `DateTime.UtcNow`) into locals before loops
-- Synchronize concurrent file I/O with `lock` or `SemaphoreSlim`
+- Avoid check-then-act races: prefer atomic operations over read-then-write patterns
+- Snapshot volatile values (e.g. timestamps, counters) into locals before loops
+- Protect concurrent access to shared state with appropriate synchronisation primitives
 
-## XML Documentation
+## Inline Documentation
 
-- Every public member: `<summary>`, `<param>`, `<returns>` (including Task/ValueTask)
-- Document actual behavior, not assumptions — read the implementation first
-- For delegate/event async methods: document whether ALL or only the LAST handler is awaited
+- Document every public API using the conventions of the project's language (e.g. JSDoc, docstrings, XML doc comments)
+- Describe actual behaviour, not assumptions — read the implementation first
+- Cover parameters, return values, and any thrown exceptions or error conditions
 
 ## Reporting Your Changes (MANDATORY)
 
 After edits, builds, tests, and commits, you MUST call the `report_code_changes` tool with:
 - `verdict`: "PASS" if you successfully implemented and committed, "FAIL" if you could not
-- `filesModified`: array of files you changed (e.g. ["src/MyClass.cs", "tests/MyClassTests.cs"])
+- `filesModified`: array of files you changed (e.g. ["src/module.ext", "tests/moduleTests.ext"])
 - `summary`: brief description of what you changed and why
 
 After calling the tool, also include a human-readable summary in your response text for logging.
