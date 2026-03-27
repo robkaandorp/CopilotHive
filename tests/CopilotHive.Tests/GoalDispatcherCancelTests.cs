@@ -202,6 +202,48 @@ public sealed class GoalDispatcherCancelTests
     }
 
     [Fact]
+    public async Task CancelGoalAsync_DraftGoalNoPipeline_ReturnsFalse()
+    {
+        var goal = new Goal
+        {
+            Id = $"goal-{Guid.NewGuid():N}",
+            Description = "Draft goal",
+            Status = GoalStatus.Draft
+        };
+        var goalSource = new CancelFakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+
+        var pipelineManager = new GoalPipelineManager();
+        var dispatcher = CreateDispatcher(goalManager, pipelineManager);
+
+        var result = await dispatcher.CancelGoalAsync(goal.Id, TestContext.Current.CancellationToken);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task CancelGoalAsync_CancelledGoalNoPipeline_ReturnsFalse()
+    {
+        var goal = new Goal
+        {
+            Id = $"goal-{Guid.NewGuid():N}",
+            Description = "Cancelled goal",
+            Status = GoalStatus.Cancelled
+        };
+        var goalSource = new CancelFakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+
+        var pipelineManager = new GoalPipelineManager();
+        var dispatcher = CreateDispatcher(goalManager, pipelineManager);
+
+        var result = await dispatcher.CancelGoalAsync(goal.Id, TestContext.Current.CancellationToken);
+
+        Assert.False(result);
+    }
+
+    [Fact]
     public async Task CancelGoalAsync_UnknownGoalId_ReturnsFalse()
     {
         var goalManager = new GoalManager();

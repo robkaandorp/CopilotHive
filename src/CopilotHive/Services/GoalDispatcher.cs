@@ -129,7 +129,7 @@ public sealed class GoalDispatcher : BackgroundService
         if (goal is null)
             return false;
 
-        if (goal.Status is GoalStatus.Completed or GoalStatus.Failed or GoalStatus.Cancelled)
+        if (goal.Status is not (GoalStatus.InProgress or GoalStatus.Pending))
             return false;
 
         await _goalManager.UpdateGoalStatusAsync(goalId, GoalStatus.Failed,
