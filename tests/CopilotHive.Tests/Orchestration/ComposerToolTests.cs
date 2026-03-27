@@ -1,3 +1,4 @@
+using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using Microsoft.Data.Sqlite;
@@ -399,6 +400,263 @@ public sealed class ComposerToolTests : IDisposable
 
         Assert.Contains("❌", result);
         Assert.Contains("not found", result);
+    }
+
+    // ── git tools — no repo manager configured ──
+
+    [Fact]
+    public async Task GitLog_NoRepoManager_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // Composer constructed without a repoManager
+        var result = await _composer.GitLogAsync("any-repo", cancellationToken: ct);
+
+        Assert.Contains("not available", result);
+    }
+
+    [Fact]
+    public async Task GitDiff_NoRepoManager_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.GitDiffAsync("any-repo", "HEAD~1", cancellationToken: ct);
+
+        Assert.Contains("not available", result);
+    }
+
+    [Fact]
+    public async Task GitShow_NoRepoManager_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.GitShowAsync("any-repo", "HEAD", cancellationToken: ct);
+
+        Assert.Contains("not available", result);
+    }
+
+    [Fact]
+    public async Task GitBranch_NoRepoManager_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.GitBranchAsync("any-repo", cancellationToken: ct);
+
+        Assert.Contains("not available", result);
+    }
+
+    [Fact]
+    public async Task GitBlame_NoRepoManager_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.GitBlameAsync("any-repo", "some/file.cs", cancellationToken: ct);
+
+        Assert.Contains("not available", result);
+    }
+
+    // ── git tools — repo manager configured, unknown repo ──
+
+    [Fact]
+    public async Task GitLog_UnknownRepo_ReturnsNotFoundWithAvailable()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitLogAsync("nonexistent-repo", cancellationToken: ct);
+
+            Assert.Contains("nonexistent-repo", result);
+            Assert.Contains("not found", result);
+            Assert.Contains("Available", result);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
+    // ── git tools — parameter validation ──
+
+    [Fact]
+    public async Task GitLog_InvalidFormat_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.GitLogAsync("any-repo", format: "invalid", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("format", result);
+    }
+
+    [Fact]
+    public async Task GitDiff_MissingRef1_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.GitDiffAsync("any-repo", "", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("ref1", result);
+    }
+
+    [Fact]
+    public async Task GitShow_MissingRef_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.GitShowAsync("any-repo", "", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("ref", result);
+    }
+
+    [Fact]
+    public async Task GitBlame_MissingPath_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.GitBlameAsync("any-repo", "", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("path", result);
+    }
+
+    // ── git tools — real git repo ──
+
+    private static string InitTempGitRepo(string basePath)
+    {
+        var reposDir = Path.Combine(basePath, "repos");
+        var repoDir = Path.Combine(reposDir, "test-repo");
+        Directory.CreateDirectory(repoDir);
+
+        static void Git(string workDir, params string[] args)
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("git")
+            {
+                WorkingDirectory = workDir,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            foreach (var a in args) psi.ArgumentList.Add(a);
+            using var p = System.Diagnostics.Process.Start(psi)!;
+            p.WaitForExit();
+        }
+
+        Git(repoDir, "init", "-b", "main");
+        Git(repoDir, "config", "user.email", "test@test.com");
+        Git(repoDir, "config", "user.name", "Test");
+
+        File.WriteAllText(Path.Combine(repoDir, "README.md"), "# Hello\nLine 2\nLine 3\n");
+        Git(repoDir, "add", "README.md");
+        Git(repoDir, "commit", "-m", "Initial commit");
+
+        return basePath;
+    }
+
+    [Fact]
+    public async Task GitLog_ValidRepo_ReturnsHistory()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitLogAsync("test-repo", max_count: 5, cancellationToken: ct);
+
+            Assert.Contains("Initial commit", result);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task GitBranch_ValidRepo_ListsBranches()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitBranchAsync("test-repo", cancellationToken: ct);
+
+            Assert.Contains("main", result);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task GitShow_ValidRepo_ReturnsCommitDetails()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitShowAsync("test-repo", "HEAD", cancellationToken: ct);
+
+            Assert.Contains("Initial commit", result);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task GitBlame_ValidRepo_ReturnsBlameLines()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitBlameAsync("test-repo", "README.md", cancellationToken: ct);
+
+            Assert.Contains("Hello", result);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
     }
 }
 
