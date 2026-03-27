@@ -1,4 +1,4 @@
-[![Build](https://github.com/robkaandorp/CopilotHive/actions/workflows/build.yml/badge.svg)](https://github.com/robkaandorp/CopilotHive/actions/workflows/build.yml)
+[![CI](https://github.com/robkaandorp/CopilotHive/actions/workflows/ci.yml/badge.svg)](https://github.com/robkaandorp/CopilotHive/actions/workflows/ci.yml)
 
 # CopilotHive
 
