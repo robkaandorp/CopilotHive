@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Visible Planning phase in iteration timeline** — `GoalDetail.razor` now shows a dedicated "Planning" phase in the iteration timeline:
+  - Planning phase is always displayed as the first phase box in both current and completed iterations
+  - During active planning (`GoalPhase.Planning`), only the Planning phase is shown (no fallback phases), with `active` status and ⏳ indicator
+  - After planning completes, Planning shows as `completed` with ✓ icon, followed by the actual planned phases
+  - Completed iterations from history also display a completed Planning phase at the start
+- **Plan reasoning display** — the Brain's iteration plan reasoning (`IterationPlan.Reason`) is now visible in the Goal Detail page:
+  - Displayed as subtle italic text below the phase bar with 📋 prefix (e.g., "📋 Standard first iteration with coding, testing, and review")
+  - Helps users understand why the Brain chose a particular iteration strategy
+  - `IterationViewInfo.PlanReason` property carries the reasoning from `DashboardStateService` to the UI
 - **Goal Detail page back button** — `GoalDetail.razor` now includes a "← Goals" back link above the goal header for quick navigation to the goals list (`/goals`); styled with `color: var(--accent)` to match the dashboard design
 
 ### Changed
