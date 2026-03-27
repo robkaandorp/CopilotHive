@@ -35,5 +35,3 @@ in the config repo overrides the local template.
 
 The **Improver** worker reads iteration metrics (test results, retry counts, issues) and edits
 these files directly to improve agent behaviour over time — creating a self-improving feedback loop.
-
-The `history/` subfolder is used by AgentsManager for version tracking and rollback.

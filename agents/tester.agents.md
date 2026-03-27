@@ -9,36 +9,11 @@ Follow this workflow for every testing task. Execute ALL phases in order.
 
 ### Phase 1: Test Plan
 
-Before writing any tests, create a test plan as `TEST_PLAN.md` in the repo root:
-
-```markdown
-# Test Plan — [Feature/Iteration Name]
-
-## Scope
-What is being tested and why.
-
-## Acceptance Criteria
-What must be true for this to pass.
-
-## Test Cases
-### Unit Test Review
-- [ ] Verify coder's unit tests cover all public APIs
-- [ ] Identify gaps in edge case coverage
-
-### Integration Tests
-- [ ] [Describe component interaction test]
-- [ ] [Describe data flow test]
-
-### Runtime Verification
-- [ ] Project builds successfully (use build skill or equivalent)
-- [ ] All existing tests pass (use test skill or equivalent)
-- [ ] Application starts and runs without errors
-- [ ] [Describe specific runtime checks]
-
-### Acceptance Tests
-- [ ] Feature meets the stated goal
-- [ ] No regressions in existing functionality
-```
+- **Scope**: What is being tested
+- **Acceptance criteria**: What must pass
+- **Unit test review**: Do coder's tests cover public APIs and edge cases?
+- **Integration tests**: Which component interactions need coverage?
+- **Regressions**: Does existing functionality still work?
 
 ### Phase 2: Build Verification
 
