@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Goal Detail page back button** — `GoalDetail.razor` now includes a "← Goals" back link above the goal header for quick navigation to the goals list (`/goals`); styled with `color: var(--accent)` to match the dashboard design
+
+### Changed
+- **Worker output rendering in Goal Detail** — iteration phase details now render worker output as Markdown instead of plain text:
+  - Uses the existing `RenderMarkdown()` method (Markdig with `UseAdvancedExtensions().DisableHtml()`)
+  - Wrapped in `<div class="chat-msg-content">` for consistent dark-theme styling (code blocks, tables, lists, headings)
+  - Previously displayed as raw `<pre>` text without formatting
+
+### Fixed
+- **Dependency link readability in Goal Detail** — dependency goal IDs are now clearly visible on the dark background:
+  - Added `class="goal-link"` to dependency links in both the active pipeline view and stored goal view
+  - The `goal-link` CSS class sets `color: var(--accent)` (`#58a6ff`) and `text-decoration: none`
+  - Previously rendered as browser-default dark blue/purple, which was unreadable on the `--bg: #0d1117` dark theme
+
 ### Changed
 - **Reset Brain Session button styling** — improved visual appearance and UX of the Brain reset button on the Orchestrator dashboard:
   - Changed from unstyled `btn btn-danger` to `chat-action-btn chat-action-btn--danger` classes for consistent dashboard design
