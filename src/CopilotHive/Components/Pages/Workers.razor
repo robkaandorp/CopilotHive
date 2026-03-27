@@ -52,7 +52,7 @@
                         }
                     </td>
                     <td style="font-family:monospace;font-size:0.85rem;color:var(--text-muted)">
-                        @{ var modelStr = w.Role != "Unspecified" && _info.RoleModels.TryGetValue(w.Role.ToLowerInvariant(), out var m) ? m : null; }
+                        @{ var modelStr = w.GetDisplayModel(_info.RoleModels); }
                         @if (modelStr is not null)
                         {
                             @StripReasoning(modelStr)

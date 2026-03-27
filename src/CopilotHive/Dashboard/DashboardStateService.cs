@@ -121,6 +121,7 @@ public sealed class DashboardStateService : IDisposable
                 CurrentTaskId = w.CurrentTaskId,
                 LastHeartbeat = w.LastHeartbeat,
                 ConnectedAt = w.ConnectedAt,
+                CurrentModel = w.CurrentModel,
             }).ToList(),
             Pipelines = pipelines.Select(p => new PipelineInfo
             {
@@ -492,6 +493,21 @@ public sealed class WorkerInfo
     public DateTime LastHeartbeat { get; init; }
     /// <summary>Connection timestamp.</summary>
     public DateTime ConnectedAt { get; init; }
+    /// <summary>Model used for the current task, or <c>null</c> when idle.</summary>
+    public string? CurrentModel { get; init; }
+
+    /// <summary>
+    /// Returns the model string to display for this worker: the task-specific
+    /// <see cref="CurrentModel"/> if set, otherwise the role-default from
+    /// <paramref name="roleModels"/>, or <c>null</c> if neither is available.
+    /// </summary>
+    /// <param name="roleModels">Role-to-model mapping from <see cref="OrchestratorInfo.RoleModels"/>.</param>
+    /// <returns>The display model string, or <c>null</c>.</returns>
+    public string? GetDisplayModel(IDictionary<string, string> roleModels)
+    {
+        return CurrentModel
+            ?? (Role != "Unspecified" && roleModels.TryGetValue(Role.ToLowerInvariant(), out var m) ? m : null);
+    }
 }
 
 /// <summary>Pipeline state for the dashboard.</summary>

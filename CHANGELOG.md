@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Worker model display in dashboard** — Workers list and Worker Detail pages now show the actual model being used for the current task (including premium tier upgrades) instead of the static config default:
+  - `ConnectedWorker.CurrentModel` property added — populated when a task is assigned (`task.Model`), cleared when the worker becomes idle
+  - `DashboardStateService.WorkerInfo.CurrentModel` added — flows from `ConnectedWorker` to the dashboard via `GetSnapshot()`
+  - `Workers.razor` and `WorkerDetail.razor` updated — prefer `CurrentModel` when available, fall back to config default only when idle
+
 ### Added
 - **Composer git tools** — the Composer now has 5 read-only git tools for inspecting repository commit history, diffs, branches, and blame information:
   - `git_log` — view commit history with options for branch, path, date filtering, and format (oneline/short/full)

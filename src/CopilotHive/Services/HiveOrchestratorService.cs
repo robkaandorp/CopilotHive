@@ -169,6 +169,34 @@ public sealed class HiveOrchestratorService(
         return Task.FromResult(new HeartbeatResponse { Acknowledged = true });
     }
 
+    /// <summary>
+    /// Applies a task assignment to a worker: activates the task in the queue, marks the worker
+    /// busy, and sets <see cref="ConnectedWorker.CurrentModel"/> from the task's requested model.
+    /// Exposed as <c>internal</c> for unit testing via <c>InternalsVisibleTo</c>.
+    /// </summary>
+    /// <param name="worker">The worker that will execute the task.</param>
+    /// <param name="task">The task being assigned.</param>
+    internal void ApplyTaskAssignment(ConnectedWorker worker, WorkTask task)
+    {
+        taskQueue.Activate(task, worker.Id);
+        workerPool.MarkBusy(worker.Id, task.TaskId);
+        worker.CurrentModel = task.Model;
+    }
+
+    /// <summary>
+    /// Applies task completion to a worker: marks the task complete in the queue, marks the
+    /// worker idle, and clears <see cref="ConnectedWorker.CurrentModel"/> to <c>null</c>.
+    /// Exposed as <c>internal</c> for unit testing via <c>InternalsVisibleTo</c>.
+    /// </summary>
+    /// <param name="worker">The worker that completed the task.</param>
+    /// <param name="taskId">The identifier of the completed task.</param>
+    internal void ApplyTaskCompletion(ConnectedWorker worker, string taskId)
+    {
+        taskQueue.MarkComplete(taskId);
+        workerPool.MarkIdle(worker.Id);
+        worker.CurrentModel = null;
+    }
+
     private async Task HandleWorkerReady(
         ConnectedWorker worker,
         IServerStreamWriter<OrchestratorMessage> responseStream,
@@ -190,8 +218,7 @@ public sealed class HiveOrchestratorService(
             if (agentsManager is not null)
                 await SendAgentsMdAsync(worker, task.Role, cancellationToken);
 
-            taskQueue.Activate(task, worker.Id);
-            workerPool.MarkBusy(worker.Id, task.TaskId);
+            ApplyTaskAssignment(worker, task);
             logger.LogInformation("Assigning task {TaskId} to worker {WorkerId}", task.TaskId, worker.Id);
 
             await worker.MessageChannel.Writer.WriteAsync(
@@ -314,8 +341,7 @@ public sealed class HiveOrchestratorService(
         // Capture role before MarkIdle resets it to Unspecified
         var workerRole = worker.Role;
 
-        taskQueue.MarkComplete(complete.TaskId);
-        workerPool.MarkIdle(worker.Id);
+        ApplyTaskCompletion(worker, complete.TaskId);
 
         // Update pipeline state
         var pipeline = pipelineManager.GetByTaskId(complete.TaskId);
