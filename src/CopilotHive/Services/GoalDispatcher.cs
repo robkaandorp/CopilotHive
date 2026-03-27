@@ -92,7 +92,14 @@ public sealed class GoalDispatcher : BackgroundService
     }
 
     /// <summary>
-    /// Cancels a goal that is currently InProgress or Pending.
+    /// Cancels an InProgress or Pending goal. If a pipeline exists, it is moved to the Failed
+    /// state. The goal status is set to Failed with reason "Cancelled by user".
+    /// Returns true if the goal was cancelled, false if it was not in a cancellable state.
+    ///
+    /// Note: The current worker task may still be running when cancel is called.
+    /// That's OK — when the worker reports back via HandleTaskCompletionAsync,
+    /// the pipeline will already be in Failed state, so the result will be ignored
+    /// (the existing early-exit check at the top of HandleTaskCompletionAsync handles this).
     /// </summary>
     /// <param name="goalId">The goal to cancel.</param>
     /// <param name="ct">Cancellation token.</param>
