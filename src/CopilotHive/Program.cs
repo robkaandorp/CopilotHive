@@ -129,7 +129,8 @@ static async Task<int> RunServerAsync(string[] args)
             sp.GetRequiredService<IGoalStore>(),
             maxCtx, maxSteps,
             sp.GetService<BrainRepoManager>(),
-            stateDir);
+            stateDir,
+            sp.GetRequiredService<GoalDispatcher>());
     });
 
     // Dashboard: log capture (registered early so logger provider can reference it)
@@ -376,6 +377,21 @@ static async Task<int> RunServerAsync(string[] args)
 
         var deleted = await store.DeleteGoalAsync(id);
         return deleted ? Results.NoContent() : Results.NotFound(new { error = $"Goal '{id}' not found." });
+    });
+
+    goalsApi.MapPost("/{id}/cancel", async (string id, GoalDispatcher dispatcher, SqliteGoalStore store) =>
+    {
+        var goal = await store.GetGoalAsync(id);
+        if (goal is null)
+            return Results.NotFound(new { error = $"Goal '{id}' not found." });
+
+        if (goal.Status is not (GoalStatus.InProgress or GoalStatus.Pending))
+            return Results.BadRequest(new { error = $"Goal '{id}' is {goal.Status} and cannot be cancelled. Only InProgress or Pending goals can be cancelled." });
+
+        var cancelled = await dispatcher.CancelGoalAsync(id);
+        return cancelled
+            ? Results.Ok(new { message = $"Goal '{id}' has been cancelled." })
+            : Results.BadRequest(new { error = $"Goal '{id}' could not be cancelled (it may have already completed or failed)." });
     });
 
     goalsApi.MapGet("/search", async (string q, string? status, SqliteGoalStore store) =>

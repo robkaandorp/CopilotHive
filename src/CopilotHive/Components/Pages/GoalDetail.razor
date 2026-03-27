@@ -31,6 +31,15 @@
             <span class="error-msg">@_revertError</span>
         }
     }
+    @if ((_detail?.Status == GoalStatus.InProgress || _detail?.Status == GoalStatus.Pending ||
+          _storedGoal?.Status == GoalStatus.InProgress || _storedGoal?.Status == GoalStatus.Pending))
+    {
+        <button style="background:var(--red);color:#fff;border:none;padding:0.4rem 1rem;border-radius:4px;cursor:pointer;font-size:0.9rem" @onclick="CancelGoal">⏹ Cancel Goal</button>
+        @if (!string.IsNullOrEmpty(_cancelError))
+        {
+            <span class="error-msg">@_cancelError</span>
+        }
+    }
 </div>
 
 @if (_detail is not null)
@@ -556,6 +565,7 @@ else
     private string? _selectedPhase;
     private string? _approveError;
     private string? _revertError;
+    private string? _cancelError;
     private string? _deleteError;
     private Dictionary<string, GoalStatus> _dependencyStatuses = new();
 
@@ -729,6 +739,26 @@ else
         {
             var errorContent = await response.Content.ReadAsStringAsync();
             _revertError = $"Error {(int)response.StatusCode}: {errorContent}";
+        }
+    }
+
+    private async Task CancelGoal()
+    {
+        _cancelError = null;
+        var confirmed = await JS.InvokeAsync<bool>("confirm", $"Are you sure you want to cancel goal '{GoalId}'?");
+        if (!confirmed) return;
+
+        var response = await HttpClient.PostAsync($"/api/goals/{GoalId}/cancel", null);
+        if (response.IsSuccessStatusCode)
+        {
+            Refresh();
+            StateHasChanged();
+        }
+        else
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            _cancelError = $"Error {(int)response.StatusCode}: {errorContent}";
+            StateHasChanged();
         }
     }
 
