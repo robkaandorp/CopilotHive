@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **GitHub Actions CI workflow** — automated build, test, and container image push to GitHub Container Registry (ghcr.io):
+  - New `.github/workflows/ci.yml` workflow triggered on pushes to `develop` branch only
+  - `test` job — restores dependencies (`dotnet restore`), builds in Release mode (`dotnet build`), and runs the full xUnit test suite (`dotnet test`)
+  - `build-and-push` job — depends on successful test completion, builds and pushes both orchestrator and worker Docker images to GHCR
+  - Images published: `ghcr.io/robkaandorp/copilothive-orchestrator` and `ghcr.io/robkaandorp/copilothive-worker`
+  - Tags: `latest` and commit SHA (`sha-{short-sha}`) for traceability
+  - Docker layer caching enabled via GitHub Actions cache (`type=gha`)
+  - Uses `secrets.GITHUB_TOKEN` with `packages: write` permission for GHCR authentication
+  - Build context: repository root (`.`), Dockerfiles located at `docker/orchestrator/Dockerfile` and `docker/worker/Dockerfile`
+
+### Added
 
 - **Brain-generated squash merge commit messages** — merge commits now use concise Brain-generated summaries instead of verbose goal descriptions:
   - `IDistributedBrain.GenerateCommitMessageAsync()` — new interface method for requesting concise commit summaries (~72 char subject + 2-4 bullet body)
