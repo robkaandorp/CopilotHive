@@ -688,7 +688,7 @@ public sealed class GoalDispatcher : BackgroundService
         try
         {
             var repos = ResolveRepositories(pipeline.Goal);
-            var commitMessage = BuildSquashCommitMessage(pipeline.GoalId, pipeline.Description);
+            var commitMessage = await GenerateMergeCommitMessageAsync(pipeline, ct);
             foreach (var repo in repos)
             {
                 // Use the persistent brain clone — no temp dirs needed.
@@ -1484,6 +1484,38 @@ public sealed class GoalDispatcher : BackgroundService
             return url;
 
         return url.Replace("https://github.com/", $"https://x-access-token:{token}@github.com/");
+    }
+
+    /// <summary>
+    /// Generates a commit message by asking the Brain for a concise summary first,
+    /// falling back to <see cref="BuildSquashCommitMessage"/> when the Brain is unavailable
+    /// or returns null. The "Goal:" prefix is always preserved.
+    /// </summary>
+    internal async Task<string> GenerateMergeCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct)
+    {
+        if (_brain is null)
+            return BuildSquashCommitMessage(pipeline.GoalId, pipeline.Description);
+
+        try
+        {
+            var brainMessage = await _brain.GenerateCommitMessageAsync(pipeline, ct);
+            if (brainMessage is not null)
+            {
+                var prefix = $"Goal: {pipeline.GoalId} — ";
+                return $"{prefix}{brainMessage}";
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw; // Preserve cancellation - do NOT swallow it
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to generate Brain commit message for goal {GoalId} — using fallback",
+                pipeline.GoalId);
+        }
+
+        return BuildSquashCommitMessage(pipeline.GoalId, pipeline.Description);
     }
 
     /// <summary>

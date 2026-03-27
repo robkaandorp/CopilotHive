@@ -224,6 +224,9 @@ file sealed class CapturingBrain : IDistributedBrain
         return Task.FromResult($"Work on {pipeline.Description} as {phase}");
     }
 
+    public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult<string?>(null);
+
     public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) => Task.CompletedTask;
 
     public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) => Task.CompletedTask;

@@ -521,6 +521,69 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         public string? Reason { get; init; }
     }
 
+    /// <inheritdoc />
+    public async Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default)
+    {
+        if (_agent is null)
+        {
+            _logger.LogDebug("Brain not connected — skipping commit message generation for goal {GoalId}", pipeline.GoalId);
+            return null;
+        }
+
+        var prompt = $$"""
+            Generate a concise git commit message for a squash merge of goal: {{pipeline.Description}}
+
+            Goal ID: {{pipeline.GoalId}}
+            Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
+
+            Format:
+            - First line: a short imperative subject (~72 characters, no "Goal:" prefix)
+            - Blank line
+            - 2–4 bullet points summarizing what was implemented
+
+            Respond with ONLY the commit message text — no tool calls, no JSON, no markdown wrapping.
+            """;
+
+        try
+        {
+            string? message = null;
+
+            await Shared.CopilotRetryPolicy.ExecuteAsync(
+                async () =>
+                {
+                    var (response, _) = await ExecuteBrainAsync(prompt, ct);
+
+                    if (!string.IsNullOrWhiteSpace(response))
+                        message = response.Trim();
+                    else
+                        throw new InvalidOperationException(
+                            $"Brain returned empty commit message for {pipeline.GoalId}");
+                },
+                onRetry: (attempt, delay, ex) =>
+                {
+                    _logger.LogWarning(
+                        "Brain commit message generation failed for {GoalId} (attempt {Attempt}/{Max}): {Error}. Retrying in {Delay}s",
+                        pipeline.GoalId, attempt, Shared.CopilotRetryPolicy.MaxRetries + 1, ex.Message, delay.TotalSeconds);
+                },
+                ct);
+
+            _logger.LogDebug("Brain generated commit message for goal {GoalId}: {Message}",
+                pipeline.GoalId, message);
+
+            return message;
+        }
+        catch (OperationCanceledException)
+        {
+            throw; // Preserve cancellation - do NOT swallow it
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to generate Brain commit message for goal {GoalId} — will use fallback",
+                pipeline.GoalId);
+            return null;
+        }
+    }
+
     /// <summary>
     /// Asks the Brain to craft a prompt for the specified phase's worker.
     /// </summary>

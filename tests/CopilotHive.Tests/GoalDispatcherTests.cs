@@ -208,6 +208,15 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
     /// <summary>Verdict to return when a worker completes (used by the test harness).</summary>
     public string Verdict { get; set; } = "PASS";
 
+    /// <summary>Optional commit message override; null means return null (use fallback).</summary>
+    public string? CommitMessageOverride { get; set; }
+
+    /// <summary>When true, <see cref="GenerateCommitMessageAsync"/> throws an exception.</summary>
+    public bool ThrowOnGenerateCommitMessage { get; set; }
+
+    /// <summary>Number of times <see cref="GenerateCommitMessageAsync"/> was called.</summary>
+    public int GenerateCommitMessageCalls { get; private set; }
+
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
     public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
@@ -216,6 +225,14 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
     public Task<string> CraftPromptAsync(
         GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
         Task.FromResult($"Work on {pipeline.Description} as {phase}");
+
+    public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default)
+    {
+        GenerateCommitMessageCalls++;
+        if (ThrowOnGenerateCommitMessage)
+            throw new InvalidOperationException("Simulated Brain failure in GenerateCommitMessageAsync");
+        return Task.FromResult(CommitMessageOverride);
+    }
 
     public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) => Task.CompletedTask;
 
@@ -845,6 +862,108 @@ public sealed class GoalDispatcherBuildSquashCommitMessageTests
         var result = GoalDispatcher.BuildSquashCommitMessage("goal-0", "");
 
         Assert.StartsWith("Goal: goal-0 \u2014", result);
+    }
+}
+
+/// <summary>
+/// Tests for the Brain-generated commit message feature in <see cref="GoalDispatcher"/>
+/// via <see cref="GoalDispatcher.GenerateMergeCommitMessageAsync"/> directly.
+/// </summary>
+public sealed class GoalDispatcherGenerateMergeCommitMessageTests
+{
+    /// <summary>
+    /// When the Brain returns a non-null message, the result must start with
+    /// the "Goal: {id} — " prefix and contain the Brain's message verbatim.
+    /// </summary>
+    [Fact]
+    public async Task GenerateMergeCommitMessageAsync_BrainReturnsMessage_UsesPrefixAndContent()
+    {
+        // Arrange
+        var goalId = "test-goal-123";
+        var brainMessage = "feat: add user authentication";
+        var expected = $"Goal: {goalId} \u2014 {brainMessage}";
+
+        var brain = new FakeDispatcherBrain { CommitMessageOverride = brainMessage };
+        var (dispatcher, pipeline) = CreateDispatcher(brain, goalId, "description");
+
+        // Act
+        var result = await dispatcher.GenerateMergeCommitMessageAsync(pipeline, TestContext.Current.CancellationToken);
+
+        // Assert — verify ACTUAL output: prefix, brain content, and full equality
+        Assert.StartsWith($"Goal: {goalId} \u2014 ", result);
+        Assert.Contains(brainMessage, result);
+        Assert.Equal(expected, result);
+    }
+
+    /// <summary>
+    /// When the Brain returns null, the result must equal <see cref="GoalDispatcher.BuildSquashCommitMessage"/>.
+    /// </summary>
+    [Fact]
+    public async Task GenerateMergeCommitMessageAsync_BrainReturnsNull_UsesFallback()
+    {
+        // Arrange
+        var goalId = "test-goal-123";
+        var description = "verbose goal description";
+
+        var brain = new FakeDispatcherBrain { CommitMessageOverride = null };
+        var (dispatcher, pipeline) = CreateDispatcher(brain, goalId, description);
+
+        // Act
+        var result = await dispatcher.GenerateMergeCommitMessageAsync(pipeline, TestContext.Current.CancellationToken);
+
+        // Assert — output equals the static fallback
+        var expected = GoalDispatcher.BuildSquashCommitMessage(goalId, description);
+        Assert.Equal(expected, result);
+    }
+
+    /// <summary>
+    /// When the Brain throws (non-cancellation), the result must equal <see cref="GoalDispatcher.BuildSquashCommitMessage"/>.
+    /// </summary>
+    [Fact]
+    public async Task GenerateMergeCommitMessageAsync_BrainThrows_UsesFallback()
+    {
+        // Arrange
+        var goalId = "test-goal-123";
+        var description = "verbose goal description";
+
+        var brain = new FakeDispatcherBrain { ThrowOnGenerateCommitMessage = true };
+        var (dispatcher, pipeline) = CreateDispatcher(brain, goalId, description);
+
+        // Act — must not throw; Brain exception is swallowed and fallback is returned
+        var result = await dispatcher.GenerateMergeCommitMessageAsync(pipeline, TestContext.Current.CancellationToken);
+
+        // Assert — output equals the static fallback
+        var expected = GoalDispatcher.BuildSquashCommitMessage(goalId, description);
+        Assert.Equal(expected, result);
+    }
+
+    /// <summary>
+    /// Builds a minimal <see cref="GoalDispatcher"/> and its matching <see cref="GoalPipeline"/>
+    /// for direct unit-testing of <see cref="GoalDispatcher.GenerateMergeCommitMessageAsync"/>.
+    /// </summary>
+    private static (GoalDispatcher dispatcher, GoalPipeline pipeline) CreateDispatcher(
+        IDistributedBrain brain, string goalId, string description)
+    {
+        var goal = new Goal { Id = goalId, Description = description };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        goalManager.GetNextGoalAsync().GetAwaiter().GetResult();
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain);
+
+        return (dispatcher, pipeline);
     }
 }
 
