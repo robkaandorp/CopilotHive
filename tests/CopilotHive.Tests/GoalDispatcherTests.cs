@@ -867,86 +867,91 @@ public sealed class GoalDispatcherBuildSquashCommitMessageTests
 
 /// <summary>
 /// Tests for the Brain-generated commit message feature in <see cref="GoalDispatcher"/>
-/// (via <c>PerformMergeAsync</c> indirectly) and the Brain-generated commit message feature.
+/// via <see cref="GoalDispatcher.GenerateMergeCommitMessageAsync"/> directly.
 /// </summary>
 public sealed class GoalDispatcherGenerateMergeCommitMessageTests
 {
     /// <summary>
-    /// When the Brain returns a non-null message, the commit message must start with
-    /// the "Goal: {id} — " prefix followed by the Brain's response.
+    /// When the Brain returns a non-null message, the result must start with
+    /// the "Goal: {id} — " prefix and contain the Brain's message verbatim.
     /// </summary>
     [Fact]
-    public async Task GenerateMergeCommitMessage_BrainSucceeds_UsesBrainMessageWithPrefix()
+    public async Task GenerateMergeCommitMessageAsync_BrainReturnsMessage_UsesPrefixAndContent()
     {
-        var brainMessage = "Add logging support\n\n- Implemented structured logging\n- Added ILogger injection";
+        // Arrange
+        var goalId = "test-goal-123";
+        var brainMessage = "feat: add user authentication";
+        var expected = $"Goal: {goalId} \u2014 {brainMessage}";
+
         var brain = new FakeDispatcherBrain { CommitMessageOverride = brainMessage };
+        var (dispatcher, pipeline) = CreateDispatcher(brain, goalId, "description");
 
-        await RunThroughMergePhaseAsync(brain, "goal-brain-msg", "Add logging support to the project");
+        // Act
+        var result = await dispatcher.GenerateMergeCommitMessageAsync(pipeline, TestContext.Current.CancellationToken);
 
-        // Verify the Brain was asked for a commit message
-        Assert.Equal(1, brain.GenerateCommitMessageCalls);
+        // Assert — verify ACTUAL output: prefix, brain content, and full equality
+        Assert.StartsWith($"Goal: {goalId} \u2014 ", result);
+        Assert.Contains(brainMessage, result);
+        Assert.Equal(expected, result);
     }
 
     /// <summary>
-    /// When the Brain returns null, <c>GenerateMergeCommitMessageAsync</c> must fall back
-    /// to <c>BuildSquashCommitMessage</c> and produce a "Goal: {id} — {description}" subject.
+    /// When the Brain returns null, the result must equal <see cref="GoalDispatcher.BuildSquashCommitMessage"/>.
     /// </summary>
     [Fact]
-    public async Task GenerateMergeCommitMessage_BrainReturnsNull_UsesFallback()
+    public async Task GenerateMergeCommitMessageAsync_BrainReturnsNull_UsesFallback()
     {
-        // Brain returns null (default FakeDispatcherBrain behaviour)
+        // Arrange
+        var goalId = "test-goal-123";
+        var description = "verbose goal description";
+
         var brain = new FakeDispatcherBrain { CommitMessageOverride = null };
+        var (dispatcher, pipeline) = CreateDispatcher(brain, goalId, description);
 
-        await RunThroughMergePhaseAsync(brain, "goal-fallback", "Fix the bug in module X");
+        // Act
+        var result = await dispatcher.GenerateMergeCommitMessageAsync(pipeline, TestContext.Current.CancellationToken);
 
-        // Brain was called but returned null — fallback should have been used (no crash)
-        Assert.Equal(1, brain.GenerateCommitMessageCalls);
+        // Assert — output equals the static fallback
+        var expected = GoalDispatcher.BuildSquashCommitMessage(goalId, description);
+        Assert.Equal(expected, result);
     }
 
     /// <summary>
-    /// When the Brain throws an exception (other than cancellation),
-    /// <c>GenerateMergeCommitMessageAsync</c> returns null and the fallback message is used.
+    /// When the Brain throws (non-cancellation), the result must equal <see cref="GoalDispatcher.BuildSquashCommitMessage"/>.
     /// </summary>
     [Fact]
-    public async Task GenerateMergeCommitMessage_BrainThrows_UsesFallback()
+    public async Task GenerateMergeCommitMessageAsync_BrainThrows_UsesFallback()
     {
+        // Arrange
+        var goalId = "test-goal-123";
+        var description = "verbose goal description";
+
         var brain = new FakeDispatcherBrain { ThrowOnGenerateCommitMessage = true };
+        var (dispatcher, pipeline) = CreateDispatcher(brain, goalId, description);
 
-        // Should not throw — Brain exception is handled with fallback
-        await RunThroughMergePhaseAsync(brain, "goal-throws", "Refactor authentication");
+        // Act — must not throw; Brain exception is swallowed and fallback is returned
+        var result = await dispatcher.GenerateMergeCommitMessageAsync(pipeline, TestContext.Current.CancellationToken);
 
-        // Verify the goal was processed (not crashed due to Brain exception)
-        Assert.Equal(1, brain.GenerateCommitMessageCalls);
+        // Assert — output equals the static fallback
+        var expected = GoalDispatcher.BuildSquashCommitMessage(goalId, description);
+        Assert.Equal(expected, result);
     }
 
     /// <summary>
-    /// Drives the dispatcher through the Review → Merging transition so <c>PerformMergeAsync</c>
-    /// (and therefore <c>GenerateMergeCommitMessageAsync</c>) is called.
-    /// The merge itself will fail (no real repo), but the Brain commit-message call is verified.
+    /// Builds a minimal <see cref="GoalDispatcher"/> and its matching <see cref="GoalPipeline"/>
+    /// for direct unit-testing of <see cref="GoalDispatcher.GenerateMergeCommitMessageAsync"/>.
     /// </summary>
-    private static async Task RunThroughMergePhaseAsync(IDistributedBrain brain, string goalId, string description)
+    private static (GoalDispatcher dispatcher, GoalPipeline pipeline) CreateDispatcher(
+        IDistributedBrain brain, string goalId, string description)
     {
         var goal = new Goal { Id = goalId, Description = description };
         var goalSource = new FakeGoalSource(goal);
         var goalManager = new GoalManager();
         goalManager.AddSource(goalSource);
-        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+        goalManager.GetNextGoalAsync().GetAwaiter().GetResult();
 
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
-
-        // Start an iteration: Coding → Review → Merging (minimal plan so Review → Merging)
-        var plan = new IterationPlan { Phases = [GoalPhase.Coding, GoalPhase.Review, GoalPhase.Merging] };
-        pipeline.SetPlan(plan);
-        pipeline.StateMachine.StartIteration(plan.Phases);
-
-        // Restore state machine to Review, with Merging queued as the next phase
-        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Review);
-        pipeline.AdvanceTo(GoalPhase.Review);
-
-        var taskId = $"task-{Guid.NewGuid():N}";
-        pipelineManager.RegisterTask(taskId, goal.Id);
-        pipeline.SetActiveTask(taskId, $"feature/{goalId}");
 
         var dispatcher = new GoalDispatcher(
             goalManager,
@@ -958,15 +963,7 @@ public sealed class GoalDispatcherGenerateMergeCommitMessageTests
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             brain);
 
-        // Review completes with APPROVE → state machine transitions Continue → Merging
-        // → DispatchPhaseAsync(Merging) → PerformMergeAsync → GenerateMergeCommitMessageAsync
-        await dispatcher.HandleTaskCompletionAsync(new TaskResult
-        {
-            TaskId = taskId,
-            Status = TaskOutcome.Completed,
-            Output = "LGTM, approved.",
-            Metrics = new TaskMetrics { Verdict = "APPROVE" },
-        }, TestContext.Current.CancellationToken);
+        return (dispatcher, pipeline);
     }
 }
 

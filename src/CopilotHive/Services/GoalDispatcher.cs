@@ -1491,7 +1491,7 @@ public sealed class GoalDispatcher : BackgroundService
     /// falling back to <see cref="BuildSquashCommitMessage"/> when the Brain is unavailable
     /// or returns null. The "Goal:" prefix is always preserved.
     /// </summary>
-    private async Task<string> GenerateMergeCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct)
+    internal async Task<string> GenerateMergeCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct)
     {
         if (_brain is null)
             return BuildSquashCommitMessage(pipeline.GoalId, pipeline.Description);
