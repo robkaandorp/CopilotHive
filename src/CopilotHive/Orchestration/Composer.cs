@@ -691,7 +691,17 @@ public sealed class Composer : IAsyncDisposable
             return "Git tools are not available — no repository manager configured.";
 
         var clonePath = _repoManager.GetClonePath(repoName);
-        if (clonePath is null || !Directory.Exists(Path.Combine(clonePath, ".git")))
+
+        // SECURITY: Prevent path traversal — validate resolved path is under the expected repos directory.
+        var expectedReposDir = Path.GetFullPath(_repoManager.WorkDirectory);
+        var resolvedPath = Path.GetFullPath(clonePath);
+        if (!resolvedPath.StartsWith(expectedReposDir + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+            && !string.Equals(resolvedPath, expectedReposDir, StringComparison.Ordinal))
+        {
+            return $"Repository '{repoName}' is not within the managed repos directory. Access denied.";
+        }
+
+        if (!Directory.Exists(Path.Combine(clonePath, ".git")))
         {
             var reposDir = _repoManager.WorkDirectory;
             var available = Directory.Exists(reposDir)
@@ -758,7 +768,17 @@ public sealed class Composer : IAsyncDisposable
         if (!validFormats.Contains(format))
             return $"❌ Invalid format '{format}'. Must be one of: oneline, short, full.";
 
-        var args = new List<string> { "log", $"--max-count={max_count}", $"--format={format}" };
+        var args = new List<string> { "log", $"--max-count={max_count}" };
+
+        // Use correct git format flags: 'oneline' needs --oneline, not --format=oneline
+        var formatArg = format.ToLowerInvariant() switch
+        {
+            "oneline" => "--oneline",
+            "short" => "--format=short",
+            "full" => "--format=full",
+            _ => "--oneline",
+        };
+        args.Add(formatArg);
 
         if (stat)
             args.Add("--stat");
@@ -766,8 +786,13 @@ public sealed class Composer : IAsyncDisposable
         if (!string.IsNullOrWhiteSpace(since))
             args.Add($"--since={since}");
 
+        // SECURITY: Validate branch to prevent git option injection
         if (!string.IsNullOrWhiteSpace(branch))
+        {
+            if (branch.StartsWith('-'))
+                return $"❌ Invalid branch '{branch}': branch names cannot start with '-'.";
             args.Add(branch);
+        }
 
         if (!string.IsNullOrWhiteSpace(path))
         {
@@ -792,6 +817,12 @@ public sealed class Composer : IAsyncDisposable
             return "❌ repository is required.";
         if (string.IsNullOrWhiteSpace(ref1))
             return "❌ ref1 is required.";
+
+        // SECURITY: Prevent git option injection for refs
+        if (ref1.StartsWith('-'))
+            return $"❌ Invalid ref '{ref1}': refs cannot start with '-'.";
+        if (!string.IsNullOrWhiteSpace(ref2) && ref2.StartsWith('-'))
+            return $"❌ Invalid ref '{ref2}': refs cannot start with '-'.";
 
         var args = new List<string> { "diff" };
 
@@ -826,6 +857,10 @@ public sealed class Composer : IAsyncDisposable
         if (string.IsNullOrWhiteSpace(@ref))
             return "❌ ref is required.";
 
+        // SECURITY: Prevent git option injection for ref
+        if (@ref.StartsWith('-'))
+            return $"❌ Invalid ref '{@ref}': refs cannot start with '-'.";
+
         var args = new List<string> { "show" };
 
         if (stat_only)
@@ -857,8 +892,13 @@ public sealed class Composer : IAsyncDisposable
         if (remote)
             args.Add("-r");
 
+        // SECURITY: Prevent git option injection for pattern
         if (!string.IsNullOrWhiteSpace(pattern))
+        {
+            if (pattern.StartsWith('-'))
+                return $"❌ Invalid pattern '{pattern}': patterns cannot start with '-'.";
             args.Add(pattern);
+        }
 
         return await RunGitAsync(repository, [.. args], ct: cancellationToken);
     }
@@ -885,6 +925,8 @@ public sealed class Composer : IAsyncDisposable
             args.Add($"-L{start},{end}");
         }
 
+        // SECURITY: Place path after -- to terminate option parsing
+        args.Add("--");
         args.Add(path);
 
         return await RunGitAsync(repository, [.. args], ct: cancellationToken);

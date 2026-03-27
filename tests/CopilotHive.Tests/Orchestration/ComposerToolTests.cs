@@ -522,6 +522,104 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("path", result);
     }
 
+    // ── git tools — path traversal prevention ──
+
+    [Fact]
+    public async Task GitLog_PathTraversal_ReturnsDenied()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitLogAsync("../../../etc", cancellationToken: ct);
+
+            Assert.Contains("Access denied", result);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
+    // ── git tools — option injection prevention ──
+
+    [Fact]
+    public async Task GitLog_BranchStartingWithDash_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitLogAsync("test-repo", branch: "--output=/tmp/evil", cancellationToken: ct);
+
+            Assert.Contains("❌", result);
+            Assert.Contains("cannot start with '-'", result);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task GitDiff_Ref1StartingWithDash_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.GitDiffAsync("any-repo", "--output=/tmp/evil", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("cannot start with '-'", result);
+    }
+
+    [Fact]
+    public async Task GitDiff_Ref2StartingWithDash_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.GitDiffAsync("any-repo", "HEAD", ref2: "--output=/tmp/evil", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("cannot start with '-'", result);
+    }
+
+    [Fact]
+    public async Task GitShow_RefStartingWithDash_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.GitShowAsync("any-repo", "--output=/tmp/evil", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("cannot start with '-'", result);
+    }
+
+    [Fact]
+    public async Task GitBranch_PatternStartingWithDash_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.GitBranchAsync("any-repo", pattern: "--delete", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("cannot start with '-'", result);
+    }
+
     // ── git tools — real git repo ──
 
     private static string InitTempGitRepo(string basePath)
