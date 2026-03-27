@@ -133,4 +133,48 @@ public sealed class ConnectedWorkerTests
     }
 
     #endregion
+
+    // ── CurrentModel ─────────────────────────────────────────────────────────
+
+    #region CurrentModel_IsNullByDefault
+
+    [Fact]
+    public void CurrentModel_IsNullByDefault()
+    {
+        var worker = CreateWorker();
+
+        Assert.Null(worker.CurrentModel);
+    }
+
+    #endregion
+
+    #region CurrentModel_CanBeSetToModelName
+
+    [Fact]
+    public void CurrentModel_CanBeSetToModelName()
+    {
+        var worker = CreateWorker();
+        const string model = "gpt-4";
+
+        worker.CurrentModel = model;
+
+        Assert.Equal(model, worker.CurrentModel);
+    }
+
+    #endregion
+
+    #region CurrentModel_CanBeClearedToNull
+
+    [Fact]
+    public void CurrentModel_CanBeClearedToNull()
+    {
+        var worker = CreateWorker();
+        worker.CurrentModel = "gpt-4";
+
+        worker.CurrentModel = null;
+
+        Assert.Null(worker.CurrentModel);
+    }
+
+    #endregion
 }

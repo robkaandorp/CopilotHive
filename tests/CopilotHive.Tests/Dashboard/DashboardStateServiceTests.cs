@@ -436,6 +436,70 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Null(detail.RepositoryUrl);
     }
 
+    // ── GetSnapshot — CurrentModel mapping ───────────────────────────────────
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetSnapshot"/> maps
+    /// <c>ConnectedWorker.CurrentModel</c> from the pool
+    /// to <c>WorkerInfo.CurrentModel</c> on the snapshot.
+    /// </summary>
+    [Fact]
+    public void GetSnapshot_MapsCurrentModelFromWorkerToInfo()
+    {
+        // Arrange: register a busy worker and set its CurrentModel
+        var workerPool = new WorkerPool();
+        var worker = workerPool.RegisterWorker("w-model-test", []);
+        workerPool.MarkBusy("w-model-test", "task-1");
+        worker.CurrentModel = "gpt-4";
+
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: null);
+
+        // Act
+        var snapshot = service.GetSnapshot();
+
+        // Assert: the WorkerInfo in the snapshot carries the model
+        var info = snapshot.Workers.Single(w => w.Id == "w-model-test");
+        Assert.Equal("gpt-4", info.CurrentModel);
+    }
+
+    /// <summary>
+    /// Verifies that <c>WorkerInfo.CurrentModel</c> is <c>null</c> when the
+    /// underlying <c>ConnectedWorker.CurrentModel</c>
+    /// has not been set (i.e., the worker is idle).
+    /// </summary>
+    [Fact]
+    public void GetSnapshot_CurrentModel_IsNullWhenWorkerIsIdle()
+    {
+        // Arrange: register a worker but do NOT set CurrentModel (idle state)
+        var workerPool = new WorkerPool();
+        workerPool.RegisterWorker("w-idle-test", []);
+
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: null);
+
+        // Act
+        var snapshot = service.GetSnapshot();
+
+        // Assert: idle worker has no model
+        var info = snapshot.Workers.Single(w => w.Id == "w-idle-test");
+        Assert.Null(info.CurrentModel);
+    }
+
     // ── WorkerOutput Priority Tests ─────────────────────────────────
 
     /// <summary>
