@@ -530,9 +530,10 @@ public sealed class ComposerToolTests : IDisposable
             await _store.UpdateGoalAsync(goal, ct);
 
             // Create dispatcher and composer with GoalDispatcher
+            // Pass real store so cancellation updates propagate to the persisted goal
             var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
             var goalManager = new GoalManager();
-            goalManager.AddSource(new FakeGoalSource(goal));
+            goalManager.AddSource(new FakeGoalSource(goal, _store));
             var pipelineManager = new GoalPipelineManager();
             var dispatcher = new GoalDispatcher(
                 goalManager,
@@ -555,6 +556,12 @@ public sealed class ComposerToolTests : IDisposable
 
             Assert.Contains("✅", result);
             Assert.Contains("cancelled", result);
+
+            // Verify the persisted goal state was updated
+            var persistedGoal = await _store.GetGoalAsync("cancel-inprogress", ct);
+            Assert.NotNull(persistedGoal);
+            Assert.Equal(GoalStatus.Failed, persistedGoal!.Status);
+            Assert.Equal("Cancelled by user", persistedGoal.FailureReason);
         }
         finally
         {
@@ -578,9 +585,10 @@ public sealed class ComposerToolTests : IDisposable
             Assert.NotNull(goal);
 
             // Create dispatcher and composer with GoalDispatcher
+            // Pass real store so cancellation updates propagate to the persisted goal
             var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
             var goalManager = new GoalManager();
-            goalManager.AddSource(new FakeGoalSource(goal!));
+            goalManager.AddSource(new FakeGoalSource(goal!, _store));
             var pipelineManager = new GoalPipelineManager();
             var dispatcher = new GoalDispatcher(
                 goalManager,
@@ -603,6 +611,12 @@ public sealed class ComposerToolTests : IDisposable
 
             Assert.Contains("✅", result);
             Assert.Contains("cancelled", result);
+
+            // Verify the persisted goal state was updated
+            var persistedGoal = await _store.GetGoalAsync("cancel-pending", ct);
+            Assert.NotNull(persistedGoal);
+            Assert.Equal(GoalStatus.Failed, persistedGoal!.Status);
+            Assert.Equal("Cancelled by user", persistedGoal.FailureReason);
         }
         finally
         {
@@ -995,12 +1009,18 @@ public sealed class ComposerToolTests : IDisposable
 
 /// <summary>
 /// Minimal <see cref="IGoalSource"/> and <see cref="IGoalStore"/> used for cancel tests that need GoalDispatcher.
+/// Optionally delegates status updates to a real store for integration testing.
 /// </summary>
 internal sealed class FakeGoalSource : IGoalSource, IGoalStore
 {
     private readonly Goal _goal;
+    private readonly IGoalStore? _realStore;
 
-    public FakeGoalSource(Goal goal) => _goal = goal;
+    public FakeGoalSource(Goal goal, IGoalStore? realStore = null)
+    {
+        _goal = goal;
+        _realStore = realStore;
+    }
 
     public string Name => "fake-source";
 
@@ -1009,13 +1029,27 @@ internal sealed class FakeGoalSource : IGoalSource, IGoalStore
             ? Task.FromResult<IReadOnlyList<Goal>>([_goal])
             : Task.FromResult<IReadOnlyList<Goal>>([]);
 
-    public Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
+    public async Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
     {
         if (goalId == _goal.Id)
         {
             _goal.Status = status;
+            if (metadata?.FailureReason is not null)
+                _goal.FailureReason = metadata.FailureReason;
         }
-        return Task.CompletedTask;
+
+        // Also delegate to real store if provided (for integration testing)
+        if (_realStore is not null)
+        {
+            var storeGoal = await _realStore.GetGoalAsync(goalId, ct);
+            if (storeGoal is not null)
+            {
+                storeGoal.Status = status;
+                if (metadata?.FailureReason is not null)
+                    storeGoal.FailureReason = metadata.FailureReason;
+                await _realStore.UpdateGoalAsync(storeGoal, ct);
+            }
+        }
     }
 
     public Task<Goal?> GetGoalAsync(string goalId, CancellationToken ct = default) =>
