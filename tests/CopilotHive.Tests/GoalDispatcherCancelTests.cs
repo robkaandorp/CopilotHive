@@ -25,7 +25,7 @@ public sealed class GoalDispatcherCancelTests
             NullLogger<GoalDispatcher>.Instance,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
 
-    private static (GoalDispatcher dispatcher, GoalPipeline pipeline, GoalManager goalManager, GoalPipelineManager pipelineManager)
+    private static (GoalDispatcher dispatcher, GoalPipeline pipeline, GoalManager goalManager, GoalPipelineManager pipelineManager, CancelFakeGoalSource goalSource)
         CreateInProgressDispatcher(GoalPhase phase = GoalPhase.Coding)
     {
         var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
@@ -43,7 +43,7 @@ public sealed class GoalDispatcherCancelTests
         pipelineManager.RegisterTask(taskId, goal.Id);
 
         var dispatcher = CreateDispatcher(goalManager, pipelineManager);
-        return (dispatcher, pipeline, goalManager, pipelineManager);
+        return (dispatcher, pipeline, goalManager, pipelineManager, goalSource);
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ public sealed class GoalDispatcherCancelTests
     [InlineData(GoalPhase.Merging)]
     public async Task CancelGoalAsync_InProgressPipeline_ReturnsTrue(GoalPhase phase)
     {
-        var (dispatcher, pipeline, _, pipelineManager) = CreateInProgressDispatcher(phase);
+        var (dispatcher, pipeline, _, pipelineManager, _) = CreateInProgressDispatcher(phase);
 
         var result = await dispatcher.CancelGoalAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
 
@@ -68,7 +68,7 @@ public sealed class GoalDispatcherCancelTests
     [InlineData(GoalPhase.Review)]
     public async Task CancelGoalAsync_InProgressPipeline_RemovesPipelineFromManager(GoalPhase phase)
     {
-        var (dispatcher, pipeline, _, pipelineManager) = CreateInProgressDispatcher(phase);
+        var (dispatcher, pipeline, _, pipelineManager, _) = CreateInProgressDispatcher(phase);
         var goalId = pipeline.GoalId;
 
         await dispatcher.CancelGoalAsync(goalId, TestContext.Current.CancellationToken);
@@ -82,17 +82,31 @@ public sealed class GoalDispatcherCancelTests
     [InlineData(GoalPhase.Review)]
     public async Task CancelGoalAsync_InProgressPipeline_MarksPipelineAsFailed(GoalPhase phase)
     {
-        var (dispatcher, pipeline, _, _) = CreateInProgressDispatcher(phase);
+        var (dispatcher, pipeline, _, _, _) = CreateInProgressDispatcher(phase);
 
         await dispatcher.CancelGoalAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
 
         Assert.Equal(GoalPhase.Failed, pipeline.Phase);
     }
 
+    [Theory]
+    [InlineData(GoalPhase.Coding)]
+    [InlineData(GoalPhase.Testing)]
+    [InlineData(GoalPhase.Review)]
+    public async Task CancelGoalAsync_InProgressPipeline_UpdatesGoalStatusToFailed(GoalPhase phase)
+    {
+        var (dispatcher, pipeline, _, _, goalSource) = CreateInProgressDispatcher(phase);
+
+        await dispatcher.CancelGoalAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+
+        Assert.Equal(GoalStatus.Failed, goalSource.LastUpdatedStatus);
+        Assert.Equal("Cancelled by user", goalSource.LastUpdatedReason);
+    }
+
     [Fact]
     public async Task CancelGoalAsync_AlreadyDonePipeline_ReturnsFalse()
     {
-        var (dispatcher, pipeline, _, _) = CreateInProgressDispatcher(GoalPhase.Done);
+        var (dispatcher, pipeline, _, _, _) = CreateInProgressDispatcher(GoalPhase.Done);
 
         var result = await dispatcher.CancelGoalAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
 
@@ -102,7 +116,7 @@ public sealed class GoalDispatcherCancelTests
     [Fact]
     public async Task CancelGoalAsync_AlreadyFailedPipeline_ReturnsFalse()
     {
-        var (dispatcher, pipeline, _, _) = CreateInProgressDispatcher(GoalPhase.Failed);
+        var (dispatcher, pipeline, _, _, _) = CreateInProgressDispatcher(GoalPhase.Failed);
 
         var result = await dispatcher.CancelGoalAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
 
@@ -204,7 +218,7 @@ public sealed class GoalDispatcherCancelTests
 /// Minimal <see cref="IGoalSource"/> and <see cref="IGoalStore"/> used by cancellation tests.
 /// Tracks last status update for assertion.
 /// </summary>
-file sealed class CancelFakeGoalSource : IGoalSource, IGoalStore
+internal sealed class CancelFakeGoalSource : IGoalSource, IGoalStore
 {
     private readonly Goal _goal;
 
