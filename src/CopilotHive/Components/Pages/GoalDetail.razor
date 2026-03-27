@@ -23,6 +23,14 @@
             <span class="error-msg">@_approveError</span>
         }
     }
+    @if (_detail?.Status == GoalStatus.Pending || _storedGoal?.Status == GoalStatus.Pending)
+    {
+        <button class="revert-btn" style="background:var(--text-muted);color:#fff;border:none;padding:0.4rem 1rem;border-radius:4px;cursor:pointer;font-size:0.9rem" @onclick="RevertToDraft">↩ Revert to Draft</button>
+        @if (!string.IsNullOrEmpty(_revertError))
+        {
+            <span class="error-msg">@_revertError</span>
+        }
+    }
 </div>
 
 @if (_detail is not null)
@@ -314,9 +322,13 @@
 
     @if (_detail.Status == GoalStatus.Draft || _detail.Status == GoalStatus.Failed)
     {
-        <div style="margin-top:1.5rem">
+        <div style="margin-top:1.5rem;display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap">
             <button style="background:var(--red);color:#fff;border:none;padding:0.4rem 1rem;border-radius:4px;cursor:pointer;font-size:0.9rem"
                 @onclick="DeleteCurrentGoal">🗑️ Delete Goal</button>
+            @if (!string.IsNullOrEmpty(_deleteError))
+            {
+                <span class="error-msg">@_deleteError</span>
+            }
         </div>
     }
 }
@@ -519,9 +531,13 @@ else if (_storedGoal is not null)
 
     @if (_storedGoal.Status == GoalStatus.Draft || _storedGoal.Status == GoalStatus.Failed)
     {
-        <div style="margin-top:1.5rem">
+        <div style="margin-top:1.5rem;display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap">
             <button style="background:var(--red);color:#fff;border:none;padding:0.4rem 1rem;border-radius:4px;cursor:pointer;font-size:0.9rem"
                 @onclick="DeleteCurrentGoal">🗑️ Delete Goal</button>
+            @if (!string.IsNullOrEmpty(_deleteError))
+            {
+                <span class="error-msg">@_deleteError</span>
+            }
         </div>
     }
 }
@@ -539,6 +555,8 @@ else
     private IReadOnlyList<ProgressEntry> _progress = [];
     private string? _selectedPhase;
     private string? _approveError;
+    private string? _revertError;
+    private string? _deleteError;
     private Dictionary<string, GoalStatus> _dependencyStatuses = new();
 
     protected override void OnInitialized()
@@ -691,8 +709,32 @@ else
         }
     }
 
+    private async Task RevertToDraft()
+    {
+        _revertError = null;
+        var body = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new { status = "Draft" }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+        var response = await HttpClient.PatchAsync($"/api/goals/{GoalId}/status", body);
+        if (response.IsSuccessStatusCode)
+        {
+            Refresh();
+            // Update local state if loaded from SQLite (no active pipeline)
+            if (_storedGoal is not null)
+                _storedGoal.Status = GoalStatus.Draft;
+            StateHasChanged();
+        }
+        else
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            _revertError = $"Error {(int)response.StatusCode}: {errorContent}";
+        }
+    }
+
     private async Task DeleteCurrentGoal()
     {
+        _deleteError = null;
         var confirmed = await JS.InvokeAsync<bool>("confirm", $"Are you sure you want to delete goal '{GoalId}'?");
         if (!confirmed) return;
 
@@ -700,6 +742,12 @@ else
         if (response.IsSuccessStatusCode)
         {
             Nav.NavigateTo("/goals");
+        }
+        else
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            _deleteError = $"Error {(int)response.StatusCode}: {errorContent}";
+            StateHasChanged();
         }
     }
 }

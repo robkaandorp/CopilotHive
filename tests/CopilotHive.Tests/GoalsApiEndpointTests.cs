@@ -206,9 +206,10 @@ public class GoalsApiEndpointTests : IClassFixture<HiveTestFactory>
         var id = UniqueId();
         await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
 
+        // Goals are created with Pending status; Pending→Draft is a valid transition
         var response = await _client.PatchAsync(
             $"/api/goals/{id}/status",
-            new StringContent(JsonSerializer.Serialize(new { status = "completed" }, JsonOpts),
+            new StringContent(JsonSerializer.Serialize(new { status = "Draft" }, JsonOpts),
                 Encoding.UTF8, "application/json"),
             TestContext.Current.CancellationToken);
 
@@ -276,6 +277,67 @@ public class GoalsApiEndpointTests : IClassFixture<HiveTestFactory>
             TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PatchGoalStatus_InvalidTransition_PendingToCompleted_Returns400()
+    {
+        var id = UniqueId();
+        // Default status is Pending
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Completed" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.Contains("Invalid transition", body);
+    }
+
+    [Fact]
+    public async Task PatchGoalStatus_InvalidTransition_DraftToCompleted_Returns400()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+        // Move to Draft first (Pending→Draft is valid)
+        await _client.PatchAsync(
+            $"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Draft" }, JsonOpts), Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Completed" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.Contains("Invalid transition", body);
+    }
+
+    [Fact]
+    public async Task PatchGoalStatus_ValidTransition_DraftToPending_Returns200()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+        // Pending→Draft
+        await _client.PatchAsync(
+            $"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Draft" }, JsonOpts), Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        // Draft→Pending
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Pending" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 
     // ── DELETE /api/goals/{id} ────────────────────────────────────────────
