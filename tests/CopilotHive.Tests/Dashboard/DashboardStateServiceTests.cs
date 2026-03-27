@@ -863,20 +863,17 @@ public sealed class DashboardStateServiceTests : IDisposable
 
     // ── CurrentModel UI fallback tests ───────────────────────────────────────
     //
-    // Workers.razor uses: w.CurrentModel ?? (w.Role != "Unspecified" && RoleModels[role] → m ? m : null)
-    // These tests verify that logic in isolation via WorkerInfo + OrchestratorInfo.RoleModels.
+    // Workers.razor and WorkerDetail.razor call WorkerInfo.GetDisplayModel(roleModels)
+    // to resolve the model to display. These tests exercise that real production method.
 
     /// <summary>
-    /// Verifies the fallback expression used in Workers.razor:
-    /// when <see cref="CopilotHive.Dashboard.WorkerInfo.CurrentModel"/> is null and the worker has a role
-    /// with a configured default model, the fallback returns that default.
+    /// Verifies that <see cref="CopilotHive.Dashboard.WorkerInfo.GetDisplayModel"/> returns the
+    /// role-default model when <see cref="CopilotHive.Dashboard.WorkerInfo.CurrentModel"/> is null
+    /// and the worker has a role with a configured default model.
     /// </summary>
     [Fact]
     public void WorkerModelFallback_CurrentModelNull_ReturnRoleDefault()
     {
-        // Simulate the Workers.razor fallback expression:
-        // var modelStr = w.CurrentModel
-        //     ?? (w.Role != "Unspecified" && _info.RoleModels.TryGetValue(w.Role.ToLowerInvariant(), out var m) ? m : null);
         var worker = new CopilotHive.Dashboard.WorkerInfo
         {
             Id = "w-fallback-1",
@@ -889,16 +886,16 @@ public sealed class DashboardStateServiceTests : IDisposable
             ["coder"] = "claude-opus-4",
         };
 
-        // Apply the same fallback expression as Workers.razor
-        var modelStr = worker.CurrentModel
-            ?? (worker.Role != "Unspecified" && roleModels.TryGetValue(worker.Role.ToLowerInvariant(), out var m) ? m : null);
+        // Call the real production helper used by Workers.razor / WorkerDetail.razor
+        var modelStr = worker.GetDisplayModel(roleModels);
 
         Assert.Equal("claude-opus-4", modelStr);
     }
 
     /// <summary>
-    /// Verifies that when <see cref="CopilotHive.Dashboard.WorkerInfo.CurrentModel"/> is set (worker is busy),
-    /// the actual task model takes precedence over the role config default.
+    /// Verifies that <see cref="CopilotHive.Dashboard.WorkerInfo.GetDisplayModel"/> returns the
+    /// task-specific model when <see cref="CopilotHive.Dashboard.WorkerInfo.CurrentModel"/> is set,
+    /// taking precedence over the role config default.
     /// </summary>
     [Fact]
     public void WorkerModelFallback_CurrentModelSet_TaskModelTakesPrecedence()
@@ -915,15 +912,15 @@ public sealed class DashboardStateServiceTests : IDisposable
             ["coder"] = "claude-opus-4",   // role default — must NOT override the task model
         };
 
-        var modelStr = worker.CurrentModel
-            ?? (worker.Role != "Unspecified" && roleModels.TryGetValue(worker.Role.ToLowerInvariant(), out var m) ? m : null);
+        var modelStr = worker.GetDisplayModel(roleModels);
 
         Assert.Equal("gpt-4o", modelStr);
     }
 
     /// <summary>
-    /// Verifies that when <see cref="CopilotHive.Dashboard.WorkerInfo.CurrentModel"/> is null AND the worker role
-    /// is <c>"Unspecified"</c>, the fallback returns <c>null</c> (no model to display).
+    /// Verifies that <see cref="CopilotHive.Dashboard.WorkerInfo.GetDisplayModel"/> returns <c>null</c>
+    /// when <see cref="CopilotHive.Dashboard.WorkerInfo.CurrentModel"/> is null AND the worker role
+    /// is <c>"Unspecified"</c> (no model to display).
     /// </summary>
     [Fact]
     public void WorkerModelFallback_UnspecifiedRole_ReturnsNull()
@@ -940,10 +937,61 @@ public sealed class DashboardStateServiceTests : IDisposable
             ["coder"] = "claude-opus-4",
         };
 
-        var modelStr = worker.CurrentModel
-            ?? (worker.Role != "Unspecified" && roleModels.TryGetValue(worker.Role.ToLowerInvariant(), out var m) ? m : null);
+        var modelStr = worker.GetDisplayModel(roleModels);
 
         Assert.Null(modelStr);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="CopilotHive.Dashboard.WorkerInfo.GetDisplayModel"/> returns <c>null</c>
+    /// when the worker has a valid role but the role is not present in the role models map.
+    /// </summary>
+    [Fact]
+    public void WorkerModelFallback_RoleNotInMap_ReturnsNull()
+    {
+        var worker = new CopilotHive.Dashboard.WorkerInfo
+        {
+            Id = "w-fallback-4",
+            Role = "Reviewer",
+            CurrentModel = null,
+        };
+
+        // Role map does NOT contain "reviewer"
+        var roleModels = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["coder"] = "claude-opus-4",
+        };
+
+        var modelStr = worker.GetDisplayModel(roleModels);
+
+        Assert.Null(modelStr);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="CopilotHive.Dashboard.WorkerInfo.GetDisplayModel"/> works
+    /// with an empty role models dictionary, returning only the <see cref="CopilotHive.Dashboard.WorkerInfo.CurrentModel"/>
+    /// when set, or <c>null</c> when idle.
+    /// </summary>
+    [Fact]
+    public void WorkerModelFallback_EmptyRoleModels_ReturnsCurrentModelOrNull()
+    {
+        var emptyRoleModels = new Dictionary<string, string>();
+
+        var busyWorker = new CopilotHive.Dashboard.WorkerInfo
+        {
+            Id = "w-fallback-5a",
+            Role = "Coder",
+            CurrentModel = "gpt-4o",
+        };
+        Assert.Equal("gpt-4o", busyWorker.GetDisplayModel(emptyRoleModels));
+
+        var idleWorker = new CopilotHive.Dashboard.WorkerInfo
+        {
+            Id = "w-fallback-5b",
+            Role = "Coder",
+            CurrentModel = null,
+        };
+        Assert.Null(idleWorker.GetDisplayModel(emptyRoleModels));
     }
 
     /// <summary>
