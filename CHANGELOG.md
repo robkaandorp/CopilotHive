@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Output is truncated to 500 lines (configurable) with truncation notice
   - Invalid repository names return an error listing available repositories
   - Parameters are passed via `ArgumentList.Add()` to prevent command injection
-  - Includes 15 xUnit tests (`ComposerToolTests`) covering null repo manager, unknown repos, parameter validation, and real git operations
+  - Includes 20 xUnit tests (`ComposerToolTests`) covering null repo manager, unknown repos, parameter validation, and real git operations
 
 ### Added
 - **Visible Planning phase in iteration timeline** — `GoalDetail.razor` now shows a dedicated "Planning" phase in the iteration timeline:
