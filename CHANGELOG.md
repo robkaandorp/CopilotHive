@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Brain-generated squash merge commit messages** — merge commits now use concise Brain-generated summaries instead of verbose goal descriptions:
+  - `IDistributedBrain.GenerateCommitMessageAsync()` — new interface method for requesting concise commit summaries (~72 char subject + 2-4 bullet body)
+  - `DistributedBrain` implementation uses `ExecuteBrainAsync` with retry policy; returns null on any failure for graceful fallback
+  - `GoalDispatcher.GenerateMergeCommitMessageAsync()` — new helper that calls Brain first, falls back to `BuildSquashCommitMessage` on null/exception
+  - Commit message preserved format: `Goal: {goalId} — {brainSummary}` (fallback to `Goal: {goalId} — {description}`)
+  - Tests added for Brain success, null return, and exception fallback scenarios
+
 ### Fixed
 - **GoalDetail.razor delete error handling** — delete operation failures now display inline error messages instead of silently failing:
   - Added `_deleteError` field to store error content
