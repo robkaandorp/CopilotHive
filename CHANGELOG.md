@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Reset Brain Session button styling** — improved visual appearance and UX of the Brain reset button on the Orchestrator dashboard:
+  - Changed from unstyled `btn btn-danger` to `chat-action-btn chat-action-btn--danger` classes for consistent dashboard design
+  - Added 🔄 icon prefix to the button label for visual clarity
+  - Added ⏳ spinner icon during reset operation for progress indication
+  - Added `.chat-action-btn--danger` CSS modifier in `site.css` — destructive actions show red hover state (`var(--red)`) to signal intent
 - **Squash merge for feature branches** — `BrainRepoManager.MergeFeatureBranchAsync` now performs squash merges instead of standard merge commits:
   - All commits from a feature branch are combined into a single commit on the base branch
   - Commit message follows the format `Goal: {goalId} — {summary}` (e.g., `Goal: add-user-auth — Add user authentication with JWT tokens`)
