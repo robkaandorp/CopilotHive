@@ -227,7 +227,9 @@ public sealed class TaskExecutor(
                         Deletions = status.Deletions,
                         Pushed = pushed,
                     };
-                    if (!pushed) aggregatedStatus = aggregatedStatus with { Pushed = false };
+                    // Only mark as failed if this repo had changes to push but push failed
+                    if (!pushed && status.FilesChanged > 0)
+                        aggregatedStatus = aggregatedStatus with { Pushed = false };
                 }
 
                 if (pushErrors.Count > 0)
