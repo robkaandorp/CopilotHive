@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Composer git tools** — the Composer now has 5 read-only git tools for inspecting repository commit history, diffs, branches, and blame information:
+  - `git_log` — view commit history with options for branch, path, date filtering, and format (oneline/short/full)
+  - `git_diff` — compare changes between refs with stat-only and path filtering options
+  - `git_show` — view details of a specific commit
+  - `git_branch` — list local or remote branches with optional glob pattern filtering
+  - `git_blame` — show line-by-line authorship for files with optional line range
+  - All tools execute against the Brain's persistent repo clones via `BrainRepoManager.GetClonePath()`
+  - Output is truncated to 500 lines (configurable) with truncation notice
+  - Invalid repository names return an error listing available repositories
+  - Parameters are passed via `ArgumentList.Add()` to prevent command injection
+  - Includes 20 xUnit tests (`ComposerToolTests`) covering null repo manager, unknown repos, parameter validation, and real git operations
+
+### Added
 - **Visible Planning phase in iteration timeline** — `GoalDetail.razor` now shows a dedicated "Planning" phase in the iteration timeline:
   - Planning phase is always displayed as the first phase box in both current and completed iterations
   - During active planning (`GoalPhase.Planning`), only the Planning phase is shown (no fallback phases), with `active` status and ⏳ indicator
