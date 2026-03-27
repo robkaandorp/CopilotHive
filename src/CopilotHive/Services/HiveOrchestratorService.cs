@@ -192,6 +192,7 @@ public sealed class HiveOrchestratorService(
 
             taskQueue.Activate(task, worker.Id);
             workerPool.MarkBusy(worker.Id, task.TaskId);
+            worker.CurrentModel = task.Model;
             logger.LogInformation("Assigning task {TaskId} to worker {WorkerId}", task.TaskId, worker.Id);
 
             await worker.MessageChannel.Writer.WriteAsync(
@@ -316,6 +317,7 @@ public sealed class HiveOrchestratorService(
 
         taskQueue.MarkComplete(complete.TaskId);
         workerPool.MarkIdle(worker.Id);
+        worker.CurrentModel = null;
 
         // Update pipeline state
         var pipeline = pipelineManager.GetByTaskId(complete.TaskId);

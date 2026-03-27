@@ -24,6 +24,8 @@ public sealed class ConnectedWorker
     public DateTime LastHeartbeat { get; set; } = DateTime.UtcNow;
     /// <summary>UTC timestamp when this worker first connected.</summary>
     public DateTime ConnectedAt { get; init; } = DateTime.UtcNow;
+    /// <summary>Model used for the current task, or <c>null</c> when idle.</summary>
+    public string? CurrentModel { get; set; }
 
     /// <summary>
     /// The orchestrator writes messages here; the worker's stream reads from it.

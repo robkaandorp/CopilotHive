@@ -41,7 +41,8 @@ else
         <div class="card">
             <div class="label">Model</div>
             <div class="value" style="font-size:0.9rem;font-family:monospace">
-                @(_worker.Role != "Unspecified" && _info.RoleModels.TryGetValue(_worker.Role.ToLowerInvariant(), out var m) ? m : "—")
+                @(_worker.CurrentModel 
+                    ?? (_worker.Role != "Unspecified" && _info.RoleModels.TryGetValue(_worker.Role.ToLowerInvariant(), out var m) ? m : "—"))
             </div>
         </div>
         <div class="card">

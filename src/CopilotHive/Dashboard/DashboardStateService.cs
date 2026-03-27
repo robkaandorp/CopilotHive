@@ -121,6 +121,7 @@ public sealed class DashboardStateService : IDisposable
                 CurrentTaskId = w.CurrentTaskId,
                 LastHeartbeat = w.LastHeartbeat,
                 ConnectedAt = w.ConnectedAt,
+                CurrentModel = w.CurrentModel,
             }).ToList(),
             Pipelines = pipelines.Select(p => new PipelineInfo
             {
@@ -492,6 +493,8 @@ public sealed class WorkerInfo
     public DateTime LastHeartbeat { get; init; }
     /// <summary>Connection timestamp.</summary>
     public DateTime ConnectedAt { get; init; }
+    /// <summary>Model used for the current task, or <c>null</c> when idle.</summary>
+    public string? CurrentModel { get; init; }
 }
 
 /// <summary>Pipeline state for the dashboard.</summary>
