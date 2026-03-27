@@ -79,15 +79,24 @@
                     <td style="text-align:center">
                         @if (g.Status == GoalStatus.Draft)
                         {
-                            <button class="approve-btn" @onclick="() => ApproveGoal(g.Id)">▶ Approve</button>
+                            <button title="Approve" style="background:none;border:none;cursor:pointer;font-size:1rem;color:var(--text-muted)" @onclick="() => ApproveGoal(g.Id)">▶</button>
                             @if (_approveErrors.ContainsKey(g.Id))
                             {
                                 <span class="error-msg">@_approveErrors[g.Id]</span>
                             }
                         }
+                        @if (g.Status == GoalStatus.Pending)
+                        {
+                            <button title="Revert to Draft" style="background:none;border:none;cursor:pointer;font-size:1rem;color:var(--text-muted)"
+                                @onclick="() => RevertToDraft(g.Id)">↩</button>
+                            @if (_revertErrors.ContainsKey(g.Id))
+                            {
+                                <span class="error-msg">@_revertErrors[g.Id]</span>
+                            }
+                        }
                         @if (g.Status == GoalStatus.Draft || g.Status == GoalStatus.Failed)
                         {
-                            <button title="Delete goal" style="background:none;border:none;cursor:pointer;font-size:1rem;color:var(--red)"
+                            <button title="Delete goal" style="background:none;border:none;cursor:pointer;font-size:1rem;color:var(--text-muted)"
                                 @onclick="() => ConfirmAndDeleteGoal(goalId)">🗑️</button>
                         }
                     </td>
@@ -109,6 +118,7 @@ else if (_loaded)
     private string _priorityFilter = "";
     private bool _loaded;
     private Dictionary<string, string> _approveErrors = new();
+    private Dictionary<string, string> _revertErrors = new();
     private Dictionary<string, GoalStatus> _goalStatusById = new();
 
     protected override async Task OnInitializedAsync()
@@ -224,6 +234,28 @@ else if (_loaded)
         {
             var errorContent = await response.Content.ReadAsStringAsync();
             _approveErrors[goalId] = $"Error {(int)response.StatusCode}: {errorContent}";
+        }
+    }
+
+    private async Task RevertToDraft(string goalId)
+    {
+        _revertErrors.Remove(goalId);
+        var body = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new { status = "Draft" }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+        var response = await HttpClient.PatchAsync($"/api/goals/{goalId}/status", body);
+        if (response.IsSuccessStatusCode)
+        {
+            var goal = _allGoals.FirstOrDefault(g => g.Id == goalId);
+            if (goal is not null)
+                goal.Status = GoalStatus.Draft;
+            ApplyFilters();
+        }
+        else
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            _revertErrors[goalId] = $"Error {(int)response.StatusCode}: {errorContent}";
         }
     }
 }

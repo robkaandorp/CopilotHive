@@ -70,6 +70,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Error message displayed next to the delete button when present
 
 ### Added
+- **"Revert to Draft" button for Pending goals in Goals list** — `Goals.razor` now includes a "↩ Revert to Draft" button for goals with `Pending` status (icon-only style matching delete button):
+  - Button appears in the Actions column for Pending goals with `title="Revert to Draft"` tooltip
+  - Calls `PATCH /api/goals/{id}/status` with `{ "status": "Draft" }` on click
+  - Updates local state and refreshes the list on success
+  - Inline error display via `_revertErrors` dictionary on failure
+  - `RevertToDraft()` method and `_revertErrors` field follow same pattern as existing `ApproveGoal()`
+
 - **"Revert to Draft" button for Pending goals** — `GoalDetail.razor` now includes a "↩ Revert to Draft" button for goals with `Pending` status (lines 26-33):
   - Button appears next to "▶ Approve" for Draft goals (now also shown for Pending)
   - Calls `PATCH /api/goals/{id}/status` with `{ "status": "Draft" }` on click
@@ -78,6 +85,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `_revertError` field and `RevertToDraft()` method follow same pattern as existing `ApproveGoal()`
 
 ### Changed
+- **Approve button in Goals list is now icon-only** — `Goals.razor` Actions column now shows the approve button as "▶" icon only (removed "Approve" text) for Draft goals:
+  - Changed from `<button>▶ Approve</button>` to `<button title="Approve">▶</button>`
+  - The `title` attribute provides a tooltip on hover for discoverability
+  - Reduces column width for better display at half-screen browser layouts
+  - Styling matches the existing delete button pattern (icon-only)
+
 - **PATCH `/api/goals/{id}/status` endpoint validation** — Program.cs (lines 347-352) now validates allowed status transitions:
   - Only `Draft → Pending` and `Pending → Draft` transitions are permitted via the public API
   - Returns `400 Bad Request` with clear error message for invalid transitions (e.g., `InProgress → Draft`, `Draft → Completed`)
