@@ -861,6 +861,116 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Null(currentIteration.PlanReason);
     }
 
+    // ── CurrentModel UI fallback tests ───────────────────────────────────────
+    //
+    // Workers.razor uses: w.CurrentModel ?? (w.Role != "Unspecified" && RoleModels[role] → m ? m : null)
+    // These tests verify that logic in isolation via WorkerInfo + OrchestratorInfo.RoleModels.
+
+    /// <summary>
+    /// Verifies the fallback expression used in Workers.razor:
+    /// when <see cref="CopilotHive.Dashboard.WorkerInfo.CurrentModel"/> is null and the worker has a role
+    /// with a configured default model, the fallback returns that default.
+    /// </summary>
+    [Fact]
+    public void WorkerModelFallback_CurrentModelNull_ReturnRoleDefault()
+    {
+        // Simulate the Workers.razor fallback expression:
+        // var modelStr = w.CurrentModel
+        //     ?? (w.Role != "Unspecified" && _info.RoleModels.TryGetValue(w.Role.ToLowerInvariant(), out var m) ? m : null);
+        var worker = new CopilotHive.Dashboard.WorkerInfo
+        {
+            Id = "w-fallback-1",
+            Role = "Coder",      // non-Unspecified role
+            CurrentModel = null, // idle — no active task model
+        };
+
+        var roleModels = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["coder"] = "claude-opus-4",
+        };
+
+        // Apply the same fallback expression as Workers.razor
+        var modelStr = worker.CurrentModel
+            ?? (worker.Role != "Unspecified" && roleModels.TryGetValue(worker.Role.ToLowerInvariant(), out var m) ? m : null);
+
+        Assert.Equal("claude-opus-4", modelStr);
+    }
+
+    /// <summary>
+    /// Verifies that when <see cref="CopilotHive.Dashboard.WorkerInfo.CurrentModel"/> is set (worker is busy),
+    /// the actual task model takes precedence over the role config default.
+    /// </summary>
+    [Fact]
+    public void WorkerModelFallback_CurrentModelSet_TaskModelTakesPrecedence()
+    {
+        var worker = new CopilotHive.Dashboard.WorkerInfo
+        {
+            Id = "w-fallback-2",
+            Role = "Coder",
+            CurrentModel = "gpt-4o",  // task-specific model
+        };
+
+        var roleModels = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["coder"] = "claude-opus-4",   // role default — must NOT override the task model
+        };
+
+        var modelStr = worker.CurrentModel
+            ?? (worker.Role != "Unspecified" && roleModels.TryGetValue(worker.Role.ToLowerInvariant(), out var m) ? m : null);
+
+        Assert.Equal("gpt-4o", modelStr);
+    }
+
+    /// <summary>
+    /// Verifies that when <see cref="CopilotHive.Dashboard.WorkerInfo.CurrentModel"/> is null AND the worker role
+    /// is <c>"Unspecified"</c>, the fallback returns <c>null</c> (no model to display).
+    /// </summary>
+    [Fact]
+    public void WorkerModelFallback_UnspecifiedRole_ReturnsNull()
+    {
+        var worker = new CopilotHive.Dashboard.WorkerInfo
+        {
+            Id = "w-fallback-3",
+            Role = "Unspecified",
+            CurrentModel = null,
+        };
+
+        var roleModels = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["coder"] = "claude-opus-4",
+        };
+
+        var modelStr = worker.CurrentModel
+            ?? (worker.Role != "Unspecified" && roleModels.TryGetValue(worker.Role.ToLowerInvariant(), out var m) ? m : null);
+
+        Assert.Null(modelStr);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetOrchestratorInfo"/> populates
+    /// <see cref="OrchestratorInfo.RoleModels"/> for all known roles, so the Workers.razor
+    /// fallback has model data available for every valid role.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_PopulatesRoleModels_ForAllKnownRoles()
+    {
+        var config = new HiveConfigFile
+        {
+            Repositories = [],
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        // The Workers.razor fallback uses role.ToLowerInvariant() as the lookup key.
+        // All five roles must be present so the fallback works for any active worker.
+        Assert.True(info.RoleModels.ContainsKey("coder"),     "RoleModels missing 'coder'");
+        Assert.True(info.RoleModels.ContainsKey("tester"),    "RoleModels missing 'tester'");
+        Assert.True(info.RoleModels.ContainsKey("reviewer"),  "RoleModels missing 'reviewer'");
+        Assert.True(info.RoleModels.ContainsKey("docwriter"), "RoleModels missing 'docwriter'");
+        Assert.True(info.RoleModels.ContainsKey("improver"),  "RoleModels missing 'improver'");
+    }
+
     /// <summary>
     /// Helper that constructs a <see cref="DashboardStateService"/> with the given
     /// optional config and an in-memory SQLite goal store.
