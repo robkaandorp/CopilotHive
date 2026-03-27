@@ -78,6 +78,43 @@ Scale services in Swarm:
 docker service scale copilothive_worker=8
 ```
 
+## Multi-Architecture Builds
+
+Both Dockerfiles support multi-architecture builds for `amd64` and `arm64` platforms. The build uses Docker's `TARGETARCH` build argument to select the correct .NET runtime identifier:
+
+- `ARG TARGETARCH` — receives the target platform architecture from Docker BuildKit
+- `ARG RID=${TARGETARCH/amd64/x64}` — maps Docker arch values to .NET runtime identifiers:
+  - `amd64` → `linux-x64`
+  - `arm64` → `linux-arm64`
+
+**Build for a specific platform:**
+
+```bash
+# Build for ARM64 (e.g., Apple Silicon, AWS Graviton)
+docker build --platform linux/arm64 -f docker/orchestrator/Dockerfile -t copilothive-orchestrator:arm64 .
+docker build --platform linux/arm64 -f docker/worker/Dockerfile -t copilothive-worker:arm64 .
+```
+
+**Build and push multi-arch images (requires BuildKit):**
+
+```bash
+# Create a multi-arch builder (once)
+docker buildx create --use --name multiarch
+
+# Build and push both architectures
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -f docker/orchestrator/Dockerfile \
+  -t ghcr.io/your-org/copilothive-orchestrator:latest \
+  --push .
+
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -f docker/worker/Dockerfile \
+  -t ghcr.io/your-org/copilothive-worker:latest \
+  --push .
+```
+
+Without explicit `--platform`, Docker defaults to the host architecture.
+
 ## Environment Variables
 
 ### Required

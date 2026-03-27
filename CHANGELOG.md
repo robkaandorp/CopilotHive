@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Multi-architecture Docker support** — Docker images now support both `amd64` and `arm64` architectures:
+  - Both `docker/orchestrator/Dockerfile` and `docker/worker/Dockerfile` use `ARG TARGETARCH` to receive the target platform from Docker BuildKit
+  - Runtime identifiers dynamically mapped via `${TARGETARCH/amd64/x64}`: Docker `amd64` → `linux-x64`, `arm64` → `linux-arm64`
+  - Building without explicit `--platform` defaults to host architecture; `--platform linux/arm64` produces arm64 binaries
+  - Runtime base images (`mcr.microsoft.com/dotnet/aspnet:10.0`, `ubuntu:24.04`) already support multi-arch
+
 ### Fixed
 - **Push error visibility** — git push failures on workers are now reported back to the orchestrator and Brain instead of being silently swallowed:
   - `TaskExecutor` captures push errors in a `pushErrors` list and appends them to `copilotOutput` under `[Git Push Errors]` section

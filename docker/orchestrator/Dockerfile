@@ -1,5 +1,7 @@
 # ── Build stage ───────────────────────────────────────────────────────────────
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+ARG TARGETARCH
+ARG RID=${TARGETARCH/amd64/x64}
 
 WORKDIR /src
 
@@ -19,7 +21,7 @@ COPY agents/ agents/
 
 RUN dotnet publish src/CopilotHive/CopilotHive.csproj \
     -c Release \
-    -r linux-x64 \
+    -r linux-${RID} \
     --self-contained \
     -o /app/publish
 
