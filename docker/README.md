@@ -80,7 +80,12 @@ docker service scale copilothive_worker=8
 
 ## Multi-Architecture Builds
 
-Both Dockerfiles support multi-architecture builds for `amd64` and `arm64` platforms. The build uses Docker's `TARGETARCH` build argument to select the correct .NET runtime identifier.
+Both Dockerfiles support multi-architecture builds for `amd64` and `arm64` platforms. The build uses Docker's `TARGETARCH` build argument to select the correct .NET runtime identifier:
+
+- `ARG TARGETARCH` — receives the target platform architecture from Docker BuildKit
+- `ARG RID=${TARGETARCH/amd64/x64}` — maps Docker arch values to .NET runtime identifiers:
+  - `amd64` → `linux-x64`
+  - `arm64` → `linux-arm64`
 
 **Build for a specific platform:**
 
