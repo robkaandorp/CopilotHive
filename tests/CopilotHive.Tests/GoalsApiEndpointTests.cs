@@ -340,6 +340,81 @@ public class GoalsApiEndpointTests : IClassFixture<HiveTestFactory>
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 
+    [Fact]
+    public async Task PatchGoalStatus_InvalidTransition_InProgressToDraft_Returns400()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        // Directly set goal to InProgress (bypassing API validation)
+        using var scope = _factory.Services.CreateScope();
+        var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+        var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.InProgress;
+        await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Draft" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.Contains("Invalid transition", body);
+    }
+
+    [Fact]
+    public async Task PatchGoalStatus_InvalidTransition_CompletedToDraft_Returns400()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        // Directly set goal to Completed (bypassing API validation)
+        using var scope = _factory.Services.CreateScope();
+        var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+        var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.Completed;
+        await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Draft" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.Contains("Invalid transition", body);
+    }
+
+    [Fact]
+    public async Task PatchGoalStatus_InvalidTransition_FailedToDraft_Returns400()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        // Directly set goal to Failed (bypassing API validation)
+        using var scope = _factory.Services.CreateScope();
+        var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+        var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.Failed;
+        await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Draft" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.Contains("Invalid transition", body);
+    }
+
     // ── DELETE /api/goals/{id} ────────────────────────────────────────────
 
     [Fact]

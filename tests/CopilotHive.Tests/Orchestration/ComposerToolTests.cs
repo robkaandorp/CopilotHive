@@ -250,6 +250,57 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("✅", result);
     }
 
+    [Fact]
+    public async Task UpdateGoal_Status_InvalidTransition_InProgressToDraft_ReturnsError()
+    {
+        // Set goal to InProgress directly then try to update to Draft
+        await _composer.CreateGoalAsync("transition-inprogress1", "Test goal");
+        var ct = TestContext.Current.CancellationToken;
+        var goal = await _store.GetGoalAsync("transition-inprogress1", ct);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.InProgress;
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync("transition-inprogress1", "status", "Draft");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid transition", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Status_InvalidTransition_CompletedToDraft_ReturnsError()
+    {
+        // Set goal to Completed directly then try to update to Draft
+        await _composer.CreateGoalAsync("transition-completed1", "Test goal");
+        var ct = TestContext.Current.CancellationToken;
+        var goal = await _store.GetGoalAsync("transition-completed1", ct);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.Completed;
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync("transition-completed1", "status", "Draft");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid transition", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Status_InvalidTransition_FailedToDraft_ReturnsError()
+    {
+        // Set goal to Failed directly then try to update to Draft
+        await _composer.CreateGoalAsync("transition-failed1", "Test goal");
+        var ct = TestContext.Current.CancellationToken;
+        var goal = await _store.GetGoalAsync("transition-failed1", ct);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.Failed;
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync("transition-failed1", "status", "Draft");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid transition", result);
+    }
+
     // ── get_goal ──
 
     [Fact]
