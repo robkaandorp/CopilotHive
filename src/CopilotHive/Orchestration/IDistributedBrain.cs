@@ -31,6 +31,16 @@ public interface IDistributedBrain
         CancellationToken ct = default);
 
     /// <summary>
+    /// Generates a concise squash-merge commit message for the specified pipeline.
+    /// Returns a short subject (~72 chars) with 2–4 bullet body lines, or <c>null</c>
+    /// if the Brain is not connected or any error occurs.
+    /// </summary>
+    /// <param name="pipeline">The goal pipeline providing context for the message.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>A concise commit message body (without the "Goal:" prefix), or <c>null</c> on failure.</returns>
+    Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default);
+
+    /// <summary>
     /// Ensures the Brain's read-only clone for a target repository exists and is
     /// up-to-date. Called by GoalDispatcher before starting a goal so the Brain
     /// has file access to the latest base branch code.
