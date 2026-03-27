@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **GoalDetail.razor delete error handling** — delete operation failures now display inline error messages instead of silently failing:
+  - Added `_deleteError` field to store error content
+  - `DeleteCurrentGoal()` method now reads error response and updates `_deleteError` on failure
+  - Error message displayed next to the delete button when present
+
+### Added
+- **"Revert to Draft" button for Pending goals** — `GoalDetail.razor` now includes a "↩ Revert to Draft" button for goals with `Pending` status (lines 26-33):
+  - Button appears next to "▶ Approve" for Draft goals (now also shown for Pending)
+  - Calls `PATCH /api/goals/{id}/status` with `{ "status": "Draft" }` on click
+  - Refreshes goal detail and updates local state on success
+  - Inline error display via `_revertError` field on failure
+  - `_revertError` field and `RevertToDraft()` method follow same pattern as existing `ApproveGoal()`
+
+### Changed
+- **PATCH `/api/goals/{id}/status` endpoint validation** — Program.cs (lines 347-352) now validates allowed status transitions:
+  - Only `Draft → Pending` and `Pending → Draft` transitions are permitted via the public API
+  - Returns `400 Bad Request` with clear error message for invalid transitions (e.g., `InProgress → Draft`, `Draft → Completed`)
+  - `404 Not Found` returned when goal does not exist
+  - Internal transitions (`InProgress`, `Completed`, `Failed`) are handled by `GoalDispatcher.UpdateGoalStatusAsync` (not the API)
+
+### Changed
+- **Composer `update_goal` tool transition validation** — `Composer.cs` (lines 550-554) now validates status transitions:
+  - Added validation to ensure only `Draft → Pending` and `Pending → Draft` transitions are allowed
+  - Returns clear error message: "❌ Invalid transition from {current} to {requested}. Only Draft→Pending and Pending→Draft are allowed."
+  - Complements the API validation to ensure consistent behavior across both UI and Composer chat
+
+### Fixed
 - **Worker model display in dashboard** — Workers list and Worker Detail pages now show the actual model being used for the current task (including premium tier upgrades) instead of the static config default:
   - `ConnectedWorker.CurrentModel` property added — populated when a task is assigned (`task.Model`), cleared when the worker becomes idle
   - `DashboardStateService.WorkerInfo.CurrentModel` added — flows from `ConnectedWorker` to the dashboard via `GetSnapshot()`

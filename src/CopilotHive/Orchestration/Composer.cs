@@ -547,6 +547,11 @@ public sealed class Composer : IAsyncDisposable
                     return $"❌ Invalid status '{value}'. Valid: Draft, Pending.";
                 if (newStatus is not (GoalStatus.Draft or GoalStatus.Pending))
                     return $"❌ Can only set status to Draft or Pending via update_goal.";
+                var validTransition =
+                    (goal.Status == GoalStatus.Draft && newStatus == GoalStatus.Pending) ||
+                    (goal.Status == GoalStatus.Pending && newStatus == GoalStatus.Draft);
+                if (!validTransition)
+                    return $"❌ Invalid transition from {goal.Status.ToDisplayName()} to {newStatus.ToDisplayName()}. Only Draft→Pending and Pending→Draft are allowed.";
                 goal.Status = newStatus;
                 await _goalStore.UpdateGoalAsync(goal);
                 _logger.LogInformation("Composer updated goal '{GoalId}' status to {Status}", id, newStatus);

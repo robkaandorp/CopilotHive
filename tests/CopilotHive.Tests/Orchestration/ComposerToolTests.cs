@@ -193,6 +193,114 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("Unknown field", result);
     }
 
+    [Fact]
+    public async Task UpdateGoal_Status_InvalidTransition_DraftToCompleted_ReturnsError()
+    {
+        // Goal starts in Draft; transitioning to Completed is blocked by the valid-values guard
+        await _composer.CreateGoalAsync("transition-invalid1", "Test goal");
+        var result = await _composer.UpdateGoalAsync("transition-invalid1", "status", "Completed");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Can only set status to Draft or Pending", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Status_InvalidTransition_PendingToCompleted_ReturnsError()
+    {
+        // Pending→Completed is blocked by the valid-values guard
+        await _composer.CreateGoalAsync("transition-invalid2", "Test goal");
+        await _composer.UpdateGoalAsync("transition-invalid2", "status", "Pending");
+        var result = await _composer.UpdateGoalAsync("transition-invalid2", "status", "Completed");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Can only set status to Draft or Pending", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Status_InvalidTransition_DraftToDraft_ReturnsError()
+    {
+        // Draft→Draft is not a valid transition
+        await _composer.CreateGoalAsync("transition-invalid3", "Test goal");
+        var result = await _composer.UpdateGoalAsync("transition-invalid3", "status", "Draft");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid transition", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Status_InvalidTransition_PendingToPending_ReturnsError()
+    {
+        // Pending→Pending is not a valid transition
+        await _composer.CreateGoalAsync("transition-invalid4", "Test goal");
+        await _composer.UpdateGoalAsync("transition-invalid4", "status", "Pending"); // Draft→Pending
+        var result = await _composer.UpdateGoalAsync("transition-invalid4", "status", "Pending");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid transition", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Status_ValidTransition_PendingToDraft_ReturnsSuccess()
+    {
+        // Draft→Pending→Draft is a valid round-trip
+        await _composer.CreateGoalAsync("transition-valid1", "Test goal");
+        await _composer.UpdateGoalAsync("transition-valid1", "status", "Pending");
+        var result = await _composer.UpdateGoalAsync("transition-valid1", "status", "Draft");
+
+        Assert.Contains("✅", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Status_InvalidTransition_InProgressToDraft_ReturnsError()
+    {
+        // Set goal to InProgress directly then try to update to Draft
+        await _composer.CreateGoalAsync("transition-inprogress1", "Test goal");
+        var ct = TestContext.Current.CancellationToken;
+        var goal = await _store.GetGoalAsync("transition-inprogress1", ct);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.InProgress;
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync("transition-inprogress1", "status", "Draft");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid transition", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Status_InvalidTransition_CompletedToDraft_ReturnsError()
+    {
+        // Set goal to Completed directly then try to update to Draft
+        await _composer.CreateGoalAsync("transition-completed1", "Test goal");
+        var ct = TestContext.Current.CancellationToken;
+        var goal = await _store.GetGoalAsync("transition-completed1", ct);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.Completed;
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync("transition-completed1", "status", "Draft");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid transition", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Status_InvalidTransition_FailedToDraft_ReturnsError()
+    {
+        // Set goal to Failed directly then try to update to Draft
+        await _composer.CreateGoalAsync("transition-failed1", "Test goal");
+        var ct = TestContext.Current.CancellationToken;
+        var goal = await _store.GetGoalAsync("transition-failed1", ct);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.Failed;
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync("transition-failed1", "status", "Draft");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid transition", result);
+    }
+
     // ── get_goal ──
 
     [Fact]

@@ -339,6 +339,18 @@ static async Task<int> RunServerAsync(string[] args)
         try
         {
             var status = Enum.Parse<GoalStatus>(update.Status, ignoreCase: true);
+
+            var existing = await store.GetGoalAsync(id);
+            if (existing is null)
+                return Results.NotFound(new { error = $"Goal '{id}' not found." });
+
+            // Only allow Draft↔Pending transitions via the public API
+            var validTransition =
+                (existing.Status == GoalStatus.Draft && status == GoalStatus.Pending) ||
+                (existing.Status == GoalStatus.Pending && status == GoalStatus.Draft);
+            if (!validTransition)
+                return Results.BadRequest(new { error = $"Invalid transition from {existing.Status} to {status}. Only Draft→Pending and Pending→Draft are allowed." });
+
             await store.UpdateGoalStatusAsync(id, status);
             var goal = await store.GetGoalAsync(id);
             return Results.Ok(goal);
