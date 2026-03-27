@@ -13,7 +13,8 @@ namespace CopilotHive.Tests;
 /// Uses <see cref="HiveTestFactory"/> (a <see cref="Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactory{TEntryPoint}"/>
 /// subclass) to boot the real application from <c>Program.cs</c> — no routes are re-implemented here.
 /// </summary>
-public class HealthEndpointTests : IClassFixture<HiveTestFactory>
+[Collection("HiveIntegration")]
+public class HealthEndpointTests
 {
     private readonly HttpClient _client;
     private readonly HiveTestFactory _factory;

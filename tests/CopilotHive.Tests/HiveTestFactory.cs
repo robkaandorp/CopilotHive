@@ -4,6 +4,16 @@ using Microsoft.AspNetCore.Mvc.Testing;
 namespace CopilotHive.Tests;
 
 /// <summary>
+/// Defines the xUnit collection that shares a single <see cref="HiveTestFactory"/> instance
+/// across all integration test classes annotated with <c>[Collection("HiveIntegration")]</c>.
+/// Sharing one factory prevents parallel SQLite write conflicts (Error 8: readonly database).
+/// </summary>
+[CollectionDefinition("HiveIntegration")]
+public class HiveTestCollection : ICollectionFixture<HiveTestFactory>
+{
+}
+
+/// <summary>
 /// Custom <see cref="WebApplicationFactory{TEntryPoint}"/> that boots the real CopilotHive application
 /// using an isolated temporary directory for state (SQLite database, metrics) so tests do not
 /// touch production storage paths such as <c>/app/state</c>.

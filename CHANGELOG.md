@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **SQLite "readonly database" error in CI** — fixed `GoalsApiEndpointTests` and other `HiveTestFactory`-based tests that failed in GitHub Actions with `SQLite Error 8: 'attempt to write a readonly database'`:
+  - Root cause: Multiple test classes using `IClassFixture<HiveTestFactory>` created separate factory instances that raced on the process-wide `STATE_DIR` environment variable, causing one factory to delete another's temp directory while SQLite was still writing to it
+  - Solution: Replaced `IClassFixture<HiveTestFactory>` with `[Collection("HiveIntegration")]` on all 5 test classes (`GoalsApiEndpointTests`, `HealthCheckTests`, `HealthEndpointTests`, `WorkerPoolStatsEndpointTests`, `UtilizationEndpointTests`)
+  - Added `[CollectionDefinition("HiveIntegration")]` class in `HiveTestFactory.cs` implementing `ICollectionFixture<HiveTestFactory>` to ensure a single shared factory instance across the entire test run
+  - Test isolation is preserved: each test uses unique goal IDs via `UniqueId()` helper
+
 ### Added
 - **Goal cancellation** — InProgress or Pending goals can now be cancelled via the API, dashboard UI, or Composer chat:
   - `GoalDispatcher.CancelGoalAsync(string goalId, CancellationToken ct)` — cancels active pipelines (moves to Failed state) or Pending goals (updates status directly); returns `true` if cancelled, `false` if already Done/Completed/Failed
