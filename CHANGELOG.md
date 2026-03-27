@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Push error visibility** — git push failures on workers are now reported back to the orchestrator and Brain instead of being silently swallowed:
+  - `TaskExecutor` captures push errors in a `pushErrors` list and appends them to `copilotOutput` under `[Git Push Errors]` section
+  - Push errors are added to `TaskMetrics.Issues` so they appear in goal tracking and metrics
+  - `GoalDispatcher.BuildWorkerOutputSummary` includes a `⚠️ Git push FAILED — changes were not pushed to the remote` warning when `FilesChanged > 0` and `Pushed == false`
+  - Warning log emitted when a task has file changes but push failed: "Task {TaskId} had {Files} file changes but push failed"
+  - Push failures still don't cause the task to fail (intentional — partial success is valid for some phases like reviewer)
+  - Tests added: `IncludesPushFailureWarning_WhenFilesChangedButNotPushed`, `OmitsPushFailureWarning_WhenPushedSuccessfully`, `OmitsPushFailureWarning_WhenNoFilesChanged`, `HandleTaskCompletionAsync_LogsWarning_WhenFilesChangedButNotPushed`, `HandleTaskCompletionAsync_NoWarning_WhenPushedSuccessfully`
+
+### Fixed
 - **SQLite "readonly database" error in CI** — fixed `GoalsApiEndpointTests` and other `HiveTestFactory`-based tests that failed in GitHub Actions with `SQLite Error 8: 'attempt to write a readonly database'`:
   - Root cause: Multiple test classes using `IClassFixture<HiveTestFactory>` created separate factory instances that raced on the process-wide `STATE_DIR` environment variable, causing one factory to delete another's temp directory while SQLite was still writing to it
   - Solution: Replaced `IClassFixture<HiveTestFactory>` with `[Collection("HiveIntegration")]` on all 5 test classes (`GoalsApiEndpointTests`, `HealthCheckTests`, `HealthEndpointTests`, `WorkerPoolStatsEndpointTests`, `UtilizationEndpointTests`)
