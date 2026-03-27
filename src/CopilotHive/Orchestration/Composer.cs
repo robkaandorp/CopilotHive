@@ -887,7 +887,7 @@ public sealed class Composer : IAsyncDisposable
         if (string.IsNullOrWhiteSpace(repository))
             return "❌ repository is required.";
 
-        var args = new List<string> { "branch" };
+        var args = new List<string> { "branch", "--list" };
 
         if (remote)
             args.Add("-r");
