@@ -215,7 +215,7 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
                         }
                     }
 
-                    // Use first repo's status as the aggregate
+                    // Aggregate status: use first repo's values, but if ANY repo fails to push, mark Pushed=false
                     aggregatedStatus ??= new GitChangeSummary
                     {
                         FilesChanged = status.FilesChanged,
@@ -223,6 +223,7 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
                         Deletions = status.Deletions,
                         Pushed = pushed,
                     };
+                    if (!pushed) aggregatedStatus = aggregatedStatus with { Pushed = false };
                 }
 
                 if (pushErrors.Count > 0)
