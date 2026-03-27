@@ -79,7 +79,7 @@
                     <td style="text-align:center">
                         @if (g.Status == GoalStatus.Draft)
                         {
-                            <button class="approve-btn" title="Approve" @onclick="() => ApproveGoal(g.Id)">▶</button>
+                            <button title="Approve" style="background:none;border:none;cursor:pointer;font-size:1rem;color:var(--text-muted)" @onclick="() => ApproveGoal(g.Id)">▶</button>
                             @if (_approveErrors.ContainsKey(g.Id))
                             {
                                 <span class="error-msg">@_approveErrors[g.Id]</span>
