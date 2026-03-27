@@ -113,7 +113,8 @@ public class WorkerUtilizationServiceTests
 /// <summary>
 /// Integration tests for the <c>GET /health/utilization</c> endpoint.
 /// </summary>
-public class UtilizationEndpointTests : IClassFixture<HiveTestFactory>
+[Collection("HiveIntegration")]
+public class UtilizationEndpointTests
 {
     private readonly HttpClient _client;
 

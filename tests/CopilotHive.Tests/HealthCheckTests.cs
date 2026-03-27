@@ -8,7 +8,8 @@ namespace CopilotHive.Tests;
 /// exercising the thread-safe <c>Interlocked.Increment</c> logic in
 /// <c>Program.cs</c> via the real application.
 /// </summary>
-public class HealthCheckTests : IClassFixture<HiveTestFactory>
+[Collection("HiveIntegration")]
+public class HealthCheckTests
 {
     private readonly HiveTestFactory _factory;
 

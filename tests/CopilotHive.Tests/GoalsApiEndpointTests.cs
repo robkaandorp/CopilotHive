@@ -12,7 +12,8 @@ namespace CopilotHive.Tests;
 /// Verifies correct HTTP status codes and response bodies for all CRUD operations,
 /// including error cases that previously returned 500 Internal Server Error.
 /// </summary>
-public class GoalsApiEndpointTests : IClassFixture<HiveTestFactory>
+[Collection("HiveIntegration")]
+public class GoalsApiEndpointTests
 {
     private static readonly JsonSerializerOptions JsonOpts =
         new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
