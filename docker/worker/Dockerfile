@@ -1,5 +1,6 @@
 # ── Build stage: compile CopilotHive.Worker ───────────────────────────────────
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+ARG TARGETARCH
 
 WORKDIR /src
 
@@ -16,7 +17,7 @@ COPY src/ src/
 
 RUN dotnet publish src/CopilotHive.Worker/CopilotHive.Worker.csproj \
     -c Release \
-    -r linux-x64 \
+    -r linux-${TARGETARCH/amd64/x64} \
     --self-contained \
     -o /worker/publish
 
