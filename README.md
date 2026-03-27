@@ -174,7 +174,7 @@ goals:
 
 - **Server-only mode** — gRPC server + HTTP health endpoint (no CLI mode)
 - **LLM-powered Brain** — `DistributedBrain` uses SharpCoder's `CodingAgent` with a single persistent session, read-only file access to repos, automatic context compaction, and configurable context window (`BRAIN_CONTEXT_WINDOW`)
-- **Composer** — conversational agent for goal decomposition and management with streaming chat UI (`/composer`); uses a persistent SharpCoder session with 7 LLM-callable tools (`create_goal`, `approve_goal`, `update_goal`, `delete_goal`, `get_goal`, `list_goals`, `search_goals`) plus codebase tools (`read_file`, `glob`, `grep`); full Markdown rendering (Markdig) and chat history persistence across page navigations
+- **Composer** — conversational agent for goal decomposition and management with streaming chat UI (`/composer`); uses a persistent SharpCoder session with 7 goal-management tools (`create_goal`, `approve_goal`, `update_goal`, `delete_goal`, `get_goal`, `list_goals`, `search_goals`) plus codebase tools (`read_file`, `glob`, `grep`) and 5 git tools (`git_log`, `git_diff`, `git_show`, `git_branch`, `git_blame`) for repository inspection; full Markdown rendering (Markdig) and chat history persistence across page navigations
 - **Sequential goal processing** — goals process one at a time so the Brain accumulates context across goals
 - **Worker utilization metrics** — `GET /health/utilization` endpoint provides per-role worker utilization and bottleneck detection
 - **Self-improvement loop** — the improver modifies `agents.md` based on accumulated metrics
