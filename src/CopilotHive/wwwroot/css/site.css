@@ -620,6 +620,11 @@ tr:last-child td { border-bottom: none; }
     cursor: not-allowed;
 }
 
+.chat-action-btn--danger:hover:not(:disabled) {
+    color: var(--red);
+    border-color: var(--red);
+}
+
 .chat-hint {
     font-size: 0.8rem;
 }

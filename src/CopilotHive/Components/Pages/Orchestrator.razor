@@ -93,8 +93,8 @@
     </div>
 
     <div style="margin-top:1rem">
-        <button class="btn btn-danger" disabled="@_resettingBrain" @onclick="ResetBrainSessionAsync">
-            @(_resettingBrain ? "Resetting…" : "Reset Brain Session")
+        <button class="chat-action-btn chat-action-btn--danger" disabled="@_resettingBrain" @onclick="ResetBrainSessionAsync">
+            @(_resettingBrain ? "⏳ Resetting…" : "🔄 Reset Brain Session")
         </button>
     </div>
 }
