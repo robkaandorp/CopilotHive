@@ -506,7 +506,7 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Single(detail.Iterations);
         var iteration = detail.Iterations[0];
         Assert.Equal(1, iteration.Number);
-        Assert.Equal(2, iteration.Phases.Count);
+        Assert.Equal(3, iteration.Phases.Count);
 
         var codingPhase = iteration.Phases.First(p => p.Name == "Coding");
         Assert.Equal("Persisted coder output from database.", codingPhase.WorkerOutput);
@@ -616,6 +616,11 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         // Create a pipeline with live output (no persisted WorkerOutput)
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        // Set a plan and advance to Coding so worker phases are visible
+        var plan = new IterationPlan { Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Merging] };
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
+        pipeline.AdvanceTo(GoalPhase.Coding);
         // Iteration defaults to 1
         pipeline.RecordOutput(WorkerRole.Coder, 1, "Live pipeline output should be used.");
         pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(30);
