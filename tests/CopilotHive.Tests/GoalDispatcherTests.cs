@@ -464,6 +464,52 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
 
         Assert.DoesNotContain("Worker output:", summary);
     }
+
+    [Fact]
+    public void IncludesPushFailureWarning_WhenFilesChangedButNotPushed()
+    {
+        var result = new TaskResult
+        {
+            TaskId = "t1",
+            Status = TaskOutcome.Completed,
+            GitStatus = new GitChangeSummary { FilesChanged = 5, Insertions = 20, Deletions = 3, Pushed = false },
+        };
+
+        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.Contains("⚠️ Git push FAILED", summary);
+        Assert.Contains("changes were not pushed to the remote", summary);
+    }
+
+    [Fact]
+    public void OmitsPushFailureWarning_WhenPushedSuccessfully()
+    {
+        var result = new TaskResult
+        {
+            TaskId = "t1",
+            Status = TaskOutcome.Completed,
+            GitStatus = new GitChangeSummary { FilesChanged = 5, Insertions = 20, Deletions = 3, Pushed = true },
+        };
+
+        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.DoesNotContain("Git push FAILED", summary);
+    }
+
+    [Fact]
+    public void OmitsPushFailureWarning_WhenNoFilesChanged()
+    {
+        var result = new TaskResult
+        {
+            TaskId = "t1",
+            Status = TaskOutcome.Completed,
+            GitStatus = new GitChangeSummary { FilesChanged = 0, Pushed = false },
+        };
+
+        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.DoesNotContain("Git push FAILED", summary);
+    }
 }
 
 /// <summary>
@@ -771,6 +817,109 @@ public sealed class GoalDispatcherModelLoggingTests
             l.Message.Contains(goal.Id));
         Assert.True(taskCompletedLog != default, $"Expected task completed log. Logs: {string.Join(", ", logger.Logs.Select(l => l.Message))}");
         Assert.Contains("model=unknown", taskCompletedLog.Message);
+    }
+}
+
+/// <summary>
+/// Tests for push-failure warning log in <see cref="GoalDispatcher.HandleTaskCompletionAsync"/>.
+/// </summary>
+public sealed class GoalDispatcherPushFailureLoggingTests
+{
+    [Fact]
+    public async Task HandleTaskCompletionAsync_LogsWarning_WhenFilesChangedButNotPushed()
+    {
+        // Arrange
+        var logger = new CollectingLogger<GoalDispatcher>();
+        var brain = new FakeDispatcherBrain();
+        var taskQueue = new TaskQueue();
+        var goal = new Goal { Id = "goal-push-fail-test", Description = "Test push failure warning" };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        var taskId = $"task-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+        pipeline.SetActiveTask(taskId);
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain);
+
+        // Act — files changed but Pushed = false (push failed)
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "Coder completed.",
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+            GitStatus = new GitChangeSummary { FilesChanged = 4, Insertions = 30, Deletions = 5, Pushed = false },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert — warning logged for push failure
+        var pushWarning = logger.Logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Warning &&
+            l.Message.Contains("push failed"));
+        Assert.True(pushWarning != default, $"Expected push failure warning log. Logs: {string.Join(", ", logger.Logs.Select(l => l.Message))}");
+        Assert.Contains(taskId, pushWarning.Message);
+    }
+
+    [Fact]
+    public async Task HandleTaskCompletionAsync_NoWarning_WhenPushedSuccessfully()
+    {
+        // Arrange
+        var logger = new CollectingLogger<GoalDispatcher>();
+        var brain = new FakeDispatcherBrain();
+        var taskQueue = new TaskQueue();
+        var goal = new Goal { Id = "goal-push-ok-test", Description = "Test no push warning when pushed ok" };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        var taskId = $"task-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+        pipeline.SetActiveTask(taskId);
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain);
+
+        // Act — files changed and Pushed = true
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "Coder completed.",
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+            GitStatus = new GitChangeSummary { FilesChanged = 4, Insertions = 30, Deletions = 5, Pushed = true },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert — no push failure warning
+        var pushWarning = logger.Logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Warning &&
+            l.Message.Contains("push failed"));
+        Assert.True(pushWarning == default, $"Unexpected push failure warning log found.");
     }
 }
 

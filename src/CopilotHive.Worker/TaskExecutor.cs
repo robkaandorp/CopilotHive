@@ -174,6 +174,7 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
 
             // Collect git status from each repo and push changes
             GitChangeSummary? aggregatedStatus = null;
+            List<string> pushErrors = [];
 
             if (isImprover)
             {
@@ -210,6 +211,7 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
                         catch (Exception ex)
                         {
                             _log.Error($"Push failed for {repo.Name}: {ex.Message}");
+                            pushErrors.Add($"Push failed for {repo.Name}: {ex.Message}");
                         }
                     }
 
@@ -222,6 +224,9 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
                         Pushed = pushed,
                     };
                 }
+
+                if (pushErrors.Count > 0)
+                    copilotOutput += "\n\n[Git Push Errors]\n" + string.Join("\n", pushErrors);
             }
 
             stopwatch.Stop();
@@ -258,6 +263,9 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
             {
                 metrics = new TaskMetrics { Verdict = "PASS" };
             }
+
+            foreach (var err in pushErrors)
+                metrics.Issues.Add(err);
 
             return new TaskResult
             {

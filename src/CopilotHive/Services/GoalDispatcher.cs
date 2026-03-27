@@ -301,6 +301,11 @@ public sealed class GoalDispatcher : BackgroundService
             "Worker output for {GoalId} (phase={Phase}):\n{Output}",
             pipeline.GoalId, pipeline.Phase, outputPreview);
 
+        if (result.GitStatus is { FilesChanged: > 0, Pushed: false })
+            _logger.LogWarning(
+                "Task {TaskId} had {Files} file changes but push failed",
+                result.TaskId, result.GitStatus.FilesChanged);
+
         // Extract structured verdict from worker tool call metrics
         var verdict = "PASS"; // Default: worker completed successfully
         if (result.Metrics is { } metrics)
@@ -1044,6 +1049,9 @@ public sealed class GoalDispatcher : BackgroundService
 
         if (result.GitStatus is { } git && git.FilesChanged > 0)
             parts.Add($"Files changed: {git.FilesChanged} (+{git.Insertions} -{git.Deletions})");
+
+        if (result.GitStatus is { FilesChanged: > 0, Pushed: false })
+            parts.Add("⚠️ Git push FAILED — changes were not pushed to the remote");
 
         if (result.Metrics is { } m)
         {
