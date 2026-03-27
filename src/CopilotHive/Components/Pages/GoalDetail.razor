@@ -10,6 +10,9 @@
 @inject NavigationManager Nav
 @inject HttpClient HttpClient
 
+<a href="/goals" style="display:inline-flex;align-items:center;gap:0.35rem;color:var(--accent);text-decoration:none;font-size:0.9rem;margin-bottom:0.5rem">
+    ← Goals
+</a>
 <div class="goal-header" style="display:flex;align-items:center;gap:1rem;">
     <h1>Goal: @GoalId</h1>
     @if (_detail?.Status == GoalStatus.Draft || _storedGoal?.Status == GoalStatus.Draft)
@@ -82,7 +85,7 @@
                 @foreach (var depId in _detail.DependsOn)
                 {
                     <li>
-                        <a href="/goals/@depId">@depId</a>
+                        <a href="/goals/@depId" class="goal-link">@depId</a>
                         @if (_dependencyStatuses.TryGetValue(depId, out var depStatus))
                         {
                             <span style="margin-left:0.4rem">@GetStatusIcon(depStatus)</span>
@@ -238,7 +241,7 @@
                             {
                                 <details class="collapsible-output">
                                     <summary>Worker Output (@phase.RoleName)</summary>
-                                    <pre>@phase.WorkerOutput</pre>
+                                    <div class="chat-msg-content">@((MarkupString)RenderMarkdown(phase.WorkerOutput))</div>
                                 </details>
                             }
                         </div>
@@ -377,7 +380,7 @@ else if (_storedGoal is not null)
                 @foreach (var depId in _storedGoal.DependsOn)
                 {
                     <li>
-                        <a href="/goals/@depId">@depId</a>
+                        <a href="/goals/@depId" class="goal-link">@depId</a>
                         @if (_dependencyStatuses.TryGetValue(depId, out var depStatus))
                         {
                             <span style="margin-left:0.4rem">@GetStatusIcon(depStatus)</span>
