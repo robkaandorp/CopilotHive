@@ -219,7 +219,16 @@ public sealed class DashboardStateService : IDisposable
 
         foreach (var summary in allSummaries)
         {
-            var phases = new List<PhaseViewInfo>();
+            var phases = new List<PhaseViewInfo>
+            {
+                new PhaseViewInfo
+                {
+                    Name = "Planning",
+                    RoleName = "",
+                    Status = "completed",
+                },
+            };
+
             foreach (var pr in summary.Phases)
             {
                 var roleName = PhaseNameToRoleName(pr.Name);
@@ -260,55 +269,76 @@ public sealed class DashboardStateService : IDisposable
         {
             var currentIter = pipeline.Iteration;
             var isCurrent = pipeline.Phase is not GoalPhase.Done and not GoalPhase.Failed;
-            var planPhases = pipeline.Plan?.Phases ?? [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging];
-            var currentPhases = new List<PhaseViewInfo>();
-            var failedFound = false;
 
-            foreach (var phase in planPhases)
+            // Determine the planning phase status
+            var planningStatus = pipeline.Phase == GoalPhase.Planning ? "active" : "completed";
+
+            var currentPhases = new List<PhaseViewInfo>
             {
-                string status;
-                if (pipeline.StateMachine.CompletedPhases.Contains(phase))
-                    status = "completed";
-                else if (isCurrent && phase == pipeline.Phase)
-                    status = "active";
-                else if (pipeline.Phase == GoalPhase.Failed && !failedFound)
-                    { status = "failed"; failedFound = true; }
-                else if (pipeline.Phase == GoalPhase.Done)
-                    status = "skipped";
-                else
-                    status = "pending";
-
-                var roleName = GetRoleNameSafe(phase);
-                string? workerOutput = null;
-                if (!string.IsNullOrEmpty(roleName))
-                    pipeline.PhaseOutputs.TryGetValue($"{roleName}-{currentIter}", out workerOutput);
-
-                var isTestPhase = phase == GoalPhase.Testing;
-                var isReviewPhase = phase == GoalPhase.Review;
-                var metrics = pipeline.Metrics;
-                var hasMetrics = status is "completed" or "active" or "failed";
-
-                currentPhases.Add(new PhaseViewInfo
+                new PhaseViewInfo
                 {
-                    Name = phase.ToDisplayName(),
-                    RoleName = roleName,
-                    Status = status,
-                    WorkerOutput = workerOutput,
-                    DurationSeconds = metrics.PhaseDurations.TryGetValue(phase.ToString(), out var dur) ? dur.TotalSeconds : null,
-                    TotalTests = hasMetrics && isTestPhase ? metrics.TotalTests : 0,
-                    PassedTests = hasMetrics && isTestPhase ? metrics.PassedTests : 0,
-                    FailedTests = hasMetrics && isTestPhase ? metrics.FailedTests : 0,
-                    CoveragePercent = hasMetrics && isTestPhase ? metrics.CoveragePercent : 0,
-                    BuildSuccess = hasMetrics && isTestPhase && metrics.BuildSuccess,
-                    ReviewVerdict = hasMetrics && isReviewPhase ? metrics.ReviewVerdict?.ToString() : null,
-                    ReviewIssuesFound = hasMetrics && isReviewPhase ? metrics.ReviewIssuesFound : 0,
-                    Issues = hasMetrics && isReviewPhase ? metrics.ReviewIssues.ToList() :
-                             hasMetrics && isTestPhase ? metrics.Issues.ToList() : [],
-                    Verdict = hasMetrics && isTestPhase ? metrics.Verdict?.ToString() : null,
-                    ProgressReports = status == "active" && pipeline.PhaseStartedAt.HasValue
+                    Name = "Planning",
+                    RoleName = "",
+                    Status = planningStatus,
+                    ProgressReports = planningStatus == "active" && pipeline.PhaseStartedAt.HasValue
                         ? progress.Where(p => p.Timestamp >= pipeline.PhaseStartedAt.Value).ToList()
                         : [],
-                });
+                },
+            };
+
+            // CRITICAL: Only show Planning alone when actively in Planning phase.
+            // Once past Planning, ALWAYS show worker phases (even if Plan is null).
+            if (pipeline.Phase != GoalPhase.Planning)
+            {
+                var planPhases = pipeline.Plan?.Phases ?? [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging];
+                var failedFound = false;
+
+                foreach (var phase in planPhases)
+                {
+                    string status;
+                    if (pipeline.StateMachine.CompletedPhases.Contains(phase))
+                        status = "completed";
+                    else if (isCurrent && phase == pipeline.Phase)
+                        status = "active";
+                    else if (pipeline.Phase == GoalPhase.Failed && !failedFound)
+                        { status = "failed"; failedFound = true; }
+                    else if (pipeline.Phase == GoalPhase.Done)
+                        status = "skipped";
+                    else
+                        status = "pending";
+
+                    var roleName = GetRoleNameSafe(phase);
+                    string? workerOutput = null;
+                    if (!string.IsNullOrEmpty(roleName))
+                        pipeline.PhaseOutputs.TryGetValue($"{roleName}-{currentIter}", out workerOutput);
+
+                    var isTestPhase = phase == GoalPhase.Testing;
+                    var isReviewPhase = phase == GoalPhase.Review;
+                    var metrics = pipeline.Metrics;
+                    var hasMetrics = status is "completed" or "active" or "failed";
+
+                    currentPhases.Add(new PhaseViewInfo
+                    {
+                        Name = phase.ToDisplayName(),
+                        RoleName = roleName,
+                        Status = status,
+                        WorkerOutput = workerOutput,
+                        DurationSeconds = metrics.PhaseDurations.TryGetValue(phase.ToString(), out var dur) ? dur.TotalSeconds : null,
+                        TotalTests = hasMetrics && isTestPhase ? metrics.TotalTests : 0,
+                        PassedTests = hasMetrics && isTestPhase ? metrics.PassedTests : 0,
+                        FailedTests = hasMetrics && isTestPhase ? metrics.FailedTests : 0,
+                        CoveragePercent = hasMetrics && isTestPhase ? metrics.CoveragePercent : 0,
+                        BuildSuccess = hasMetrics && isTestPhase && metrics.BuildSuccess,
+                        ReviewVerdict = hasMetrics && isReviewPhase ? metrics.ReviewVerdict?.ToString() : null,
+                        ReviewIssuesFound = hasMetrics && isReviewPhase ? metrics.ReviewIssuesFound : 0,
+                        Issues = hasMetrics && isReviewPhase ? metrics.ReviewIssues.ToList() :
+                                 hasMetrics && isTestPhase ? metrics.Issues.ToList() : [],
+                        Verdict = hasMetrics && isTestPhase ? metrics.Verdict?.ToString() : null,
+                        ProgressReports = status == "active" && pipeline.PhaseStartedAt.HasValue
+                            ? progress.Where(p => p.Timestamp >= pipeline.PhaseStartedAt.Value).ToList()
+                            : [],
+                    });
+                }
             }
 
             iterations.Add(new IterationViewInfo
@@ -316,6 +346,7 @@ public sealed class DashboardStateService : IDisposable
                 Number = currentIter,
                 Phases = currentPhases,
                 IsCurrent = isCurrent,
+                PlanReason = pipeline.Plan?.Reason,
             });
         }
 
@@ -555,6 +586,8 @@ public sealed class IterationViewInfo
     public List<PhaseViewInfo> Phases { get; init; } = [];
     /// <summary>Whether this is the currently executing iteration.</summary>
     public bool IsCurrent { get; init; }
+    /// <summary>Brain's reasoning for the iteration plan, or null if not yet planned.</summary>
+    public string? PlanReason { get; init; }
 }
 
 /// <summary>Detail for a single phase within an iteration.</summary>

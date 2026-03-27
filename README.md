@@ -201,6 +201,7 @@ goals:
 - **Iteration summaries** — structured per-iteration metrics (phases, test counts, review verdicts) recorded in goals.yaml for observability without reading logs
 - **Phase duration logging** — each pipeline phase logs its wall-clock duration in seconds when it completes (e.g., "Phase Testing for goal X completed in 45.2s")
 - **Goal dependency visualization** — the dashboard displays dependency relationships: 🔗 icon for unblocked goals (all dependencies completed), ⏳ icon for blocked goals (dependencies pending); the goal detail page lists dependencies as clickable links with status indicators
+- **Visible Planning phase in iteration timeline** — the Goal Detail page shows the Brain's planning phase as a distinct phase box (active when planning, completed once plan is determined), with the plan's reasoning displayed below the phase bar for transparency
 
 ## Contributing
 
