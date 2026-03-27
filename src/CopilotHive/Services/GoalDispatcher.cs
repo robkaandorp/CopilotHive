@@ -92,6 +92,54 @@ public sealed class GoalDispatcher : BackgroundService
     }
 
     /// <summary>
+    /// Cancels an InProgress or Pending goal. If a pipeline exists, it is moved to the Failed
+    /// state. The goal status is set to Failed with reason "Cancelled by user".
+    /// Returns true if the goal was cancelled, false if it was not in a cancellable state.
+    ///
+    /// Note: The current worker task may still be running when cancel is called.
+    /// That's OK — when the worker reports back via HandleTaskCompletionAsync,
+    /// the pipeline will already be in Failed state, so the result will be ignored
+    /// (the existing early-exit check at the top of HandleTaskCompletionAsync handles this).
+    /// </summary>
+    /// <param name="goalId">The goal to cancel.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>
+    /// <c>true</c> if the goal was successfully cancelled; <c>false</c> if the goal
+    /// is already Done, Completed, or Failed and cannot be cancelled.
+    /// </returns>
+    public async Task<bool> CancelGoalAsync(string goalId, CancellationToken ct = default)
+    {
+        var pipeline = _pipelineManager.GetByGoalId(goalId);
+
+        if (pipeline is not null)
+        {
+            // InProgress goal — active pipeline exists
+            if (pipeline.Phase is GoalPhase.Done or GoalPhase.Failed)
+                return false;
+
+            await MarkGoalFailed(pipeline, "Cancelled by user", ct);
+            _pipelineManager.RemovePipeline(goalId);
+            _dispatchedGoals.TryRemove(goalId, out _);
+            _logger.LogInformation("Goal {GoalId} cancelled (was InProgress, phase={Phase})", goalId, pipeline.Phase);
+            return true;
+        }
+
+        // No active pipeline — check the store for Pending goals
+        var goal = await _goalManager.GetGoalAsync(goalId, ct);
+        if (goal is null)
+            return false;
+
+        if (goal.Status is not (GoalStatus.InProgress or GoalStatus.Pending))
+            return false;
+
+        await _goalManager.UpdateGoalStatusAsync(goalId, GoalStatus.Failed,
+            new GoalUpdateMetadata { FailureReason = "Cancelled by user" }, ct);
+        _dispatchedGoals.TryRemove(goalId, out _);
+        _logger.LogInformation("Goal {GoalId} cancelled (was {Status})", goalId, goal.Status);
+        return true;
+    }
+
+    /// <summary>
     /// Enqueue a goal for re-dispatch. Called by <see cref="StaleWorkerCleanupService"/>
     /// when a dead worker's task is cleared, or by <see cref="RestoreActivePipelinesAsync"/>
     /// when a stale mid-task pipeline is found on startup.

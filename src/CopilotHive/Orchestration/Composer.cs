@@ -3,6 +3,7 @@ using System.Text.Json;
 using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
+using CopilotHive.Services;
 using Microsoft.Extensions.AI;
 using SharpCoder;
 
@@ -23,6 +24,7 @@ public sealed class Composer : IAsyncDisposable
     private readonly ILogger<Composer> _logger;
     private readonly IGoalStore _goalStore;
     private readonly BrainRepoManager? _repoManager;
+    private readonly GoalDispatcher? _goalDispatcher;
     private readonly string _stateDir;
     private IChatClient? _chatClient;
     private CodingAgent? _agent;
@@ -61,6 +63,7 @@ public sealed class Composer : IAsyncDisposable
         - Approve drafts to queue them for execution (approve_goal)
         - Update existing goals (update_goal)
         - Delete draft or failed goals (delete_goal)
+        - Cancel InProgress or Pending goals (cancel_goal)
         - Inspect repository history (git_log, git_diff, git_show, git_branch, git_blame)
 
         Guidelines for goal creation:
@@ -85,7 +88,8 @@ public sealed class Composer : IAsyncDisposable
         int maxContextTokens = Constants.DefaultBrainContextWindow,
         int maxSteps = Constants.DefaultBrainMaxSteps,
         BrainRepoManager? repoManager = null,
-        string? stateDir = null)
+        string? stateDir = null,
+        GoalDispatcher? goalDispatcher = null)
     {
         _model = model;
         _maxContextTokens = maxContextTokens;
@@ -93,6 +97,7 @@ public sealed class Composer : IAsyncDisposable
         _logger = logger;
         _goalStore = goalStore;
         _repoManager = repoManager;
+        _goalDispatcher = goalDispatcher;
         _stateDir = stateDir ?? "/app/state";
         _session = AgentSession.Create("composer");
 
@@ -401,6 +406,8 @@ public sealed class Composer : IAsyncDisposable
                 "Search goals by text query across ID, description, and failure reason."),
             AIFunctionFactory.Create(DeleteGoalAsync, "delete_goal",
                 "Permanently delete a goal. Only Draft or Failed goals can be deleted."),
+            AIFunctionFactory.Create(CancelGoalAsync, "cancel_goal",
+                "Cancel an InProgress or Pending goal, stopping its execution."),
             AIFunctionFactory.Create(GitLogAsync, "git_log",
                 "View commit history for a repository branch or path."),
             AIFunctionFactory.Create(GitDiffAsync, "git_diff",
@@ -511,6 +518,32 @@ public sealed class Composer : IAsyncDisposable
 
         _logger.LogInformation("Composer deleted goal '{GoalId}'", id);
         return $"✅ Goal '{id}' has been permanently deleted.";
+    }
+
+    [Description("Cancel an InProgress or Pending goal, stopping its execution.")]
+    internal async Task<string> CancelGoalAsync(
+        [Description("Goal ID to cancel")] string id)
+    {
+        var error = Shared.ToolValidation.Check(
+            (!string.IsNullOrWhiteSpace(id), "id is required"));
+        if (error is not null) return error;
+
+        var goal = await _goalStore.GetGoalAsync(id);
+        if (goal is null)
+            return $"❌ Goal '{id}' not found.";
+
+        if (goal.Status is not (GoalStatus.InProgress or GoalStatus.Pending))
+            return $"❌ Goal '{id}' is {goal.Status.ToDisplayName()}. Only InProgress or Pending goals can be cancelled.";
+
+        if (_goalDispatcher is null)
+            return "❌ Goal dispatcher is not available — cannot cancel goals.";
+
+        var cancelled = await _goalDispatcher.CancelGoalAsync(id);
+        if (!cancelled)
+            return $"❌ Goal '{id}' could not be cancelled (it may have already completed or failed).";
+
+        _logger.LogInformation("Composer cancelled goal '{GoalId}'", id);
+        return $"✅ Goal '{id}' has been cancelled.";
     }
 
     [Description("Update a field on an existing goal.")]

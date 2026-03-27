@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Goal cancellation** — InProgress or Pending goals can now be cancelled via the API, dashboard UI, or Composer chat:
+  - `GoalDispatcher.CancelGoalAsync(string goalId, CancellationToken ct)` — cancels active pipelines (moves to Failed state) or Pending goals (updates status directly); returns `true` if cancelled, `false` if already Done/Completed/Failed
+  - `POST /api/goals/{id}/cancel` endpoint — returns `200 OK` on success, `404 Not Found` if goal doesn't exist, `400 Bad Request` if goal is not InProgress or Pending
+  - `GoalDetail.razor` — shows "⏹ Cancel Goal" button for InProgress and Pending goals with browser confirmation dialog; errors displayed inline (not silently swallowed)
+  - `Composer.CancelGoalAsync` tool — `cancel_goal` function available in Composer chat; validates goal status before calling dispatcher; returns descriptive error messages for non-cancellable goals
+  - `GoalManager.GetGoalAsync` — new method to retrieve a goal by ID from any registered source
+  - 11 xUnit tests (`GoalDispatcherCancelTests`) covering: cancel InProgress pipeline, cancel Pending goal without pipeline, reject cancel for Done/Failed/Completed goals, reject cancel for unknown goal IDs
+
+### Added
 - **GitHub Actions CI workflow** — automated build, test, and container image push to GitHub Container Registry (ghcr.io):
   - New `.github/workflows/ci.yml` workflow triggered on pushes to `develop` branch only
   - `test` job — restores dependencies (`dotnet restore`), builds in Release mode (`dotnet build`), and runs the full xUnit test suite (`dotnet test`)

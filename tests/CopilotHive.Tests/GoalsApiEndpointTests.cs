@@ -491,4 +491,65 @@ public class GoalsApiEndpointTests : IClassFixture<HiveTestFactory>
         Assert.Equal(JsonValueKind.Array, doc.RootElement.ValueKind);
         Assert.Equal(0, doc.RootElement.GetArrayLength());
     }
+
+    // ── POST /api/goals/{id}/cancel ─────────────────────────────────────
+
+    [Fact]
+    public async Task CancelGoal_InProgressGoal_Returns200OK()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        // Set goal to InProgress directly
+        using var scope = _factory.Services.CreateScope();
+        var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+        var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.InProgress;
+        await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var response = await _client.PostAsync($"/api/goals/{id}/cancel", null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task CancelGoal_PendingGoal_Returns200OK()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        var response = await _client.PostAsync($"/api/goals/{id}/cancel", null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task CancelGoal_CompletedGoal_Returns400BadRequest()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        // Set goal to Completed directly
+        using var scope = _factory.Services.CreateScope();
+        var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+        var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.Completed;
+        await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var response = await _client.PostAsync($"/api/goals/{id}/cancel", null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.Contains("cannot be cancelled", body);
+    }
+
+    [Fact]
+    public async Task CancelGoal_NonExistentGoal_Returns404NotFound()
+    {
+        var response = await _client.PostAsync("/api/goals/nonexistent-goal-xyz/cancel", null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
 }

@@ -156,6 +156,31 @@ public sealed class GoalManager
     }
 
     /// <summary>
+    /// Retrieves a goal by ID by searching all registered <see cref="IGoalStore"/> sources.
+    /// Returns <c>null</c> if no source contains the goal.
+    /// </summary>
+    /// <param name="goalId">Identifier of the goal to retrieve.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The matching <see cref="Goal"/>, or <c>null</c> if not found.</returns>
+    public async Task<Goal?> GetGoalAsync(string goalId, CancellationToken ct = default)
+    {
+        List<IGoalSource> snapshot;
+        lock (_lock) { snapshot = [.. _sources]; }
+
+        foreach (var source in snapshot)
+        {
+            if (source is IGoalStore store)
+            {
+                var goal = await store.GetGoalAsync(goalId, ct);
+                if (goal is not null)
+                    return goal;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Returns the list of dependency IDs from <paramref name="dependsOn"/> that are not yet
     /// satisfied.  A dependency is considered satisfied only when the backing source knows about
     /// it and reports its status as <see cref="GoalStatus.Completed"/>.

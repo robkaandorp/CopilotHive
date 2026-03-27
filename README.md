@@ -174,12 +174,12 @@ goals:
 
 - **Server-only mode** — gRPC server + HTTP health endpoint (no CLI mode)
 - **LLM-powered Brain** — `DistributedBrain` uses SharpCoder's `CodingAgent` with a single persistent session, read-only file access to repos, automatic context compaction, and configurable context window (`BRAIN_CONTEXT_WINDOW`)
-- **Composer** — conversational agent for goal decomposition and management with streaming chat UI (`/composer`); uses a persistent SharpCoder session with 7 goal-management tools (`create_goal`, `approve_goal`, `update_goal`, `delete_goal`, `get_goal`, `list_goals`, `search_goals`) plus codebase tools (`read_file`, `glob`, `grep`) and 5 git tools (`git_log`, `git_diff`, `git_show`, `git_branch`, `git_blame`) for repository inspection; full Markdown rendering (Markdig) and chat history persistence across page navigations
+- **Composer** — conversational agent for goal decomposition and management with streaming chat UI (`/composer`); uses a persistent SharpCoder session with 8 goal-management tools (`create_goal`, `approve_goal`, `update_goal`, `delete_goal`, `cancel_goal`, `get_goal`, `list_goals`, `search_goals`) plus codebase tools (`read_file`, `glob`, `grep`) and 5 git tools (`git_log`, `git_diff`, `git_show`, `git_branch`, `git_blame`) for repository inspection; full Markdown rendering (Markdig) and chat history persistence across page navigations
 - **Sequential goal processing** — goals process one at a time so the Brain accumulates context across goals
 - **Worker utilization metrics** — `GET /health/utilization` endpoint provides per-role worker utilization and bottleneck detection
 - **Self-improvement loop** — the improver modifies `agents.md` based on accumulated metrics
 - **SQLite persistence** — `PipelineStore` with auto-migration for pipeline state; `SqliteGoalStore` as the primary source of truth for goals with full CRUD, search, and iteration history
-- **Goals REST API** — `GET/POST/PATCH/DELETE /api/goals`, `GET /api/goals/{id}`, `GET /api/goals/search?q=…&status=…`
+- **Goals REST API** — `GET/POST/PATCH/DELETE /api/goals`, `GET /api/goals/{id}`, `GET /api/goals/search?q=…&status=…`, `POST /api/goals/{id}/cancel`
 - **Dashboard** — Blazor Server UI with goals browser (filterable/searchable), goal detail with iteration timeline and dependency visualization, worker status (including actual model being used per task with premium tier display), orchestrator view (Brain + Composer stats, with Reset Brain Session button), live logs, and configuration; configuration page displays `hive-config.yaml` with YAML syntax highlighting (keys, comments, booleans, numbers)
 - **Config repo** — externalized agent instructions and goals (`CopilotHive-Config`)
 - **Multi-repo goal support** — goals can target any accessible Git repository

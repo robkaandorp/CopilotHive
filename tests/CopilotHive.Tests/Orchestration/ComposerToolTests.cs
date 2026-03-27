@@ -1,6 +1,8 @@
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
+using CopilotHive.Services;
+using CopilotHive.Workers;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -510,6 +512,145 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("not found", result);
     }
 
+    // ── cancel_goal ──
+
+    [Fact]
+    public async Task CancelGoal_InProgressGoal_ReturnsSuccessMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            // Create goal and set to InProgress
+            await _composer.CreateGoalAsync("cancel-inprogress", "Goal to cancel");
+            var goal = await _store.GetGoalAsync("cancel-inprogress", ct);
+            Assert.NotNull(goal);
+            goal!.Status = GoalStatus.InProgress;
+            await _store.UpdateGoalAsync(goal, ct);
+
+            // Create dispatcher and composer with GoalDispatcher
+            // Pass real store so cancellation updates propagate to the persisted goal
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var goalManager = new GoalManager();
+            goalManager.AddSource(new FakeGoalSource(goal, _store));
+            var pipelineManager = new GoalPipelineManager();
+            var dispatcher = new GoalDispatcher(
+                goalManager,
+                pipelineManager,
+                new TaskQueue(),
+                new GrpcWorkerGateway(new WorkerPool()),
+                new TaskCompletionNotifier(),
+                NullLogger<GoalDispatcher>.Instance,
+                repoManager);
+
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir,
+                goalDispatcher: dispatcher);
+
+            var result = await composer.CancelGoalAsync("cancel-inprogress");
+
+            Assert.Contains("✅", result);
+            Assert.Contains("cancelled", result);
+
+            // Verify the persisted goal state was updated
+            var persistedGoal = await _store.GetGoalAsync("cancel-inprogress", ct);
+            Assert.NotNull(persistedGoal);
+            Assert.Equal(GoalStatus.Failed, persistedGoal!.Status);
+            Assert.Equal("Cancelled by user", persistedGoal.FailureReason);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task CancelGoal_PendingGoal_ReturnsSuccessMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            // Create goal in Pending status
+            await _composer.CreateGoalAsync("cancel-pending", "Goal to cancel");
+            await _composer.ApproveGoalAsync("cancel-pending"); // Draft → Pending
+
+            var goal = await _store.GetGoalAsync("cancel-pending", ct);
+            Assert.NotNull(goal);
+
+            // Create dispatcher and composer with GoalDispatcher
+            // Pass real store so cancellation updates propagate to the persisted goal
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var goalManager = new GoalManager();
+            goalManager.AddSource(new FakeGoalSource(goal!, _store));
+            var pipelineManager = new GoalPipelineManager();
+            var dispatcher = new GoalDispatcher(
+                goalManager,
+                pipelineManager,
+                new TaskQueue(),
+                new GrpcWorkerGateway(new WorkerPool()),
+                new TaskCompletionNotifier(),
+                NullLogger<GoalDispatcher>.Instance,
+                repoManager);
+
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir,
+                goalDispatcher: dispatcher);
+
+            var result = await composer.CancelGoalAsync("cancel-pending");
+
+            Assert.Contains("✅", result);
+            Assert.Contains("cancelled", result);
+
+            // Verify the persisted goal state was updated
+            var persistedGoal = await _store.GetGoalAsync("cancel-pending", ct);
+            Assert.NotNull(persistedGoal);
+            Assert.Equal(GoalStatus.Failed, persistedGoal!.Status);
+            Assert.Equal("Cancelled by user", persistedGoal.FailureReason);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task CancelGoal_CompletedGoal_ReturnsErrorMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create goal and set to Completed
+        await _composer.CreateGoalAsync("cancel-completed", "Completed goal");
+        var goal = await _store.GetGoalAsync("cancel-completed", ct);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.Completed;
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.CancelGoalAsync("cancel-completed");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Only InProgress or Pending goals can be cancelled", result);
+    }
+
+    [Fact]
+    public async Task CancelGoal_NonExistentGoal_ReturnsErrorMessage()
+    {
+        var result = await _composer.CancelGoalAsync("nonexistent-goal");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not found", result);
+    }
+
     // ── git tools — no repo manager configured ──
 
     [Fact]
@@ -864,5 +1005,81 @@ public sealed class ComposerToolTests : IDisposable
             Directory.Delete(tmpDir, recursive: true);
         }
     }
+}
+
+/// <summary>
+/// Minimal <see cref="IGoalSource"/> and <see cref="IGoalStore"/> used for cancel tests that need GoalDispatcher.
+/// Optionally delegates status updates to a real store for integration testing.
+/// </summary>
+internal sealed class FakeGoalSource : IGoalSource, IGoalStore
+{
+    private readonly Goal _goal;
+    private readonly IGoalStore? _realStore;
+
+    public FakeGoalSource(Goal goal, IGoalStore? realStore = null)
+    {
+        _goal = goal;
+        _realStore = realStore;
+    }
+
+    public string Name => "fake-source";
+
+    public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+        _goal.Status == GoalStatus.Pending
+            ? Task.FromResult<IReadOnlyList<Goal>>([_goal])
+            : Task.FromResult<IReadOnlyList<Goal>>([]);
+
+    public async Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
+    {
+        if (goalId == _goal.Id)
+        {
+            _goal.Status = status;
+            if (metadata?.FailureReason is not null)
+                _goal.FailureReason = metadata.FailureReason;
+        }
+
+        // Also delegate to real store if provided (for integration testing)
+        if (_realStore is not null)
+        {
+            var storeGoal = await _realStore.GetGoalAsync(goalId, ct);
+            if (storeGoal is not null)
+            {
+                storeGoal.Status = status;
+                if (metadata?.FailureReason is not null)
+                    storeGoal.FailureReason = metadata.FailureReason;
+                await _realStore.UpdateGoalAsync(storeGoal, ct);
+            }
+        }
+    }
+
+    public Task<Goal?> GetGoalAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<Goal?>(_goal.Id == goalId ? _goal : null);
+
+    public Task<IReadOnlyList<Goal>> GetAllGoalsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>([_goal]);
+
+    public Task<IReadOnlyList<Goal>> GetGoalsByStatusAsync(GoalStatus status, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(_goal.Status == status ? [_goal] : []);
+
+    public Task<IReadOnlyList<Goal>> SearchGoalsAsync(string query, GoalStatus? status = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>([]);
+
+    public Task<Goal> CreateGoalAsync(Goal goal, CancellationToken ct = default) =>
+        Task.FromResult(goal);
+
+    public Task UpdateGoalAsync(Goal goal, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<bool> DeleteGoalAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult(true);
+
+    public Task<int> ImportGoalsAsync(IEnumerable<Goal> goals, CancellationToken ct = default) =>
+        Task.FromResult(0);
+
+    public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<IterationSummary>>([]);
+
+    public Task AddIterationAsync(string goalId, IterationSummary summary, CancellationToken ct = default) =>
+        Task.CompletedTask;
 }
 
