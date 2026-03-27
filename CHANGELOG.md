@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Tests added for Brain success, null return, and exception fallback scenarios
 
 ### Fixed
+- **BrainRepoManagerTests CI failures** — 5 tests in `BrainRepoManagerTests.cs` now use temporary directories instead of hardcoded absolute paths (`/app/state`, `/custom/path`), fixing `UnauthorizedAccessException` on GitHub Actions ubuntu-latest runner:
+  - Tests implement `IDisposable` to clean up temp directories after execution
+  - Path assertions use `StartsWith`/`EndsWith` against temp-based paths instead of hardcoded values
+  - Tests pass on both Linux (GitHub Actions) and Docker (worker environment)
 - **GoalDetail.razor delete error handling** — delete operation failures now display inline error messages instead of silently failing:
   - Added `_deleteError` field to store error content
   - `DeleteCurrentGoal()` method now reads error response and updates `_deleteError` on failure
