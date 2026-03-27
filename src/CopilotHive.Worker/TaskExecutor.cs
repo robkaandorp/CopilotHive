@@ -9,12 +9,16 @@ namespace CopilotHive.Worker;
 /// Orchestrates the full lifecycle of a single task:
 /// clone repos, handle branches, run Copilot, collect results.
 /// </summary>
-public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? toolBridge = null)
+public sealed class TaskExecutor(
+    IAgentRunner agentRunner,
+    IToolCallBridge? toolBridge = null,
+    IGitOperations? gitOperations = null)
 {
     private const string WorkRoot = "/copilot-home";
     private const string ConfigRepoDir = "/config-repo";
     private const string ConfigAgentsDir = "/config-repo/agents";
     private readonly WorkerLogger _log = new("Task");
+    private readonly IGitOperations _git = gitOperations ?? new DefaultGitOperations();
 
     /// <summary>
     /// Executes the full lifecycle of a task: cloning repos, branching,
@@ -48,10 +52,10 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
 
                     // Clean up any previous clone
                     if (Directory.Exists(targetDir))
-                        await GitOperations.ForceDeleteDirectoryAsync(targetDir);
+                        await _git.ForceDeleteDirectoryAsync(targetDir);
 
                     Console.WriteLine($"[Task] Cloning {repo.Name} from {repo.Url}");
-                    await GitOperations.CloneRepositoryAsync(repo.Url, targetDir, ct);
+                    await _git.CloneRepositoryAsync(repo.Url, targetDir, ct);
 
                     // Handle branch operations
                     if (task.BranchInfo is { } branchInfo && !string.IsNullOrEmpty(branchInfo.FeatureBranch))
@@ -64,19 +68,19 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
                         {
                             case BranchAction.Create:
                                 _log.Info($"Creating branch {branchInfo.FeatureBranch} from {baseBranch}");
-                                await GitOperations.CreateBranchAsync(targetDir, branchInfo.FeatureBranch, baseBranch, ct);
+                                await _git.CreateBranchAsync(targetDir, branchInfo.FeatureBranch, baseBranch, ct);
                                 break;
 
                             case BranchAction.Checkout:
                                 try
                                 {
                                     _log.Info($"Checking out branch {branchInfo.FeatureBranch}");
-                                    await GitOperations.CheckoutBranchAsync(targetDir, branchInfo.FeatureBranch, ct);
+                                    await _git.CheckoutBranchAsync(targetDir, branchInfo.FeatureBranch, ct);
                                 }
                                 catch (GitOperationException ex)
                                 {
                                     _log.Warn($"Checkout failed ({ex.Message}), creating branch from {baseBranch}");
-                                    await GitOperations.CreateBranchAsync(targetDir, branchInfo.FeatureBranch, baseBranch, ct);
+                                    await _git.CreateBranchAsync(targetDir, branchInfo.FeatureBranch, baseBranch, ct);
                                 }
                                 break;
 
@@ -102,7 +106,7 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
                 && !string.IsNullOrEmpty(bi1.FeatureBranch) && !string.IsNullOrEmpty(bi1.BaseBranch))
             {
                 var (_, targetDir) = repoDirectories[0];
-                mergeBase = await GitOperations.GetMergeBaseAsync(targetDir, bi1.BaseBranch, ct);
+                mergeBase = await _git.GetMergeBaseAsync(targetDir, bi1.BaseBranch, ct);
                 if (mergeBase != null)
                     _log.Info($"Merge base: {mergeBase[..12]}");
                 else
@@ -192,7 +196,7 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
                 foreach (var (repo, dir) in repoDirectories)
                 {
                     var baseBranch = task.BranchInfo?.BaseBranch ?? repo.DefaultBranch;
-                    var status = await GitOperations.GetGitStatusAsync(dir, baseBranch, ct);
+                    var status = await _git.GetGitStatusAsync(dir, baseBranch, ct);
 
                     // Push if there are changes, we have a feature branch, and the role is allowed to push.
                     // Reviewer is read-only — it must never push changes to the coder's branch.
@@ -204,7 +208,7 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
                     {
                         try
                         {
-                            await GitOperations.PushBranchAsync(dir, bi.FeatureBranch, ct);
+                            await _git.PushBranchAsync(dir, bi.FeatureBranch, ct);
                             pushed = true;
                             _log.Info($"Pushed {bi.FeatureBranch} for {repo.Name}");
                         }
@@ -334,7 +338,7 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
     {
         for (var attempt = 0; attempt < maxRetries; attempt++)
         {
-            if (!await GitOperations.HasUncommittedChangesAsync(workDir, ct))
+            if (!await _git.HasUncommittedChangesAsync(workDir, ct))
                 return previousOutput;
 
             _log.Info($"Working directory has uncommitted changes (attempt {attempt + 1}/{maxRetries}), prompting Copilot to commit...");
@@ -352,7 +356,7 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
             previousOutput += "\n\n[Auto-commit prompt]\n" + cleanupOutput;
         }
 
-        if (await GitOperations.HasUncommittedChangesAsync(workDir, ct))
+        if (await _git.HasUncommittedChangesAsync(workDir, ct))
             _log.Error("Working directory still dirty after commit retries — uncommitted changes may be lost");
 
         return previousOutput;
@@ -438,7 +442,7 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
             _log.Error($"Agents.md still over limit after {WorkerConstants.AgentsMdMaxRetries} retries: {fileNames}. Discarding all changes.");
 
             // Discard all agents.md changes to keep config repo clean
-            await GitOperations.RunGitCommandAsync(ConfigRepoDir, "checkout -- agents/", ct);
+            await _git.RunGitCommandAsync(ConfigRepoDir, "checkout -- agents/", ct);
             previousOutput += $"\n\n[Agents.md changes discarded — files still over {WorkerConstants.AgentsMdMaxCharacters}-char limit after {WorkerConstants.AgentsMdMaxRetries} retries: {fileNames}]";
         }
 
@@ -475,7 +479,7 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
         }
 
         _log.Info("Pulling latest config repo for improver...");
-        var (exitCode, stdout, stderr) = await GitOperations.RunGitCommandAsync(
+        var (exitCode, stdout, stderr) = await _git.RunGitCommandAsync(
             ConfigRepoDir, "pull --ff-only", ct);
 
         if (exitCode == 0)
@@ -494,7 +498,7 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
             return new GitChangeSummary();
 
         // Only stage agents/*.agents.md — defense-in-depth to prevent touching other files
-        var (addExit, _, addErr) = await GitOperations.RunGitCommandAsync(
+        var (addExit, _, addErr) = await _git.RunGitCommandAsync(
             ConfigRepoDir, "add agents/*.agents.md", ct);
         if (addExit != 0)
         {
@@ -503,7 +507,7 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
         }
 
         // Check if there are staged changes
-        var (diffExit, diffOut, _) = await GitOperations.RunGitCommandAsync(
+        var (diffExit, diffOut, _) = await _git.RunGitCommandAsync(
             ConfigRepoDir, "diff --cached --name-only", ct);
         if (diffExit != 0 || string.IsNullOrWhiteSpace(diffOut))
         {
@@ -516,7 +520,7 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
         _log.Info($"Improver changed {filesChanged} file(s): {string.Join(", ", changedFiles)}");
 
         // Commit
-        var (commitExit, commitOut, commitErr) = await GitOperations.RunGitCommandAsync(
+        var (commitExit, commitOut, commitErr) = await _git.RunGitCommandAsync(
             ConfigRepoDir, "commit -m \"Improve agents.md files (automated by CopilotHive Improver)\"", ct);
         if (commitExit != 0)
         {
@@ -530,16 +534,16 @@ public sealed class TaskExecutor(IAgentRunner agentRunner, IToolCallBridge? tool
         var pushed = false;
         try
         {
-            var (pullExit, pullOut, pullErr) = await GitOperations.RunGitCommandAsync(
+            var (pullExit, pullOut, pullErr) = await _git.RunGitCommandAsync(
                 ConfigRepoDir, "pull --no-rebase", ct);
             if (pullExit != 0)
             {
                 _log.Error($"git pull failed: {pullErr.Trim()}");
                 // Abort any in-progress merge and try force-pushing our commit
-                await GitOperations.RunGitCommandAsync(ConfigRepoDir, "merge --abort", ct);
+                await _git.RunGitCommandAsync(ConfigRepoDir, "merge --abort", ct);
             }
 
-            var (pushExit, _, pushErr) = await GitOperations.RunGitCommandAsync(
+            var (pushExit, _, pushErr) = await _git.RunGitCommandAsync(
                 ConfigRepoDir, "push", ct);
             if (pushExit != 0)
             {
