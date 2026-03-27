@@ -286,10 +286,11 @@ public sealed class DashboardStateService : IDisposable
                 },
             };
 
-            // Only show worker phases when we actually have a plan (not during Planning phase)
-            if (pipeline.Phase != GoalPhase.Planning && pipeline.Plan is not null)
+            // CRITICAL: Only show Planning alone when actively in Planning phase.
+            // Once past Planning, ALWAYS show worker phases (even if Plan is null).
+            if (pipeline.Phase != GoalPhase.Planning)
             {
-                var planPhases = pipeline.Plan.Phases;
+                var planPhases = pipeline.Plan?.Phases ?? [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging];
                 var failedFound = false;
 
                 foreach (var phase in planPhases)

@@ -649,6 +649,154 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Equal("Live pipeline output should be used.", codingPhase.WorkerOutput);
     }
 
+    // ── Planning Phase Visibility Tests ─────────────────────────────────
+
+    /// <summary>
+    /// During <see cref="GoalPhase.Planning"/> with no Plan set, ONLY the
+    /// Planning phase should be shown with <c>"active"</c> status.
+    /// </summary>
+    [Fact]
+    public void GetGoalDetail_DuringPlanning_OnlyShowsPlanningPhaseActive()
+    {
+        var goal = new Goal
+        {
+            Id = "planning-only-goal",
+            Description = "Goal in planning phase",
+            Status = GoalStatus.InProgress,
+        };
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        // Pipeline starts in Planning phase by default, no plan set
+
+        var goalManager = new GoalManager();
+        var goalSource = new FakeGoalSourceForOutputTests(goal);
+        goalManager.AddSource(goalSource);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: null);
+
+        var detail = service.GetGoalDetail("planning-only-goal");
+
+        Assert.NotNull(detail);
+        var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
+        Assert.NotNull(currentIteration);
+        // Only the Planning phase should be shown
+        Assert.Single(currentIteration.Phases);
+        Assert.Equal("Planning", currentIteration.Phases[0].Name);
+        Assert.Equal("active", currentIteration.Phases[0].Status);
+        // PlanReason should be null since no plan is set
+        Assert.Null(currentIteration.PlanReason);
+    }
+
+    /// <summary>
+    /// After planning completes and a Plan is set, the iteration should show
+    /// Planning (<c>"completed"</c>) plus worker phases, and
+    /// <see cref="IterationViewInfo.PlanReason"/> should carry the plan's reason.
+    /// </summary>
+    [Fact]
+    public void GetGoalDetail_AfterPlanningComplete_ShowsCompletedPlanningPlusWorkerPhases()
+    {
+        var goal = new Goal
+        {
+            Id = "post-planning-goal",
+            Description = "Goal past planning",
+            Status = GoalStatus.InProgress,
+        };
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+
+        // Set a plan with a reason and advance to Coding
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Merging],
+            Reason = "Brain decided to skip review this iteration.",
+        };
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        var goalManager = new GoalManager();
+        var goalSource = new FakeGoalSourceForOutputTests(goal);
+        goalManager.AddSource(goalSource);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: null);
+
+        var detail = service.GetGoalDetail("post-planning-goal");
+
+        Assert.NotNull(detail);
+        var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
+        Assert.NotNull(currentIteration);
+        // Planning (completed) + 3 worker phases = 4 total
+        Assert.Equal(4, currentIteration.Phases.Count);
+        Assert.Equal("Planning", currentIteration.Phases[0].Name);
+        Assert.Equal("completed", currentIteration.Phases[0].Status);
+        Assert.Equal("Coding", currentIteration.Phases[1].Name);
+        Assert.Equal("active", currentIteration.Phases[1].Status);
+        // PlanReason should be populated from the plan
+        Assert.Equal("Brain decided to skip review this iteration.", currentIteration.PlanReason);
+    }
+
+    /// <summary>
+    /// When the pipeline is past Planning but <see cref="GoalPipeline.Plan"/>
+    /// is <c>null</c>, fallback phases (Coding, Testing, Review, Merging)
+    /// must still be shown alongside the completed Planning phase.
+    /// </summary>
+    [Fact]
+    public void GetGoalDetail_PastPlanningWithNullPlan_ShowsFallbackWorkerPhases()
+    {
+        var goal = new Goal
+        {
+            Id = "null-plan-goal",
+            Description = "Goal past planning without a plan",
+            Status = GoalStatus.InProgress,
+        };
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+
+        // Advance past Planning WITHOUT setting a plan (Plan remains null)
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        var goalManager = new GoalManager();
+        var goalSource = new FakeGoalSourceForOutputTests(goal);
+        goalManager.AddSource(goalSource);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: null);
+
+        var detail = service.GetGoalDetail("null-plan-goal");
+
+        Assert.NotNull(detail);
+        var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
+        Assert.NotNull(currentIteration);
+        // Planning (completed) + 4 fallback worker phases = 5 total
+        Assert.Equal(5, currentIteration.Phases.Count);
+        Assert.Equal("Planning", currentIteration.Phases[0].Name);
+        Assert.Equal("completed", currentIteration.Phases[0].Status);
+        // Fallback phases: Coding, Testing, Review, Merging
+        Assert.Equal("Coding", currentIteration.Phases[1].Name);
+        Assert.Equal("Testing", currentIteration.Phases[2].Name);
+        Assert.Equal("Review", currentIteration.Phases[3].Name);
+        Assert.Equal("Merging", currentIteration.Phases[4].Name);
+        // PlanReason should be null since no plan was set
+        Assert.Null(currentIteration.PlanReason);
+    }
+
     /// <summary>
     /// Helper that constructs a <see cref="DashboardStateService"/> with the given
     /// optional config and an in-memory SQLite goal store.
