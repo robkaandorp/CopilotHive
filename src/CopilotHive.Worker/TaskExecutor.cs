@@ -219,17 +219,21 @@ public sealed class TaskExecutor(
                         }
                     }
 
-                    // Aggregate status: use first repo's values, but if ANY repo fails to push, mark Pushed=false
-                    aggregatedStatus ??= new GitChangeSummary
+                    // Only consider repos with actual changes for the aggregate.
+                    // Repos with no changes must never overwrite an existing aggregate or set FilesChanged=0.
+                    if (status.FilesChanged > 0)
                     {
-                        FilesChanged = status.FilesChanged,
-                        Insertions = status.Insertions,
-                        Deletions = status.Deletions,
-                        Pushed = pushed,
-                    };
-                    // Only mark as failed if this repo had changes to push but push failed
-                    if (!pushed && status.FilesChanged > 0)
-                        aggregatedStatus = aggregatedStatus with { Pushed = false };
+                        if (aggregatedStatus is null)
+                            aggregatedStatus = new GitChangeSummary
+                            {
+                                FilesChanged = status.FilesChanged,
+                                Insertions = status.Insertions,
+                                Deletions = status.Deletions,
+                                Pushed = pushed,
+                            };
+                        else if (!pushed)
+                            aggregatedStatus = aggregatedStatus with { Pushed = false };
+                    }
                 }
 
                 if (pushErrors.Count > 0)
