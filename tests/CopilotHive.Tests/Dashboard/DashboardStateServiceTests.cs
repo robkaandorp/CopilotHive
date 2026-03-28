@@ -436,6 +436,62 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Null(detail.RepositoryUrl);
     }
 
+    // ── RepositoryNames ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetGoalDetail"/> populates
+    /// <see cref="GoalDetailInfo.RepositoryNames"/> from the stored goal's
+    /// <see cref="Goal.RepositoryNames"/>.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_PopulatesRepositoryNames()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "repo-names-goal",
+            Description = "Goal with repositories",
+            RepositoryNames = ["repo-alpha", "repo-beta"],
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        using var service = BuildService(config: null);
+
+        var detail = service.GetGoalDetail("repo-names-goal");
+
+        Assert.NotNull(detail);
+        Assert.Equal(2, detail.RepositoryNames.Count);
+        Assert.Contains("repo-alpha", detail.RepositoryNames);
+        Assert.Contains("repo-beta", detail.RepositoryNames);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="GoalDetailInfo.RepositoryNames"/> is an empty list
+    /// (not null) when the stored goal has no repository names.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_RepositoryNames_EmptyWhenGoalHasNoRepos()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "no-repos-goal",
+            Description = "Goal without repositories",
+            // RepositoryNames defaults to empty list
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        using var service = BuildService(config: null);
+
+        var detail = service.GetGoalDetail("no-repos-goal");
+
+        Assert.NotNull(detail);
+        Assert.NotNull(detail.RepositoryNames);
+        Assert.Empty(detail.RepositoryNames);
+    }
+
     // ── GetSnapshot — CurrentModel mapping ───────────────────────────────────
 
     /// <summary>
