@@ -33,6 +33,7 @@ public sealed class Composer : IAsyncDisposable
     private CodingAgent? _agent;
     private AgentSession _session;
 
+    private readonly HiveConfigFile? _hiveConfig;
     private readonly string _systemPrompt;
     private readonly List<AITool> _composerTools;
 
@@ -95,7 +96,8 @@ public sealed class Composer : IAsyncDisposable
         string? stateDir = null,
         GoalDispatcher? goalDispatcher = null,
         IHttpClientFactory? httpClientFactory = null,
-        string? ollamaApiKey = null)
+        string? ollamaApiKey = null,
+        HiveConfigFile? hiveConfig = null)
     {
         _model = model;
         _maxContextTokens = maxContextTokens;
@@ -107,6 +109,7 @@ public sealed class Composer : IAsyncDisposable
         _stateDir = stateDir ?? "/app/state";
         _httpClientFactory = httpClientFactory;
         _ollamaApiKey = string.IsNullOrWhiteSpace(ollamaApiKey) ? null : ollamaApiKey;
+        _hiveConfig = hiveConfig;
         _session = AgentSession.Create("composer");
 
         var (_, _, reasoning) = SDK.ChatClientFactory.ParseProviderModelAndReasoning(model);
@@ -115,6 +118,14 @@ public sealed class Composer : IAsyncDisposable
         _systemPrompt = DefaultSystemPrompt;
         if (_ollamaApiKey is not null)
             _systemPrompt += "\n- Research information on the web (web_search, web_fetch)";
+
+        var repos = _hiveConfig?.Repositories;
+        if (repos is not null && repos.Count > 0)
+        {
+            _systemPrompt += "\n\nConfigured repositories:";
+            foreach (var repo in repos)
+                _systemPrompt += $"\n- {repo.Name} ({repo.Url}, default branch: {repo.DefaultBranch})";
+        }
 
         _composerTools = BuildComposerTools();
     }

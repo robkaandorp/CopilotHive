@@ -1,3 +1,4 @@
+using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
@@ -2006,6 +2007,103 @@ public sealed class ComposerToolTests : IDisposable
         {
             Directory.Delete(tmpDir, recursive: true);
         }
+    }
+
+    // ── system prompt — repo injection ──
+
+    [Fact]
+    public void SystemPrompt_WithConfiguredRepos_IncludesRepoSection()
+    {
+        var hiveConfig = new HiveConfigFile
+        {
+            Repositories =
+            [
+                new RepositoryConfig { Name = "my-repo", Url = "https://github.com/org/my-repo.git", DefaultBranch = "main" },
+            ],
+        };
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            hiveConfig: hiveConfig);
+
+        var prompt = composer.GetSystemPrompt();
+        Assert.Contains("Configured repositories:", prompt);
+        Assert.Contains("my-repo", prompt);
+        Assert.Contains("https://github.com/org/my-repo.git", prompt);
+        Assert.Contains("default branch: main", prompt);
+    }
+
+    [Fact]
+    public void SystemPrompt_WithMultipleRepos_ListsAllRepos()
+    {
+        var hiveConfig = new HiveConfigFile
+        {
+            Repositories =
+            [
+                new RepositoryConfig { Name = "repo-a", Url = "https://github.com/org/repo-a.git", DefaultBranch = "main" },
+                new RepositoryConfig { Name = "repo-b", Url = "https://github.com/org/repo-b.git", DefaultBranch = "develop" },
+            ],
+        };
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            hiveConfig: hiveConfig);
+
+        var prompt = composer.GetSystemPrompt();
+        Assert.Contains("repo-a", prompt);
+        Assert.Contains("repo-b", prompt);
+        Assert.Contains("default branch: develop", prompt);
+    }
+
+    [Fact]
+    public void SystemPrompt_WithNullHiveConfig_DoesNotIncludeRepoSection()
+    {
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            hiveConfig: null);
+
+        var prompt = composer.GetSystemPrompt();
+        Assert.DoesNotContain("Configured repositories:", prompt);
+    }
+
+    [Fact]
+    public void SystemPrompt_WithEmptyRepositoriesList_DoesNotIncludeRepoSection()
+    {
+        var hiveConfig = new HiveConfigFile { Repositories = [] };
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            hiveConfig: hiveConfig);
+
+        var prompt = composer.GetSystemPrompt();
+        Assert.DoesNotContain("Configured repositories:", prompt);
+    }
+
+    [Fact]
+    public void SystemPrompt_WithoutHiveConfig_StillIncludesDefaultContent()
+    {
+        // Backward-compatible: constructor without hiveConfig param still works
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath());
+
+        var prompt = composer.GetSystemPrompt();
+        Assert.Contains("You are the Composer", prompt);
+        Assert.DoesNotContain("Configured repositories:", prompt);
     }
 }
 

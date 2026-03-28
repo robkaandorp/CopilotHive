@@ -133,7 +133,8 @@ static async Task<int> RunServerAsync(string[] args)
             stateDir,
             sp.GetRequiredService<GoalDispatcher>(),
             !string.IsNullOrWhiteSpace(ollamaApiKey) ? sp.GetRequiredService<IHttpClientFactory>() : null,
-            ollamaApiKey);
+            ollamaApiKey,
+            sp.GetService<HiveConfigFile>());
     });
 
     // Dashboard: log capture (registered early so logger provider can reference it)
