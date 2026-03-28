@@ -88,6 +88,12 @@ public sealed class Composer : IAsyncDisposable
         - Check existing goals first to avoid duplication
         - New goals are created as Draft — user must approve before dispatch
         - Use lowercase-kebab-case for goal IDs (e.g. "add-user-auth", "fix-parser-bug")
+        - Documentation: only include docwriting in the goal description when the goal explicitly
+          requires documentation updates (e.g. "update README", "add changelog entry"). Internal
+          refactors, bug fixes, and test additions do NOT need a docwriting phase.
+        - Files NOT to change: if certain files must not be modified (e.g. source files for a
+          docs-only goal, or docs files for an internal refactor), list them explicitly in the
+          description so workers know to leave them untouched.
         """;
 
     /// <summary>

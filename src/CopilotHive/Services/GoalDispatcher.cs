@@ -1507,24 +1507,27 @@ public sealed class GoalDispatcher : BackgroundService
             : "";
 
         return $"""
-            You are the doc-writer. Your ONLY job is to update documentation for the code changes
-            that have already been made on this branch.
+            You are the doc-writer. Your ONLY job is to update the documentation files
+            that the goal explicitly requests. Do NOT update files that are not mentioned
+            in the goal description.
 
-            Goal summary: {pipeline.Description}
+            Goal description: {pipeline.Description}
             {additionalContext}
-            Your tasks (do ALL of these):
-            1. Run `git diff origin/<base-branch>...HEAD --stat` to see ALL files changed on this branch
-            2. Run `git diff origin/<base-branch>...HEAD` to review the full diff
-            3. Update the CHANGELOG.md — add entries under [Unreleased] describing what was added/changed/fixed
-            4. Verify XML doc comments on new/changed public APIs are present and accurate — flag missing or incorrect ones in your report but do NOT edit source code files (that is the coder's job)
-            5. Update README.md if the changes affect user-facing features or configuration
+            Your tasks:
+            1. Re-read the goal description above to identify EXACTLY which documentation
+               files you are asked to update (e.g. README.md, CHANGELOG.md, specific .md files)
+            2. Run `git diff origin/<base-branch>...HEAD --stat` to see ALL files changed on this branch
+            3. Run `git diff origin/<base-branch>...HEAD` to review the full diff
+            4. Update ONLY the documentation files explicitly requested in the goal description
+            5. Verify XML doc comments on new/changed public APIs are present and accurate — flag missing or incorrect ones in your report but do NOT edit source code files (that is the coder's job)
             6. Run `git add -A && git commit` with message "docs: update documentation for [brief description]"
 
             CRITICAL RULES:
             - Do NOT edit source code (.cs files) — that is the coder's job
             - Do NOT write or run tests — that is the tester's job
             - Do NOT run git push — the orchestrator handles that
-            - Only edit documentation files: CHANGELOG.md, README.md, and other .md files
+            - Only edit documentation files explicitly requested in the goal description
+            - Do NOT update CHANGELOG.md or README.md unless the goal description says to
 
             When done, call the `report_doc_changes` tool with:
             - verdict: "PASS" if you successfully updated documentation, "FAIL" if you could not
