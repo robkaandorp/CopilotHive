@@ -220,6 +220,10 @@ public sealed class DashboardStateService : IDisposable
 
         foreach (var summary in allSummaries)
         {
+            var summaryConversation = pipeline?.Conversation ?? Enumerable.Empty<ConversationEntry>();
+            var summaryCraftPrompts = ExtractCraftPrompts(summaryConversation, summary.Iteration);
+            var (summaryPlanningPrompt, summaryPlanningResponse) = ExtractPlanningPrompts(summaryConversation, summary.Iteration);
+
             var phases = new List<PhaseViewInfo>
             {
                 new PhaseViewInfo
@@ -243,6 +247,7 @@ public sealed class DashboardStateService : IDisposable
                 var isTestPhase = pr.Name == "Testing";
                 var isReviewPhase = pr.Name == "Review";
 
+                summaryCraftPrompts.TryGetValue(roleName, out var summaryPhasePrompts);
                 phases.Add(new PhaseViewInfo
                 {
                     Name = pr.Name,
@@ -254,6 +259,8 @@ public sealed class DashboardStateService : IDisposable
                     PassedTests = isTestPhase ? (summary.TestCounts?.Passed ?? 0) : 0,
                     FailedTests = isTestPhase ? (summary.TestCounts?.Failed ?? 0) : 0,
                     ReviewVerdict = isReviewPhase ? summary.ReviewVerdict : null,
+                    BrainPrompt = summaryPhasePrompts.BrainPrompt,
+                    WorkerPrompt = summaryPhasePrompts.WorkerPrompt,
                 });
             }
 
@@ -262,6 +269,8 @@ public sealed class DashboardStateService : IDisposable
                 Number = summary.Iteration,
                 Phases = phases,
                 IsCurrent = false,
+                PlanningBrainPrompt = summaryPlanningPrompt,
+                PlanningBrainResponse = summaryPlanningResponse,
             });
         }
 
@@ -273,6 +282,9 @@ public sealed class DashboardStateService : IDisposable
 
             // Determine the planning phase status
             var planningStatus = pipeline.Phase == GoalPhase.Planning ? "active" : "completed";
+
+            var craftPrompts = ExtractCraftPrompts(pipeline.Conversation, currentIter);
+            var (planningBrainPrompt, planningBrainResponse) = ExtractPlanningPrompts(pipeline.Conversation, currentIter);
 
             var currentPhases = new List<PhaseViewInfo>
             {
@@ -318,6 +330,7 @@ public sealed class DashboardStateService : IDisposable
                     var metrics = pipeline.Metrics;
                     var hasMetrics = status is "completed" or "active" or "failed";
 
+                    craftPrompts.TryGetValue(roleName, out var phasePrompts);
                     currentPhases.Add(new PhaseViewInfo
                     {
                         Name = phase.ToDisplayName(),
@@ -338,6 +351,8 @@ public sealed class DashboardStateService : IDisposable
                         ProgressReports = status == "active" && pipeline.PhaseStartedAt.HasValue
                             ? progress.Where(p => p.Timestamp >= pipeline.PhaseStartedAt.Value).ToList()
                             : [],
+                        BrainPrompt = phasePrompts.BrainPrompt,
+                        WorkerPrompt = phasePrompts.WorkerPrompt,
                     });
                 }
             }
@@ -348,6 +363,8 @@ public sealed class DashboardStateService : IDisposable
                 Phases = currentPhases,
                 IsCurrent = isCurrent,
                 PlanReason = pipeline.Plan?.Reason,
+                PlanningBrainPrompt = planningBrainPrompt,
+                PlanningBrainResponse = planningBrainResponse,
             });
         }
 
@@ -382,6 +399,73 @@ public sealed class DashboardStateService : IDisposable
     }
 
     private string? ResolveRepositoryUrl(Goal goal) => GetRepositoryUrl(goal);
+
+    /// <summary>
+    /// Extracts the planning Brain prompt and response for a given iteration from the conversation log.
+    /// </summary>
+    /// <param name="conversation">The pipeline conversation entries to search.</param>
+    /// <param name="iteration">The iteration number to filter by.</param>
+    /// <returns>A tuple of (userPrompt, assistantResponse), each of which may be null if not found.</returns>
+    internal static (string? UserPrompt, string? AssistantResponse) ExtractPlanningPrompts(
+        IEnumerable<ConversationEntry> conversation, int iteration)
+    {
+        var planningEntries = conversation
+            .Where(e => e.Iteration == iteration && e.Purpose == "planning")
+            .ToList();
+        var userPrompt = planningEntries.FirstOrDefault(e => e.Role == "user")?.Content;
+        var assistantResponse = planningEntries.FirstOrDefault(e => e.Role == "assistant")?.Content;
+        return (userPrompt, assistantResponse);
+    }
+
+    /// <summary>
+    /// Walks the conversation log and associates craft-prompt pairs with the worker role
+    /// that follows them. Returns a dictionary keyed by role name (e.g. "coder", "tester").
+    /// </summary>
+    /// <param name="conversation">The pipeline conversation entries to search.</param>
+    /// <param name="iteration">The iteration number to filter by.</param>
+    /// <returns>A dictionary from role name to its associated (BrainPrompt, WorkerPrompt) pair.</returns>
+    internal static Dictionary<string, (string? BrainPrompt, string? WorkerPrompt)> ExtractCraftPrompts(
+        IEnumerable<ConversationEntry> conversation, int iteration)
+    {
+        var result = new Dictionary<string, (string? BrainPrompt, string? WorkerPrompt)>(StringComparer.OrdinalIgnoreCase);
+
+        // Filter to entries for this iteration, excluding planning entries
+        var entries = conversation
+            .Where(e => e.Iteration == iteration && e.Purpose != "planning")
+            .ToList();
+
+        // Walk entries; collect pending craft-prompt pair and associate with the next worker-output role
+        string? pendingBrainPrompt = null;
+        string? pendingWorkerPrompt = null;
+
+        foreach (var entry in entries)
+        {
+            if (entry.Purpose == "craft-prompt")
+            {
+                if (entry.Role == "user")
+                {
+                    // New craft-prompt request: start a fresh pair
+                    pendingBrainPrompt = entry.Content;
+                    pendingWorkerPrompt = null;
+                }
+                else if (entry.Role == "assistant")
+                {
+                    pendingWorkerPrompt = entry.Content;
+                }
+            }
+            else if (entry.Purpose == "worker-output")
+            {
+                // Associate the accumulated craft-prompt pair with this worker role
+                if (!string.IsNullOrEmpty(entry.Role))
+                    result[entry.Role] = (pendingBrainPrompt, pendingWorkerPrompt);
+                // Reset pending state for the next worker
+                pendingBrainPrompt = null;
+                pendingWorkerPrompt = null;
+            }
+        }
+
+        return result;
+    }
 
     /// <summary>
     /// Resolves the URL of the first repository associated with a goal,
@@ -604,6 +688,10 @@ public sealed class IterationViewInfo
     public bool IsCurrent { get; init; }
     /// <summary>Brain's reasoning for the iteration plan, or null if not yet planned.</summary>
     public string? PlanReason { get; init; }
+    /// <summary>Brain prompt (user message) sent during the planning phase, or null if not available.</summary>
+    public string? PlanningBrainPrompt { get; init; }
+    /// <summary>Brain response (assistant message) from the planning phase, or null if not available.</summary>
+    public string? PlanningBrainResponse { get; init; }
 }
 
 /// <summary>Detail for a single phase within an iteration.</summary>
@@ -639,4 +727,8 @@ public sealed class PhaseViewInfo
     public List<string> Issues { get; init; } = [];
     /// <summary>Progress reports during this phase.</summary>
     public List<ProgressEntry> ProgressReports { get; init; } = [];
+    /// <summary>Brain prompt (user message) sent when crafting the worker prompt for this phase, or null if not available.</summary>
+    public string? BrainPrompt { get; init; }
+    /// <summary>Crafted worker prompt (Brain assistant message) for this phase, or null if not available.</summary>
+    public string? WorkerPrompt { get; init; }
 }
