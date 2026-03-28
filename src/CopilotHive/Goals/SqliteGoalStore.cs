@@ -76,6 +76,16 @@ public sealed class SqliteGoalStore : IGoalStore
                 UNIQUE(goal_id, iteration)
             );
 
+            CREATE TABLE IF NOT EXISTS releases (
+                id              TEXT PRIMARY KEY,
+                tag             TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'planning',
+                notes           TEXT,
+                created_at      TEXT NOT NULL,
+                released_at     TEXT,
+                repositories    TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status);
             CREATE INDEX IF NOT EXISTS idx_goal_iterations_goal ON goal_iterations(goal_id);
             """;
@@ -115,6 +125,14 @@ public sealed class SqliteGoalStore : IGoalStore
             alter.CommandText = "ALTER TABLE goals ADD COLUMN scope TEXT NOT NULL DEFAULT 'patch'";
             alter.ExecuteNonQuery();
             _logger.LogInformation("Migrated goals table: added 'scope' column");
+        }
+
+        if (!existingColumns.Contains("release_id"))
+        {
+            using var alter = _db.CreateCommand();
+            alter.CommandText = "ALTER TABLE goals ADD COLUMN release_id TEXT";
+            alter.ExecuteNonQuery();
+            _logger.LogInformation("Migrated goals table: added 'release_id' column");
         }
 
         var iterationColumns = GetTableColumns("goal_iterations");
@@ -269,8 +287,8 @@ public sealed class SqliteGoalStore : IGoalStore
         {
             using var cmd = _db.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO goals (id, description, title, status, priority, scope, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id, depends_on, merge_commit_hash)
-                VALUES (@id, @desc, @title, @status, @priority, @scope, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId, @dependsOn, @mergeCommitHash)
+                INSERT INTO goals (id, description, title, status, priority, scope, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id, depends_on, merge_commit_hash, release_id)
+                VALUES (@id, @desc, @title, @status, @priority, @scope, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId, @dependsOn, @mergeCommitHash, @releaseId)
                 """;
             BindGoalParams(cmd, goal);
             cmd.ExecuteNonQuery();
@@ -295,7 +313,8 @@ public sealed class SqliteGoalStore : IGoalStore
                     iterations = @iterations, failure_reason = @failureReason,
                     notes = @notes, phase_durations = @phaseDurations,
                     total_duration_seconds = @totalDuration, source_conversation_id = @sourceConvId,
-                    depends_on = @dependsOn, merge_commit_hash = @mergeCommitHash
+                    depends_on = @dependsOn, merge_commit_hash = @mergeCommitHash,
+                    release_id = @releaseId
                 WHERE id = @id
                 """;
             BindGoalParams(cmd, goal);
@@ -409,8 +428,8 @@ public sealed class SqliteGoalStore : IGoalStore
                     using var cmd = _db.CreateCommand();
                     cmd.Transaction = tx;
                     cmd.CommandText = """
-                        INSERT INTO goals (id, description, title, status, priority, scope, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id, depends_on, merge_commit_hash)
-                        VALUES (@id, @desc, @title, @status, @priority, @scope, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId, @dependsOn, @mergeCommitHash)
+                        INSERT INTO goals (id, description, title, status, priority, scope, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id, depends_on, merge_commit_hash, release_id)
+                        VALUES (@id, @desc, @title, @status, @priority, @scope, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId, @dependsOn, @mergeCommitHash, @releaseId)
                         """;
                     BindGoalParams(cmd, goal);
                     cmd.ExecuteNonQuery();
@@ -429,6 +448,124 @@ public sealed class SqliteGoalStore : IGoalStore
             _logger.LogInformation("Imported {Count} goals into SQLite store", imported);
 
         return Task.FromResult(imported);
+    }
+
+    // ── Release CRUD ─────────────────────────────────────────────────────
+
+    /// <inheritdoc />
+    public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO releases (id, tag, status, notes, created_at, released_at, repositories)
+                VALUES (@id, @tag, @status, @notes, @createdAt, @releasedAt, @repos)
+                """;
+            BindReleaseParams(cmd, release);
+            cmd.ExecuteNonQuery();
+        }
+
+        _logger.LogInformation("Created release {ReleaseId}: {Tag}", release.Id, release.Tag);
+        return Task.FromResult(release);
+    }
+
+    /// <inheritdoc />
+    public Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT * FROM releases WHERE id = @id";
+            cmd.Parameters.AddWithValue("@id", releaseId);
+
+            using var reader = cmd.ExecuteReader();
+            if (!reader.Read())
+                return Task.FromResult<Release?>(null);
+
+            return Task.FromResult<Release?>(ReadReleaseFromRow(reader));
+        }
+    }
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<Release>> GetReleasesAsync(CancellationToken ct = default)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "SELECT * FROM releases ORDER BY created_at DESC";
+
+            var releases = new List<Release>();
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+                releases.Add(ReadReleaseFromRow(reader));
+
+            return Task.FromResult<IReadOnlyList<Release>>(releases);
+        }
+    }
+
+    /// <inheritdoc />
+    public Task UpdateReleaseAsync(Release release, CancellationToken ct = default)
+    {
+        lock (_lock)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = """
+                UPDATE releases SET
+                    tag = @tag, status = @status, notes = @notes,
+                    released_at = @releasedAt, repositories = @repos
+                WHERE id = @id
+                """;
+            BindReleaseParams(cmd, release);
+
+            var rows = cmd.ExecuteNonQuery();
+            if (rows == 0)
+                throw new KeyNotFoundException($"Release '{release.Id}' not found in SQLite store.");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default)
+    {
+        lock (_lock)
+        {
+            // Enforce Planning-only delete: fetch the release first and reject if already Released.
+            using var fetchCmd = _db.CreateCommand();
+            fetchCmd.CommandText = "SELECT status FROM releases WHERE id = @id";
+            fetchCmd.Parameters.AddWithValue("@id", releaseId);
+            var statusRaw = fetchCmd.ExecuteScalar();
+
+            if (statusRaw is null)
+                return Task.FromResult(false); // not found
+
+            var status = Enum.Parse<ReleaseStatus>((string)statusRaw, ignoreCase: true);
+            if (status != ReleaseStatus.Planning)
+                return Task.FromResult(false); // only Planning releases may be deleted
+
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "DELETE FROM releases WHERE id = @id";
+            cmd.Parameters.AddWithValue("@id", releaseId);
+            var rows = cmd.ExecuteNonQuery();
+
+            if (rows > 0)
+                _logger.LogInformation("Deleted release {ReleaseId}", releaseId);
+
+            return Task.FromResult(rows > 0);
+        }
+    }
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default)
+    {
+        lock (_lock)
+        {
+            var goals = ReadGoalsCore(
+                "SELECT * FROM goals WHERE release_id = @releaseId ORDER BY created_at DESC",
+                ("@releaseId", releaseId));
+            return Task.FromResult<IReadOnlyList<Goal>>(goals);
+        }
     }
 
     // ── Internals ────────────────────────────────────────────────────────
@@ -525,6 +662,10 @@ public sealed class SqliteGoalStore : IGoalStore
         if (TryGetOrdinal(reader, "merge_commit_hash", out var mergeHashOrd) && !reader.IsDBNull(mergeHashOrd))
             goal.MergeCommitHash = reader.GetString(mergeHashOrd);
 
+        // release_id may be absent in databases created before migration
+        if (TryGetOrdinal(reader, "release_id", out var releaseIdOrd) && !reader.IsDBNull(releaseIdOrd))
+            goal.ReleaseId = reader.GetString(releaseIdOrd);
+
         return goal;
     }
 
@@ -554,6 +695,7 @@ public sealed class SqliteGoalStore : IGoalStore
         cmd.Parameters.AddWithValue("@dependsOn", goal.DependsOn.Count > 0
             ? JsonSerializer.Serialize(goal.DependsOn, JsonOptions) : (object)DBNull.Value);
         cmd.Parameters.AddWithValue("@mergeCommitHash", (object?)goal.MergeCommitHash ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@releaseId", (object?)goal.ReleaseId ?? DBNull.Value);
     }
 
     private void InsertIterationCore(string goalId, IterationSummary summary, SqliteTransaction? transaction)
@@ -656,5 +798,46 @@ public sealed class SqliteGoalStore : IGoalStore
         }
         ordinal = -1;
         return false;
+    }
+
+    private static Release ReadReleaseFromRow(SqliteDataReader reader)
+    {
+        var release = new Release
+        {
+            Id = reader.GetString(reader.GetOrdinal("id")),
+            Tag = reader.GetString(reader.GetOrdinal("tag")),
+            Status = Enum.Parse<ReleaseStatus>(reader.GetString(reader.GetOrdinal("status")), ignoreCase: true),
+            CreatedAt = DateTime.Parse(reader.GetString(reader.GetOrdinal("created_at"))),
+        };
+
+        var notesOrd = reader.GetOrdinal("notes");
+        if (!reader.IsDBNull(notesOrd))
+            release.Notes = reader.GetString(notesOrd);
+
+        var releasedOrd = reader.GetOrdinal("released_at");
+        if (!reader.IsDBNull(releasedOrd))
+            release.ReleasedAt = DateTime.Parse(reader.GetString(releasedOrd));
+
+        var reposOrd = reader.GetOrdinal("repositories");
+        if (!reader.IsDBNull(reposOrd))
+        {
+            var repos = JsonSerializer.Deserialize<List<string>>(reader.GetString(reposOrd), JsonOptions);
+            if (repos is not null)
+                release.RepositoryNames.AddRange(repos);
+        }
+
+        return release;
+    }
+
+    private static void BindReleaseParams(SqliteCommand cmd, Release release)
+    {
+        cmd.Parameters.AddWithValue("@id", release.Id);
+        cmd.Parameters.AddWithValue("@tag", release.Tag);
+        cmd.Parameters.AddWithValue("@status", release.Status.ToString().ToLowerInvariant());
+        cmd.Parameters.AddWithValue("@notes", (object?)release.Notes ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@createdAt", release.CreatedAt.ToString("O"));
+        cmd.Parameters.AddWithValue("@releasedAt", release.ReleasedAt.HasValue ? release.ReleasedAt.Value.ToString("O") : (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("@repos", release.RepositoryNames.Count > 0
+            ? JsonSerializer.Serialize(release.RepositoryNames, JsonOptions) : (object)DBNull.Value);
     }
 }

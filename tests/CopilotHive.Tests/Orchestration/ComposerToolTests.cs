@@ -2665,6 +2665,113 @@ public sealed class ComposerToolTests : IDisposable
             Directory.Delete(tmpDir, recursive: true);
         }
     }
+
+    // ── create_release ─────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task CreateRelease_ValidInput_CreatesRelease()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", "Initial release");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("v1.0.0", result);
+        Assert.Contains("Planning", result);
+
+        var release = await _store.GetReleaseAsync("v1.0.0", ct);
+        Assert.NotNull(release);
+        Assert.Equal("v1.0.0", release!.Id);
+        Assert.Equal("v1.0.0", release.Tag);
+        Assert.Equal("Initial release", release.Notes);
+        Assert.Equal(ReleaseStatus.Planning, release.Status);
+    }
+
+    [Fact]
+    public async Task CreateRelease_WithRepositories_StoresRepoList()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", repositories: "CopilotHive, CopilotHive-Config");
+
+        var release = await _store.GetReleaseAsync("v1.0.0", ct);
+        Assert.NotNull(release);
+        Assert.Equal(2, release!.RepositoryNames.Count);
+        Assert.Contains("CopilotHive", release.RepositoryNames);
+        Assert.Contains("CopilotHive-Config", release.RepositoryNames);
+    }
+
+    [Fact]
+    public async Task CreateRelease_DuplicateId_ReturnsError()
+    {
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0");
+        var result = await _composer.CreateReleaseAsync("v1.0.0", "v1.0.1");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("already exists", result);
+    }
+
+    [Fact]
+    public async Task CreateRelease_MissingId_ReturnsError()
+    {
+        var result = await _composer.CreateReleaseAsync("", "v1.0.0");
+
+        Assert.Contains("ERROR", result);
+        Assert.Contains("id is required", result);
+    }
+
+    [Fact]
+    public async Task CreateRelease_MissingTag_ReturnsError()
+    {
+        var result = await _composer.CreateReleaseAsync("v1.0.0", "");
+
+        Assert.Contains("ERROR", result);
+        Assert.Contains("tag is required", result);
+    }
+
+    // ── list_releases ─────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task ListReleases_NoReleases_ReturnsEmptyMessage()
+    {
+        var result = await _composer.ListReleasesAsync();
+
+        Assert.Contains("No releases found", result);
+    }
+
+    [Fact]
+    public async Task ListReleases_WithReleases_ListsAll()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create releases
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0");
+        await _composer.CreateReleaseAsync("v2.0.0", "v2.0.0");
+
+        // Create goals assigned to releases
+        await _store.CreateGoalAsync(new Goal
+        {
+            Id = "goal-1",
+            Description = "Goal 1",
+            ReleaseId = "v1.0.0",
+            CreatedAt = DateTime.UtcNow,
+        }, ct);
+        await _store.CreateGoalAsync(new Goal
+        {
+            Id = "goal-2",
+            Description = "Goal 2",
+            ReleaseId = "v1.0.0",
+            CreatedAt = DateTime.UtcNow,
+        }, ct);
+
+        var result = await _composer.ListReleasesAsync();
+
+        Assert.Contains("2 release(s)", result);
+        Assert.Contains("v1.0.0", result);
+        Assert.Contains("v2.0.0", result);
+        Assert.Contains("[Planning]", result);
+        Assert.Contains("2 goal(s)", result);
+    }
 }
 
 /// <summary>
@@ -2741,6 +2848,24 @@ internal sealed class FakeGoalSource : IGoalSource, IGoalStore
 
     public Task AddIterationAsync(string goalId, IterationSummary summary, CancellationToken ct = default) =>
         Task.CompletedTask;
+
+    public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default) =>
+        Task.FromResult(release);
+
+    public Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default) =>
+        Task.FromResult<Release?>(null);
+
+    public Task<IReadOnlyList<Release>> GetReleasesAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Release>>([]);
+
+    public Task UpdateReleaseAsync(Release release, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default) =>
+        Task.FromResult(false);
+
+    public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>([]);
 }
 
 /// <summary>

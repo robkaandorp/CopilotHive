@@ -77,6 +77,7 @@ public sealed class Composer : IAsyncDisposable
         - Cancel InProgress or Pending goals (cancel_goal)
         - Inspect repository history (git_log, git_diff, git_show, git_branch, git_blame)
         - List configured repositories (list_repositories)
+        - Create and manage releases (create_release, list_releases)
         - Ask the user questions for clarification (ask_user)
 
         Guidelines for goal creation:
@@ -559,6 +560,10 @@ public sealed class Composer : IAsyncDisposable
                 "Show line-by-line authorship information for a file."),
             AIFunctionFactory.Create(ListRepositoriesAsync, "list_repositories",
                 "List all configured repositories with their names, URLs, and default branches."),
+            AIFunctionFactory.Create(CreateReleaseAsync, "create_release",
+                "Create a new release in Planning status."),
+            AIFunctionFactory.Create(ListReleasesAsync, "list_releases",
+                "List all releases with their status and goal count."),
         };
 
         if (_ollamaApiKey is not null)
@@ -970,6 +975,66 @@ public sealed class Composer : IAsyncDisposable
         foreach (var repo in repos)
             sb.AppendLine($"- **{repo.Name}** — {repo.Url} (branch: {repo.DefaultBranch})");
         return Task.FromResult(sb.ToString().TrimEnd());
+    }
+
+    [Description("Create a new release in Planning status.")]
+    internal async Task<string> CreateReleaseAsync(
+        [Description("Unique release ID (e.g. 'v1.2.0')")] string id,
+        [Description("Version tag for the release (e.g. 'v1.2.0')")] string tag,
+        [Description("Optional notes or changelog summary")] string? notes = null,
+        [Description("Comma-separated repository names this release applies to")] string? repositories = null)
+    {
+        var error = Shared.ToolValidation.Check(
+            (!string.IsNullOrWhiteSpace(id), "id is required"),
+            (!string.IsNullOrWhiteSpace(tag), "tag is required"));
+        if (error is not null) return error;
+
+        var existing = await _goalStore.GetReleaseAsync(id);
+        if (existing is not null)
+            return $"❌ Release '{id}' already exists (status: {existing.Status}).";
+
+        var repos = string.IsNullOrWhiteSpace(repositories)
+            ? new List<string>()
+            : repositories.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+
+        var release = new Release
+        {
+            Id = id,
+            Tag = tag,
+            Notes = string.IsNullOrWhiteSpace(notes) ? null : notes,
+            RepositoryNames = repos,
+        };
+
+        await _goalStore.CreateReleaseAsync(release);
+        _logger.LogInformation("Composer created release '{ReleaseId}'", id);
+
+        return $"""
+            ✅ Release created:
+            - ID: {id}
+            - Tag: {tag}
+            - Status: Planning
+            - Repositories: {(repos.Count > 0 ? string.Join(", ", repos) : "(none)")}
+            """;
+    }
+
+    [Description("List all releases with their status and goal count.")]
+    internal async Task<string> ListReleasesAsync()
+    {
+        var releases = await _goalStore.GetReleasesAsync();
+
+        if (releases.Count == 0)
+            return "No releases found.";
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"**{releases.Count} release(s):**\n");
+
+        foreach (var r in releases)
+        {
+            var goals = await _goalStore.GetGoalsByReleaseAsync(r.Id);
+            sb.AppendLine($"- `{r.Id}` [{r.Status}] tag={r.Tag} — {goals.Count} goal(s)");
+        }
+
+        return sb.ToString();
     }
 
     // ── Git tool implementations ──

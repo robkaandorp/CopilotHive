@@ -41,4 +41,24 @@ public interface IGoalStore : IGoalSource
     /// Returns the number of goals imported.
     /// </summary>
     Task<int> ImportGoalsAsync(IEnumerable<Goal> goals, CancellationToken ct = default);
+
+    // ── Release CRUD ─────────────────────────────────────────────────────
+
+    /// <summary>Creates a new release. Throws if a release with the same ID already exists.</summary>
+    Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default);
+
+    /// <summary>Returns a single release by ID, or <c>null</c> if not found.</summary>
+    Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default);
+
+    /// <summary>Returns all releases, ordered by creation date descending.</summary>
+    Task<IReadOnlyList<Release>> GetReleasesAsync(CancellationToken ct = default);
+
+    /// <summary>Updates a release's mutable fields. Throws if release not found.</summary>
+    Task UpdateReleaseAsync(Release release, CancellationToken ct = default);
+
+    /// <summary>Deletes a release. Returns <c>false</c> if not found.</summary>
+    Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default);
+
+    /// <summary>Returns all goals assigned to the given release.</summary>
+    Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default);
 }
