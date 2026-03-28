@@ -98,6 +98,36 @@
                 }
             }
         </div>
+        <!-- Release assignment -->
+        @{
+            var releaseId = _goalReleaseId;
+        }
+        @if (!string.IsNullOrEmpty(releaseId))
+        {
+            <div style="margin-top:0.5rem;font-size:0.85rem">
+                📦 Release: <a href="/releases/@Uri.EscapeDataString(releaseId)" style="color:var(--accent);text-decoration:none;font-weight:500">@releaseId</a>
+            </div>
+        }
+        else if (_detail.Status == GoalStatus.Completed && _planningReleases.Count > 0)
+        {
+            <div style="margin-top:0.5rem;font-size:0.85rem;display:flex;align-items:center;gap:0.5rem">
+                <span style="color:var(--text-muted)">📦 Assign to release:</span>
+                <select @bind="_selectedReleaseId"
+                        style="padding:0.3rem 0.6rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem">
+                    <option value="">— select —</option>
+                    @foreach (var r in _planningReleases)
+                    {
+                        <option value="@r.Id">@r.Tag</option>
+                    }
+                </select>
+                <button class="approve-btn" style="font-size:0.8rem;padding:0.25rem 0.6rem"
+                        @onclick="AssignToRelease" disabled="@string.IsNullOrEmpty(_selectedReleaseId)">Assign</button>
+                @if (!string.IsNullOrEmpty(_releaseAssignError))
+                {
+                    <span class="error-msg">@_releaseAssignError</span>
+                }
+            </div>
+        }
     </div>
 
     @if (_detail.DependsOn.Count > 0)
@@ -411,6 +441,32 @@ else if (_storedGoal is not null)
                 Total duration: @FormatTotalDuration(_storedGoal.TotalDurationSeconds.Value)
             </div>
         }
+        @if (!string.IsNullOrEmpty(_storedGoal.ReleaseId))
+        {
+            <div style="margin-top:0.5rem;font-size:0.85rem">
+                📦 Release: <a href="/releases/@Uri.EscapeDataString(_storedGoal.ReleaseId)" style="color:var(--accent);text-decoration:none;font-weight:500">@_storedGoal.ReleaseId</a>
+            </div>
+        }
+        else if (_storedGoal.Status == GoalStatus.Completed && _planningReleases.Count > 0)
+        {
+            <div style="margin-top:0.5rem;font-size:0.85rem;display:flex;align-items:center;gap:0.5rem">
+                <span style="color:var(--text-muted)">📦 Assign to release:</span>
+                <select @bind="_selectedReleaseId"
+                        style="padding:0.3rem 0.6rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem">
+                    <option value="">— select —</option>
+                    @foreach (var r in _planningReleases)
+                    {
+                        <option value="@r.Id">@r.Tag</option>
+                    }
+                </select>
+                <button class="approve-btn" style="font-size:0.8rem;padding:0.25rem 0.6rem"
+                        @onclick="AssignToRelease" disabled="@string.IsNullOrEmpty(_selectedReleaseId)">Assign</button>
+                @if (!string.IsNullOrEmpty(_releaseAssignError))
+                {
+                    <span class="error-msg">@_releaseAssignError</span>
+                }
+            </div>
+        }
     </div>
 
     @if (!string.IsNullOrEmpty(_storedGoal.FailureReason))
@@ -576,6 +632,10 @@ else
     private string? _cancelError;
     private string? _deleteError;
     private Dictionary<string, GoalStatus> _dependencyStatuses = new();
+    private List<Release> _planningReleases = [];
+    private string _selectedReleaseId = "";
+    private string? _releaseAssignError;
+    private string? _goalReleaseId;
 
     protected override void OnInitialized()
     {
@@ -604,6 +664,17 @@ else
             _storedIterations = [];
         }
 
+        // Resolve release ID — load from store for _detail branch (pipeline goals don't carry ReleaseId)
+        if (_detail is not null)
+        {
+            var liveGoal = GoalStore.GetGoalAsync(GoalId).GetAwaiter().GetResult();
+            _goalReleaseId = liveGoal?.ReleaseId;
+        }
+        else
+        {
+            _goalReleaseId = _storedGoal?.ReleaseId;
+        }
+
         // Pre-fetch dependency statuses for display
         var depIds = _detail?.DependsOn ?? _storedGoal?.DependsOn ?? [];
         if (depIds.Count > 0)
@@ -628,6 +699,24 @@ else
         else
         {
             _dependencyStatuses = new();
+        }
+
+        // Load Planning releases for release-assignment dropdown (shown when goal is Completed and unassigned)
+        var goalStatus = _detail?.Status ?? _storedGoal?.Status;
+        if (goalStatus == GoalStatus.Completed && string.IsNullOrEmpty(_goalReleaseId))
+        {
+            var allReleases = GoalStore.GetReleasesAsync().GetAwaiter().GetResult();
+            var goalRepos = _detail?.RepositoryNames ?? _storedGoal?.RepositoryNames ?? [];
+            _planningReleases = allReleases
+                .Where(r => r.Status == ReleaseStatus.Planning)
+                .Where(r => r.RepositoryNames.Count == 0 ||
+                            goalRepos.Count == 0 ||
+                            r.RepositoryNames.Intersect(goalRepos, StringComparer.OrdinalIgnoreCase).Any())
+                .ToList();
+        }
+        else
+        {
+            _planningReleases = [];
         }
     }
 
@@ -794,6 +883,30 @@ else
             var errorContent = await response.Content.ReadAsStringAsync();
             _deleteError = $"Error {(int)response.StatusCode}: {errorContent}";
             StateHasChanged();
+        }
+    }
+
+    private async Task AssignToRelease()
+    {
+        _releaseAssignError = null;
+        if (string.IsNullOrEmpty(_selectedReleaseId)) return;
+
+        var encodedRelease = Uri.EscapeDataString(_selectedReleaseId);
+        var response = await HttpClient.PatchAsync($"/api/releases/{encodedRelease}/goals/{GoalId}", null);
+        if (response.IsSuccessStatusCode)
+        {
+            // Update local state
+            if (_storedGoal is not null)
+                _storedGoal.ReleaseId = _selectedReleaseId;
+            _goalReleaseId = _selectedReleaseId;
+            _selectedReleaseId = "";
+            _planningReleases = [];
+            StateHasChanged();
+        }
+        else
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            _releaseAssignError = $"Error {(int)response.StatusCode}: {errorContent}";
         }
     }
 }

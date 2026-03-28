@@ -1,0 +1,309 @@
+@page "/releases/{ReleaseId}"
+@using CopilotHive.Goals
+@using Markdig
+@inject IGoalStore GoalStore
+@inject IJSRuntime JS
+@inject NavigationManager Nav
+@inject HttpClient HttpClient
+
+<a href="/releases" style="display:inline-flex;align-items:center;gap:0.35rem;color:var(--accent);text-decoration:none;font-size:0.9rem;margin-bottom:0.5rem">
+    ← Releases
+</a>
+
+@if (_release is not null)
+{
+    <!-- Header -->
+    <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:1rem">
+        <h1>@_release.Tag</h1>
+        @foreach (var repo in _release.RepositoryNames)
+        {
+            <span class="repo-tag">@repo</span>
+        }
+        <span class="badge @ReleaseBadge(_release.Status)">@_release.Status</span>
+        @if (_release.Status == ReleaseStatus.Planning)
+        {
+            <button class="approve-btn" @onclick="MarkAsReleased">✅ Mark as Released</button>
+            @if (!string.IsNullOrEmpty(_actionError))
+            {
+                <span class="error-msg">@_actionError</span>
+            }
+        }
+    </div>
+
+    <!-- Metadata card -->
+    <div class="card" style="margin-bottom:1rem;font-size:0.85rem;color:var(--text-muted)">
+        <div style="display:flex;gap:1.5rem;flex-wrap:wrap">
+            <span>Created: <strong style="color:var(--text)">@_release.CreatedAt.ToString("yyyy-MM-dd HH:mm")</strong> UTC</span>
+            @if (_release.ReleasedAt.HasValue)
+            {
+                <span>Released: <strong style="color:var(--text)">@_release.ReleasedAt.Value.ToString("yyyy-MM-dd HH:mm")</strong> UTC</span>
+            }
+            <span>Goals: <strong style="color:var(--text)">@_goals.Count</strong></span>
+        </div>
+    </div>
+
+    <!-- Editable Notes (Planning only) -->
+    @if (_release.Status == ReleaseStatus.Planning)
+    {
+        <div class="card" style="margin-bottom:1rem">
+            <div class="label" style="margin-bottom:0.5rem">Notes</div>
+            <textarea @bind="_editNotes" rows="4"
+                      style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;padding:0.5rem;font-family:inherit;resize:vertical"
+                      placeholder="Release notes…"></textarea>
+            <div style="margin-top:0.5rem;display:flex;gap:0.5rem">
+                <button class="approve-btn" @onclick="SaveNotes">Save Notes</button>
+                @if (!string.IsNullOrEmpty(_notesError))
+                {
+                    <span class="error-msg">@_notesError</span>
+                }
+                @if (_notesSaved)
+                {
+                    <span style="color:var(--green);font-size:0.85rem">✓ Saved</span>
+                }
+            </div>
+        </div>
+    }
+    else if (!string.IsNullOrEmpty(_release.Notes))
+    {
+        <div class="card" style="margin-bottom:1rem">
+            <div class="label" style="margin-bottom:0.5rem">Notes</div>
+            <div class="chat-msg-content">@((MarkupString)RenderMarkdown(_release.Notes))</div>
+        </div>
+    }
+
+    <!-- Goals grouped by scope -->
+    @if (_goals.Count > 0)
+    {
+        var breaking = _goals.Where(g => g.Scope == GoalScope.Breaking).ToList();
+        var features = _goals.Where(g => g.Scope == GoalScope.Feature).ToList();
+        var patches = _goals.Where(g => g.Scope == GoalScope.Patch).ToList();
+
+        <h2 style="margin-top:1rem;margin-bottom:0.75rem">Goals</h2>
+
+        @if (breaking.Count > 0)
+        {
+            <div class="release-scope-section">
+                <div class="release-scope-header">💥 Breaking Changes</div>
+                @foreach (var g in breaking)
+                {
+                    <div class="release-goal-row">
+                        <a href="/goals/@g.Id" class="goal-link">@g.Id</a>
+                        <span class="goal-desc" style="flex:1">@Truncate(g.Description, 120)</span>
+                        <span class="badge @StatusBadge(g.Status)">@g.Status</span>
+                    </div>
+                }
+            </div>
+        }
+
+        @if (features.Count > 0)
+        {
+            <div class="release-scope-section">
+                <div class="release-scope-header">✨ Features</div>
+                @foreach (var g in features)
+                {
+                    <div class="release-goal-row">
+                        <a href="/goals/@g.Id" class="goal-link">@g.Id</a>
+                        <span class="goal-desc" style="flex:1">@Truncate(g.Description, 120)</span>
+                        <span class="badge @StatusBadge(g.Status)">@g.Status</span>
+                    </div>
+                }
+            </div>
+        }
+
+        @if (patches.Count > 0)
+        {
+            <div class="release-scope-section">
+                <div class="release-scope-header">🔧 Fixes</div>
+                @foreach (var g in patches)
+                {
+                    <div class="release-goal-row">
+                        <a href="/goals/@g.Id" class="goal-link">@g.Id</a>
+                        <span class="goal-desc" style="flex:1">@Truncate(g.Description, 120)</span>
+                        <span class="badge @StatusBadge(g.Status)">@g.Status</span>
+                    </div>
+                }
+            </div>
+        }
+    }
+    else
+    {
+        <p style="color:var(--text-muted);margin-top:0.5rem">No goals assigned to this release yet.</p>
+    }
+
+    <!-- Changelog preview -->
+    <h2 style="margin-top:1.5rem;margin-bottom:0.5rem">Changelog Preview</h2>
+    <div style="display:flex;gap:0.5rem;margin-bottom:0.5rem">
+        <button class="chat-action-btn" @onclick="CopyChangelog">📋 Copy Changelog</button>
+    </div>
+    <details class="collapsible-output" open>
+        <summary>Markdown Changelog</summary>
+        <div class="changelog-preview">
+            <pre>@BuildChangelog()</pre>
+        </div>
+    </details>
+}
+else if (_loaded)
+{
+    <p style="color:var(--text-muted)">Release not found.</p>
+}
+
+@code {
+    [Parameter] public string ReleaseId { get; set; } = "";
+
+    private Release? _release;
+    private List<Goal> _goals = [];
+    private bool _loaded;
+    private string _editNotes = "";
+    private bool _notesSaved;
+    private string? _notesError;
+    private string? _actionError;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var decoded = Uri.UnescapeDataString(ReleaseId);
+        _release = await GoalStore.GetReleaseAsync(decoded);
+        if (_release is not null)
+        {
+            _editNotes = _release.Notes ?? "";
+            _goals = (await GoalStore.GetGoalsByReleaseAsync(decoded)).ToList();
+        }
+        _loaded = true;
+    }
+
+    private async Task MarkAsReleased()
+    {
+        _actionError = null;
+        var body = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new { status = "Released" }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+        var id = Uri.EscapeDataString(ReleaseId);
+        var response = await HttpClient.PatchAsync($"/api/releases/{id}", body);
+        if (response.IsSuccessStatusCode)
+        {
+            _release!.Status = ReleaseStatus.Released;
+            _release.ReleasedAt ??= DateTime.UtcNow;
+            StateHasChanged();
+        }
+        else
+        {
+            var error = await response.Content.ReadAsStringAsync();
+            _actionError = $"Error {(int)response.StatusCode}: {error}";
+        }
+    }
+
+    private async Task SaveNotes()
+    {
+        _notesError = null;
+        _notesSaved = false;
+        var body = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new { notes = _editNotes }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+        var id = Uri.EscapeDataString(ReleaseId);
+        var response = await HttpClient.PatchAsync($"/api/releases/{id}", body);
+        if (response.IsSuccessStatusCode)
+        {
+            _release!.Notes = _editNotes;
+            _notesSaved = true;
+            StateHasChanged();
+        }
+        else
+        {
+            var error = await response.Content.ReadAsStringAsync();
+            _notesError = $"Error {(int)response.StatusCode}: {error}";
+        }
+    }
+
+    private async Task CopyChangelog()
+    {
+        var changelog = BuildChangelog();
+        await JS.InvokeVoidAsync("navigator.clipboard.writeText", changelog);
+    }
+
+    private string BuildChangelog()
+    {
+        if (_release is null) return "";
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"## {_release.Tag}");
+        sb.AppendLine();
+
+        if (_release.ReleasedAt.HasValue)
+            sb.AppendLine($"_Released {_release.ReleasedAt.Value:yyyy-MM-dd}_");
+        else
+            sb.AppendLine($"_Created {_release.CreatedAt:yyyy-MM-dd} · Status: {_release.Status}_");
+        sb.AppendLine();
+
+        var breaking = _goals.Where(g => g.Scope == GoalScope.Breaking).ToList();
+        var features = _goals.Where(g => g.Scope == GoalScope.Feature).ToList();
+        var patches = _goals.Where(g => g.Scope == GoalScope.Patch).ToList();
+
+        if (breaking.Count > 0)
+        {
+            sb.AppendLine("### 💥 Breaking Changes");
+            sb.AppendLine();
+            foreach (var g in breaking)
+                sb.AppendLine($"- {g.Description}");
+            sb.AppendLine();
+        }
+
+        if (features.Count > 0)
+        {
+            sb.AppendLine("### ✨ Features");
+            sb.AppendLine();
+            foreach (var g in features)
+                sb.AppendLine($"- {g.Description}");
+            sb.AppendLine();
+        }
+
+        if (patches.Count > 0)
+        {
+            sb.AppendLine("### 🔧 Fixes");
+            sb.AppendLine();
+            foreach (var g in patches)
+                sb.AppendLine($"- {g.Description}");
+            sb.AppendLine();
+        }
+
+        if (!string.IsNullOrEmpty(_release.Notes))
+        {
+            sb.AppendLine("### Notes");
+            sb.AppendLine();
+            sb.AppendLine(_release.Notes);
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
+    private static string ReleaseBadge(ReleaseStatus s) => s switch
+    {
+        ReleaseStatus.Planning => "badge-yellow",
+        ReleaseStatus.Released => "badge-green",
+        _ => "badge-muted",
+    };
+
+    private static string StatusBadge(GoalStatus s) => s switch
+    {
+        GoalStatus.Completed => "badge-green",
+        GoalStatus.Failed => "badge-red",
+        GoalStatus.InProgress => "badge-blue",
+        GoalStatus.Pending => "badge-yellow",
+        GoalStatus.Cancelled => "badge-muted",
+        _ => "badge-muted",
+    };
+
+    private static string Truncate(string s, int max) =>
+        s.Length <= max ? s : s[..max] + "…";
+
+    private static readonly MarkdownPipeline MdPipeline = new MarkdownPipelineBuilder()
+        .UseAdvancedExtensions()
+        .DisableHtml()
+        .Build();
+
+    private static string RenderMarkdown(string content)
+    {
+        if (string.IsNullOrEmpty(content)) return "";
+        return Markdown.ToHtml(content, MdPipeline);
+    }
+}
