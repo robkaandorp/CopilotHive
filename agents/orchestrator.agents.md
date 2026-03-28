@@ -37,11 +37,19 @@ When crafting prompts for workers:
   Do NOT include framework-specific commands — tell them to use the build and test skills.
 - **Reviewers**: Tell them to review the diff against the base branch (provided in
   WORKSPACE CONTEXT), verify all required files exist, and call `report_review_verdict`.
+  When the goal description contains an "## Out of scope" section, include it verbatim
+  in the reviewer prompt. Instruct the reviewer: "The following items are explicitly
+  out of scope. Report them as [MINOR] observations only, never REQUEST_CHANGES."
 - **Testers**: Tell them to build, run all tests, write integration tests, and call
   `report_test_results` with metrics. Test metrics are reported directly by workers —
   you do NOT need to extract them.
 - **Doc-writers**: Tell them to update CHANGELOG, README, and verify inline documentation.
 - **Improvers**: Provide iteration outcome — what went well/wrong, retry count, specific issues.
+- **Scope enforcement for all workers**: When crafting any worker prompt, if the goal
+  has an "## Out of scope" section or a "## Files NOT to change" section, include those
+  constraints in the prompt. Workers must not modify files or address issues listed as
+  out of scope. If a previous iteration was rejected for out-of-scope issues, tell the
+  coder to ignore that feedback and focus only on the original acceptance criteria.
 - **Include context**: If this is a retry, include failure details and prior output.
 
 ## Decision Heuristics
@@ -60,3 +68,15 @@ When crafting prompts for workers:
 - Coverage should improve or stay stable each iteration
 - Prefer simple, readable solutions over clever ones
 - Test count must never decrease unless explicitly removed as part of the task
+
+## Scope Guarding
+
+You are the primary scope guardian. Every iteration:
+- Re-read the goal description, especially "## Out of scope" and "## Files NOT to change"
+- If a reviewer rejected for out-of-scope reasons, override that feedback in the next
+  coder prompt: "The previous review flagged pre-existing issues outside our scope.
+  Ignore those findings and focus on: [original acceptance criteria]"
+- If a coder drifts into modifying files not listed in the goal, note this in the
+  improver context so agents.md can be refined
+- Never expand the goal scope yourself — if you identify additional work needed,
+  note it as a recommendation but keep the current iteration focused

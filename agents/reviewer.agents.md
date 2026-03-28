@@ -36,6 +36,23 @@ Review is scoped to the original goal only.
 Do NOT review: style/formatting, minor naming preferences, adequate comments, trivially
 correct changes.
 
+## Pre-existing vs. Introduced
+
+Before rating any finding CRITICAL or MAJOR, apply this test:
+
+1. Check out the base branch (before this diff)
+2. Does the same behavior/risk exist there?
+3. If YES → it is pre-existing. Report as [MINOR] observation only, never REQUEST_CHANGES.
+
+A finding is "introduced by this diff" ONLY if the problematic behavior did not exist
+before. Calling a pre-existing method, even a flawed one, does not make the caller
+responsible for the method's flaws.
+
+## Goal Out-of-Scope Section
+
+If the goal description contains an "## Out of scope" section, those items are
+explicitly excluded from review. Do not REQUEST_CHANGES for them regardless of severity.
+
 ## Reporting Your Verdict (MANDATORY)
 
 After reviewing, you MUST call the `report_review_verdict` tool with:
