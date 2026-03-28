@@ -130,7 +130,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
                     defaultBranch, repoName);
 
                 if (Directory.Exists(clonePath))
-                    Directory.Delete(clonePath, recursive: true);
+                    await ForceDeleteDirectoryAsync(clonePath);
 
                 await RunGitAsync(WorkDirectory, ["clone", repoUrl, repoName], ct);
             }
@@ -291,6 +291,39 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// </summary>
     public string GetClonePath(string repoName) =>
         Path.Combine(WorkDirectory, repoName);
+
+    /// <summary>
+    /// Deletes a directory with retries to handle transient file locks (e.g. from git processes on Windows).
+    /// Clears read-only attributes before deletion so <c>.git</c> pack-files can be removed.
+    /// </summary>
+    /// <param name="path">The directory to delete.</param>
+    /// <param name="maxRetries">Maximum number of attempts before giving up.</param>
+    private static async Task ForceDeleteDirectoryAsync(string path, int maxRetries = 5)
+    {
+        for (var i = 0; i < maxRetries; i++)
+        {
+            if (!Directory.Exists(path))
+                return;
+
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
+                {
+                    File.SetAttributes(file, FileAttributes.Normal);
+                }
+                Directory.Delete(path, recursive: true);
+                return;
+            }
+            catch (UnauthorizedAccessException) when (i < maxRetries - 1)
+            {
+                await Task.Delay(200 * (i + 1));
+            }
+            catch (IOException) when (i < maxRetries - 1)
+            {
+                await Task.Delay(200 * (i + 1));
+            }
+        }
+    }
 
     private static async Task RunGitAsync(string workingDir, string[] args, CancellationToken ct)
     {
