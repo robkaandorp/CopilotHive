@@ -717,12 +717,13 @@ public sealed class Composer : IAsyncDisposable
         [Description("Phase name: Coding, Testing, Review, DocWriting, or Improve")] string phase,
         [Description("Maximum lines to return. Default: 200")] int max_lines = 200)
     {
-        // 1. Required parameter validation FIRST
-        var error = Shared.ToolValidation.Check(
-            (!string.IsNullOrWhiteSpace(id), "id is required"),
-            (iteration >= 1, "iteration must be >= 1"),
-            (!string.IsNullOrWhiteSpace(phase), "phase is required"));
-        if (error is not null) return error;
+        // 1. Explicit required-param validation with EXACT messages FIRST
+        if (string.IsNullOrWhiteSpace(id))
+            return "Goal ID is required";
+        if (iteration <= 0)
+            return "Iteration must be a positive number";
+        if (string.IsNullOrWhiteSpace(phase))
+            return "ERROR: Invalid parameters: phase is required";
 
         // 2. Whitelist check SECOND
         if (!PhaseOutputKeys.TryGetValue(phase, out var rolePrefix))

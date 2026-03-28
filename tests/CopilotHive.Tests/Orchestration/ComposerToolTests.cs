@@ -1028,8 +1028,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var result = await _composer.GetPhaseOutputAsync("some-goal", 0, "Coding");
 
-        Assert.Contains("ERROR", result);
-        Assert.Contains("iteration must be >= 1", result);
+        Assert.Equal("Iteration must be a positive number", result);
     }
 
     [Fact]
@@ -1037,8 +1036,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var result = await _composer.GetPhaseOutputAsync("", 1, "Coding");
 
-        Assert.Contains("ERROR", result);
-        Assert.Contains("id is required", result);
+        Assert.Equal("Goal ID is required", result);
     }
 
     [Theory]
@@ -1048,8 +1046,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var result = await _composer.GetPhaseOutputAsync("some-goal", 1, phase);
 
-        Assert.Contains("ERROR", result);
-        Assert.Contains("phase is required", result);
+        Assert.Equal("ERROR: Invalid parameters: phase is required", result);
     }
 
     [Fact]
