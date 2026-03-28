@@ -1,5 +1,7 @@
+using CopilotHive.Git;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace CopilotHive.Tests;
 
@@ -29,6 +31,11 @@ public sealed class HiveTestFactory : WebApplicationFactory<Program>
         Path.Combine(Path.GetTempPath(), $"copilothive-test-{Guid.NewGuid():N}");
 
     /// <summary>
+    /// Optional mock for IBrainRepoManager. If set, it will replace the real implementation in DI.
+    /// </summary>
+    public IBrainRepoManager? MockRepoManager { get; set; }
+
+    /// <summary>
     /// Initialises the factory and points <c>STATE_DIR</c> at a temporary directory.
     /// </summary>
     public HiveTestFactory()
@@ -40,6 +47,22 @@ public sealed class HiveTestFactory : WebApplicationFactory<Program>
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Testing");
+
+        // Replace IBrainRepoManager with mock if set
+        if (MockRepoManager is not null)
+        {
+            builder.ConfigureServices(services =>
+            {
+                // Remove existing IBrainRepoManager registration
+                var existingDescriptor = services.SingleOrDefault(
+                    d => d.ServiceType == typeof(IBrainRepoManager));
+                if (existingDescriptor is not null)
+                    services.Remove(existingDescriptor);
+
+                // Add mock
+                services.AddSingleton(MockRepoManager);
+            });
+        }
     }
 
     /// <inheritdoc />

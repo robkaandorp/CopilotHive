@@ -520,141 +520,108 @@ public sealed class ComposerToolTests : IDisposable
     public async Task DeleteGoal_FailedGoal_WithRepoManager_CallsDeleteRemoteBranchForEachRepo()
     {
         var ct = TestContext.Current.CancellationToken;
-        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tmpDir);
-        try
-        {
-            // Create a failed goal with two repositories
-            await _composer.CreateGoalAsync("failed-goal-branches", "Will fail", repositories: "repo-a, repo-b");
-            var goal = (await _store.GetGoalAsync("failed-goal-branches", ct))!;
-            goal.Status = GoalStatus.Failed;
-            await _store.UpdateGoalAsync(goal, ct);
 
-            // Use a TestLogger to capture log messages
-            var logger = new TestLogger<BrainRepoManager>();
-            var repoManager = new BrainRepoManager(tmpDir, logger);
-            var composer = new Composer(
-                "test-model",
-                NullLogger<Composer>.Instance,
-                _store,
-                repoManager: repoManager,
-                stateDir: tmpDir);
+        // Create a failed goal with two repositories
+        await _composer.CreateGoalAsync("failed-goal-branches", "Will fail", repositories: "repo-a, repo-b");
+        var goal = (await _store.GetGoalAsync("failed-goal-branches", ct))!;
+        goal.Status = GoalStatus.Failed;
+        await _store.UpdateGoalAsync(goal, ct);
 
-            var result = await composer.DeleteGoalAsync("failed-goal-branches");
+        // Mock the repo manager
+        var mockRepoManager = new Mock<IBrainRepoManager>();
+        mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-a", "copilothive/failed-goal-branches", It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask)
+            .Verifiable();
+        mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-b", "copilothive/failed-goal-branches", It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask)
+            .Verifiable();
 
-            // Verify goal deleted successfully
-            Assert.Contains("✅", result);
-            Assert.Contains("deleted", result);
-            var deletedGoal = await _store.GetGoalAsync("failed-goal-branches", ct);
-            Assert.Null(deletedGoal);
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            repoManager: mockRepoManager.Object,
+            stateDir: Path.GetTempPath());
 
-            // Verify DeleteRemoteBranchAsync was called for each repository by checking logs
-            // Since clones don't exist, we expect warning logs for each repo
-            var warningMessages = logger.LogEntries
-                .Where(e => e.LogLevel == LogLevel.Warning)
-                .Select(e => e.Message)
-                .ToList();
+        var result = await composer.DeleteGoalAsync("failed-goal-branches");
 
-            // Two repos = two "Cannot delete remote branch" warnings (one per repo)
-            Assert.Equal(2, warningMessages.Count(m => m.Contains("Cannot delete remote branch")));
-            Assert.Contains(warningMessages, m => m.Contains("repo-a"));
-            Assert.Contains(warningMessages, m => m.Contains("repo-b"));
-        }
-        finally
-        {
-            if (Directory.Exists(tmpDir))
-                Directory.Delete(tmpDir, recursive: true);
-        }
+        // Verify goal deleted successfully
+        Assert.Contains("✅", result);
+        Assert.Contains("deleted", result);
+        var deletedGoal = await _store.GetGoalAsync("failed-goal-branches", ct);
+        Assert.Null(deletedGoal);
+
+        // Verify DeleteRemoteBranchAsync was called for each repository
+        mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-a", "copilothive/failed-goal-branches", It.IsAny<CancellationToken>()), Times.Once);
+        mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-b", "copilothive/failed-goal-branches", It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
     public async Task DeleteGoal_DraftGoal_WithRepoManager_DoesNotAttemptBranchCleanup()
     {
         var ct = TestContext.Current.CancellationToken;
-        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tmpDir);
-        try
-        {
-            // Create a draft goal with a repository
-            await _composer.CreateGoalAsync("draft-no-branch", "Draft goal", repositories: "repo-a");
 
-            // Use a TestLogger to capture log messages
-            var logger = new TestLogger<BrainRepoManager>();
-            var repoManager = new BrainRepoManager(tmpDir, logger);
-            var composer = new Composer(
-                "test-model",
-                NullLogger<Composer>.Instance,
-                _store,
-                repoManager: repoManager,
-                stateDir: tmpDir);
+        // Create a draft goal with a repository
+        await _composer.CreateGoalAsync("draft-no-branch", "Draft goal", repositories: "repo-a");
 
-            var result = await composer.DeleteGoalAsync("draft-no-branch");
+        // Mock the repo manager
+        var mockRepoManager = new Mock<IBrainRepoManager>();
+        mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Throws(new InvalidOperationException("Should not be called for Draft goals"));
 
-            Assert.Contains("✅", result);
-            // Goal is removed from store (Draft goals delete fine with no branch cleanup)
-            var deletedGoal = await _store.GetGoalAsync("draft-no-branch", ct);
-            Assert.Null(deletedGoal);
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            repoManager: mockRepoManager.Object,
+            stateDir: Path.GetTempPath());
 
-            // Verify no branch cleanup was attempted for Draft goals
-            // No "Cannot delete remote branch" warnings should appear
-            var warningMessages = logger.LogEntries
-                .Where(e => e.LogLevel == LogLevel.Warning)
-                .Select(e => e.Message)
-                .ToList();
+        var result = await composer.DeleteGoalAsync("draft-no-branch");
 
-            Assert.DoesNotContain(warningMessages, m => m.Contains("Cannot delete remote branch"));
-        }
-        finally
-        {
-            if (Directory.Exists(tmpDir))
-                Directory.Delete(tmpDir, recursive: true);
-        }
+        Assert.Contains("✅", result);
+        // Goal is removed from store (Draft goals delete fine with no branch cleanup)
+        var deletedGoal = await _store.GetGoalAsync("draft-no-branch", ct);
+        Assert.Null(deletedGoal);
+
+        // Verify DeleteRemoteBranchAsync was never called for Draft goals
+        mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
-    public async Task DeleteGoal_FailedGoal_BestEffortCleanup_StillSucceedsWhenGitFails()
+    public async Task DeleteGoal_FailedGoal_BestEffortCleanup_StillSucceedsWhenDeleteRemoteBranchThrows()
     {
         var ct = TestContext.Current.CancellationToken;
-        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tmpDir);
-        try
-        {
-            // Create a failed goal with repositories
-            await _composer.CreateGoalAsync("failed-cleanup", "Will fail", repositories: "repo-a");
-            var goal = (await _store.GetGoalAsync("failed-cleanup", ct))!;
-            goal.Status = GoalStatus.Failed;
-            await _store.UpdateGoalAsync(goal, ct);
 
-            // Use a TestLogger to capture behavior
-            var logger = new TestLogger<BrainRepoManager>();
-            var repoManager = new BrainRepoManager(tmpDir, logger);
-            var composer = new Composer(
-                "test-model",
-                NullLogger<Composer>.Instance,
-                _store,
-                repoManager: repoManager,
-                stateDir: tmpDir);
+        // Create a failed goal with repositories
+        await _composer.CreateGoalAsync("failed-cleanup", "Will fail", repositories: "repo-a");
+        var goal = (await _store.GetGoalAsync("failed-cleanup", ct))!;
+        goal.Status = GoalStatus.Failed;
+        await _store.UpdateGoalAsync(goal, ct);
 
-            // DeleteRemoteBranchAsync will log warnings (no clones exist) but won't throw
-            // Goal deletion should still succeed - this is the "best-effort" behavior
-            var result = await composer.DeleteGoalAsync("failed-cleanup");
+        // Mock the repo manager to throw when DeleteRemoteBranchAsync is called
+        var mockRepoManager = new Mock<IBrainRepoManager>();
+        mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-a", "copilothive/failed-cleanup", It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("Git operation failed"))
+            .Verifiable();
 
-            // Verify the goal was deleted despite branch cleanup issues
-            Assert.Contains("✅", result);
-            Assert.Contains("deleted", result);
-            var deletedGoal = await _store.GetGoalAsync("failed-cleanup", ct);
-            Assert.Null(deletedGoal);
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            repoManager: mockRepoManager.Object,
+            stateDir: Path.GetTempPath());
 
-            // Verify that cleanup was attempted (even though it failed)
-            Assert.Contains(logger.LogEntries, e =>
-                e.LogLevel == LogLevel.Warning &&
-                e.Message.Contains("Cannot delete remote branch"));
-        }
-        finally
-        {
-            if (Directory.Exists(tmpDir))
-                Directory.Delete(tmpDir, recursive: true);
-        }
+        // DeleteRemoteBranchAsync will throw, but goal deletion should still succeed - this is "best-effort"
+        var result = await composer.DeleteGoalAsync("failed-cleanup");
+
+        // Verify the goal was deleted despite branch cleanup issues
+        Assert.Contains("✅", result);
+        Assert.Contains("deleted", result);
+        var deletedGoal = await _store.GetGoalAsync("failed-cleanup", ct);
+        Assert.Null(deletedGoal);
+
+        // Verify that the cleanup was attempted (even though it threw)
+        mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-a", "copilothive/failed-cleanup", It.IsAny<CancellationToken>()), Times.Once);
     }
 
     // ── cancel_goal ──
