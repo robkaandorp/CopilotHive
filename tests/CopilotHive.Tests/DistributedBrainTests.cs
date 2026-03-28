@@ -458,6 +458,46 @@ public sealed class DistributedBrainTests
         }
     }
 
+    // -- Review Phase Guidance Static Verification --
+
+    [Fact]
+    public void ReviewPhaseGuidance_ContainsScopeClarificationGuidance()
+    {
+        // Verify that the source code contains the expected reviewer guidance strings.
+        // This ensures the guidance is present in both Review phase branches (with and without docwriting).
+        // Use environment variable or current directory to find the repo root
+        var repoRoot = Environment.CurrentDirectory;
+        // Navigate up until we find the solution file
+        while (repoRoot != null && !Directory.GetFiles(repoRoot, "*.slnx").Any())
+        {
+            repoRoot = Directory.GetParent(repoRoot)?.FullName;
+        }
+        Assert.NotNull(repoRoot);
+        
+        var sourcePath = Path.Combine(repoRoot, "src", "CopilotHive", "Orchestration", "DistributedBrain.cs");
+        Assert.True(File.Exists(sourcePath), $"Source file not found at {sourcePath}");
+        
+        var source = File.ReadAllText(sourcePath);
+        
+        // Verify the guidance strings for "Files to change" are present
+        Assert.Contains("\"Files to change\" in the goal is GUIDANCE", source);
+        Assert.Contains("Test files and test changes that cover the modified code are ALWAYS acceptable and expected", source);
+        
+        // Verify the guidance for "Files NOT to change"
+        Assert.Contains("\"Files NOT to change\" in the goal IS a strict prohibition", source);
+        Assert.Contains("flag any changes to those files as MAJOR", source);
+        
+        // Verify goal description scope guidance
+        Assert.Contains("The goal description defines WHAT to do. New behavior described in the goal is IN SCOPE", source);
+        
+        // Verify the focus guidance
+        Assert.Contains("Only flag issues that are clearly bugs, security problems, or genuine scope violations", source);
+        
+        // Verify docwriting-specific guidance
+        Assert.Contains("The docwriting phase already ran before this review", source);
+        Assert.Contains("Changes to CHANGELOG.md, README.md, and XML doc comments are EXPECTED", source);
+    }
+
 }
 
 /// <summary>

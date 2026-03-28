@@ -614,9 +614,17 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             GoalPhase.Review when docWritingPrecededReview => """
                 - For reviewers: Do NOT include any git diff commands in your prompt — the worker's WORKSPACE CONTEXT already provides the correct diff command with the exact merge-base hash. Just tell them to review the branch changes using the diff command from their workspace context, focus only on the diff lines (+ and -), and call the report_review_verdict tool when done.
                 - IMPORTANT: The docwriting phase already ran before this review. Changes to CHANGELOG.md, README.md, and XML doc comments are EXPECTED and should NOT be flagged as scope violations.
+                - "Files to change" in the goal is GUIDANCE, not an exhaustive whitelist. Test files and test changes that cover the modified code are ALWAYS acceptable and expected.
+                - "Files NOT to change" in the goal IS a strict prohibition — flag any changes to those files as MAJOR.
+                - The goal description defines WHAT to do. New behavior described in the goal is IN SCOPE — do not reject changes just because the base branch doesn't have them yet.
+                - Only flag issues that are clearly bugs, security problems, or genuine scope violations (touching unrelated code/features).
                 """,
             GoalPhase.Review => """
                 - For reviewers: Do NOT include any git diff commands in your prompt — the worker's WORKSPACE CONTEXT already provides the correct diff command with the exact merge-base hash. Just tell them to review the branch changes using the diff command from their workspace context, focus only on the diff lines (+ and -), and call the report_review_verdict tool when done.
+                - "Files to change" in the goal is GUIDANCE, not an exhaustive whitelist. Test files and test changes that cover the modified code are ALWAYS acceptable and expected.
+                - "Files NOT to change" in the goal IS a strict prohibition — flag any changes to those files as MAJOR.
+                - The goal description defines WHAT to do. New behavior described in the goal is IN SCOPE — do not reject changes just because the base branch doesn't have them yet.
+                - Only flag issues that are clearly bugs, security problems, or genuine scope violations (touching unrelated code/features).
                 """,
             GoalPhase.Testing => """
                 - For testers: tell them to build, run the test skill, write integration tests, and call the report_test_results tool when done. Do NOT tell them to create report files.
