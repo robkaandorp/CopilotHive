@@ -15,6 +15,11 @@
 </a>
 <div class="goal-header" style="display:flex;align-items:center;gap:1rem;">
     <h1>Goal: @GoalId</h1>
+    @{ var repoNames = _storedGoal?.RepositoryNames ?? _detail?.RepositoryNames ?? []; }
+    @foreach (var repo in repoNames)
+    {
+        <span class="repo-tag">@repo</span>
+    }
     @if (_detail?.Status == GoalStatus.Draft || _storedGoal?.Status == GoalStatus.Draft)
     {
         <button class="approve-btn" @onclick="ApproveGoal">▶ Approve</button>
@@ -537,19 +542,6 @@ else if (_storedGoal is not null)
     else
     {
         <p style="color:var(--text-muted);margin-top:1rem">No iteration history recorded.</p>
-    }
-
-    @if (_storedGoal.RepositoryNames.Count > 0)
-    {
-        <div class="card" style="margin-top:1rem">
-            <div class="label">Repositories</div>
-            <div class="goal-repos" style="margin-top:0.25rem">
-                @foreach (var repo in _storedGoal.RepositoryNames)
-                {
-                    <span class="repo-tag">@repo</span>
-                }
-            </div>
-        </div>
     }
 
     @if (_storedGoal.Status == GoalStatus.Draft || _storedGoal.Status == GoalStatus.Failed)
