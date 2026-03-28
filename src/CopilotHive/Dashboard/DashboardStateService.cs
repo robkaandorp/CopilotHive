@@ -526,6 +526,9 @@ public sealed class DashboardStateService : IDisposable
         _ => "",
     };
 
+    /// <summary>Returns the CopilotHive assembly version string.</summary>
+    public string GetVersion() => _version;
+
     /// <summary>Returns orchestrator info including uptime, versions, and model configuration.</summary>
     public OrchestratorInfo GetOrchestratorInfo()
     {
