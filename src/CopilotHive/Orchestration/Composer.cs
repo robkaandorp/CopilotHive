@@ -24,7 +24,7 @@ public sealed class Composer : IAsyncDisposable
     private readonly ReasoningEffort? _reasoningEffort;
     private readonly ILogger<Composer> _logger;
     private readonly IGoalStore _goalStore;
-    private readonly BrainRepoManager? _repoManager;
+    private readonly IBrainRepoManager? _repoManager;
     private readonly GoalDispatcher? _goalDispatcher;
     private readonly string _stateDir;
     private readonly IHttpClientFactory? _httpClientFactory;
@@ -90,7 +90,7 @@ public sealed class Composer : IAsyncDisposable
         IGoalStore goalStore,
         int maxContextTokens = Constants.DefaultBrainContextWindow,
         int maxSteps = Constants.DefaultBrainMaxSteps,
-        BrainRepoManager? repoManager = null,
+        IBrainRepoManager? repoManager = null,
         string? stateDir = null,
         GoalDispatcher? goalDispatcher = null,
         IHttpClientFactory? httpClientFactory = null,

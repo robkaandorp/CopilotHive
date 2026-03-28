@@ -70,7 +70,7 @@ static async Task<int> RunServerAsync(string[] args)
         new MetricsTracker(metricsDir, sp.GetRequiredService<ILogger<MetricsTracker>>()));
 
     // Brain repo manager: persistent read-only clones for Brain file access
-    builder.Services.AddSingleton(sp =>
+    builder.Services.AddSingleton<IBrainRepoManager>(sp =>
         new BrainRepoManager(stateDir, sp.GetRequiredService<ILogger<BrainRepoManager>>()));
 
     builder.Services.AddSingleton(sp =>
@@ -101,7 +101,7 @@ static async Task<int> RunServerAsync(string[] args)
                 sp.GetService<AgentsManager>(),
                 maxCtx,
                 maxSteps,
-                sp.GetService<BrainRepoManager>(),
+                sp.GetService<IBrainRepoManager>(),
                 stateDir);
         });
     }
@@ -129,7 +129,7 @@ static async Task<int> RunServerAsync(string[] args)
         return new Composer(model, sp.GetRequiredService<ILogger<Composer>>(),
             sp.GetRequiredService<IGoalStore>(),
             maxCtx, maxSteps,
-            sp.GetService<BrainRepoManager>(),
+            sp.GetService<IBrainRepoManager>(),
             stateDir,
             sp.GetRequiredService<GoalDispatcher>(),
             !string.IsNullOrWhiteSpace(ollamaApiKey) ? sp.GetRequiredService<IHttpClientFactory>() : null,
@@ -376,7 +376,7 @@ static async Task<int> RunServerAsync(string[] args)
         }
     });
 
-    goalsApi.MapDelete("/{id}", async (string id, SqliteGoalStore store, IServiceProvider sp, ILogger<Program> logger) =>
+    goalsApi.MapDelete("/{id}", async (string id, SqliteGoalStore store, IBrainRepoManager? repoManager, ILogger<Program> logger) =>
     {
         var goal = await store.GetGoalAsync(id);
         if (goal is null)
@@ -392,7 +392,6 @@ static async Task<int> RunServerAsync(string[] args)
         // Best-effort cleanup of remote feature branches for Failed goals
         if (goal.Status == GoalStatus.Failed)
         {
-            var repoManager = sp.GetService<BrainRepoManager>();
             if (repoManager is not null)
             {
                 var branchName = $"copilothive/{id}";

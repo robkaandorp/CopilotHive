@@ -27,7 +27,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly ReasoningEffort? _reasoningEffort;
     private readonly ILogger<DistributedBrain> _logger;
     private readonly MetricsTracker? _metricsTracker;
-    private readonly BrainRepoManager? _repoManager;
+    private readonly IBrainRepoManager? _repoManager;
     private readonly string _stateDir;
     private IChatClient? _chatClient;
     private CodingAgent? _agent;
@@ -83,7 +83,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null,
         int maxContextTokens = Constants.DefaultBrainContextWindow,
         int maxSteps = Constants.DefaultBrainMaxSteps,
-        BrainRepoManager? repoManager = null,
+        IBrainRepoManager? repoManager = null,
         string? stateDir = null)
     {
         _modelOverride = modelOverride;
