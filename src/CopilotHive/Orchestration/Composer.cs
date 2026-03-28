@@ -541,6 +541,25 @@ public sealed class Composer : IAsyncDisposable
             return $"❌ Failed to delete goal '{id}'.";
 
         _logger.LogInformation("Composer deleted goal '{GoalId}'", id);
+
+        // Best-effort cleanup of remote feature branches for Failed goals
+        if (_repoManager is not null && goal.Status == GoalStatus.Failed)
+        {
+            var branchName = $"copilothive/{id}";
+            foreach (var repoName in goal.RepositoryNames)
+            {
+                try
+                {
+                    await _repoManager.DeleteRemoteBranchAsync(repoName, branchName);
+                    _logger.LogInformation("Deleted remote branch {Branch} from {Repo}", branchName, repoName);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to delete remote branch {Branch} from {Repo}", branchName, repoName);
+                }
+            }
+        }
+
         return $"✅ Goal '{id}' has been permanently deleted.";
     }
 

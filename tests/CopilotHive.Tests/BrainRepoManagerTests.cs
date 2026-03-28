@@ -76,4 +76,34 @@ public sealed class BrainRepoManagerTests : IDisposable
 
         Assert.StartsWith(manager.WorkDirectory, clonePath);
     }
+
+    [Fact]
+    public async Task DeleteRemoteBranchAsync_NoCloneExists_LogsWarningAndDoesNotThrow()
+    {
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        var ct = TestContext.Current.CancellationToken;
+
+        // No clone exists — method should not throw, just log a warning
+        var ex = await Record.ExceptionAsync(() =>
+            manager.DeleteRemoteBranchAsync("nonexistent-repo", "copilothive/test-goal", ct));
+
+        Assert.Null(ex);
+    }
+
+    [Fact]
+    public async Task DeleteRemoteBranchAsync_CloneExistsWithNoBranch_DoesNotThrow()
+    {
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        var ct = TestContext.Current.CancellationToken;
+        var clonePath = manager.GetClonePath("test-repo");
+
+        // Create a minimal .git structure so the clone-existence check passes
+        Directory.CreateDirectory(Path.Combine(clonePath, ".git"));
+
+        // Method should not throw even though git push will fail (no remote configured)
+        var ex = await Record.ExceptionAsync(() =>
+            manager.DeleteRemoteBranchAsync("test-repo", "copilothive/test-goal", ct));
+
+        Assert.Null(ex);
+    }
 }

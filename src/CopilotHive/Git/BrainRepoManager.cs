@@ -184,6 +184,46 @@ public sealed class BrainRepoManager
     }
 
     /// <summary>
+    /// Deletes a remote feature branch from the specified repository.
+    /// Best-effort: logs a warning if the branch doesn't exist or deletion fails.
+    /// Also attempts to delete the local tracking branch; failure is silently ignored.
+    /// </summary>
+    /// <param name="repoName">Short name of the repository (must have been cloned via <see cref="EnsureCloneAsync"/>).</param>
+    /// <param name="branchName">Branch name to delete from the remote (e.g. "copilothive/my-goal").</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default)
+    {
+        var clonePath = GetClonePath(repoName);
+        if (!Directory.Exists(Path.Combine(clonePath, ".git")))
+        {
+            _logger.LogWarning(
+                "Cannot delete remote branch {Branch} from {Repo}: no clone found at {Path}",
+                branchName, repoName, clonePath);
+            return;
+        }
+
+        try
+        {
+            await RunGitAsync(clonePath, ["push", "origin", "--delete", branchName], ct);
+            _logger.LogInformation("Deleted remote branch {Branch} from {Repo}", branchName, repoName);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to delete remote branch {Branch} from {Repo}", branchName, repoName);
+        }
+
+        // Best-effort: delete the local tracking branch
+        try
+        {
+            await RunGitAsync(clonePath, ["branch", "-D", branchName], ct);
+        }
+        catch
+        {
+            // Ignored — local branch may not exist
+        }
+    }
+
+    /// <summary>
     /// Returns the clone path for a repository without performing any git operations.
     /// </summary>
     public string GetClonePath(string repoName) =>

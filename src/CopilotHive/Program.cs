@@ -376,7 +376,7 @@ static async Task<int> RunServerAsync(string[] args)
         }
     });
 
-    goalsApi.MapDelete("/{id}", async (string id, SqliteGoalStore store) =>
+    goalsApi.MapDelete("/{id}", async (string id, SqliteGoalStore store, IServiceProvider sp, ILogger<Program> logger) =>
     {
         var goal = await store.GetGoalAsync(id);
         if (goal is null)
@@ -386,7 +386,32 @@ static async Task<int> RunServerAsync(string[] args)
             return Results.BadRequest(new { error = "Only Draft or Failed goals can be deleted" });
 
         var deleted = await store.DeleteGoalAsync(id);
-        return deleted ? Results.NoContent() : Results.NotFound(new { error = $"Goal '{id}' not found." });
+        if (!deleted)
+            return Results.NotFound(new { error = $"Goal '{id}' not found." });
+
+        // Best-effort cleanup of remote feature branches for Failed goals
+        if (goal.Status == GoalStatus.Failed)
+        {
+            var repoManager = sp.GetService<BrainRepoManager>();
+            if (repoManager is not null)
+            {
+                var branchName = $"copilothive/{id}";
+                foreach (var repoName in goal.RepositoryNames)
+                {
+                    try
+                    {
+                        await repoManager.DeleteRemoteBranchAsync(repoName, branchName);
+                        logger.LogInformation("Deleted remote branch {Branch} from {Repo}", branchName, repoName);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(ex, "Failed to delete remote branch {Branch} from {Repo}", branchName, repoName);
+                    }
+                }
+            }
+        }
+
+        return Results.NoContent();
     });
 
     goalsApi.MapPost("/{id}/cancel", async (string id, GoalDispatcher dispatcher, SqliteGoalStore store) =>

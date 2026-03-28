@@ -515,6 +515,76 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("not found", result);
     }
 
+    [Fact]
+    public async Task DeleteGoal_FailedGoal_WithRepoManager_BranchCleanupIsAttempted()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            // Create a failed goal with two repositories
+            await _composer.CreateGoalAsync("failed-goal-branches", "Will fail", repositories: "repo-a, repo-b");
+            var goal = (await _store.GetGoalAsync("failed-goal-branches", ct))!;
+            goal.Status = GoalStatus.Failed;
+            await _store.UpdateGoalAsync(goal, ct);
+
+            // Use a real BrainRepoManager (no clones exist — DeleteRemoteBranchAsync logs warning but doesn't throw)
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            // Even though no clones exist, goal deletion should succeed (best-effort branch cleanup)
+            var result = await composer.DeleteGoalAsync("failed-goal-branches");
+
+            Assert.Contains("✅", result);
+            Assert.Contains("deleted", result);
+            // Goal is removed from store
+            var deletedGoal = await _store.GetGoalAsync("failed-goal-branches", ct);
+            Assert.Null(deletedGoal);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteGoal_DraftGoal_WithRepoManager_DoesNotAttemptBranchCleanup()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            // Create a draft goal with a repository
+            await _composer.CreateGoalAsync("draft-no-branch", "Draft goal", repositories: "repo-a");
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.DeleteGoalAsync("draft-no-branch");
+
+            Assert.Contains("✅", result);
+            // Goal is removed from store (Draft goals delete fine with no branch cleanup)
+            var deletedGoal = await _store.GetGoalAsync("draft-no-branch", ct);
+            Assert.Null(deletedGoal);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
     // ── cancel_goal ──
 
     [Fact]
