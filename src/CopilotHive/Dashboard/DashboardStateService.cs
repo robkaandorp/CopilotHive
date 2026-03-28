@@ -1,3 +1,4 @@
+using System.Reflection;
 using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
@@ -23,7 +24,11 @@ public sealed class DashboardStateService : IDisposable
     private readonly HiveConfigFile? _config;
     private readonly Timer _timer;
     private readonly DateTime _startTime = DateTime.UtcNow;
-    private readonly string _version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown";
+    private readonly string _version =
+        Assembly.GetExecutingAssembly()
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+        ?? Assembly.GetExecutingAssembly().GetName().Version?.ToString()
+        ?? "unknown";
     private readonly string? _sharpCoderVersion = typeof(SharpCoder.CodingAgent).Assembly.GetName().Version?.ToString();
     private List<Goal> _cachedPendingGoals = [];
 
