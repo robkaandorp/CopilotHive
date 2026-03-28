@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Repository tags on Goal Detail page** — repository names are now prominently displayed next to the goal title instead of buried in a card at the bottom:
+  - `GoalDetail.razor` now shows repository names as `repo-tag` labels immediately after the `<h1>` title using the same styling as the goals list page
+  - Works for both live pipeline goals (`_detail`) and stored-only goals (`_storedGoal`) with fallback: `_storedGoal?.RepositoryNames ?? _detail?.RepositoryNames ?? []`
+  - The standalone "Repositories" card at the bottom of the page has been removed as it is now redundant
+  - Goals with no repositories show no tags (no empty container rendered)
+  - `GoalDetailInfo` in `DashboardStateService.cs` now includes `RepositoryNames { get; init; } = []` property, populated from the goal's `RepositoryNames` in `GetGoalDetail()`
+
 ### Fixed
 - **Composer `web_search` context window overflow** — search results now have per-result content truncated to 500 characters, preventing context window overflow:
   - Added `const int MaxContentChars = 500` constant in `WebSearchAsync` method for maintainability
