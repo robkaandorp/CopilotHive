@@ -55,7 +55,7 @@ jobs:
       - name: Set version
         id: version
         run: |
-          PREFIX=$(grep -oPm1 '(?<=<VersionPrefix>)[^<]+' src/CopilotHive/CopilotHive.csproj)
+          PREFIX=$(grep -oPm1 '(?<=<VersionPrefix>)[^<]+' Directory.Build.props)
           echo "version=${PREFIX}-beta.${{ github.run_number }}" >> $GITHUB_OUTPUT
           echo "prefix=${PREFIX}" >> $GITHUB_OUTPUT
 
@@ -79,6 +79,8 @@ jobs:
           push: true
           tags: ${{ steps.orchestrator-meta.outputs.tags }}
           labels: ${{ steps.orchestrator-meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
           cache-from: type=gha,scope=orchestrator
           cache-to: type=gha,mode=max,scope=orchestrator
 
@@ -102,5 +104,7 @@ jobs:
           push: true
           tags: ${{ steps.worker-meta.outputs.tags }}
           labels: ${{ steps.worker-meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
           cache-from: type=gha,scope=worker
           cache-to: type=gha,mode=max,scope=worker
