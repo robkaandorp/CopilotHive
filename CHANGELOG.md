@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Remote branch cleanup on goal deletion** — when a Failed goal is deleted, its remote feature branches are automatically cleaned up from all associated repositories:
+  - `BrainRepoManager.DeleteRemoteBranchAsync(repoName, branchName)` — deletes the remote branch and local tracking branch from the specified repository clone; best-effort (logs warning on failure, doesn't throw)
+  - `Composer.DeleteGoalAsync` — after successful store deletion, calls `DeleteRemoteBranchAsync` for each repository in `goal.RepositoryNames` when `goal.Status == GoalStatus.Failed`
+  - `DELETE /api/goals/{id}` endpoint — same branch cleanup logic added to the API endpoint via `IServiceProvider`
+  - Branch naming convention: `copilothive/{goalId}` (e.g., `copilothive/my-goal`)
+  - Only Failed goals trigger branch cleanup (Draft goals may not have branches yet)
+  - Cleanup is best-effort — goal deletion succeeds even if branch deletion fails (e.g., branch doesn't exist, remote unreachable)
+  - Includes 8 xUnit tests for `DeleteRemoteBranchAsync` covering: no clone exists, clone exists with no branch, successful deletion, warning logging on failure
+  - Includes 3 integration tests for `Composer.DeleteGoalAsync` covering: Failed goal with repo manager (cleanup attempted), Draft goal with repo manager (no cleanup), Failed goal with git failures (still succeeds)
+  - Includes 2 API endpoint tests for `DELETE /api/goals/{id}` covering: Failed goal returns 204 No Content, goal is removed from store
+
+### Added
 - **Composer web research tools** — `web_search` and `web_fetch` tools are now available in the Composer for researching information on the web via Ollama's web search and fetch APIs:
   - `web_search` — searches the web for information, returns titles, URLs, and content snippets; supports `max_results` parameter (clamped to 1-10, default 5)
   - `web_fetch` — fetches a web page and returns its title, content, and extracted links; supports `max_lines` parameter for content truncation (default 200)
