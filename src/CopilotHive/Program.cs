@@ -133,7 +133,8 @@ static async Task<int> RunServerAsync(string[] args)
             stateDir,
             sp.GetRequiredService<GoalDispatcher>(),
             !string.IsNullOrWhiteSpace(ollamaApiKey) ? sp.GetRequiredService<IHttpClientFactory>() : null,
-            ollamaApiKey);
+            ollamaApiKey,
+            sp.GetService<HiveConfigFile>());
     });
 
     // Dashboard: log capture (registered early so logger provider can reference it)
@@ -262,6 +263,26 @@ static async Task<int> RunServerAsync(string[] args)
         catch (Exception ex)
         {
             logger.LogWarning(ex, "Composer failed to connect — chat will be unavailable");
+        }
+    }
+
+    // Eager clone all configured repos at startup
+    var repoManager = app.Services.GetService<IBrainRepoManager>();
+    var hiveConfig = app.Services.GetService<HiveConfigFile>();
+    if (repoManager is not null && hiveConfig is not null)
+    {
+        foreach (var repo in hiveConfig.Repositories)
+        {
+            try
+            {
+                var url = GoalDispatcher.InjectTokenIntoUrl(repo.Url);
+                await repoManager.EnsureCloneAsync(repo.Name, url, repo.DefaultBranch);
+                logger.LogInformation("Cloned/updated repo '{RepoName}' at startup", repo.Name);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Failed to clone repo '{RepoName}' at startup", repo.Name);
+            }
         }
     }
 

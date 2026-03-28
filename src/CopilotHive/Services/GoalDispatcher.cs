@@ -1533,7 +1533,7 @@ public sealed class GoalDispatcher : BackgroundService
             """;
     }
 
-    private static string InjectTokenIntoUrl(string url)
+    internal static string InjectTokenIntoUrl(string url)
     {
         var token = Environment.GetEnvironmentVariable("GH_TOKEN");
         if (string.IsNullOrEmpty(token) || !url.StartsWith("https://github.com/"))

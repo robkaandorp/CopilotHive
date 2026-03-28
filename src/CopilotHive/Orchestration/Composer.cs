@@ -33,6 +33,7 @@ public sealed class Composer : IAsyncDisposable
     private CodingAgent? _agent;
     private AgentSession _session;
 
+    private readonly HiveConfigFile? _hiveConfig;
     private readonly string _systemPrompt;
     private readonly List<AITool> _composerTools;
 
@@ -69,6 +70,7 @@ public sealed class Composer : IAsyncDisposable
         - Delete draft or failed goals (delete_goal)
         - Cancel InProgress or Pending goals (cancel_goal)
         - Inspect repository history (git_log, git_diff, git_show, git_branch, git_blame)
+        - List configured repositories (list_repositories)
 
         Guidelines for goal creation:
         - Each goal should be completable in 1-3 iterations (small, focused)
@@ -95,7 +97,8 @@ public sealed class Composer : IAsyncDisposable
         string? stateDir = null,
         GoalDispatcher? goalDispatcher = null,
         IHttpClientFactory? httpClientFactory = null,
-        string? ollamaApiKey = null)
+        string? ollamaApiKey = null,
+        HiveConfigFile? hiveConfig = null)
     {
         _model = model;
         _maxContextTokens = maxContextTokens;
@@ -107,6 +110,7 @@ public sealed class Composer : IAsyncDisposable
         _stateDir = stateDir ?? "/app/state";
         _httpClientFactory = httpClientFactory;
         _ollamaApiKey = string.IsNullOrWhiteSpace(ollamaApiKey) ? null : ollamaApiKey;
+        _hiveConfig = hiveConfig;
         _session = AgentSession.Create("composer");
 
         var (_, _, reasoning) = SDK.ChatClientFactory.ParseProviderModelAndReasoning(model);
@@ -115,6 +119,14 @@ public sealed class Composer : IAsyncDisposable
         _systemPrompt = DefaultSystemPrompt;
         if (_ollamaApiKey is not null)
             _systemPrompt += "\n- Research information on the web (web_search, web_fetch)";
+
+        var repos = _hiveConfig?.Repositories;
+        if (repos is not null && repos.Count > 0)
+        {
+            _systemPrompt += "\n\nConfigured repositories:";
+            foreach (var repo in repos)
+                _systemPrompt += $"\n- {repo.Name} ({repo.Url}, default branch: {repo.DefaultBranch})";
+        }
 
         _composerTools = BuildComposerTools();
     }
@@ -435,6 +447,8 @@ public sealed class Composer : IAsyncDisposable
                 "List local or remote branches in a repository."),
             AIFunctionFactory.Create(GitBlameAsync, "git_blame",
                 "Show line-by-line authorship information for a file."),
+            AIFunctionFactory.Create(ListRepositoriesAsync, "list_repositories",
+                "List all configured repositories with their names, URLs, and default branches."),
         };
 
         if (_ollamaApiKey is not null)
@@ -826,6 +840,20 @@ public sealed class Composer : IAsyncDisposable
 
     private static string Truncate(string text, int maxLength) =>
         text.Length <= maxLength ? text : text[..(maxLength - 1)] + "…";
+
+    [Description("List all configured repositories with their names, URLs, and default branches.")]
+    internal Task<string> ListRepositoriesAsync()
+    {
+        var repos = _hiveConfig?.Repositories;
+        if (repos is null || repos.Count == 0)
+            return Task.FromResult("No repositories configured.");
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"## Configured Repositories ({repos.Count})");
+        foreach (var repo in repos)
+            sb.AppendLine($"- **{repo.Name}** — {repo.Url} (branch: {repo.DefaultBranch})");
+        return Task.FromResult(sb.ToString().TrimEnd());
+    }
 
     // ── Git tool implementations ──
 
