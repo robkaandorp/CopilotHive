@@ -2297,6 +2297,9 @@ public sealed class ComposerToolTests : IDisposable
         Assert.NotNull(pending);
         Assert.Equal("Confirm?", pending!.Text);
         Assert.Equal(QuestionType.YesNo, pending.Type);
+        Assert.Equal(2, pending.Options.Count);
+        Assert.Contains("Yes", pending.Options);
+        Assert.Contains("No", pending.Options);
 
         // Submit an answer
         _composer.SubmitAnswer("Yes — looks good");
