@@ -906,7 +906,6 @@ public sealed class ComposerToolTests : IDisposable
     [InlineData("Review", "reviewer")]
     [InlineData("DocWriting", "docwriter")]
     [InlineData("Improve", "improver")]
-    [InlineData("Planning", "planning")]
     public async Task GetPhaseOutput_RoleKeyMapping_FallsBackCorrectly(string phaseName, string rolePrefix)
     {
         var ct = TestContext.Current.CancellationToken;
@@ -987,6 +986,25 @@ public sealed class ComposerToolTests : IDisposable
     }
 
     [Fact]
+    public async Task GetPhaseOutput_UnknownPhase_ReturnsFailFastMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("phase-unknown", "Unknown phase test");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Planning", Result = "pass", DurationSeconds = 1.0, WorkerOutput = null }],
+        };
+        await _store.AddIterationAsync("phase-unknown", summary, ct);
+
+        var result = await _composer.GetPhaseOutputAsync("phase-unknown", 1, "Planning");
+
+        Assert.Contains("Unknown phase 'Planning'", result);
+        Assert.Contains("Coding, Testing, Review, DocWriting, Improve", result);
+    }
+
+    [Fact]
     public async Task GetPhaseOutput_NoOutputRecorded_ReturnsMessage()
     {
         var ct = TestContext.Current.CancellationToken;
@@ -1035,7 +1053,7 @@ public sealed class ComposerToolTests : IDisposable
     public void SystemPrompt_IncludesDrillIntoPhaseOutput()
     {
         Assert.Contains("get_phase_output", _composer.GetSystemPrompt());
-        Assert.Contains("Drill into phase output", _composer.GetSystemPrompt());
+        Assert.Contains("Drill into worker phase output", _composer.GetSystemPrompt());
     }
 
     // ── git tools — no repo manager configured ──

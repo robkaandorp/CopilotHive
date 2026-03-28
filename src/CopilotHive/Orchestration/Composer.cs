@@ -62,7 +62,7 @@ public sealed class Composer : IAsyncDisposable
         - Read the codebase to understand current state (read_file, glob, grep)
         - Search existing goals to avoid duplication (search_goals)
         - Browse goal history and status (list_goals, get_goal)
-        - Drill into phase output (get_phase_output)
+        - Drill into worker phase output for Coding, Testing, Review, DocWriting, or Improve (get_phase_output)
         - Create goals as drafts for user review (create_goal)
         - Approve drafts to queue them for execution (approve_goal)
         - Update existing goals (update_goal)
@@ -701,11 +701,20 @@ public sealed class Composer : IAsyncDisposable
         return sb.ToString();
     }
 
+    private static readonly Dictionary<string, string> PhaseOutputKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Coding"] = "coder",
+        ["Testing"] = "tester",
+        ["Review"] = "reviewer",
+        ["DocWriting"] = "docwriter",
+        ["Improve"] = "improver",
+    };
+
     [Description("Get the raw worker output for a specific phase within an iteration.")]
     internal async Task<string> GetPhaseOutputAsync(
         [Description("Goal ID")] string id,
         [Description("Iteration number (1-based)")] int iteration,
-        [Description("Phase name: Coding, Testing, Review, DocWriting, Improve, or Planning")] string phase,
+        [Description("Phase name: Coding, Testing, Review, DocWriting, or Improve")] string phase,
         [Description("Maximum lines to return. Default: 200")] int max_lines = 200)
     {
         var error = Shared.ToolValidation.Check(
@@ -733,16 +742,9 @@ public sealed class Composer : IAsyncDisposable
         if (string.IsNullOrEmpty(output))
         {
             // Fall back to PhaseOutputs dictionary using role key mapping
-            var roleKey = phase.ToLowerInvariant() switch
-            {
-                "coding" => $"coder-{iteration}",
-                "testing" => $"tester-{iteration}",
-                "review" => $"reviewer-{iteration}",
-                "docwriting" => $"docwriter-{iteration}",
-                "improve" => $"improver-{iteration}",
-                "planning" => $"planning-{iteration}",
-                _ => $"{phase.ToLowerInvariant()}-{iteration}",
-            };
+            if (!PhaseOutputKeys.TryGetValue(phase, out var rolePrefix))
+                return $"Unknown phase '{phase}'. Supported phases: Coding, Testing, Review, DocWriting, Improve.";
+            var roleKey = $"{rolePrefix}-{iteration}";
             iterSummary.PhaseOutputs.TryGetValue(roleKey, out output);
         }
 
