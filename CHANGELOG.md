@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Composer `ask_user` tool** — the Composer can now present interactive questions in the chat UI, suspending the response loop until the user answers:
+  - `AskUserAsync` method presents questions with three types: `YesNo` (two buttons), `SingleChoice` (radio buttons), and `MultiChoice` (checkboxes)
+  - `ComposerQuestion` class encapsulates the question text, type, options, and a `TaskCompletionSource<string>` for async/await blocking
+  - `PendingQuestion` property on `Composer` exposes the current question; `OnQuestionAsked` event notifies the UI to re-render
+  - All question types include an optional text area for additional feedback (placeholder: "Optional additional feedback…")
+  - YesNo questions render "Yes" and "No" buttons plus Cancel; SingleChoice and MultiChoice render options with Submit (disabled until selection made) and Cancel buttons
+  - Answers are formatted with optional feedback: "Yes — {feedback}" or "Option A, Option B — {feedback}" and returned as the tool result to the LLM
+  - `SubmitAnswer` and `CancelQuestion` methods allow the UI to complete the question; cancellation returns "User cancelled the question without answering." to the LLM
+  - Question widget styled with card-like appearance using `--accent` border color and translucent background; consistent with existing dashboard button patterns
+  - Tool registered as `ask_user` in `BuildComposerTools()` with description "Ask the user a question and wait for their answer. Use for clarification or confirmation."
+  - System prompt updated to mention new capability: "Ask the user questions for clarification (ask_user)"
+  - UI clears local selection state (`_selectedOptions`, `_questionFeedback`) after answer submission or cancellation
+  - 13 xUnit tests covering: tool registration, system prompt mention, missing question error, invalid type error, missing options for choice questions, YesNo flow, SingleChoice flow, MultiChoice flow, cancellation, event raising, and no-pending-question safety
+
 ### Changed
 - **Repository tags on Goal Detail page** — repository names are now prominently displayed next to the goal title instead of buried in a card at the bottom:
   - `GoalDetail.razor` now shows repository names as `repo-tag` labels immediately after the `<h1>` title using the same styling as the goals list page
