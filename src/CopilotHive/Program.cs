@@ -401,7 +401,6 @@ static async Task<int> RunServerAsync(string[] args)
                     try
                     {
                         await repoManager.DeleteRemoteBranchAsync(repoName, branchName);
-                        logger.LogInformation("Deleted remote branch {Branch} from {Repo}", branchName, repoName);
                     }
                     catch (Exception ex)
                     {

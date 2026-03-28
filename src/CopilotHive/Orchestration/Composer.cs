@@ -551,7 +551,6 @@ public sealed class Composer : IAsyncDisposable
                 try
                 {
                     await _repoManager.DeleteRemoteBranchAsync(repoName, branchName);
-                    _logger.LogInformation("Deleted remote branch {Branch} from {Repo}", branchName, repoName);
                 }
                 catch (Exception ex)
                 {
