@@ -672,6 +672,78 @@ public sealed class PipelineStoreSchemaMigrationTests
     }
 
     [Fact]
+    public async Task MigrateSchema_WhenConversationColumnsMissing_AddsIterationAndPurpose()
+    {
+        var (seeder, client) = CreateOldSchemaConnections();
+        await using (seeder)
+        await using (var store = new PipelineStore(client, NullLogger<PipelineStore>.Instance))
+        {
+            // Verify conversation_entries got the new columns
+            using var cmd = seeder.CreateCommand();
+            cmd.CommandText = "SELECT name FROM pragma_table_info('conversation_entries')";
+            using var reader = cmd.ExecuteReader();
+            var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while (reader.Read())
+                columns.Add(reader.GetString(0));
+
+            Assert.Contains("iteration", columns);
+            Assert.Contains("purpose", columns);
+        }
+    }
+
+    [Fact]
+    public async Task MigrateSchema_PreservesExistingConversationEntries()
+    {
+        var (seeder, client) = CreateOldSchemaConnections();
+        await using (seeder)
+        {
+            // Create a proper Goal JSON for the legacy entry using the same JSON options as PipelineStore
+            var jsonOptions = new System.Text.Json.JsonSerializerOptions
+            {
+                PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase
+            };
+            var goal = new Goal { Id = "mg-legacy", Description = "Legacy goal", RepositoryNames = ["test-repo"] };
+            var goalJson = System.Text.Json.JsonSerializer.Serialize(goal, jsonOptions);
+            var createdAt = DateTime.UtcNow.ToString("o");
+
+            // Insert a conversation entry into the old schema (no iteration/purpose columns)
+            using (var insertCmd = seeder.CreateCommand())
+            {
+                insertCmd.CommandText = """
+                    INSERT INTO pipelines (goal_id, description, goal_json, phase, iteration, review_retries, test_retries, max_retries, created_at)
+                    VALUES (@goalId, @description, @goalJson, 'Planning', 1, 0, 0, 3, @createdAt)
+                    """;
+                insertCmd.Parameters.AddWithValue("@goalId", "mg-legacy");
+                insertCmd.Parameters.AddWithValue("@description", "Legacy goal");
+                insertCmd.Parameters.AddWithValue("@goalJson", goalJson);
+                insertCmd.Parameters.AddWithValue("@createdAt", createdAt);
+                insertCmd.ExecuteNonQuery();
+            }
+            using (var insertCmd = seeder.CreateCommand())
+            {
+                insertCmd.CommandText = """
+                    INSERT INTO conversation_entries (goal_id, seq, role, content)
+                    VALUES ('mg-legacy', 0, 'user', 'Legacy message without metadata')
+                    """;
+                insertCmd.ExecuteNonQuery();
+            }
+
+            // Now open PipelineStore, which should migrate the schema
+            await using (var store = new PipelineStore(client, NullLogger<PipelineStore>.Instance))
+            {
+                // Load and verify the legacy entry is preserved with null metadata
+                var snapshots = store.LoadActivePipelines();
+                var snap = Assert.Single(snapshots);
+                Assert.Single(snap.Conversation);
+                Assert.Equal("user", snap.Conversation[0].Role);
+                Assert.Equal("Legacy message without metadata", snap.Conversation[0].Content);
+                Assert.Null(snap.Conversation[0].Iteration);
+                Assert.Null(snap.Conversation[0].Purpose);
+            }
+        }
+    }
+
+    [Fact]
     public async Task MigrateSchema_CalledTwice_IsIdempotent()
     {
         var name = $"migration-test-{Guid.NewGuid():N}";
