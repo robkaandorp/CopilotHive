@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Composer context overflow auto-recovery** — when the Composer session exceeds the LLM's context window limit, it now automatically resets to recover:
+  - Detects `model_max_prompt_tokens_exceeded` errors from the LLM provider (checks full exception chain including inner exceptions)
+  - Automatically resets the Composer session, clearing conversation history and deleting the persisted session file
+  - Shows a clear warning message to the user: "⚠️ Context limit reached. Session has been reset automatically. Please repeat your request."
+  - Logs the overflow at Warning level with the original exception for debugging
+  - After reset, the user can continue chatting normally (session is fully functional)
+  - Non-context-overflow errors continue to be handled by the existing generic catch block
+  - Includes 10 xUnit tests for `IsContextOverflowError` (positive match, negative match, inner exception chain, nested inner exceptions, null handling) and session reset verification using mocked `IChatClient`
+
+### Added
 - **Repository filter dropdown on Goals page** — the Goals list now includes a repository filter alongside existing status and priority filters:
   - Dropdown lists all distinct repository names found across all goals, sorted alphabetically (case-insensitive deduplication)
   - Selecting "All repositories" shows goals regardless of repository (including goals with no repositories)

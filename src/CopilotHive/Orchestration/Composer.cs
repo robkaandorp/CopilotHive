@@ -251,6 +251,16 @@ public sealed class Composer : IAsyncDisposable
         {
             _logger.LogInformation("Composer streaming cancelled");
         }
+        catch (Exception ex) when (IsContextOverflowError(ex))
+        {
+            _logger.LogWarning(ex, "Composer context overflow detected — resetting session");
+            _streamingContent += "\n\n⚠️ Context limit reached. Session has been reset automatically. Please repeat your request.";
+            _session = AgentSession.Create("composer");
+            RecreateAgent();
+            var sessionFile = GetSessionFilePath();
+            if (File.Exists(sessionFile))
+                File.Delete(sessionFile);
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Composer streaming failed");
@@ -263,6 +273,24 @@ public sealed class Composer : IAsyncDisposable
             _streamCts = null;
             OnStreamingUpdate?.Invoke();
         }
+    }
+
+    /// <summary>
+    /// Returns <c>true</c> if the exception (or any inner exception) represents a context
+    /// overflow error from the LLM provider, identified by the
+    /// <c>model_max_prompt_tokens_exceeded</c> error code in the message.
+    /// </summary>
+    /// <param name="ex">The exception to inspect.</param>
+    /// <returns><c>true</c> when the exception indicates a context-window overflow.</returns>
+    internal static bool IsContextOverflowError(Exception? ex)
+    {
+        while (ex is not null)
+        {
+            if (ex.Message.Contains("model_max_prompt_tokens_exceeded", StringComparison.OrdinalIgnoreCase))
+                return true;
+            ex = ex.InnerException;
+        }
+        return false;
     }
 
     /// <summary>
