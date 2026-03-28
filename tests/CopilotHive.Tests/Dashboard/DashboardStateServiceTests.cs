@@ -1093,6 +1093,46 @@ public sealed class DashboardStateServiceTests : IDisposable
             logSink, progressLog, goalStore: _store, config: config);
     }
 
+    // ── GetVersion ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetVersion"/> returns a non-empty version string.
+    /// </summary>
+    [Fact]
+    public void GetVersion_ReturnsNonEmptyString()
+    {
+        using var service = BuildService(config: null);
+        var version = service.GetVersion();
+        Assert.NotNull(version);
+        Assert.NotEmpty(version);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetVersion"/> returns the same version
+    /// on repeated calls (idempotent).
+    /// </summary>
+    [Fact]
+    public void GetVersion_ReturnsSameValueOnRepeatedCalls()
+    {
+        using var service = BuildService(config: null);
+        var version1 = service.GetVersion();
+        var version2 = service.GetVersion();
+        Assert.Equal(version1, version2);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetVersion"/> returns the same version
+    /// as <see cref="OrchestratorInfo.Version"/>.
+    /// </summary>
+    [Fact]
+    public void GetVersion_MatchesOrchestratorInfoVersion()
+    {
+        using var service = BuildService(config: null);
+        var version = service.GetVersion();
+        var orchestratorInfo = service.GetOrchestratorInfo();
+        Assert.Equal(version, orchestratorInfo.Version);
+    }
+
     // ── ExtractPlanningPrompts ──────────────────────────────────────────────
 
     /// <summary>
