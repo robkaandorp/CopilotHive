@@ -261,6 +261,37 @@
                                 </div>
                             }
 
+                            @if (phase.Name == "Planning")
+                            {
+                                @if (!string.IsNullOrEmpty(iteration.PlanningBrainResponse))
+                                {
+                                    <details class="collapsible-output">
+                                        <summary>Planning Response</summary>
+                                        <div class="chat-msg-content">@((MarkupString)RenderMarkdown(iteration.PlanningBrainResponse))</div>
+                                    </details>
+                                }
+                                @if (!string.IsNullOrEmpty(iteration.PlanningBrainPrompt))
+                                {
+                                    <details class="collapsible-output">
+                                        <summary style="color:var(--text-muted)">Planning Prompt</summary>
+                                        <div class="chat-msg-content">@((MarkupString)RenderMarkdown(iteration.PlanningBrainPrompt))</div>
+                                    </details>
+                                }
+                            }
+                            @if (!string.IsNullOrEmpty(phase.BrainPrompt))
+                            {
+                                <details class="collapsible-output">
+                                    <summary style="color:var(--text-muted)">Brain Prompt</summary>
+                                    <div class="chat-msg-content">@((MarkupString)RenderMarkdown(phase.BrainPrompt))</div>
+                                </details>
+                            }
+                            @if (!string.IsNullOrEmpty(phase.WorkerPrompt))
+                            {
+                                <details class="collapsible-output">
+                                    <summary>Worker Prompt (@phase.RoleName)</summary>
+                                    <div class="chat-msg-content">@((MarkupString)RenderMarkdown(phase.WorkerPrompt))</div>
+                                </details>
+                            }
                             @if (!string.IsNullOrEmpty(phase.WorkerOutput))
                             {
                                 <details class="collapsible-output">
@@ -310,23 +341,6 @@
     else
     {
         <p style="color:var(--text-muted)">No progress reports for this goal yet.</p>
-    }
-
-    <!-- Conversation Log -->
-    @if (_detail.Conversation.Count > 0)
-    {
-        <h2 style="margin-top:1.5rem">Brain Conversation</h2>
-        <details style="margin-bottom:1rem">
-            <summary style="cursor:pointer;color:var(--accent)">Show @_detail.Conversation.Count message(s)</summary>
-            <div class="log-view" style="margin-top:0.5rem">
-                @foreach (var msg in _detail.Conversation)
-                {
-                    <div class="log-line @(msg.Role == "assistant" ? "log-info" : "log-debug")">
-                        <strong>[@msg.Role]</strong> @msg.Content
-                    </div>
-                }
-            </div>
-        </details>
     }
 
     @if (_detail.Status == GoalStatus.Draft || _detail.Status == GoalStatus.Failed)

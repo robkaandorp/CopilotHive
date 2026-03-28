@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Inline prompt display in Goal Detail** — Brain prompts and worker prompts are now displayed inline within each phase on the Goal Detail page, replacing the flat conversation log:
+  - `PhaseViewInfo` now includes `BrainPrompt` (the prompt sent to the Brain to generate the worker prompt) and `WorkerPrompt` (the Brain's crafted prompt sent to the worker)
+  - `IterationViewInfo` now includes `PlanningBrainPrompt` and `PlanningBrainResponse` for the iteration planning phase
+  - `DashboardStateService.GetGoalDetail()` extracts prompts from tagged `ConversationEntry` metadata (`Iteration` and `Purpose` fields) using new `ExtractPlanningPrompts()` and `ExtractCraftPrompts()` helpers
+  - `GoalDetail.razor` displays prompts as collapsible sections above Worker Output: Brain Prompt (muted styling) and Worker Prompt (with role name)
+  - Planning phase displays Planning Response and Planning Prompt when expanded
+  - All prompts are rendered as Markdown using `RenderMarkdown()` with `chat-msg-content` styling
+  - The flat "Brain Conversation" section at the bottom of the page has been removed — conversation data is now shown contextually within phases
+  - Completed iterations (from `IterationSummary`, no live pipeline) gracefully show null prompts — sections are simply not displayed
+  - Includes 10 xUnit tests for `ExtractPlanningPrompts`, `ExtractCraftPrompts`, and prompt population in `GetGoalDetail` including null handling for completed iterations
+
+### Added
 - **ConversationEntry metadata** — `ConversationEntry` now tracks iteration context and purpose, enabling conversation history to be analyzed by iteration without heuristic parsing:
   - `ConversationEntry` record extended with `Iteration` (int?) and `Purpose` (string?) properties with default null values for backward compatibility
   - Purpose values: `"planning"` — iteration planning prompt/response, `"craft-prompt"` — Brain generating worker prompts, `"worker-output"` — structured output summary from workers, `"error"` — error messages

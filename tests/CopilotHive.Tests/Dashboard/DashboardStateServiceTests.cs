@@ -1036,6 +1036,482 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: _store, config: config);
     }
+
+    // ── ExtractPlanningPrompts ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.ExtractPlanningPrompts"/> returns null for
+    /// both values when there are no planning entries for the given iteration.
+    /// </summary>
+    [Fact]
+    public void ExtractPlanningPrompts_NoEntries_ReturnsNulls()
+    {
+        var entries = new List<ConversationEntry>
+        {
+            new ConversationEntry("user", "Some other message", 1, "craft-prompt"),
+        };
+
+        var (userPrompt, assistantResponse) = DashboardStateService.ExtractPlanningPrompts(entries, 1);
+
+        Assert.Null(userPrompt);
+        Assert.Null(assistantResponse);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.ExtractPlanningPrompts"/> correctly extracts
+    /// the user prompt and assistant response for a given iteration.
+    /// </summary>
+    [Fact]
+    public void ExtractPlanningPrompts_WithPlanningEntries_ExtractsBothPrompts()
+    {
+        var entries = new List<ConversationEntry>
+        {
+            new ConversationEntry("user", "Plan this goal now", 1, "planning"),
+            new ConversationEntry("assistant", "Here is my plan: ...", 1, "planning"),
+        };
+
+        var (userPrompt, assistantResponse) = DashboardStateService.ExtractPlanningPrompts(entries, 1);
+
+        Assert.Equal("Plan this goal now", userPrompt);
+        Assert.Equal("Here is my plan: ...", assistantResponse);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.ExtractPlanningPrompts"/> only returns entries
+    /// matching the requested iteration, ignoring entries from other iterations.
+    /// </summary>
+    [Fact]
+    public void ExtractPlanningPrompts_FiltersToRequestedIteration()
+    {
+        var entries = new List<ConversationEntry>
+        {
+            new ConversationEntry("user", "Iter 1 prompt", 1, "planning"),
+            new ConversationEntry("assistant", "Iter 1 response", 1, "planning"),
+            new ConversationEntry("user", "Iter 2 prompt", 2, "planning"),
+            new ConversationEntry("assistant", "Iter 2 response", 2, "planning"),
+        };
+
+        var (userPrompt, assistantResponse) = DashboardStateService.ExtractPlanningPrompts(entries, 2);
+
+        Assert.Equal("Iter 2 prompt", userPrompt);
+        Assert.Equal("Iter 2 response", assistantResponse);
+    }
+
+    // ── ExtractCraftPrompts ────────────────────────────────────────────────
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.ExtractCraftPrompts"/> returns an empty
+    /// dictionary when there are no craft-prompt or worker-output entries.
+    /// </summary>
+    [Fact]
+    public void ExtractCraftPrompts_NoEntries_ReturnsEmpty()
+    {
+        var entries = new List<ConversationEntry>
+        {
+            new ConversationEntry("user", "Planning prompt", 1, "planning"),
+        };
+
+        var result = DashboardStateService.ExtractCraftPrompts(entries, 1);
+
+        Assert.Empty(result);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.ExtractCraftPrompts"/> associates
+    /// a craft-prompt pair with the subsequent worker-output role.
+    /// </summary>
+    [Fact]
+    public void ExtractCraftPrompts_SingleWorker_AssociatesCorrectly()
+    {
+        var entries = new List<ConversationEntry>
+        {
+            new ConversationEntry("user", "Write code for this", 1, "craft-prompt"),
+            new ConversationEntry("assistant", "Your task: implement feature X", 1, "craft-prompt"),
+            new ConversationEntry("coder", "I implemented feature X.", 1, "worker-output"),
+        };
+
+        var result = DashboardStateService.ExtractCraftPrompts(entries, 1);
+
+        Assert.True(result.ContainsKey("coder"));
+        Assert.Equal("Write code for this", result["coder"].BrainPrompt);
+        Assert.Equal("Your task: implement feature X", result["coder"].WorkerPrompt);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.ExtractCraftPrompts"/> correctly associates
+    /// separate craft-prompt pairs with each worker role in order.
+    /// </summary>
+    [Fact]
+    public void ExtractCraftPrompts_MultipleWorkers_AssociatesEachCorrectly()
+    {
+        var entries = new List<ConversationEntry>
+        {
+            new ConversationEntry("user", "Brain asks coder", 1, "craft-prompt"),
+            new ConversationEntry("assistant", "Crafted coder prompt", 1, "craft-prompt"),
+            new ConversationEntry("coder", "Coder done.", 1, "worker-output"),
+            new ConversationEntry("user", "Brain asks tester", 1, "craft-prompt"),
+            new ConversationEntry("assistant", "Crafted tester prompt", 1, "craft-prompt"),
+            new ConversationEntry("tester", "Tester done.", 1, "worker-output"),
+        };
+
+        var result = DashboardStateService.ExtractCraftPrompts(entries, 1);
+
+        Assert.True(result.ContainsKey("coder"));
+        Assert.Equal("Brain asks coder", result["coder"].BrainPrompt);
+        Assert.Equal("Crafted coder prompt", result["coder"].WorkerPrompt);
+
+        Assert.True(result.ContainsKey("tester"));
+        Assert.Equal("Brain asks tester", result["tester"].BrainPrompt);
+        Assert.Equal("Crafted tester prompt", result["tester"].WorkerPrompt);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.ExtractCraftPrompts"/> filters to the
+    /// requested iteration and ignores entries from other iterations.
+    /// </summary>
+    [Fact]
+    public void ExtractCraftPrompts_FiltersToRequestedIteration()
+    {
+        var entries = new List<ConversationEntry>
+        {
+            new ConversationEntry("user", "Iter 1 brain prompt", 1, "craft-prompt"),
+            new ConversationEntry("assistant", "Iter 1 worker prompt", 1, "craft-prompt"),
+            new ConversationEntry("coder", "Iter 1 output", 1, "worker-output"),
+            new ConversationEntry("user", "Iter 2 brain prompt", 2, "craft-prompt"),
+            new ConversationEntry("assistant", "Iter 2 worker prompt", 2, "craft-prompt"),
+            new ConversationEntry("coder", "Iter 2 output", 2, "worker-output"),
+        };
+
+        var result = DashboardStateService.ExtractCraftPrompts(entries, 2);
+
+        Assert.True(result.ContainsKey("coder"));
+        Assert.Equal("Iter 2 brain prompt", result["coder"].BrainPrompt);
+        Assert.Equal("Iter 2 worker prompt", result["coder"].WorkerPrompt);
+        // Should not contain iter 1 overwriting iter 2
+        Assert.Single(result);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.ExtractCraftPrompts"/> handles the case where
+    /// a worker-output appears without a preceding craft-prompt (legacy or missing entries).
+    /// </summary>
+    [Fact]
+    public void ExtractCraftPrompts_WorkerOutputWithoutCraftPrompt_HasNullPrompts()
+    {
+        var entries = new List<ConversationEntry>
+        {
+            new ConversationEntry("coder", "Coder just did it.", 1, "worker-output"),
+        };
+
+        var result = DashboardStateService.ExtractCraftPrompts(entries, 1);
+
+        Assert.True(result.ContainsKey("coder"));
+        Assert.Null(result["coder"].BrainPrompt);
+        Assert.Null(result["coder"].WorkerPrompt);
+    }
+
+    // ── Regression: ExtractPlanningPrompts — multiple entries ──────────────
+
+    /// <summary>
+    /// Regression: when <c>PlanIterationAsync</c> is called more than once (nudge/retry),
+    /// multiple planning entries are appended. <see cref="DashboardStateService.ExtractPlanningPrompts"/>
+    /// must return the LAST pair, not the first.
+    /// </summary>
+    [Fact]
+    public void ExtractPlanningPrompts_MultiplePlanningEntries_ReturnsLastPair()
+    {
+        var entries = new List<ConversationEntry>
+        {
+            // First attempt (should be ignored)
+            new ConversationEntry("user",      "Plan attempt 1",      1, "planning"),
+            new ConversationEntry("assistant", "Response attempt 1",  1, "planning"),
+            // Second (nudge) attempt — this is the authoritative one
+            new ConversationEntry("user",      "Plan attempt 2 nudge", 1, "planning"),
+            new ConversationEntry("assistant", "Response attempt 2",   1, "planning"),
+        };
+
+        var (userPrompt, assistantResponse) = DashboardStateService.ExtractPlanningPrompts(entries, 1);
+
+        Assert.Equal("Plan attempt 2 nudge", userPrompt);
+        Assert.Equal("Response attempt 2",   assistantResponse);
+    }
+
+    // ── Regression: ExtractCraftPrompts — AskBrainAsync mid-task follow-ups ──
+
+    /// <summary>
+    /// Regression: <c>AskBrainAsync</c> adds more craft-prompt entries after the initial
+    /// dispatch pair. <see cref="DashboardStateService.ExtractCraftPrompts"/> must keep
+    /// only the FIRST pair (the dispatch prompt), not the follow-up Q&amp;A.
+    /// </summary>
+    [Fact]
+    public void ExtractCraftPrompts_MidTaskFollowUp_ShowsDispatchPromptNotFollowUp()
+    {
+        var entries = new List<ConversationEntry>
+        {
+            // Initial dispatch pair (first — should be retained)
+            new ConversationEntry("user",      "Dispatch: write the feature",  1, "craft-prompt"),
+            new ConversationEntry("assistant", "Task: implement feature X",    1, "craft-prompt"),
+            // Mid-task follow-up via AskBrainAsync (should NOT overwrite the dispatch prompt)
+            new ConversationEntry("user",      "Follow-up question",           1, "craft-prompt"),
+            new ConversationEntry("assistant", "Follow-up answer",             1, "craft-prompt"),
+            // Worker reports output after the follow-up
+            new ConversationEntry("coder",     "Coder finished with help.",    1, "worker-output"),
+        };
+
+        var result = DashboardStateService.ExtractCraftPrompts(entries, 1);
+
+        Assert.True(result.ContainsKey("coder"));
+        // Must show the FIRST (dispatch) prompt, not the follow-up
+        Assert.Equal("Dispatch: write the feature", result["coder"].BrainPrompt);
+        Assert.Equal("Task: implement feature X",   result["coder"].WorkerPrompt);
+    }
+
+    // ── GetGoalDetail: inline prompts in phases ──────────────────────────
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetGoalDetail"/> populates
+    /// <see cref="PhaseViewInfo.BrainPrompt"/> and <see cref="PhaseViewInfo.WorkerPrompt"/>
+    /// for worker phases from the pipeline conversation.
+    /// </summary>
+    [Fact]
+    public void GetGoalDetail_PopulatesPhasePrompts_FromPipelineConversation()
+    {
+        var goal = new Goal
+        {
+            Id = "prompt-goal",
+            Description = "Goal with phase prompts",
+            Status = GoalStatus.InProgress,
+        };
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+
+        var plan = new IterationPlan { Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Merging] };
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        // Add craft-prompt + worker-output conversation entries
+        pipeline.Conversation.Add(new ConversationEntry("user", "Brain prompt for coder", 1, "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "Crafted coder task", 1, "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("coder", "Coder finished.", 1, "worker-output"));
+
+        var goalManager = new GoalManager();
+        var goalSource = new FakeGoalSourceForOutputTests(goal);
+        goalManager.AddSource(goalSource);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: null);
+
+        var detail = service.GetGoalDetail("prompt-goal");
+
+        Assert.NotNull(detail);
+        var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
+        Assert.NotNull(currentIteration);
+
+        var codingPhase = currentIteration.Phases.FirstOrDefault(p => p.Name == "Coding");
+        Assert.NotNull(codingPhase);
+        Assert.Equal("Brain prompt for coder", codingPhase.BrainPrompt);
+        Assert.Equal("Crafted coder task", codingPhase.WorkerPrompt);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetGoalDetail"/> populates
+    /// <see cref="IterationViewInfo.PlanningBrainPrompt"/> and <see cref="IterationViewInfo.PlanningBrainResponse"/>
+    /// from planning entries in the pipeline conversation.
+    /// </summary>
+    [Fact]
+    public void GetGoalDetail_PopulatesPlanningPrompts_FromPipelineConversation()
+    {
+        var goal = new Goal
+        {
+            Id = "planning-prompt-goal",
+            Description = "Goal testing planning prompts",
+            Status = GoalStatus.InProgress,
+        };
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+
+        // Add planning conversation entries
+        pipeline.Conversation.Add(new ConversationEntry("user", "Please plan iteration 1", 1, "planning"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "I will code and test.", 1, "planning"));
+
+        var goalManager = new GoalManager();
+        var goalSource = new FakeGoalSourceForOutputTests(goal);
+        goalManager.AddSource(goalSource);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: null);
+
+        var detail = service.GetGoalDetail("planning-prompt-goal");
+
+        Assert.NotNull(detail);
+        var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
+        Assert.NotNull(currentIteration);
+
+        Assert.Equal("Please plan iteration 1", currentIteration.PlanningBrainPrompt);
+        Assert.Equal("I will code and test.", currentIteration.PlanningBrainResponse);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetGoalDetail"/> returns null for
+    /// <see cref="IterationViewInfo.PlanningBrainPrompt"/> and <see cref="IterationViewInfo.PlanningBrainResponse"/>
+    /// when no planning entries exist in the pipeline conversation.
+    /// </summary>
+    [Fact]
+    public void GetGoalDetail_NullPlanningPrompts_WhenNoPlanningEntriesExist()
+    {
+        var goal = new Goal
+        {
+            Id = "no-planning-prompt-goal",
+            Description = "Goal with no planning entries",
+            Status = GoalStatus.InProgress,
+        };
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        pipelineManager.CreatePipeline(goal, maxRetries: 3);
+
+        var goalManager = new GoalManager();
+        var goalSource = new FakeGoalSourceForOutputTests(goal);
+        goalManager.AddSource(goalSource);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: null);
+
+        var detail = service.GetGoalDetail("no-planning-prompt-goal");
+
+        Assert.NotNull(detail);
+        var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
+        Assert.NotNull(currentIteration);
+
+        Assert.Null(currentIteration.PlanningBrainPrompt);
+        Assert.Null(currentIteration.PlanningBrainResponse);
+    }
+
+    /// <summary>
+    /// Verifies that phase prompts are null when no conversation entries exist.
+    /// </summary>
+    [Fact]
+    public void GetGoalDetail_NullPhasePrompts_WhenNoConversationEntries()
+    {
+        var goal = new Goal
+        {
+            Id = "no-conv-prompt-goal",
+            Description = "Goal with no conversation",
+            Status = GoalStatus.InProgress,
+        };
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+
+        var plan = new IterationPlan { Phases = [GoalPhase.Coding, GoalPhase.Merging] };
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        // No conversation entries added
+
+        var goalManager = new GoalManager();
+        var goalSource = new FakeGoalSourceForOutputTests(goal);
+        goalManager.AddSource(goalSource);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: null);
+
+        var detail = service.GetGoalDetail("no-conv-prompt-goal");
+
+        Assert.NotNull(detail);
+        var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
+        Assert.NotNull(currentIteration);
+
+        var codingPhase = currentIteration.Phases.FirstOrDefault(p => p.Name == "Coding");
+        Assert.NotNull(codingPhase);
+        Assert.Null(codingPhase.BrainPrompt);
+        Assert.Null(codingPhase.WorkerPrompt);
+    }
+
+    /// <summary>
+    /// Verifies that completed iterations (no live pipeline) show null prompts
+    /// because there's no conversation to extract from.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_CompletedIteration_ShowsNullPrompts()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a completed goal with iteration summary but NO pipeline
+        var goal = new Goal
+        {
+            Id = "completed-iteration-goal",
+            Description = "Completed goal with iteration summary",
+            Status = GoalStatus.Completed,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = "Coding",
+                    Result = "pass",
+                    DurationSeconds = 60.0,
+                    WorkerOutput = "Coder completed work.",
+                },
+            ],
+        };
+        await _store.UpdateGoalStatusAsync("completed-iteration-goal", GoalStatus.Completed,
+            new GoalUpdateMetadata { Iterations = 1, IterationSummary = summary }, ct);
+
+        // Build service WITHOUT a pipeline for this goal (simulating completed state)
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store);
+
+        var detail = service.GetGoalDetail("completed-iteration-goal");
+
+        Assert.NotNull(detail);
+        Assert.Single(detail.Iterations);
+        var iteration = detail.Iterations[0];
+        Assert.False(iteration.IsCurrent); // Not current - completed
+
+        // Planning prompts should be null (no pipeline conversation)
+        Assert.Null(iteration.PlanningBrainPrompt);
+        Assert.Null(iteration.PlanningBrainResponse);
+
+        // Phase prompts should be null (no pipeline conversation)
+        var codingPhase = iteration.Phases.FirstOrDefault(p => p.Name == "Coding");
+        Assert.NotNull(codingPhase);
+        Assert.Null(codingPhase.BrainPrompt);
+        Assert.Null(codingPhase.WorkerPrompt);
+        // But WorkerOutput should still be populated from the stored summary
+        Assert.Equal("Coder completed work.", codingPhase.WorkerOutput);
+    }
 }
 
 /// <summary>
