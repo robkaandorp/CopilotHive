@@ -1041,6 +1041,17 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("id is required", result);
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task GetPhaseOutput_EmptyOrWhitespacePhase_ReturnsValidationError(string phase)
+    {
+        var result = await _composer.GetPhaseOutputAsync("some-goal", 1, phase);
+
+        Assert.Contains("ERROR", result);
+        Assert.Contains("phase is required", result);
+    }
+
     [Fact]
     public void BuildComposerTools_IncludesGetPhaseOutput()
     {

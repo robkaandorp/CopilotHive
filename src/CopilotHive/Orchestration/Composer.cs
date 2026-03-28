@@ -717,15 +717,16 @@ public sealed class Composer : IAsyncDisposable
         [Description("Phase name: Coding, Testing, Review, DocWriting, or Improve")] string phase,
         [Description("Maximum lines to return. Default: 200")] int max_lines = 200)
     {
-        // 1. Validate phase against whitelist FIRST
-        if (!PhaseOutputKeys.TryGetValue(phase ?? string.Empty, out var rolePrefix))
-            return $"Unknown phase '{phase}'. Supported phases: Coding, Testing, Review, DocWriting, Improve.";
-
+        // 1. Required parameter validation FIRST
         var error = Shared.ToolValidation.Check(
             (!string.IsNullOrWhiteSpace(id), "id is required"),
             (iteration >= 1, "iteration must be >= 1"),
             (!string.IsNullOrWhiteSpace(phase), "phase is required"));
         if (error is not null) return error;
+
+        // 2. Whitelist check SECOND
+        if (!PhaseOutputKeys.TryGetValue(phase, out var rolePrefix))
+            return $"Unknown phase '{phase}'. Supported phases: Coding, Testing, Review, DocWriting, Improve.";
 
         // 2. Fetch goal
         var goal = await _goalStore.GetGoalAsync(id);
