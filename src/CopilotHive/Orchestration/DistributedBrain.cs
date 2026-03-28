@@ -342,8 +342,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - Is this a documentation-only change? (coder edits, then docwriter — may skip testing)
             - Is this a retry after failure? (what phases need re-running)
             - What does the metrics history suggest?
-            IMPORTANT: Always include the docwriting phase — the doc-writer updates the CHANGELOG,
-            README, and XML doc comments. Even internal changes need changelog entries.
+            IMPORTANT: Only include the docwriting phase when the goal explicitly requests
+            documentation updates (e.g. "update README", "add changelog entry", "update docs").
+            Skip docwriting for purely internal changes (refactors, bug fixes, test additions)
+            unless the goal description specifically calls for it.
             Include the improve phase to let the improver refine agents.md guidance based on
             how the iteration went — especially when steps needed retries or produced issues.
 
@@ -620,7 +622,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 - For testers: tell them to build, run the test skill, write integration tests, and call the report_test_results tool when done. Do NOT tell them to create report files.
                 """,
             GoalPhase.DocWriting => """
-                - For docwriters: Do NOT include any git diff commands in your prompt — the worker's WORKSPACE CONTEXT already provides the correct diff command. Tell them to use the diff command from their workspace context to see what changed, then update README, CHANGELOG, and XML doc comments. Build to verify and commit. Call the report_doc_changes tool when done.
+                - For docwriters: Do NOT include any git diff commands in your prompt — the worker's WORKSPACE CONTEXT already provides the correct diff command. Tell them to use the diff command from their workspace context to see what changed, then update ONLY the documentation files the goal explicitly requests (e.g. README.md, CHANGELOG.md). Do NOT update files not mentioned in the goal. Build to verify and commit. Call the report_doc_changes tool when done.
                 """,
             GoalPhase.Improve => """
                 - For improvers: tell them to analyze iteration results and update *.agents.md files directly using file tools. Do NOT tell them to run git commands — the infrastructure commits and pushes automatically.
