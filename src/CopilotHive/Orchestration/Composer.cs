@@ -1144,6 +1144,7 @@ public sealed class Composer : IAsyncDisposable
             var json = await response.Content.ReadAsStringAsync();
             using var doc = JsonDocument.Parse(json);
 
+            const int MaxContentChars = 500;
             var sb = new System.Text.StringBuilder();
             var results = doc.RootElement.GetProperty("results");
             foreach (var result in results.EnumerateArray())
@@ -1151,6 +1152,8 @@ public sealed class Composer : IAsyncDisposable
                 var title = result.TryGetProperty("title", out var t) ? t.GetString() : "";
                 var url = result.TryGetProperty("url", out var u) ? u.GetString() : "";
                 var content = result.TryGetProperty("content", out var c) ? c.GetString() : "";
+                if (content is not null && content.Length > MaxContentChars)
+                    content = content[..MaxContentChars] + "…";
                 sb.AppendLine($"### {title}");
                 sb.AppendLine(url);
                 sb.AppendLine(content);
@@ -1169,7 +1172,7 @@ public sealed class Composer : IAsyncDisposable
     [Description("Fetch a web page and return its content. Use after web_search to read full pages.")]
     internal async Task<string> WebFetchAsync(
         [Description("URL to fetch")] string url,
-        [Description("Maximum lines of content to return. Default: 200")] int max_lines = 200)
+        [Description("Maximum lines of content to return. Default: 100")] int max_lines = 100)
     {
         if (_ollamaApiKey is null)
             return "❌ Web fetch is not available — no OLLAMA_API_KEY configured.";
