@@ -486,7 +486,7 @@ public sealed class Composer : IAsyncDisposable
     {
         var pending = PendingQuestion;
         if (pending is null) return;
-        pending.Completion.TrySetResult("(User cancelled the question.)");
+        pending.Completion.TrySetResult("User cancelled the question without answering.");
     }
 
     internal List<AITool> BuildComposerTools()

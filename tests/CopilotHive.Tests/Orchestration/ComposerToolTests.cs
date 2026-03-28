@@ -2325,7 +2325,7 @@ public sealed class ComposerToolTests : IDisposable
         _composer.CancelQuestion();
 
         var result = await askTask;
-        Assert.Contains("cancelled", result, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("User cancelled the question without answering.", result);
         Assert.Null(_composer.PendingQuestion);
     }
 
