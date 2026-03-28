@@ -73,6 +73,13 @@ body {
 .hive-nav a:hover { background: var(--bg-card); color: var(--text); }
 .hive-nav a.active { background: var(--bg-card); color: var(--accent); }
 
+/* Version badge pinned to the bottom of the nav */
+.nav-version {
+    margin-top: auto;
+    padding: 0.5rem;
+    font-size: 0.75rem;
+}
+
 .hive-main {
     padding: 1.5rem;
     overflow-y: auto;
