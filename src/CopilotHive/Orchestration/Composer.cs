@@ -717,35 +717,40 @@ public sealed class Composer : IAsyncDisposable
         [Description("Phase name: Coding, Testing, Review, DocWriting, or Improve")] string phase,
         [Description("Maximum lines to return. Default: 200")] int max_lines = 200)
     {
+        // 1. Validate phase against whitelist FIRST
+        if (!PhaseOutputKeys.TryGetValue(phase ?? string.Empty, out var rolePrefix))
+            return $"Unknown phase '{phase}'. Supported phases: Coding, Testing, Review, DocWriting, Improve.";
+
         var error = Shared.ToolValidation.Check(
             (!string.IsNullOrWhiteSpace(id), "id is required"),
             (iteration >= 1, "iteration must be >= 1"),
             (!string.IsNullOrWhiteSpace(phase), "phase is required"));
         if (error is not null) return error;
 
+        // 2. Fetch goal
         var goal = await _goalStore.GetGoalAsync(id);
         if (goal is null)
             return "Goal not found";
 
+        // 3. Fetch iterations and find the requested iteration
         var iterations = await _goalStore.GetIterationsAsync(id);
         var iterSummary = iterations.FirstOrDefault(i => i.Iteration == iteration);
         if (iterSummary is null)
             return $"Iteration {iteration} not found";
 
+        // 4. Find the phase in the iteration
         var phaseResult = iterSummary.Phases
             .FirstOrDefault(p => p.Name.Equals(phase, StringComparison.OrdinalIgnoreCase));
         if (phaseResult is null)
             return $"Phase '{phase}' not found in iteration {iteration}";
 
+        // 5. Check worker output, then fall back to PhaseOutputs dictionary
         string? output = phaseResult.WorkerOutput;
 
         if (string.IsNullOrEmpty(output))
         {
-            // Fall back to PhaseOutputs dictionary using role key mapping
-            if (!PhaseOutputKeys.TryGetValue(phase, out var rolePrefix))
-                return $"Unknown phase '{phase}'. Supported phases: Coding, Testing, Review, DocWriting, Improve.";
-            var roleKey = $"{rolePrefix}-{iteration}";
-            iterSummary.PhaseOutputs.TryGetValue(roleKey, out output);
+            var outputKey = $"{rolePrefix}-{iteration}";
+            iterSummary.PhaseOutputs.TryGetValue(outputKey, out output);
         }
 
         if (string.IsNullOrEmpty(output))
