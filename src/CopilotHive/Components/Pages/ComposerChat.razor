@@ -45,6 +45,81 @@ else
                 </div>
             }
 
+            @if (Composer.PendingQuestion is { } pq)
+            {
+                <div class="chat-msg chat-msg-assistant chat-question-widget">
+                    <div class="chat-msg-role">Composer — Question</div>
+                    <div class="chat-msg-content">
+                        <p class="chat-question-text">@pq.Text</p>
+
+                        @if (pq.Type == QuestionType.YesNo)
+                        {
+                            <div class="chat-question-actions">
+                                <button class="chat-send chat-question-yes"
+                                        @onclick="() => SubmitYesNo(true, pq)">Yes</button>
+                                <button class="chat-action-btn chat-question-no"
+                                        @onclick="() => SubmitYesNo(false, pq)">No</button>
+                            </div>
+                            <textarea class="chat-input chat-question-feedback"
+                                      @bind="_questionFeedback"
+                                      placeholder="Optional additional feedback…"
+                                      rows="2"></textarea>
+                        }
+                        else if (pq.Type == QuestionType.SingleChoice)
+                        {
+                            <div class="chat-question-options">
+                                @foreach (var opt in pq.Options)
+                                {
+                                    <label class="chat-question-option">
+                                        <input type="radio"
+                                               name="single-choice"
+                                               checked="@(_selectedOptions.Contains(opt))"
+                                               @onchange="() => SelectSingle(opt)" />
+                                        @opt
+                                    </label>
+                                }
+                            </div>
+                            <textarea class="chat-input chat-question-feedback"
+                                      @bind="_questionFeedback"
+                                      placeholder="Optional additional feedback…"
+                                      rows="2"></textarea>
+                            <div class="chat-question-actions">
+                                <button class="chat-send"
+                                        disabled="@(_selectedOptions.Count == 0)"
+                                        @onclick="() => SubmitChoice(pq)">Submit</button>
+                                <button class="chat-action-btn"
+                                        @onclick="() => CancelQuestion(pq)">Cancel</button>
+                            </div>
+                        }
+                        else if (pq.Type == QuestionType.MultiChoice)
+                        {
+                            <div class="chat-question-options">
+                                @foreach (var opt in pq.Options)
+                                {
+                                    <label class="chat-question-option">
+                                        <input type="checkbox"
+                                               checked="@(_selectedOptions.Contains(opt))"
+                                               @onchange="() => ToggleOption(opt)" />
+                                        @opt
+                                    </label>
+                                }
+                            </div>
+                            <textarea class="chat-input chat-question-feedback"
+                                      @bind="_questionFeedback"
+                                      placeholder="Optional additional feedback…"
+                                      rows="2"></textarea>
+                            <div class="chat-question-actions">
+                                <button class="chat-send"
+                                        disabled="@(_selectedOptions.Count == 0)"
+                                        @onclick="() => SubmitChoice(pq)">Submit</button>
+                                <button class="chat-action-btn"
+                                        @onclick="() => CancelQuestion(pq)">Cancel</button>
+                            </div>
+                        }
+                    </div>
+                </div>
+            }
+
             <div id="chat-anchor"></div>
         </div>
 
@@ -92,6 +167,8 @@ else
 
     private readonly List<ChatMessage> _messages = [];
     private string _inputText = "";
+    private HashSet<string> _selectedOptions = [];
+    private string _questionFeedback = "";
 
     protected override void OnInitialized()
     {
@@ -100,6 +177,7 @@ else
             LoadHistory();
         }
         Composer.OnStreamingUpdate += HandleStreamingUpdate;
+        Composer.OnQuestionAsked += HandleQuestionAsked;
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -177,5 +255,57 @@ else
     public void Dispose()
     {
         Composer.OnStreamingUpdate -= HandleStreamingUpdate;
+        Composer.OnQuestionAsked -= HandleQuestionAsked;
+    }
+
+    private void HandleQuestionAsked()
+    {
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void SelectSingle(string option)
+    {
+        _selectedOptions = [option];
+    }
+
+    private void ToggleOption(string option)
+    {
+        if (_selectedOptions.Contains(option))
+            _selectedOptions.Remove(option);
+        else
+            _selectedOptions.Add(option);
+    }
+
+    private void SubmitYesNo(bool yes, ComposerQuestion question)
+    {
+        var answer = yes ? "Yes" : "No";
+        if (!string.IsNullOrWhiteSpace(_questionFeedback))
+            answer += $" — {_questionFeedback.Trim()}";
+
+        _selectedOptions = [];
+        _questionFeedback = "";
+        Composer.SubmitAnswer(answer);
+        StateHasChanged();
+    }
+
+    private void SubmitChoice(ComposerQuestion question)
+    {
+        var selected = string.Join(", ", _selectedOptions);
+        var answer = string.IsNullOrWhiteSpace(_questionFeedback)
+            ? selected
+            : $"{selected} — {_questionFeedback.Trim()}";
+
+        _selectedOptions = [];
+        _questionFeedback = "";
+        Composer.SubmitAnswer(answer);
+        StateHasChanged();
+    }
+
+    private void CancelQuestion(ComposerQuestion question)
+    {
+        _selectedOptions = [];
+        _questionFeedback = "";
+        Composer.CancelQuestion();
+        StateHasChanged();
     }
 }

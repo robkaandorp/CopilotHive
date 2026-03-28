@@ -714,3 +714,59 @@ tr:last-child td { border-bottom: none; }
 .yaml-number {
     color: #f2cc60;
 }
+
+/* ── Composer Question Widget ────────────────────────────────────── */
+
+.chat-question-widget {
+    border-color: var(--accent);
+    background: rgba(88, 166, 255, 0.07);
+}
+
+.chat-question-text {
+    font-weight: 500;
+    margin-bottom: 0.75rem;
+}
+
+.chat-question-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+}
+
+.chat-question-option {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    cursor: pointer;
+    font-size: 0.95rem;
+}
+
+.chat-question-option input {
+    cursor: pointer;
+    accent-color: var(--accent);
+    width: 1rem;
+    height: 1rem;
+    flex-shrink: 0;
+}
+
+.chat-question-feedback {
+    margin-top: 0.5rem;
+    margin-bottom: 0.75rem;
+    width: 100%;
+}
+
+.chat-question-actions {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.chat-question-yes {
+    background: var(--green);
+}
+
+.chat-question-no {
+    color: var(--text-muted);
+}
