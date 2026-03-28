@@ -21,6 +21,9 @@
     protected override void OnInitialized()
     {
         _version = State.GetVersion();
-        _isBeta = _version.Contains('-') || _version.StartsWith("0.");
+        _isBeta = _version.Contains("-beta", StringComparison.OrdinalIgnoreCase)
+                  || _version.Contains("-alpha", StringComparison.OrdinalIgnoreCase)
+                  || _version.Contains("-rc", StringComparison.OrdinalIgnoreCase)
+                  || _version.StartsWith("0.");
     }
 }
