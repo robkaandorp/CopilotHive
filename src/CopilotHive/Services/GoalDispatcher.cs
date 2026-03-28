@@ -942,6 +942,9 @@ public sealed class GoalDispatcher : BackgroundService
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Completed, completedMeta, ct);
         await CommitGoalsToConfigRepoAsync($"Goal '{pipeline.GoalId}' completed", ct);
 
+        // Auto-tag: assign the goal to a Planning release if exactly one exists
+        await TryAutoTagReleaseAsync(pipeline, ct);
+
         pipeline.Metrics.Iteration = pipeline.Iteration;
         pipeline.Metrics.Duration = duration;
         pipeline.Metrics.Verdict = TaskVerdict.Pass;
@@ -1001,6 +1004,42 @@ public sealed class GoalDispatcher : BackgroundService
             pipeline.GoalId, pipeline.Iteration, duration.TotalMinutes,
             pipeline.Metrics.PassedTests, pipeline.Metrics.TotalTests,
             pipeline.Metrics.CoveragePercent);
+    }
+
+    /// <summary>
+    /// Attempts to auto-assign a completed goal to a Planning release when exactly one exists.
+    /// Only runs when the goal has no <see cref="Goal.ReleaseId"/> set and has at least one repository.
+    /// Best-effort: failures are logged but do not fail the goal.
+    /// </summary>
+    private async Task TryAutoTagReleaseAsync(GoalPipeline pipeline, CancellationToken ct)
+    {
+        try
+        {
+            var goal = pipeline.Goal;
+            if (goal.ReleaseId is not null || goal.RepositoryNames.Count == 0)
+                return;
+
+            var store = _goalManager.Sources.OfType<IGoalStore>().FirstOrDefault();
+            if (store is null)
+                return;
+
+            var releases = await store.GetReleasesAsync(ct);
+            var planningReleases = releases.Where(r => r.Status == ReleaseStatus.Planning).ToList();
+
+            if (planningReleases.Count != 1)
+                return;
+
+            goal.ReleaseId = planningReleases[0].Id;
+            await store.UpdateGoalAsync(goal, ct);
+
+            _logger.LogInformation(
+                "Auto-tagged goal {GoalId} to release {ReleaseId}",
+                pipeline.GoalId, goal.ReleaseId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to auto-tag goal {GoalId} to a release", pipeline.GoalId);
+        }
     }
 
     private async Task MarkGoalFailed(GoalPipeline pipeline, string reason, CancellationToken ct)
