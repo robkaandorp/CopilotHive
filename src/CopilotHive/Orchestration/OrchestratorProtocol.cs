@@ -8,7 +8,13 @@ namespace CopilotHive.Orchestration;
 /// </summary>
 /// <param name="Role">The role of the message sender (e.g. "user", "assistant", "system").</param>
 /// <param name="Content">The text content of the message.</param>
-public sealed record ConversationEntry(string Role, string Content);
+/// <param name="Iteration">The pipeline iteration number this entry belongs to, or <c>null</c> for legacy entries.</param>
+/// <param name="Purpose">A short label describing the purpose of this entry (e.g. "planning", "craft-prompt", "worker-output", "error"), or <c>null</c> for legacy entries.</param>
+public sealed record ConversationEntry(
+    string Role,
+    string Content,
+    int? Iteration = null,
+    string? Purpose = null);
 
 /// <summary>
 /// Result of executing a worker action, fed back to the orchestrator LLM.

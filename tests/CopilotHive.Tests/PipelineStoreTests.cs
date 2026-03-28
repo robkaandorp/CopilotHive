@@ -90,6 +90,40 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     }
 
     [Fact]
+    public void SavePipeline_ThenLoad_RestoresConversationMetadata()
+    {
+        var pipeline = CreatePipeline();
+        pipeline.Conversation.Add(new ConversationEntry("user", "Plan now", Iteration: 1, Purpose: "planning"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "Here is the plan", Iteration: 1, Purpose: "planning"));
+        pipeline.Conversation.Add(new ConversationEntry("system", "Error occurred", Iteration: 1, Purpose: "error"));
+
+        _store.SavePipeline(pipeline);
+        var snap = Assert.Single(_store.LoadActivePipelines());
+
+        Assert.Equal(1, snap.Conversation[0].Iteration);
+        Assert.Equal("planning", snap.Conversation[0].Purpose);
+        Assert.Equal(1, snap.Conversation[1].Iteration);
+        Assert.Equal("planning", snap.Conversation[1].Purpose);
+        Assert.Equal(1, snap.Conversation[2].Iteration);
+        Assert.Equal("error", snap.Conversation[2].Purpose);
+    }
+
+    [Fact]
+    public void SavePipeline_ThenLoad_HandlesNullMetadataForLegacyRows()
+    {
+        var pipeline = CreatePipeline();
+        // Legacy-style entry with no metadata
+        pipeline.Conversation.Add(new ConversationEntry("user", "Legacy message"));
+
+        _store.SavePipeline(pipeline);
+        var snap = Assert.Single(_store.LoadActivePipelines());
+
+        Assert.Single(snap.Conversation);
+        Assert.Null(snap.Conversation[0].Iteration);
+        Assert.Null(snap.Conversation[0].Purpose);
+    }
+
+    [Fact]
     public void SavePipeline_ThenLoad_RestoresPhaseOutputs()
     {
         var pipeline = CreatePipeline();
@@ -215,6 +249,20 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         Assert.Equal("First", snap.Conversation[0].Content);
         Assert.Equal("Second", snap.Conversation[1].Content);
         Assert.Equal("Third", snap.Conversation[2].Content);
+    }
+
+    [Fact]
+    public void AppendConversation_PersistsMetadata()
+    {
+        var pipeline = CreatePipeline();
+        _store.SavePipeline(pipeline);
+
+        _store.AppendConversation("goal-1", new ConversationEntry("user", "Craft prompt", Iteration: 2, Purpose: "craft-prompt"));
+
+        var snap = Assert.Single(_store.LoadActivePipelines());
+        Assert.Single(snap.Conversation);
+        Assert.Equal(2, snap.Conversation[0].Iteration);
+        Assert.Equal("craft-prompt", snap.Conversation[0].Purpose);
     }
 
     #endregion
