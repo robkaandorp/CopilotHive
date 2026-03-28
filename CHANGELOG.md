@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Worker container restart failure** — `docker/worker/entrypoint.sh` now handles config repo restarts correctly:
+  - Replaces unconditional `git clone` with a clone-or-pull pattern that handles three cases:
+    1. **First start** — directory doesn't exist → clone
+    2. **Restart with existing repo** — `.git` exists → fetch + reset to latest
+    3. **Corrupt/partial clone** — directory exists but no `.git` → rm + clone fresh
+  - Config repo now has latest changes after restart (not stale from previous run)
+  - `git config user.email/name` is set after both clone and pull paths
+
 ### Added
 - **Inline prompt display in Goal Detail** — Brain prompts and worker prompts are now displayed inline within each phase on the Goal Detail page, replacing the flat conversation log:
   - `PhaseViewInfo` now includes `BrainPrompt` (the prompt sent to the Brain to generate the worker prompt) and `WorkerPrompt` (the Brain's crafted prompt sent to the worker)
