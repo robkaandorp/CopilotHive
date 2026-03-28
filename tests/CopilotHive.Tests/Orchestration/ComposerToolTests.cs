@@ -2466,9 +2466,10 @@ public sealed class ComposerToolTests : IDisposable
 
     /// <summary>
     /// Helper that uses reflection to inject a fake <see cref="IChatClient"/> into a
-    /// <see cref="Composer"/> instance and then rebuilds its internal <c>CodingAgent</c>
-    /// by calling the private <c>RecreateAgent()</c> method.  This allows hermetic tests
-    /// that never call the real LLM API.
+    /// <see cref="Composer"/> instance and then builds its internal <c>CodingAgent</c>
+    /// by calling the private <c>RecreateAgent()</c> method.  Call this BEFORE
+    /// <c>SendMessage</c> — no <c>ConnectAsync</c> call is needed, making the test
+    /// fully hermetic (no real LLM endpoint required).
     /// </summary>
     private static void InjectFakeChatClient(Composer composer, IChatClient fakeClient)
     {
@@ -2508,10 +2509,9 @@ public sealed class ComposerToolTests : IDisposable
                 _store,
                 stateDir: tmpDir);
 
-            // ConnectAsync sets _chatClient via SDK.ChatClientFactory — we then replace it
-            await composer.ConnectAsync(ct);
-
-            // Inject a mock IChatClient that throws model_max_prompt_tokens_exceeded
+            // Inject the fake IChatClient BEFORE any agent is created so we never
+            // call SDK.ChatClientFactory.Create (which requires a real LLM endpoint).
+            // InjectFakeChatClient sets _chatClient and calls RecreateAgent() internally.
             var overflowEx = new InvalidOperationException("model_max_prompt_tokens_exceeded");
             var mockClient = new Mock<IChatClient>();
             mockClient
@@ -2580,9 +2580,9 @@ public sealed class ComposerToolTests : IDisposable
                 _store,
                 stateDir: tmpDir);
 
-            await composer.ConnectAsync(ct);
-
-            // Inject a mock IChatClient that throws model_max_prompt_tokens_exceeded
+            // Inject the fake IChatClient BEFORE any agent is created so we never
+            // call SDK.ChatClientFactory.Create (which requires a real LLM endpoint).
+            // InjectFakeChatClient sets _chatClient and calls RecreateAgent() internally.
             var overflowEx = new InvalidOperationException("model_max_prompt_tokens_exceeded");
             var mockClient = new Mock<IChatClient>();
             mockClient
