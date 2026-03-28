@@ -180,4 +180,73 @@ public sealed class FileGoalSourceTests : IDisposable
         var goal = Assert.Single(goals);
         Assert.Equal("existing-hash", goal.MergeCommitHash);
     }
+
+    [Fact]
+    public async Task ReadGoalsAsync_WithScope_ParsesCorrectly()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var path = WriteTempYaml(
+            """
+            goals:
+              - id: scope-patch
+                description: Patch goal
+                scope: patch
+              - id: scope-feature
+                description: Feature goal
+                scope: feature
+              - id: scope-breaking
+                description: Breaking goal
+                scope: breaking
+              - id: scope-missing
+                description: No scope field
+            """);
+
+        var source = new FileGoalSource(path);
+        var goals = await source.ReadGoalsAsync(ct);
+
+        Assert.Equal(4, goals.Count);
+        Assert.Equal(GoalScope.Patch, goals.First(g => g.Id == "scope-patch").Scope);
+        Assert.Equal(GoalScope.Feature, goals.First(g => g.Id == "scope-feature").Scope);
+        Assert.Equal(GoalScope.Breaking, goals.First(g => g.Id == "scope-breaking").Scope);
+        Assert.Equal(GoalScope.Patch, goals.First(g => g.Id == "scope-missing").Scope);
+    }
+
+    [Fact]
+    public async Task WriteGoalsAsync_NonPatchScope_WritesFieldToYaml()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var path = WriteTempYaml(
+            """
+            goals:
+              - id: write-scope-test
+                description: Feature goal
+                scope: feature
+            """);
+
+        var source = new FileGoalSource(path);
+        // Trigger a write by updating status
+        await source.UpdateGoalStatusAsync("write-scope-test", GoalStatus.Completed, null, ct);
+
+        var yaml = await File.ReadAllTextAsync(path, ct);
+        Assert.Contains("scope: feature", yaml);
+    }
+
+    [Fact]
+    public async Task WriteGoalsAsync_PatchScope_OmitsFieldFromYaml()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var path = WriteTempYaml(
+            """
+            goals:
+              - id: patch-scope-test
+                description: Patch goal
+            """);
+
+        var source = new FileGoalSource(path);
+        await source.UpdateGoalStatusAsync("patch-scope-test", GoalStatus.Completed, null, ct);
+
+        var yaml = await File.ReadAllTextAsync(path, ct);
+        // Patch is the default; it should be omitted (null) to keep YAML clean
+        Assert.DoesNotContain("scope: patch", yaml);
+    }
 }

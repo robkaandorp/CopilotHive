@@ -578,7 +578,8 @@ public sealed class Composer : IAsyncDisposable
         [Description("Clear description including acceptance criteria")] string description,
         [Description("Comma-separated repository names this goal applies to")] string? repositories = null,
         [Description("Priority: Low, Normal, High, or Critical. Default: Normal")] string? priority = null,
-        [Description("Comma-separated goal IDs this goal depends on")] string? depends_on = null)
+        [Description("Comma-separated goal IDs this goal depends on")] string? depends_on = null,
+        [Description("Scope: Patch, Feature, or Breaking. Default: Patch")] string? scope = null)
     {
         var isValidId = IsValidGoalId(id);
         var error = Shared.ToolValidation.Check(
@@ -595,6 +596,10 @@ public sealed class Composer : IAsyncDisposable
         if (!string.IsNullOrEmpty(priority) && Enum.TryParse<GoalPriority>(priority, ignoreCase: true, out var p))
             goalPriority = p;
 
+        var goalScope = GoalScope.Patch;
+        if (!string.IsNullOrEmpty(scope) && Enum.TryParse<GoalScope>(scope, ignoreCase: true, out var s))
+            goalScope = s;
+
         var repos = string.IsNullOrWhiteSpace(repositories)
             ? new List<string>()
             : repositories.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
@@ -608,6 +613,7 @@ public sealed class Composer : IAsyncDisposable
             Id = id,
             Description = description,
             Priority = goalPriority,
+            Scope = goalScope,
             Status = GoalStatus.Draft,
             RepositoryNames = repos,
             DependsOn = deps,
@@ -620,6 +626,7 @@ public sealed class Composer : IAsyncDisposable
             ✅ Goal created as Draft:
             - ID: {id}
             - Priority: {goalPriority}
+            - Scope: {goalScope}
             - Repositories: {(repos.Count > 0 ? string.Join(", ", repos) : "(none)")}
             - Dependencies: {(deps.Count > 0 ? string.Join(", ", deps) : "(none)")}
             - Status: Draft (not yet dispatched — use approve_goal to queue it)

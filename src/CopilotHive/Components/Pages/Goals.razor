@@ -46,6 +46,7 @@
                 <th>Goal</th>
                 <th>Status</th>
                 <th>Priority</th>
+                <th>Scope</th>
                 <th>Iterations</th>
                 <th>Duration</th>
                 <th>Created</th>
@@ -81,6 +82,7 @@
                         }
                     </td>
                     <td><span class="badge @PriorityBadge(g.Priority)">@g.Priority</span></td>
+                    <td><span title="@g.Scope.ToDisplayName()">@ScopeEmoji(g.Scope)</span></td>
                     <td>@(g.Iterations?.ToString() ?? "—")</td>
                     <td style="color:var(--text-muted);white-space:nowrap">@FormatDuration(g)</td>
                     <td style="color:var(--text-muted);white-space:nowrap">@g.CreatedAt.ToString("yyyy-MM-dd HH:mm")</td>
@@ -190,6 +192,14 @@ else if (_loaded)
         GoalPriority.Normal => "badge-muted",
         GoalPriority.Low => "badge-muted",
         _ => "badge-muted",
+    };
+
+    private static string ScopeEmoji(GoalScope scope) => scope switch
+    {
+        GoalScope.Patch => "🔧",
+        GoalScope.Feature => "✨",
+        GoalScope.Breaking => "💥",
+        _ => throw new InvalidOperationException($"Unknown GoalScope: {scope}"),
     };
 
     private static string FormatDuration(Goal g)

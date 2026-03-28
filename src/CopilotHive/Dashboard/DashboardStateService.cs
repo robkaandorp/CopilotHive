@@ -388,6 +388,7 @@ public sealed class DashboardStateService : IDisposable
             Description = goal.Description,
             Status = effectiveStatus,
             Priority = goal.Priority,
+            Scope = goal.Scope,
             CurrentIteration = pipeline?.Iteration ?? 0,
             CurrentPhase = pipeline?.Phase.ToDisplayName() ?? "",
             CreatedAt = pipeline?.CreatedAt ?? goal.CreatedAt,
@@ -667,6 +668,8 @@ public sealed class GoalDetailInfo
     public GoalStatus Status { get; init; }
     /// <summary>Goal priority level.</summary>
     public GoalPriority Priority { get; init; }
+    /// <summary>Goal scope.</summary>
+    public GoalScope Scope { get; init; }
     /// <summary>Current iteration number (zero if not started).</summary>
     public int CurrentIteration { get; init; }
     /// <summary>Name of the current pipeline phase.</summary>

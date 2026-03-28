@@ -11,6 +11,8 @@ public sealed class Goal
     public required string Description { get; init; }
     /// <summary>Scheduling priority; higher-priority goals are dispatched first.</summary>
     public GoalPriority Priority { get; init; } = GoalPriority.Normal;
+    /// <summary>Scope of change this goal introduces.</summary>
+    public GoalScope Scope { get; init; } = GoalScope.Patch;
     /// <summary>Current lifecycle status of the goal.</summary>
     public GoalStatus Status { get; set; } = GoalStatus.Pending;
     /// <summary>Names of repositories this goal applies to.</summary>
@@ -96,6 +98,17 @@ public enum GoalPriority
     High,
     /// <summary>Highest priority; processed before all others.</summary>
     Critical,
+}
+
+/// <summary>Indicates the breadth of change a goal is expected to introduce.</summary>
+public enum GoalScope
+{
+    /// <summary>Small, isolated fix or tweak with no public API impact.</summary>
+    Patch,
+    /// <summary>New capability added in a backward-compatible way.</summary>
+    Feature,
+    /// <summary>Change that breaks backward compatibility or alters existing contracts.</summary>
+    Breaking,
 }
 
 /// <summary>Lifecycle status values for a goal.</summary>
