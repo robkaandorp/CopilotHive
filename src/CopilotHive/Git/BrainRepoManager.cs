@@ -118,8 +118,22 @@ public sealed class BrainRepoManager : IBrainRepoManager
                 repoName, repoUrl, defaultBranch);
 
             Directory.CreateDirectory(WorkDirectory);
-            await RunGitAsync(WorkDirectory,
-                ["clone", "--branch", defaultBranch, repoUrl, repoName], ct);
+            try
+            {
+                await RunGitAsync(WorkDirectory,
+                    ["clone", "--branch", defaultBranch, repoUrl, repoName], ct);
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("not found in upstream"))
+            {
+                _logger.LogWarning(
+                    "Branch '{Branch}' not found in upstream for {Repo} — retrying clone without --branch",
+                    defaultBranch, repoName);
+
+                if (Directory.Exists(clonePath))
+                    Directory.Delete(clonePath, recursive: true);
+
+                await RunGitAsync(WorkDirectory, ["clone", repoUrl, repoName], ct);
+            }
 
             // Configure git identity for merge commits
             await RunGitAsync(clonePath, ["config", "user.email", "copilothive@local"], ct);

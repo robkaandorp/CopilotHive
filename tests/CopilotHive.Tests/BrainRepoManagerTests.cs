@@ -175,6 +175,103 @@ public sealed class BrainRepoManagerTests : IDisposable
             e.Message.Contains("Failed to delete remote branch"));
     }
 
+    [Fact]
+    public async Task EnsureCloneAsync_BranchNotFound_FallsBackToBranchlessClone()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a bare "remote" repo with only the default branch (main)
+        var remoteDir = Path.Combine(_tempDir, "remote.git");
+        Directory.CreateDirectory(remoteDir);
+        Git(remoteDir, "init", "--bare", "-b", "main");
+
+        // Push an initial commit to the bare remote via a temp working clone
+        var seedDir = Path.Combine(_tempDir, "seed");
+        Git(_tempDir, "clone", remoteDir, "seed");
+        Git(seedDir, "config", "user.email", "test@test.com");
+        Git(seedDir, "config", "user.name", "Test");
+        File.WriteAllText(Path.Combine(seedDir, "README.md"), "# Hello\n");
+        Git(seedDir, "add", "README.md");
+        Git(seedDir, "commit", "-m", "Initial commit");
+        Git(seedDir, "push", "origin", "main");
+
+        var logger = new TestLogger<BrainRepoManager>();
+        var manager = new BrainRepoManager(_tempDir, logger);
+
+        // Request a branch that does not exist — should fall back to branchless clone
+        var clonePath = await manager.EnsureCloneAsync("seed-repo", remoteDir, "nonexistent-branch", ct);
+
+        // The clone must exist
+        Assert.True(Directory.Exists(Path.Combine(clonePath, ".git")));
+
+        // A warning about the missing branch must have been logged
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message.Contains("not found in upstream"));
+    }
+
+    [Fact]
+    public async Task EnsureCloneAsync_BranchNotFound_ConfiguresGitIdentityAfterFallback()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a bare "remote" repo
+        var remoteDir = Path.Combine(_tempDir, "remote2.git");
+        Directory.CreateDirectory(remoteDir);
+        Git(remoteDir, "init", "--bare", "-b", "main");
+
+        var seedDir = Path.Combine(_tempDir, "seed2");
+        Git(_tempDir, "clone", remoteDir, "seed2");
+        Git(seedDir, "config", "user.email", "test@test.com");
+        Git(seedDir, "config", "user.name", "Test");
+        File.WriteAllText(Path.Combine(seedDir, "README.md"), "# Hello\n");
+        Git(seedDir, "add", "README.md");
+        Git(seedDir, "commit", "-m", "Initial commit");
+        Git(seedDir, "push", "origin", "main");
+
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        var clonePath = await manager.EnsureCloneAsync("seed2-repo", remoteDir, "nonexistent-branch", ct);
+
+        // Git identity must be configured even after the branchless-fallback clone
+        var email = GitOutput(clonePath, "config", "user.email").Trim();
+        var name = GitOutput(clonePath, "config", "user.name").Trim();
+        Assert.Equal("copilothive@local", email);
+        Assert.Equal("CopilotHive", name);
+    }
+
+    [Fact]
+    public async Task EnsureCloneAsync_BranchExists_ClonesWithBranchFlag()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a bare "remote" repo with a non-main default branch
+        var remoteDir = Path.Combine(_tempDir, "remote3.git");
+        Directory.CreateDirectory(remoteDir);
+        Git(remoteDir, "init", "--bare", "-b", "develop");
+
+        var seedDir = Path.Combine(_tempDir, "seed3");
+        Git(_tempDir, "clone", remoteDir, "seed3");
+        Git(seedDir, "config", "user.email", "test@test.com");
+        Git(seedDir, "config", "user.name", "Test");
+        File.WriteAllText(Path.Combine(seedDir, "README.md"), "# Hello\n");
+        Git(seedDir, "add", "README.md");
+        Git(seedDir, "commit", "-m", "Initial commit");
+        Git(seedDir, "push", "origin", "develop");
+
+        var logger = new TestLogger<BrainRepoManager>();
+        var manager = new BrainRepoManager(_tempDir, logger);
+
+        var clonePath = await manager.EnsureCloneAsync("seed3-repo", remoteDir, "develop", ct);
+
+        // Clone must exist
+        Assert.True(Directory.Exists(Path.Combine(clonePath, ".git")));
+
+        // No fallback warning should have been emitted
+        Assert.DoesNotContain(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message.Contains("not found in upstream"));
+    }
+
     private static string InitTempGitRepoWithRemote(string basePath, string repoName)
     {
         var reposDir = Path.Combine(basePath, "repos");
