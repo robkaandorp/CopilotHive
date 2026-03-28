@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Repository filter dropdown on Goals page** — the Goals list now includes a repository filter alongside existing status and priority filters:
+  - Dropdown lists all distinct repository names found across all goals, sorted alphabetically (case-insensitive deduplication)
+  - Selecting "All repositories" shows goals regardless of repository (including goals with no repositories)
+  - Selecting a specific repository filters the list to only goals associated with that repository
+  - Works in combination with existing status, priority, and search filters
+  - Filter count `@_filtered.Count goal(s)` updates correctly when repo filter is applied
+  - `_repositories` property computes distinct repo names from `_allGoals` via `SelectMany`, `Distinct`, and `OrderBy`
+  - Filter uses case-insensitive `StringComparer.OrdinalIgnoreCase` matching for repository names
+  - Includes 11 xUnit tests covering: empty goal list, goals with no repos, deduplication, case-insensitive deduplication, empty/whitespace filter returns all, matching repo returns only matches, case-insensitive matching, no match returns empty, goals with no repos excluded when filtering
+
+### Added
 - **Composer `ask_user` tool** — the Composer can now present interactive questions in the chat UI, suspending the response loop until the user answers:
   - `AskUserAsync` method presents questions with three types: `YesNo` (two buttons), `SingleChoice` (radio buttons), and `MultiChoice` (checkboxes)
   - `ComposerQuestion` class encapsulates the question text, type, options, and a `TaskCompletionSource<string>` for async/await blocking

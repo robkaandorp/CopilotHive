@@ -26,6 +26,14 @@
         }
     </select>
 
+    <select @bind="_repoFilter" @bind:after="ApplyFilters">
+        <option value="">All repositories</option>
+        @foreach (var r in _allRepoNames)
+        {
+            <option value="@r">@r</option>
+        }
+    </select>
+
     <span class="filter-count">@_filtered.Count goal(s)</span>
 </div>
 
@@ -116,10 +124,17 @@ else if (_loaded)
     private string _searchText = "";
     private string _statusFilter = "";
     private string _priorityFilter = "";
+    private string _repoFilter = "";
     private bool _loaded;
     private Dictionary<string, string> _approveErrors = new();
     private Dictionary<string, string> _revertErrors = new();
     private Dictionary<string, GoalStatus> _goalStatusById = new();
+
+    private List<string> _allRepoNames => _allGoals
+        .SelectMany(g => g.RepositoryNames)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .OrderBy(r => r, StringComparer.OrdinalIgnoreCase)
+        .ToList();
 
     protected override async Task OnInitializedAsync()
     {
@@ -138,6 +153,9 @@ else if (_loaded)
 
         if (!string.IsNullOrWhiteSpace(_priorityFilter) && Enum.TryParse<GoalPriority>(_priorityFilter, out var priority))
             query = query.Where(g => g.Priority == priority);
+
+        if (!string.IsNullOrWhiteSpace(_repoFilter))
+            query = query.Where(g => g.RepositoryNames.Contains(_repoFilter, StringComparer.OrdinalIgnoreCase));
 
         if (!string.IsNullOrWhiteSpace(_searchText))
         {
