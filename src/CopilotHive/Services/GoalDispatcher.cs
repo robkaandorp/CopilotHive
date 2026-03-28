@@ -1015,12 +1015,13 @@ public sealed class GoalDispatcher : BackgroundService
     {
         try
         {
-            var goal = pipeline.Goal;
-            if (goal.ReleaseId is not null || goal.RepositoryNames.Count == 0)
-                return;
-
             var store = _goalManager.Sources.OfType<IGoalStore>().FirstOrDefault();
             if (store is null)
+                return;
+
+            var goalId = pipeline.GoalId;
+            var goal = await store.GetGoalAsync(goalId, ct);
+            if (goal is null || goal.ReleaseId is not null || goal.RepositoryNames.Count == 0)
                 return;
 
             var releases = await store.GetReleasesAsync(ct);
@@ -1029,7 +1030,10 @@ public sealed class GoalDispatcher : BackgroundService
             if (planningReleases.Count != 1)
                 return;
 
-            goal.ReleaseId = planningReleases[0].Id;
+            var planningRelease = planningReleases[0];
+            goal = await store.GetGoalAsync(goalId, ct);
+            if (goal is null || goal.ReleaseId is not null) return; // already tagged or deleted
+            goal.ReleaseId = planningRelease.Id;
             await store.UpdateGoalAsync(goal, ct);
 
             _logger.LogInformation(

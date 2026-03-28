@@ -531,6 +531,19 @@ public sealed class SqliteGoalStore : IGoalStore
     {
         lock (_lock)
         {
+            // Enforce Planning-only delete: fetch the release first and reject if already Released.
+            using var fetchCmd = _db.CreateCommand();
+            fetchCmd.CommandText = "SELECT status FROM releases WHERE id = @id";
+            fetchCmd.Parameters.AddWithValue("@id", releaseId);
+            var statusRaw = fetchCmd.ExecuteScalar();
+
+            if (statusRaw is null)
+                return Task.FromResult(false); // not found
+
+            var status = Enum.Parse<ReleaseStatus>((string)statusRaw, ignoreCase: true);
+            if (status != ReleaseStatus.Planning)
+                return Task.FromResult(false); // only Planning releases may be deleted
+
             using var cmd = _db.CreateCommand();
             cmd.CommandText = "DELETE FROM releases WHERE id = @id";
             cmd.Parameters.AddWithValue("@id", releaseId);

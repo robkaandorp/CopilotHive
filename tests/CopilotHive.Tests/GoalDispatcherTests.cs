@@ -1304,6 +1304,61 @@ public sealed class GoalDispatcherAutoTagReleaseTests
     }
 
     [Fact]
+    public async Task TryAutoTagRelease_ReloadsGoalFromStore_DoesNotOverwriteCompletedFields()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
+
+        // Create a Planning release
+        await store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0", Status = ReleaseStatus.Planning }, ct);
+
+        // Create a goal with completion fields set (simulating a goal that was Completed
+        // and then had its status / timestamps written to the store by UpdateGoalStatusAsync).
+        var completedAt = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
+        var startedAt = new DateTime(2025, 1, 1, 11, 0, 0, DateTimeKind.Utc);
+        var goal = new Goal
+        {
+            Id = "completed-goal",
+            Description = "A completed goal",
+            RepositoryNames = ["CopilotHive"],
+            Status = GoalStatus.Completed,
+            StartedAt = startedAt,
+            CompletedAt = completedAt,
+            Iterations = 3,
+            MergeCommitHash = "abc123",
+            CreatedAt = DateTime.UtcNow,
+        };
+        await store.CreateGoalAsync(goal, ct);
+
+        // Simulate TryAutoTagReleaseAsync: reload from store, then set ReleaseId
+        var goalId = goal.Id;
+        var releases = await store.GetReleasesAsync(ct);
+        var planningReleases = releases.Where(r => r.Status == ReleaseStatus.Planning).ToList();
+        Assert.Single(planningReleases);
+
+        var planningRelease = planningReleases[0];
+        // Bug 1 fix: reload fresh goal from store (NOT the stale in-memory object)
+        var freshGoal = await store.GetGoalAsync(goalId, ct);
+        Assert.NotNull(freshGoal);
+        Assert.Null(freshGoal!.ReleaseId); // not yet tagged
+        freshGoal.ReleaseId = planningRelease.Id;
+        await store.UpdateGoalAsync(freshGoal, ct);
+
+        // Verify the completion fields are preserved and not overwritten
+        var fetched = await store.GetGoalAsync(goalId, ct);
+        Assert.NotNull(fetched);
+        Assert.Equal("v1.0.0", fetched!.ReleaseId);
+        Assert.Equal(GoalStatus.Completed, fetched.Status);
+        Assert.Equal(completedAt, fetched.CompletedAt);
+        Assert.Equal(startedAt, fetched.StartedAt);
+        Assert.Equal(3, fetched.Iterations);
+        Assert.Equal("abc123", fetched.MergeCommitHash);
+    }
+
+    [Fact]
     public async Task GetGoalsByRelease_ReturnsCorrectGoals()
     {
         var ct = TestContext.Current.CancellationToken;

@@ -148,6 +148,38 @@ public sealed class ReleaseTests : IDisposable
         Assert.False(deleted);
     }
 
+    [Fact]
+    public async Task DeleteRelease_ReleasedRelease_ReturnsFalseAndDoesNotDelete()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // Create a release in Released status — cannot be deleted.
+        var release = new Release { Id = "v2.0.0", Tag = "v2.0.0", Status = ReleaseStatus.Released };
+        await _store.CreateReleaseAsync(release, ct);
+
+        var deleted = await _store.DeleteReleaseAsync("v2.0.0", ct);
+        Assert.False(deleted);
+
+        // Release must still exist in the store.
+        var fetched = await _store.GetReleaseAsync("v2.0.0", ct);
+        Assert.NotNull(fetched);
+        Assert.Equal(ReleaseStatus.Released, fetched!.Status);
+    }
+
+    [Fact]
+    public async Task DeleteRelease_PlanningRelease_Succeeds()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // Planning release can always be deleted.
+        var release = new Release { Id = "v3.0.0-plan", Tag = "v3.0.0-plan", Status = ReleaseStatus.Planning };
+        await _store.CreateReleaseAsync(release, ct);
+
+        var deleted = await _store.DeleteReleaseAsync("v3.0.0-plan", ct);
+        Assert.True(deleted);
+
+        var fetched = await _store.GetReleaseAsync("v3.0.0-plan", ct);
+        Assert.Null(fetched);
+    }
+
     // ── Goal.ReleaseId ─────────────────────────────────────────────────────
 
     [Fact]
