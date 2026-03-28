@@ -1389,6 +1389,73 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Null(codingPhase.BrainPrompt);
         Assert.Null(codingPhase.WorkerPrompt);
     }
+
+    /// <summary>
+    /// Verifies that completed iterations (no live pipeline) show null prompts
+    /// because there's no conversation to extract from.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_CompletedIteration_ShowsNullPrompts()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a completed goal with iteration summary but NO pipeline
+        var goal = new Goal
+        {
+            Id = "completed-iteration-goal",
+            Description = "Completed goal with iteration summary",
+            Status = GoalStatus.Completed,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = "Coding",
+                    Result = "pass",
+                    DurationSeconds = 60.0,
+                    WorkerOutput = "Coder completed work.",
+                },
+            ],
+        };
+        await _store.UpdateGoalStatusAsync("completed-iteration-goal", GoalStatus.Completed,
+            new GoalUpdateMetadata { Iterations = 1, IterationSummary = summary }, ct);
+
+        // Build service WITHOUT a pipeline for this goal (simulating completed state)
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store);
+
+        var detail = service.GetGoalDetail("completed-iteration-goal");
+
+        Assert.NotNull(detail);
+        Assert.Single(detail.Iterations);
+        var iteration = detail.Iterations[0];
+        Assert.False(iteration.IsCurrent); // Not current - completed
+
+        // Planning prompts should be null (no pipeline conversation)
+        Assert.Null(iteration.PlanningBrainPrompt);
+        Assert.Null(iteration.PlanningBrainResponse);
+
+        // Phase prompts should be null (no pipeline conversation)
+        var codingPhase = iteration.Phases.FirstOrDefault(p => p.Name == "Coding");
+        Assert.NotNull(codingPhase);
+        Assert.Null(codingPhase.BrainPrompt);
+        Assert.Null(codingPhase.WorkerPrompt);
+        // But WorkerOutput should still be populated from the stored summary
+        Assert.Equal("Coder completed work.", codingPhase.WorkerOutput);
+    }
 }
 
 /// <summary>
