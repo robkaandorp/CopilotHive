@@ -412,8 +412,8 @@ public sealed class DashboardStateService : IDisposable
         var planningEntries = conversation
             .Where(e => e.Iteration == iteration && e.Purpose == "planning")
             .ToList();
-        var userPrompt = planningEntries.FirstOrDefault(e => e.Role == "user")?.Content;
-        var assistantResponse = planningEntries.FirstOrDefault(e => e.Role == "assistant")?.Content;
+        var userPrompt = planningEntries.LastOrDefault(e => e.Role == "user")?.Content;
+        var assistantResponse = planningEntries.LastOrDefault(e => e.Role == "assistant")?.Content;
         return (userPrompt, assistantResponse);
     }
 
@@ -444,13 +444,20 @@ public sealed class DashboardStateService : IDisposable
             {
                 if (entry.Role == "user")
                 {
-                    // New craft-prompt request: start a fresh pair
-                    pendingBrainPrompt = entry.Content;
-                    pendingWorkerPrompt = null;
+                    // Only capture the first craft-prompt request in each phase block.
+                    // Mid-task AskBrainAsync follow-ups also use Purpose=="craft-prompt",
+                    // so we must not overwrite the initial dispatch prompt.
+                    if (pendingBrainPrompt is null)
+                    {
+                        pendingBrainPrompt = entry.Content;
+                        pendingWorkerPrompt = null;
+                    }
                 }
                 else if (entry.Role == "assistant")
                 {
-                    pendingWorkerPrompt = entry.Content;
+                    // Only record the response for the first pair; ignore follow-up assistant turns.
+                    if (pendingBrainPrompt is not null && pendingWorkerPrompt is null)
+                        pendingWorkerPrompt = entry.Content;
                 }
             }
             else if (entry.Purpose == "worker-output")

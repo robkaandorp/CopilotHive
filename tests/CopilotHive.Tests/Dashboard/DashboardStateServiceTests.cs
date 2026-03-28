@@ -1210,6 +1210,62 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Null(result["coder"].WorkerPrompt);
     }
 
+    // ── Regression: ExtractPlanningPrompts — multiple entries ──────────────
+
+    /// <summary>
+    /// Regression: when <c>PlanIterationAsync</c> is called more than once (nudge/retry),
+    /// multiple planning entries are appended. <see cref="DashboardStateService.ExtractPlanningPrompts"/>
+    /// must return the LAST pair, not the first.
+    /// </summary>
+    [Fact]
+    public void ExtractPlanningPrompts_MultiplePlanningEntries_ReturnsLastPair()
+    {
+        var entries = new List<ConversationEntry>
+        {
+            // First attempt (should be ignored)
+            new ConversationEntry("user",      "Plan attempt 1",      1, "planning"),
+            new ConversationEntry("assistant", "Response attempt 1",  1, "planning"),
+            // Second (nudge) attempt — this is the authoritative one
+            new ConversationEntry("user",      "Plan attempt 2 nudge", 1, "planning"),
+            new ConversationEntry("assistant", "Response attempt 2",   1, "planning"),
+        };
+
+        var (userPrompt, assistantResponse) = DashboardStateService.ExtractPlanningPrompts(entries, 1);
+
+        Assert.Equal("Plan attempt 2 nudge", userPrompt);
+        Assert.Equal("Response attempt 2",   assistantResponse);
+    }
+
+    // ── Regression: ExtractCraftPrompts — AskBrainAsync mid-task follow-ups ──
+
+    /// <summary>
+    /// Regression: <c>AskBrainAsync</c> adds more craft-prompt entries after the initial
+    /// dispatch pair. <see cref="DashboardStateService.ExtractCraftPrompts"/> must keep
+    /// only the FIRST pair (the dispatch prompt), not the follow-up Q&amp;A.
+    /// </summary>
+    [Fact]
+    public void ExtractCraftPrompts_MidTaskFollowUp_ShowsDispatchPromptNotFollowUp()
+    {
+        var entries = new List<ConversationEntry>
+        {
+            // Initial dispatch pair (first — should be retained)
+            new ConversationEntry("user",      "Dispatch: write the feature",  1, "craft-prompt"),
+            new ConversationEntry("assistant", "Task: implement feature X",    1, "craft-prompt"),
+            // Mid-task follow-up via AskBrainAsync (should NOT overwrite the dispatch prompt)
+            new ConversationEntry("user",      "Follow-up question",           1, "craft-prompt"),
+            new ConversationEntry("assistant", "Follow-up answer",             1, "craft-prompt"),
+            // Worker reports output after the follow-up
+            new ConversationEntry("coder",     "Coder finished with help.",    1, "worker-output"),
+        };
+
+        var result = DashboardStateService.ExtractCraftPrompts(entries, 1);
+
+        Assert.True(result.ContainsKey("coder"));
+        // Must show the FIRST (dispatch) prompt, not the follow-up
+        Assert.Equal("Dispatch: write the feature", result["coder"].BrainPrompt);
+        Assert.Equal("Task: implement feature X",   result["coder"].WorkerPrompt);
+    }
+
     // ── GetGoalDetail: inline prompts in phases ──────────────────────────
 
     /// <summary>
