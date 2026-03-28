@@ -113,6 +113,7 @@ public sealed class FileGoalSource : IGoalSource
                 Id = g.Id,
                 Description = g.Description,
                 Priority = g.Priority.ToString().ToLowerInvariant(),
+                Scope = g.Scope == GoalScope.Patch ? null : g.Scope.ToString().ToLowerInvariant(),
                 Status = FormatStatus(g.Status),
                 Repositories = g.RepositoryNames,
                 Depends_on = g.DependsOn.Count > 0 ? g.DependsOn : null,
@@ -149,6 +150,7 @@ public sealed class FileGoalSource : IGoalSource
             Id = id,
             Description = entry.Description ?? string.Empty,
             Priority = ParsePriority(entry.Priority),
+            Scope = ParseScope(entry.Scope),
             Status = ParseStatus(entry.Status),
             RepositoryNames = entry.Repositories ?? [],
             DependsOn = entry.Depends_on ?? [],
@@ -170,6 +172,13 @@ public sealed class FileGoalSource : IGoalSource
         "high" => GoalPriority.High,
         "critical" => GoalPriority.Critical,
         _ => GoalPriority.Normal,
+    };
+
+    private static GoalScope ParseScope(string? value) => value?.ToLowerInvariant() switch
+    {
+        "feature" => GoalScope.Feature,
+        "breaking" => GoalScope.Breaking,
+        _ => GoalScope.Patch,
     };
 
     private static GoalStatus ParseStatus(string? value) => value?.ToLowerInvariant().Replace("_", "") switch
@@ -248,6 +257,7 @@ public sealed class FileGoalSource : IGoalSource
         public string? Title { get; set; }
         public string? Description { get; set; }
         public string? Priority { get; set; }
+        public string? Scope { get; set; }
         public string? Status { get; set; }
         public List<string>? Repositories { get; set; }
         public List<string>? Depends_on { get; set; }

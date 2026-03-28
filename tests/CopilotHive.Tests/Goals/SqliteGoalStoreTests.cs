@@ -771,4 +771,58 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
         Assert.Single(s.PhaseOutputs);
         Assert.Equal("Reviewer: Missing null checks.", s.PhaseOutputs["reviewer-1"]);
     }
+
+    [Fact]
+    public async Task CreateGoal_WithScope_PersistsAndReadsBack()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = new Goal
+        {
+            Id = "scope-feature",
+            Description = "Add feature X",
+            Status = GoalStatus.Pending,
+            Priority = GoalPriority.Normal,
+            Scope = GoalScope.Feature,
+            CreatedAt = new DateTime(2025, 1, 15, 10, 0, 0, DateTimeKind.Utc),
+        };
+
+        await _store.CreateGoalAsync(goal, ct);
+        var fetched = await _store.GetGoalAsync("scope-feature", ct);
+
+        Assert.NotNull(fetched);
+        Assert.Equal(GoalScope.Feature, fetched!.Scope);
+    }
+
+    [Fact]
+    public async Task CreateGoal_WithBreakingScope_PersistsAndReadsBack()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = new Goal
+        {
+            Id = "scope-breaking",
+            Description = "Breaking change",
+            Status = GoalStatus.Pending,
+            Scope = GoalScope.Breaking,
+            CreatedAt = new DateTime(2025, 1, 15, 10, 0, 0, DateTimeKind.Utc),
+        };
+
+        await _store.CreateGoalAsync(goal, ct);
+        var fetched = await _store.GetGoalAsync("scope-breaking", ct);
+
+        Assert.NotNull(fetched);
+        Assert.Equal(GoalScope.Breaking, fetched!.Scope);
+    }
+
+    [Fact]
+    public async Task CreateGoal_DefaultScope_IsPatch()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = MakeGoal("scope-default");
+
+        await _store.CreateGoalAsync(goal, ct);
+        var fetched = await _store.GetGoalAsync("scope-default", ct);
+
+        Assert.NotNull(fetched);
+        Assert.Equal(GoalScope.Patch, fetched!.Scope);
+    }
 }

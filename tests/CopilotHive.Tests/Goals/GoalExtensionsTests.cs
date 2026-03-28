@@ -49,4 +49,20 @@ public class GoalExtensionsTests
     [Fact]
     public void GoalStatus_InvalidValue_ThrowsInvalidOperationException()
         => Assert.Throws<InvalidOperationException>(() => ((GoalStatus)999).ToDisplayName());
+
+    [Fact]
+    public void GoalScope_Patch_ReturnsPatch()
+        => Assert.Equal("Patch", GoalScope.Patch.ToDisplayName());
+
+    [Fact]
+    public void GoalScope_Feature_ReturnsFeature()
+        => Assert.Equal("Feature", GoalScope.Feature.ToDisplayName());
+
+    [Fact]
+    public void GoalScope_Breaking_ReturnsBreaking()
+        => Assert.Equal("Breaking", GoalScope.Breaking.ToDisplayName());
+
+    [Fact]
+    public void GoalScope_InvalidValue_ThrowsInvalidOperationException()
+        => Assert.Throws<InvalidOperationException>(() => ((GoalScope)999).ToDisplayName());
 }

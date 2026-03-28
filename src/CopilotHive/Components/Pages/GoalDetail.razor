@@ -56,6 +56,7 @@
         <div style="margin-top:0.5rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
             <span class="badge @StatusBadge(_detail.Status)">@_detail.Status</span>
             <span style="color:var(--text-muted)">Priority: @_detail.Priority</span>
+            <span style="color:var(--text-muted)" title="@_detail.Scope.ToDisplayName()">Scope: @ScopeEmoji(_detail.Scope) @_detail.Scope.ToDisplayName()</span>
             @if (!string.IsNullOrEmpty(_detail.CoderBranch))
             {
                 <span style="font-family:monospace;font-size:0.85rem;color:var(--accent)">⎇ @_detail.CoderBranch</span>
@@ -369,6 +370,7 @@ else if (_storedGoal is not null)
         <div style="margin-top:0.5rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
             <span class="badge @StatusBadge(_storedGoal.Status)">@_storedGoal.Status</span>
             <span style="color:var(--text-muted)">Priority: @_storedGoal.Priority</span>
+            <span style="color:var(--text-muted)" title="@_storedGoal.Scope.ToDisplayName()">Scope: @ScopeEmoji(_storedGoal.Scope) @_storedGoal.Scope.ToDisplayName()</span>
             @if (_storedGoal.Iterations.HasValue)
             {
                 <span style="color:var(--text-muted)">Iterations: <strong style="color:var(--text)">@_storedGoal.Iterations</strong></span>
@@ -666,6 +668,14 @@ else
 
     private static string ReviewBadge(string? verdict) =>
         string.Equals(verdict, "Approve", StringComparison.OrdinalIgnoreCase) ? "badge-green" : "badge-red";
+
+    private static string ScopeEmoji(GoalScope scope) => scope switch
+    {
+        GoalScope.Patch => "🔧",
+        GoalScope.Feature => "✨",
+        GoalScope.Breaking => "💥",
+        _ => throw new InvalidOperationException($"Unknown GoalScope: {scope}"),
+    };
 
     private static string FormatDuration(double seconds) =>
         seconds >= 60 ? $"{seconds / 60:F1}m" : $"{seconds:F0}s";

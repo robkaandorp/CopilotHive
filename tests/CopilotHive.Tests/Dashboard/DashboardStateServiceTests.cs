@@ -1608,6 +1608,59 @@ public sealed class DashboardStateServiceTests : IDisposable
         // But WorkerOutput should still be populated from the stored summary
         Assert.Equal("Coder completed work.", codingPhase.WorkerOutput);
     }
+
+    /// <summary>
+    /// Verifies that <see cref="GoalDetailInfo.Scope"/> is populated from the underlying <see cref="Goal"/>.
+    /// </summary>
+    [Fact]
+    public void GoalDetailInfo_Scope_ReflectsGoalScope()
+    {
+        var detail = new GoalDetailInfo
+        {
+            GoalId = "scoped-goal",
+            Description = "A feature goal",
+            Status = GoalStatus.Pending,
+            Priority = GoalPriority.Normal,
+            Scope = GoalScope.Feature,
+        };
+
+        Assert.Equal(GoalScope.Feature, detail.Scope);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetGoalDetail"/> populates
+    /// <see cref="GoalDetailInfo.Scope"/> from a stored goal.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_GoalWithScope_PopulatesScope()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "breaking-goal",
+            Description = "Breaking change",
+            Scope = GoalScope.Breaking,
+            Status = GoalStatus.Pending,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store);
+
+        var detail = service.GetGoalDetail("breaking-goal");
+
+        Assert.NotNull(detail);
+        Assert.Equal(GoalScope.Breaking, detail!.Scope);
+    }
 }
 
 /// <summary>

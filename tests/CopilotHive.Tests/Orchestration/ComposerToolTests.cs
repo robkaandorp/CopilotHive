@@ -119,6 +119,40 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("description is required", result);
     }
 
+    [Fact]
+    public async Task CreateGoal_WithScope_SetsScope()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("scoped-goal", "Add new capability", scope: "Feature");
+
+        var goal = await _store.GetGoalAsync("scoped-goal", ct);
+        Assert.NotNull(goal);
+        Assert.Equal(GoalScope.Feature, goal!.Scope);
+    }
+
+    [Fact]
+    public async Task CreateGoal_WithBreakingScope_IncludesScopeInResponse()
+    {
+        var result = await _composer.CreateGoalAsync("breaking-goal", "Breaking change", scope: "Breaking");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("Breaking", result);
+        Assert.Contains("Scope:", result);
+    }
+
+    [Fact]
+    public async Task CreateGoal_DefaultScope_IsPatch()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("default-scope-goal", "Patch something");
+
+        var goal = await _store.GetGoalAsync("default-scope-goal", ct);
+        Assert.NotNull(goal);
+        Assert.Equal(GoalScope.Patch, goal!.Scope);
+    }
+
     // ── approve_goal ──
 
     [Fact]

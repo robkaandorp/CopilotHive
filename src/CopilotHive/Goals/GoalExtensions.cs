@@ -2,7 +2,7 @@ using System;
 
 namespace CopilotHive.Goals;
 
-/// <summary>Extension methods for <see cref="GoalPriority"/> and <see cref="GoalStatus"/>.</summary>
+/// <summary>Extension methods for <see cref="GoalPriority"/>, <see cref="GoalScope"/>, and <see cref="GoalStatus"/>.</summary>
 public static class GoalExtensions
 {
     /// <summary>Returns a human-readable display name for the priority.</summary>
@@ -15,6 +15,17 @@ public static class GoalExtensions
         GoalPriority.Normal => "Normal",
         GoalPriority.Low => "Low",
         _ => throw new InvalidOperationException($"Unknown GoalPriority: {priority}")
+    };
+
+    /// <summary>Returns a human-readable display name for the scope.</summary>
+    /// <param name="scope">The <see cref="GoalScope"/> value.</param>
+    /// <returns>A display name string for the given scope.</returns>
+    public static string ToDisplayName(this GoalScope scope) => scope switch
+    {
+        GoalScope.Patch => "Patch",
+        GoalScope.Feature => "Feature",
+        GoalScope.Breaking => "Breaking",
+        _ => throw new InvalidOperationException($"Unknown GoalScope: {scope}")
     };
 
     /// <summary>Returns a human-readable display name for the status.</summary>
