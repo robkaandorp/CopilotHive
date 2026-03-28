@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Cleanup is best-effort — goal deletion succeeds even if branch deletion fails (e.g., branch doesn't exist, remote unreachable)
   - Includes 5 xUnit tests for `DeleteRemoteBranchAsync` covering: no clone exists, clone exists with no branch, successful deletion, warning logging on failure
   - Includes 3 integration tests for `Composer.DeleteGoalAsync` covering: Failed goal with repo manager (cleanup attempted), Draft goal with repo manager (no cleanup), Failed goal with git failures (still succeeds)
-  - Includes 2 API endpoint tests for `DELETE /api/goals/{id}` covering: Failed goal returns 204 No Content, goal is removed from store
+  - Includes 3 API endpoint tests for `DELETE /api/goals/{id}` covering: Failed goal returns 204 No Content, goal is removed from store, branch cleanup is attempted
 
 ### Added
 - **Composer web research tools** — `web_search` and `web_fetch` tools are now available in the Composer for researching information on the web via Ollama's web search and fetch APIs:
