@@ -297,8 +297,8 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// Clears read-only attributes before deletion so <c>.git</c> pack-files can be removed.
     /// </summary>
     /// <param name="path">The directory to delete.</param>
-    /// <param name="maxRetries">Maximum number of attempts before giving up.</param>
-    private static async Task ForceDeleteDirectoryAsync(string path, int maxRetries = 5)
+    /// <param name="maxRetries">Maximum number of attempts before giving up (default: 3).</param>
+    private static async Task ForceDeleteDirectoryAsync(string path, int maxRetries = 3)
     {
         for (var i = 0; i < maxRetries; i++)
         {
