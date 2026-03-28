@@ -2464,17 +2464,42 @@ public sealed class ComposerToolTests : IDisposable
 
     // ── Session reset on context overflow ──
 
+    /// <summary>
+    /// Helper that uses reflection to inject a fake <see cref="IChatClient"/> into a
+    /// <see cref="Composer"/> instance and then rebuilds its internal <c>CodingAgent</c>
+    /// by calling the private <c>RecreateAgent()</c> method.  This allows hermetic tests
+    /// that never call the real LLM API.
+    /// </summary>
+    private static void InjectFakeChatClient(Composer composer, IChatClient fakeClient)
+    {
+        var composerType = typeof(Composer);
+
+        // Replace the private _chatClient field
+        var chatClientField = composerType.GetField("_chatClient",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("_chatClient field not found on Composer");
+        chatClientField.SetValue(composer, fakeClient);
+
+        // Rebuild the CodingAgent with the injected client
+        var recreateAgent = composerType.GetMethod("RecreateAgent",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("RecreateAgent method not found on Composer");
+        recreateAgent.Invoke(composer, null);
+    }
+
     [Fact]
     public async Task RunStreaming_ContextOverflow_ResetsSessionAndAppendsWarning()
     {
-        // Arrange: create a Composer whose agent throws a context overflow exception
+        // Arrange: create a Composer whose AI client throws a context-overflow error
         var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
         Directory.CreateDirectory(tmpDir);
         try
         {
-            // Write a fake session file to verify it gets deleted
+            var ct = TestContext.Current.CancellationToken;
+
+            // Write a fake session file so we can verify it gets deleted on reset
             var sessionFile = Path.Combine(tmpDir, "composer-session.json");
-            await File.WriteAllTextAsync(sessionFile, "{}", TestContext.Current.CancellationToken);
+            await File.WriteAllTextAsync(sessionFile, "{}", ct);
 
             var testLogger = new TestLogger<Composer>();
             var composer = new Composer(
@@ -2483,26 +2508,50 @@ public sealed class ComposerToolTests : IDisposable
                 _store,
                 stateDir: tmpDir);
 
-            // Inject a fake chat client that immediately throws a context overflow error
-            await composer.ConnectAsync(TestContext.Current.CancellationToken);
+            // ConnectAsync sets _chatClient via SDK.ChatClientFactory — we then replace it
+            await composer.ConnectAsync(ct);
 
-            // We exercise the overflow path by invoking RunStreamingAsync indirectly
-            // via a subclass hook — instead, we test the session-reset branch directly
-            // by checking IsContextOverflowError and the post-reset state manually.
+            // Inject a mock IChatClient that throws model_max_prompt_tokens_exceeded
+            var overflowEx = new InvalidOperationException("model_max_prompt_tokens_exceeded");
+            var mockClient = new Mock<IChatClient>();
+            mockClient
+                .Setup(c => c.GetStreamingResponseAsync(
+                    It.IsAny<IEnumerable<ChatMessage>>(),
+                    It.IsAny<ChatOptions?>(),
+                    It.IsAny<CancellationToken>()))
+                .Throws(overflowEx);
+            // Also cover the non-streaming path in case CodingAgent uses it
+            mockClient
+                .Setup(c => c.GetResponseAsync(
+                    It.IsAny<IEnumerable<ChatMessage>>(),
+                    It.IsAny<ChatOptions?>(),
+                    It.IsAny<CancellationToken>()))
+                .ThrowsAsync(overflowEx);
 
-            // Verify: before reset the session file exists
+            InjectFakeChatClient(composer, mockClient.Object);
+
+            // The session file exists before we trigger the overflow
             Assert.True(File.Exists(sessionFile));
 
-            // Simulate context overflow reset (replicating the catch block logic)
-            // Re-create session and delete file (same as the catch block does)
-            var resetTask = composer.ResetSessionAsync(TestContext.Current.CancellationToken);
-            await resetTask;
+            // Act: trigger RunStreamingAsync via SendMessage, which fires a background task
+            composer.SendMessage("hello");
 
-            // After reset the session file should be gone
-            Assert.False(File.Exists(sessionFile));
+            // Wait for IsStreaming to become false (streaming completed or caught the overflow)
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (composer.IsStreaming && DateTime.UtcNow < deadline)
+                await Task.Delay(20, CancellationToken.None);
 
-            // Stats should show a fresh session with zero messages
-            // (agent is connected so GetStats() is non-null)
+            Assert.False(composer.IsStreaming, "Streaming should have finished after overflow");
+
+            // Assert: session file deleted
+            Assert.False(File.Exists(sessionFile), "Session file should be deleted after overflow reset");
+
+            // Assert: warning appended to StreamingContent
+            Assert.Contains("⚠️", composer.StreamingContent);
+            Assert.Contains("Context limit reached", composer.StreamingContent);
+            Assert.Contains("Session has been reset automatically", composer.StreamingContent);
+
+            // Assert: stats reflect a fresh session (zero messages)
             var stats = composer.GetStats();
             Assert.NotNull(stats);
             Assert.Equal(0, stats!.MessageCount);
@@ -2516,26 +2565,71 @@ public sealed class ComposerToolTests : IDisposable
     [Fact]
     public async Task RunStreaming_ContextOverflow_WarningIsLoggedAtWarningLevel()
     {
-        // Verifies that IsContextOverflowError logs at Warning, not Error, level
-        // We test this by exercising the helper and logger integration
-        var testLogger = new TestLogger<Composer>();
-        var composer = new Composer(
-            "test-model",
-            testLogger,
-            _store,
-            stateDir: Path.GetTempPath());
+        // Verifies that the context-overflow catch block logs at Warning level
+        // with the expected message, and does NOT log at Error level
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            var ct = TestContext.Current.CancellationToken;
 
-        // Connect so session file path is known
-        await composer.ConnectAsync(TestContext.Current.CancellationToken);
+            var testLogger = new TestLogger<Composer>();
+            var composer = new Composer(
+                "test-model",
+                testLogger,
+                _store,
+                stateDir: tmpDir);
 
-        // Verify that the IsContextOverflowError helper correctly identifies the error
-        var overflowEx = new InvalidOperationException(
-            "Request failed: model_max_prompt_tokens_exceeded");
-        Assert.True(Composer.IsContextOverflowError(overflowEx));
+            await composer.ConnectAsync(ct);
 
-        // Verify non-overflow exception is NOT treated as overflow
-        var otherEx = new InvalidOperationException("rate_limit_exceeded");
-        Assert.False(Composer.IsContextOverflowError(otherEx));
+            // Inject a mock IChatClient that throws model_max_prompt_tokens_exceeded
+            var overflowEx = new InvalidOperationException("model_max_prompt_tokens_exceeded");
+            var mockClient = new Mock<IChatClient>();
+            mockClient
+                .Setup(c => c.GetStreamingResponseAsync(
+                    It.IsAny<IEnumerable<ChatMessage>>(),
+                    It.IsAny<ChatOptions?>(),
+                    It.IsAny<CancellationToken>()))
+                .Throws(overflowEx);
+            mockClient
+                .Setup(c => c.GetResponseAsync(
+                    It.IsAny<IEnumerable<ChatMessage>>(),
+                    It.IsAny<ChatOptions?>(),
+                    It.IsAny<CancellationToken>()))
+                .ThrowsAsync(overflowEx);
+
+            InjectFakeChatClient(composer, mockClient.Object);
+
+            // Act: trigger the streaming path
+            composer.SendMessage("hello");
+
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (composer.IsStreaming && DateTime.UtcNow < deadline)
+                await Task.Delay(20, CancellationToken.None);
+
+            Assert.False(composer.IsStreaming, "Streaming should have finished after overflow");
+
+            // Assert: a Warning-level log entry containing the overflow message
+            var warningEntries = testLogger.LogEntries
+                .Where(e => e.LogLevel == LogLevel.Warning)
+                .ToList();
+            Assert.NotEmpty(warningEntries);
+            Assert.Contains(warningEntries,
+                e => e.Message.Contains("context overflow", StringComparison.OrdinalIgnoreCase)
+                  || e.Message.Contains("overflow", StringComparison.OrdinalIgnoreCase));
+
+            // Assert: no Error-level log entry for the overflow (it must NOT be logged at Error)
+            var errorEntries = testLogger.LogEntries
+                .Where(e => e.LogLevel == LogLevel.Error)
+                .ToList();
+            // None of the Error entries should be about context overflow
+            Assert.DoesNotContain(errorEntries,
+                e => e.Message.Contains("model_max_prompt_tokens_exceeded", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
     }
 }
 

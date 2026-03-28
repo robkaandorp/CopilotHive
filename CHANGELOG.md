@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Logs the overflow at Warning level with the original exception for debugging
   - After reset, the user can continue chatting normally (session is fully functional)
   - Non-context-overflow errors continue to be handled by the existing generic catch block
-  - Includes 14 xUnit tests for `IsContextOverflowError` (positive match, negative match, inner exception chain, nested inner exceptions, null handling) and session reset verification
+  - Includes 10 xUnit tests for `IsContextOverflowError` (positive match, negative match, inner exception chain, nested inner exceptions, null handling) and session reset verification using mocked `IChatClient`
 
 ### Added
 - **Repository filter dropdown on Goals page** — the Goals list now includes a repository filter alongside existing status and priority filters:
