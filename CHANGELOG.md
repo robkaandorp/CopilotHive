@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Composer `web_search` context window overflow** — search results now have per-result content truncated to 500 characters, preventing context window overflow:
+  - Added `const int MaxContentChars = 500` constant in `WebSearchAsync` method for maintainability
+  - Each search result content is truncated to 500 characters with "…" suffix when exceeding the limit
+  - A single search call now returns ~3K tokens instead of 30-50K+ tokens (10-20x reduction)
+  - Prevents Brain session from hitting context window limits after just 3-4 user prompts with web search
+  - Updated `WebSearch_WithApiKey_FormatsResults` test to verify short content does NOT have truncation marker
+  - Added `WebSearch_TruncatesLongContent` test verifying 600-character content is truncated to 500 chars + "…"
+
+### Changed
+- **Composer `web_fetch` default `max_lines` reduced** — changed default from 200 to 100 lines:
+  - 200 lines of web content could still be 5-15K tokens; 100 lines is more proportionate
+  - The `max_lines` parameter remains available for the model to request more if needed
+
 ### Added
 - **Composer `list_repositories` tool** — new tool for querying the live hive-config.yaml to list all configured repositories:
   - `ListRepositoriesAsync` method reads from `_hiveConfig` at call time (not a stale snapshot), so it reflects the current state even when `hive-config.yaml` is updated without restart
