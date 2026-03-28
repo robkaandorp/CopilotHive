@@ -2235,6 +2235,170 @@ public sealed class ComposerToolTests : IDisposable
         var prompt = _composer.GetSystemPrompt();
         Assert.Contains("list_repositories", prompt);
     }
+
+    // ── ask_user tool ──
+
+    [Fact]
+    public void BuildComposerTools_IncludesAskUserTool()
+    {
+        var tools = _composer.BuildComposerTools();
+        var names = tools.OfType<AIFunction>().Select(t => t.Name).ToList();
+        Assert.Contains("ask_user", names);
+    }
+
+    [Fact]
+    public void SystemPrompt_MentionsAskUserCapability()
+    {
+        var prompt = _composer.GetSystemPrompt();
+        Assert.Contains("ask_user", prompt);
+    }
+
+    [Fact]
+    public async Task AskUser_MissingQuestion_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.AskUserAsync("", cancellationToken: ct);
+        Assert.Contains("❌", result);
+        Assert.Contains("question is required", result);
+    }
+
+    [Fact]
+    public async Task AskUser_InvalidType_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.AskUserAsync("Do you agree?", type: "InvalidType", cancellationToken: ct);
+        Assert.Contains("❌", result);
+        Assert.Contains("InvalidType", result);
+    }
+
+    [Fact]
+    public async Task AskUser_SingleChoiceWithNoOptions_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.AskUserAsync("Pick one?", type: "SingleChoice", options: null, cancellationToken: ct);
+        Assert.Contains("❌", result);
+        Assert.Contains("Options are required", result);
+    }
+
+    [Fact]
+    public async Task AskUser_YesNo_SetsPendingQuestionAndReturnsOnSubmit()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Start asking (will suspend until answered)
+        var askTask = _composer.AskUserAsync("Confirm?", type: "YesNo", cancellationToken: ct);
+
+        // Wait for PendingQuestion to be populated
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (_composer.PendingQuestion is null && DateTime.UtcNow < deadline)
+            await Task.Delay(10, ct);
+
+        var pending = _composer.PendingQuestion;
+        Assert.NotNull(pending);
+        Assert.Equal("Confirm?", pending!.Text);
+        Assert.Equal(QuestionType.YesNo, pending.Type);
+        Assert.Equal(["Yes", "No"], _composer.PendingQuestion?.Options);
+        Assert.Equal(2, pending.Options.Count);
+        Assert.Contains("Yes", pending.Options);
+        Assert.Contains("No", pending.Options);
+
+        // Submit an answer
+        _composer.SubmitAnswer("Yes — looks good");
+
+        var result = await askTask;
+        Assert.Equal("Yes — looks good", result);
+        Assert.Null(_composer.PendingQuestion);
+    }
+
+    [Fact]
+    public async Task AskUser_CancelQuestion_ReturnsCancellationMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var askTask = _composer.AskUserAsync("Are you sure?", type: "YesNo", cancellationToken: ct);
+
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (_composer.PendingQuestion is null && DateTime.UtcNow < deadline)
+            await Task.Delay(10, ct);
+
+        Assert.NotNull(_composer.PendingQuestion);
+
+        _composer.CancelQuestion();
+
+        var result = await askTask;
+        Assert.Equal("User cancelled the question without answering.", result);
+        Assert.Null(_composer.PendingQuestion);
+    }
+
+    [Fact]
+    public async Task AskUser_SingleChoice_SetsPendingWithOptions()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var askTask = _composer.AskUserAsync("Pick one?", type: "SingleChoice", options: "Alpha, Beta, Gamma", cancellationToken: ct);
+
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (_composer.PendingQuestion is null && DateTime.UtcNow < deadline)
+            await Task.Delay(10, ct);
+
+        var pending = _composer.PendingQuestion;
+        Assert.NotNull(pending);
+        Assert.Equal(QuestionType.SingleChoice, pending!.Type);
+        Assert.Equal(3, pending.Options.Count);
+        Assert.Contains("Alpha", pending.Options);
+
+        _composer.SubmitAnswer("Beta");
+        await askTask;
+    }
+
+    [Fact]
+    public async Task AskUser_MultiChoice_SetsPendingWithOptions()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var askTask = _composer.AskUserAsync("Pick all that apply?", type: "MultiChoice", options: "A, B, C", cancellationToken: ct);
+
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (_composer.PendingQuestion is null && DateTime.UtcNow < deadline)
+            await Task.Delay(10, ct);
+
+        var pending = _composer.PendingQuestion;
+        Assert.NotNull(pending);
+        Assert.Equal(QuestionType.MultiChoice, pending!.Type);
+
+        _composer.SubmitAnswer("A, C");
+        await askTask;
+    }
+
+    [Fact]
+    public void SubmitAnswer_NoPendingQuestion_DoesNotThrow()
+    {
+        Assert.Null(_composer.PendingQuestion);
+        _composer.SubmitAnswer("anything"); // Should not throw
+    }
+
+    [Fact]
+    public void CancelQuestion_NoPendingQuestion_DoesNotThrow()
+    {
+        Assert.Null(_composer.PendingQuestion);
+        _composer.CancelQuestion(); // Should not throw
+    }
+
+    [Fact]
+    public async Task AskUser_OnQuestionAsked_EventIsRaised()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var eventRaised = false;
+        _composer.OnQuestionAsked += () => { eventRaised = true; };
+
+        var askTask = _composer.AskUserAsync("Event test?", type: "YesNo", cancellationToken: ct);
+
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (!eventRaised && DateTime.UtcNow < deadline)
+            await Task.Delay(10, ct);
+
+        Assert.True(eventRaised);
+
+        _composer.SubmitAnswer("Yes");
+        await askTask;
+    }
 }
 
 /// <summary>

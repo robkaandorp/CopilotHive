@@ -55,6 +55,12 @@ public sealed class Composer : IAsyncDisposable
     /// <summary>Raised when streaming state changes (new text, completion, error).</summary>
     public event Action? OnStreamingUpdate;
 
+    /// <summary>The question currently waiting for a user answer, or <c>null</c> if none.</summary>
+    public ComposerQuestion? PendingQuestion { get; private set; }
+
+    /// <summary>Raised when the Composer asks a new question so the UI can re-render.</summary>
+    public event Action? OnQuestionAsked;
+
     private const string DefaultSystemPrompt = """
         You are the Composer — a strategic advisor for the CopilotHive multi-agent system.
         You help the user decompose high-level intent into well-scoped, actionable goals.
@@ -71,6 +77,7 @@ public sealed class Composer : IAsyncDisposable
         - Cancel InProgress or Pending goals (cancel_goal)
         - Inspect repository history (git_log, git_diff, git_show, git_branch, git_blame)
         - List configured repositories (list_repositories)
+        - Ask the user questions for clarification (ask_user)
 
         Guidelines for goal creation:
         - Each goal should be completable in 1-3 iterations (small, focused)
@@ -415,10 +422,79 @@ public sealed class Composer : IAsyncDisposable
 
     // ── Tool implementations ──
 
+    /// <summary>
+    /// Presents a question to the user and suspends the streaming loop until an answer is received.
+    /// Called by the Composer LLM via the <c>ask_user</c> tool.
+    /// </summary>
+    [Description("Ask the user a question and wait for their answer. Suspends the response until the user replies.")]
+    internal async Task<string> AskUserAsync(
+        [Description("The question text to display to the user.")] string question,
+        [Description("Question type: YesNo, SingleChoice, or MultiChoice. Default: YesNo")] string type = "YesNo",
+        [Description("Comma-separated list of options for SingleChoice or MultiChoice questions. Leave empty for YesNo.")] string? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(question))
+            return "❌ question is required.";
+
+        if (!Enum.TryParse<QuestionType>(type, ignoreCase: true, out var questionType))
+            return $"❌ Invalid type '{type}'. Valid types: YesNo, SingleChoice, MultiChoice.";
+
+        var optionList = questionType == QuestionType.YesNo
+            ? ["Yes", "No"]
+            : (options?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList() ?? []);
+
+        if (questionType != QuestionType.YesNo && optionList.Count == 0)
+            return $"❌ Options are required for {questionType} questions.";
+
+        var pending = new ComposerQuestion
+        {
+            Text = question,
+            Type = questionType,
+            Options = optionList,
+        };
+
+        PendingQuestion = pending;
+        OnQuestionAsked?.Invoke();
+
+        _logger.LogInformation("Composer waiting for user answer to question: {Question}", question);
+
+        try
+        {
+            return await pending.Completion.Task.WaitAsync(cancellationToken);
+        }
+        finally
+        {
+            PendingQuestion = null;
+        }
+    }
+
+    /// <summary>
+    /// Submits the user's answer to the currently pending question, resuming the streaming loop.
+    /// </summary>
+    /// <param name="answer">The answer string to return to the Composer LLM.</param>
+    public void SubmitAnswer(string answer)
+    {
+        var pending = PendingQuestion;
+        if (pending is null) return;
+        pending.Completion.TrySetResult(answer);
+    }
+
+    /// <summary>
+    /// Cancels the currently pending question, returning a cancellation message to the LLM.
+    /// </summary>
+    public void CancelQuestion()
+    {
+        var pending = PendingQuestion;
+        if (pending is null) return;
+        pending.Completion.TrySetResult("User cancelled the question without answering.");
+    }
+
     internal List<AITool> BuildComposerTools()
     {
         var tools = new List<AITool>
         {
+            AIFunctionFactory.Create(AskUserAsync, "ask_user",
+                "Ask the user a question and wait for their answer. Use for clarification or confirmation."),
             AIFunctionFactory.Create(CreateGoalAsync, "create_goal",
                 "Create a new goal as Draft. It will not be dispatched until approved."),
             AIFunctionFactory.Create(ApproveGoalAsync, "approve_goal",
