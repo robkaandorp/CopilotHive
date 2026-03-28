@@ -2,6 +2,7 @@
 FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG TARGETARCH
 ARG RID=${TARGETARCH/amd64/x64}
+ARG VERSION=0.1.0-local
 
 WORKDIR /src
 
@@ -20,6 +21,7 @@ RUN dotnet publish src/CopilotHive.Worker/CopilotHive.Worker.csproj \
     -c Release \
     -r linux-${RID} \
     --self-contained \
+    -p:Version=${VERSION} \
     -o /worker/publish
 
 # ── Runtime stage: slim worker with SharpCoder agent engine ───────────────────

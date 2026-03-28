@@ -309,7 +309,10 @@ static async Task<int> RunServerAsync(string[] args)
         .AddInteractiveServerRenderMode();
     var _serverStartTime = DateTime.UtcNow;
     var _checkCount = 0;
-    var _version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown";
+    var _version = Assembly.GetExecutingAssembly()
+        .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+        ?? Assembly.GetExecutingAssembly().GetName().Version?.ToString()
+        ?? "unknown";
     app.MapGet("/health", async (SqliteGoalStore goalStore, WorkerPool workerPool) =>
     {
         var count = Interlocked.Increment(ref _checkCount);
