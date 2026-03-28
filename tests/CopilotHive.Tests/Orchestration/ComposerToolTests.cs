@@ -763,6 +763,281 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("not found", result);
     }
 
+    // ── get_goal — iteration detail format ──
+
+    [Fact]
+    public async Task GetGoal_WithIterations_ShowsPerPhaseDetail()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("iter-detail", "Goal with iterations");
+
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            ReviewVerdict = "reject",
+            TestCounts = new TestCounts { Passed = 840, Total = 840, Failed = 0 },
+            Phases =
+            [
+                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 45.2 },
+                new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 120.1 },
+                new PhaseResult { Name = "Review", Result = "fail", DurationSeconds = 30.5 },
+            ],
+        };
+        await _store.AddIterationAsync("iter-detail", summary, ct);
+
+        var result = await _composer.GetGoalAsync("iter-detail");
+
+        // Header uses new per-iteration format
+        Assert.Contains("### Iteration 1 (review: reject)", result);
+        // Per-phase lines with duration
+        Assert.Contains("- Coding: pass (45.2s)", result);
+        Assert.Contains("- Testing: pass (120.1s) — 840/840", result);
+        Assert.Contains("- Review: fail (30.5s)", result);
+        // Old summary format must not be present
+        Assert.DoesNotContain("**Iteration 1:**", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_WithIterations_NoReviewVerdict_OmitsSuffix()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("iter-no-review", "Goal without review");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            ReviewVerdict = null,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 10.0 }],
+        };
+        await _store.AddIterationAsync("iter-no-review", summary, ct);
+
+        var result = await _composer.GetGoalAsync("iter-no-review");
+
+        Assert.Contains("### Iteration 1\n", result);
+        Assert.DoesNotContain("(review:", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_TestingPhaseWithNoTestCounts_OmitsTestSuffix()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("iter-no-counts", "Goal without test counts");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            TestCounts = null,
+            Phases = [new PhaseResult { Name = "Testing", Result = "fail", DurationSeconds = 5.0 }],
+        };
+        await _store.AddIterationAsync("iter-no-counts", summary, ct);
+
+        var result = await _composer.GetGoalAsync("iter-no-counts");
+
+        // Testing line without test counts suffix
+        Assert.Contains("- Testing: fail (5.0s)\n", result);
+        Assert.DoesNotContain(" — ", result);
+    }
+
+    // ── get_phase_output ──
+
+    [Fact]
+    public async Task GetPhaseOutput_ReturnsWorkerOutputFromPhaseResult()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("phase-out", "Goal for phase output");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 10.0, WorkerOutput = "coder log line 1\ncoder log line 2" },
+            ],
+        };
+        await _store.AddIterationAsync("phase-out", summary, ct);
+
+        var result = await _composer.GetPhaseOutputAsync("phase-out", 1, "Coding");
+
+        Assert.Contains("coder log line 1", result);
+        Assert.Contains("coder log line 2", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_CaseInsensitivePhase_Matches()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("phase-case", "Goal for case test");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 5.0, WorkerOutput = "test output" }],
+        };
+        await _store.AddIterationAsync("phase-case", summary, ct);
+
+        var result = await _composer.GetPhaseOutputAsync("phase-case", 1, "testing");
+
+        Assert.Contains("test output", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_FallsBackToPhaseOutputs_WhenWorkerOutputNull()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("phase-fallback", "Goal for fallback test");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 10.0, WorkerOutput = null }],
+            PhaseOutputs = new Dictionary<string, string> { ["coder-1"] = "fallback coder output" },
+        };
+        await _store.AddIterationAsync("phase-fallback", summary, ct);
+
+        var result = await _composer.GetPhaseOutputAsync("phase-fallback", 1, "Coding");
+
+        Assert.Contains("fallback coder output", result);
+    }
+
+    [Theory]
+    [InlineData("Coding", "coder")]
+    [InlineData("Testing", "tester")]
+    [InlineData("Review", "reviewer")]
+    [InlineData("DocWriting", "docwriter")]
+    [InlineData("Improve", "improver")]
+    [InlineData("Planning", "planning")]
+    public async Task GetPhaseOutput_RoleKeyMapping_FallsBackCorrectly(string phaseName, string rolePrefix)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goalId = $"phase-map-{phaseName.ToLower()}";
+
+        await _composer.CreateGoalAsync(goalId, "Role key mapping test");
+        var summary = new IterationSummary
+        {
+            Iteration = 2,
+            Phases = [new PhaseResult { Name = phaseName, Result = "pass", DurationSeconds = 1.0, WorkerOutput = null }],
+            PhaseOutputs = new Dictionary<string, string> { [$"{rolePrefix}-2"] = $"output for {phaseName}" },
+        };
+        await _store.AddIterationAsync(goalId, summary, ct);
+
+        var result = await _composer.GetPhaseOutputAsync(goalId, 2, phaseName);
+
+        Assert.Contains($"output for {phaseName}", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_TruncatesToMaxLines()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("phase-trunc", "Truncation test");
+        var longOutput = string.Join('\n', Enumerable.Range(1, 300).Select(i => $"Line {i}"));
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 1.0, WorkerOutput = longOutput }],
+        };
+        await _store.AddIterationAsync("phase-trunc", summary, ct);
+
+        var result = await _composer.GetPhaseOutputAsync("phase-trunc", 1, "Coding", max_lines: 10);
+
+        Assert.Contains("truncated", result);
+        Assert.Contains("300 lines total", result);
+        Assert.DoesNotContain("Line 300", result);
+        Assert.Contains("Line 1", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_GoalNotFound_ReturnsMessage()
+    {
+        var result = await _composer.GetPhaseOutputAsync("nonexistent-goal", 1, "Coding");
+
+        Assert.Equal("Goal not found", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_IterationNotFound_ReturnsMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("phase-no-iter", "No iterations");
+
+        var result = await _composer.GetPhaseOutputAsync("phase-no-iter", 5, "Coding");
+
+        Assert.Equal("Iteration 5 not found", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_PhaseNotFound_ReturnsMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("phase-no-phase", "Has iteration but no such phase");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 1.0 }],
+        };
+        await _store.AddIterationAsync("phase-no-phase", summary, ct);
+
+        var result = await _composer.GetPhaseOutputAsync("phase-no-phase", 1, "Review");
+
+        Assert.Equal("Phase 'Review' not found in iteration 1", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_NoOutputRecorded_ReturnsMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("phase-no-output", "No output recorded");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 1.0, WorkerOutput = null }],
+            // PhaseOutputs is empty — no fallback
+        };
+        await _store.AddIterationAsync("phase-no-output", summary, ct);
+
+        var result = await _composer.GetPhaseOutputAsync("phase-no-output", 1, "Coding");
+
+        Assert.Equal("No output recorded for phase Coding in iteration 1", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_InvalidIteration_ReturnsValidationError()
+    {
+        var result = await _composer.GetPhaseOutputAsync("some-goal", 0, "Coding");
+
+        Assert.Contains("ERROR", result);
+        Assert.Contains("iteration must be >= 1", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_EmptyId_ReturnsValidationError()
+    {
+        var result = await _composer.GetPhaseOutputAsync("", 1, "Coding");
+
+        Assert.Contains("ERROR", result);
+        Assert.Contains("id is required", result);
+    }
+
+    [Fact]
+    public void BuildComposerTools_IncludesGetPhaseOutput()
+    {
+        var tools = _composer.BuildComposerTools();
+        var toolNames = tools.OfType<AIFunction>().Select(t => t.Name).ToList();
+        Assert.Contains("get_phase_output", toolNames);
+    }
+
+    [Fact]
+    public void SystemPrompt_IncludesDrillIntoPhaseOutput()
+    {
+        Assert.Contains("get_phase_output", _composer.GetSystemPrompt());
+        Assert.Contains("Drill into phase output", _composer.GetSystemPrompt());
+    }
+
     // ── git tools — no repo manager configured ──
 
     [Fact]

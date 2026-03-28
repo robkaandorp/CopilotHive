@@ -62,6 +62,7 @@ public sealed class Composer : IAsyncDisposable
         - Read the codebase to understand current state (read_file, glob, grep)
         - Search existing goals to avoid duplication (search_goals)
         - Browse goal history and status (list_goals, get_goal)
+        - Drill into phase output (get_phase_output)
         - Create goals as drafts for user review (create_goal)
         - Approve drafts to queue them for execution (approve_goal)
         - Update existing goals (update_goal)
@@ -414,6 +415,8 @@ public sealed class Composer : IAsyncDisposable
                 "Update a field on an existing goal."),
             AIFunctionFactory.Create(GetGoalAsync, "get_goal",
                 "Get full details for a goal including iteration history."),
+            AIFunctionFactory.Create(GetPhaseOutputAsync, "get_phase_output",
+                "Get the raw worker output for a specific phase within an iteration."),
             AIFunctionFactory.Create(ListGoalsAsync, "list_goals",
                 "List goals, optionally filtered by status."),
             AIFunctionFactory.Create(SearchGoalsAsync, "search_goals",
@@ -675,9 +678,16 @@ public sealed class Composer : IAsyncDisposable
             sb.AppendLine($"\n### Iterations ({iterations.Count})");
             foreach (var iter in iterations)
             {
-                sb.AppendLine($"- **Iteration {iter.Iteration}:** {iter.Phases.Count} phases" +
-                    (iter.TestCounts is not null ? $", {iter.TestCounts.Passed}/{iter.TestCounts.Total} tests" : "") +
-                    (iter.ReviewVerdict is not null ? $", review: {iter.ReviewVerdict}" : ""));
+                var reviewSuffix = iter.ReviewVerdict is not null ? $" (review: {iter.ReviewVerdict})" : "";
+                sb.AppendLine($"\n### Iteration {iter.Iteration}{reviewSuffix}");
+                foreach (var phase in iter.Phases)
+                {
+                    var durationStr = $"{phase.DurationSeconds:F1}s";
+                    var line = $"- {phase.Name}: {phase.Result} ({durationStr})";
+                    if (phase.Name.Equals("Testing", StringComparison.OrdinalIgnoreCase) && iter.TestCounts is not null)
+                        line += $" — {iter.TestCounts.Passed}/{iter.TestCounts.Total}";
+                    sb.AppendLine(line);
+                }
             }
         }
 
@@ -689,6 +699,62 @@ public sealed class Composer : IAsyncDisposable
         }
 
         return sb.ToString();
+    }
+
+    [Description("Get the raw worker output for a specific phase within an iteration.")]
+    internal async Task<string> GetPhaseOutputAsync(
+        [Description("Goal ID")] string id,
+        [Description("Iteration number (1-based)")] int iteration,
+        [Description("Phase name: Coding, Testing, Review, DocWriting, Improve, or Planning")] string phase,
+        [Description("Maximum lines to return. Default: 200")] int max_lines = 200)
+    {
+        var error = Shared.ToolValidation.Check(
+            (!string.IsNullOrWhiteSpace(id), "id is required"),
+            (iteration >= 1, "iteration must be >= 1"),
+            (!string.IsNullOrWhiteSpace(phase), "phase is required"));
+        if (error is not null) return error;
+
+        var goal = await _goalStore.GetGoalAsync(id);
+        if (goal is null)
+            return "Goal not found";
+
+        var iterations = await _goalStore.GetIterationsAsync(id);
+        var iterSummary = iterations.FirstOrDefault(i => i.Iteration == iteration);
+        if (iterSummary is null)
+            return $"Iteration {iteration} not found";
+
+        var phaseResult = iterSummary.Phases
+            .FirstOrDefault(p => p.Name.Equals(phase, StringComparison.OrdinalIgnoreCase));
+        if (phaseResult is null)
+            return $"Phase '{phase}' not found in iteration {iteration}";
+
+        string? output = phaseResult.WorkerOutput;
+
+        if (string.IsNullOrEmpty(output))
+        {
+            // Fall back to PhaseOutputs dictionary using role key mapping
+            var roleKey = phase.ToLowerInvariant() switch
+            {
+                "coding" => $"coder-{iteration}",
+                "testing" => $"tester-{iteration}",
+                "review" => $"reviewer-{iteration}",
+                "docwriting" => $"docwriter-{iteration}",
+                "improve" => $"improver-{iteration}",
+                "planning" => $"planning-{iteration}",
+                _ => $"{phase.ToLowerInvariant()}-{iteration}",
+            };
+            iterSummary.PhaseOutputs.TryGetValue(roleKey, out output);
+        }
+
+        if (string.IsNullOrEmpty(output))
+            return $"No output recorded for phase {phase} in iteration {iteration}";
+
+        var lines = output.Split('\n');
+        if (lines.Length <= max_lines)
+            return output;
+
+        var truncated = string.Join('\n', lines.Take(max_lines));
+        return truncated + $"\n... (truncated, {lines.Length} lines total)";
     }
 
     [Description("List goals, optionally filtered by status.")]
