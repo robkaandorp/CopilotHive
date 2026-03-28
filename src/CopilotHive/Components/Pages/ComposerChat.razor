@@ -59,6 +59,8 @@ else
                                         @onclick="() => SubmitYesNo(true, pq)">Yes</button>
                                 <button class="chat-action-btn chat-question-no"
                                         @onclick="() => SubmitYesNo(false, pq)">No</button>
+                                <button class="chat-action-btn"
+                                        @onclick="() => CancelQuestion(pq)">Cancel</button>
                             </div>
                             <textarea class="chat-input chat-question-feedback"
                                       @bind="_questionFeedback"

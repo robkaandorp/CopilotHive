@@ -439,9 +439,9 @@ public sealed class Composer : IAsyncDisposable
         if (!Enum.TryParse<QuestionType>(type, ignoreCase: true, out var questionType))
             return $"❌ Invalid type '{type}'. Valid types: YesNo, SingleChoice, MultiChoice.";
 
-        var optionList = string.IsNullOrWhiteSpace(options)
-            ? new List<string>()
-            : options.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+        var optionList = questionType == QuestionType.YesNo
+            ? ["Yes", "No"]
+            : (options?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList() ?? []);
 
         if (questionType != QuestionType.YesNo && optionList.Count == 0)
             return $"❌ Options are required for {questionType} questions.";
