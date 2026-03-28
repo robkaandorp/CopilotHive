@@ -585,6 +585,44 @@ public sealed class ComposerToolTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task DeleteGoal_FailedGoal_BestEffortCleanup_StillSucceedsWhenGitFails()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            // Create a failed goal with repositories
+            await _composer.CreateGoalAsync("failed-cleanup", "Will fail", repositories: "repo-a");
+            var goal = (await _store.GetGoalAsync("failed-cleanup", ct))!;
+            goal.Status = GoalStatus.Failed;
+            await _store.UpdateGoalAsync(goal, ct);
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            // DeleteRemoteBranchAsync will log warnings (no clones exist) but won't throw
+            // Goal deletion should still succeed - this is the "best-effort" behavior
+            var result = await composer.DeleteGoalAsync("failed-cleanup");
+
+            // Verify the goal was deleted despite branch cleanup issues
+            Assert.Contains("✅", result);
+            Assert.Contains("deleted", result);
+            var deletedGoal = await _store.GetGoalAsync("failed-cleanup", ct);
+            Assert.Null(deletedGoal);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
     // ── cancel_goal ──
 
     [Fact]

@@ -458,6 +458,57 @@ public class GoalsApiEndpointTests
         Assert.Contains("Only Draft or Failed goals can be deleted", body);
     }
 
+    [Fact]
+    public async Task DeleteGoal_FailedGoal_Returns204NoContent()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        // Set goal to Failed status
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+            Assert.NotNull(goal);
+            goal!.Status = GoalStatus.Failed;
+            await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
+        }
+
+        var response = await _client.DeleteAsync($"/api/goals/{id}",
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task DeleteGoal_FailedGoal_IsRemovedFromStore()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        // Set goal to Failed status
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+            Assert.NotNull(goal);
+            goal!.Status = GoalStatus.Failed;
+            await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
+        }
+
+        var response = await _client.DeleteAsync($"/api/goals/{id}",
+            TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        // Verify goal is actually deleted from store
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+            Assert.Null(goal);
+        }
+    }
+
     // ── GET /api/goals/search ─────────────────────────────────────────────
 
     [Fact]
