@@ -265,6 +265,26 @@ static async Task<int> RunServerAsync(string[] args)
         }
     }
 
+    // Eager clone all configured repos at startup
+    var repoManager = app.Services.GetService<IBrainRepoManager>();
+    var hiveConfig = app.Services.GetService<HiveConfigFile>();
+    if (repoManager is not null && hiveConfig is not null)
+    {
+        foreach (var repo in hiveConfig.Repositories)
+        {
+            try
+            {
+                var url = GoalDispatcher.InjectTokenIntoUrl(repo.Url);
+                await repoManager.EnsureCloneAsync(repo.Name, url, repo.DefaultBranch);
+                logger.LogInformation("Cloned/updated repo '{RepoName}' at startup", repo.Name);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Failed to clone repo '{RepoName}' at startup", repo.Name);
+            }
+        }
+    }
+
     // Bootstrap: import goals from YAML file into SQLite (one-time migration)
     if (!string.IsNullOrEmpty(goalsFile) && File.Exists(goalsFile))
     {
