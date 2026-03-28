@@ -1329,6 +1329,37 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("Test Page", result);
         Assert.Contains("https://example.com", result);
         Assert.Contains("Some content here.", result);
+        // Short content (under 500 chars) should NOT have truncation marker
+        Assert.DoesNotContain("…", result);
+    }
+
+    [Fact]
+    public async Task WebSearch_TruncatesLongContent()
+    {
+        // Create content longer than 500 characters
+        var longContent = new string('A', 600); // 600 chars, exceeds the 500 char limit
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK,
+            $$"""{"results":[{"title":"Long Result","url":"https://example.com/long","content":"{{longContent}}"}]}""");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebSearchAsync("test query", 3);
+
+        // Verify truncation marker is present
+        Assert.Contains("…", result);
+        // Verify the original full content does NOT appear (it was truncated)
+        Assert.DoesNotContain(new string('A', 600), result);
+        // Verify truncated content is present (500 chars + "…")
+        Assert.Contains(new string('A', 500) + "…", result);
     }
 
     [Fact]
