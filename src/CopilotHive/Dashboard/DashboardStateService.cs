@@ -395,6 +395,7 @@ public sealed class DashboardStateService : IDisposable
             Conversation = pipeline?.Conversation.ToList() ?? [],
             MergeCommitHash = pipeline?.MergeCommitHash ?? goal.MergeCommitHash,
             RepositoryUrl = ResolveRepositoryUrl(goal),
+            RepositoryNames = goal.RepositoryNames,
         };
     }
 
@@ -682,6 +683,8 @@ public sealed class GoalDetailInfo
     public string? MergeCommitHash { get; init; }
     /// <summary>URL of the primary repository for this goal (with .git suffix removed), or <c>null</c> if not resolved.</summary>
     public string? RepositoryUrl { get; init; }
+    /// <summary>Repository names associated with this goal.</summary>
+    public List<string> RepositoryNames { get; init; } = [];
 }
 
 /// <summary>Detail for a single iteration in the goal timeline.</summary>
