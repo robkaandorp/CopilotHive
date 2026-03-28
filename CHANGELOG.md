@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Composer `get_phase_output` tool** — new tool for drilling into worker output from specific phases of a goal iteration:
+  - `GetPhaseOutputAsync` method takes `goalId`, `iteration` (1-based), `phase` name, and optional `max_lines` (default 200)
+  - Phase name matching is case-insensitive (Coding, Testing, Review, DocWriting, Improve, Planning)
+  - Returns worker output from `PhaseResult.WorkerOutput` if available, falls back to `IterationSummary.PhaseOutputs` dictionary using role key mapping (e.g., `"Coding"` → `"coder-{iteration}"`)
+  - Output truncated to `max_lines` with notice (`"... (truncated, N lines total)"`)
+  - Clear error messages: "Goal not found", "Iteration N not found", "Phase 'X' not found in iteration N", "No output recorded for phase X in iteration N"
+  - Registered as `get_phase_output` in `BuildComposerTools()` with description "Get the raw worker output for a specific phase within an iteration."
+  - System prompt updated to mention new capability: "Drill into phase output (get_phase_output)"
+  - Includes 16 xUnit tests covering: happy path, case-insensitive matching, fallback to PhaseOutputs, role key mapping for all 6 phases, truncation, and error cases (goal not found, iteration not found, phase not found, no output recorded, invalid inputs)
+
+### Changed
+- **Composer `get_goal` enriched iteration display** — iteration details now show per-phase breakdown instead of just a phase count:
+  - Old format: `- **Iteration 1:** 4 phases, 840/840 tests, review: reject`
+  - New format shows each phase on its own line with name, result, duration, and test counts for Testing phases:
+    ```
+    ### Iteration 1 (review: reject)
+    - Coding: pass (45.2s)
+    - Testing: pass (120.1s) — 840/840
+    - Review: fail (30.5s)
+    ```
+  - Phase durations formatted to 1 decimal place
+  - Testing phase includes test counts inline when available (e.g., "840/840")
+  - Review verdict shown in header suffix when available
+  - Includes 4 xUnit tests covering: per-phase detail display, review verdict suffix handling, no-review-verdict case, Testing phase without test counts
+
+### Added
 - **Remote branch cleanup on goal deletion** — when a Failed goal is deleted, its remote feature branches are automatically cleaned up from all associated repositories:
   - `BrainRepoManager.DeleteRemoteBranchAsync(repoName, branchName)` — deletes the remote branch and local tracking branch from the specified repository clone; best-effort (logs warning on failure, doesn't throw)
   - `Composer.DeleteGoalAsync` — after successful store deletion, calls `DeleteRemoteBranchAsync` for each repository in `goal.RepositoryNames` when `goal.Status == GoalStatus.Failed`
