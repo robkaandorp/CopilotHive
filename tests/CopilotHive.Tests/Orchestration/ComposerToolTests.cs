@@ -4,7 +4,10 @@ using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
+using System.Net;
 
 namespace CopilotHive.Tests.Orchestration;
 
@@ -869,7 +872,596 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("cannot start with '-'", result);
     }
 
-    // ── git tools — real git repo ──
+    // ── web_search — no API key ──
+
+    [Fact]
+    public async Task WebSearch_NoApiKey_ReturnsError()
+    {
+        // Composer created without ollamaApiKey — web_search should return an error
+        var result = await _composer.WebSearchAsync("test query");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("OLLAMA_API_KEY", result);
+    }
+
+    [Fact]
+    public async Task WebFetch_NoApiKey_ReturnsError()
+    {
+        // Composer created without ollamaApiKey — web_fetch should return an error
+        var result = await _composer.WebFetchAsync("https://example.com");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("OLLAMA_API_KEY", result);
+    }
+
+    // ── web_search — with API key (mocked HTTP) ──
+
+    [Fact]
+    public async Task WebSearch_WithApiKey_FormatsResults()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK,
+            """{"results":[{"title":"Test Page","url":"https://example.com","content":"Some content here."}]}""");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebSearchAsync("test query", 3);
+
+        Assert.Contains("Test Page", result);
+        Assert.Contains("https://example.com", result);
+        Assert.Contains("Some content here.", result);
+    }
+
+    [Fact]
+    public async Task WebSearch_WithApiKey_SendsAuthorizationHeader()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        HttpRequestMessage? capturedRequest = null;
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK,
+            """{"results":[]}""",
+            req => { capturedRequest = req; });
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "my-secret-key");
+
+        await composer.WebSearchAsync("something");
+
+        Assert.NotNull(capturedRequest);
+        Assert.Equal("Bearer", capturedRequest!.Headers.Authorization?.Scheme);
+        Assert.Equal("my-secret-key", capturedRequest.Headers.Authorization?.Parameter);
+    }
+
+    [Fact]
+    public async Task WebSearch_HttpError_ReturnsError()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.InternalServerError, "");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebSearchAsync("test");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("500", result);
+    }
+
+    [Fact]
+    public async Task WebSearch_ClampsMaxResults()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        string? capturedBody = null;
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK,
+            """{"results":[]}""",
+            null,
+            async req => { capturedBody = await req.Content!.ReadAsStringAsync(); });
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        // max_results=50 should be clamped to 10
+        await composer.WebSearchAsync("test", 50);
+
+        Assert.NotNull(capturedBody);
+        Assert.Contains("\"max_results\":10", capturedBody);
+    }
+
+    // ── web_fetch — with API key (mocked HTTP) ──
+
+    [Fact]
+    public async Task WebFetch_WithApiKey_FormatsResponse()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK,
+            """{"title":"Example Domain","content":"This domain is for use in illustrative examples.","links":["https://www.iana.org/domains/example"]}""");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebFetchAsync("https://example.com");
+
+        Assert.Contains("# Example Domain", result);
+        Assert.Contains("This domain is for use in illustrative examples.", result);
+        Assert.Contains("## Links", result);
+        Assert.Contains("https://www.iana.org/domains/example", result);
+    }
+
+    [Fact]
+    public async Task WebFetch_TruncatesLongContent()
+    {
+        // Build a response with many lines
+        var manyLines = string.Join("\n", Enumerable.Range(1, 300).Select(i => $"Line {i}"));
+        var json = System.Text.Json.JsonSerializer.Serialize(new { title = "Long Page", content = manyLines, links = Array.Empty<string>() });
+
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK, json);
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebFetchAsync("https://example.com", max_lines: 10);
+
+        Assert.Contains("truncated", result);
+        Assert.DoesNotContain("Line 300", result);
+    }
+
+    [Fact]
+    public async Task WebFetch_HttpError_ReturnsError()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.NotFound, "");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebFetchAsync("https://example.com");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("404", result);
+    }
+
+    // ── web_search — additional edge cases ──
+
+    [Fact]
+    public async Task WebSearch_EmptyQuery_ReturnsError()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK, """{"results":[]}""");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebSearchAsync("");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("query is required", result);
+    }
+
+    [Fact]
+    public async Task WebSearch_WhitespaceQuery_ReturnsError()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK, """{"results":[]}""");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebSearchAsync("   ");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("query is required", result);
+    }
+
+    [Fact]
+    public async Task WebSearch_MultipleResults_FormatsAll()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK,
+            """{"results":[{"title":"First","url":"https://a.com","content":"Content A"},{"title":"Second","url":"https://b.com","content":"Content B"},{"title":"Third","url":"https://c.com","content":"Content C"}]}""");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebSearchAsync("test", 10);
+
+        Assert.Contains("### First", result);
+        Assert.Contains("https://a.com", result);
+        Assert.Contains("Content A", result);
+        Assert.Contains("### Second", result);
+        Assert.Contains("https://b.com", result);
+        Assert.Contains("Content B", result);
+        Assert.Contains("### Third", result);
+        Assert.Contains("https://c.com", result);
+        Assert.Contains("Content C", result);
+    }
+
+    [Fact]
+    public async Task WebSearch_EmptyResults_ReturnsNoResults()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK, """{"results":[]}""");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebSearchAsync("nonexistent");
+
+        Assert.Contains("No results found", result);
+    }
+
+    [Fact]
+    public async Task WebSearch_MissingFieldsInResults_HandlesGracefully()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        // Some results missing title, url, or content fields
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK,
+            """{"results":[{"title":"Has Title","url":"https://example.com"},{"url":"https://missing-title.com","content":"No title"}]}""");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebSearchAsync("test");
+
+        // Should not throw and should still format available fields
+        Assert.Contains("https://example.com", result);
+        Assert.Contains("https://missing-title.com", result);
+    }
+
+    [Fact]
+    public async Task WebSearch_NetworkError_ReturnsErrorMessage()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(
+            req => throw new HttpRequestException("Network error"));
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebSearchAsync("test");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Network error", result);
+    }
+
+    // ── web_fetch — additional edge cases ──
+
+    [Fact]
+    public async Task WebFetch_EmptyUrl_ReturnsError()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK, """{"title":"","content":""}""");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebFetchAsync("");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("url is required", result);
+    }
+
+    [Fact]
+    public async Task WebFetch_WhitespaceUrl_ReturnsError()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK, """{"title":"","content":""}""");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebFetchAsync("   ");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("url is required", result);
+    }
+
+    [Fact]
+    public async Task WebFetch_WithApiKey_SendsAuthorizationHeader()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        HttpRequestMessage? capturedRequest = null;
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK,
+            """{"title":"Test","content":"Content"}""",
+            req => { capturedRequest = req; });
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "my-fetch-key");
+
+        await composer.WebFetchAsync("https://example.com");
+
+        Assert.NotNull(capturedRequest);
+        Assert.Equal("Bearer", capturedRequest!.Headers.Authorization?.Scheme);
+        Assert.Equal("my-fetch-key", capturedRequest.Headers.Authorization?.Parameter);
+    }
+
+    [Fact]
+    public async Task WebFetch_NoLinks_OmitsLinksSection()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK,
+            """{"title":"Simple Page","content":"Just content","links":[]}""");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebFetchAsync("https://example.com");
+
+        Assert.Contains("# Simple Page", result);
+        Assert.Contains("Just content", result);
+        Assert.DoesNotContain("## Links", result);
+    }
+
+    [Fact]
+    public async Task WebFetch_MissingLinksField_OmitsLinksSection()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        // Response without "links" field at all
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK,
+            """{"title":"No Links","content":"Content without links"}""");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebFetchAsync("https://example.com");
+
+        Assert.Contains("# No Links", result);
+        Assert.DoesNotContain("## Links", result);
+    }
+
+    [Fact]
+    public async Task WebFetch_NetworkError_ReturnsErrorMessage()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(
+            req => throw new HttpRequestException("Connection refused"));
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebFetchAsync("https://example.com");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Connection refused", result);
+    }
+
+    [Fact]
+    public async Task WebFetch_JsonError_ReturnsErrorMessage()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK, "invalid json");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebFetchAsync("https://example.com");
+
+        Assert.Contains("❌", result);
+    }
+
+    // ── system prompt ──
+
+    [Fact]
+    public void SystemPrompt_WithApiKey_IncludesWebCapabilities()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        Assert.Contains("web_search", composer.GetSystemPrompt());
+        Assert.Contains("web_fetch", composer.GetSystemPrompt());
+    }
+
+    [Fact]
+    public void SystemPrompt_WithoutApiKey_DoesNotIncludeWebCapabilities()
+    {
+        // _composer is created without ollamaApiKey in the test constructor
+        Assert.DoesNotContain("web_search", _composer.GetSystemPrompt());
+        Assert.DoesNotContain("web_fetch", _composer.GetSystemPrompt());
+    }
+
+    [Fact]
+    public void BuildComposerTools_WithoutApiKey_DoesNotIncludeWebTools()
+    {
+        var composer = new Composer("model", NullLogger<Composer>.Instance, _store, ollamaApiKey: null);
+        var tools = composer.BuildComposerTools();
+        var toolNames = tools.OfType<AIFunction>().Select(t => t.Name).ToList();
+        Assert.DoesNotContain("web_search", toolNames);
+        Assert.DoesNotContain("web_fetch", toolNames);
+    }
+
+    [Fact]
+    public async Task WebSearch_Timeout_ReturnsErrorMessage()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(
+            req => throw new TaskCanceledException("The request timed out."));
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebSearchAsync("test query");
+
+        Assert.Contains("❌", result);
+        // Should return an error message, not throw an exception
+        Assert.Contains("timed out", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task WebFetch_Timeout_ReturnsErrorMessage()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(
+            req => throw new TaskCanceledException("The request timed out."));
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebFetchAsync("https://example.com");
+
+        Assert.Contains("❌", result);
+        // Should return an error message, not throw an exception
+        Assert.Contains("timed out", result, StringComparison.OrdinalIgnoreCase);
+    }
 
     private static string InitTempGitRepo(string basePath)
     {
@@ -1083,3 +1675,47 @@ internal sealed class FakeGoalSource : IGoalSource, IGoalStore
         Task.CompletedTask;
 }
 
+/// <summary>
+/// Simple <see cref="HttpMessageHandler"/> that returns a fixed response for unit tests.
+/// </summary>
+internal sealed class FakeHttpMessageHandler : HttpMessageHandler
+{
+    private readonly HttpStatusCode _statusCode;
+    private readonly string? _body;
+    private readonly Action<HttpRequestMessage>? _onRequest;
+    private readonly Func<HttpRequestMessage, Task>? _onRequestAsync;
+    private readonly Func<HttpRequestMessage, Exception>? _throwException;
+
+    public FakeHttpMessageHandler(
+        HttpStatusCode statusCode,
+        string body,
+        Action<HttpRequestMessage>? onRequest = null,
+        Func<HttpRequestMessage, Task>? onRequestAsync = null)
+    {
+        _statusCode = statusCode;
+        _body = body;
+        _onRequest = onRequest;
+        _onRequestAsync = onRequestAsync;
+    }
+
+    public FakeHttpMessageHandler(Func<HttpRequestMessage, Exception> throwException)
+    {
+        _throwException = throwException;
+    }
+
+    protected override async Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        if (_throwException is not null)
+            throw _throwException(request);
+
+        _onRequest?.Invoke(request);
+        if (_onRequestAsync is not null)
+            await _onRequestAsync(request);
+
+        return new HttpResponseMessage(_statusCode)
+        {
+            Content = new StringContent(_body ?? "", System.Text.Encoding.UTF8, "application/json"),
+        };
+    }
+}

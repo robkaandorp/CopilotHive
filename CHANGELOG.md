@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Composer web research tools** — `web_search` and `web_fetch` tools are now available in the Composer for researching information on the web via Ollama's web search and fetch APIs:
+  - `web_search` — searches the web for information, returns titles, URLs, and content snippets; supports `max_results` parameter (clamped to 1-10, default 5)
+  - `web_fetch` — fetches a web page and returns its title, content, and extracted links; supports `max_lines` parameter for content truncation (default 200)
+  - Both tools require `OLLAMA_API_KEY` environment variable; return clear error messages when not configured ("❌ Web search is not available — no OLLAMA_API_KEY configured.")
+  - Tools are conditionally registered — only appear in LLM tool list when API key is present
+  - System prompt dynamically mentions web capabilities only when configured
+  - Uses named HTTP client `"ollama-web"` with 15-second timeout via `IHttpClientFactory`
+  - Authorization via `Authorization: Bearer {OLLAMA_API_KEY}` header
+  - Graceful error handling for HTTP errors, network failures, timeouts, and invalid JSON responses
+  - Includes 24 xUnit tests covering: search formatting, fetch formatting, fetch truncation, missing API key errors, HTTP error handling, network failure handling, authorization header verification
+
 ### Changed
 - **Multi-architecture Docker support** — Docker images now support both `amd64` and `arm64` architectures:
   - Both `docker/orchestrator/Dockerfile` and `docker/worker/Dockerfile` use `ARG TARGETARCH` to receive the target platform from Docker BuildKit
