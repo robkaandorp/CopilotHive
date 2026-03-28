@@ -80,6 +80,7 @@ static async Task<int> RunServerAsync(string[] args)
     var brainModel = Environment.GetEnvironmentVariable("BRAIN_MODEL");
     var brainContextWindowEnv = Environment.GetEnvironmentVariable("BRAIN_CONTEXT_WINDOW");
     var brainMaxStepsEnv = Environment.GetEnvironmentVariable("BRAIN_MAX_STEPS");
+    var ollamaApiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
     if (!string.IsNullOrEmpty(brainModel))
     {
         builder.Services.AddSingleton<IDistributedBrain>(sp =>
@@ -130,7 +131,9 @@ static async Task<int> RunServerAsync(string[] args)
             maxCtx, maxSteps,
             sp.GetService<BrainRepoManager>(),
             stateDir,
-            sp.GetRequiredService<GoalDispatcher>());
+            sp.GetRequiredService<GoalDispatcher>(),
+            !string.IsNullOrEmpty(ollamaApiKey) ? sp.GetRequiredService<IHttpClientFactory>() : null,
+            ollamaApiKey);
     });
 
     // Dashboard: log capture (registered early so logger provider can reference it)
@@ -140,6 +143,13 @@ static async Task<int> RunServerAsync(string[] args)
     builder.Logging.AddProvider(new DashboardLoggerProvider(dashboardLogSink));
 
     builder.Services.AddHostedService<StaleWorkerCleanupService>();
+
+    // HTTP client for Ollama web research tools
+    builder.Services.AddHttpClient("ollama-web", client =>
+    {
+        client.BaseAddress = new Uri("https://ollama.com/");
+        client.Timeout = TimeSpan.FromSeconds(15);
+    });
 
     // Dashboard: Blazor Server + real-time state aggregation
     builder.Services.AddSingleton<DashboardStateService>();

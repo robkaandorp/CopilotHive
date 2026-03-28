@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Net.Http.Json;
 using System.Text.Json;
 using CopilotHive.Configuration;
 using CopilotHive.Git;
@@ -26,11 +27,13 @@ public sealed class Composer : IAsyncDisposable
     private readonly BrainRepoManager? _repoManager;
     private readonly GoalDispatcher? _goalDispatcher;
     private readonly string _stateDir;
+    private readonly IHttpClientFactory? _httpClientFactory;
+    private readonly string? _ollamaApiKey;
     private IChatClient? _chatClient;
     private CodingAgent? _agent;
     private AgentSession _session;
 
-    private readonly string _systemPrompt = DefaultSystemPrompt;
+    private readonly string _systemPrompt;
     private readonly List<AITool> _composerTools;
 
     // Streaming state owned by the service (survives component navigation)
@@ -89,7 +92,9 @@ public sealed class Composer : IAsyncDisposable
         int maxSteps = Constants.DefaultBrainMaxSteps,
         BrainRepoManager? repoManager = null,
         string? stateDir = null,
-        GoalDispatcher? goalDispatcher = null)
+        GoalDispatcher? goalDispatcher = null,
+        IHttpClientFactory? httpClientFactory = null,
+        string? ollamaApiKey = null)
     {
         _model = model;
         _maxContextTokens = maxContextTokens;
@@ -99,10 +104,16 @@ public sealed class Composer : IAsyncDisposable
         _repoManager = repoManager;
         _goalDispatcher = goalDispatcher;
         _stateDir = stateDir ?? "/app/state";
+        _httpClientFactory = httpClientFactory;
+        _ollamaApiKey = ollamaApiKey;
         _session = AgentSession.Create("composer");
 
         var (_, _, reasoning) = SDK.ChatClientFactory.ParseProviderModelAndReasoning(model);
         _reasoningEffort = reasoning;
+
+        _systemPrompt = DefaultSystemPrompt;
+        if (_ollamaApiKey is not null)
+            _systemPrompt += "\n- Research information on the web (web_search, web_fetch)";
 
         _composerTools = BuildComposerTools();
     }
@@ -390,8 +401,8 @@ public sealed class Composer : IAsyncDisposable
 
     private List<AITool> BuildComposerTools()
     {
-        return
-        [
+        var tools = new List<AITool>
+        {
             AIFunctionFactory.Create(CreateGoalAsync, "create_goal",
                 "Create a new goal as Draft. It will not be dispatched until approved."),
             AIFunctionFactory.Create(ApproveGoalAsync, "approve_goal",
@@ -418,7 +429,17 @@ public sealed class Composer : IAsyncDisposable
                 "List local or remote branches in a repository."),
             AIFunctionFactory.Create(GitBlameAsync, "git_blame",
                 "Show line-by-line authorship information for a file."),
-        ];
+        };
+
+        if (_ollamaApiKey is not null)
+        {
+            tools.Add(AIFunctionFactory.Create(WebSearchAsync, "web_search",
+                "Search the web for information. Returns titles, URLs, and content snippets."));
+            tools.Add(AIFunctionFactory.Create(WebFetchAsync, "web_fetch",
+                "Fetch a web page and return its content. Use after web_search to read full pages."));
+        }
+
+        return tools;
     }
 
     [Description("Create a new goal as Draft status. Returns the created goal summary.")]
@@ -968,6 +989,119 @@ public sealed class Composer : IAsyncDisposable
         args.Add(path);
 
         return await RunGitAsync(repository, [.. args], ct: cancellationToken);
+    }
+
+    // ── Web research tool implementations ──
+
+    [Description("Search the web for information. Returns titles, URLs, and content snippets.")]
+    internal async Task<string> WebSearchAsync(
+        [Description("Search query")] string query,
+        [Description("Maximum results to return (1-10, default 5)")] int max_results = 5)
+    {
+        if (_ollamaApiKey is null)
+            return "❌ Web search is not available — no OLLAMA_API_KEY configured.";
+
+        if (string.IsNullOrWhiteSpace(query))
+            return "❌ query is required.";
+
+        max_results = Math.Clamp(max_results, 1, 10);
+
+        var client = _httpClientFactory!.CreateClient("ollama-web");
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, "api/web_search");
+            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _ollamaApiKey);
+            request.Content = JsonContent.Create(new { query, max_results });
+
+            using var response = await client.SendAsync(request);
+            if (!response.IsSuccessStatusCode)
+                return $"❌ Web search failed: HTTP {(int)response.StatusCode} {response.ReasonPhrase}";
+
+            var json = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+
+            var sb = new System.Text.StringBuilder();
+            var results = doc.RootElement.GetProperty("results");
+            foreach (var result in results.EnumerateArray())
+            {
+                var title = result.TryGetProperty("title", out var t) ? t.GetString() : "";
+                var url = result.TryGetProperty("url", out var u) ? u.GetString() : "";
+                var content = result.TryGetProperty("content", out var c) ? c.GetString() : "";
+                sb.AppendLine($"### {title}");
+                sb.AppendLine(url);
+                sb.AppendLine(content);
+                sb.AppendLine();
+            }
+
+            return sb.Length > 0 ? sb.ToString().TrimEnd() : "No results found.";
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            _logger.LogWarning(ex, "WebSearch failed for query '{Query}'", query);
+            return $"❌ Web search error: {ex.Message}";
+        }
+    }
+
+    [Description("Fetch a web page and return its content. Use after web_search to read full pages.")]
+    internal async Task<string> WebFetchAsync(
+        [Description("URL to fetch")] string url,
+        [Description("Maximum lines of content to return. Default: 200")] int max_lines = 200)
+    {
+        if (_ollamaApiKey is null)
+            return "❌ Web fetch is not available — no OLLAMA_API_KEY configured.";
+
+        if (string.IsNullOrWhiteSpace(url))
+            return "❌ url is required.";
+
+        var client = _httpClientFactory!.CreateClient("ollama-web");
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, "api/web_fetch");
+            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _ollamaApiKey);
+            request.Content = JsonContent.Create(new { url });
+
+            using var response = await client.SendAsync(request);
+            if (!response.IsSuccessStatusCode)
+                return $"❌ Web fetch failed: HTTP {(int)response.StatusCode} {response.ReasonPhrase}";
+
+            var json = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+
+            var title = doc.RootElement.TryGetProperty("title", out var t) ? t.GetString() ?? "" : "";
+            var content = doc.RootElement.TryGetProperty("content", out var c) ? c.GetString() ?? "" : "";
+            var links = doc.RootElement.TryGetProperty("links", out var l)
+                ? l.EnumerateArray().Select(x => x.GetString()).Where(x => x is not null).ToList()
+                : new List<string?>();
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"# {title}");
+            sb.AppendLine();
+            sb.Append(content);
+
+            if (links.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine();
+                sb.AppendLine("## Links");
+                foreach (var link in links)
+                    sb.AppendLine($"- {link}");
+            }
+
+            var output = sb.ToString();
+            var lines = output.Split('\n');
+            if (lines.Length > max_lines)
+            {
+                output = string.Join('\n', lines.Take(max_lines));
+                output += $"\n...(truncated, {lines.Length} lines total)";
+            }
+
+            return output;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            _logger.LogWarning(ex, "WebFetch failed for url '{Url}'", url);
+            return $"❌ Web fetch error: {ex.Message}";
+        }
     }
 
     private static bool IsValidGoalId(string? id)
