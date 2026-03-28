@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Composer `list_repositories` tool** — new tool for querying the live hive-config.yaml to list all configured repositories:
+  - `ListRepositoriesAsync` method reads from `_hiveConfig` at call time (not a stale snapshot), so it reflects the current state even when `hive-config.yaml` is updated without restart
+  - Returns formatted Markdown list with repository name, URL, and default branch for each configured repo
+  - Returns "No repositories configured." when no repos are set in the config
+  - Registered as `list_repositories` in `BuildComposerTools()` with description "List all configured repositories with their names, URLs, and default branches."
+  - System prompt updated to mention new capability: "List configured repositories (list_repositories)"
+  - Includes 6 xUnit tests covering: null config, empty list, single repo, multiple repos, tool registration, and system prompt mention
+
 ### Fixed
 - **Worker container restart failure** — `docker/worker/entrypoint.sh` now handles config repo restarts correctly:
   - Replaces unconditional `git clone` with a clone-or-pull pattern that handles three cases:
