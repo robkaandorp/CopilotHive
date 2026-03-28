@@ -2105,6 +2105,105 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("You are the Composer", prompt);
         Assert.DoesNotContain("Configured repositories:", prompt);
     }
+
+    // ── list_repositories ──
+
+    [Fact]
+    public async Task ListRepositories_NullHiveConfig_ReturnsNoRepositoriesMessage()
+    {
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            hiveConfig: null);
+
+        var result = await composer.ListRepositoriesAsync();
+
+        Assert.Equal("No repositories configured.", result);
+    }
+
+    [Fact]
+    public async Task ListRepositories_EmptyList_ReturnsNoRepositoriesMessage()
+    {
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            hiveConfig: new HiveConfigFile { Repositories = [] });
+
+        var result = await composer.ListRepositoriesAsync();
+
+        Assert.Equal("No repositories configured.", result);
+    }
+
+    [Fact]
+    public async Task ListRepositories_WithRepos_ReturnsFormattedList()
+    {
+        var hiveConfig = new HiveConfigFile
+        {
+            Repositories =
+            [
+                new RepositoryConfig { Name = "my-repo", Url = "https://github.com/org/my-repo.git", DefaultBranch = "main" },
+            ],
+        };
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            hiveConfig: hiveConfig);
+
+        var result = await composer.ListRepositoriesAsync();
+
+        Assert.Contains("## Configured Repositories (1)", result);
+        Assert.Contains("my-repo", result);
+        Assert.Contains("https://github.com/org/my-repo.git", result);
+        Assert.Contains("branch: main", result);
+    }
+
+    [Fact]
+    public async Task ListRepositories_WithMultipleRepos_ListsAllRepos()
+    {
+        var hiveConfig = new HiveConfigFile
+        {
+            Repositories =
+            [
+                new RepositoryConfig { Name = "repo-a", Url = "https://github.com/org/repo-a.git", DefaultBranch = "main" },
+                new RepositoryConfig { Name = "repo-b", Url = "https://github.com/org/repo-b.git", DefaultBranch = "develop" },
+            ],
+        };
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            hiveConfig: hiveConfig);
+
+        var result = await composer.ListRepositoriesAsync();
+
+        Assert.Contains("## Configured Repositories (2)", result);
+        Assert.Contains("repo-a", result);
+        Assert.Contains("repo-b", result);
+        Assert.Contains("branch: main", result);
+        Assert.Contains("branch: develop", result);
+    }
+
+    [Fact]
+    public void BuildComposerTools_IncludesListRepositoriesTool()
+    {
+        var tools = _composer.BuildComposerTools();
+        var names = tools.OfType<AIFunction>().Select(t => t.Name).ToList();
+        Assert.Contains("list_repositories", names);
+    }
+
+    [Fact]
+    public void SystemPrompt_MentionsListRepositoriesCapability()
+    {
+        var prompt = _composer.GetSystemPrompt();
+        Assert.Contains("list_repositories", prompt);
+    }
 }
 
 /// <summary>

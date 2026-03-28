@@ -70,6 +70,7 @@ public sealed class Composer : IAsyncDisposable
         - Delete draft or failed goals (delete_goal)
         - Cancel InProgress or Pending goals (cancel_goal)
         - Inspect repository history (git_log, git_diff, git_show, git_branch, git_blame)
+        - List configured repositories (list_repositories)
 
         Guidelines for goal creation:
         - Each goal should be completable in 1-3 iterations (small, focused)
@@ -446,6 +447,8 @@ public sealed class Composer : IAsyncDisposable
                 "List local or remote branches in a repository."),
             AIFunctionFactory.Create(GitBlameAsync, "git_blame",
                 "Show line-by-line authorship information for a file."),
+            AIFunctionFactory.Create(ListRepositoriesAsync, "list_repositories",
+                "List all configured repositories with their names, URLs, and default branches."),
         };
 
         if (_ollamaApiKey is not null)
@@ -837,6 +840,20 @@ public sealed class Composer : IAsyncDisposable
 
     private static string Truncate(string text, int maxLength) =>
         text.Length <= maxLength ? text : text[..(maxLength - 1)] + "…";
+
+    [Description("List all configured repositories with their names, URLs, and default branches.")]
+    internal Task<string> ListRepositoriesAsync()
+    {
+        var repos = _hiveConfig?.Repositories;
+        if (repos is null || repos.Count == 0)
+            return Task.FromResult("No repositories configured.");
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"## Configured Repositories ({repos.Count})");
+        foreach (var repo in repos)
+            sb.AppendLine($"- **{repo.Name}** — {repo.Url} (branch: {repo.DefaultBranch})");
+        return Task.FromResult(sb.ToString().TrimEnd());
+    }
 
     // ── Git tool implementations ──
 
