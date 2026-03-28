@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Registered as `get_phase_output` in `BuildComposerTools()` with description "Get the raw worker output for a specific phase within an iteration."
   - System prompt updated to mention new capability: "Drill into phase output (get_phase_output)"
   - Phase outputs are only available for worker phases (Coding, Testing, Review, DocWriting, Improve). Planning phase is not supported for `get_phase_output` since it is executed internally by the orchestrator Brain, not by a worker.
-  - Includes 14 xUnit tests covering: happy path, case-insensitive matching, fallback to PhaseOutputs, role key mapping for all 5 phases, truncation, and error cases (goal not found, iteration not found, phase not found, no output recorded, invalid inputs)
+  - Includes 18 xUnit tests covering: happy path, case-insensitive matching, fallback to PhaseOutputs, role key mapping for all 5 phases, truncation, and error cases (goal not found, iteration not found, phase not found, no output recorded, invalid inputs)
 
 ### Changed
 - **Composer `get_goal` enriched iteration display** — iteration details now show per-phase breakdown instead of just a phase count:
