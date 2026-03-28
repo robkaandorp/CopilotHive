@@ -4,6 +4,7 @@ using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using System.Net;
@@ -1392,17 +1393,74 @@ public sealed class ComposerToolTests : IDisposable
             httpClientFactory: mockFactory.Object,
             ollamaApiKey: "test-key");
 
-        // We verify indirectly by checking BuildComposerTools includes web tools.
-        // Also check constructor doesn't throw and the composer is created successfully.
-        Assert.NotNull(composer);
+        Assert.Contains("web_search", composer.GetSystemPrompt());
+        Assert.Contains("web_fetch", composer.GetSystemPrompt());
     }
 
     [Fact]
     public void SystemPrompt_WithoutApiKey_DoesNotIncludeWebCapabilities()
     {
         // _composer is created without ollamaApiKey in the test constructor
-        // Ensure no exception and default prompt is used
-        Assert.NotNull(_composer);
+        Assert.DoesNotContain("web_search", _composer.GetSystemPrompt());
+        Assert.DoesNotContain("web_fetch", _composer.GetSystemPrompt());
+    }
+
+    [Fact]
+    public void BuildComposerTools_WithoutApiKey_DoesNotIncludeWebTools()
+    {
+        var composer = new Composer("model", NullLogger<Composer>.Instance, _store, ollamaApiKey: null);
+        var tools = composer.BuildComposerTools();
+        var toolNames = tools.OfType<AIFunction>().Select(t => t.Name).ToList();
+        Assert.DoesNotContain("web_search", toolNames);
+        Assert.DoesNotContain("web_fetch", toolNames);
+    }
+
+    [Fact]
+    public async Task WebSearch_Timeout_ReturnsErrorMessage()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(
+            req => throw new TaskCanceledException("The request timed out."));
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebSearchAsync("test query");
+
+        Assert.Contains("❌", result);
+        // Should return an error message, not throw an exception
+        Assert.Contains("timed out", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task WebFetch_Timeout_ReturnsErrorMessage()
+    {
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(
+            req => throw new TaskCanceledException("The request timed out."));
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebFetchAsync("https://example.com");
+
+        Assert.Contains("❌", result);
+        // Should return an error message, not throw an exception
+        Assert.Contains("timed out", result, StringComparison.OrdinalIgnoreCase);
     }
 
     private static string InitTempGitRepo(string basePath)

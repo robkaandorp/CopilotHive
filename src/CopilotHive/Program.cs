@@ -132,7 +132,7 @@ static async Task<int> RunServerAsync(string[] args)
             sp.GetService<BrainRepoManager>(),
             stateDir,
             sp.GetRequiredService<GoalDispatcher>(),
-            !string.IsNullOrEmpty(ollamaApiKey) ? sp.GetRequiredService<IHttpClientFactory>() : null,
+            !string.IsNullOrWhiteSpace(ollamaApiKey) ? sp.GetRequiredService<IHttpClientFactory>() : null,
             ollamaApiKey);
     });
 

@@ -105,7 +105,7 @@ public sealed class Composer : IAsyncDisposable
         _goalDispatcher = goalDispatcher;
         _stateDir = stateDir ?? "/app/state";
         _httpClientFactory = httpClientFactory;
-        _ollamaApiKey = ollamaApiKey;
+        _ollamaApiKey = string.IsNullOrWhiteSpace(ollamaApiKey) ? null : ollamaApiKey;
         _session = AgentSession.Create("composer");
 
         var (_, _, reasoning) = SDK.ChatClientFactory.ParseProviderModelAndReasoning(model);
@@ -120,6 +120,9 @@ public sealed class Composer : IAsyncDisposable
 
     /// <summary>Whether the Composer has connected and is ready for streaming.</summary>
     public bool IsConnected => _agent is not null;
+
+    /// <summary>Returns the system prompt used by the Composer.</summary>
+    internal string GetSystemPrompt() => _systemPrompt;
 
     /// <summary>Returns current Composer session statistics.</summary>
     public BrainStats? GetStats()
@@ -399,7 +402,7 @@ public sealed class Composer : IAsyncDisposable
 
     // ── Tool implementations ──
 
-    private List<AITool> BuildComposerTools()
+    internal List<AITool> BuildComposerTools()
     {
         var tools = new List<AITool>
         {
