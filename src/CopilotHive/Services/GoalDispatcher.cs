@@ -30,7 +30,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly AgentsManager? _agentsManager;
     private readonly MetricsTracker? _metricsTracker;
     private readonly ConfigRepoManager? _configRepo;
-    private readonly BrainRepoManager _repoManager;
+    private readonly IBrainRepoManager _repoManager;
     private readonly ILogger<GoalDispatcher> _logger;
     private readonly HiveConfigFile? _config;
 
@@ -65,7 +65,7 @@ public sealed class GoalDispatcher : BackgroundService
         IWorkerGateway workerGateway,
         TaskCompletionNotifier completionNotifier,
         ILogger<GoalDispatcher> logger,
-        BrainRepoManager repoManager,
+        IBrainRepoManager repoManager,
         IDistributedBrain? brain = null,
         HiveConfigFile? config = null,
         MetricsTracker? metricsTracker = null,

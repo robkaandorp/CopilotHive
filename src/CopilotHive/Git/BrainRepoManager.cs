@@ -5,13 +5,62 @@ namespace CopilotHive.Git;
 
 /// <summary>
 /// Manages persistent clones of target repositories for the Brain.
+/// </summary>
+public interface IBrainRepoManager
+{
+    /// <summary>
+    /// The directory containing all repo clones. Used as the Brain's CodingAgent WorkDirectory
+    /// so the Brain can read files across all repositories via relative paths.
+    /// </summary>
+    string WorkDirectory { get; }
+
+    /// <summary>
+    /// Ensures a clone exists for the given repository and returns its path.
+    /// If the clone already exists, pulls the latest changes on the default branch.
+    /// </summary>
+    /// <param name="repoName">Short name of the repository (used in the directory name).</param>
+    /// <param name="repoUrl">Remote URL of the repository (with credentials if needed).</param>
+    /// <param name="defaultBranch">Default branch to check out (e.g. "main", "develop").</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>Absolute path to the clone directory.</returns>
+    Task<string> EnsureCloneAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default);
+
+    /// <summary>
+    /// Squash-merges a feature branch into the default branch and pushes.
+    /// </summary>
+    /// <param name="repoName">Repository name (must have been cloned via <see cref="EnsureCloneAsync"/>).</param>
+    /// <param name="featureBranch">The feature branch to merge.</param>
+    /// <param name="defaultBranch">The base branch to merge into.</param>
+    /// <param name="commitMessage">The commit message for the resulting squash commit.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The full SHA-1 hash of the resulting squash commit on the default branch.</returns>
+    Task<string> MergeFeatureBranchAsync(string repoName, string featureBranch, string defaultBranch, string commitMessage, CancellationToken ct = default);
+
+    /// <summary>
+    /// Deletes a remote feature branch from the specified repository.
+    /// </summary>
+    /// <param name="repoName">Short name of the repository.</param>
+    /// <param name="branchName">Branch name to delete from the remote.</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns the clone path for a repository without performing any git operations.
+    /// </summary>
+    /// <param name="repoName">Short name of the repository.</param>
+    /// <returns>Absolute path to the clone directory.</returns>
+    string GetClonePath(string repoName);
+}
+
+/// <summary>
+/// Manages persistent clones of target repositories for the Brain.
 /// Each repository gets its own clone at <c>{basePath}/repos/{repoName}</c>,
 /// checked out to the default branch. The parent <c>repos/</c> directory serves
 /// as the Brain's <see cref="WorkDirectory"/> so all repos are visible to file tools.
 /// Clones persist across goals and are updated (pulled) before each goal starts.
 /// The same clone is reused for merge operations to avoid redundant temp clones.
 /// </summary>
-public sealed class BrainRepoManager
+public sealed class BrainRepoManager : IBrainRepoManager
 {
     private readonly string _basePath;
     private readonly ILogger _logger;
@@ -181,6 +230,46 @@ public sealed class BrainRepoManager
             throw new InvalidOperationException($"git rev-parse HEAD failed: {stderr}");
         }
         return await process.StandardOutput.ReadToEndAsync(ct);
+    }
+
+    /// <summary>
+    /// Deletes a remote feature branch from the specified repository.
+    /// Best-effort: logs a warning if the branch doesn't exist or deletion fails.
+    /// Also attempts to delete the local tracking branch; failure is silently ignored.
+    /// </summary>
+    /// <param name="repoName">Short name of the repository (must have been cloned via <see cref="EnsureCloneAsync"/>).</param>
+    /// <param name="branchName">Branch name to delete from the remote (e.g. "copilothive/my-goal").</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default)
+    {
+        var clonePath = GetClonePath(repoName);
+        if (!Directory.Exists(Path.Combine(clonePath, ".git")))
+        {
+            _logger.LogWarning(
+                "Cannot delete remote branch {Branch} from {Repo}: no clone found at {Path}",
+                branchName, repoName, clonePath);
+            return;
+        }
+
+        try
+        {
+            await RunGitAsync(clonePath, ["push", "origin", "--delete", branchName], ct);
+            _logger.LogInformation("Deleted remote branch {Branch} from {Repo}", branchName, repoName);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to delete remote branch {Branch} from {Repo}", branchName, repoName);
+        }
+
+        // Best-effort: delete the local tracking branch
+        try
+        {
+            await RunGitAsync(clonePath, ["branch", "-D", branchName], ct);
+        }
+        catch
+        {
+            // Ignored — local branch may not exist
+        }
     }
 
     /// <summary>

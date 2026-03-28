@@ -5,6 +5,7 @@ using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using System.Net;
@@ -513,6 +514,114 @@ public sealed class ComposerToolTests : IDisposable
 
         Assert.Contains("❌", result);
         Assert.Contains("not found", result);
+    }
+
+    [Fact]
+    public async Task DeleteGoal_FailedGoal_WithRepoManager_CallsDeleteRemoteBranchForEachRepo()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a failed goal with two repositories
+        await _composer.CreateGoalAsync("failed-goal-branches", "Will fail", repositories: "repo-a, repo-b");
+        var goal = (await _store.GetGoalAsync("failed-goal-branches", ct))!;
+        goal.Status = GoalStatus.Failed;
+        await _store.UpdateGoalAsync(goal, ct);
+
+        // Mock the repo manager
+        var mockRepoManager = new Mock<IBrainRepoManager>();
+        mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-a", "copilothive/failed-goal-branches", It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask)
+            .Verifiable();
+        mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-b", "copilothive/failed-goal-branches", It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask)
+            .Verifiable();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            repoManager: mockRepoManager.Object,
+            stateDir: Path.GetTempPath());
+
+        var result = await composer.DeleteGoalAsync("failed-goal-branches");
+
+        // Verify goal deleted successfully
+        Assert.Contains("✅", result);
+        Assert.Contains("deleted", result);
+        var deletedGoal = await _store.GetGoalAsync("failed-goal-branches", ct);
+        Assert.Null(deletedGoal);
+
+        // Verify DeleteRemoteBranchAsync was called for each repository
+        mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-a", "copilothive/failed-goal-branches", It.IsAny<CancellationToken>()), Times.Once);
+        mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-b", "copilothive/failed-goal-branches", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task DeleteGoal_DraftGoal_WithRepoManager_DoesNotAttemptBranchCleanup()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a draft goal with a repository
+        await _composer.CreateGoalAsync("draft-no-branch", "Draft goal", repositories: "repo-a");
+
+        // Mock the repo manager
+        var mockRepoManager = new Mock<IBrainRepoManager>();
+        mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Throws(new InvalidOperationException("Should not be called for Draft goals"));
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            repoManager: mockRepoManager.Object,
+            stateDir: Path.GetTempPath());
+
+        var result = await composer.DeleteGoalAsync("draft-no-branch");
+
+        Assert.Contains("✅", result);
+        // Goal is removed from store (Draft goals delete fine with no branch cleanup)
+        var deletedGoal = await _store.GetGoalAsync("draft-no-branch", ct);
+        Assert.Null(deletedGoal);
+
+        // Verify DeleteRemoteBranchAsync was never called for Draft goals
+        mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task DeleteGoal_FailedGoal_BestEffortCleanup_StillSucceedsWhenDeleteRemoteBranchThrows()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a failed goal with repositories
+        await _composer.CreateGoalAsync("failed-cleanup", "Will fail", repositories: "repo-a");
+        var goal = (await _store.GetGoalAsync("failed-cleanup", ct))!;
+        goal.Status = GoalStatus.Failed;
+        await _store.UpdateGoalAsync(goal, ct);
+
+        // Mock the repo manager to throw when DeleteRemoteBranchAsync is called
+        var mockRepoManager = new Mock<IBrainRepoManager>();
+        mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-a", "copilothive/failed-cleanup", It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("Git operation failed"))
+            .Verifiable();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            repoManager: mockRepoManager.Object,
+            stateDir: Path.GetTempPath());
+
+        // DeleteRemoteBranchAsync will throw, but goal deletion should still succeed - this is "best-effort"
+        var result = await composer.DeleteGoalAsync("failed-cleanup");
+
+        // Verify the goal was deleted despite branch cleanup issues
+        Assert.Contains("✅", result);
+        Assert.Contains("deleted", result);
+        var deletedGoal = await _store.GetGoalAsync("failed-cleanup", ct);
+        Assert.Null(deletedGoal);
+
+        // Verify that the cleanup was attempted (even though it threw)
+        mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-a", "copilothive/failed-cleanup", It.IsAny<CancellationToken>()), Times.Once);
     }
 
     // ── cancel_goal ──
@@ -1717,5 +1826,22 @@ internal sealed class FakeHttpMessageHandler : HttpMessageHandler
         {
             Content = new StringContent(_body ?? "", System.Text.Encoding.UTF8, "application/json"),
         };
+    }
+}
+
+/// <summary>
+/// Test logger that captures log entries for verification.
+/// </summary>
+internal sealed class TestLogger<T> : ILogger<T>
+{
+    public List<(LogLevel LogLevel, string Message, Exception? Exception)> LogEntries { get; } = [];
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        LogEntries.Add((logLevel, formatter(state, exception), exception));
     }
 }

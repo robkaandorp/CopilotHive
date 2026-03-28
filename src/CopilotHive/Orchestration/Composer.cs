@@ -24,7 +24,7 @@ public sealed class Composer : IAsyncDisposable
     private readonly ReasoningEffort? _reasoningEffort;
     private readonly ILogger<Composer> _logger;
     private readonly IGoalStore _goalStore;
-    private readonly BrainRepoManager? _repoManager;
+    private readonly IBrainRepoManager? _repoManager;
     private readonly GoalDispatcher? _goalDispatcher;
     private readonly string _stateDir;
     private readonly IHttpClientFactory? _httpClientFactory;
@@ -90,7 +90,7 @@ public sealed class Composer : IAsyncDisposable
         IGoalStore goalStore,
         int maxContextTokens = Constants.DefaultBrainContextWindow,
         int maxSteps = Constants.DefaultBrainMaxSteps,
-        BrainRepoManager? repoManager = null,
+        IBrainRepoManager? repoManager = null,
         string? stateDir = null,
         GoalDispatcher? goalDispatcher = null,
         IHttpClientFactory? httpClientFactory = null,
@@ -541,6 +541,24 @@ public sealed class Composer : IAsyncDisposable
             return $"❌ Failed to delete goal '{id}'.";
 
         _logger.LogInformation("Composer deleted goal '{GoalId}'", id);
+
+        // Best-effort cleanup of remote feature branches for Failed goals
+        if (_repoManager is not null && goal.Status == GoalStatus.Failed)
+        {
+            var branchName = $"copilothive/{id}";
+            foreach (var repoName in goal.RepositoryNames)
+            {
+                try
+                {
+                    await _repoManager.DeleteRemoteBranchAsync(repoName, branchName);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to delete remote branch {Branch} from {Repo}", branchName, repoName);
+                }
+            }
+        }
+
         return $"✅ Goal '{id}' has been permanently deleted.";
     }
 

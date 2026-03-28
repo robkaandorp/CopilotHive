@@ -70,7 +70,7 @@ static async Task<int> RunServerAsync(string[] args)
         new MetricsTracker(metricsDir, sp.GetRequiredService<ILogger<MetricsTracker>>()));
 
     // Brain repo manager: persistent read-only clones for Brain file access
-    builder.Services.AddSingleton(sp =>
+    builder.Services.AddSingleton<IBrainRepoManager>(sp =>
         new BrainRepoManager(stateDir, sp.GetRequiredService<ILogger<BrainRepoManager>>()));
 
     builder.Services.AddSingleton(sp =>
@@ -101,7 +101,7 @@ static async Task<int> RunServerAsync(string[] args)
                 sp.GetService<AgentsManager>(),
                 maxCtx,
                 maxSteps,
-                sp.GetService<BrainRepoManager>(),
+                sp.GetService<IBrainRepoManager>(),
                 stateDir);
         });
     }
@@ -129,7 +129,7 @@ static async Task<int> RunServerAsync(string[] args)
         return new Composer(model, sp.GetRequiredService<ILogger<Composer>>(),
             sp.GetRequiredService<IGoalStore>(),
             maxCtx, maxSteps,
-            sp.GetService<BrainRepoManager>(),
+            sp.GetService<IBrainRepoManager>(),
             stateDir,
             sp.GetRequiredService<GoalDispatcher>(),
             !string.IsNullOrWhiteSpace(ollamaApiKey) ? sp.GetRequiredService<IHttpClientFactory>() : null,
@@ -376,7 +376,7 @@ static async Task<int> RunServerAsync(string[] args)
         }
     });
 
-    goalsApi.MapDelete("/{id}", async (string id, SqliteGoalStore store) =>
+    goalsApi.MapDelete("/{id}", async (string id, SqliteGoalStore store, IBrainRepoManager? repoManager, ILogger<Program> logger) =>
     {
         var goal = await store.GetGoalAsync(id);
         if (goal is null)
@@ -386,7 +386,30 @@ static async Task<int> RunServerAsync(string[] args)
             return Results.BadRequest(new { error = "Only Draft or Failed goals can be deleted" });
 
         var deleted = await store.DeleteGoalAsync(id);
-        return deleted ? Results.NoContent() : Results.NotFound(new { error = $"Goal '{id}' not found." });
+        if (!deleted)
+            return Results.NotFound(new { error = $"Goal '{id}' not found." });
+
+        // Best-effort cleanup of remote feature branches for Failed goals
+        if (goal.Status == GoalStatus.Failed)
+        {
+            if (repoManager is not null)
+            {
+                var branchName = $"copilothive/{id}";
+                foreach (var repoName in goal.RepositoryNames)
+                {
+                    try
+                    {
+                        await repoManager.DeleteRemoteBranchAsync(repoName, branchName);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(ex, "Failed to delete remote branch {Branch} from {Repo}", branchName, repoName);
+                    }
+                }
+            }
+        }
+
+        return Results.NoContent();
     });
 
     goalsApi.MapPost("/{id}/cancel", async (string id, GoalDispatcher dispatcher, SqliteGoalStore store) =>

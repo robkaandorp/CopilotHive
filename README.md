@@ -197,6 +197,7 @@ goals:
 - **Three-dot diff comparison** — accurate detection of all changes on feature branches using `origin/{baseBranch}...HEAD`
 - **HTTP resilience** — all LLM API calls use `Microsoft.Extensions.Http.Resilience` with 3 retries, exponential backoff, and 2-minute per-attempt timeout
 - **Worker feedback in Brain context** — worker output (verdicts, test metrics, issues) is injected into the Brain conversation for informed replanning after failures
+- **Automatic branch cleanup** — when a Failed goal is deleted, its remote feature branches are automatically cleaned up from all associated repositories; best-effort (logs warning on failure, doesn't prevent goal deletion)
 - **Goal notes** — non-fatal observations tracked in goals.yaml (e.g. "Improver skipped: timeout")
 - **Iteration summaries** — structured per-iteration metrics (phases, test counts, review verdicts) recorded in goals.yaml for observability without reading logs
 - **Phase duration logging** — each pipeline phase logs its wall-clock duration in seconds when it completes (e.g., "Phase Testing for goal X completed in 45.2s")
