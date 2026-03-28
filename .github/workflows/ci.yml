@@ -52,6 +52,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Set version
+        id: version
+        run: |
+          PREFIX=$(grep -oPm1 '(?<=<VersionPrefix>)[^<]+' src/CopilotHive/CopilotHive.csproj)
+          echo "version=${PREFIX}-beta.${{ github.run_number }}" >> $GITHUB_OUTPUT
+          echo "prefix=${PREFIX}" >> $GITHUB_OUTPUT
+
       # ── Orchestrator ──────────────────────────────────────────────
       - name: Orchestrator — metadata
         id: orchestrator-meta
@@ -61,6 +68,7 @@ jobs:
           tags: |
             type=sha
             type=raw,value=latest
+            type=raw,value=${{ steps.version.outputs.version }}
 
       - name: Orchestrator — build & push
         uses: docker/build-push-action@v6
@@ -83,6 +91,7 @@ jobs:
           tags: |
             type=sha
             type=raw,value=latest
+            type=raw,value=${{ steps.version.outputs.version }}
 
       - name: Worker — build & push
         uses: docker/build-push-action@v6
