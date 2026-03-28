@@ -119,6 +119,10 @@ public sealed class BrainRepoManagerTests : IDisposable
         Git(clonePath, "checkout", "-b", "copilothive/test-goal");
         Git(clonePath, "checkout", "main"); // Go back to main
 
+        // Verify the branch exists before deletion
+        var branchesBefore = GitOutput(clonePath, "branch", "--list", "copilothive/test-goal");
+        Assert.Contains("copilothive/test-goal", branchesBefore);
+
         var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
 
         // This will fail to push --delete because there's no actual remote,
@@ -129,6 +133,10 @@ public sealed class BrainRepoManagerTests : IDisposable
 
         // Method should not throw - it handles errors gracefully
         Assert.Null(ex);
+
+        // Verify the local branch was deleted (the git branch -D command ran)
+        var branchesAfter = GitOutput(clonePath, "branch", "--list", "copilothive/test-goal");
+        Assert.DoesNotContain("copilothive/test-goal", branchesAfter);
     }
 
     [Fact]
@@ -199,6 +207,22 @@ public sealed class BrainRepoManagerTests : IDisposable
         foreach (var a in args) psi.ArgumentList.Add(a);
         using var p = Process.Start(psi)!;
         p.WaitForExit();
+    }
+
+    private static string GitOutput(string workDir, params string[] args)
+    {
+        var psi = new ProcessStartInfo("git")
+        {
+            WorkingDirectory = workDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        using var p = Process.Start(psi)!;
+        var output = p.StandardOutput.ReadToEnd();
+        p.WaitForExit();
+        return output;
     }
 }
 

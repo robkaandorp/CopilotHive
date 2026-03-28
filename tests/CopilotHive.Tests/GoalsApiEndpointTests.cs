@@ -34,8 +34,13 @@ public class GoalsApiEndpointTests
     private static string UniqueId() =>
         "test-" + Guid.NewGuid().ToString("N")[..16];
 
-    private static StringContent GoalJson(string id, string description = "Test goal") =>
-        new(JsonSerializer.Serialize(new { id, description }, JsonOpts), Encoding.UTF8, "application/json");
+    private static StringContent GoalJson(string id, string description = "Test goal", string? repositories = null)
+    {
+        object goalData = repositories is not null
+            ? new { id, description, repositoryNames = repositories.Split(", ") }
+            : new { id, description };
+        return new StringContent(JsonSerializer.Serialize(goalData, JsonOpts), Encoding.UTF8, "application/json");
+    }
 
     // ── POST /api/goals ───────────────────────────────────────────────────
 
@@ -462,7 +467,8 @@ public class GoalsApiEndpointTests
     public async Task DeleteGoal_FailedGoal_Returns204NoContent()
     {
         var id = UniqueId();
-        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+        // Create goal with repositories so branch cleanup is attempted
+        await _client.PostAsync("/api/goals", GoalJson(id, "Test goal", "repo1, repo2"), TestContext.Current.CancellationToken);
 
         // Set goal to Failed status
         using (var scope = _factory.Services.CreateScope())
@@ -484,7 +490,8 @@ public class GoalsApiEndpointTests
     public async Task DeleteGoal_FailedGoal_IsRemovedFromStore()
     {
         var id = UniqueId();
-        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+        // Create goal with repositories so branch cleanup is attempted
+        await _client.PostAsync("/api/goals", GoalJson(id, "Test goal", "repo1, repo2"), TestContext.Current.CancellationToken);
 
         // Set goal to Failed status
         using (var scope = _factory.Services.CreateScope())
@@ -501,6 +508,38 @@ public class GoalsApiEndpointTests
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
         // Verify goal is actually deleted from store
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+            Assert.Null(goal);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteGoal_FailedGoal_WithRepositories_AttemptsBranchCleanup()
+    {
+        var id = UniqueId();
+        // Create goal with repositories to verify cleanup code path runs
+        await _client.PostAsync("/api/goals", GoalJson(id, "Test goal", "repo-a, repo-b"), TestContext.Current.CancellationToken);
+
+        // Set goal to Failed status
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+            Assert.NotNull(goal);
+            goal!.Status = GoalStatus.Failed;
+            await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
+        }
+
+        var response = await _client.DeleteAsync($"/api/goals/{id}",
+            TestContext.Current.CancellationToken);
+
+        // Should still succeed even though branch cleanup runs (best-effort)
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        // Verify goal is removed from store
         using (var scope = _factory.Services.CreateScope())
         {
             var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();

@@ -5,6 +5,7 @@ using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using System.Net;
@@ -516,7 +517,7 @@ public sealed class ComposerToolTests : IDisposable
     }
 
     [Fact]
-    public async Task DeleteGoal_FailedGoal_WithRepoManager_BranchCleanupIsAttempted()
+    public async Task DeleteGoal_FailedGoal_WithRepoManager_CallsDeleteRemoteBranchForEachRepo()
     {
         var ct = TestContext.Current.CancellationToken;
         var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -529,8 +530,9 @@ public sealed class ComposerToolTests : IDisposable
             goal.Status = GoalStatus.Failed;
             await _store.UpdateGoalAsync(goal, ct);
 
-            // Use a real BrainRepoManager (no clones exist — DeleteRemoteBranchAsync logs warning but doesn't throw)
-            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            // Use a TestLogger to capture log messages
+            var logger = new TestLogger<BrainRepoManager>();
+            var repoManager = new BrainRepoManager(tmpDir, logger);
             var composer = new Composer(
                 "test-model",
                 NullLogger<Composer>.Instance,
@@ -538,18 +540,30 @@ public sealed class ComposerToolTests : IDisposable
                 repoManager: repoManager,
                 stateDir: tmpDir);
 
-            // Even though no clones exist, goal deletion should succeed (best-effort branch cleanup)
             var result = await composer.DeleteGoalAsync("failed-goal-branches");
 
+            // Verify goal deleted successfully
             Assert.Contains("✅", result);
             Assert.Contains("deleted", result);
-            // Goal is removed from store
             var deletedGoal = await _store.GetGoalAsync("failed-goal-branches", ct);
             Assert.Null(deletedGoal);
+
+            // Verify DeleteRemoteBranchAsync was called for each repository by checking logs
+            // Since clones don't exist, we expect warning logs for each repo
+            var warningMessages = logger.LogEntries
+                .Where(e => e.LogLevel == LogLevel.Warning)
+                .Select(e => e.Message)
+                .ToList();
+
+            // Two repos = two "Cannot delete remote branch" warnings (one per repo)
+            Assert.Equal(2, warningMessages.Count(m => m.Contains("Cannot delete remote branch")));
+            Assert.Contains(warningMessages, m => m.Contains("repo-a"));
+            Assert.Contains(warningMessages, m => m.Contains("repo-b"));
         }
         finally
         {
-            Directory.Delete(tmpDir, recursive: true);
+            if (Directory.Exists(tmpDir))
+                Directory.Delete(tmpDir, recursive: true);
         }
     }
 
@@ -564,7 +578,9 @@ public sealed class ComposerToolTests : IDisposable
             // Create a draft goal with a repository
             await _composer.CreateGoalAsync("draft-no-branch", "Draft goal", repositories: "repo-a");
 
-            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            // Use a TestLogger to capture log messages
+            var logger = new TestLogger<BrainRepoManager>();
+            var repoManager = new BrainRepoManager(tmpDir, logger);
             var composer = new Composer(
                 "test-model",
                 NullLogger<Composer>.Instance,
@@ -578,10 +594,20 @@ public sealed class ComposerToolTests : IDisposable
             // Goal is removed from store (Draft goals delete fine with no branch cleanup)
             var deletedGoal = await _store.GetGoalAsync("draft-no-branch", ct);
             Assert.Null(deletedGoal);
+
+            // Verify no branch cleanup was attempted for Draft goals
+            // No "Cannot delete remote branch" warnings should appear
+            var warningMessages = logger.LogEntries
+                .Where(e => e.LogLevel == LogLevel.Warning)
+                .Select(e => e.Message)
+                .ToList();
+
+            Assert.DoesNotContain(warningMessages, m => m.Contains("Cannot delete remote branch"));
         }
         finally
         {
-            Directory.Delete(tmpDir, recursive: true);
+            if (Directory.Exists(tmpDir))
+                Directory.Delete(tmpDir, recursive: true);
         }
     }
 
@@ -599,7 +625,9 @@ public sealed class ComposerToolTests : IDisposable
             goal.Status = GoalStatus.Failed;
             await _store.UpdateGoalAsync(goal, ct);
 
-            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            // Use a TestLogger to capture behavior
+            var logger = new TestLogger<BrainRepoManager>();
+            var repoManager = new BrainRepoManager(tmpDir, logger);
             var composer = new Composer(
                 "test-model",
                 NullLogger<Composer>.Instance,
@@ -616,10 +644,16 @@ public sealed class ComposerToolTests : IDisposable
             Assert.Contains("deleted", result);
             var deletedGoal = await _store.GetGoalAsync("failed-cleanup", ct);
             Assert.Null(deletedGoal);
+
+            // Verify that cleanup was attempted (even though it failed)
+            Assert.Contains(logger.LogEntries, e =>
+                e.LogLevel == LogLevel.Warning &&
+                e.Message.Contains("Cannot delete remote branch"));
         }
         finally
         {
-            Directory.Delete(tmpDir, recursive: true);
+            if (Directory.Exists(tmpDir))
+                Directory.Delete(tmpDir, recursive: true);
         }
     }
 
@@ -1825,5 +1859,22 @@ internal sealed class FakeHttpMessageHandler : HttpMessageHandler
         {
             Content = new StringContent(_body ?? "", System.Text.Encoding.UTF8, "application/json"),
         };
+    }
+}
+
+/// <summary>
+/// Test logger that captures log entries for verification.
+/// </summary>
+internal sealed class TestLogger<T> : ILogger<T>
+{
+    public List<(LogLevel LogLevel, string Message, Exception? Exception)> LogEntries { get; } = [];
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        LogEntries.Add((logLevel, formatter(state, exception), exception));
     }
 }
