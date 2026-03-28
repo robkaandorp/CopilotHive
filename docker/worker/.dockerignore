@@ -1,7 +1,11 @@
+**/.git
+**/bin
+**/obj
+**/node_modules
+**/.vs
+**/.vscode
+**/TestResults
 *.md~
 *.swp
 *.bak
-.git
-.gitignore
-README.md
 LICENSE
