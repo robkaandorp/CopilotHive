@@ -111,16 +111,18 @@ public sealed class PipelineStore : IAsyncDisposable
     // are automatically brought up to date on startup.
     private static readonly (string Table, string Column, string Definition)[] SchemaColumns =
     [
-        ("pipelines", "max_iterations",    "INTEGER NOT NULL DEFAULT 10"),
-        ("pipelines", "improver_retries",  "INTEGER NOT NULL DEFAULT 0"),
-        ("pipelines", "phase_outputs",     "TEXT NOT NULL DEFAULT '{}'"),
-        ("pipelines", "metrics_json",      "TEXT NOT NULL DEFAULT '{}'"),
-        ("pipelines", "active_task_id",    "TEXT"),
-        ("pipelines", "coder_branch",      "TEXT"),
-        ("pipelines", "completed_at",      "TEXT"),
-        ("pipelines", "goal_started_at",   "TEXT"),
-        ("pipelines", "plan_json",         "TEXT"),
-        ("pipelines", "merge_commit_hash", "TEXT"),
+        ("pipelines",             "max_iterations",    "INTEGER NOT NULL DEFAULT 10"),
+        ("pipelines",             "improver_retries",  "INTEGER NOT NULL DEFAULT 0"),
+        ("pipelines",             "phase_outputs",     "TEXT NOT NULL DEFAULT '{}'"),
+        ("pipelines",             "metrics_json",      "TEXT NOT NULL DEFAULT '{}'"),
+        ("pipelines",             "active_task_id",    "TEXT"),
+        ("pipelines",             "coder_branch",      "TEXT"),
+        ("pipelines",             "completed_at",      "TEXT"),
+        ("pipelines",             "goal_started_at",   "TEXT"),
+        ("pipelines",             "plan_json",         "TEXT"),
+        ("pipelines",             "merge_commit_hash", "TEXT"),
+        ("conversation_entries",  "iteration",         "INTEGER"),
+        ("conversation_entries",  "purpose",           "TEXT"),
     ];
 
     /// <summary>
@@ -197,12 +199,14 @@ public sealed class PipelineStore : IAsyncDisposable
         {
             using var cmd = _db.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO conversation_entries (goal_id, seq, role, content)
-                VALUES (@goalId, COALESCE((SELECT MAX(seq) FROM conversation_entries WHERE goal_id = @goalId), -1) + 1, @role, @content)
+                INSERT INTO conversation_entries (goal_id, seq, role, content, iteration, purpose)
+                VALUES (@goalId, COALESCE((SELECT MAX(seq) FROM conversation_entries WHERE goal_id = @goalId), -1) + 1, @role, @content, @iteration, @purpose)
                 """;
             cmd.Parameters.AddWithValue("@goalId", goalId);
             cmd.Parameters.AddWithValue("@role", entry.Role);
             cmd.Parameters.AddWithValue("@content", entry.Content);
+            cmd.Parameters.AddWithValue("@iteration", (object?)entry.Iteration ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@purpose", (object?)entry.Purpose ?? DBNull.Value);
             cmd.ExecuteNonQuery();
         }
     }
@@ -339,11 +343,13 @@ public sealed class PipelineStore : IAsyncDisposable
             var entry = pipeline.Conversation[i];
             using var ins = _db.CreateCommand();
             ins.Transaction = tx;
-            ins.CommandText = "INSERT INTO conversation_entries (goal_id, seq, role, content) VALUES (@goalId, @seq, @role, @content)";
+            ins.CommandText = "INSERT INTO conversation_entries (goal_id, seq, role, content, iteration, purpose) VALUES (@goalId, @seq, @role, @content, @iteration, @purpose)";
             ins.Parameters.AddWithValue("@goalId", pipeline.GoalId);
             ins.Parameters.AddWithValue("@seq", i);
             ins.Parameters.AddWithValue("@role", entry.Role);
             ins.Parameters.AddWithValue("@content", entry.Content);
+            ins.Parameters.AddWithValue("@iteration", (object?)entry.Iteration ?? DBNull.Value);
+            ins.Parameters.AddWithValue("@purpose", (object?)entry.Purpose ?? DBNull.Value);
             ins.ExecuteNonQuery();
         }
     }
@@ -351,13 +357,17 @@ public sealed class PipelineStore : IAsyncDisposable
     private List<ConversationEntry> LoadConversationCore(string goalId)
     {
         using var cmd = _db.CreateCommand();
-        cmd.CommandText = "SELECT role, content FROM conversation_entries WHERE goal_id = @goalId ORDER BY seq";
+        cmd.CommandText = "SELECT role, content, iteration, purpose FROM conversation_entries WHERE goal_id = @goalId ORDER BY seq";
         cmd.Parameters.AddWithValue("@goalId", goalId);
 
         var entries = new List<ConversationEntry>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
-            entries.Add(new ConversationEntry(reader.GetString(0), reader.GetString(1)));
+        {
+            var iteration = reader.IsDBNull(2) ? (int?)null : reader.GetInt32(2);
+            var purpose   = reader.IsDBNull(3) ? null       : reader.GetString(3);
+            entries.Add(new ConversationEntry(reader.GetString(0), reader.GetString(1), iteration, purpose));
+        }
         return entries;
     }
 

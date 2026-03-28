@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **ConversationEntry metadata** — `ConversationEntry` now tracks iteration context and purpose, enabling conversation history to be analyzed by iteration without heuristic parsing:
+  - `ConversationEntry` record extended with `Iteration` (int?) and `Purpose` (string?) properties with default null values for backward compatibility
+  - Purpose values: `"planning"` — iteration planning prompt/response, `"craft-prompt"` — Brain generating worker prompts, `"worker-output"` — structured output summary from workers, `"error"` — error messages
+  - All conversation entries in `DistributedBrain.PlanIterationAsync` and `DistributedBrain.CraftPromptAsync` are tagged with iteration and purpose
+  - Worker output entries in `GoalDispatcher.DriveNextPhaseAsync` are tagged with iteration and purpose
+  - `PipelineStore` persists and loads `Iteration` and `Purpose` via new `iteration` and `purpose` columns with automatic schema migration for existing databases
+  - Legacy entries (null iteration/purpose) load correctly, preserving backward compatibility
+  - Existing code creating `ConversationEntry(role, content)` continues to compile unchanged due to default parameters
+
+### Added
 - **Composer `get_phase_output` tool** — new tool for drilling into worker output from specific phases of a goal iteration:
   - `GetPhaseOutputAsync` method takes `goalId`, `iteration` (1-based), `phase` name, and optional `max_lines` (default 200)
   - Phase name matching is case-insensitive (Coding, Testing, Review, DocWriting, Improve)

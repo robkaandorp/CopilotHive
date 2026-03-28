@@ -382,8 +382,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     },
                     ct);
 
-                pipeline.Conversation.Add(new ConversationEntry("user", currentPrompt));
-                pipeline.Conversation.Add(new ConversationEntry("assistant", response));
+                pipeline.Conversation.Add(new ConversationEntry("user", currentPrompt, pipeline.Iteration, "planning"));
+                pipeline.Conversation.Add(new ConversationEntry("assistant", response, pipeline.Iteration, "planning"));
 
                 if (toolCall is { ToolName: "report_iteration_plan" })
                 {
@@ -421,7 +421,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         catch (Exception ex)
         {
             _logger.LogError(ex, "Brain iteration planning failed for goal {GoalId}", pipeline.GoalId);
-            pipeline.Conversation.Add(new ConversationEntry("system", $"Error: {ex.Message}"));
+            pipeline.Conversation.Add(new ConversationEntry("system", $"Error: {ex.Message}", pipeline.Iteration, "error"));
         }
 
         _logger.LogInformation("Using default iteration plan for goal {GoalId}", pipeline.GoalId);
@@ -679,8 +679,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     _logger.LogDebug("Brain craft-prompt response for {GoalId}:\n{Response}",
                         pipeline.GoalId, Truncate(response, Constants.TruncationVerbose));
 
-                    pipeline.Conversation.Add(new ConversationEntry("user", prompt));
-                    pipeline.Conversation.Add(new ConversationEntry("assistant", response));
+                    pipeline.Conversation.Add(new ConversationEntry("user", prompt, pipeline.Iteration, "craft-prompt"));
+                    pipeline.Conversation.Add(new ConversationEntry("assistant", response, pipeline.Iteration, "craft-prompt"));
 
                     if (string.IsNullOrWhiteSpace(response))
                         throw new InvalidOperationException(
@@ -693,7 +693,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     _logger.LogWarning(
                         "Brain craft-prompt failed for {GoalId} (attempt {Attempt}/{Max}): {Error}. Retrying in {Delay}s",
                         pipeline.GoalId, attempt, Shared.CopilotRetryPolicy.MaxRetries + 1, ex.Message, delay.TotalSeconds);
-                    pipeline.Conversation.Add(new ConversationEntry("system", $"Error on attempt {attempt}: {ex.Message}"));
+                    pipeline.Conversation.Add(new ConversationEntry("system", $"Error on attempt {attempt}: {ex.Message}", pipeline.Iteration, "error"));
                 },
                 ct);
 
@@ -707,7 +707,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             _logger.LogError(ex, "Brain failed to craft prompt for {GoalId} phase {Phase} — using fallback",
                 pipeline.GoalId, phase);
-            pipeline.Conversation.Add(new ConversationEntry("system", $"CraftPrompt error: {ex.Message}"));
+            pipeline.Conversation.Add(new ConversationEntry("system", $"CraftPrompt error: {ex.Message}", pipeline.Iteration, "error"));
             return $"Work on: {pipeline.Description}";
         }
     }

@@ -351,7 +351,7 @@ public sealed class GoalDispatcher : BackgroundService
         // the reviewer rejected. Use a structured summary to stay within token budget.
         var workerRole = pipeline.Phase.ToWorkerRole().ToRoleName();
         var outputSummary = BuildWorkerOutputSummary(pipeline.Phase, verdict, result);
-        pipeline.Conversation.Add(new ConversationEntry(workerRole, outputSummary));
+        pipeline.Conversation.Add(new ConversationEntry(workerRole, outputSummary, pipeline.Iteration, "worker-output"));
 
         // After Improver: sync config repo to pick up the changes it pushed directly
         if (pipeline.Phase == GoalPhase.Improve)
