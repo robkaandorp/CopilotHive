@@ -774,6 +774,13 @@ public sealed class Composer : IAsyncDisposable
                 {
                     await _goalStore.ResetGoalIterationDataAsync(id);
 
+                    // Clear iteration data on the goal object to prevent overwriting with old values
+                    goal.FailureReason = null;
+                    goal.Iterations = 0;
+                    goal.TotalDurationSeconds = null;
+                    goal.StartedAt = null;
+                    goal.IterationSummaries = [];
+
                     if (_repoManager is not null)
                     {
                         var branchName = $"copilothive/{id}";

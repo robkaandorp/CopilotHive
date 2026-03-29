@@ -472,6 +472,53 @@ public class GoalsApiEndpointTests
         }
     }
 
+    [Fact]
+    public async Task PatchGoalStatus_FailedToDraft_DeletesRemoteBranchesForAllRepositories()
+    {
+        // Create a mock repo manager that will be injected via DI
+        var mockRepoManager = new Mock<IBrainRepoManager>();
+        mockRepoManager.Setup(r => r.WorkDirectory).Returns(Path.GetTempPath());
+        mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-a", It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask)
+            .Verifiable();
+        mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-b", It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask)
+            .Verifiable();
+
+        // Create a new factory with the mock
+        using var factory = new HiveTestFactory { MockRepoManager = mockRepoManager.Object };
+        using var client = factory.CreateClient();
+
+        var id = UniqueId();
+        // Create goal with repositories
+        await client.PostAsync("/api/goals", GoalJson(id, "Test goal", "repo-a, repo-b"), TestContext.Current.CancellationToken);
+
+        // Set goal to Failed status
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+            Assert.NotNull(goal);
+            goal!.Status = GoalStatus.Failed;
+            await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
+        }
+
+        // Transition Failed → Draft (should delete remote branches)
+        var response = await client.PatchAsync(
+            $"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Draft" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        // Should succeed
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // Verify DeleteRemoteBranchAsync was called for each repository with the correct branch name
+        var expectedBranchName = $"copilothive/{id}";
+        mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-a", expectedBranchName, It.IsAny<CancellationToken>()), Times.Once);
+        mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-b", expectedBranchName, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
     // ── DELETE /api/goals/{id} ────────────────────────────────────────────
 
     [Fact]
