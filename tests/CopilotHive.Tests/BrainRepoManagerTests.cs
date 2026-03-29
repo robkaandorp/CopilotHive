@@ -275,7 +275,7 @@ public sealed class BrainRepoManagerTests : IDisposable
     [Fact]
     public async Task MergeFeatureBranchAsync_EmptyRemote_ReturnsEmptyWithoutThrowing()
     {
-        // Arrange: create a bare remote with no commits (empty)
+        // Arrange: create a bare remote with no commits (empty) — neither branch exists
         var ct = TestContext.Current.CancellationToken;
         var remoteDir = Path.Combine(_tempDir, "empty-remote2.git");
         Directory.CreateDirectory(remoteDir);
@@ -303,6 +303,72 @@ public sealed class BrainRepoManagerTests : IDisposable
         Assert.Contains(logger.LogEntries, e =>
             e.LogLevel == LogLevel.Warning &&
             e.Message.Contains("empty repository"));
+    }
+
+    [Fact]
+    public async Task MergeFeatureBranchAsync_NoDefaultBranchButFeatureExists_CreatesDefaultBranchAndReturnsHash()
+    {
+        // Arrange: bare remote with only the feature branch (no default branch yet — orphan push scenario)
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create the bare remote
+        var remoteDir = Path.Combine(_tempDir, "orphan-remote.git");
+        Directory.CreateDirectory(remoteDir);
+        Git(remoteDir, "init", "--bare");
+
+        // Push a feature branch to the remote via a staging repo — no default branch is created
+        var stagingDir = Path.Combine(_tempDir, "orphan-staging");
+        Directory.CreateDirectory(stagingDir);
+        Git(stagingDir, "init", "-b", "copilothive/feat");
+        Git(stagingDir, "config", "user.email", "test@test.com");
+        Git(stagingDir, "config", "user.name", "Test");
+        File.WriteAllText(Path.Combine(stagingDir, "README.md"), "# Feature\n");
+        Git(stagingDir, "add", "README.md");
+        Git(stagingDir, "commit", "-m", "Feature commit");
+        Git(stagingDir, "remote", "add", "origin", remoteDir);
+        Git(stagingDir, "push", "origin", "copilothive/feat");
+
+        // Get the expected commit SHA from the staging repo
+        var expectedSha = GitOutput(stagingDir, "rev-parse", "HEAD").Trim();
+
+        // Clone from the remote (without --branch since the default branch doesn't exist yet)
+        var reposDir = Path.Combine(_tempDir, "repos");
+        Directory.CreateDirectory(reposDir);
+        Git(reposDir, "clone", remoteDir, "orphan-repo");
+        var clonePath = Path.Combine(reposDir, "orphan-repo");
+        Git(clonePath, "config", "user.email", "test@test.com");
+        Git(clonePath, "config", "user.name", "Test");
+
+        var logger = new TestLogger<BrainRepoManager>();
+        var manager = new BrainRepoManager(_tempDir, logger);
+
+        // Act
+        string? result = null;
+        var ex = await Record.ExceptionAsync(async () =>
+            result = await manager.MergeFeatureBranchAsync(
+                "orphan-repo", "copilothive/feat", "main", "chore: squash", ct));
+
+        // Assert: no exception
+        Assert.Null(ex);
+
+        // Should return the feature branch HEAD hash (not empty)
+        Assert.NotNull(result);
+        Assert.NotEmpty(result);
+        Assert.Equal(expectedSha, result);
+
+        // Should log an info message about creating the default branch
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Information &&
+            e.Message.Contains("Creating it from feature branch"));
+
+        // Should NOT log the "empty repository" warning
+        Assert.DoesNotContain(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message.Contains("empty repository"));
+
+        // Verify the default branch now exists on the remote
+        var remoteBranches = GitOutput(remoteDir, "branch");
+        Assert.Contains("main", remoteBranches);
     }
 
     private static string InitTempGitRepoWithRemote(string basePath, string repoName)
