@@ -176,6 +176,52 @@ public sealed class GitOperationsTests : IAsyncLifetime
         Assert.Contains("nonexistent-base", exception.Message);
     }
 
+    // ── GetGitStatusAsync ─────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetGitStatusAsync_OrphanBranch_FallsBackToEmptyTree()
+    {
+        // Arrange — create an orphan branch with two files (no shared history with any base branch)
+        var (_, symRefOut, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "symbolic-ref --short HEAD", CancellationToken.None);
+        var defaultBranch = symRefOut.Trim();
+
+        await GitOperations.CreateBranchAsync(_repoDir, "orphan-feature", defaultBranch, CancellationToken.None);
+        await CommitFileAsync("alpha.txt", "line1\nline2\n");
+        await CommitFileAsync("beta.txt", "a\nb\nc\n");
+
+        // Act — use a base branch that shares no history so the three-dot diff fails;
+        //        the empty-tree fallback should report both committed files.
+        var summary = await GitOperations.GetGitStatusAsync(
+            _repoDir, "nonexistent-base", CancellationToken.None);
+
+        // Assert — empty-tree fallback should capture the two committed files
+        Assert.Equal(2, summary.FilesChanged);
+        Assert.True(summary.Insertions > 0, "Expected insertions > 0 from committed files");
+    }
+
+    [Fact]
+    public async Task GetGitStatusAsync_NormalBranch_UsesMergeBaseDiff()
+    {
+        // Arrange — commit on the default branch, then branch off and add another file
+        await CommitFileAsync("base.txt", "base content\n");
+
+        var (_, symRefOut, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "symbolic-ref --short HEAD", CancellationToken.None);
+        var defaultBranch = symRefOut.Trim();
+
+        await GitOperations.CreateBranchAsync(_repoDir, "feature-normal", defaultBranch, CancellationToken.None);
+        await CommitFileAsync("feature.txt", "feature content\n");
+
+        // Act — pass null baseBranch so it falls back to HEAD~1 which should work for a non-orphan branch
+        var summary = await GitOperations.GetGitStatusAsync(
+            _repoDir, null, CancellationToken.None);
+
+        // Assert — should see exactly the file added since HEAD~1
+        Assert.Equal(1, summary.FilesChanged);
+        Assert.True(summary.Insertions > 0);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private async Task CommitFileAsync(string fileName, string content)

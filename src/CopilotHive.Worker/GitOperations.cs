@@ -121,7 +121,19 @@ public static class GitOperations
         var (statExit, statOut, _) = await RunGitCommandAsync(
             repoDir, $"diff --stat --numstat {diffRef}", ct);
         if (statExit == 0)
+        {
             ParseDiffStat(statOut, ref filesChanged, ref insertions, ref deletions);
+        }
+        else
+        {
+            // Fallback for orphan branches that share no common history with the base:
+            // diff HEAD against the empty tree so we still capture all files added on this branch.
+            const string EmptyTreeSha = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+            var (fallbackExit, fallbackOut, _) = await RunGitCommandAsync(
+                repoDir, $"diff --stat --numstat {EmptyTreeSha} HEAD", ct);
+            if (fallbackExit == 0)
+                ParseDiffStat(fallbackOut, ref filesChanged, ref insertions, ref deletions);
+        }
 
         return new GitChangeSummary
         {
