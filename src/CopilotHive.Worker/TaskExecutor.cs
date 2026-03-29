@@ -1,7 +1,10 @@
 using System.Diagnostics;
+using System.Text.Json;
 using CopilotHive.Goals;
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using Microsoft.Extensions.AI;
+using SharpCoder;
 
 namespace CopilotHive.Worker;
 
@@ -12,7 +15,8 @@ namespace CopilotHive.Worker;
 public sealed class TaskExecutor(
     IAgentRunner agentRunner,
     IToolCallBridge? toolBridge = null,
-    IGitOperations? gitOperations = null)
+    IGitOperations? gitOperations = null,
+    ISessionClient? sessionClient = null)
 {
     private const string WorkRoot = "/copilot-home";
     private const string ConfigRepoDir = "/config-repo";
@@ -36,6 +40,12 @@ public sealed class TaskExecutor(
         agentRunner.SetCurrentTaskId(task.TaskId);
         agentRunner.ClearTestReport();
         agentRunner.ClearWorkerReport();
+
+        // Load persisted session (if any) so the agent can resume prior context
+        if (sessionClient != null && !string.IsNullOrEmpty(task.SessionId))
+        {
+            await LoadSessionAsync(task.SessionId, ct);
+        }
 
         try
         {
@@ -278,6 +288,12 @@ public sealed class TaskExecutor(
             foreach (var err in pushErrors)
                 metrics.Issues.Add(err);
 
+            // Persist updated session so future tasks in the same goal can resume context
+            if (sessionClient != null && !string.IsNullOrEmpty(task.SessionId))
+            {
+                await SaveSessionAsync(task.SessionId, ct);
+            }
+
             return new TaskResult
             {
                 TaskId = task.TaskId,
@@ -331,6 +347,59 @@ public sealed class TaskExecutor(
                     Issues = [ex.Message],
                 },
             };
+        }
+    }
+
+    /// <summary>
+    /// Loads a persisted <see cref="AgentSession"/> from the session client and calls
+    /// <see cref="IAgentRunner.SetSession"/> so the next prompt resumes prior context.
+    /// Falls back to a fresh session on any error.
+    /// </summary>
+    private async Task LoadSessionAsync(string sessionId, CancellationToken ct)
+    {
+        try
+        {
+            var json = await sessionClient!.GetSessionAsync(sessionId, ct);
+            if (json == null)
+            {
+                _log.Info($"No persisted session found for '{sessionId}' — starting fresh");
+                agentRunner.SetSession(null);
+                return;
+            }
+
+            var session = JsonSerializer.Deserialize<AgentSession>(json, AIJsonUtilities.DefaultOptions);
+            agentRunner.SetSession(session);
+            _log.Info($"Restored session '{sessionId}' ({session?.MessageHistory?.Count ?? 0} history messages)");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to load session '{sessionId}': {ex.Message} — starting fresh");
+            agentRunner.SetSession(null);
+        }
+    }
+
+    /// <summary>
+    /// Serializes the current <see cref="AgentSession"/> from the agent runner and saves it
+    /// via the session client. Logs a warning on error but never throws.
+    /// </summary>
+    private async Task SaveSessionAsync(string sessionId, CancellationToken ct)
+    {
+        try
+        {
+            var session = agentRunner.GetSession() as AgentSession;
+            if (session == null)
+            {
+                _log.Info($"No session to save for '{sessionId}'");
+                return;
+            }
+
+            var json = JsonSerializer.Serialize(session, AIJsonUtilities.DefaultOptions);
+            await sessionClient!.SaveSessionAsync(sessionId, json, ct);
+            _log.Info($"Saved session '{sessionId}' ({session.MessageHistory?.Count ?? 0} history messages)");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to save session '{sessionId}': {ex.Message}");
         }
     }
 
