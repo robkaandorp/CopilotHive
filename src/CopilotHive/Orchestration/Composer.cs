@@ -1428,7 +1428,7 @@ public sealed class Composer : IAsyncDisposable
 
             var title = doc.RootElement.TryGetProperty("title", out var t) ? t.GetString() ?? "" : "";
             var content = doc.RootElement.TryGetProperty("content", out var c) ? c.GetString() ?? "" : "";
-            var links = doc.RootElement.TryGetProperty("links", out var l)
+            var links = doc.RootElement.TryGetProperty("links", out var l) && l.ValueKind == JsonValueKind.Array
                 ? l.EnumerateArray().Select(x => x.GetString()).Where(x => x is not null).ToList()
                 : new List<string?>();
 
