@@ -385,6 +385,76 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     }
 
     #endregion
+
+    #region GetConversation — Per-goal conversation retrieval
+
+    [Fact]
+    public void GetConversation_ReturnsEntriesForGoal()
+    {
+        var pipeline1 = CreatePipeline("goal-1", "First goal");
+        pipeline1.Conversation.Add(new ConversationEntry("user", "Hello from goal 1"));
+        pipeline1.Conversation.Add(new ConversationEntry("assistant", "Hi there!"));
+
+        var pipeline2 = CreatePipeline("goal-2", "Second goal");
+        pipeline2.Conversation.Add(new ConversationEntry("user", "Hello from goal 2"));
+
+        _store.SavePipeline(pipeline1);
+        _store.SavePipeline(pipeline2);
+
+        var conversation1 = _store.GetConversation("goal-1");
+        var conversation2 = _store.GetConversation("goal-2");
+
+        Assert.Equal(2, conversation1.Count);
+        Assert.Equal("user", conversation1[0].Role);
+        Assert.Equal("Hello from goal 1", conversation1[0].Content);
+        Assert.Equal("assistant", conversation1[1].Role);
+
+        Assert.Single(conversation2);
+        Assert.Equal("Hello from goal 2", conversation2[0].Content);
+    }
+
+    [Fact]
+    public void GetConversation_NoEntries_ReturnsEmptyList()
+    {
+        var pipeline = CreatePipeline("goal-empty", "Empty goal");
+        _store.SavePipeline(pipeline);
+
+        var conversation = _store.GetConversation("goal-empty");
+
+        Assert.Empty(conversation);
+    }
+
+    [Fact]
+    public void GetConversation_NonExistentGoal_ReturnsEmptyList()
+    {
+        var conversation = _store.GetConversation("nonexistent-goal");
+
+        Assert.Empty(conversation);
+    }
+
+    [Fact]
+    public void GetConversation_PreservesMetadata()
+    {
+        var pipeline = CreatePipeline("goal-meta", "Goal with metadata");
+        pipeline.Conversation.Add(new ConversationEntry("user", "Plan request", Iteration: 1, Purpose: "planning"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "Here's the plan", Iteration: 1, Purpose: "planning"));
+        pipeline.Conversation.Add(new ConversationEntry("user", "Brain prompt for coder", Iteration: 2, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "Worker task for coder", Iteration: 2, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("coder", "Done!", Iteration: 2, Purpose: "worker-output"));
+
+        _store.SavePipeline(pipeline);
+
+        var conversation = _store.GetConversation("goal-meta");
+
+        Assert.Equal(5, conversation.Count);
+        Assert.Equal(1, conversation[0].Iteration);
+        Assert.Equal("planning", conversation[0].Purpose);
+        Assert.Equal(2, conversation[2].Iteration);
+        Assert.Equal("craft-prompt", conversation[2].Purpose);
+        Assert.Equal("worker-output", conversation[4].Purpose);
+    }
+
+    #endregion
 }
 
 public sealed class GoalPipelineSnapshotRestorationTests

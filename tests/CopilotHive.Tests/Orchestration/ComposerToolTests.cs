@@ -2,6 +2,7 @@ using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Data.Sqlite;
@@ -1082,6 +1083,149 @@ public sealed class ComposerToolTests : IDisposable
         var result = await _composer.GetPhaseOutputAsync("some-goal", 1, phase);
 
         Assert.Equal("ERROR: Invalid parameters: phase is required", result);
+    }
+
+    // ── GetPhaseOutputAsync with content parameter (brain_prompt / worker_prompt) ──
+
+    [Fact]
+    public async Task GetPhaseOutput_ContentOutput_DefaultBehaviorUnchanged()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("content-output", "Goal for content output test");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 10.0, WorkerOutput = "coder output here" }],
+        };
+        await _store.AddIterationAsync("content-output", summary, ct);
+
+        // Explicitly passing "output" should behave same as default
+        var result = await _composer.GetPhaseOutputAsync("content-output", 1, "Coding", content: "output");
+        Assert.Contains("coder output here", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_BrainPrompt_NoPipelineConversation_ReturnsMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("no-pipeline", "Goal without pipeline conversation");
+
+        // Without PipelineStore wired, there's no conversation to retrieve
+        var result = await _composer.GetPhaseOutputAsync("no-pipeline", 1, "Coding", content: "brain_prompt");
+
+        Assert.Contains("No pipeline conversation available", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_WorkerPrompt_NoPipelineConversation_ReturnsMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("no-pipeline-wp", "Goal without pipeline conversation");
+
+        var result = await _composer.GetPhaseOutputAsync("no-pipeline-wp", 1, "Coding", content: "worker_prompt");
+
+        Assert.Contains("No pipeline conversation available", result);
+    }
+
+    // ── GetPhaseOutputAsync with PipelineStore for brain_prompt/worker_prompt ──
+
+    [Fact]
+    public async Task GetPhaseOutput_BrainPrompt_WithPipelineStore_ReturnsPrompt()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a PipelineStore and wire it to a new SqliteGoalStore
+        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var composerWithPipeline = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            storeWithPipeline,
+            stateDir: Path.GetTempPath());
+
+        // Create a goal and pipeline with conversation
+        await composerWithPipeline.CreateGoalAsync("brain-prompt-goal", "Goal with brain prompt");
+        var goal = await storeWithPipeline.GetGoalAsync("brain-prompt-goal", ct);
+        Assert.NotNull(goal);
+
+        var pipeline = new GoalPipeline(goal, maxRetries: 3);
+        pipeline.Conversation.Add(new ConversationEntry("user", "Brain asks coder to implement X", Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "Your task: implement X", Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("coder", "Coder completed.", Iteration: 1, Purpose: "worker-output"));
+
+        pipelineStore.SavePipeline(pipeline);
+
+        // Now test GetPhaseOutputAsync with content: "brain_prompt"
+        var result = await composerWithPipeline.GetPhaseOutputAsync("brain-prompt-goal", 1, "Coding", content: "brain_prompt");
+
+        Assert.Contains("Brain asks coder to implement X", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_WorkerPrompt_WithPipelineStore_ReturnsPrompt()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a PipelineStore and wire it to a new SqliteGoalStore
+        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var composerWithPipeline = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            storeWithPipeline,
+            stateDir: Path.GetTempPath());
+
+        // Create a goal and pipeline with conversation
+        await composerWithPipeline.CreateGoalAsync("worker-prompt-goal", "Goal with worker prompt");
+        var goal = await storeWithPipeline.GetGoalAsync("worker-prompt-goal", ct);
+        Assert.NotNull(goal);
+
+        var pipeline = new GoalPipeline(goal, maxRetries: 3);
+        pipeline.Conversation.Add(new ConversationEntry("user", "Brain prompt for tester", Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "Your task: test the code", Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("tester", "Tests passed!", Iteration: 1, Purpose: "worker-output"));
+
+        pipelineStore.SavePipeline(pipeline);
+
+        // Now test GetPhaseOutputAsync with content: "worker_prompt"
+        var result = await composerWithPipeline.GetPhaseOutputAsync("worker-prompt-goal", 1, "Testing", content: "worker_prompt");
+
+        Assert.Contains("Your task: test the code", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_BrainPrompt_NoPromptForPhase_ReturnsMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a PipelineStore and wire it
+        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var composerWithPipeline = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            storeWithPipeline,
+            stateDir: Path.GetTempPath());
+
+        // Create a goal and pipeline with conversation for Coding phase only
+        await composerWithPipeline.CreateGoalAsync("partial-prompt-goal", "Goal with partial prompts");
+        var goal = await storeWithPipeline.GetGoalAsync("partial-prompt-goal", ct);
+        Assert.NotNull(goal);
+
+        var pipeline = new GoalPipeline(goal, maxRetries: 3);
+        pipeline.Conversation.Add(new ConversationEntry("user", "Brain for coder", Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "Task for coder", Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("coder", "Done", Iteration: 1, Purpose: "worker-output"));
+
+        pipelineStore.SavePipeline(pipeline);
+
+        // Request brain_prompt for Review phase - should fail as no craft-prompt for reviewer
+        var result = await composerWithPipeline.GetPhaseOutputAsync("partial-prompt-goal", 1, "Review", content: "brain_prompt");
+
+        Assert.Contains("No brain prompt found", result);
     }
 
     [Fact]
