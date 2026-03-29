@@ -33,11 +33,11 @@ The Orchestrator Brain (an LLM-powered decision engine) receives goals and dispa
 
 Goals flow through a structured pipeline:
 
-**Coding → Testing → Doc Writing → Review → Merge → Improve**
+**Coding → Testing → (Doc Writing) → Review → Merge → Improve**
 
 1. **Coding**: A worker (assigned the coder role) implements the goal on a feature branch.
 2. **Testing**: A worker (assigned the tester role) builds the project and runs all tests.
-3. **Doc Writing**: A worker (assigned the doc-writer role) updates documentation to reflect the changes.
+3. **Doc Writing** *(conditional)*: A worker (assigned the doc-writer role) updates documentation to reflect the changes. This phase is included only when the goal requires documentation changes; the Brain conditionally skips it for goals that don't affect user-facing behaviour or public APIs.
 4. **Review**: A worker (assigned the reviewer role) inspects the diff, tests, and documentation.
 5. **Merge**: The Brain decides when quality is sufficient and squash-merges the branch, combining all feature branch commits into a single descriptive commit.
 6. **Improve** *(non-blocking)*: A worker (assigned the improver role) updates `agents.md` based on metrics. If improvement fails, the pipeline still completes — the failure is recorded in goal notes and metrics.
@@ -166,7 +166,7 @@ goals:
 | `src/CopilotHive/` | Main orchestrator — Brain, GoalDispatcher, persistence, metrics |
 | `src/CopilotHive.Shared/` | Shared protobuf definitions and DTOs |
 | `src/CopilotHive.Worker/` | Worker process (runs inside Docker containers) |
-| `tests/` | 587+ xUnit tests |
+| `tests/` | 1087+ xUnit tests |
 | `agents/` | Default agent templates (overridden by config repo at runtime) |
 | `docker/` | Dockerfiles and container configuration |
 
@@ -174,13 +174,14 @@ goals:
 
 - **Server-only mode** — gRPC server + HTTP health endpoint (no CLI mode)
 - **LLM-powered Brain** — `DistributedBrain` uses SharpCoder's `CodingAgent` with a single persistent session, read-only file access to repos, automatic context compaction, and configurable context window (`BRAIN_CONTEXT_WINDOW`)
-- **Composer** — conversational agent for goal decomposition and management with streaming chat UI (`/composer`); uses a persistent SharpCoder session with 8 goal-management tools (`create_goal`, `approve_goal`, `update_goal`, `delete_goal`, `cancel_goal`, `get_goal`, `list_goals`, `search_goals`) plus codebase tools (`read_file`, `glob`, `grep`), 5 git tools (`git_log`, `git_diff`, `git_show`, `git_branch`, `git_blame`), 2 web research tools (`web_search`, `web_fetch`) — available only when `OLLAMA_API_KEY` is set, phase output inspection (`get_phase_output`), repository listing (`list_repositories`) — queries live config to show all configured repositories, and interactive user questions (`ask_user`) — supports Yes/No, SingleChoice, and MultiChoice questions with optional feedback; full Markdown rendering (Markdig) and chat history persistence across page navigations; **automatic context overflow recovery** — detects `model_max_prompt_tokens_exceeded` errors and auto-resets the session to recover
+- **Composer** — conversational agent for goal decomposition and management with streaming chat UI (`/composer`); uses a persistent SharpCoder session with 8 goal-management tools (`create_goal`, `approve_goal`, `update_goal`, `delete_goal`, `cancel_goal`, `get_goal`, `list_goals`, `search_goals`), 2 release-management tools (`create_release`, `list_releases`), codebase tools (`read_file`, `glob`, `grep`), 5 git tools (`git_log`, `git_diff`, `git_show`, `git_branch`, `git_blame`), 2 web research tools (`web_search`, `web_fetch`) — available only when `OLLAMA_API_KEY` is set, phase output inspection (`get_phase_output` with `content` parameter to retrieve specific output text), repository listing (`list_repositories`) — queries live config to show all configured repositories, and interactive user questions (`ask_user`) — supports Yes/No, SingleChoice, and MultiChoice questions with optional feedback; full Markdown rendering (Markdig) and chat history persistence across page navigations; **automatic context overflow recovery** — detects `model_max_prompt_tokens_exceeded` errors and auto-resets the session to recover
 - **Sequential goal processing** — goals process one at a time so the Brain accumulates context across goals
 - **Worker utilization metrics** — `GET /health/utilization` endpoint provides per-role worker utilization and bottleneck detection
 - **Self-improvement loop** — the improver modifies `agents.md` based on accumulated metrics
-- **SQLite persistence** — `PipelineStore` with auto-migration for pipeline state; `SqliteGoalStore` as the primary source of truth for goals with full CRUD, search, and iteration history
+- **SQLite persistence** — `PipelineStore` with auto-migration for pipeline state; `SqliteGoalStore` as the primary source of truth for goals with full CRUD, search, and iteration history; `SqliteReleaseStore` for release entities with full CRUD
 - **Goals REST API** — `GET/POST/PATCH/DELETE /api/goals`, `GET /api/goals/{id}`, `GET /api/goals/search?q=…&status=…`, `POST /api/goals/{id}/cancel`
-- **Dashboard** — Blazor Server UI with goals browser (filterable/searchable by status, priority, and repository), goal detail with iteration timeline and dependency visualization, worker status (including actual model being used per task with premium tier display), orchestrator view (Brain + Composer stats, with Reset Brain Session button), live logs, and configuration; configuration page displays `hive-config.yaml` with YAML syntax highlighting (keys, comments, booleans, numbers)
+- **Releases REST API** — `GET/POST/PATCH/DELETE /api/releases`, `GET /api/releases/{id}`; release statuses follow the lifecycle **Planning → In Progress → Released**; goals can be assigned to a release via the API or the Composer
+- **Dashboard** — Blazor Server UI with goals browser (filterable/searchable by status, priority, and repository), goal detail with iteration timeline and dependency visualization, **Releases page** (list all releases with status and goal count; detail page showing assigned goals and progress), release assignment visible on the Goals page, worker status (including actual model being used per task with premium tier display), orchestrator view (Brain + Composer stats, with Reset Brain Session button), live logs, and configuration; configuration page displays `hive-config.yaml` with YAML syntax highlighting (keys, comments, booleans, numbers); nav bar and footer display the running **CopilotHive version** sourced from assembly metadata
 - **Config repo** — externalized agent instructions and goals (`CopilotHive-Config`)
 - **Multi-repo goal support** — goals can target any accessible Git repository
 - **Per-role model selection** — assign different LLM models to each worker type
@@ -205,6 +206,12 @@ goals:
 - **Visible Planning phase in iteration timeline** — the Goal Detail page shows the Brain's planning phase as a distinct phase box (active when planning, completed once plan is determined), with the plan's reasoning displayed below the phase bar for transparency
 - **Inline prompt display** — Brain prompts and worker prompts are shown inline within each phase on the Goal Detail page, using tagged `ConversationEntry` metadata; prompts appear as collapsible sections (Brain Prompt muted, Worker Prompt with role name) above Worker Output, with Planning Prompt/Response shown for the planning phase
 - **Conversation entry metadata** — `ConversationEntry` tracks iteration number and purpose for each conversation entry (planning, craft-prompt, worker-output, error), enabling analysis of conversation history by iteration without heuristic parsing
+- **Release Management** — releases are first-class entities with a full CRUD REST API (`/api/releases`) and SQLite persistence (`SqliteReleaseStore`). Goals can be assigned to a release; the release tracks status (**Planning → In Progress → Released**) and aggregates goal counts per status. The Composer exposes `create_release` and `list_releases` tools for conversational release planning. The Dashboard includes a **Releases page** listing all releases with status badges and goal counts, plus a detail page per release showing assigned goals and progress.
+- **Worker Session Persistence** — SharpCoder `AgentSession` objects are persisted per-role on the orchestrator via two new gRPC RPCs (`GetSession` / `SaveSession`). Sessions are stored in SQLite as part of `GoalPipeline`, allowing workers to resume from the same session context across orchestrator restarts without losing conversation history.
+- **GoalScope** — goals carry a `scope` field (`Patch` / `Feature` / `Breaking`) that communicates the intended impact to workers. The reviewer enforces scope-appropriate rules (e.g., `Breaking` changes require migration notes and changelog entries). Scope is exposed in all Composer tools that return or accept goal data, and displayed as a badge on the Goals page and goal detail page in the Dashboard.
+- **Conditional Doc Writing** — the Brain inspects the goal description and decides at planning time whether the DocWriting phase is needed. Goals that don't affect user-facing behaviour or public APIs skip the phase entirely, reducing pipeline duration. The decision is recorded in iteration metadata and visible on the Goal Detail page.
+- **Eager Repo Cloning** — at startup, the Brain clones all repositories declared in the config into the local Brain repo store (`{stateDir}/repos/{repoName}`). This ensures file-access tools are immediately available for the first goal without waiting for an on-demand clone, eliminating the cold-start latency that affected the first iteration.
+- **Version Display** — the CopilotHive version (read from assembly `InformationalVersion` metadata) is shown in the Dashboard navigation bar and footer. This makes it easy to verify which build is running without inspecting logs or binary metadata.
 
 ## Contributing
 
