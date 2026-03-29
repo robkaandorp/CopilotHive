@@ -370,7 +370,8 @@ static async Task<int> RunServerAsync(string[] args)
         }
     });
 
-    goalsApi.MapPatch("/{id}/status", async (string id, GoalStatusUpdate update, SqliteGoalStore store) =>
+    goalsApi.MapPatch("/{id}/status", async (string id, GoalStatusUpdate update, SqliteGoalStore store,
+        IBrainRepoManager? repoManager, GoalDispatcher? dispatcher, ILogger<Program> endpointLogger) =>
     {
         try
         {
@@ -380,12 +381,42 @@ static async Task<int> RunServerAsync(string[] args)
             if (existing is null)
                 return Results.NotFound(new { error = $"Goal '{id}' not found." });
 
-            // Only allow Draft↔Pending transitions via the public API
+            // Allowed transitions via the public API:
+            //   Draft ↔ Pending (approve / revert)
+            //   Failed → Draft (retry — resets iteration data and cleans up feature branch)
             var validTransition =
                 (existing.Status == GoalStatus.Draft && status == GoalStatus.Pending) ||
-                (existing.Status == GoalStatus.Pending && status == GoalStatus.Draft);
+                (existing.Status == GoalStatus.Pending && status == GoalStatus.Draft) ||
+                (existing.Status == GoalStatus.Failed && status == GoalStatus.Draft);
             if (!validTransition)
-                return Results.BadRequest(new { error = $"Invalid transition from {existing.Status} to {status}. Only Draft→Pending and Pending→Draft are allowed." });
+                return Results.BadRequest(new { error = $"Invalid transition from {existing.Status} to {status}. Only Draft→Pending, Pending→Draft, and Failed→Draft are allowed." });
+
+            // Failed→Draft: reset iteration data and delete the feature branch (best-effort)
+            if (existing.Status == GoalStatus.Failed && status == GoalStatus.Draft)
+            {
+                await store.ResetGoalIterationDataAsync(id);
+
+                // Clear GoalDispatcher runtime state so the goal can be re-dispatched fresh
+                dispatcher?.ClearGoalRetryState(id);
+
+                if (repoManager is not null)
+                {
+                    var branchName = $"copilothive/{id}";
+                    foreach (var repoName in existing.RepositoryNames)
+                    {
+                        try
+                        {
+                            await repoManager.DeleteRemoteBranchAsync(repoName, branchName);
+                        }
+                        catch (Exception ex)
+                        {
+                            endpointLogger.LogWarning(ex,
+                                "Failed to delete remote branch {Branch} from {Repo} during retry reset",
+                                branchName, repoName);
+                        }
+                    }
+                }
+            }
 
             await store.UpdateGoalStatusAsync(id, status);
             var goal = await store.GetGoalAsync(id);

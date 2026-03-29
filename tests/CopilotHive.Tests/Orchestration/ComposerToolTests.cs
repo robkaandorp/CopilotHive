@@ -327,9 +327,9 @@ public sealed class ComposerToolTests : IDisposable
     }
 
     [Fact]
-    public async Task UpdateGoal_Status_InvalidTransition_FailedToDraft_ReturnsError()
+    public async Task UpdateGoal_Status_ValidTransition_FailedToDraft_Succeeds()
     {
-        // Set goal to Failed directly then try to update to Draft
+        // Failed→Draft is now a valid "retry" transition
         await _composer.CreateGoalAsync("transition-failed1", "Test goal");
         var ct = TestContext.Current.CancellationToken;
         var goal = await _store.GetGoalAsync("transition-failed1", ct);
@@ -339,8 +339,80 @@ public sealed class ComposerToolTests : IDisposable
 
         var result = await _composer.UpdateGoalAsync("transition-failed1", "status", "Draft");
 
-        Assert.Contains("❌", result);
-        Assert.Contains("Invalid transition", result);
+        Assert.Contains("✅", result);
+        Assert.Contains("Draft", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Status_FailedToDraft_ResetsIterationData()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a goal with repositories and set it to Failed with iteration data
+        await _composer.CreateGoalAsync("retry-reset-iter", "Test goal", repositories: "repo-a, repo-b");
+        var goal = await _store.GetGoalAsync("retry-reset-iter", ct);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.Failed;
+        goal.FailureReason = "Worker timed out";
+        goal.Iterations = 3;
+        goal.TotalDurationSeconds = 180.5;
+        goal.StartedAt = new DateTime(2025, 1, 15, 10, 0, 0, DateTimeKind.Utc);
+        goal.CompletedAt = new DateTime(2025, 1, 15, 10, 30, 0, DateTimeKind.Utc);
+        await _store.UpdateGoalAsync(goal, ct);
+
+        // Transition Failed → Draft
+        var result = await _composer.UpdateGoalAsync("retry-reset-iter", "status", "Draft");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("Draft", result);
+
+        // Verify iteration data was cleared
+        var reset = await _store.GetGoalAsync("retry-reset-iter", ct);
+        Assert.NotNull(reset);
+        Assert.Equal(GoalStatus.Draft, reset!.Status);
+        Assert.Null(reset.FailureReason);
+        Assert.Equal(0, reset.Iterations);
+        Assert.Null(reset.TotalDurationSeconds);
+        Assert.Null(reset.StartedAt);
+        Assert.Null(reset.CompletedAt);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Status_FailedToDraft_DeletesRemoteBranchesForAllRepositories()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a goal with repositories
+        await _composer.CreateGoalAsync("retry-branch-cleanup", "Test goal", repositories: "repo-x, repo-y");
+        var goal = await _store.GetGoalAsync("retry-branch-cleanup", ct);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.Failed;
+        await _store.UpdateGoalAsync(goal, ct);
+
+        // Mock the repo manager
+        var mockRepoManager = new Mock<IBrainRepoManager>();
+        mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-x", "copilothive/retry-branch-cleanup", It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask)
+            .Verifiable();
+        mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-y", "copilothive/retry-branch-cleanup", It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask)
+            .Verifiable();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            repoManager: mockRepoManager.Object,
+            stateDir: Path.GetTempPath());
+
+        var result = await composer.UpdateGoalAsync("retry-branch-cleanup", "status", "Draft");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("Draft", result);
+
+        // Verify DeleteRemoteBranchAsync was called for each repository
+        mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-x", "copilothive/retry-branch-cleanup", It.IsAny<CancellationToken>()), Times.Once);
+        mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-y", "copilothive/retry-branch-cleanup", It.IsAny<CancellationToken>()), Times.Once);
     }
 
     // ── update_goal — release field ──
@@ -3282,6 +3354,9 @@ internal sealed class FakeGoalSource : IGoalSource, IGoalStore
 
     public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
+
+    public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) =>
+        Task.CompletedTask;
 }
 
 /// <summary>

@@ -593,6 +593,50 @@ public sealed class SqliteGoalStore : IGoalStore
         return Task.FromResult<IReadOnlyList<ConversationEntry>>(conversation);
     }
 
+    // ── Iteration reset ──────────────────────────────────────────────────
+
+    /// <inheritdoc />
+    public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default)
+    {
+        lock (_lock)
+        {
+            using var tx = _db.BeginTransaction();
+            try
+            {
+                // Clear iteration data on the goals row
+                using var cmd = _db.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = """
+                    UPDATE goals SET
+                        failure_reason        = NULL,
+                        iterations            = 0,
+                        phase_durations       = NULL,
+                        total_duration_seconds = NULL,
+                        started_at            = NULL,
+                        completed_at          = NULL
+                    WHERE id = @id
+                    """;
+                cmd.Parameters.AddWithValue("@id", goalId);
+                var rows = cmd.ExecuteNonQuery();
+                if (rows == 0)
+                    throw new KeyNotFoundException($"Goal '{goalId}' not found in SQLite store.");
+
+                // Delete all iteration summaries (phase outputs included via CASCADE / DELETE)
+                using var deleteIter = _db.CreateCommand();
+                deleteIter.Transaction = tx;
+                deleteIter.CommandText = "DELETE FROM goal_iterations WHERE goal_id = @id";
+                deleteIter.Parameters.AddWithValue("@id", goalId);
+                deleteIter.ExecuteNonQuery();
+
+                tx.Commit();
+            }
+            catch { tx.Rollback(); throw; }
+        }
+
+        _logger.LogInformation("Reset iteration data for goal {GoalId}", goalId);
+        return Task.CompletedTask;
+    }
+
     // ── Internals ────────────────────────────────────────────────────────
 
     private List<Goal> ReadGoalsCore(string sql, params (string name, object value)[] parameters)

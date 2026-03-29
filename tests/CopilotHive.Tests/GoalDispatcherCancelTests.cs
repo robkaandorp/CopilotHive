@@ -3,6 +3,7 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests;
@@ -258,6 +259,139 @@ public sealed class GoalDispatcherCancelTests
 }
 
 /// <summary>
+/// Tests for <see cref="GoalDispatcher.ClearGoalRetryState"/>.
+/// </summary>
+public sealed class GoalDispatcherClearRetryStateTests
+{
+    private static GoalDispatcher CreateDispatcher(
+        GoalManager goalManager,
+        GoalPipelineManager pipelineManager) =>
+        new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
+
+    [Fact]
+    public void ClearGoalRetryState_WithActivePipeline_RemovesPipelineFromManager()
+    {
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Retry goal" };
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Failed);
+
+        var goalManager = new GoalManager();
+        var dispatcher = CreateDispatcher(goalManager, pipelineManager);
+
+        dispatcher.ClearGoalRetryState(goal.Id);
+
+        Assert.Null(pipelineManager.GetByGoalId(goal.Id));
+    }
+
+    [Fact]
+    public void ClearGoalRetryState_WithActivePipeline_AllowsGoalToBeDispatchedAgain()
+    {
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Retry goal" };
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Failed);
+
+        var goalManager = new GoalManager();
+        var dispatcher = CreateDispatcher(goalManager, pipelineManager);
+
+        // Simulate that the goal was previously dispatched by calling cancel (which adds to _dispatchedGoals)
+        // We verify indirectly that the pipeline was removed (state is clear for re-dispatch).
+        dispatcher.ClearGoalRetryState(goal.Id);
+
+        // After clearing, no pipeline exists for the goal
+        Assert.Null(pipelineManager.GetByGoalId(goal.Id));
+    }
+
+    [Fact]
+    public void ClearGoalRetryState_NoPipeline_DoesNotThrow()
+    {
+        var goalManager = new GoalManager();
+        var pipelineManager = new GoalPipelineManager();
+        var dispatcher = CreateDispatcher(goalManager, pipelineManager);
+
+        // Should not throw even when the goal has no pipeline
+        var ex = Record.Exception(() => dispatcher.ClearGoalRetryState("nonexistent-goal"));
+        Assert.Null(ex);
+    }
+
+    [Fact]
+    public async Task ClearGoalRetryState_AfterActualDispatch_AllowsGoalToBeRedispatched()
+    {
+        // This test proves that ClearGoalRetryState actually clears _dispatchedGoals.
+        // _dispatchedGoals is only populated inside the private DispatchNextGoalAsync method,
+        // so we must run the background service loop to populate it, then verify that
+        // after ClearGoalRetryState the same dispatcher can dispatch the goal again.
+        //
+        // Without clearing _dispatchedGoals, the second dispatch loop would silently return
+        // early at the TryAdd guard in DispatchNextGoalAsync, and no second pipeline would form.
+        var logger = new RetryStateCollectingLogger<GoalDispatcher>();
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Retry goal", Status = GoalStatus.Pending };
+        var goalSource = new CancelFakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+
+        var pipelineManager = new GoalPipelineManager();
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            startupDelay: TimeSpan.Zero);
+
+        // Act 1: Run the background service so DispatchNextGoalAsync executes and
+        // populates _dispatchedGoals[goalId]. The goal becomes InProgress after dispatch.
+        using var cts1 = new CancellationTokenSource();
+        using var linked1 = CancellationTokenSource.CreateLinkedTokenSource(
+            cts1.Token, TestContext.Current.CancellationToken);
+        var task1 = dispatcher.StartAsync(linked1.Token);
+        await Task.Delay(200, TestContext.Current.CancellationToken);
+        cts1.Cancel();
+        await Task.WhenAny(task1, Task.Delay(1000, TestContext.Current.CancellationToken));
+
+        // Assert: pipeline was created — this proves _dispatchedGoals was populated by
+        // DispatchNextGoalAsync (the TryAdd guard at line 1439 ran and succeeded).
+        var pipelineAfterFirstDispatch = pipelineManager.GetByGoalId(goal.Id);
+        Assert.NotNull(pipelineAfterFirstDispatch);
+        var firstDispatchLogs = logger.Logs.Count(l => l.Message.Contains($"Dispatching goal '{goal.Id}'"));
+        Assert.Equal(1, firstDispatchLogs);
+
+        // Act 2: Clear retry state — removes _dispatchedGoals entry and stale pipeline.
+        dispatcher.ClearGoalRetryState(goal.Id);
+        goalSource.ResetForRequeue(); // Goal becomes Pending again for re-dispatch.
+
+        // Assert: pipeline was removed by ClearGoalRetryState.
+        Assert.Null(pipelineManager.GetByGoalId(goal.Id));
+
+        // Act 3: Run the SAME dispatcher instance again. Because _dispatchedGoals was cleared,
+        // TryAdd in DispatchNextGoalAsync succeeds and the goal is dispatched a second time.
+        // Without ClearGoalRetryState, TryAdd would fail and no second dispatch log would appear.
+        using var cts2 = new CancellationTokenSource();
+        using var linked2 = CancellationTokenSource.CreateLinkedTokenSource(
+            cts2.Token, TestContext.Current.CancellationToken);
+        var task2 = dispatcher.StartAsync(linked2.Token);
+        await Task.Delay(200, TestContext.Current.CancellationToken);
+        cts2.Cancel();
+        await Task.WhenAny(task2, Task.Delay(1000, TestContext.Current.CancellationToken));
+
+        // Assert: goal was dispatched a second time — proving _dispatchedGoals was cleared.
+        var totalDispatchLogs = logger.Logs.Count(l => l.Message.Contains($"Dispatching goal '{goal.Id}'"));
+        Assert.Equal(2, totalDispatchLogs);
+    }
+}
+
+/// <summary>
 /// Minimal <see cref="IGoalSource"/> and <see cref="IGoalStore"/> used by cancellation tests.
 /// Tracks last status update for assertion.
 /// </summary>
@@ -341,4 +475,49 @@ internal sealed class CancelFakeGoalSource : IGoalSource, IGoalStore
 
     public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
+
+    public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    /// <summary>
+    /// Resets the goal status to Pending so GetPendingGoalsAsync returns it again.
+    /// Used to simulate re-queuing after ClearGoalRetryState.
+    /// </summary>
+    public void ResetForRequeue() => _goal.Status = GoalStatus.Pending;
+}
+
+/// <summary>
+/// Thread-safe logger that collects log messages for assertion in
+/// <see cref="GoalDispatcherClearRetryStateTests"/>.
+/// </summary>
+internal sealed class RetryStateCollectingLogger<T> : ILogger<T>
+{
+    private readonly List<(LogLevel Level, string Message)> _logs = [];
+    private readonly Lock _lock = new();
+
+    /// <summary>All log messages collected so far.</summary>
+    public IReadOnlyList<(LogLevel Level, string Message)> Logs
+    {
+        get { lock (_lock) { return [.. _logs]; } }
+    }
+
+    /// <inheritdoc/>
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+    /// <inheritdoc/>
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    /// <inheritdoc/>
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        lock (_lock)
+        {
+            _logs.Add((logLevel, formatter(state, exception)));
+        }
+    }
 }

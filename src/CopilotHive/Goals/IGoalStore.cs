@@ -71,4 +71,14 @@ public interface IGoalStore : IGoalSource
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The conversation entries, or an empty list if no pipeline exists for this goal.</returns>
     Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Resets all iteration data for a goal so it can be retried from scratch.
+    /// Clears: <c>FailureReason</c>, <c>Iterations</c> (reset to 0), <c>IterationSummaries</c>,
+    /// phase outputs, <c>TotalDurationSeconds</c>, and <c>StartedAt</c>.
+    /// Preserves: ID, Description, Priority, Scope, DependsOn, ReleaseId, RepositoryNames, CreatedAt.
+    /// </summary>
+    /// <param name="goalId">The ID of the goal to reset.</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default);
 }

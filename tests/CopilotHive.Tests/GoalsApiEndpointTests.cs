@@ -399,7 +399,7 @@ public class GoalsApiEndpointTests
     }
 
     [Fact]
-    public async Task PatchGoalStatus_InvalidTransition_FailedToDraft_Returns400()
+    public async Task PatchGoalStatus_ValidTransition_FailedToDraft_Returns200()
     {
         var id = UniqueId();
         await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
@@ -410,6 +410,7 @@ public class GoalsApiEndpointTests
         var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
         Assert.NotNull(goal);
         goal!.Status = GoalStatus.Failed;
+        goal.FailureReason = "Worker timed out";
         await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
 
         var response = await _client.PatchAsync(
@@ -418,9 +419,106 @@ public class GoalsApiEndpointTests
                 Encoding.UTF8, "application/json"),
             TestContext.Current.CancellationToken);
 
-        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
-        Assert.Contains("Invalid transition", body);
+        using var doc = JsonDocument.Parse(body);
+        // Status should now be Draft
+        var statusElement = doc.RootElement.GetProperty("status");
+        var isDraft = statusElement.ValueKind == JsonValueKind.Number
+            ? statusElement.GetInt32() == (int)GoalStatus.Draft
+            : string.Equals(statusElement.GetString(), "Draft", StringComparison.OrdinalIgnoreCase);
+        Assert.True(isDraft, $"Expected status to be Draft but got: {statusElement}");
+    }
+
+    [Fact]
+    public async Task PatchGoalStatus_ValidTransition_FailedToDraft_ResetsIterationData()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        // Set goal to Failed with iteration data
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+            Assert.NotNull(goal);
+            goal!.Status = GoalStatus.Failed;
+            goal.FailureReason = "Build failed";
+            goal.Iterations = 3;
+            goal.TotalDurationSeconds = 120.0;
+            goal.StartedAt = DateTime.UtcNow.AddMinutes(-5);
+            goal.CompletedAt = DateTime.UtcNow;
+            await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
+        }
+
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Draft" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // Verify iteration data was cleared
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var updated = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+            Assert.NotNull(updated);
+            Assert.Equal(GoalStatus.Draft, updated!.Status);
+            Assert.Null(updated.FailureReason);
+            Assert.Equal(0, updated.Iterations);
+            Assert.Null(updated.TotalDurationSeconds);
+            Assert.Null(updated.StartedAt);
+            Assert.Null(updated.CompletedAt);
+        }
+    }
+
+    [Fact]
+    public async Task PatchGoalStatus_FailedToDraft_DeletesRemoteBranchesForAllRepositories()
+    {
+        // Create a mock repo manager that will be injected via DI
+        var mockRepoManager = new Mock<IBrainRepoManager>();
+        mockRepoManager.Setup(r => r.WorkDirectory).Returns(Path.GetTempPath());
+        mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-a", It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask)
+            .Verifiable();
+        mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-b", It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask)
+            .Verifiable();
+
+        // Create a new factory with the mock
+        using var factory = new HiveTestFactory { MockRepoManager = mockRepoManager.Object };
+        using var client = factory.CreateClient();
+
+        var id = UniqueId();
+        // Create goal with repositories
+        await client.PostAsync("/api/goals", GoalJson(id, "Test goal", "repo-a, repo-b"), TestContext.Current.CancellationToken);
+
+        // Set goal to Failed status
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+            Assert.NotNull(goal);
+            goal!.Status = GoalStatus.Failed;
+            await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
+        }
+
+        // Transition Failed → Draft (should delete remote branches)
+        var response = await client.PatchAsync(
+            $"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Draft" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        // Should succeed
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // Verify DeleteRemoteBranchAsync was called for each repository with the correct branch name
+        var expectedBranchName = $"copilothive/{id}";
+        mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-a", expectedBranchName, It.IsAny<CancellationToken>()), Times.Once);
+        mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-b", expectedBranchName, It.IsAny<CancellationToken>()), Times.Once);
     }
 
     // ── DELETE /api/goals/{id} ────────────────────────────────────────────

@@ -149,6 +149,20 @@ public sealed class GoalDispatcher : BackgroundService
         _redispatchQueue.Enqueue(goalId);
     }
 
+    /// <summary>
+    /// Clears all dispatcher runtime state for a goal that is being retried (Failed→Draft).
+    /// Removes the goal from <see cref="_dispatchedGoals"/> so it can be dispatched again,
+    /// and removes the stale pipeline from the <see cref="GoalPipelineManager"/> so the
+    /// dispatcher does not see an active pipeline blocking new goal dispatch.
+    /// </summary>
+    /// <param name="goalId">The goal being retried.</param>
+    public void ClearGoalRetryState(string goalId)
+    {
+        _dispatchedGoals.TryRemove(goalId, out _);
+        _pipelineManager.RemovePipeline(goalId);
+        _logger.LogInformation("Cleared dispatcher retry state for goal {GoalId}", goalId);
+    }
+
     /// <inheritdoc/>
     /// <summary>
     /// Handles a question from a worker tool call by routing it to the Brain.

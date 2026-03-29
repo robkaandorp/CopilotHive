@@ -939,4 +939,93 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
 
         Assert.Empty(conversation);
     }
+
+    // ── ResetGoalIterationDataAsync ────────────────────────────────────────
+
+    [Fact]
+    public async Task ResetGoalIterationData_ClearsIterationFieldsAndDeletesIterations()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = MakeGoal("reset-iter-goal");
+        await _store.CreateGoalAsync(goal, ct);
+
+        // Set iteration data
+        var created = await _store.GetGoalAsync("reset-iter-goal", ct);
+        Assert.NotNull(created);
+        created!.Status = GoalStatus.Failed;
+        created.FailureReason = "Build failed";
+        created.Iterations = 5;
+        created.TotalDurationSeconds = 1234.5;
+        created.StartedAt = new DateTime(2025, 1, 15, 10, 0, 0, DateTimeKind.Utc);
+        created.CompletedAt = new DateTime(2025, 1, 15, 11, 0, 0, DateTimeKind.Utc);
+        await _store.UpdateGoalAsync(created, ct);
+
+        // Add an iteration summary
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 45.2 }],
+            TestCounts = new TestCounts { Total = 10, Passed = 10, Failed = 0 },
+            ReviewVerdict = "approve",
+        };
+        await _store.AddIterationAsync("reset-iter-goal", summary, ct);
+
+        // Reset
+        await _store.ResetGoalIterationDataAsync("reset-iter-goal", ct);
+
+        // Verify all iteration fields are cleared
+        var reset = await _store.GetGoalAsync("reset-iter-goal", ct);
+        Assert.NotNull(reset);
+        Assert.Null(reset!.FailureReason);
+        Assert.Equal(0, reset.Iterations);
+        Assert.Null(reset.TotalDurationSeconds);
+        Assert.Null(reset.StartedAt);
+        Assert.Null(reset.CompletedAt);
+        Assert.Empty(reset.IterationSummaries);
+
+        // Status remains unchanged (Failed)
+        Assert.Equal(GoalStatus.Failed, reset.Status);
+    }
+
+    [Fact]
+    public async Task ResetGoalIterationData_PreservesAllNonIterationFields()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = new Goal
+        {
+            Id = "preserve-fields-goal",
+            Description = "Original description",
+            Priority = GoalPriority.High,
+            Scope = GoalScope.Feature,
+            Status = GoalStatus.Pending,
+            DependsOn = ["goal-1", "goal-2"],
+            ReleaseId = "v1.0.0",
+            RepositoryNames = ["repo-a", "repo-b"],
+            CreatedAt = new DateTime(2025, 1, 15, 10, 0, 0, DateTimeKind.Utc),
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        // Reset (even though no iteration data set)
+        await _store.ResetGoalIterationDataAsync("preserve-fields-goal", ct);
+
+        // Verify all non-iteration fields preserved
+        var reset = await _store.GetGoalAsync("preserve-fields-goal", ct);
+        Assert.NotNull(reset);
+        Assert.Equal("preserve-fields-goal", reset!.Id);
+        Assert.Equal("Original description", reset.Description);
+        Assert.Equal(GoalPriority.High, reset.Priority);
+        Assert.Equal(GoalScope.Feature, reset.Scope);
+        Assert.Equal(GoalStatus.Pending, reset.Status);
+        Assert.Equal(["goal-1", "goal-2"], reset.DependsOn);
+        Assert.Equal("v1.0.0", reset.ReleaseId);
+        Assert.Equal(["repo-a", "repo-b"], reset.RepositoryNames);
+        Assert.Equal(new DateTime(2025, 1, 15, 10, 0, 0, DateTimeKind.Utc), reset.CreatedAt);
+    }
+
+    [Fact]
+    public async Task ResetGoalIterationData_GoalNotFound_Throws()
+    {
+        await Assert.ThrowsAsync<KeyNotFoundException>(() =>
+            _store.ResetGoalIterationDataAsync("nonexistent-goal", TestContext.Current.CancellationToken));
+    }
 }
