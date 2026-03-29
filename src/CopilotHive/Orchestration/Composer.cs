@@ -872,15 +872,15 @@ public sealed class Composer : IAsyncDisposable
         {
             var conversation = await _goalStore.GetPipelineConversationAsync(id);
             if (conversation.Count == 0)
-                return $"No pipeline conversation available for goal '{id}'.";
+                return $"No pipeline conversation is available for goal '{id}' (requested: {content} for phase '{phase}', iteration {iteration}).";
 
             var craftPrompts = DashboardStateService.ExtractCraftPrompts(conversation, iteration);
             if (!craftPrompts.TryGetValue(rolePrefix, out var prompts))
-                return $"No {content.Replace('_', ' ')} found for phase {phase} in iteration {iteration}.";
+                return $"No {content.Replace('_', ' ')} is available for phase '{phase}' in iteration {iteration} of goal '{id}'.";
 
             var promptText = content == "brain_prompt" ? prompts.BrainPrompt : prompts.WorkerPrompt;
             if (string.IsNullOrEmpty(promptText))
-                return $"No {content.Replace('_', ' ')} found for phase {phase} in iteration {iteration}.";
+                return $"No {content.Replace('_', ' ')} is available for phase '{phase}' in iteration {iteration} of goal '{id}'.";
 
             var promptLines = promptText.Split('\n');
             if (promptLines.Length <= max_lines)

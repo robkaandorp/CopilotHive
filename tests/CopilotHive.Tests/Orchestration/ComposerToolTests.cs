@@ -1115,7 +1115,7 @@ public sealed class ComposerToolTests : IDisposable
         // Without PipelineStore wired, there's no conversation to retrieve
         var result = await _composer.GetPhaseOutputAsync("no-pipeline", 1, "Coding", content: "brain_prompt");
 
-        Assert.Contains("No pipeline conversation available", result);
+        Assert.Contains("No pipeline conversation is available for goal 'no-pipeline'", result);
     }
 
     [Fact]
@@ -1127,7 +1127,7 @@ public sealed class ComposerToolTests : IDisposable
 
         var result = await _composer.GetPhaseOutputAsync("no-pipeline-wp", 1, "Coding", content: "worker_prompt");
 
-        Assert.Contains("No pipeline conversation available", result);
+        Assert.Contains("No pipeline conversation is available for goal 'no-pipeline-wp'", result);
     }
 
     // ── GetPhaseOutputAsync with PipelineStore for brain_prompt/worker_prompt ──
@@ -1225,7 +1225,7 @@ public sealed class ComposerToolTests : IDisposable
         // Request brain_prompt for Review phase - should fail as no craft-prompt for reviewer
         var result = await composerWithPipeline.GetPhaseOutputAsync("partial-prompt-goal", 1, "Review", content: "brain_prompt");
 
-        Assert.Contains("No brain prompt found", result);
+        Assert.Contains("No brain prompt is available for phase 'Review' in iteration 1 of goal 'partial-prompt-goal'", result);
     }
 
     [Fact]
