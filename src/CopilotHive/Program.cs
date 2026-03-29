@@ -554,6 +554,8 @@ static void PrintBanner()
                              ██║  ██║██║ ╚████╔╝ ███████╗
                              ╚═╝  ╚═╝╚═╝  ╚═══╝  ╚══════╝
         """);
+    var version = CopilotHive.Services.VersionHelper.InformationalVersion;
+    Console.WriteLine($"CopilotHive v{version}");
     Console.WriteLine($"Started at {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC");
 }
 

@@ -1,3 +1,4 @@
+using System.Reflection;
 using Grpc.Core;
 using Microsoft.Extensions.Logging;
 using CopilotHive.Agents;
@@ -41,7 +42,7 @@ public sealed class HiveOrchestratorService(
             return Task.FromResult(new RegisterResponse
             {
                 Accepted = true,
-                OrchestratorVersion = Constants.OrchestratorVersion,
+                OrchestratorVersion = VersionHelper.InformationalVersion,
                 AssignedWorkerId = workerId,
             });
         }
@@ -51,7 +52,7 @@ public sealed class HiveOrchestratorService(
             return Task.FromResult(new RegisterResponse
             {
                 Accepted = false,
-                OrchestratorVersion = Constants.OrchestratorVersion,
+                OrchestratorVersion = VersionHelper.InformationalVersion,
                 AssignedWorkerId = workerId,
             });
         }
@@ -420,4 +421,21 @@ public sealed class HiveOrchestratorService(
         });
     }
 
+}
+
+/// <summary>
+/// Provides the assembly informational version for use at runtime without hardcoded strings.
+/// </summary>
+internal static class VersionHelper
+{
+    /// <summary>
+    /// Gets the informational version from <see cref="AssemblyInformationalVersionAttribute"/>,
+    /// falling back to the assembly version or <c>"unknown"</c> if neither is available.
+    /// </summary>
+    public static readonly string InformationalVersion =
+        Assembly.GetExecutingAssembly()
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+            ?.InformationalVersion
+        ?? Assembly.GetExecutingAssembly().GetName().Version?.ToString()
+        ?? "unknown";
 }
