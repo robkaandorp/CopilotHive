@@ -3,6 +3,7 @@
 @inject IGoalStore GoalStore
 @inject NavigationManager Nav
 @inject HttpClient HttpClient
+@inject CopilotHive.Configuration.HiveConfigFile? HiveConfig
 
 <h1>Releases</h1>
 
@@ -47,7 +48,7 @@
                 <select @bind="_createRepo"
                         style="padding:0.5rem 0.75rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem">
                     <option value="">— none —</option>
-                    @foreach (var r in _allRepoNames)
+                    @foreach (var r in _configuredRepoNames)
                     {
                         <option value="@r">@r</option>
                     }
@@ -152,6 +153,11 @@ else if (_loaded)
     private List<string> _allRepoNames => _allReleases
         .SelectMany(r => r.RepositoryNames)
         .Distinct(StringComparer.OrdinalIgnoreCase)
+        .OrderBy(r => r, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    private List<string> _configuredRepoNames => (HiveConfig?.Repositories ?? [])
+        .Select(r => r.Name)
         .OrderBy(r => r, StringComparer.OrdinalIgnoreCase)
         .ToList();
 
