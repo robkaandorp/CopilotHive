@@ -231,6 +231,9 @@ public sealed class BrainRepoManagerTests : IDisposable
         Git(stagingDir, "remote", "add", "origin", remoteDir);
         Git(stagingDir, "push", "origin", "main");
 
+        // Get the commit SHA from the remote
+        var expectedSha = GitOutput(stagingDir, "rev-parse", "HEAD").Trim();
+
         // Clone from the populated remote
         var reposDir = Path.Combine(_tempDir, "repos");
         Directory.CreateDirectory(reposDir);
@@ -251,10 +254,18 @@ public sealed class BrainRepoManagerTests : IDisposable
         Assert.DoesNotContain(logger.LogEntries, e =>
             e.LogLevel == LogLevel.Warning &&
             e.Message.Contains("skipping checkout/reset"));
+
+        // Verify HEAD is on the expected branch
+        var headBranch = GitOutput(clonePath, "rev-parse", "--abbrev-ref", "HEAD").Trim();
+        Assert.Equal("main", headBranch);
+
+        // Verify the working tree is at the expected commit
+        var headSha = GitOutput(clonePath, "rev-parse", "HEAD").Trim();
+        Assert.Equal(expectedSha, headSha);
     }
 
     [Fact]
-    public async Task MergeFeatureBranchAsync_EmptyRemote_ThrowsWithClearMessage()
+    public async Task MergeFeatureBranchAsync_EmptyRemote_ReturnsEmptyWithoutThrowing()
     {
         // Arrange: create a bare remote with no commits (empty)
         var ct = TestContext.Current.CancellationToken;
@@ -270,18 +281,20 @@ public sealed class BrainRepoManagerTests : IDisposable
         Git(clonePath, "config", "user.email", "test@test.com");
         Git(clonePath, "config", "user.name", "Test");
 
-        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        var logger = new TestLogger<BrainRepoManager>();
+        var manager = new BrainRepoManager(_tempDir, logger);
 
         // Act
-        var ex = await Record.ExceptionAsync(() =>
-            manager.MergeFeatureBranchAsync("empty-repo2", "copilothive/feat", "main", "msg", ct));
+        string? result = null;
+        var ex = await Record.ExceptionAsync(async () =>
+            result = await manager.MergeFeatureBranchAsync("empty-repo2", "copilothive/feat", "main", "msg", ct));
 
-        // Assert: must throw with the expected message indicating empty repository
-        Assert.NotNull(ex);
-        var ioe = Assert.IsType<InvalidOperationException>(ex);
-        Assert.Contains("empty-repo2", ioe.Message);
-        Assert.Contains("main", ioe.Message);
-        Assert.Contains("empty repository", ioe.Message);
+        // Assert: should NOT throw — returns empty string and logs a warning
+        Assert.Null(ex);
+        Assert.Equal(string.Empty, result);
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message.Contains("empty repository"));
     }
 
     private static string InitTempGitRepoWithRemote(string basePath, string repoName)
