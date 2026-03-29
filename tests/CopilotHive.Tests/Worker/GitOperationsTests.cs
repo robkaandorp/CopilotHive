@@ -56,21 +56,36 @@ public sealed class GitOperationsTests : IAsyncLifetime
     [Fact]
     public async Task CreateBranchAsync_OnEmptyRepo_CreatesOrphanBranch()
     {
-        // Act — the repo has no commits so checking out 'main' would fail
-        await GitOperations.CreateBranchAsync(_repoDir, "feature", "main", CancellationToken.None);
+        // Discover the actual default branch name from git config
+        var (_, symRefOut, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "symbolic-ref --short HEAD", CancellationToken.None);
+        var defaultBranch = symRefOut.Trim();
 
-        // Assert — verify we are now on the new orphan branch
+        // Act — the repo has no commits so checking out the default branch would fail
+        await GitOperations.CreateBranchAsync(_repoDir, "feature", defaultBranch, CancellationToken.None);
+
+        // Assert 1 — verify we are now on the new orphan branch
         var (_, stdout, _) = await GitOperations.RunGitCommandAsync(
             _repoDir, "branch --show-current", CancellationToken.None);
-
         Assert.Equal("feature", stdout.Trim());
+
+        // Assert 2 — add a commit and verify it has NO parent (orphan branch characteristic)
+        await CommitFileAsync("orphan.txt", "orphan content");
+        var (_, parentOutput, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "log --format=%P", CancellationToken.None);
+        Assert.Equal(string.Empty, parentOutput.Trim());
     }
 
     [Fact]
     public async Task CreateBranchAsync_OnEmptyRepo_OrphanBranchIsRealOrphan()
     {
+        // Discover the actual default branch name from git config
+        var (_, symRefOut, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "symbolic-ref --short HEAD", CancellationToken.None);
+        var defaultBranch = symRefOut.Trim();
+
         // Arrange — create orphan branch on empty repo
-        await GitOperations.CreateBranchAsync(_repoDir, "feature/test", "develop", CancellationToken.None);
+        await GitOperations.CreateBranchAsync(_repoDir, "feature/test", defaultBranch, CancellationToken.None);
 
         // Add a file and commit so the branch actually appears in git refs
         await CommitFileAsync("orphan.txt", "orphan content");
@@ -89,8 +104,13 @@ public sealed class GitOperationsTests : IAsyncLifetime
     [Fact]
     public async Task CreateBranchAsync_OnEmptyRepo_CreatesOrphanBranchWithNoParentCommits()
     {
+        // Discover the actual default branch name from git config
+        var (_, symRefOut, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "symbolic-ref --short HEAD", CancellationToken.None);
+        var defaultBranch = symRefOut.Trim();
+
         // Act - create orphan branch on empty repo
-        await GitOperations.CreateBranchAsync(_repoDir, "feature/test", "main", CancellationToken.None);
+        await GitOperations.CreateBranchAsync(_repoDir, "feature/test", defaultBranch, CancellationToken.None);
 
         // Assert - verify the branch has no parent commits (git log returns empty or error)
         var (_, stdout, _) = await GitOperations.RunGitCommandAsync(
@@ -104,8 +124,13 @@ public sealed class GitOperationsTests : IAsyncLifetime
     [Fact]
     public async Task CreateBranchAsync_OnEmptyRepo_CreatesCommitableOrphanBranch()
     {
+        // Discover the actual default branch name from git config
+        var (_, symRefOut, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "symbolic-ref --short HEAD", CancellationToken.None);
+        var defaultBranch = symRefOut.Trim();
+
         // Arrange - create orphan branch on empty repo
-        await GitOperations.CreateBranchAsync(_repoDir, "feature/test", "main", CancellationToken.None);
+        await GitOperations.CreateBranchAsync(_repoDir, "feature/test", defaultBranch, CancellationToken.None);
 
         // Act - add a file and commit on the orphan branch
         await CommitFileAsync("newfile.txt", "content");
