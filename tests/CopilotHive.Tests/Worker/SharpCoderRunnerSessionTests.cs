@@ -135,6 +135,27 @@ public sealed class SharpCoderRunnerSessionTests
             Directory.Delete(workDir, recursive: true);
         }
     }
+
+    /// <summary>
+    /// <see cref="SharpCoderRunner.ResetSessionAsync"/> must clear <c>_session</c> to <c>null</c>
+    /// so that subsequent prompts start with a fresh session instead of leaking stale context.
+    /// </summary>
+    [Fact]
+    public async Task ResetSessionAsync_ClearsSession()
+    {
+        var runner = CreateRunner();
+        var session = AgentSession.Create("session-to-clear");
+
+        // Pre-condition: session is set
+        runner.SetSession(session);
+        Assert.NotNull(runner.GetSession());
+
+        // Act
+        await runner.ResetSessionAsync(ct: TestContext.Current.CancellationToken);
+
+        // Assert: session must be null after reset
+        Assert.Null(runner.GetSession());
+    }
 }
 
 /// <summary>

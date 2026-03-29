@@ -93,6 +93,7 @@ public sealed class SharpCoderRunner : IAgentRunner
         _log.Info($"Resetting session. Requested model: {model ?? "default"}");
         _chatClient?.Dispose();
         _chatClient = CreateChatClient(model);
+        _session = null;
         return Task.CompletedTask;
     }
 

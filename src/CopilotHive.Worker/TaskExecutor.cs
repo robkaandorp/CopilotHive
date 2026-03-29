@@ -373,6 +373,7 @@ public sealed class TaskExecutor(
         }
         catch (Exception ex)
         {
+            if (ex is OperationCanceledException) throw;
             _log.Warn($"Failed to load session '{sessionId}': {ex.Message} — starting fresh");
             agentRunner.SetSession(null);
         }
@@ -399,6 +400,7 @@ public sealed class TaskExecutor(
         }
         catch (Exception ex)
         {
+            if (ex is OperationCanceledException) throw;
             _log.Warn($"Failed to save session '{sessionId}': {ex.Message}");
         }
     }

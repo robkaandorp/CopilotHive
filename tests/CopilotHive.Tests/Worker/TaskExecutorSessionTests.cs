@@ -33,6 +33,12 @@ public sealed class TaskExecutorSessionTests
         /// <summary>If set to true, <see cref="SaveSessionAsync"/> throws an exception.</summary>
         public bool SaveShouldFail { get; set; }
 
+        /// <summary>If set to true, <see cref="GetSessionAsync"/> throws <see cref="OperationCanceledException"/>.</summary>
+        public bool GetShouldThrowCancelled { get; set; }
+
+        /// <summary>If set to true, <see cref="SaveSessionAsync"/> throws <see cref="OperationCanceledException"/>.</summary>
+        public bool SaveShouldThrowCancelled { get; set; }
+
         /// <summary>Number of times <see cref="GetSessionAsync"/> was called.</summary>
         public int GetCallCount { get; private set; }
 
@@ -52,6 +58,7 @@ public sealed class TaskExecutorSessionTests
         public Task<string?> GetSessionAsync(string sessionId, CancellationToken ct)
         {
             GetCallCount++;
+            if (GetShouldThrowCancelled) throw new OperationCanceledException("Simulated cancellation during GetSession");
             if (GetShouldFail) throw new InvalidOperationException("Simulated GetSession failure");
             _store.TryGetValue(sessionId, out var json);
             return Task.FromResult<string?>(json);
@@ -61,6 +68,7 @@ public sealed class TaskExecutorSessionTests
         public Task SaveSessionAsync(string sessionId, string sessionJson, CancellationToken ct)
         {
             SaveCallCount++;
+            if (SaveShouldThrowCancelled) throw new OperationCanceledException("Simulated cancellation during SaveSession");
             if (SaveShouldFail) throw new InvalidOperationException("Simulated SaveSession failure");
             _store[sessionId] = sessionJson;
             LastSavedSessionId = sessionId;
@@ -339,5 +347,47 @@ public sealed class TaskExecutorSessionTests
         Assert.NotNull(sessionClient.LastSavedJson);
         var restored = JsonSerializer.Deserialize<AgentSession>(sessionClient.LastSavedJson!, AIJsonUtilities.DefaultOptions);
         Assert.NotNull(restored);
+    }
+
+    /// <summary>
+    /// When <see cref="ISessionClient.GetSessionAsync"/> throws <see cref="OperationCanceledException"/>,
+    /// the exception must propagate instead of being swallowed by the graceful fallback handler.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_WhenGetSessionThrowsCancelled_PropagatesCancellation()
+    {
+        // Arrange
+        var sessionClient = new FakeSessionClient { GetShouldThrowCancelled = true };
+        var agentRunner = new SessionTrackingAgentRunner();
+        var executor = new TaskExecutor(agentRunner, gitOperations: new NoOpGitOperations(), sessionClient: sessionClient);
+        var task = BuildTask("goal-8:Coder");
+
+        // Act & Assert — OperationCanceledException must propagate
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => executor.ExecuteAsync(task, TestContext.Current.CancellationToken));
+    }
+
+    /// <summary>
+    /// When <see cref="ISessionClient.SaveSessionAsync"/> throws <see cref="OperationCanceledException"/>,
+    /// the exception must propagate instead of being swallowed by the graceful fallback handler.
+    /// Since <c>SaveSessionAsync</c> is called inside the outer try-catch of <c>ExecuteAsync</c>,
+    /// the propagated exception is caught by the outer <c>OperationCanceledException</c> handler,
+    /// resulting in a <see cref="TaskOutcome.Failed"/> result — not a <see cref="TaskOutcome.Completed"/> one.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_WhenSaveSessionThrowsCancelled_PropagatesCancellation()
+    {
+        // Arrange
+        var sessionClient = new FakeSessionClient { SaveShouldThrowCancelled = true };
+        var agentRunner = new SessionTrackingAgentRunner();
+        var executor = new TaskExecutor(agentRunner, gitOperations: new NoOpGitOperations(), sessionClient: sessionClient);
+        var task = BuildTask("goal-9:Coder");
+
+        // Act — SaveSessionAsync re-throws OCE; the outer OperationCanceledException catch handles it
+        var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        // Assert — must NOT be Completed because cancellation was not swallowed;
+        // the outer OCE handler without ct.IsCancellationRequested returns Failed
+        Assert.Equal(TaskOutcome.Failed, result.Status);
     }
 }
