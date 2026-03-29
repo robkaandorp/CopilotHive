@@ -1228,6 +1228,30 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("No brain prompt is available for phase 'Review' in iteration 1 of goal 'partial-prompt-goal'", result);
     }
 
+    [Theory]
+    [InlineData("brain")]
+    [InlineData("promptt")]
+    [InlineData("worker")]
+    [InlineData("Brain_Prompt")]
+    [InlineData("invalid")]
+    [InlineData("")]
+    public async Task GetPhaseOutput_InvalidContent_ReturnsValidationError(string invalidContent)
+    {
+        await _composer.CreateGoalAsync("invalid-content", "Goal for invalid content test");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 5.0, WorkerOutput = "should not see this" }],
+        };
+        var ct = TestContext.Current.CancellationToken;
+        await _store.AddIterationAsync("invalid-content", summary, ct);
+
+        var result = await _composer.GetPhaseOutputAsync("invalid-content", 1, "Coding", content: invalidContent);
+
+        Assert.Contains($"Invalid content '{invalidContent}'. Valid values: output, brain_prompt, worker_prompt.", result);
+        Assert.DoesNotContain("should not see this", result);
+    }
+
     [Fact]
     public void BuildComposerTools_IncludesGetPhaseOutput()
     {

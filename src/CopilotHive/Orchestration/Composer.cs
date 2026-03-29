@@ -867,7 +867,11 @@ public sealed class Composer : IAsyncDisposable
         if (!PhaseOutputKeys.TryGetValue(phase, out var rolePrefix))
             return $"Unknown phase '{phase}'. Supported phases: Coding, Testing, Review, DocWriting, Improve.";
 
-        // 3. Handle brain_prompt / worker_prompt via pipeline conversation
+        // 3. Validate content parameter
+        if (content is not "output" and not "brain_prompt" and not "worker_prompt")
+            return $"Invalid content '{content}'. Valid values: output, brain_prompt, worker_prompt.";
+
+        // 4. Handle brain_prompt / worker_prompt via pipeline conversation
         if (content is "brain_prompt" or "worker_prompt")
         {
             var conversation = await _goalStore.GetPipelineConversationAsync(id);
@@ -890,24 +894,24 @@ public sealed class Composer : IAsyncDisposable
             return truncatedPrompt + $"\n... (truncated, {promptLines.Length} lines total)";
         }
 
-        // 4. Fetch goal (output mode)
+        // 5. Fetch goal (output mode)
         var goal = await _goalStore.GetGoalAsync(id);
         if (goal is null)
             return "Goal not found";
 
-        // 5. Fetch iterations and find the requested iteration
+        // 6. Fetch iterations and find the requested iteration
         var iterations = await _goalStore.GetIterationsAsync(id);
         var iterSummary = iterations.FirstOrDefault(i => i.Iteration == iteration);
         if (iterSummary is null)
             return $"Iteration {iteration} not found";
 
-        // 6. Find the phase in the iteration
+        // 7. Find the phase in the iteration
         var phaseResult = iterSummary.Phases
             .FirstOrDefault(p => p.Name.Equals(phase, StringComparison.OrdinalIgnoreCase));
         if (phaseResult is null)
             return $"Phase '{phase}' not found in iteration {iteration}";
 
-        // 7. Check worker output, then fall back to PhaseOutputs dictionary
+        // 8. Check worker output, then fall back to PhaseOutputs dictionary
         string? output = phaseResult.WorkerOutput;
 
         if (string.IsNullOrEmpty(output))
