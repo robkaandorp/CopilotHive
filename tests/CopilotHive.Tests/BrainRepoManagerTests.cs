@@ -242,10 +242,14 @@ public sealed class BrainRepoManagerTests : IDisposable
         Git(clonePath, "config", "user.email", "test@test.com");
         Git(clonePath, "config", "user.name", "Test");
 
+        // Put the clone into a DIFFERENT state so EnsureCloneAsync must actually do work:
+        // switch to a new local branch "other" so HEAD is no longer on "main".
+        Git(clonePath, "checkout", "-b", "other");
+
         var logger = new TestLogger<BrainRepoManager>();
         var manager = new BrainRepoManager(_tempDir, logger);
 
-        // Act
+        // Act: EnsureCloneAsync must checkout main and reset to origin/main
         var ex = await Record.ExceptionAsync(() =>
             manager.EnsureCloneAsync("populated-repo", remoteDir, "main", ct));
 
@@ -255,11 +259,11 @@ public sealed class BrainRepoManagerTests : IDisposable
             e.LogLevel == LogLevel.Warning &&
             e.Message.Contains("skipping checkout/reset"));
 
-        // Verify HEAD is on the expected branch
+        // Verify HEAD is back on "main" (checkout was actually performed)
         var headBranch = GitOutput(clonePath, "rev-parse", "--abbrev-ref", "HEAD").Trim();
         Assert.Equal("main", headBranch);
 
-        // Verify the working tree is at the expected commit
+        // Verify the working tree is at the expected origin/main commit (reset was performed)
         var headSha = GitOutput(clonePath, "rev-parse", "HEAD").Trim();
         Assert.Equal(expectedSha, headSha);
     }
