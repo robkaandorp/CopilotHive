@@ -23,6 +23,7 @@ public static class GrpcMapper
             Prompt = task.Prompt,
             Role = ToGrpcRole(task.Role),
             Model = task.Model,
+            SessionId = task.SessionId,
         };
         foreach (var repo in task.Repositories)
         {
@@ -137,6 +138,7 @@ public static class GrpcMapper
             Prompt = assignment.Prompt,
             Role = ToDomainRole(assignment.Role),
             Model = assignment.Model,
+            SessionId = assignment.SessionId,
             BranchInfo = assignment.BranchInfo is not null ? ToDomain(assignment.BranchInfo) : null,
             Repositories = [.. assignment.Repositories.Select(r => new TargetRepository
             {

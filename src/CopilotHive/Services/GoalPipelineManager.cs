@@ -115,7 +115,9 @@ public sealed class GoalPipelineManager
     }
 
     /// <summary>
-    /// Stores the session JSON for the specified role in a goal's pipeline.
+    /// Stores the session JSON for the specified role in a goal's pipeline,
+    /// then flushes the updated pipeline state to the persistent store so sessions
+    /// survive orchestrator restarts.
     /// Does nothing if the goal pipeline does not exist.
     /// </summary>
     /// <param name="goalId">The goal whose pipeline to update.</param>
@@ -124,6 +126,9 @@ public sealed class GoalPipelineManager
     public void SetRoleSession(string goalId, string roleName, string sessionJson)
     {
         var pipeline = GetByGoalId(goalId);
-        pipeline?.SetRoleSession(roleName, sessionJson);
+        if (pipeline is null) return;
+
+        pipeline.SetRoleSession(roleName, sessionJson);
+        PersistState(pipeline);
     }
 }

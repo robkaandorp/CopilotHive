@@ -1,6 +1,8 @@
 using CopilotHive.Goals;
+using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests;
 
@@ -787,6 +789,34 @@ public sealed class GoalPipelineManagerTests
 
         // Should be a no-op, not throw
         manager.SetRoleSession("nonexistent", "coder", "{}");
+    }
+
+    /// <summary>
+    /// Verifies the persistence bug fix: SetRoleSession must flush to the store so
+    /// that sessions survive a simulated orchestrator restart (RestoreFromStore).
+    /// </summary>
+    [Fact]
+    public async Task SetRoleSession_WithStore_SessionSurvivesPipelineReload()
+    {
+        // Arrange — create a manager backed by a real in-memory SQLite store
+        await using var store = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        var goal = new Goal { Id = "persist-goal", Description = "Persistence test" };
+        manager.CreatePipeline(goal);
+
+        const string sessionJson = """{"iteration":5,"messages":[]}""";
+
+        // Act — save the session (this is the call that previously did NOT persist)
+        manager.SetRoleSession("persist-goal", "coder", sessionJson);
+
+        // Simulate restart: create a fresh manager backed by the SAME store and restore
+        var restoredManager = new GoalPipelineManager(store);
+        restoredManager.RestoreFromStore();
+
+        // Assert — the session must be retrievable from the restored manager
+        var retrieved = restoredManager.GetRoleSession("persist-goal", "coder");
+        Assert.Equal(sessionJson, retrieved);
     }
 
     #endregion

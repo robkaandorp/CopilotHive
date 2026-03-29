@@ -52,6 +52,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
             BranchInfo = branchInfo,
             Role = role,
             Model = model ?? "",
+            SessionId = $"{goalId}:{roleName}",
             Repositories = repoList,
         };
     }

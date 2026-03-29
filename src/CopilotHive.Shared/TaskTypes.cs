@@ -20,6 +20,8 @@ public sealed record WorkTask
     public required WorkerRole Role { get; init; }
     /// <summary>Optional model ID for this task (e.g., "claude-sonnet-4.6").</summary>
     public string Model { get; init; } = "";
+    /// <summary>Session identifier in format "goalId:roleName", used for session persistence.</summary>
+    public string SessionId { get; init; } = "";
     /// <summary>Branch information for git operations, or <c>null</c> if not applicable.</summary>
     public BranchSpec? BranchInfo { get; set; }
     /// <summary>Repositories the worker should operate on.</summary>
