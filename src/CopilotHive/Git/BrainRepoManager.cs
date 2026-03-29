@@ -158,6 +158,16 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// All commits from the feature branch are combined into a single commit on the base branch.
     /// Uses the persistent brain clone instead of creating a temporary directory.
     /// On failure, the clone is reset to the remote state.
+    /// <para>
+    /// Special case — orphan feature branch: when the default branch does not yet exist on
+    /// origin but the feature branch does, the default branch is created from the feature
+    /// branch tip (fetch → checkout → push) and its HEAD commit hash is returned directly,
+    /// bypassing the squash-merge flow.
+    /// </para>
+    /// <para>
+    /// Truly empty repository: when neither branch exists, the merge is skipped and
+    /// <see cref="string.Empty"/> is returned.
+    /// </para>
     /// </summary>
     /// <param name="repoName">Repository name (must have been cloned via <see cref="EnsureCloneAsync"/>).</param>
     /// <param name="featureBranch">The feature branch to merge (e.g. "copilothive/add-logging").</param>
@@ -165,9 +175,9 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// <param name="commitMessage">The commit message for the resulting squash commit.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>
-    /// The full SHA-1 hash of the resulting squash commit on the default branch,
-    /// or <see cref="string.Empty"/> if the default branch does not yet exist on origin
-    /// (e.g. the repository is empty).
+    /// The full SHA-1 hash of the resulting commit on the default branch.
+    /// Returns <see cref="string.Empty"/> only when both the default branch and the feature
+    /// branch are absent on origin (truly empty repository).
     /// </returns>
     /// <exception cref="InvalidOperationException">Thrown when the merge fails (after reset).</exception>
     public async Task<string> MergeFeatureBranchAsync(
@@ -187,10 +197,28 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
         if (!await RemoteBranchExistsAsync(clonePath, defaultBranch, ct))
         {
-            _logger.LogWarning(
-                "Cannot merge into '{Branch}' for '{Repo}': the branch does not exist on origin (empty repository). Skipping merge.",
-                defaultBranch, repoName);
-            return string.Empty;
+            // Check whether the feature branch exists on origin
+            if (!await RemoteBranchExistsAsync(clonePath, featureBranch, ct))
+            {
+                // Truly empty repository — neither branch exists yet
+                _logger.LogWarning(
+                    "Cannot merge into '{Branch}' for '{Repo}': neither the default branch nor the feature branch exists on origin (empty repository). Skipping merge.",
+                    defaultBranch, repoName);
+                return string.Empty;
+            }
+
+            // Default branch is absent but the feature branch is present — create the default
+            // branch from the feature branch tip so subsequent goals have a base to build on.
+            _logger.LogInformation(
+                "Default branch '{DefaultBranch}' does not exist on origin for '{Repo}'. Creating it from feature branch '{FeatureBranch}'.",
+                defaultBranch, repoName, featureBranch);
+
+            await RunGitAsync(clonePath, ["fetch", "origin", featureBranch], ct);
+            await RunGitAsync(clonePath, ["checkout", "-B", defaultBranch, $"origin/{featureBranch}"], ct);
+            await RunGitAsync(clonePath, ["push", "origin", defaultBranch], ct);
+
+            var newBranchHash = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct);
+            return newBranchHash.Trim();
         }
 
         await RunGitAsync(clonePath, ["checkout", defaultBranch], ct);
