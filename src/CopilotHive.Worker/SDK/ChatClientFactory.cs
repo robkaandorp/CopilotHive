@@ -253,7 +253,7 @@ public static class ChatClientFactory
     {
         private int _requestCount;
         private static readonly string CompletionsLogDir =
-            Environment.GetEnvironmentVariable("DIAGNOSTICS_DIR") ?? "/app/diagnostics";
+            Environment.GetEnvironmentVariable("DIAGNOSTICS_DIR") ?? Path.Combine(Path.GetTempPath(), "copilothive-diagnostics");
 
         public CopilotChoiceMergingHandler() { }
         public CopilotChoiceMergingHandler(HttpMessageHandler inner) : base(inner) { }
@@ -417,7 +417,7 @@ public static class ChatClientFactory
         private readonly List<JsonNode> _turnHistory = new();
         private int _requestCount;
         private static readonly string ResponsesLogDir =
-            Environment.GetEnvironmentVariable("DIAGNOSTICS_DIR") ?? "/app/diagnostics";
+            Environment.GetEnvironmentVariable("DIAGNOSTICS_DIR") ?? Path.Combine(Path.GetTempPath(), "copilothive-diagnostics");
 
         public CopilotResponsesHandler() { }
         public CopilotResponsesHandler(HttpMessageHandler inner) : base(inner) { }

@@ -228,7 +228,7 @@ public sealed class SharpCoderRunner : IAgentRunner
     }
 
     private static readonly string DiagnosticsDir =
-        Environment.GetEnvironmentVariable("DIAGNOSTICS_DIR") ?? "/app/diagnostics";
+        Environment.GetEnvironmentVariable("DIAGNOSTICS_DIR") ?? Path.Combine(Path.GetTempPath(), "copilothive-diagnostics");
 
     private void WriteDiagnosticsFile(AgentResult? result, string userPrompt, TimeSpan elapsed, AgentOptions options, string phase)
     {
