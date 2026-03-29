@@ -70,6 +70,14 @@
                                 }
                             </div>
                         }
+                        @if (!string.IsNullOrEmpty(g.ReleaseId))
+                        {
+                            <div style="margin-top:0.2rem">
+                                <a href="/releases/@Uri.EscapeDataString(g.ReleaseId)"
+                                   class="release-version-muted"
+                                   @onclick:stopPropagation="true">📦 @g.ReleaseId</a>
+                            </div>
+                        }
                     </td>
                     <td><span class="badge @StatusBadge(g.Status)">@g.Status</span>
                         @if (g.DependsOn.Count > 0)

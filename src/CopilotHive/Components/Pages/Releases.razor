@@ -1,0 +1,265 @@
+@page "/releases"
+@using CopilotHive.Goals
+@inject IGoalStore GoalStore
+@inject NavigationManager Nav
+@inject HttpClient HttpClient
+
+<h1>Releases</h1>
+
+<!-- Filter Bar -->
+<div class="filter-bar">
+    <select @bind="_repoFilter" @bind:after="ApplyFilters">
+        <option value="">All repositories</option>
+        @foreach (var r in _allRepoNames)
+        {
+            <option value="@r">@r</option>
+        }
+    </select>
+
+    <select @bind="_statusFilter" @bind:after="ApplyFilters">
+        <option value="">All statuses</option>
+        @foreach (var s in Enum.GetValues<ReleaseStatus>())
+        {
+            <option value="@s">@s</option>
+        }
+    </select>
+
+    <span class="filter-count">@_filtered.Count release(s)</span>
+
+    <button class="approve-btn" style="margin-left:auto" @onclick="() => _showCreateForm = !_showCreateForm">
+        + New Release
+    </button>
+</div>
+
+<!-- Inline Create Form -->
+@if (_showCreateForm)
+{
+    <div class="card release-create-form" style="margin-bottom:1rem">
+        <div class="label" style="margin-bottom:0.5rem">New Release</div>
+        <div style="display:flex;gap:0.75rem;flex-wrap:wrap;align-items:flex-end">
+            <div>
+                <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Version</div>
+                <input type="text" placeholder="e.g. v1.2.0" @bind="_createVersion"
+                       style="padding:0.5rem 0.75rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;min-width:160px" />
+            </div>
+            <div>
+                <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Repository (optional)</div>
+                <select @bind="_createRepo"
+                        style="padding:0.5rem 0.75rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem">
+                    <option value="">— none —</option>
+                    @foreach (var r in _allRepoNames)
+                    {
+                        <option value="@r">@r</option>
+                    }
+                </select>
+            </div>
+            <button class="approve-btn" @onclick="CreateRelease">Create</button>
+            <button style="background:var(--bg-card);border:1px solid var(--border);color:var(--text-muted);padding:0.4rem 0.85rem;border-radius:6px;cursor:pointer;font-size:0.85rem"
+                    @onclick="() => _showCreateForm = false">Cancel</button>
+        </div>
+        @if (!string.IsNullOrEmpty(_createError))
+        {
+            <span class="error-msg" style="margin-top:0.5rem">@_createError</span>
+        }
+    </div>
+}
+
+<!-- Releases grouped by repository -->
+@if (_filtered.Count > 0)
+{
+    @foreach (var repoGroup in GetGroupedReleases())
+    {
+        <div style="margin-bottom:1.5rem">
+            @if (!string.IsNullOrEmpty(repoGroup.Key))
+            {
+                <h2 style="margin-bottom:0.75rem">
+                    <span class="repo-tag" style="font-size:0.9rem;padding:0.2rem 0.6rem">@repoGroup.Key</span>
+                </h2>
+            }
+            else
+            {
+                <h2 style="margin-bottom:0.75rem">Unassigned</h2>
+            }
+
+            <div class="releases-grid">
+                @foreach (var release in repoGroup)
+                {
+                    var goalCounts = _goalCountsByRelease.TryGetValue(release.Id, out var counts) ? counts : (Breaking: 0, Feature: 0, Patch: 0);
+                    <div class="release-card @(release.Status == ReleaseStatus.Released ? "release-card--released" : "")"
+                         @onclick="() => NavigateToRelease(release.Id)">
+                        <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.5rem">
+                            <span class="release-version">@release.Tag</span>
+                            <span class="badge @ReleaseBadge(release.Status)">@release.Status</span>
+                        </div>
+                        @if (release.RepositoryNames.Count > 0)
+                        {
+                            <div class="goal-repos" style="margin-bottom:0.5rem">
+                                @foreach (var repo in release.RepositoryNames)
+                                {
+                                    <span class="repo-tag">@repo</span>
+                                }
+                            </div>
+                        }
+                        <div class="release-scope-counts">
+                            @if (goalCounts.Breaking > 0)
+                            {
+                                <span title="Breaking Changes">💥 @goalCounts.Breaking</span>
+                            }
+                            @if (goalCounts.Feature > 0)
+                            {
+                                <span title="Features">✨ @goalCounts.Feature</span>
+                            }
+                            @if (goalCounts.Patch > 0)
+                            {
+                                <span title="Fixes">🔧 @goalCounts.Patch</span>
+                            }
+                            @if (goalCounts.Breaking == 0 && goalCounts.Feature == 0 && goalCounts.Patch == 0)
+                            {
+                                <span style="color:var(--text-muted);font-size:0.8rem">No goals assigned</span>
+                            }
+                        </div>
+                        <div style="margin-top:0.5rem;font-size:0.75rem;color:var(--text-muted)">
+                            Created @release.CreatedAt.ToString("yyyy-MM-dd")
+                            @if (release.ReleasedAt.HasValue)
+                            {
+                                <span style="margin-left:0.75rem">Released @release.ReleasedAt.Value.ToString("yyyy-MM-dd")</span>
+                            }
+                        </div>
+                    </div>
+                }
+            </div>
+        </div>
+    }
+}
+else if (_loaded)
+{
+    <p style="color:var(--text-muted);margin-top:1rem">No releases found.</p>
+}
+
+@code {
+    private List<Release> _allReleases = [];
+    private List<Release> _filtered = [];
+    private Dictionary<string, IReadOnlyList<Goal>> _goalsByRelease = new();
+    private Dictionary<string, (int Breaking, int Feature, int Patch)> _goalCountsByRelease = new();
+    private string _repoFilter = "";
+    private string _statusFilter = "";
+    private bool _loaded;
+    private bool _showCreateForm;
+    private string _createVersion = "";
+    private string _createRepo = "";
+    private string? _createError;
+
+    private List<string> _allRepoNames => _allReleases
+        .SelectMany(r => r.RepositoryNames)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .OrderBy(r => r, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    protected override async Task OnInitializedAsync()
+    {
+        _allReleases = (await GoalStore.GetReleasesAsync()).ToList();
+        await LoadGoalCountsAsync();
+        _loaded = true;
+        ApplyFilters();
+    }
+
+    private async Task LoadGoalCountsAsync()
+    {
+        foreach (var release in _allReleases)
+        {
+            var goals = await GoalStore.GetGoalsByReleaseAsync(release.Id);
+            _goalsByRelease[release.Id] = goals;
+            _goalCountsByRelease[release.Id] = (
+                Breaking: goals.Count(g => g.Scope == GoalScope.Breaking),
+                Feature: goals.Count(g => g.Scope == GoalScope.Feature),
+                Patch: goals.Count(g => g.Scope == GoalScope.Patch)
+            );
+        }
+    }
+
+    private void ApplyFilters()
+    {
+        var query = _allReleases.AsEnumerable();
+
+        if (!string.IsNullOrWhiteSpace(_repoFilter))
+            query = query.Where(r => r.RepositoryNames.Contains(_repoFilter, StringComparer.OrdinalIgnoreCase));
+
+        if (!string.IsNullOrWhiteSpace(_statusFilter) && Enum.TryParse<ReleaseStatus>(_statusFilter, out var status))
+            query = query.Where(r => r.Status == status);
+
+        _filtered = query.OrderByDescending(r => r.CreatedAt).ToList();
+    }
+
+    private IEnumerable<IGrouping<string, Release>> GetGroupedReleases()
+    {
+        // When a repo filter is active, each release must only appear under the filtered
+        // repo group — never under sibling repos that do not match the active filter.
+        // Without a filter, a multi-repo release appears under every repo group it belongs to.
+        var activeFilter = string.IsNullOrWhiteSpace(_repoFilter) ? null : _repoFilter;
+
+        return _filtered
+            .SelectMany(r =>
+            {
+                if (activeFilter is not null)
+                {
+                    // Only emit the matching repo key so the release appears under that group only.
+                    return r.RepositoryNames
+                        .Where(name => string.Equals(name, activeFilter, StringComparison.OrdinalIgnoreCase))
+                        .Select(name => (Key: name, Release: r));
+                }
+
+                // No filter: expand into all repo groups; unassigned releases go to the empty group.
+                return r.RepositoryNames.Count > 0
+                    ? r.RepositoryNames.Select(name => (Key: name, Release: r))
+                    : [(Key: "", Release: r)];
+            })
+            .GroupBy(pair => pair.Key, pair => pair.Release, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static string ReleaseBadge(ReleaseStatus s) => s switch
+    {
+        ReleaseStatus.Planning => "badge-yellow",
+        ReleaseStatus.Released => "badge-green",
+        _ => "badge-muted",
+    };
+
+    private void NavigateToRelease(string releaseId) =>
+        Nav.NavigateTo($"/releases/{Uri.EscapeDataString(releaseId)}");
+
+    private async Task CreateRelease()
+    {
+        _createError = null;
+        if (string.IsNullOrWhiteSpace(_createVersion))
+        {
+            _createError = "Version is required.";
+            return;
+        }
+
+        var body = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new { version = _createVersion, repository = _createRepo }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+
+        var response = await HttpClient.PostAsync("/api/releases/", body);
+        if (response.IsSuccessStatusCode)
+        {
+            var created = await response.Content.ReadFromJsonAsync<Release>();
+            if (created is not null)
+            {
+                _allReleases.Insert(0, created);
+                _goalsByRelease[created.Id] = [];
+                _goalCountsByRelease[created.Id] = (0, 0, 0);
+            }
+            _createVersion = "";
+            _createRepo = "";
+            _showCreateForm = false;
+            ApplyFilters();
+        }
+        else
+        {
+            var error = await response.Content.ReadAsStringAsync();
+            _createError = $"Error {(int)response.StatusCode}: {error}";
+        }
+    }
+}

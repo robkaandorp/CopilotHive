@@ -1661,6 +1661,175 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.NotNull(detail);
         Assert.Equal(GoalScope.Breaking, detail!.Scope);
     }
+
+    // ── Release methods ───────────────────────────────────────────────
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetReleasesAsync"/> returns all releases
+    /// when no repository filter is applied.
+    /// </summary>
+    [Fact]
+    public async Task GetReleasesAsync_NoFilter_ReturnsAllReleases()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0" }, ct);
+        await _store.CreateReleaseAsync(new Release { Id = "v2.0.0", Tag = "v2.0.0" }, ct);
+
+        using var service = CreateService();
+
+        var releases = await service.GetReleasesAsync(ct: ct);
+
+        Assert.Equal(2, releases.Count);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetReleasesAsync"/> filters by repository name.
+    /// </summary>
+    [Fact]
+    public async Task GetReleasesAsync_WithRepoFilter_ReturnsMatchingReleases()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0", RepositoryNames = ["repo-a"] }, ct);
+        await _store.CreateReleaseAsync(new Release { Id = "v2.0.0", Tag = "v2.0.0", RepositoryNames = ["repo-b"] }, ct);
+
+        using var service = CreateService();
+
+        var releases = await service.GetReleasesAsync(repository: "repo-a", ct: ct);
+
+        Assert.Single(releases);
+        Assert.Equal("v1.0.0", releases[0].Id);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetReleasesAsync"/> returns empty list
+    /// when goal store is not configured.
+    /// </summary>
+    [Fact]
+    public async Task GetReleasesAsync_NoGoalStore_ReturnsEmpty()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: null);
+
+        var releases = await service.GetReleasesAsync(ct: ct);
+
+        Assert.Empty(releases);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetReleaseDetailAsync"/> returns the release by ID.
+    /// </summary>
+    [Fact]
+    public async Task GetReleaseDetailAsync_ExistingRelease_ReturnsRelease()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _store.CreateReleaseAsync(new Release { Id = "v3.0.0", Tag = "v3.0.0" }, ct);
+
+        using var service = CreateService();
+
+        var release = await service.GetReleaseDetailAsync("v3.0.0", ct);
+
+        Assert.NotNull(release);
+        Assert.Equal("v3.0.0", release!.Id);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetReleaseDetailAsync"/> returns null for unknown IDs.
+    /// </summary>
+    [Fact]
+    public async Task GetReleaseDetailAsync_UnknownRelease_ReturnsNull()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        using var service = CreateService();
+
+        var release = await service.GetReleaseDetailAsync("no-such-release", ct);
+
+        Assert.Null(release);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.CreateReleaseAsync"/> creates a release
+    /// with the given version and repository.
+    /// </summary>
+    [Fact]
+    public async Task CreateReleaseAsync_ValidParams_CreatesRelease()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        using var service = CreateService();
+
+        var release = await service.CreateReleaseAsync("my-repo", "v4.0.0", ct);
+
+        Assert.Equal("v4.0.0", release.Id);
+        Assert.Equal("v4.0.0", release.Tag);
+        Assert.Contains("my-repo", release.RepositoryNames);
+        Assert.Equal(ReleaseStatus.Planning, release.Status);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.UpdateReleaseAsync"/> persists changes.
+    /// </summary>
+    [Fact]
+    public async Task UpdateReleaseAsync_ChangesStatus_Persists()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _store.CreateReleaseAsync(new Release { Id = "v5.0.0", Tag = "v5.0.0" }, ct);
+
+        using var service = CreateService();
+
+        var release = await _store.GetReleaseAsync("v5.0.0", ct);
+        release!.Status = ReleaseStatus.Released;
+        await service.UpdateReleaseAsync(release, ct);
+
+        var updated = await _store.GetReleaseAsync("v5.0.0", ct);
+        Assert.Equal(ReleaseStatus.Released, updated!.Status);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetGoalsByReleaseAsync"/> returns goals for a release.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalsByReleaseAsync_AssignedGoals_ReturnsGoals()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _store.CreateReleaseAsync(new Release { Id = "v6.0.0", Tag = "v6.0.0" }, ct);
+        var goal = new Goal { Id = "release-goal-1", Description = "A goal in v6.0.0", ReleaseId = "v6.0.0" };
+        await _store.CreateGoalAsync(goal, ct);
+
+        using var service = CreateService();
+
+        var goals = await service.GetGoalsByReleaseAsync("v6.0.0", ct);
+
+        Assert.Single(goals);
+        Assert.Equal("release-goal-1", goals[0].Id);
+    }
+
+    private DashboardStateService CreateService()
+    {
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+        return new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store);
+    }
 }
 
 /// <summary>

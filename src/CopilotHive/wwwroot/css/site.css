@@ -777,3 +777,109 @@ tr:last-child td { border-bottom: none; }
 .chat-question-no {
     color: var(--text-muted);
 }
+
+/* ── Release Pages ───────────────────────────────────────────────── */
+
+.releases-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 1rem;
+}
+
+.release-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    cursor: pointer;
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.release-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px rgba(88,166,255,0.2);
+}
+
+.release-card--released {
+    border-color: rgba(63,185,80,0.35);
+}
+
+.release-version {
+    font-size: 1.1rem;
+    font-weight: 600;
+    font-family: monospace;
+    color: var(--text);
+}
+
+.release-scope-counts {
+    display: flex;
+    gap: 0.75rem;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    flex-wrap: wrap;
+}
+
+.release-create-form {
+    max-width: 600px;
+}
+
+/* Release detail: scope section grouping */
+.release-scope-section {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 0.75rem;
+    overflow: hidden;
+}
+
+.release-scope-header {
+    padding: 0.5rem 1rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    background: rgba(110,118,129,0.08);
+    border-bottom: 1px solid var(--border);
+}
+
+.release-goal-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.85rem;
+    flex-wrap: wrap;
+}
+
+.release-goal-row:last-child {
+    border-bottom: none;
+}
+
+/* Changelog preview block */
+.changelog-preview {
+    background: #000;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin-top: 0.5rem;
+    font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+    font-size: 0.8rem;
+    line-height: 1.6;
+    max-height: 400px;
+    overflow-y: auto;
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* Muted release link in Goals table */
+.release-version-muted {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    text-decoration: none;
+    font-family: monospace;
+}
+
+.release-version-muted:hover {
+    color: var(--accent);
+    text-decoration: underline;
+}

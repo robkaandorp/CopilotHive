@@ -527,6 +527,70 @@ public sealed class DashboardStateService : IDisposable
         _ => "",
     };
 
+    /// <summary>Returns all releases, optionally filtered by repository name.</summary>
+    /// <param name="repository">Optional repository name to filter by, or <c>null</c> for all releases.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>All matching releases ordered by creation date descending.</returns>
+    public async Task<IReadOnlyList<Release>> GetReleasesAsync(string? repository = null, CancellationToken ct = default)
+    {
+        if (_goalStore is null)
+            return [];
+        var releases = await _goalStore.GetReleasesAsync(ct);
+        if (!string.IsNullOrEmpty(repository))
+            releases = releases.Where(r => r.RepositoryNames.Contains(repository, StringComparer.OrdinalIgnoreCase)).ToList();
+        return releases;
+    }
+
+    /// <summary>Returns a single release by ID with its associated goals, or <c>null</c> if not found.</summary>
+    /// <param name="releaseId">Release identifier to look up.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The release, or <c>null</c>.</returns>
+    public async Task<Release?> GetReleaseDetailAsync(string releaseId, CancellationToken ct = default)
+    {
+        if (_goalStore is null)
+            return null;
+        return await _goalStore.GetReleaseAsync(releaseId, ct);
+    }
+
+    /// <summary>Updates a release's mutable fields via the goal store.</summary>
+    /// <param name="release">The release with updated fields.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task UpdateReleaseAsync(Release release, CancellationToken ct = default)
+    {
+        if (_goalStore is not null)
+            await _goalStore.UpdateReleaseAsync(release, ct);
+    }
+
+    /// <summary>Creates a new release for the given repository and version tag.</summary>
+    /// <param name="repository">Repository name this release belongs to.</param>
+    /// <param name="version">Version tag for the release (e.g. "v1.2.0").</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The created release.</returns>
+    /// <exception cref="InvalidOperationException">Thrown if the goal store is not configured.</exception>
+    public async Task<Release> CreateReleaseAsync(string repository, string version, CancellationToken ct = default)
+    {
+        if (_goalStore is null)
+            throw new InvalidOperationException("Goal store is not configured.");
+        var release = new Release
+        {
+            Id = version,
+            Tag = version,
+            RepositoryNames = string.IsNullOrEmpty(repository) ? [] : [repository],
+        };
+        return await _goalStore.CreateReleaseAsync(release, ct);
+    }
+
+    /// <summary>Returns all goals assigned to the given release.</summary>
+    /// <param name="releaseId">Release identifier.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>Goals associated with the release.</returns>
+    public async Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default)
+    {
+        if (_goalStore is null)
+            return [];
+        return await _goalStore.GetGoalsByReleaseAsync(releaseId, ct);
+    }
+
     /// <summary>Returns the CopilotHive assembly version string.</summary>
     public string GetVersion() => _version;
 
