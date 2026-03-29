@@ -1,5 +1,7 @@
 using System.Text.Json;
 using CopilotHive.Configuration;
+using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 
@@ -13,6 +15,7 @@ public sealed class SqliteGoalStore : IGoalStore
 {
     private readonly SqliteConnection _db;
     private readonly ILogger<SqliteGoalStore> _logger;
+    private readonly PipelineStore? _pipelineStore;
     private readonly Lock _lock = new();
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
@@ -20,9 +23,13 @@ public sealed class SqliteGoalStore : IGoalStore
     public string Name => "sqlite";
 
     /// <summary>Creates a new <see cref="SqliteGoalStore"/> at the given database path.</summary>
-    public SqliteGoalStore(string dbPath, ILogger<SqliteGoalStore> logger)
+    /// <param name="dbPath">Full path to the SQLite database file.</param>
+    /// <param name="logger">Logger instance.</param>
+    /// <param name="pipelineStore">Optional <see cref="PipelineStore"/> used to retrieve pipeline conversations.</param>
+    public SqliteGoalStore(string dbPath, ILogger<SqliteGoalStore> logger, PipelineStore? pipelineStore = null)
     {
         _logger = logger;
+        _pipelineStore = pipelineStore;
         _db = new SqliteConnection($"Data Source={dbPath}");
         _db.Open();
         InitSchema();
@@ -30,9 +37,10 @@ public sealed class SqliteGoalStore : IGoalStore
     }
 
     /// <summary>Creates a store using an already-open connection (for testing).</summary>
-    internal SqliteGoalStore(SqliteConnection connection, ILogger<SqliteGoalStore> logger)
+    internal SqliteGoalStore(SqliteConnection connection, ILogger<SqliteGoalStore> logger, PipelineStore? pipelineStore = null)
     {
         _logger = logger;
+        _pipelineStore = pipelineStore;
         _db = connection;
         InitSchema();
     }
@@ -566,6 +574,18 @@ public sealed class SqliteGoalStore : IGoalStore
                 ("@releaseId", releaseId));
             return Task.FromResult<IReadOnlyList<Goal>>(goals);
         }
+    }
+
+    // ── Pipeline conversation ────────────────────────────────────────────
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default)
+    {
+        if (_pipelineStore is null)
+            return Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
+
+        var conversation = _pipelineStore.GetConversation(goalId);
+        return Task.FromResult<IReadOnlyList<ConversationEntry>>(conversation);
     }
 
     // ── Internals ────────────────────────────────────────────────────────

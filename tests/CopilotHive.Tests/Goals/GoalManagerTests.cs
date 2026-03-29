@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using CopilotHive.Goals;
+using CopilotHive.Orchestration;
 using Microsoft.Extensions.Logging;
 
 namespace CopilotHive.Tests.Goals;
@@ -534,6 +535,10 @@ file sealed class DependencyTestGoalStore : IGoalStore
     /// <inheritdoc/>
     public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Goal>>([]);
+
+    /// <inheritdoc/>
+    public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
 }
 
 /// <summary>

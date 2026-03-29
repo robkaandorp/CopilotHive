@@ -2866,6 +2866,9 @@ internal sealed class FakeGoalSource : IGoalSource, IGoalStore
 
     public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Goal>>([]);
+
+    public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
 }
 
 /// <summary>
