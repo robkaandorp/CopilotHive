@@ -192,12 +192,27 @@ else if (_loaded)
 
     private IEnumerable<IGrouping<string, Release>> GetGroupedReleases()
     {
-        // Expand each release into one entry per repository so multi-repo releases appear
-        // under every repository group.  Releases with no repos get the empty-string group.
+        // When a repo filter is active, each release must only appear under the filtered
+        // repo group — never under sibling repos that do not match the active filter.
+        // Without a filter, a multi-repo release appears under every repo group it belongs to.
+        var activeFilter = string.IsNullOrWhiteSpace(_repoFilter) ? null : _repoFilter;
+
         return _filtered
-            .SelectMany(r => r.RepositoryNames.Count > 0
-                ? r.RepositoryNames.Select(name => (Key: name, Release: r))
-                : [(Key: "", Release: r)])
+            .SelectMany(r =>
+            {
+                if (activeFilter is not null)
+                {
+                    // Only emit the matching repo key so the release appears under that group only.
+                    return r.RepositoryNames
+                        .Where(name => string.Equals(name, activeFilter, StringComparison.OrdinalIgnoreCase))
+                        .Select(name => (Key: name, Release: r));
+                }
+
+                // No filter: expand into all repo groups; unassigned releases go to the empty group.
+                return r.RepositoryNames.Count > 0
+                    ? r.RepositoryNames.Select(name => (Key: name, Release: r))
+                    : [(Key: "", Release: r)];
+            })
             .GroupBy(pair => pair.Key, pair => pair.Release, StringComparer.OrdinalIgnoreCase)
             .OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase);
     }
