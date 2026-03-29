@@ -67,13 +67,23 @@ public sealed class GitOperationsTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task CreateBranchAsync_OnEmptyRepo_OrphanBranchDoesNotThrow()
+    public async Task CreateBranchAsync_OnEmptyRepo_OrphanBranchIsRealOrphan()
     {
-        // Should complete without throwing
-        var exception = await Record.ExceptionAsync(() =>
-            GitOperations.CreateBranchAsync(_repoDir, "my-branch", "develop", CancellationToken.None));
+        // Arrange — create orphan branch on empty repo
+        await GitOperations.CreateBranchAsync(_repoDir, "feature/test", "develop", CancellationToken.None);
 
-        Assert.Null(exception);
+        // Add a file and commit so the branch actually appears in git refs
+        await CommitFileAsync("orphan.txt", "orphan content");
+
+        // Assert 1 — the branch now shows up in git branch --list
+        var (_, branchList, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "branch --list feature/test", CancellationToken.None);
+        Assert.Contains("feature/test", branchList);
+
+        // Assert 2 — the commit has NO parent (key characteristic of an orphan branch)
+        var (_, parentOutput, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "log --format=%P", CancellationToken.None);
+        Assert.Equal(string.Empty, parentOutput.Trim());
     }
 
     [Fact]
@@ -115,7 +125,12 @@ public sealed class GitOperationsTests : IAsyncLifetime
     {
         await CommitFileAsync("readme.md", "# Project");
 
-        await GitOperations.CreateBranchAsync(_repoDir, "feature/new", "master", CancellationToken.None);
+        // Discover the actual default branch name set by this environment's git config
+        var (_, symRefOut, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "symbolic-ref --short HEAD", CancellationToken.None);
+        var defaultBranch = symRefOut.Trim();
+
+        await GitOperations.CreateBranchAsync(_repoDir, "feature/new", defaultBranch, CancellationToken.None);
 
         var (_, stdout, _) = await GitOperations.RunGitCommandAsync(
             _repoDir, "branch --show-current", CancellationToken.None);
