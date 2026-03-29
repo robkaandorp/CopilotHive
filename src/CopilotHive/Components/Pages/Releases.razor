@@ -192,9 +192,13 @@ else if (_loaded)
 
     private IEnumerable<IGrouping<string, Release>> GetGroupedReleases()
     {
-        // Group by first repo name; empty key for releases with no repos
+        // Expand each release into one entry per repository so multi-repo releases appear
+        // under every repository group.  Releases with no repos get the empty-string group.
         return _filtered
-            .GroupBy(r => r.RepositoryNames.Count > 0 ? r.RepositoryNames[0] : "")
+            .SelectMany(r => r.RepositoryNames.Count > 0
+                ? r.RepositoryNames.Select(name => (Key: name, Release: r))
+                : [(Key: "", Release: r)])
+            .GroupBy(pair => pair.Key, pair => pair.Release, StringComparer.OrdinalIgnoreCase)
             .OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase);
     }
 

@@ -178,7 +178,7 @@ else if (_loaded)
             System.Text.Encoding.UTF8,
             "application/json");
         var id = Uri.EscapeDataString(ReleaseId);
-        var response = await HttpClient.PatchAsync($"/api/releases/{id}", body);
+        var response = await HttpClient.PatchAsync($"/api/releases/{id}/status", body);
         if (response.IsSuccessStatusCode)
         {
             _release!.Status = ReleaseStatus.Released;
@@ -201,7 +201,7 @@ else if (_loaded)
             System.Text.Encoding.UTF8,
             "application/json");
         var id = Uri.EscapeDataString(ReleaseId);
-        var response = await HttpClient.PatchAsync($"/api/releases/{id}", body);
+        var response = await HttpClient.PatchAsync($"/api/releases/{id}/notes", body);
         if (response.IsSuccessStatusCode)
         {
             _release!.Notes = _editNotes;

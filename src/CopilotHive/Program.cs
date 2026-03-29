@@ -463,29 +463,6 @@ static async Task<int> RunServerAsync(string[] args)
     // ── Releases REST API ────────────────────────────────────────────────────
     var releasesApi = app.MapGroup("/api/releases");
 
-    releasesApi.MapGet("/", async (string? repository, SqliteGoalStore store) =>
-    {
-        var releases = await store.GetReleasesAsync();
-        if (!string.IsNullOrEmpty(repository))
-            releases = releases.Where(r => r.RepositoryNames.Contains(repository, StringComparer.OrdinalIgnoreCase)).ToList();
-        return Results.Ok(releases);
-    });
-
-    releasesApi.MapGet("/{id}", async (string id, SqliteGoalStore store) =>
-    {
-        var release = await store.GetReleaseAsync(id);
-        return release is null ? Results.NotFound(new { error = $"Release '{id}' not found." }) : Results.Ok(release);
-    });
-
-    releasesApi.MapGet("/{id}/goals", async (string id, SqliteGoalStore store) =>
-    {
-        var release = await store.GetReleaseAsync(id);
-        if (release is null)
-            return Results.NotFound(new { error = $"Release '{id}' not found." });
-        var goals = await store.GetGoalsByReleaseAsync(id);
-        return Results.Ok(goals);
-    });
-
     releasesApi.MapPost("/", async (CreateReleaseRequest request, SqliteGoalStore store) =>
     {
         if (string.IsNullOrWhiteSpace(request.Version))
@@ -509,51 +486,48 @@ static async Task<int> RunServerAsync(string[] args)
         }
     });
 
-    releasesApi.MapPatch("/{id}", async (string id, UpdateReleaseRequest request, SqliteGoalStore store) =>
+    releasesApi.MapPatch("/{id}/status", async (string id, UpdateReleaseStatusRequest request, SqliteGoalStore store) =>
     {
         var existing = await store.GetReleaseAsync(id);
         if (existing is null)
             return Results.NotFound(new { error = $"Release '{id}' not found." });
 
-        if (!string.IsNullOrEmpty(request.Status) && Enum.TryParse<ReleaseStatus>(request.Status, ignoreCase: true, out var newStatus))
-        {
-            existing.Status = newStatus;
-            if (newStatus == ReleaseStatus.Released && existing.ReleasedAt is null)
-                existing.ReleasedAt = DateTime.UtcNow;
-        }
+        if (string.IsNullOrEmpty(request.Status))
+            return Results.BadRequest(new { error = "Status is required." });
 
-        if (request.Notes is not null)
-            existing.Notes = request.Notes;
+        if (!Enum.TryParse<ReleaseStatus>(request.Status, ignoreCase: true, out var newStatus))
+            return Results.BadRequest(new { error = $"Invalid status '{request.Status}'." });
+
+        existing.Status = newStatus;
+        if (newStatus == ReleaseStatus.Released && existing.ReleasedAt is null)
+            existing.ReleasedAt = DateTime.UtcNow;
 
         await store.UpdateReleaseAsync(existing);
         return Results.Ok(existing);
     });
 
-    releasesApi.MapPatch("/{releaseId}/goals/{goalId}", async (string releaseId, string goalId, SqliteGoalStore store) =>
+    releasesApi.MapPatch("/{id}/notes", async (string id, UpdateReleaseNotesRequest request, SqliteGoalStore store) =>
     {
-        var release = await store.GetReleaseAsync(releaseId);
-        if (release is null)
-            return Results.NotFound(new { error = $"Release '{releaseId}' not found." });
+        var existing = await store.GetReleaseAsync(id);
+        if (existing is null)
+            return Results.NotFound(new { error = $"Release '{id}' not found." });
 
-        var goal = await store.GetGoalAsync(goalId);
-        if (goal is null)
-            return Results.NotFound(new { error = $"Goal '{goalId}' not found." });
-
-        goal.ReleaseId = releaseId;
-        await store.UpdateGoalAsync(goal);
-        return Results.Ok(goal);
+        existing.Notes = request.Notes;
+        await store.UpdateReleaseAsync(existing);
+        return Results.Ok(existing);
     });
 
-    releasesApi.MapDelete("/{releaseId}/goals/{goalId}", async (string releaseId, string goalId, SqliteGoalStore store) =>
+    goalsApi.MapPatch("/{id}/release", async (string id, AssignGoalReleaseRequest request, SqliteGoalStore store) =>
     {
-        var goal = await store.GetGoalAsync(goalId);
+        var release = await store.GetReleaseAsync(request.ReleaseId);
+        if (release is null)
+            return Results.NotFound(new { error = $"Release '{request.ReleaseId}' not found." });
+
+        var goal = await store.GetGoalAsync(id);
         if (goal is null)
-            return Results.NotFound(new { error = $"Goal '{goalId}' not found." });
+            return Results.NotFound(new { error = $"Goal '{id}' not found." });
 
-        if (goal.ReleaseId != releaseId)
-            return Results.BadRequest(new { error = $"Goal '{goalId}' is not assigned to release '{releaseId}'." });
-
-        goal.ReleaseId = null;
+        goal.ReleaseId = request.ReleaseId;
         await store.UpdateGoalAsync(goal);
         return Results.Ok(goal);
     });
@@ -591,10 +565,17 @@ record GoalStatusUpdate(string Status);
 /// <param name="Repository">Optional repository name this release belongs to.</param>
 record CreateReleaseRequest(string Version, string? Repository = null);
 
-/// <summary>Request body for updating a release via the HTTP API.</summary>
-/// <param name="Status">New status string ("Planning" or "Released"), or <c>null</c> to leave unchanged.</param>
-/// <param name="Notes">Updated release notes, or <c>null</c> to leave unchanged.</param>
-record UpdateReleaseRequest(string? Status = null, string? Notes = null);
+/// <summary>Request body for updating the status of a release via the HTTP API.</summary>
+/// <param name="Status">New status string (e.g. "Planning" or "Released").</param>
+record UpdateReleaseStatusRequest(string Status);
+
+/// <summary>Request body for updating the notes of a release via the HTTP API.</summary>
+/// <param name="Notes">Updated release notes.</param>
+record UpdateReleaseNotesRequest(string? Notes);
+
+/// <summary>Request body for assigning a goal to a release via the HTTP API.</summary>
+/// <param name="ReleaseId">The release ID to assign this goal to.</param>
+record AssignGoalReleaseRequest(string ReleaseId);
 
 // Marker class required by WebApplicationFactory<T> in integration tests.
 #pragma warning disable CS1591

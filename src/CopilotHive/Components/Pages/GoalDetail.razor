@@ -891,8 +891,11 @@ else
         _releaseAssignError = null;
         if (string.IsNullOrEmpty(_selectedReleaseId)) return;
 
-        var encodedRelease = Uri.EscapeDataString(_selectedReleaseId);
-        var response = await HttpClient.PatchAsync($"/api/releases/{encodedRelease}/goals/{GoalId}", null);
+        var body = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new { releaseId = _selectedReleaseId }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+        var response = await HttpClient.PatchAsync($"/api/goals/{GoalId}/release", body);
         if (response.IsSuccessStatusCode)
         {
             // Update local state
