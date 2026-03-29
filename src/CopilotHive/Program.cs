@@ -193,7 +193,8 @@ static async Task<int> RunServerAsync(string[] args)
     // Goals: SQLite-backed goal store (primary source of truth)
     var goalsDbPath = Path.Combine(stateDir, "goals.db");
     builder.Services.AddSingleton(sp =>
-        new SqliteGoalStore(goalsDbPath, sp.GetRequiredService<ILogger<SqliteGoalStore>>()));
+        new SqliteGoalStore(goalsDbPath, sp.GetRequiredService<ILogger<SqliteGoalStore>>(),
+            sp.GetRequiredService<PipelineStore>()));
     builder.Services.AddSingleton<IGoalStore>(sp => sp.GetRequiredService<SqliteGoalStore>());
 
     builder.Services.AddSingleton(sp =>

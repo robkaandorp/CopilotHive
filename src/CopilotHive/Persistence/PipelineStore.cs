@@ -354,6 +354,17 @@ public sealed class PipelineStore : IAsyncDisposable
         }
     }
 
+    /// <summary>Loads the conversation entries for a specific goal from the store.</summary>
+    /// <param name="goalId">The goal ID whose conversation entries to retrieve.</param>
+    /// <returns>The conversation entries, or an empty list if no entries exist.</returns>
+    public List<ConversationEntry> GetConversation(string goalId)
+    {
+        lock (_lock)
+        {
+            return LoadConversationCore(goalId);
+        }
+    }
+
     private List<ConversationEntry> LoadConversationCore(string goalId)
     {
         using var cmd = _db.CreateCommand();

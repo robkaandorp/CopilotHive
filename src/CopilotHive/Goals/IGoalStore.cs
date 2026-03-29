@@ -1,3 +1,5 @@
+using CopilotHive.Orchestration;
+
 namespace CopilotHive.Goals;
 
 /// <summary>
@@ -61,4 +63,12 @@ public interface IGoalStore : IGoalSource
 
     /// <summary>Returns all goals assigned to the given release.</summary>
     Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default);
+
+    // ── Pipeline conversation ────────────────────────────────────────────
+
+    /// <summary>Returns the pipeline conversation entries for the given goal.</summary>
+    /// <param name="goalId">The goal ID whose pipeline conversation to retrieve.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The conversation entries, or an empty list if no pipeline exists for this goal.</returns>
+    Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default);
 }

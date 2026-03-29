@@ -1,4 +1,7 @@
 using CopilotHive.Goals;
+using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
+using CopilotHive.Services;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -601,6 +604,55 @@ public sealed class SqliteGoalStoreTests : IDisposable
         Assert.Single(fetched.DependsOn);
         Assert.Contains("old-goal", fetched.DependsOn);
     }
+
+    // ── DeleteGoalAsync — PipelineStore cleanup ────────────────────────────
+
+    [Fact]
+    public async Task DeleteGoalAsync_ClearsPipelineConversationData()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a PipelineStore alongside the GoalStore
+        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+
+        // Create a goal and pipeline with conversation entries
+        var goal = MakeGoal("delete-pipeline-goal", status: GoalStatus.Draft);
+        await storeWithPipeline.CreateGoalAsync(goal, ct);
+
+        var pipeline = new GoalPipeline(goal, maxRetries: 3);
+        pipeline.Conversation.Add(new ConversationEntry("user", "Brain prompt", Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "Worker task", Iteration: 1, Purpose: "craft-prompt"));
+        pipelineStore.SavePipeline(pipeline);
+
+        // Verify conversation data exists before deletion
+        var conversationBefore = pipelineStore.GetConversation("delete-pipeline-goal");
+        Assert.Equal(2, conversationBefore.Count);
+
+        // Delete the goal
+        var deleted = await storeWithPipeline.DeleteGoalAsync("delete-pipeline-goal", ct);
+        Assert.True(deleted);
+
+        // Verify pipeline conversation data was cleaned up
+        var conversationAfter = pipelineStore.GetConversation("delete-pipeline-goal");
+        Assert.Empty(conversationAfter);
+    }
+
+    [Fact]
+    public async Task DeleteGoalAsync_NoPipelineStore_StillDeletes()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Store without PipelineStore (null)
+        var goal = MakeGoal("delete-no-pipeline", status: GoalStatus.Draft);
+        await _store.CreateGoalAsync(goal, ct);
+
+        var deleted = await _store.DeleteGoalAsync("delete-no-pipeline", ct);
+        Assert.True(deleted);
+
+        var fetched = await _store.GetGoalAsync("delete-no-pipeline", ct);
+        Assert.Null(fetched);
+    }
 }
 
 /// <summary>
@@ -824,5 +876,67 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
 
         Assert.NotNull(fetched);
         Assert.Equal(GoalScope.Patch, fetched!.Scope);
+    }
+
+    // ── GetPipelineConversationAsync ────────────────────────────────────────
+
+    [Fact]
+    public async Task GetPipelineConversationAsync_WithoutPipelineStore_ReturnsEmpty()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // SqliteGoalStore created without PipelineStore returns empty list
+        var conversation = await _store.GetPipelineConversationAsync("any-goal", ct);
+
+        Assert.Empty(conversation);
+    }
+
+    [Fact]
+    public async Task GetPipelineConversationAsync_WithPipelineStore_ReturnsConversation()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a PipelineStore alongside the GoalStore
+        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+
+        // Create a goal and pipeline with conversation entries
+        var goal = MakeGoal("conv-goal");
+        await storeWithPipeline.CreateGoalAsync(goal, ct);
+
+        var pipeline = new GoalPipeline(goal, maxRetries: 3);
+        pipeline.Conversation.Add(new ConversationEntry("user", "Brain prompt for coder", Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "Worker task for coder", Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("coder", "Coder completed task", Iteration: 1, Purpose: "worker-output"));
+
+        pipelineStore.SavePipeline(pipeline);
+
+        // Now retrieve via GetPipelineConversationAsync
+        var conversation = await storeWithPipeline.GetPipelineConversationAsync("conv-goal", ct);
+
+        Assert.Equal(3, conversation.Count);
+        Assert.Equal("user", conversation[0].Role);
+        Assert.Equal("Brain prompt for coder", conversation[0].Content);
+        Assert.Equal(1, conversation[0].Iteration);
+        Assert.Equal("craft-prompt", conversation[0].Purpose);
+        Assert.Equal("coder", conversation[2].Role);
+        Assert.Equal("worker-output", conversation[2].Purpose);
+    }
+
+    [Fact]
+    public async Task GetPipelineConversationAsync_NoPipelineForGoal_ReturnsEmpty()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+
+        // Goal exists but no pipeline stored for it
+        var goal = MakeGoal("no-pipeline-goal");
+        await storeWithPipeline.CreateGoalAsync(goal, ct);
+
+        var conversation = await storeWithPipeline.GetPipelineConversationAsync("no-pipeline-goal", ct);
+
+        Assert.Empty(conversation);
     }
 }

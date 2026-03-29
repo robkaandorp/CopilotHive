@@ -1,5 +1,6 @@
 using CopilotHive.Git;
 using CopilotHive.Goals;
+using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -337,4 +338,7 @@ internal sealed class CancelFakeGoalSource : IGoalSource, IGoalStore
 
     public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Goal>>([]);
+
+    public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
 }

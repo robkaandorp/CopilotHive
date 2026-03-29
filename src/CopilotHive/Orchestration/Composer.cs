@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Net.Http.Json;
 using System.Text.Json;
 using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Services;
@@ -69,7 +70,7 @@ public sealed class Composer : IAsyncDisposable
         - Read the codebase to understand current state (read_file, glob, grep)
         - Search existing goals to avoid duplication (search_goals)
         - Browse goal history and status (list_goals, get_goal)
-        - Drill into worker phase output for Coding, Testing, Review, DocWriting, or Improve (get_phase_output)
+        - Drill into worker phase output, brain prompts, or worker prompts for Coding, Testing, Review, DocWriting, or Improve (get_phase_output)
         - Create goals as drafts for user review (create_goal)
         - Approve drafts to queue them for execution (approve_goal)
         - Update existing goals (update_goal)
@@ -539,7 +540,7 @@ public sealed class Composer : IAsyncDisposable
             AIFunctionFactory.Create(GetGoalAsync, "get_goal",
                 "Get full details for a goal including iteration history."),
             AIFunctionFactory.Create(GetPhaseOutputAsync, "get_phase_output",
-                "Get the raw worker output for a specific phase within an iteration."),
+                "Get the raw worker output, brain prompt, or worker prompt for a specific phase within an iteration."),
             AIFunctionFactory.Create(ListGoalsAsync, "list_goals",
                 "List goals, optionally filtered by status."),
             AIFunctionFactory.Create(SearchGoalsAsync, "search_goals",
@@ -846,12 +847,13 @@ public sealed class Composer : IAsyncDisposable
         ["Improve"] = "improver",
     };
 
-    [Description("Get the raw worker output for a specific phase within an iteration.")]
+    [Description("Get the raw worker output, brain prompt, or worker prompt for a specific phase within an iteration.")]
     internal async Task<string> GetPhaseOutputAsync(
         [Description("Goal ID")] string id,
         [Description("Iteration number (1-based)")] int iteration,
         [Description("Phase name: Coding, Testing, Review, DocWriting, or Improve")] string phase,
-        [Description("Maximum lines to return. Default: 200")] int max_lines = 200)
+        [Description("Maximum lines to return. Default: 200")] int max_lines = 200,
+        [Description("What to return: output (default), brain_prompt, or worker_prompt")] string content = "output")
     {
         // 1. Explicit required-param validation with EXACT messages FIRST
         if (string.IsNullOrWhiteSpace(id))
@@ -865,24 +867,56 @@ public sealed class Composer : IAsyncDisposable
         if (!PhaseOutputKeys.TryGetValue(phase, out var rolePrefix))
             return $"Unknown phase '{phase}'. Supported phases: Coding, Testing, Review, DocWriting, Improve.";
 
-        // 2. Fetch goal
+        // 3. Validate content parameter
+        if (content is not "output" and not "brain_prompt" and not "worker_prompt")
+            return $"Invalid content '{content}'. Valid values: output, brain_prompt, worker_prompt.";
+
+        // 4. Handle brain_prompt / worker_prompt via pipeline conversation
+        if (content is "brain_prompt" or "worker_prompt")
+        {
+            // Verify the goal still exists before retrieving prompt data
+            var promptGoal = await _goalStore.GetGoalAsync(id);
+            if (promptGoal is null)
+                return $"No {content.Replace('_', ' ')} is available for phase '{phase}' in iteration {iteration} of goal '{id}'.";
+
+            var conversation = await _goalStore.GetPipelineConversationAsync(id);
+            if (conversation.Count == 0)
+                return $"No pipeline conversation is available for goal '{id}' (requested: {content} for phase '{phase}', iteration {iteration}).";
+
+            var craftPrompts = DashboardStateService.ExtractCraftPrompts(conversation, iteration);
+            if (!craftPrompts.TryGetValue(rolePrefix, out var prompts))
+                return $"No {content.Replace('_', ' ')} is available for phase '{phase}' in iteration {iteration} of goal '{id}'.";
+
+            var promptText = content == "brain_prompt" ? prompts.BrainPrompt : prompts.WorkerPrompt;
+            if (string.IsNullOrEmpty(promptText))
+                return $"No {content.Replace('_', ' ')} is available for phase '{phase}' in iteration {iteration} of goal '{id}'.";
+
+            var promptLines = promptText.Split('\n');
+            if (promptLines.Length <= max_lines)
+                return promptText;
+
+            var truncatedPrompt = string.Join('\n', promptLines.Take(max_lines));
+            return truncatedPrompt + $"\n... (truncated, {promptLines.Length} lines total)";
+        }
+
+        // 5. Fetch goal (output mode)
         var goal = await _goalStore.GetGoalAsync(id);
         if (goal is null)
             return "Goal not found";
 
-        // 3. Fetch iterations and find the requested iteration
+        // 6. Fetch iterations and find the requested iteration
         var iterations = await _goalStore.GetIterationsAsync(id);
         var iterSummary = iterations.FirstOrDefault(i => i.Iteration == iteration);
         if (iterSummary is null)
             return $"Iteration {iteration} not found";
 
-        // 4. Find the phase in the iteration
+        // 7. Find the phase in the iteration
         var phaseResult = iterSummary.Phases
             .FirstOrDefault(p => p.Name.Equals(phase, StringComparison.OrdinalIgnoreCase));
         if (phaseResult is null)
             return $"Phase '{phase}' not found in iteration {iteration}";
 
-        // 5. Check worker output, then fall back to PhaseOutputs dictionary
+        // 8. Check worker output, then fall back to PhaseOutputs dictionary
         string? output = phaseResult.WorkerOutput;
 
         if (string.IsNullOrEmpty(output))
