@@ -242,9 +242,13 @@ public sealed class BrainRepoManagerTests : IDisposable
         Git(clonePath, "config", "user.email", "test@test.com");
         Git(clonePath, "config", "user.name", "Test");
 
-        // Put the clone into a DIFFERENT state so EnsureCloneAsync must actually do work:
-        // switch to a new local branch "other" so HEAD is no longer on "main".
-        Git(clonePath, "checkout", "-b", "other");
+        // Put main into a divergent state by committing a new file locally (don't push).
+        // This advances main ahead of origin/main, so EnsureCloneAsync must run
+        // `git reset --hard origin/main` to rewind back to expectedSha — verifying
+        // that BOTH checkout AND reset are genuinely exercised.
+        File.WriteAllText(Path.Combine(clonePath, "local-only.txt"), "divergent\n");
+        Git(clonePath, "add", "local-only.txt");
+        Git(clonePath, "commit", "-m", "Local divergent commit (not pushed)");
 
         var logger = new TestLogger<BrainRepoManager>();
         var manager = new BrainRepoManager(_tempDir, logger);
