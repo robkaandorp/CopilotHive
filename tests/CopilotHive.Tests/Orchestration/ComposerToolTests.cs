@@ -1228,6 +1228,74 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("No brain prompt is available for phase 'Review' in iteration 1 of goal 'partial-prompt-goal'", result);
     }
 
+    [Fact]
+    public async Task GetPhaseOutput_BrainPrompt_TruncatesToMaxLines()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var composerWithPipeline = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            storeWithPipeline,
+            stateDir: Path.GetTempPath());
+
+        await composerWithPipeline.CreateGoalAsync("brain-prompt-trunc", "Goal for brain_prompt truncation test");
+        var goal = await storeWithPipeline.GetGoalAsync("brain-prompt-trunc", ct);
+        Assert.NotNull(goal);
+
+        // Build a brain prompt with 300 lines
+        var longBrainPrompt = string.Join('\n', Enumerable.Range(1, 300).Select(i => $"Brain line {i}"));
+
+        var pipeline = new GoalPipeline(goal, maxRetries: 3);
+        pipeline.Conversation.Add(new ConversationEntry("user", longBrainPrompt, Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "Your task: implement X", Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("coder", "Coder completed.", Iteration: 1, Purpose: "worker-output"));
+        pipelineStore.SavePipeline(pipeline);
+
+        var result = await composerWithPipeline.GetPhaseOutputAsync("brain-prompt-trunc", 1, "Coding", content: "brain_prompt", max_lines: 10);
+
+        Assert.Contains("truncated", result);
+        Assert.Contains("300 lines total", result);
+        Assert.DoesNotContain("Brain line 300", result);
+        Assert.Contains("Brain line 1", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_WorkerPrompt_TruncatesToMaxLines()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var composerWithPipeline = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            storeWithPipeline,
+            stateDir: Path.GetTempPath());
+
+        await composerWithPipeline.CreateGoalAsync("worker-prompt-trunc", "Goal for worker_prompt truncation test");
+        var goal = await storeWithPipeline.GetGoalAsync("worker-prompt-trunc", ct);
+        Assert.NotNull(goal);
+
+        // Build a worker prompt with 300 lines
+        var longWorkerPrompt = string.Join('\n', Enumerable.Range(1, 300).Select(i => $"Worker line {i}"));
+
+        var pipeline = new GoalPipeline(goal, maxRetries: 3);
+        pipeline.Conversation.Add(new ConversationEntry("user", "Brain prompt for tester", Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", longWorkerPrompt, Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("tester", "Tests passed!", Iteration: 1, Purpose: "worker-output"));
+        pipelineStore.SavePipeline(pipeline);
+
+        var result = await composerWithPipeline.GetPhaseOutputAsync("worker-prompt-trunc", 1, "Testing", content: "worker_prompt", max_lines: 10);
+
+        Assert.Contains("truncated", result);
+        Assert.Contains("300 lines total", result);
+        Assert.DoesNotContain("Worker line 300", result);
+        Assert.Contains("Worker line 1", result);
+    }
+
     [Theory]
     [InlineData("brain")]
     [InlineData("promptt")]
