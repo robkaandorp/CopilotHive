@@ -2127,6 +2127,32 @@ public sealed class ComposerToolTests : IDisposable
     }
 
     [Fact]
+    public async Task WebFetch_NullLinks_OmitsLinksSection()
+    {
+        // Tests the fix: links property is null - should NOT throw, should return empty links list
+        var mockFactory = new Mock<IHttpClientFactory>();
+        var fakeHandler = new FakeHttpMessageHandler(HttpStatusCode.OK,
+            """{"title":"Page With Null Links","content":"Content here","links":null}""");
+        var httpClient = new HttpClient(fakeHandler) { BaseAddress = new Uri("https://ollama.com/") };
+        mockFactory.Setup(f => f.CreateClient("ollama-web")).Returns(httpClient);
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            httpClientFactory: mockFactory.Object,
+            ollamaApiKey: "test-key");
+
+        var result = await composer.WebFetchAsync("https://example.com");
+
+        Assert.Contains("# Page With Null Links", result);
+        Assert.Contains("Content here", result);
+        // Links section should NOT appear because null links are treated as empty
+        Assert.DoesNotContain("## Links", result);
+    }
+
+    [Fact]
     public async Task WebFetch_NetworkError_ReturnsErrorMessage()
     {
         var mockFactory = new Mock<IHttpClientFactory>();
