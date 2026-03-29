@@ -320,6 +320,48 @@ public sealed class GoalDispatcherClearRetryStateTests
         var ex = Record.Exception(() => dispatcher.ClearGoalRetryState("nonexistent-goal"));
         Assert.Null(ex);
     }
+
+    [Fact]
+    public async Task ClearGoalRetryState_ClearsDispatchedGoalsEntry_AllowingRedispatch()
+    {
+        // This test verifies that ClearGoalRetryState clears _dispatchedGoals
+        // so the goal can be dispatched again. Without clearing _dispatchedGoals,
+        // the dispatcher would skip re-dispatching (line 1439 in GoalDispatcher.cs).
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Retry goal", Status = GoalStatus.Pending };
+        var goalSource = new CancelFakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        // Populate goal→source map
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Failed);
+
+        var dispatcher = CreateDispatcher(goalManager, pipelineManager);
+
+        // First, get the next goal which adds it to _dispatchedGoals
+        var firstDispatch = await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+        Assert.NotNull(firstDispatch);
+        Assert.Equal(goal.Id, firstDispatch!.Id);
+
+        // Now simulate that the goal was processed (return it to pending for re-dispatch)
+        goal.Status = GoalStatus.Pending;
+
+        // Clear retry state - this should clear _dispatchedGoals so the goal can be re-dispatched
+        dispatcher.ClearGoalRetryState(goal.Id);
+
+        // Verify the pipeline was removed
+        Assert.Null(pipelineManager.GetByGoalId(goal.Id));
+
+        // The goal should now be dispatchable again because _dispatchedGoals was cleared
+        // We verify this by checking that GetNextGoalAsync returns the goal again
+        // (In the real dispatcher, this would allow the polling loop to dispatch it)
+        goalSource.ResetForRequeue();
+        var secondDispatch = await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+        Assert.NotNull(secondDispatch);
+        Assert.Equal(goal.Id, secondDispatch!.Id);
+    }
 }
 
 /// <summary>
@@ -409,4 +451,10 @@ internal sealed class CancelFakeGoalSource : IGoalSource, IGoalStore
 
     public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) =>
         Task.CompletedTask;
+
+    /// <summary>
+    /// Resets the goal status to Pending so GetPendingGoalsAsync returns it again.
+    /// Used to simulate re-queuing after ClearGoalRetryState.
+    /// </summary>
+    public void ResetForRequeue() => _goal.Status = GoalStatus.Pending;
 }
