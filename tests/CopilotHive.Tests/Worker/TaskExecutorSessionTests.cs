@@ -369,13 +369,11 @@ public sealed class TaskExecutorSessionTests
 
     /// <summary>
     /// When <see cref="ISessionClient.SaveSessionAsync"/> throws <see cref="OperationCanceledException"/>,
-    /// the exception must propagate instead of being swallowed by the graceful fallback handler.
-    /// Since <c>SaveSessionAsync</c> is called inside the outer try-catch of <c>ExecuteAsync</c>,
-    /// the propagated exception is caught by the outer <c>OperationCanceledException</c> handler,
-    /// resulting in a <see cref="TaskOutcome.Failed"/> result — not a <see cref="TaskOutcome.Completed"/> one.
+    /// the exception must be swallowed by the best-effort save handler and the task must still complete
+    /// successfully — session save is infrastructure and must never fail the goal.
     /// </summary>
     [Fact]
-    public async Task ExecuteAsync_WhenSaveSessionThrowsCancelled_PropagatesCancellation()
+    public async Task ExecuteAsync_WhenSaveSessionThrowsCancelled_StillCompletes()
     {
         // Arrange
         var sessionClient = new FakeSessionClient { SaveShouldThrowCancelled = true };
@@ -383,11 +381,10 @@ public sealed class TaskExecutorSessionTests
         var executor = new TaskExecutor(agentRunner, gitOperations: new NoOpGitOperations(), sessionClient: sessionClient);
         var task = BuildTask("goal-9:Coder");
 
-        // Act — SaveSessionAsync re-throws OCE; the outer OperationCanceledException catch handles it
+        // Act — SaveSessionAsync throws OCE; the best-effort catch swallows it
         var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
 
-        // Assert — must NOT be Completed because cancellation was not swallowed;
-        // the outer OCE handler without ct.IsCancellationRequested returns Failed
-        Assert.Equal(TaskOutcome.Failed, result.Status);
+        // Assert — task must complete successfully; session save failure is non-fatal
+        Assert.Equal(TaskOutcome.Completed, result.Status);
     }
 }
