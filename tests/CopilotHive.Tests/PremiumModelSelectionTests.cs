@@ -189,6 +189,93 @@ public class PremiumModelSelectionTests
 }
 
 /// <summary>
+/// Tests that verify the eager-push path in <see cref="GoalDispatcher"/>
+/// sets <see cref="ConnectedWorker.CurrentModel"/> on the worker before sending the task.
+/// </summary>
+public sealed class GoalDispatcherEagerPushCurrentModelTests
+{
+    [Fact]
+    public async Task EagerPush_SetsCurrentModelOnIdleWorker()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        const string expectedModel = "premium-coder-model";
+
+        // Arrange: a brain that returns a default plan (no premium tiers — model comes from config)
+        var brain = new CapturingBrain(modelTierToReturn: "default");
+
+        var hiveConfigFile = new HiveConfigFile
+        {
+            Workers =
+            {
+                ["tester"] = new WorkerConfig { Model = expectedModel },
+            },
+        };
+
+        // Register an idle worker so the eager-push path fires
+        var workerPool = new WorkerPool();
+        var idleWorker = workerPool.RegisterWorker("worker-1", []);
+        var gateway = new GrpcWorkerGateway(workerPool);
+
+        // Build the dispatcher with the real gateway (which has the idle worker)
+        var goal = new Goal
+        {
+            Id = $"goal-{Guid.NewGuid():N}",
+            Description = "Test eager push",
+            RepositoryNames = ["test-repo"],
+        };
+        var goalSource = new PremiumFakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        await goalManager.GetNextGoalAsync(ct);
+
+        // Add test-repo to config so ResolveRepositories succeeds
+        hiveConfigFile.Repositories.Add(new RepositoryConfig
+        {
+            Name = "test-repo",
+            Url = "https://example.com/test-repo.git",
+            DefaultBranch = "develop",
+        });
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        // Apply the plan so the state machine knows which phases to run
+        var plan = await brain.PlanIterationAsync(pipeline, ct);
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.StartIteration(plan.Phases);
+
+        var taskId = $"task-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            gateway,
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain,
+            hiveConfigFile);
+
+        // Act: complete the Coding task with PASS → dispatcher advances to Testing and
+        // eager-pushes the tester task to the idle worker
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "All done.",
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+            GitStatus = new GitChangeSummary { FilesChanged = 1 },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: the idle worker's CurrentModel must equal the tester model
+        Assert.Equal(expectedModel, idleWorker.CurrentModel);
+    }
+}
+
+/// <summary>
 /// A brain stub that returns an iteration plan with configurable per-phase model tiers.
 /// Sets the requested tier on ALL phases so the dispatcher picks it up regardless of which phase runs next.
 /// </summary>
