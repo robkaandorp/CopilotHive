@@ -704,6 +704,7 @@ public sealed class GoalDispatcher : BackgroundService
 
                 _taskQueue.Activate(queuedTask, idleWorker.Id);
                 _workerGateway.MarkBusy(idleWorker.Id, queuedTask.TaskId);
+                idleWorker.CurrentModel = queuedTask.Model;
                 await _workerGateway.SendTaskAsync(idleWorker.Id, queuedTask, ct);
                 _logger.LogInformation("Task {TaskId} pushed to worker {WorkerId}", queuedTask.TaskId, idleWorker.Id);
             }
