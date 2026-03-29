@@ -892,3 +892,94 @@ public sealed class PipelineStoreSchemaMigrationTests
     }
 }
 
+public sealed class PipelineStoreRoleSessionTests : IAsyncDisposable
+{
+    private readonly PipelineStore _store;
+
+    public PipelineStoreRoleSessionTests()
+    {
+        _store = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+    }
+
+    public async ValueTask DisposeAsync() => await _store.DisposeAsync();
+
+    private static Goal CreateGoal(string id = "goal-1") =>
+        new() { Id = id, Description = "Test goal", RepositoryNames = ["repo"] };
+
+    private static GoalPipeline CreatePipeline(string id = "goal-1")
+    {
+        var goal = CreateGoal(id);
+        return new GoalPipeline(goal);
+    }
+
+    [Fact]
+    public void SavePipeline_ThenLoad_RestoresRoleSessions()
+    {
+        var pipeline = CreatePipeline("g1");
+        pipeline.SetRoleSession("coder", """{"msg":"hello"}""");
+        pipeline.SetRoleSession("reviewer", """{"msg":"reviewed"}""");
+
+        _store.SavePipeline(pipeline);
+        var snap = Assert.Single(_store.LoadActivePipelines());
+
+        Assert.Equal("""{"msg":"hello"}""", snap.RoleSessions["coder"]);
+        Assert.Equal("""{"msg":"reviewed"}""", snap.RoleSessions["reviewer"]);
+    }
+
+    [Fact]
+    public void SavePipeline_NoRoleSessions_SnapshotHasEmptyDictionary()
+    {
+        var pipeline = CreatePipeline("g1");
+
+        _store.SavePipeline(pipeline);
+        var snap = Assert.Single(_store.LoadActivePipelines());
+
+        Assert.Empty(snap.RoleSessions);
+    }
+
+    [Fact]
+    public void SavePipelineState_ThenLoad_RoleSessionsArePreserved()
+    {
+        var pipeline = CreatePipeline("g1");
+        _store.SavePipeline(pipeline);
+
+        // Now set a session and save state only
+        pipeline.SetRoleSession("tester", "tester-session");
+        _store.SavePipelineState(pipeline);
+
+        var snap = Assert.Single(_store.LoadActivePipelines());
+        Assert.Equal("tester-session", snap.RoleSessions["tester"]);
+    }
+
+    [Fact]
+    public void RoundTrip_ViaGoalPipeline_SessionsSurviveSnapshotRestore()
+    {
+        var pipeline = CreatePipeline("g1");
+        pipeline.SetRoleSession("coder", "coder-data");
+        pipeline.SetRoleSession("Tester", "tester-data");
+
+        _store.SavePipeline(pipeline);
+        var snap = Assert.Single(_store.LoadActivePipelines());
+        var restored = new GoalPipeline(snap);
+
+        Assert.Equal("coder-data",  restored.GetRoleSession("coder"));
+        Assert.Equal("tester-data", restored.GetRoleSession("tester"));
+    }
+
+    [Fact]
+    public void RoundTrip_RoleSessionsAreCaseInsensitiveAfterRestore()
+    {
+        var pipeline = CreatePipeline("g1");
+        pipeline.SetRoleSession("CODER", "uppercase-stored");
+
+        _store.SavePipeline(pipeline);
+        var snap = Assert.Single(_store.LoadActivePipelines());
+        var restored = new GoalPipeline(snap);
+
+        // Any casing should work
+        Assert.Equal("uppercase-stored", restored.GetRoleSession("coder"));
+        Assert.Equal("uppercase-stored", restored.GetRoleSession("Coder"));
+        Assert.Equal("uppercase-stored", restored.GetRoleSession("CODER"));
+    }
+}
+
