@@ -18,7 +18,10 @@ public interface IDistributedBrain
     /// iteration (new goal or after failure loop-back). Returns an IterationPlan with
     /// the ordered phase sequence and per-phase instructions.
     /// </summary>
-    Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default);
+    /// <param name="pipeline">The goal pipeline containing iteration state and context.</param>
+    /// <param name="additionalContext">Optional extra context injected at the top of the planning prompt (e.g. retry context).</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default);
 
     /// <summary>
     /// Craft a context-aware prompt for a specific phase's worker.

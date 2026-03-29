@@ -219,7 +219,7 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
-    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
         Task.FromResult(IterationPlan.Default());
 
     public Task<string> CraftPromptAsync(
@@ -1401,4 +1401,210 @@ public sealed class GoalDispatcherAutoTagReleaseTests
         Assert.Equal(2, releaseGoals.Count);
         Assert.All(releaseGoals, g => Assert.Equal("v1.0.0", g.ReleaseId));
     }
+}
+
+/// <summary>
+/// Tests for retry context injection when a previously-failed goal is re-dispatched
+/// via <see cref="GoalDispatcher.ClearGoalRetryState"/>.
+/// </summary>
+public sealed class GoalDispatcherRetryContextTests
+{
+    /// <summary>
+    /// After <see cref="GoalDispatcher.ClearGoalRetryState"/> is called, the next dispatch
+    /// of that goal must pass the retry context string to <see cref="IDistributedBrain.PlanIterationAsync"/>.
+    /// </summary>
+    [Fact]
+    public async Task ClearGoalRetryState_ThenDispatch_InjectsRetryContextToPlanIteration()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var capturingBrain = new RetryCapturingBrain();
+        var goalId = $"goal-retry-{Guid.NewGuid():N}";
+        var goal = new Goal { Id = goalId, Description = "Retry test goal", RepositoryNames = ["test-repo"] };
+        var dispatcher = CreateRetryDispatcher(goal, capturingBrain);
+
+        // Act: mark goal as retried, then run dispatch
+        dispatcher.ClearGoalRetryState(goalId);
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Assert: PlanIterationAsync was called with a non-null additionalContext
+        Assert.True(capturingBrain.PlanIterationCalled, "PlanIterationAsync should have been called");
+        Assert.NotNull(capturingBrain.LastPlanAdditionalContext);
+        Assert.Contains("RETRIED", capturingBrain.LastPlanAdditionalContext, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// After <see cref="GoalDispatcher.ClearGoalRetryState"/> is called, the first
+    /// coder prompt should contain the retry hint context.
+    /// </summary>
+    [Fact]
+    public async Task ClearGoalRetryState_ThenDispatch_InjectsRetryContextToCoderPrompt()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var capturingBrain = new RetryCapturingBrain();
+        var goalId = $"goal-retry-coder-{Guid.NewGuid():N}";
+        var goal = new Goal { Id = goalId, Description = "Retry coder context test", RepositoryNames = ["test-repo"] };
+        var dispatcher = CreateRetryDispatcher(goal, capturingBrain);
+
+        // Act
+        dispatcher.ClearGoalRetryState(goalId);
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Assert: CraftPromptAsync was called with the retry coder context
+        Assert.True(capturingBrain.CraftPromptCalled, "CraftPromptAsync should have been called");
+        Assert.NotNull(capturingBrain.LastCraftAdditionalContext);
+        Assert.Contains("previously attempted", capturingBrain.LastCraftAdditionalContext, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// When a goal is dispatched fresh (not a retry), <see cref="IDistributedBrain.PlanIterationAsync"/>
+    /// should receive null for additionalContext.
+    /// </summary>
+    [Fact]
+    public async Task FreshDispatch_NoClearGoalRetryState_PassesNullContextToPlanIteration()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var capturingBrain = new RetryCapturingBrain();
+        var goalId = $"goal-fresh-{Guid.NewGuid():N}";
+        var goal = new Goal { Id = goalId, Description = "Fresh dispatch test", RepositoryNames = ["test-repo"] };
+        var dispatcher = CreateRetryDispatcher(goal, capturingBrain);
+
+        // Act: dispatch WITHOUT calling ClearGoalRetryState
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Assert: PlanIterationAsync was called with null additionalContext
+        Assert.True(capturingBrain.PlanIterationCalled, "PlanIterationAsync should have been called");
+        Assert.Null(capturingBrain.LastPlanAdditionalContext);
+    }
+
+    /// <summary>
+    /// After <see cref="GoalDispatcher.ClearGoalRetryState"/> the goal should be
+    /// re-dispatched as a retry exactly once — the _retriedGoals entry is consumed (TryRemove).
+    /// </summary>
+    [Fact]
+    public async Task ClearGoalRetryState_RetryEntryConsumedAfterDispatch()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var capturingBrain = new RetryCapturingBrain();
+        var goalId = $"goal-retry-once-{Guid.NewGuid():N}";
+        var goal = new Goal { Id = goalId, Description = "Retry-once test", RepositoryNames = ["test-repo"] };
+        var dispatcher = CreateRetryDispatcher(goal, capturingBrain);
+
+        dispatcher.ClearGoalRetryState(goalId);
+
+        // First dispatch — should be treated as retry
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+        var firstContext = capturingBrain.LastPlanAdditionalContext;
+
+        // The retry entry is consumed: context must have been set on the first dispatch
+        Assert.NotNull(firstContext);
+        Assert.Contains("RETRIED", firstContext!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────────────────
+
+    private static GoalDispatcher CreateRetryDispatcher(Goal goal, IDistributedBrain brain)
+    {
+        var goalSource = new RetryFakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        goalManager.GetNextGoalAsync().GetAwaiter().GetResult(); // populate internal map
+
+        var pipelineManager = new GoalPipelineManager();
+
+        // Provide a minimal HiveConfigFile so ResolveRepositories doesn't throw
+        var config = new HiveConfigFile
+        {
+            Repositories =
+            [
+                new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
+            ],
+        };
+
+        return new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain,
+            config: config,
+            startupDelay: TimeSpan.Zero);
+    }
+
+    private static Task InvokeDispatchNextGoalAsync(GoalDispatcher dispatcher, CancellationToken ct)
+    {
+        var method = typeof(GoalDispatcher).GetMethod(
+            "DispatchNextGoalAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        return (Task)method.Invoke(dispatcher, [ct])!;
+    }
+}
+
+/// <summary>
+/// A brain stub that captures the additionalContext passed to PlanIterationAsync and CraftPromptAsync.
+/// </summary>
+file sealed class RetryCapturingBrain : IDistributedBrain
+{
+    public bool PlanIterationCalled { get; private set; }
+    public string? LastPlanAdditionalContext { get; private set; }
+
+    public bool CraftPromptCalled { get; private set; }
+    public string? LastCraftAdditionalContext { get; private set; }
+
+    public void Reset()
+    {
+        PlanIterationCalled = false;
+        LastPlanAdditionalContext = null;
+        CraftPromptCalled = false;
+        LastCraftAdditionalContext = null;
+    }
+
+    public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
+    {
+        PlanIterationCalled = true;
+        LastPlanAdditionalContext = additionalContext;
+        return Task.FromResult(IterationPlan.Default());
+    }
+
+    public Task<string> CraftPromptAsync(
+        GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
+    {
+        CraftPromptCalled = true;
+        LastCraftAdditionalContext = additionalContext;
+        return Task.FromResult($"Work on {pipeline.Description} as {phase}");
+    }
+
+    public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult<string?>(null);
+
+    public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public BrainStats? GetStats() => null;
+}
+
+/// <summary>Goal source for retry context tests — always returns the goal (same as FakeGoalSource).</summary>
+file sealed class RetryFakeGoalSource : IGoalSource
+{
+    private readonly Goal _goal;
+
+    public RetryFakeGoalSource(Goal goal) => _goal = goal;
+
+    public string Name => "retry-fake";
+
+    public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>([_goal]);
+
+    public Task UpdateGoalStatusAsync(
+        string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
+        Task.CompletedTask;
 }

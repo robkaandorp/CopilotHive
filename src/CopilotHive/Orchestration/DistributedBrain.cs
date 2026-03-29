@@ -306,7 +306,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <summary>
     /// Asks the Brain to plan which phases should run during the current iteration.
     /// </summary>
-    public async Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default)
+    /// <param name="pipeline">The goal pipeline containing iteration state and context.</param>
+    /// <param name="additionalContext">Optional extra context prepended to the planning prompt (e.g. retry context for a previously failed goal).</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
     {
         var previousIterationContext = BuildPreviousIterationContext(pipeline);
 
@@ -328,7 +331,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             : "";
 
         var prompt = $$"""
-            Plan the workflow for iteration {{pipeline.Iteration}} of goal: {{pipeline.Description}}
+            {{(additionalContext is not null ? $"{additionalContext}\n\n" : "")}}Plan the workflow for iteration {{pipeline.Iteration}} of goal: {{pipeline.Description}}
 
             Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
             (You can browse the code under these folder names in your working directory)

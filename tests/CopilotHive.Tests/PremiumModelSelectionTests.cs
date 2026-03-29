@@ -241,7 +241,7 @@ public sealed class GoalDispatcherEagerPushCurrentModelTests
         pipeline.AdvanceTo(GoalPhase.Coding);
 
         // Apply the plan so the state machine knows which phases to run
-        var plan = await brain.PlanIterationAsync(pipeline, ct);
+        var plan = await brain.PlanIterationAsync(pipeline, null, ct);
         pipeline.SetPlan(plan);
         pipeline.StateMachine.StartIteration(plan.Phases);
 
@@ -290,7 +290,7 @@ file sealed class CapturingBrain : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
-    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default)
+    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
     {
         var plan = IterationPlan.Default();
 
