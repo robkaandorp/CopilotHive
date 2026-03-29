@@ -28,9 +28,9 @@
 ### Changed
 - **SharpCoder NuGet reference** — Updated from 0.4.4 to 0.5.0
 
-## Removed
-- WORKER_ROLE env var, workers are now always generic.
-- Update xunit nuget package to xunit.v3.
+### Removed
+- **WORKER_ROLE env var** — Workers are now always generic
+- **xUnit NuGet package** — Updated to xunit.v3
 
 ## [0.8] — Doc Writer Role
 
