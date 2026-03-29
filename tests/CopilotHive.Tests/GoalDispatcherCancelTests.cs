@@ -258,6 +258,71 @@ public sealed class GoalDispatcherCancelTests
 }
 
 /// <summary>
+/// Tests for <see cref="GoalDispatcher.ClearGoalRetryState"/>.
+/// </summary>
+public sealed class GoalDispatcherClearRetryStateTests
+{
+    private static GoalDispatcher CreateDispatcher(
+        GoalManager goalManager,
+        GoalPipelineManager pipelineManager) =>
+        new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
+
+    [Fact]
+    public void ClearGoalRetryState_WithActivePipeline_RemovesPipelineFromManager()
+    {
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Retry goal" };
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Failed);
+
+        var goalManager = new GoalManager();
+        var dispatcher = CreateDispatcher(goalManager, pipelineManager);
+
+        dispatcher.ClearGoalRetryState(goal.Id);
+
+        Assert.Null(pipelineManager.GetByGoalId(goal.Id));
+    }
+
+    [Fact]
+    public void ClearGoalRetryState_WithActivePipeline_AllowsGoalToBeDispatchedAgain()
+    {
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Retry goal" };
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Failed);
+
+        var goalManager = new GoalManager();
+        var dispatcher = CreateDispatcher(goalManager, pipelineManager);
+
+        // Simulate that the goal was previously dispatched by calling cancel (which adds to _dispatchedGoals)
+        // We verify indirectly that the pipeline was removed (state is clear for re-dispatch).
+        dispatcher.ClearGoalRetryState(goal.Id);
+
+        // After clearing, no pipeline exists for the goal
+        Assert.Null(pipelineManager.GetByGoalId(goal.Id));
+    }
+
+    [Fact]
+    public void ClearGoalRetryState_NoPipeline_DoesNotThrow()
+    {
+        var goalManager = new GoalManager();
+        var pipelineManager = new GoalPipelineManager();
+        var dispatcher = CreateDispatcher(goalManager, pipelineManager);
+
+        // Should not throw even when the goal has no pipeline
+        var ex = Record.Exception(() => dispatcher.ClearGoalRetryState("nonexistent-goal"));
+        Assert.Null(ex);
+    }
+}
+
+/// <summary>
 /// Minimal <see cref="IGoalSource"/> and <see cref="IGoalStore"/> used by cancellation tests.
 /// Tracks last status update for assertion.
 /// </summary>

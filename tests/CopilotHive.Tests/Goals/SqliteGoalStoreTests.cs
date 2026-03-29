@@ -957,6 +957,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
         created.Iterations = 5;
         created.TotalDurationSeconds = 1234.5;
         created.StartedAt = new DateTime(2025, 1, 15, 10, 0, 0, DateTimeKind.Utc);
+        created.CompletedAt = new DateTime(2025, 1, 15, 11, 0, 0, DateTimeKind.Utc);
         await _store.UpdateGoalAsync(created, ct);
 
         // Add an iteration summary
@@ -979,6 +980,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
         Assert.Equal(0, reset.Iterations);
         Assert.Null(reset.TotalDurationSeconds);
         Assert.Null(reset.StartedAt);
+        Assert.Null(reset.CompletedAt);
         Assert.Empty(reset.IterationSummaries);
 
         // Status remains unchanged (Failed)

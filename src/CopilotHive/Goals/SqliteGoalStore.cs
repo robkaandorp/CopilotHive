@@ -612,7 +612,8 @@ public sealed class SqliteGoalStore : IGoalStore
                         iterations            = 0,
                         phase_durations       = NULL,
                         total_duration_seconds = NULL,
-                        started_at            = NULL
+                        started_at            = NULL,
+                        completed_at          = NULL
                     WHERE id = @id
                     """;
                 cmd.Parameters.AddWithValue("@id", goalId);

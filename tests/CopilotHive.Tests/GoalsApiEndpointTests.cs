@@ -447,6 +447,7 @@ public class GoalsApiEndpointTests
             goal.Iterations = 3;
             goal.TotalDurationSeconds = 120.0;
             goal.StartedAt = DateTime.UtcNow.AddMinutes(-5);
+            goal.CompletedAt = DateTime.UtcNow;
             await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
         }
 
@@ -469,6 +470,7 @@ public class GoalsApiEndpointTests
             Assert.Equal(0, updated.Iterations);
             Assert.Null(updated.TotalDurationSeconds);
             Assert.Null(updated.StartedAt);
+            Assert.Null(updated.CompletedAt);
         }
     }
 

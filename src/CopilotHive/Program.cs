@@ -371,7 +371,7 @@ static async Task<int> RunServerAsync(string[] args)
     });
 
     goalsApi.MapPatch("/{id}/status", async (string id, GoalStatusUpdate update, SqliteGoalStore store,
-        IBrainRepoManager? repoManager, ILogger<Program> endpointLogger) =>
+        IBrainRepoManager? repoManager, GoalDispatcher? dispatcher, ILogger<Program> endpointLogger) =>
     {
         try
         {
@@ -395,6 +395,9 @@ static async Task<int> RunServerAsync(string[] args)
             if (existing.Status == GoalStatus.Failed && status == GoalStatus.Draft)
             {
                 await store.ResetGoalIterationDataAsync(id);
+
+                // Clear GoalDispatcher runtime state so the goal can be re-dispatched fresh
+                dispatcher?.ClearGoalRetryState(id);
 
                 if (repoManager is not null)
                 {

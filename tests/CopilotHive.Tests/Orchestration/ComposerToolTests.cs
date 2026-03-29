@@ -357,6 +357,7 @@ public sealed class ComposerToolTests : IDisposable
         goal.Iterations = 3;
         goal.TotalDurationSeconds = 180.5;
         goal.StartedAt = new DateTime(2025, 1, 15, 10, 0, 0, DateTimeKind.Utc);
+        goal.CompletedAt = new DateTime(2025, 1, 15, 10, 30, 0, DateTimeKind.Utc);
         await _store.UpdateGoalAsync(goal, ct);
 
         // Transition Failed → Draft
@@ -373,6 +374,7 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Equal(0, reset.Iterations);
         Assert.Null(reset.TotalDurationSeconds);
         Assert.Null(reset.StartedAt);
+        Assert.Null(reset.CompletedAt);
     }
 
     [Fact]
