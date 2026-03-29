@@ -170,6 +170,54 @@ public sealed class HiveOrchestratorService(
     }
 
     /// <summary>
+    /// Retrieves a persisted role session for the given session ID.
+    /// </summary>
+    /// <param name="request">Request containing the session ID in format "goalId:roleName".</param>
+    /// <param name="context">Server call context.</param>
+    /// <returns>A <see cref="GetSessionResponse"/> with the session JSON and a found flag.</returns>
+    public override Task<GetSessionResponse> GetSession(GetSessionRequest request, ServerCallContext context)
+    {
+        var (goalId, roleName) = ParseSessionId(request.SessionId);
+        var sessionJson = pipelineManager.GetRoleSession(goalId, roleName);
+
+        if (sessionJson is not null)
+        {
+            logger.LogDebug("GetSession hit for session_id={SessionId}", request.SessionId);
+            return Task.FromResult(new GetSessionResponse { Found = true, SessionJson = sessionJson });
+        }
+
+        logger.LogDebug("GetSession miss for session_id={SessionId}", request.SessionId);
+        return Task.FromResult(new GetSessionResponse { Found = false, SessionJson = "" });
+    }
+
+    /// <summary>
+    /// Persists a role session for the given session ID.
+    /// </summary>
+    /// <param name="request">Request containing the session ID and serialised session JSON.</param>
+    /// <param name="context">Server call context.</param>
+    /// <returns>A <see cref="SaveSessionResponse"/> indicating success.</returns>
+    public override Task<SaveSessionResponse> SaveSession(SaveSessionRequest request, ServerCallContext context)
+    {
+        var (goalId, roleName) = ParseSessionId(request.SessionId);
+        pipelineManager.SetRoleSession(goalId, roleName, request.SessionJson);
+        logger.LogDebug("SaveSession stored for session_id={SessionId}", request.SessionId);
+        return Task.FromResult(new SaveSessionResponse { Success = true });
+    }
+
+    /// <summary>
+    /// Parses a session ID in the format "goalId:roleName" into its components.
+    /// </summary>
+    /// <param name="sessionId">The session ID to parse.</param>
+    /// <returns>A tuple of (goalId, roleName).</returns>
+    private static (string goalId, string roleName) ParseSessionId(string sessionId)
+    {
+        var idx = sessionId.IndexOf(':');
+        if (idx < 0)
+            throw new ArgumentException($"Invalid session_id format '{sessionId}': expected 'goalId:roleName'.", nameof(sessionId));
+        return (sessionId[..idx], sessionId[(idx + 1)..]);
+    }
+
+    /// <summary>
     /// Applies a task assignment to a worker: activates the task in the queue, marks the worker
     /// busy, and sets <see cref="ConnectedWorker.CurrentModel"/> from the task's requested model.
     /// Exposed as <c>internal</c> for unit testing via <c>InternalsVisibleTo</c>.

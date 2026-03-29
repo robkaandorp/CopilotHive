@@ -33,6 +33,9 @@ public sealed class WorkerService(
     private AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>? _stream;
     private string? _assignedId;
 
+    // The gRPC client, set after successful registration — used by session RPCs
+    private HiveOrchestrator.HiveOrchestratorClient? _client;
+
     /// <summary>
     /// Runs the full worker lifecycle: connects to Copilot, registers with the orchestrator,
     /// opens a bidirectional gRPC stream, and processes task assignments until cancelled.
@@ -53,6 +56,7 @@ public sealed class WorkerService(
             }
         });
         var client = new HiveOrchestrator.HiveOrchestratorClient(channel);
+        _client = client;
 
         // 1. Register
         var registerRequest = new RegisterRequest
@@ -252,6 +256,48 @@ public sealed class WorkerService(
                 ArgumentsJson = argsJson,
             },
         }, ct);
+    }
+
+    #endregion
+
+    #region Session management
+
+    /// <summary>
+    /// Retrieves a persisted session from the orchestrator for the given session ID.
+    /// Uses the gRPC channel directly (not the bidirectional stream).
+    /// </summary>
+    /// <param name="sessionId">The session identifier in format "goalId:roleName".</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>
+    /// The session JSON if found, or <c>null</c> if no session exists for the given ID.
+    /// </returns>
+    public async Task<string?> GetSessionAsync(string sessionId, CancellationToken ct)
+    {
+        if (_client is null)
+            throw new InvalidOperationException("Not connected to orchestrator");
+
+        var response = await _client.GetSessionAsync(
+            new GetSessionRequest { SessionId = sessionId },
+            cancellationToken: ct);
+
+        return response.Found ? response.SessionJson : null;
+    }
+
+    /// <summary>
+    /// Persists a session to the orchestrator for the given session ID.
+    /// Uses the gRPC channel directly (not the bidirectional stream).
+    /// </summary>
+    /// <param name="sessionId">The session identifier in format "goalId:roleName".</param>
+    /// <param name="sessionJson">The serialised session JSON to persist.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task SaveSessionAsync(string sessionId, string sessionJson, CancellationToken ct)
+    {
+        if (_client is null)
+            throw new InvalidOperationException("Not connected to orchestrator");
+
+        await _client.SaveSessionAsync(
+            new SaveSessionRequest { SessionId = sessionId, SessionJson = sessionJson },
+            cancellationToken: ct);
     }
 
     #endregion
