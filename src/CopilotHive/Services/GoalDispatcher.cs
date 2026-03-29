@@ -37,6 +37,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly BranchCoordinator _branchCoordinator = new();
     private readonly TaskBuilder _taskBuilder = new(new BranchCoordinator());
     private readonly ConcurrentDictionary<string, bool> _dispatchedGoals = new();
+    private readonly ConcurrentDictionary<string, bool> _retriedGoals = new();
     private readonly ConcurrentQueue<string> _redispatchQueue = new();
     private DateTime _lastAgentsSync = DateTime.MinValue;
     private readonly TimeSpan _startupDelay;
@@ -160,6 +161,7 @@ public sealed class GoalDispatcher : BackgroundService
     {
         _dispatchedGoals.TryRemove(goalId, out _);
         _pipelineManager.RemovePipeline(goalId);
+        _retriedGoals[goalId] = true;
         _logger.LogInformation("Cleared dispatcher retry state for goal {GoalId}", goalId);
     }
 
@@ -476,7 +478,7 @@ public sealed class GoalDispatcher : BackgroundService
         try
         {
             newPlan = _brain is not null
-                ? ValidatePlan(await _brain.PlanIterationAsync(pipeline, ct))
+                ? ValidatePlan(await _brain.PlanIterationAsync(pipeline, null, ct))
                 : IterationPlan.Default();
         }
         catch (Exception ex)
@@ -839,7 +841,7 @@ public sealed class GoalDispatcher : BackgroundService
         try
         {
             newPlan = _brain is not null
-                ? ValidatePlan(await _brain.PlanIterationAsync(pipeline, ct))
+                ? ValidatePlan(await _brain.PlanIterationAsync(pipeline, null, ct))
                 : IterationPlan.Default();
         }
         catch
@@ -1439,7 +1441,14 @@ public sealed class GoalDispatcher : BackgroundService
         if (!_dispatchedGoals.TryAdd(goal.Id, true))
             return;
 
-        _logger.LogInformation("Dispatching goal '{GoalId}': {Description} (Priority={Priority})", goal.Id, goal.Description, goal.Priority);
+        // Peek whether this goal is a retry (previously failed and re-dispatched).
+        // We do NOT remove the entry yet — removal happens only after dispatch succeeds,
+        // so that a failure between here and DispatchToRole does not silently consume
+        // the retry marker (the next dispatch attempt will still get the retry context).
+        var isRetry = _retriedGoals.ContainsKey(goal.Id);
+
+        _logger.LogInformation("Dispatching goal '{GoalId}': {Description} (Priority={Priority}, IsRetry={IsRetry})",
+            goal.Id, goal.Description, goal.Priority, isRetry);
 
         // Ensure Brain repo clones are up-to-date before planning
         if (_brain is not null)
@@ -1466,13 +1475,24 @@ public sealed class GoalDispatcher : BackgroundService
         var pipeline = _pipelineManager.CreatePipeline(goal, maxRetries, maxIterations);
         pipeline.GoalStartedAt = startedMeta.StartedAt;
 
+        // Build retry context strings injected into Brain calls when this goal was previously failed and re-dispatched
+        const string RetryPlanContext =
+            "IMPORTANT: This goal previously failed and has been RETRIED. This is a completely fresh start — iteration 1. " +
+            "Disregard any previous planning, prompts, or feedback for this goal from your session history. " +
+            "The previous feature branch has been deleted. The coder will start from a clean checkout of the base branch. " +
+            "Plan this as if it's a brand new goal.";
+
+        const string RetryCoderContext =
+            "This goal was previously attempted and failed. This is a fresh retry — start from scratch.";
+
         // Plan iteration phases
         IterationPlan iterationPlan;
         if (_brain is not null)
         {
             try
             {
-                iterationPlan = ValidatePlan(await _brain.PlanIterationAsync(pipeline, ct));
+                var planContext = isRetry ? RetryPlanContext : null;
+                iterationPlan = ValidatePlan(await _brain.PlanIterationAsync(pipeline, planContext, ct));
             }
             catch (Exception ex)
             {
@@ -1490,11 +1510,16 @@ public sealed class GoalDispatcher : BackgroundService
         pipeline.AdvanceTo(GoalPhase.Coding);
 
         // Craft prompt for coder and dispatch
+        var coderAdditionalContext = isRetry ? RetryCoderContext : null;
         var coderPrompt = _brain is not null
-            ? await _brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, ct)
+            ? await _brain.CraftPromptAsync(pipeline, GoalPhase.Coding, coderAdditionalContext, ct)
             : BuildCoderPrompt(goal);
 
         await DispatchToRole(pipeline, WorkerRole.Coder, coderPrompt, ct);
+
+        // Dispatch succeeded — consume the retry marker so subsequent dispatches of
+        // this goal (e.g. after a new failure+retry cycle) are treated as fresh starts.
+        _retriedGoals.TryRemove(goal.Id, out _);
 
         _pipelineManager.PersistFull(pipeline);
     }

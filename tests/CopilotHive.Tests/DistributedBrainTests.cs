@@ -97,7 +97,7 @@ public sealed class DistributedBrainTests
     {
         var fake = new FakeDistributedBrain();
         var pipeline = CreatePipeline("g-6", "Update README");
-        var plan = await fake.PlanIterationAsync(pipeline, TestContext.Current.CancellationToken);
+        var plan = await fake.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
         Assert.NotNull(plan);
         Assert.NotEmpty(plan.Phases);
     }
@@ -118,7 +118,7 @@ public sealed class DistributedBrainTests
         var fake = new FakeDistributedBrain();
         var pipeline = CreatePipeline("g-9", "Multi-step goal");
         await fake.ConnectAsync(TestContext.Current.CancellationToken);
-        await fake.PlanIterationAsync(pipeline, TestContext.Current.CancellationToken);
+        await fake.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
         await fake.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken);
         Assert.True(fake.Connected);
         Assert.Equal(1, fake.PlanIterationCalls);
@@ -383,7 +383,7 @@ public sealed class DistributedBrainTests
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-plan", "Test plan");
 
-        var plan = await brain.PlanIterationAsync(pipeline, TestContext.Current.CancellationToken);
+        var plan = await brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
 
         Assert.NotNull(plan);
         Assert.NotEmpty(plan.Phases);
@@ -511,7 +511,7 @@ file sealed class FakeDistributedBrain : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) { Connected = true; return Task.CompletedTask; }
 
-    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, CancellationToken ct = default)
+    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
     {
         PlanIterationCalls++;
         return Task.FromResult(IterationPlan.Default());
