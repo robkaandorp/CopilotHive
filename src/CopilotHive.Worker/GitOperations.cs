@@ -42,6 +42,8 @@ public static class GitOperations
 
     /// <summary>
     /// Creates a new branch from the given base branch.
+    /// If the repository is empty (no commits), creates an orphan branch via
+    /// <c>git checkout --orphan</c> instead of branching from the base branch.
     /// Throws <see cref="GitOperationException"/> on failure.
     /// </summary>
     /// <param name="repoDir">Path to the local git repository.</param>
@@ -53,11 +55,36 @@ public static class GitOperations
     {
         var (exitCode1, _, stderr1) = await RunGitCommandAsync(repoDir, $"checkout {baseBranch}", ct);
         if (exitCode1 != 0)
-            throw new GitOperationException($"Failed to checkout base branch '{baseBranch}': {stderr1.Trim()}");
+        {
+            if (await IsRepoEmptyAsync(repoDir, ct))
+            {
+                var (orphanExit, _, orphanStderr) = await RunGitCommandAsync(
+                    repoDir, $"checkout --orphan {branchName}", ct);
+                if (orphanExit != 0)
+                    throw new GitOperationException(
+                        $"Failed to create orphan branch '{branchName}': {orphanStderr.Trim()}");
+                return;
+            }
+
+            throw new GitOperationException(
+                $"Failed to checkout base branch '{baseBranch}': {stderr1.Trim()}");
+        }
 
         var (exitCode2, _, stderr2) = await RunGitCommandAsync(repoDir, $"checkout -b {branchName}", ct);
         if (exitCode2 != 0)
             throw new GitOperationException($"Failed to create branch '{branchName}': {stderr2.Trim()}");
+    }
+
+    /// <summary>
+    /// Returns true if the repository has no commits (is empty).
+    /// Uses <c>git rev-parse HEAD</c>; a non-zero exit code indicates no commits exist.
+    /// </summary>
+    /// <param name="repoDir">Path to the local git repository.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public static async Task<bool> IsRepoEmptyAsync(string repoDir, CancellationToken ct)
+    {
+        var (exitCode, stdout, _) = await RunGitCommandAsync(repoDir, "rev-parse HEAD", ct);
+        return exitCode != 0 || string.IsNullOrWhiteSpace(stdout);
     }
 
     /// <summary>
