@@ -50,7 +50,7 @@ else
                 <div class="chat-msg chat-msg-assistant chat-question-widget">
                     <div class="chat-msg-role">Composer — Question</div>
                     <div class="chat-msg-content">
-                        <p class="chat-question-text">@pq.Text</p>
+                        <div class="chat-question-text">@((MarkupString)FormatContent(pq.Text))</div>
 
                         @if (pq.Type == QuestionType.YesNo)
                         {
