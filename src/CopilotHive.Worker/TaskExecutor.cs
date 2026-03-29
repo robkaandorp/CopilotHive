@@ -400,7 +400,6 @@ public sealed class TaskExecutor(
         }
         catch (Exception ex)
         {
-            if (ex is OperationCanceledException) throw;
             _log.Warn($"Failed to save session '{sessionId}': {ex.Message}");
         }
     }
