@@ -76,6 +76,38 @@ public sealed class GitOperationsTests : IAsyncLifetime
         Assert.Null(exception);
     }
 
+    [Fact]
+    public async Task CreateBranchAsync_OnEmptyRepo_CreatesOrphanBranchWithNoParentCommits()
+    {
+        // Act - create orphan branch on empty repo
+        await GitOperations.CreateBranchAsync(_repoDir, "feature/test", "main", CancellationToken.None);
+
+        // Assert - verify the branch has no parent commits (git log returns empty or error)
+        var (_, stdout, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "log --oneline", CancellationToken.None);
+
+        // On an orphan branch with no commits, git log should return empty output
+        // (exit code may be non-zero, but stdout will be empty)
+        Assert.Equal(string.Empty, stdout.Trim());
+    }
+
+    [Fact]
+    public async Task CreateBranchAsync_OnEmptyRepo_CreatesCommitableOrphanBranch()
+    {
+        // Arrange - create orphan branch on empty repo
+        await GitOperations.CreateBranchAsync(_repoDir, "feature/test", "main", CancellationToken.None);
+
+        // Act - add a file and commit on the orphan branch
+        await CommitFileAsync("newfile.txt", "content");
+
+        // Assert - verify the commit has no parents (orphan commit)
+        var (_, stdout, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "log --format=%P", CancellationToken.None);
+
+        // %P formats parent hashes; for an orphan commit, this should be empty
+        Assert.Equal(string.Empty, stdout.Trim());
+    }
+
     // ── CreateBranchAsync — non-empty repository ─────────────────────────────
 
     [Fact]
