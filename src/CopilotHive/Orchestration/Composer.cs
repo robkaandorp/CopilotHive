@@ -731,13 +731,13 @@ public sealed class Composer : IAsyncDisposable
     [Description("Update a field on an existing goal.")]
     internal async Task<string> UpdateGoalAsync(
         [Description("Goal ID to update")] string id,
-        [Description("Field to update: description, priority, repositories, or status")] string field,
+        [Description("Field to update: description, priority, repositories, status, or release")] string field,
         [Description("New value for the field")] string value)
     {
         var error = Shared.ToolValidation.Check(
             (!string.IsNullOrWhiteSpace(id), "id is required"),
             (!string.IsNullOrWhiteSpace(field), "field is required"),
-            (!string.IsNullOrWhiteSpace(value), "value is required"));
+            (field.Equals("release", StringComparison.OrdinalIgnoreCase) || !string.IsNullOrWhiteSpace(value), "value is required"));
         if (error is not null) return error;
 
         var goal = await _goalStore.GetGoalAsync(id);
@@ -777,8 +777,24 @@ public sealed class Composer : IAsyncDisposable
                 // RepositoryNames is init-only; we'd need to recreate
                 return "❌ Repositories cannot be changed after creation. Delete and re-create the goal instead.";
 
+            case "release":
+                if (value.Equals("none", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(value))
+                {
+                    goal.ReleaseId = null;
+                    await _goalStore.UpdateGoalAsync(goal);
+                    _logger.LogInformation("Composer cleared release on goal '{GoalId}'", id);
+                    return $"✅ Goal '{id}' release cleared.";
+                }
+                var release = await _goalStore.GetReleaseAsync(value);
+                if (release is null)
+                    return $"❌ Release '{value}' not found.";
+                goal.ReleaseId = release.Id;
+                await _goalStore.UpdateGoalAsync(goal);
+                _logger.LogInformation("Composer set release on goal '{GoalId}' to '{ReleaseId}'", id, release.Id);
+                return $"✅ Goal '{id}' release set to '{release.Id}'.";
+
             default:
-                return $"❌ Unknown field '{field}'. Valid fields: description, priority, status, repositories.";
+                return $"❌ Unknown field '{field}'. Valid fields: description, priority, status, repositories, release.";
         }
     }
 
