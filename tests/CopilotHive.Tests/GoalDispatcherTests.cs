@@ -1478,7 +1478,8 @@ public sealed class GoalDispatcherRetryContextTests
 
     /// <summary>
     /// After <see cref="GoalDispatcher.ClearGoalRetryState"/> the goal should be
-    /// re-dispatched as a retry exactly once — the _retriedGoals entry is consumed (TryRemove).
+    /// re-dispatched as a retry exactly once — the _retriedGoals entry is consumed after
+    /// the first successful dispatch, so a second dispatch of the same goal gets null context.
     /// </summary>
     [Fact]
     public async Task ClearGoalRetryState_RetryEntryConsumedAfterDispatch()
@@ -1495,9 +1496,33 @@ public sealed class GoalDispatcherRetryContextTests
         await InvokeDispatchNextGoalAsync(dispatcher, ct);
         var firstContext = capturingBrain.LastPlanAdditionalContext;
 
-        // The retry entry is consumed: context must have been set on the first dispatch
+        // The retry context must have been injected on the first dispatch
         Assert.NotNull(firstContext);
         Assert.Contains("RETRIED", firstContext!, StringComparison.OrdinalIgnoreCase);
+
+        // Reset the dispatcher's internal gate state (mimics what ClearGoalRetryState does
+        // for _dispatchedGoals and pipeline removal, but WITHOUT re-adding to _retriedGoals).
+        // This simulates the goal failing again and being re-queued for a second cycle.
+        var dispatchedGoalsField = typeof(GoalDispatcher).GetField(
+            "_dispatchedGoals",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var dispatchedGoals = (System.Collections.Concurrent.ConcurrentDictionary<string, bool>)dispatchedGoalsField.GetValue(dispatcher)!;
+        dispatchedGoals.TryRemove(goalId, out _);
+
+        var pipelineManagerField = typeof(GoalDispatcher).GetField(
+            "_pipelineManager",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var pipelineManager = (GoalPipelineManager)pipelineManagerField.GetValue(dispatcher)!;
+        pipelineManager.RemovePipeline(goalId);
+
+        // Reset brain capture state for the second dispatch
+        capturingBrain.Reset();
+
+        // Second dispatch — the retry entry was consumed, so context must be null
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        Assert.True(capturingBrain.PlanIterationCalled, "PlanIterationAsync should have been called on second dispatch");
+        Assert.Null(capturingBrain.LastPlanAdditionalContext);
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────

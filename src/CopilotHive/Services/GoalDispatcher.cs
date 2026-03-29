@@ -1441,8 +1441,11 @@ public sealed class GoalDispatcher : BackgroundService
         if (!_dispatchedGoals.TryAdd(goal.Id, true))
             return;
 
-        // Check whether this goal is a retry (previously failed and re-dispatched)
-        _retriedGoals.TryRemove(goal.Id, out var isRetry);
+        // Peek whether this goal is a retry (previously failed and re-dispatched).
+        // We do NOT remove the entry yet — removal happens only after dispatch succeeds,
+        // so that a failure between here and DispatchToRole does not silently consume
+        // the retry marker (the next dispatch attempt will still get the retry context).
+        var isRetry = _retriedGoals.ContainsKey(goal.Id);
 
         _logger.LogInformation("Dispatching goal '{GoalId}': {Description} (Priority={Priority}, IsRetry={IsRetry})",
             goal.Id, goal.Description, goal.Priority, isRetry);
@@ -1513,6 +1516,10 @@ public sealed class GoalDispatcher : BackgroundService
             : BuildCoderPrompt(goal);
 
         await DispatchToRole(pipeline, WorkerRole.Coder, coderPrompt, ct);
+
+        // Dispatch succeeded — consume the retry marker so subsequent dispatches of
+        // this goal (e.g. after a new failure+retry cycle) are treated as fresh starts.
+        _retriedGoals.TryRemove(goal.Id, out _);
 
         _pipelineManager.PersistFull(pipeline);
     }
