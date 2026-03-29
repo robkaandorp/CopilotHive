@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 **Composer Agent & Chat UI.** A conversational Composer agent at `/composer` provides streaming chat for goal decomposition and management. It offers goal CRUD tools, codebase inspection, git operations, web search and fetch capabilities, phase output inspection, repository listing, and interactive user questions. The interface supports keyboard shortcuts, auto-scroll, full Markdown rendering, session reset, and automatic context overflow recovery.
 
-**Brain & Orchestration.** The Brain now uses a SharpCoder agent with a single persistent session that carries context across all goals. It has read-only file access to all target repositories via clones created at startup, automatic context compaction when usage approaches the limit, and session persistence for crash recovery. Goals process sequentially so the Brain accumulates learnings across iterations. The Brain also generates concise commit messages for squash merges, falling back to a deterministic format on failure.
+**Brain & Orchestration.** The Brain now operates as a Composer with read-only access to all target repositories, manages memory automatically when usage approaches the limit, and persists its session across crashes. Goals process sequentially so the Brain accumulates learnings across iterations. The Brain also generates concise commit messages for squash merges, falling back to a deterministic format on failure.
 
 **Dashboard & UI.** The Goals browser at `/goals` provides search, status, priority, and repository filters with a sortable table and inline actions. The Goal detail page shows collapsible prompts, a Planning phase with reasoning display, dependency visualization with status indicators, worker output rendered as Markdown, and clickable merge commit links. A Configuration page offers syntax highlighting and Markdown rendering for agent files. A Releases page supports release creation and goal-to-release assignment. The version is displayed in the navigation bar from assembly metadata.
 
@@ -29,13 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-**SharpCoder & Core Pipeline.** SharpCoder was updated from 0.4.4 to 0.5.0, enabling persistent Brain and worker sessions. The pipeline phase order is now Coding → Testing → Review → DocWriting → Improve → Merge. The orchestrator runs exclusively in server mode — the CLI flag has been removed. The Brain is configured to access all target repositories simultaneously and is explicitly restricted from issuing git branch management commands or framework-specific build commands.
+**SharpCoder & Core Pipeline.** SharpCoder was updated from 0.4.4 to 0.5.0, enabling persistent Brain and worker sessions. The pipeline phase order is now Coding → Testing → Review → DocWriting → Improve → Merge. The orchestrator runs exclusively in server mode — the CLI flag has been removed. The Brain is configured to access all target repositories simultaneously and is explicitly restricted from issuing advanced git operations.
 
-**Goal Storage, Workers & DocWriter.** SQLite is now the sole goal source; the file-based source is used only for YAML round-tripping. Docker Compose uses a single generic worker service with configurable replicas, replacing fixed-role containers. The DocWriter role is restricted to documentation files only and no longer edits source code or runs builds, instead reviewing XML doc comments and flagging issues.
+**Goal Storage, Workers & DocWriter.** SQLite is now the sole goal source; the file-based source is used only for configuration file editing. Docker Compose uses a single generic worker service with configurable replicas, replacing fixed-role containers. The DocWriter role is restricted to documentation files only and no longer edits source code or runs builds, instead reviewing XML doc comments and flagging issues.
 
 ### Fixed
 
-**Stability & Correctness.** Startup now handles empty repository clones, and worker containers survive restarts via clone-or-pull recovery. Brain restrictions prevent generation of git branch and checkout commands, eliminating no-op commits on the wrong branch. Session saves no longer re-throw cancellations, and null phase results throw explicitly rather than defaulting silently.
+**Stability & Correctness.** Startup now handles empty repository clones, and worker containers reconnect automatically after crashes. Brain restrictions prevent generation of branch operations on the wrong branch, eliminating no-op commits. Session saves no longer re-throw cancellations, and null phase results throw explicitly rather than defaulting silently.
 
 **UI & API.** The releases form shows all configured repositories, and delete errors appear as inline messages on the Goal detail page. Dependency links use accent colors for dark mode readability. Goal deletion enforces status restrictions with consistent validation between the API and Composer. Web search results are truncated to prevent overflow.
 
