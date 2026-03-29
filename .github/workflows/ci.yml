@@ -3,6 +3,7 @@ name: CI — Build, Test & Push Containers
 on:
   push:
     branches: [develop]
+    tags: ['v*']
 
 env:
   REGISTRY: ghcr.io
