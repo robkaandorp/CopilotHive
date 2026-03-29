@@ -131,6 +131,12 @@ public sealed class GoalPipeline
     /// <summary>Accumulated output from each completed phase, keyed by "{role}-{iteration}".</summary>
     public ConcurrentDictionary<string, string> PhaseOutputs { get; } = new();
 
+    /// <summary>
+    /// Persisted agent session JSON blobs, keyed by role name (case-insensitive).
+    /// Allows workers to resume mid-session after an orchestrator restart.
+    /// </summary>
+    public ConcurrentDictionary<string, string> RoleSessions { get; } = new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>In-memory iteration summaries for completed iterations (available to dashboard before goal finishes).</summary>
     public List<IterationSummary> CompletedIterationSummaries { get; } = [];
 
@@ -190,6 +196,9 @@ public sealed class GoalPipeline
 
         foreach (var (key, value) in snapshot.PhaseOutputs)
             PhaseOutputs[key] = value;
+
+        foreach (var (key, value) in snapshot.RoleSessions)
+            RoleSessions[key] = value;
 
         Metrics.BuildSuccess = snapshot.Metrics.BuildSuccess;
         Metrics.TotalTests = snapshot.Metrics.TotalTests;
@@ -279,6 +288,24 @@ public sealed class GoalPipeline
     {
         PhaseOutputs[$"{role.ToRoleName()}-{iteration}"] = output;
     }
+
+    /// <summary>
+    /// Returns the persisted session JSON for the given role, or <c>null</c> if no session has been stored.
+    /// The lookup is case-insensitive.
+    /// </summary>
+    /// <param name="roleName">The name of the role whose session to retrieve.</param>
+    /// <returns>The session JSON string, or <c>null</c> if not found.</returns>
+    public string? GetRoleSession(string roleName) =>
+        RoleSessions.TryGetValue(roleName, out var session) ? session : null;
+
+    /// <summary>
+    /// Stores the session JSON for the given role, overwriting any previously stored value.
+    /// The key is treated case-insensitively.
+    /// </summary>
+    /// <param name="roleName">The name of the role whose session to store.</param>
+    /// <param name="sessionJson">The serialised session JSON to persist.</param>
+    public void SetRoleSession(string roleName, string sessionJson) =>
+        RoleSessions[roleName] = sessionJson;
 
     /// <summary>Increment the review retry counter. Returns true if retries remain.</summary>
     public bool IncrementReviewRetry()

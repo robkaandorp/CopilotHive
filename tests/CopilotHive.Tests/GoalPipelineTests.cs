@@ -299,6 +299,180 @@ public sealed class GoalPipelineTests
     #endregion
 }
 
+public sealed class GoalPipelineRoleSessionTests
+{
+    private static Goal CreateGoal(string id = "goal-1") =>
+        new() { Id = id, Description = "Test goal" };
+
+    #region RoleSessions — initial state
+
+    [Fact]
+    public void NewPipeline_RoleSessions_StartsEmpty()
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+
+        Assert.Empty(pipeline.RoleSessions);
+    }
+
+    #endregion
+
+    #region GetRoleSession — null for unknown
+
+    [Fact]
+    public void GetRoleSession_UnknownRole_ReturnsNull()
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+
+        var result = pipeline.GetRoleSession("coder");
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void GetRoleSession_EmptyDictionary_ReturnsNull()
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+
+        Assert.Null(pipeline.GetRoleSession("reviewer"));
+        Assert.Null(pipeline.GetRoleSession("tester"));
+    }
+
+    #endregion
+
+    #region SetRoleSession / GetRoleSession — round-trip
+
+    [Fact]
+    public void SetRoleSession_ThenGetRoleSession_ReturnsSameValue()
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+        const string sessionJson = """{"messages":[{"role":"user","content":"hello"}]}""";
+
+        pipeline.SetRoleSession("coder", sessionJson);
+
+        Assert.Equal(sessionJson, pipeline.GetRoleSession("coder"));
+    }
+
+    [Fact]
+    public void SetRoleSession_Overwrite_ReturnsNewValue()
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+        pipeline.SetRoleSession("coder", "first");
+        pipeline.SetRoleSession("coder", "second");
+
+        Assert.Equal("second", pipeline.GetRoleSession("coder"));
+    }
+
+    [Fact]
+    public void SetRoleSession_MultipleRoles_AreStoredIndependently()
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+        pipeline.SetRoleSession("coder", "coder-session");
+        pipeline.SetRoleSession("tester", "tester-session");
+        pipeline.SetRoleSession("reviewer", "reviewer-session");
+
+        Assert.Equal("coder-session", pipeline.GetRoleSession("coder"));
+        Assert.Equal("tester-session", pipeline.GetRoleSession("tester"));
+        Assert.Equal("reviewer-session", pipeline.GetRoleSession("reviewer"));
+        Assert.Equal(3, pipeline.RoleSessions.Count);
+    }
+
+    #endregion
+
+    #region Case-insensitivity
+
+    [Theory]
+    [InlineData("coder", "CODER")]
+    [InlineData("Coder", "coder")]
+    [InlineData("REVIEWER", "reviewer")]
+    [InlineData("Tester", "TESTER")]
+    public void GetRoleSession_IsCaseInsensitive(string setKey, string getKey)
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+        pipeline.SetRoleSession(setKey, "my-session");
+
+        Assert.Equal("my-session", pipeline.GetRoleSession(getKey));
+    }
+
+    [Fact]
+    public void SetRoleSession_DifferentCasings_OverwriteSameSlot()
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+        pipeline.SetRoleSession("Coder", "first");
+        pipeline.SetRoleSession("CODER", "second");
+
+        // Should only be one entry (case-insensitive key)
+        Assert.Single(pipeline.RoleSessions);
+        Assert.Equal("second", pipeline.GetRoleSession("coder"));
+    }
+
+    #endregion
+
+    #region Snapshot restore
+
+    [Fact]
+    public void RestoredFromSnapshot_WithRoleSessions_SessionsAreAvailable()
+    {
+        var goal = CreateGoal("g1");
+        var snapshot = new CopilotHive.Persistence.PipelineSnapshot
+        {
+            GoalId = goal.Id,
+            Description = goal.Description,
+            Goal = goal,
+            CreatedAt = DateTime.UtcNow,
+            RoleSessions = new Dictionary<string, string>
+            {
+                ["coder"]    = "coder-json",
+                ["reviewer"] = "reviewer-json",
+            },
+        };
+
+        var pipeline = new GoalPipeline(snapshot);
+
+        Assert.Equal("coder-json",    pipeline.GetRoleSession("coder"));
+        Assert.Equal("reviewer-json", pipeline.GetRoleSession("reviewer"));
+    }
+
+    [Fact]
+    public void RestoredFromSnapshot_EmptyRoleSessions_StartsEmpty()
+    {
+        var goal = CreateGoal("g2");
+        var snapshot = new CopilotHive.Persistence.PipelineSnapshot
+        {
+            GoalId = goal.Id,
+            Description = goal.Description,
+            Goal = goal,
+            CreatedAt = DateTime.UtcNow,
+            RoleSessions = [],
+        };
+
+        var pipeline = new GoalPipeline(snapshot);
+
+        Assert.Empty(pipeline.RoleSessions);
+    }
+
+    [Fact]
+    public void RestoredFromSnapshot_RoleSessionsAreCaseInsensitive()
+    {
+        var goal = CreateGoal("g3");
+        var snapshot = new CopilotHive.Persistence.PipelineSnapshot
+        {
+            GoalId = goal.Id,
+            Description = goal.Description,
+            Goal = goal,
+            CreatedAt = DateTime.UtcNow,
+            RoleSessions = new Dictionary<string, string> { ["CODER"] = "stored" },
+        };
+
+        var pipeline = new GoalPipeline(snapshot);
+
+        // Case-insensitive lookup works after restore
+        Assert.Equal("stored", pipeline.GetRoleSession("coder"));
+        Assert.Equal("stored", pipeline.GetRoleSession("Coder"));
+    }
+
+    #endregion
+}
+
 public sealed class GoalPipelineManagerTests
 {
     private static Goal CreateGoal(string id = "goal-1", string description = "Test goal") =>
@@ -556,6 +730,63 @@ public sealed class GoalPipelineManagerTests
         var pipeline = new GoalPipeline(snapshot);
 
         Assert.Null(pipeline.GoalStartedAt);
+    }
+
+    #endregion
+
+    #region GetRoleSession / SetRoleSession — convenience methods
+
+    [Fact]
+    public void GetRoleSession_UnknownGoalId_ReturnsNull()
+    {
+        var manager = new GoalPipelineManager();
+
+        var result = manager.GetRoleSession("nonexistent-goal", "coder");
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void GetRoleSession_UnknownRole_ReturnsNull()
+    {
+        var manager = new GoalPipelineManager();
+        manager.CreatePipeline(CreateGoal("g1"));
+
+        var result = manager.GetRoleSession("g1", "unknown-role");
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void SetRoleSession_ThenGetRoleSession_RoundTrips()
+    {
+        var manager = new GoalPipelineManager();
+        manager.CreatePipeline(CreateGoal("g1"));
+        const string json = """{"session":"data"}""";
+
+        manager.SetRoleSession("g1", "coder", json);
+
+        Assert.Equal(json, manager.GetRoleSession("g1", "coder"));
+    }
+
+    [Fact]
+    public void SetRoleSession_CaseInsensitiveRoleName_CanBeRetrievedWithDifferentCase()
+    {
+        var manager = new GoalPipelineManager();
+        manager.CreatePipeline(CreateGoal("g1"));
+
+        manager.SetRoleSession("g1", "Coder", "session-data");
+
+        Assert.Equal("session-data", manager.GetRoleSession("g1", "CODER"));
+    }
+
+    [Fact]
+    public void SetRoleSession_UnknownGoalId_DoesNotThrow()
+    {
+        var manager = new GoalPipelineManager();
+
+        // Should be a no-op, not throw
+        manager.SetRoleSession("nonexistent", "coder", "{}");
     }
 
     #endregion

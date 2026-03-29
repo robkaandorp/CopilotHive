@@ -100,4 +100,30 @@ public sealed class GoalPipelineManager
 
         return restored;
     }
+
+    /// <summary>
+    /// Returns the persisted session JSON for the specified role in a goal's pipeline,
+    /// or <c>null</c> if the goal or role session does not exist.
+    /// </summary>
+    /// <param name="goalId">The goal whose pipeline to look up.</param>
+    /// <param name="roleName">The role name whose session to retrieve (case-insensitive).</param>
+    /// <returns>The session JSON, or <c>null</c>.</returns>
+    public string? GetRoleSession(string goalId, string roleName)
+    {
+        var pipeline = GetByGoalId(goalId);
+        return pipeline?.GetRoleSession(roleName);
+    }
+
+    /// <summary>
+    /// Stores the session JSON for the specified role in a goal's pipeline.
+    /// Does nothing if the goal pipeline does not exist.
+    /// </summary>
+    /// <param name="goalId">The goal whose pipeline to update.</param>
+    /// <param name="roleName">The role name whose session to store (case-insensitive).</param>
+    /// <param name="sessionJson">The serialised session JSON to persist.</param>
+    public void SetRoleSession(string goalId, string roleName, string sessionJson)
+    {
+        var pipeline = GetByGoalId(goalId);
+        pipeline?.SetRoleSession(roleName, sessionJson);
+    }
 }

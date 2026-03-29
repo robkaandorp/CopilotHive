@@ -120,7 +120,8 @@ public sealed class PipelineStore : IAsyncDisposable
         ("pipelines",             "completed_at",      "TEXT"),
         ("pipelines",             "goal_started_at",   "TEXT"),
         ("pipelines",             "plan_json",         "TEXT"),
-        ("pipelines",             "merge_commit_hash", "TEXT"),
+        ("pipelines",             "merge_commit_hash",  "TEXT"),
+        ("pipelines",             "role_sessions_json", "TEXT NOT NULL DEFAULT '{}'"),
         ("conversation_entries",  "iteration",         "INTEGER"),
         ("conversation_entries",  "purpose",           "TEXT"),
     ];
@@ -253,7 +254,8 @@ public sealed class PipelineStore : IAsyncDisposable
                 SELECT goal_id, description, goal_json, phase, iteration,
                        review_retries, test_retries, max_retries, max_iterations,
                        active_task_id, coder_branch, phase_outputs, metrics_json,
-                       created_at, completed_at, goal_started_at, plan_json, merge_commit_hash
+                       created_at, completed_at, goal_started_at, plan_json, merge_commit_hash,
+                       COALESCE(role_sessions_json, '{}')
                 FROM pipelines
                 WHERE phase NOT IN ('Done', 'Failed')
                 """;
@@ -282,6 +284,7 @@ public sealed class PipelineStore : IAsyncDisposable
                     GoalStartedAt = reader.IsDBNull(15) ? null : DateTime.Parse(reader.GetString(15), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
                     Plan = reader.IsDBNull(16) ? null : JsonSerializer.Deserialize<IterationPlan>(reader.GetString(16), JsonOptions),
                     MergeCommitHash = reader.IsDBNull(17) ? null : reader.GetString(17),
+                    RoleSessions = JsonSerializer.Deserialize<Dictionary<string, string>>(reader.GetString(18), JsonOptions) ?? [],
                     Conversation = LoadConversationCore(goalId),
                 });
             }
@@ -303,12 +306,14 @@ public sealed class PipelineStore : IAsyncDisposable
                 (goal_id, description, goal_json, phase, iteration,
                  review_retries, test_retries, max_retries, max_iterations,
                  active_task_id, coder_branch, plan_json, phase_outputs, metrics_json,
-                 created_at, completed_at, goal_started_at, merge_commit_hash)
+                 created_at, completed_at, goal_started_at, merge_commit_hash,
+                 role_sessions_json)
             VALUES
                 (@goalId, @desc, @goalJson, @phase, @iteration,
                  @reviewRetries, @testRetries, @maxRetries, @maxIterations,
                  @activeTaskId, @coderBranch, @planJson, @phaseOutputs, @metricsJson,
-                 @createdAt, @completedAt, @goalStartedAt, @mergeCommitHash)
+                 @createdAt, @completedAt, @goalStartedAt, @mergeCommitHash,
+                 @roleSessionsJson)
             """;
         cmd.Parameters.AddWithValue("@goalId", pipeline.GoalId);
         cmd.Parameters.AddWithValue("@desc", pipeline.Description);
@@ -331,6 +336,7 @@ public sealed class PipelineStore : IAsyncDisposable
         cmd.Parameters.AddWithValue("@goalStartedAt",
             pipeline.GoalStartedAt.HasValue ? pipeline.GoalStartedAt.Value.ToString("O") : DBNull.Value);
         cmd.Parameters.AddWithValue("@mergeCommitHash", (object?)pipeline.MergeCommitHash ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@roleSessionsJson", JsonSerializer.Serialize(new Dictionary<string, string>(pipeline.RoleSessions), JsonOptions));
         cmd.ExecuteNonQuery();
     }
 
@@ -457,4 +463,6 @@ public sealed class PipelineSnapshot
     public List<(string TaskId, string GoalId)> TaskMappings { get; set; } = [];
     /// <summary>SHA-1 hash of the merge commit for this pipeline's changes, or <c>null</c> if not yet merged.</summary>
     public string? MergeCommitHash { get; init; }
+    /// <summary>Persisted agent session JSON blobs, keyed by role name.</summary>
+    public Dictionary<string, string> RoleSessions { get; init; } = [];
 }
