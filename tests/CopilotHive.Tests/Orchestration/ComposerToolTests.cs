@@ -327,9 +327,9 @@ public sealed class ComposerToolTests : IDisposable
     }
 
     [Fact]
-    public async Task UpdateGoal_Status_InvalidTransition_FailedToDraft_ReturnsError()
+    public async Task UpdateGoal_Status_ValidTransition_FailedToDraft_Succeeds()
     {
-        // Set goal to Failed directly then try to update to Draft
+        // Failed→Draft is now a valid "retry" transition
         await _composer.CreateGoalAsync("transition-failed1", "Test goal");
         var ct = TestContext.Current.CancellationToken;
         var goal = await _store.GetGoalAsync("transition-failed1", ct);
@@ -339,8 +339,8 @@ public sealed class ComposerToolTests : IDisposable
 
         var result = await _composer.UpdateGoalAsync("transition-failed1", "status", "Draft");
 
-        Assert.Contains("❌", result);
-        Assert.Contains("Invalid transition", result);
+        Assert.Contains("✅", result);
+        Assert.Contains("Draft", result);
     }
 
     // ── update_goal — release field ──
@@ -3282,6 +3282,9 @@ internal sealed class FakeGoalSource : IGoalSource, IGoalStore
 
     public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
+
+    public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) =>
+        Task.CompletedTask;
 }
 
 /// <summary>

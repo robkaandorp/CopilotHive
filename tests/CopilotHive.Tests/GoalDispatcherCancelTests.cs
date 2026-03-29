@@ -341,4 +341,7 @@ internal sealed class CancelFakeGoalSource : IGoalSource, IGoalStore
 
     public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
+
+    public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) =>
+        Task.CompletedTask;
 }

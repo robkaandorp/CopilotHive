@@ -764,9 +764,35 @@ public sealed class Composer : IAsyncDisposable
                     return $"❌ Can only set status to Draft or Pending via update_goal.";
                 var validTransition =
                     (goal.Status == GoalStatus.Draft && newStatus == GoalStatus.Pending) ||
-                    (goal.Status == GoalStatus.Pending && newStatus == GoalStatus.Draft);
+                    (goal.Status == GoalStatus.Pending && newStatus == GoalStatus.Draft) ||
+                    (goal.Status == GoalStatus.Failed && newStatus == GoalStatus.Draft);
                 if (!validTransition)
-                    return $"❌ Invalid transition from {goal.Status.ToDisplayName()} to {newStatus.ToDisplayName()}. Only Draft→Pending and Pending→Draft are allowed.";
+                    return $"❌ Invalid transition from {goal.Status.ToDisplayName()} to {newStatus.ToDisplayName()}. Only Draft→Pending, Pending→Draft, and Failed→Draft are allowed.";
+
+                // Failed→Draft: reset iteration data and clean up feature branch (best-effort)
+                if (goal.Status == GoalStatus.Failed && newStatus == GoalStatus.Draft)
+                {
+                    await _goalStore.ResetGoalIterationDataAsync(id);
+
+                    if (_repoManager is not null)
+                    {
+                        var branchName = $"copilothive/{id}";
+                        foreach (var repoName in goal.RepositoryNames)
+                        {
+                            try
+                            {
+                                await _repoManager.DeleteRemoteBranchAsync(repoName, branchName);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex,
+                                    "Failed to delete remote branch {Branch} from {Repo} during retry reset",
+                                    branchName, repoName);
+                            }
+                        }
+                    }
+                }
+
                 goal.Status = newStatus;
                 await _goalStore.UpdateGoalAsync(goal);
                 _logger.LogInformation("Composer updated goal '{GoalId}' status to {Status}", id, newStatus);

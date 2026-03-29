@@ -112,6 +112,15 @@
                                 <span class="error-msg">@_revertErrors[g.Id]</span>
                             }
                         }
+                        @if (g.Status == GoalStatus.Failed)
+                        {
+                            <button title="Retry (reset to Draft)" style="background:none;border:none;cursor:pointer;font-size:1rem;color:var(--text-muted)"
+                                @onclick="() => RetryFailedGoal(g.Id)">↩</button>
+                            @if (_retryErrors.ContainsKey(g.Id))
+                            {
+                                <span class="error-msg">@_retryErrors[g.Id]</span>
+                            }
+                        }
                         @if (g.Status == GoalStatus.Draft || g.Status == GoalStatus.Failed)
                         {
                             <button title="Delete goal" style="background:none;border:none;cursor:pointer;font-size:1rem;color:var(--text-muted)"
@@ -138,6 +147,7 @@ else if (_loaded)
     private bool _loaded;
     private Dictionary<string, string> _approveErrors = new();
     private Dictionary<string, string> _revertErrors = new();
+    private Dictionary<string, string> _retryErrors = new();
     private Dictionary<string, GoalStatus> _goalStatusById = new();
 
     private List<string> _allRepoNames => _allGoals
@@ -292,6 +302,35 @@ else if (_loaded)
         {
             var errorContent = await response.Content.ReadAsStringAsync();
             _revertErrors[goalId] = $"Error {(int)response.StatusCode}: {errorContent}";
+        }
+    }
+
+    private async Task RetryFailedGoal(string goalId)
+    {
+        _retryErrors.Remove(goalId);
+        var body = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new { status = "Draft" }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+        var response = await HttpClient.PatchAsync($"/api/goals/{goalId}/status", body);
+        if (response.IsSuccessStatusCode)
+        {
+            var goal = _allGoals.FirstOrDefault(g => g.Id == goalId);
+            if (goal is not null)
+            {
+                goal.Status = GoalStatus.Draft;
+                goal.FailureReason = null;
+                goal.Iterations = 0;
+                goal.StartedAt = null;
+                goal.TotalDurationSeconds = null;
+                goal.IterationSummaries = [];
+            }
+            ApplyFilters();
+        }
+        else
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            _retryErrors[goalId] = $"Error {(int)response.StatusCode}: {errorContent}";
         }
     }
 }

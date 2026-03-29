@@ -539,6 +539,10 @@ file sealed class DependencyTestGoalStore : IGoalStore
     /// <inheritdoc/>
     public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
+
+    /// <inheritdoc/>
+    public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) =>
+        Task.CompletedTask;
 }
 
 /// <summary>
