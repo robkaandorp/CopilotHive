@@ -874,6 +874,11 @@ public sealed class Composer : IAsyncDisposable
         // 4. Handle brain_prompt / worker_prompt via pipeline conversation
         if (content is "brain_prompt" or "worker_prompt")
         {
+            // Verify the goal still exists before retrieving prompt data
+            var promptGoal = await _goalStore.GetGoalAsync(id);
+            if (promptGoal is null)
+                return $"No {content.Replace('_', ' ')} is available for phase '{phase}' in iteration {iteration} of goal '{id}'.";
+
             var conversation = await _goalStore.GetPipelineConversationAsync(id);
             if (conversation.Count == 0)
                 return $"No pipeline conversation is available for goal '{id}' (requested: {content} for phase '{phase}', iteration {iteration}).";

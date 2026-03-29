@@ -3008,6 +3008,78 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("[Planning]", result);
         Assert.Contains("2 goal(s)", result);
     }
+
+    // ── get_phase_output — deleted goal data leak ──
+
+    [Fact]
+    public async Task GetPhaseOutput_BrainPrompt_DeletedGoal_ReturnsNotAvailable()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a PipelineStore and wire it to a new SqliteGoalStore
+        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var composerWithPipeline = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            storeWithPipeline,
+            stateDir: Path.GetTempPath());
+
+        // Create a goal and pipeline with conversation
+        await composerWithPipeline.CreateGoalAsync("deleted-brain-prompt", "Goal to be deleted");
+        var goal = await storeWithPipeline.GetGoalAsync("deleted-brain-prompt", ct);
+        Assert.NotNull(goal);
+
+        var pipeline = new GoalPipeline(goal, maxRetries: 3);
+        pipeline.Conversation.Add(new ConversationEntry("user", "Brain asks coder to implement X", Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "Your task: implement X", Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("coder", "Coder completed.", Iteration: 1, Purpose: "worker-output"));
+        pipelineStore.SavePipeline(pipeline);
+
+        // Delete the goal
+        await storeWithPipeline.DeleteGoalAsync("deleted-brain-prompt", ct);
+
+        // Request brain_prompt for the deleted goal — should return "No ... is available" instead of leaking data
+        var result = await composerWithPipeline.GetPhaseOutputAsync("deleted-brain-prompt", 1, "Coding", content: "brain_prompt");
+
+        Assert.Contains("No brain prompt is available", result);
+        Assert.DoesNotContain("Brain asks coder to implement X", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_WorkerPrompt_DeletedGoal_ReturnsNotAvailable()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a PipelineStore and wire it to a new SqliteGoalStore
+        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var composerWithPipeline = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            storeWithPipeline,
+            stateDir: Path.GetTempPath());
+
+        // Create a goal and pipeline with conversation
+        await composerWithPipeline.CreateGoalAsync("deleted-worker-prompt", "Goal to be deleted");
+        var goal = await storeWithPipeline.GetGoalAsync("deleted-worker-prompt", ct);
+        Assert.NotNull(goal);
+
+        var pipeline = new GoalPipeline(goal, maxRetries: 3);
+        pipeline.Conversation.Add(new ConversationEntry("user", "Brain prompt for tester", Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "Your task: test the code", Iteration: 1, Purpose: "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("tester", "Tests passed!", Iteration: 1, Purpose: "worker-output"));
+        pipelineStore.SavePipeline(pipeline);
+
+        // Delete the goal
+        await storeWithPipeline.DeleteGoalAsync("deleted-worker-prompt", ct);
+
+        // Request worker_prompt for the deleted goal — should return "No ... is available" instead of leaking data
+        var result = await composerWithPipeline.GetPhaseOutputAsync("deleted-worker-prompt", 1, "Testing", content: "worker_prompt");
+
+        Assert.Contains("No worker prompt is available", result);
+        Assert.DoesNotContain("Your task: test the code", result);
+    }
 }
 
 /// <summary>

@@ -346,7 +346,12 @@ public sealed class SqliteGoalStore : IGoalStore
             var rows = cmd.ExecuteNonQuery();
 
             if (rows > 0)
+            {
                 _logger.LogInformation("Deleted goal {GoalId}", goalId);
+
+                // Clean up orphaned pipeline/conversation data
+                _pipelineStore?.RemovePipeline(goalId);
+            }
 
             return Task.FromResult(rows > 0);
         }
