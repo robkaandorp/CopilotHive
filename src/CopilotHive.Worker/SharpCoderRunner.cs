@@ -26,6 +26,7 @@ public sealed class SharpCoderRunner : IAgentRunner
 {
     private readonly WorkerLogger _log = new("SharpCoder");
     private readonly bool _verboseLogging = Environment.GetEnvironmentVariable("VERBOSE_LOGGING") == "true";
+    private readonly Func<string?, IChatClient>? _clientFactory;
     private IChatClient? _chatClient;
     private string _currentModel = "(default)";
     private ReasoningEffort? _currentReasoning;
@@ -47,6 +48,7 @@ public sealed class SharpCoderRunner : IAgentRunner
     {
         _chatClient = chatClient;
         _currentModel = model;
+        _clientFactory = _ => chatClient;
     }
 
     private IToolCallBridge? _toolBridge;
@@ -92,7 +94,7 @@ public sealed class SharpCoderRunner : IAgentRunner
     {
         _log.Info($"Resetting session. Requested model: {model ?? "default"}");
         _chatClient?.Dispose();
-        _chatClient = CreateChatClient(model);
+        _chatClient = _clientFactory != null ? _clientFactory(model) : CreateChatClient(model);
         _session = null;
         return Task.CompletedTask;
     }
