@@ -737,7 +737,7 @@ public sealed class Composer : IAsyncDisposable
         var error = Shared.ToolValidation.Check(
             (!string.IsNullOrWhiteSpace(id), "id is required"),
             (!string.IsNullOrWhiteSpace(field), "field is required"),
-            (field.Equals("release", StringComparison.OrdinalIgnoreCase) || !string.IsNullOrWhiteSpace(value), "value is required"));
+            (string.Equals(field, "release", StringComparison.OrdinalIgnoreCase) || !string.IsNullOrWhiteSpace(value), "value is required"));
         if (error is not null) return error;
 
         var goal = await _goalStore.GetGoalAsync(id);
@@ -778,7 +778,7 @@ public sealed class Composer : IAsyncDisposable
                 return "❌ Repositories cannot be changed after creation. Delete and re-create the goal instead.";
 
             case "release":
-                if (value.Equals("none", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(value))
+                if (string.IsNullOrWhiteSpace(value) || string.Equals(value, "none", StringComparison.OrdinalIgnoreCase))
                 {
                     goal.ReleaseId = null;
                     await _goalStore.UpdateGoalAsync(goal);
