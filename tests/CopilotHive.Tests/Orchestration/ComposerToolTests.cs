@@ -343,6 +343,85 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("Invalid transition", result);
     }
 
+    // ── update_goal — release field ──
+
+    [Fact]
+    public async Task UpdateGoal_Release_ValidId_SetsReleaseId()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("release-goal-set", "Goal to assign to a release");
+        await _store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0" }, ct);
+
+        var result = await _composer.UpdateGoalAsync("release-goal-set", "release", "v1.0.0");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("v1.0.0", result);
+
+        var goal = await _store.GetGoalAsync("release-goal-set", ct);
+        Assert.NotNull(goal);
+        Assert.Equal("v1.0.0", goal!.ReleaseId);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Release_None_ClearsReleaseId()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0" }, ct);
+        await _composer.CreateGoalAsync("release-goal-clear-none", "Goal to clear release via none");
+        var goal = await _store.GetGoalAsync("release-goal-clear-none", ct);
+        Assert.NotNull(goal);
+        goal!.ReleaseId = "v1.0.0";
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync("release-goal-clear-none", "release", "none");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("cleared", result);
+
+        var updated = await _store.GetGoalAsync("release-goal-clear-none", ct);
+        Assert.Null(updated!.ReleaseId);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Release_EmptyString_ClearsReleaseId()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0" }, ct);
+        await _composer.CreateGoalAsync("release-goal-clear-empty", "Goal to clear release via empty string");
+        var goal = await _store.GetGoalAsync("release-goal-clear-empty", ct);
+        Assert.NotNull(goal);
+        goal!.ReleaseId = "v1.0.0";
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync("release-goal-clear-empty", "release", "");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("cleared", result);
+
+        var updated = await _store.GetGoalAsync("release-goal-clear-empty", ct);
+        Assert.Null(updated!.ReleaseId);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Release_InvalidId_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("release-goal-invalid", "Goal with invalid release");
+
+        var result = await _composer.UpdateGoalAsync("release-goal-invalid", "release", "nonexistent-release");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not found", result);
+
+        var goal = await _store.GetGoalAsync("release-goal-invalid", ct);
+        Assert.NotNull(goal);
+        Assert.Null(goal!.ReleaseId);
+    }
+
     // ── get_goal ──
 
     [Fact]
