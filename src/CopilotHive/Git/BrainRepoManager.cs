@@ -108,8 +108,18 @@ public sealed class BrainRepoManager : IBrainRepoManager
                 repoName, defaultBranch);
 
             await RunGitAsync(clonePath, ["fetch", "origin"], ct);
-            await RunGitAsync(clonePath, ["checkout", defaultBranch], ct);
-            await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct);
+
+            if (!await RemoteBranchExistsAsync(clonePath, defaultBranch, ct))
+            {
+                _logger.LogWarning(
+                    "Default branch '{Branch}' does not exist on origin for {Repo} — skipping checkout/reset (empty repository)",
+                    defaultBranch, repoName);
+            }
+            else
+            {
+                await RunGitAsync(clonePath, ["checkout", defaultBranch], ct);
+                await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct);
+            }
         }
         else
         {
@@ -170,6 +180,11 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
         // Ensure we're on the base branch with latest remote state
         await RunGitAsync(clonePath, ["fetch", "origin"], ct);
+
+        if (!await RemoteBranchExistsAsync(clonePath, defaultBranch, ct))
+            throw new InvalidOperationException(
+                $"Cannot merge into '{defaultBranch}' for '{repoName}': the branch does not exist on origin (empty repository).");
+
         await RunGitAsync(clonePath, ["checkout", defaultBranch], ct);
         await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct);
 
@@ -217,6 +232,35 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
         var hashResult = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct);
         return hashResult.Trim();
+    }
+
+    /// <summary>
+    /// Returns <c>true</c> if <c>origin/{branch}</c> exists in the given clone; <c>false</c> otherwise.
+    /// Uses <c>git rev-parse --verify</c> so it works correctly on empty repositories where the branch
+    /// has not yet been pushed.
+    /// </summary>
+    /// <param name="clonePath">Absolute path to the local git clone.</param>
+    /// <param name="branch">Branch name to check (without the <c>origin/</c> prefix).</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns><c>true</c> if the remote-tracking ref exists; <c>false</c> if the repository is empty or the branch was not found.</returns>
+    private static async Task<bool> RemoteBranchExistsAsync(string clonePath, string branch, CancellationToken ct)
+    {
+        var psi = new ProcessStartInfo("git")
+        {
+            WorkingDirectory = clonePath,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("rev-parse");
+        psi.ArgumentList.Add("--verify");
+        psi.ArgumentList.Add($"origin/{branch}");
+
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to start git process");
+
+        await process.WaitForExitAsync(ct);
+        return process.ExitCode == 0;
     }
 
     /// <summary>
