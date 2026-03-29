@@ -71,11 +71,15 @@ public sealed class TaskExecutorTests
         public TestResultReport? LastTestReport { get; private set; }
         public WorkerReport? LastWorkerReport { get; private set; }
 
+        private object? _session;
+
         public void ClearTestReport() => LastTestReport = null;
         public void ClearWorkerReport() => LastWorkerReport = null;
         public void SetToolBridge(IToolCallBridge? bridge) { }
         public void SetCurrentTaskId(string? taskId) { }
         public void SetCustomAgent(WorkerRole role, string agentsMdContent) { }
+        public void SetSession(object? session) => _session = session;
+        public object? GetSession() => _session;
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ResetSessionAsync(string? model = null, CancellationToken ct = default) => Task.CompletedTask;

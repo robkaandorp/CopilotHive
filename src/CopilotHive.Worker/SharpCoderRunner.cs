@@ -54,6 +54,9 @@ public sealed class SharpCoderRunner : IAgentRunner
     private WorkerRole _currentRole;
     private string? _customAgentSystemPrompt;
 
+    /// <summary>Current agent session; set via <see cref="SetSession"/> before <see cref="SendPromptAsync"/>.</summary>
+    private AgentSession? _session;
+
     private TestResultReport? _lastTestReport;
     private WorkerReport? _lastWorkerReport;
 
@@ -72,6 +75,12 @@ public sealed class SharpCoderRunner : IAgentRunner
         _customAgentSystemPrompt = agentsMdContent;
     }
 
+    /// <inheritdoc/>
+    public void SetSession(object? session) => _session = session as AgentSession;
+
+    /// <inheritdoc/>
+    public object? GetSession() => _session;
+
     public Task ConnectAsync(CancellationToken ct = default)
     {
         _log.Info("Initializing SharpCoderRunner IChatClient...");
@@ -84,6 +93,7 @@ public sealed class SharpCoderRunner : IAgentRunner
         _log.Info($"Resetting session. Requested model: {model ?? "default"}");
         _chatClient?.Dispose();
         _chatClient = CreateChatClient(model);
+        _session = null;
         return Task.CompletedTask;
     }
 
@@ -109,7 +119,16 @@ public sealed class SharpCoderRunner : IAgentRunner
         WriteDiagnosticsFile(null, prompt, TimeSpan.Zero, options, "pre");
 
         var agent = new CodingAgent(_chatClient, options);
-        var result = await agent.ExecuteAsync(prompt, ct);
+        AgentResult result;
+        if (_session != null)
+        {
+            result = await agent.ExecuteAsync(_session, prompt, ct);
+        }
+        else
+        {
+            _session = AgentSession.Create(Guid.NewGuid().ToString("N"));
+            result = await agent.ExecuteAsync(_session, prompt, ct);
+        }
 
         stopwatch.Stop();
         var elapsedSecs = stopwatch.Elapsed.TotalSeconds.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);

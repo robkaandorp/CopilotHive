@@ -30,6 +30,25 @@ public interface IAgentRunner : IAsyncDisposable
     /// <summary>Sets the custom agent configuration for the specified role.</summary>
     void SetCustomAgent(WorkerRole role, string agentsMdContent);
 
+    /// <summary>
+    /// Sets the agent session to resume in the next <see cref="SendPromptAsync"/> call.
+    /// Pass <c>null</c> to start a fresh session.
+    /// </summary>
+    /// <param name="session">
+    /// The session object to restore, or <c>null</c> to start a new session.
+    /// Implementations that use <see cref="SharpCoder.AgentSession"/> must cast accordingly.
+    /// </param>
+    void SetSession(object? session);
+
+    /// <summary>
+    /// Returns the current agent session after the last <see cref="SendPromptAsync"/> call,
+    /// or <c>null</c> if no session has been created yet.
+    /// </summary>
+    /// <returns>
+    /// The session object (e.g. <see cref="SharpCoder.AgentSession"/>) or <c>null</c>.
+    /// </returns>
+    object? GetSession();
+
     /// <summary>Connects to the underlying AI agent engine.</summary>
     Task ConnectAsync(CancellationToken ct = default);
 

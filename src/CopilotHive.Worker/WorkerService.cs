@@ -15,7 +15,7 @@ namespace CopilotHive.Worker;
 public sealed class WorkerService(
     string orchestratorUrl,
     string workerId,
-    string[] capabilities) : IToolCallBridge
+    string[] capabilities) : IToolCallBridge, ISessionClient
 {
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(30);
 
@@ -139,7 +139,7 @@ public sealed class WorkerService(
                     {
                         try
                         {
-                            var executor = new TaskExecutor(_agentRunner, this);
+                            var executor = new TaskExecutor(_agentRunner, this, sessionClient: this);
                             var result = await executor.ExecuteAsync(domainTask, localCts.Token);
 
                             await stream.RequestStream.WriteAsync(new WorkerMessage
