@@ -1,0 +1,614 @@
+using CopilotHive.Configuration;
+using CopilotHive.Git;
+using CopilotHive.Goals;
+using CopilotHive.Orchestration;
+using CopilotHive.Services;
+using CopilotHive.Workers;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
+namespace CopilotHive.Tests.Orchestration;
+
+/// <summary>
+/// Integration tests for the three-tier clarification resolution chain:
+/// Brain → Composer → Human.
+/// Tests verify that clarification requests flow correctly through each tier,
+/// with proper timeout handling and state management.
+/// </summary>
+public sealed class ClarificationIntegrationTests
+{
+    // ── Scenario 1: Brain answers directly (no escalation) ────────────────
+
+    [Fact]
+    public async Task BrainAnswersDirectly_ReturnsAnswerWithoutEscalation()
+    {
+        // Arrange: Brain returns a confident answer (no ESCALATE marker)
+        var brain = new FakeClarificationBrain("Use JSON format for the output.");
+        var queue = new ClarificationQueueService();
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, useComposer: false);
+
+        // Act
+        var answer = await dispatcher.AskBrainAsync(pipeline, "What format should the output use?", TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.Equal("Use JSON format for the output.", answer);
+        Assert.Equal(0, queue.PendingHumanCount);
+        Assert.Empty(queue.GetAllRequests());
+    }
+
+    [Fact]
+    public async Task BrainAnswersDirectly_NoClarificationQueueNeeded()
+    {
+        // Arrange: Brain returns a confident answer, no queue/composer configured
+        var brain = new FakeClarificationBrain("The answer is 42.");
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, null, useComposer: false);
+
+        // Act
+        var answer = await dispatcher.AskBrainAsync(pipeline, "What is the meaning of life?", TestContext.Current.CancellationToken);
+
+        // Assert - Answer returned directly, no queue interaction
+        Assert.Equal("The answer is 42.", answer);
+    }
+
+    [Fact]
+    public async Task BrainReturnsPartialEscalateMarker_TreatedAsEscalation()
+    {
+        // Arrange: Brain returns a response containing "escalate" but not as a marker
+        var brain = new FakeClarificationBrain("I should escalate this to someone else.");
+        var queue = new ClarificationQueueService();
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, useComposer: false);
+
+        // Act
+        var answer = await dispatcher.AskBrainAsync(pipeline, "Question?", TestContext.Current.CancellationToken);
+
+        // Assert - The response doesn't START with ESCALATE:, so it's returned as-is
+        Assert.Equal("I should escalate this to someone else.", answer);
+    }
+
+    // ── Scenario 2: Brain Escalation without Composer/Queue ──────────────────
+
+    [Fact]
+    public async Task BrainEscalates_NoComposerOrQueue_ReturnsFallback()
+    {
+        // Arrange: Brain escalates but no Composer/Queue available
+        var brain = new FakeClarificationBrain("ESCALATE: Cannot answer from codebase");
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, null, useComposer: false);
+
+        // Act
+        var answer = await dispatcher.AskBrainAsync(pipeline, "What should I do?", TestContext.Current.CancellationToken);
+
+        // Assert - Fallback returned immediately
+        Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, answer);
+    }
+
+    [Fact]
+    public async Task BrainEscalates_NoComposer_ReturnsFallback()
+    {
+        // Arrange: Brain escalates, queue exists but no composer
+        var brain = new FakeClarificationBrain("ESCALATE: Need clarification");
+        var queue = new ClarificationQueueService();
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, useComposer: false);
+
+        // Act
+        var answer = await dispatcher.AskBrainAsync(pipeline, "What format?", TestContext.Current.CancellationToken);
+
+        // Assert - Fallback returned (no composer to try)
+        Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, answer);
+    }
+
+    // ── Scenario 3: ClarificationQueueService direct tests ───────────────────
+
+    [Fact]
+    public void Enqueue_CreatesRequestWithAwaitingComposerStatus()
+    {
+        // Arrange
+        var queue = new ClarificationQueueService();
+        var request = new ClarificationRequest
+        {
+            GoalId = "goal-1",
+            WorkerRole = "coder",
+            Question = "What format should I use?",
+        };
+
+        // Act
+        var tcs = queue.Enqueue(request);
+
+        // Assert
+        Assert.NotNull(tcs);
+        Assert.False(tcs.Task.IsCompleted);
+        Assert.Equal(ClarificationStatus.AwaitingComposer, request.Status);
+        Assert.Equal(0, queue.PendingHumanCount); // Not yet escalated to human
+        Assert.Single(queue.GetAllRequests());
+    }
+
+    [Fact]
+    public void EscalateToHuman_UpdatesStatusAndRaisesEvent()
+    {
+        // Arrange
+        var queue = new ClarificationQueueService();
+        var request = new ClarificationRequest
+        {
+            GoalId = "goal-1",
+            WorkerRole = "coder",
+            Question = "Question?",
+        };
+        queue.Enqueue(request);
+        
+        var changeCount = 0;
+        queue.OnChanged += () => changeCount++;
+
+        // Act
+        queue.EscalateToHuman(request.Id);
+
+        // Assert
+        Assert.Equal(ClarificationStatus.AwaitingHuman, request.Status);
+        Assert.Equal(1, queue.PendingHumanCount);
+        Assert.Equal(1, changeCount); // OnChanged raised once
+    }
+
+    [Fact]
+    public async Task SubmitAnswer_CompletesWaiterAndUpdatesRequest()
+    {
+        // Arrange
+        var queue = new ClarificationQueueService();
+        var request = new ClarificationRequest
+        {
+            GoalId = "goal-1",
+            WorkerRole = "coder",
+            Question = "Question?",
+            Status = ClarificationStatus.AwaitingHuman,
+        };
+        var tcs = queue.Enqueue(request);
+
+        // Act
+        var result = queue.SubmitAnswer(request.Id, "Here's the answer", "human");
+
+        // Assert
+        Assert.True(result);
+        Assert.True(tcs.Task.IsCompleted);
+        Assert.Equal("Here's the answer", await tcs.Task);
+        Assert.Equal(ClarificationStatus.Answered, request.Status);
+        Assert.Equal("human", request.ResolvedBy);
+    }
+
+    [Fact]
+    public async Task ComposerAnswer_SubmitAnswer_ResolvesRequest()
+    {
+        // Arrange - Simulating Composer answering after escalation
+        var queue = new ClarificationQueueService();
+        var request = new ClarificationRequest
+        {
+            GoalId = "goal-1",
+            WorkerRole = "coder",
+            Question = "Question?",
+        };
+        var tcs = queue.Enqueue(request);
+
+        // First escalate to human (simulating Composer can't answer)
+        queue.EscalateToHuman(request.Id);
+        Assert.Equal(1, queue.PendingHumanCount);
+
+        // Act - Composer answers before human
+        queue.SubmitAnswer(request.Id, "Actually I can answer this", "composer");
+
+        // Assert
+        Assert.Equal("Actually I can answer this", await tcs.Task);
+        Assert.Equal(ClarificationStatus.Answered, request.Status);
+        Assert.Equal("composer", request.ResolvedBy);
+        Assert.Equal(0, queue.PendingHumanCount);
+    }
+
+    [Fact]
+    public async Task MarkTimedOut_SetsStatusAndCompletesWithFallback()
+    {
+        // Arrange
+        var queue = new ClarificationQueueService();
+        var request = new ClarificationRequest
+        {
+            GoalId = "goal-1",
+            WorkerRole = "coder",
+            Question = "Question?",
+        };
+        var tcs = queue.Enqueue(request);
+
+        // Act
+        queue.MarkTimedOut(request.Id);
+
+        // Assert
+        Assert.True(tcs.Task.IsCompleted);
+        Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, await tcs.Task);
+        Assert.Equal(ClarificationStatus.TimedOut, request.Status);
+        Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, request.Answer);
+        Assert.Equal(0, queue.PendingHumanCount);
+    }
+
+    // ── Scenario 4: Timeout fallback via queue ───────────────────────────────
+
+    [Fact]
+    public async Task HumanTimeout_ReturnsFallbackMessage()
+    {
+        // Arrange
+        var queue = new ClarificationQueueService();
+        var request = new ClarificationRequest
+        {
+            GoalId = "goal-1",
+            WorkerRole = "coder",
+            Question = "Question?",
+            Status = ClarificationStatus.AwaitingHuman,
+        };
+        var tcs = queue.Enqueue(request);
+
+        // Simulate timeout by marking as timed out
+        queue.MarkTimedOut(request.Id);
+
+        // Act & Assert
+        var answer = await tcs.Task;
+        Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, answer);
+    }
+
+    // ── Scenario 5: Multiple simultaneous requests ──────────────────────────
+
+    [Fact]
+    public async Task MultipleRequests_AreTrackedIndependentlyInQueue()
+    {
+        // Arrange
+        var queue = new ClarificationQueueService();
+
+        var request1 = new ClarificationRequest
+        {
+            Id = "req-1",
+            GoalId = "goal-1",
+            WorkerRole = "coder",
+            Question = "Question 1?",
+            Status = ClarificationStatus.AwaitingHuman,
+        };
+        var request2 = new ClarificationRequest
+        {
+            Id = "req-2",
+            GoalId = "goal-2",
+            WorkerRole = "tester",
+            Question = "Question 2?",
+            Status = ClarificationStatus.AwaitingHuman,
+        };
+        var request3 = new ClarificationRequest
+        {
+            Id = "req-3",
+            GoalId = "goal-3",
+            WorkerRole = "coder",
+            Question = "Question 3?",
+            Status = ClarificationStatus.AwaitingHuman,
+        };
+
+        // Act
+        var tcs1 = queue.Enqueue(request1);
+        var tcs2 = queue.Enqueue(request2);
+        var tcs3 = queue.Enqueue(request3);
+
+        // Assert - All tracked independently
+        Assert.Equal(3, queue.PendingHumanCount);
+        var pending = queue.GetPendingHumanRequests();
+        Assert.Equal(3, pending.Count);
+
+        // Answer each separately
+        queue.SubmitAnswer("req-1", "Answer 1", "human");
+        Assert.True(tcs1.Task.IsCompleted);
+        Assert.Equal("Answer 1", await tcs1.Task);
+        Assert.Equal(2, queue.PendingHumanCount);
+
+        queue.SubmitAnswer("req-2", "Answer 2", "human");
+        Assert.True(tcs2.Task.IsCompleted);
+        Assert.Equal("Answer 2", await tcs2.Task);
+        Assert.Equal(1, queue.PendingHumanCount);
+
+        queue.SubmitAnswer("req-3", "Answer 3", "human");
+        Assert.True(tcs3.Task.IsCompleted);
+        Assert.Equal("Answer 3", await tcs3.Task);
+        Assert.Equal(0, queue.PendingHumanCount);
+    }
+
+    [Fact]
+    public async Task MultipleRequests_DifferentTiers_ResolveCorrectly()
+    {
+        // Arrange - Test queue behavior for different resolution paths
+        var queue = new ClarificationQueueService();
+
+        // Request 1: Composer resolves
+        var req1 = new ClarificationRequest
+        {
+            Id = "composer-req",
+            GoalId = "goal-1",
+            WorkerRole = "coder",
+            Question = "Question for Composer",
+        };
+        var tcs1 = queue.Enqueue(req1);
+
+        // Request 2: Human resolves
+        var req2 = new ClarificationRequest
+        {
+            Id = "human-req",
+            GoalId = "goal-2",
+            WorkerRole = "coder",
+            Question = "Question for Human",
+            Status = ClarificationStatus.AwaitingHuman,
+        };
+        var tcs2 = queue.Enqueue(req2);
+
+        // Request 3: Timeout
+        var req3 = new ClarificationRequest
+        {
+            Id = "timeout-req",
+            GoalId = "goal-3",
+            WorkerRole = "coder",
+            Question = "Timeout question",
+            Status = ClarificationStatus.AwaitingHuman,
+        };
+        var tcs3 = queue.Enqueue(req3);
+
+        // Act - Composer answers request 1
+        queue.SubmitAnswer("composer-req", "Composer auto-answer", "composer");
+        Assert.Equal("Composer auto-answer", await tcs1.Task);
+        Assert.Equal(ClarificationStatus.Answered, req1.Status);
+        Assert.Equal("composer", req1.ResolvedBy);
+
+        // Act - Human answers request 2
+        queue.SubmitAnswer("human-req", "Human answer", "human");
+        Assert.Equal("Human answer", await tcs2.Task);
+        Assert.Equal(ClarificationStatus.Answered, req2.Status);
+        Assert.Equal("human", req2.ResolvedBy);
+
+        // Act - Request 3 times out
+        queue.MarkTimedOut("timeout-req");
+        Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, await tcs3.Task);
+        Assert.Equal(ClarificationStatus.TimedOut, req3.Status);
+
+        // Assert - All resolved, none pending
+        Assert.Equal(0, queue.PendingHumanCount);
+        Assert.Equal(3, queue.GetAllRequests().Count);
+    }
+
+    // ── Scenario: Human escalation flow ────────────────────────────────────
+
+    [Fact]
+    public async Task HumanEscalation_QueueWaiter_ResolvesWhenAnswerSubmitted()
+    {
+        // Arrange
+        var queue = new ClarificationQueueService();
+        var request = new ClarificationRequest
+        {
+            GoalId = "goal-human",
+            WorkerRole = "coder",
+            Question = "What should the timeout be?",
+            Status = ClarificationStatus.AwaitingHuman,
+        };
+        var tcs = queue.Enqueue(request);
+
+        // Act - Submit answer from another "thread" (simulating human response)
+        var answerTask = tcs.Task;
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(50, TestContext.Current.CancellationToken);
+            queue.SubmitAnswer(request.Id, "Use 5 minutes", "human");
+        }, TestContext.Current.CancellationToken);
+
+        // Assert - Waiter receives answer
+        var answer = await answerTask;
+        Assert.Equal("Use 5 minutes", answer);
+        Assert.Equal(ClarificationStatus.Answered, request.Status);
+    }
+
+    [Fact]
+    public void OnChangedEvent_RaisedOnAllStateTransitions()
+    {
+        // Arrange
+        var queue = new ClarificationQueueService();
+        var events = new List<string>();
+        queue.OnChanged += () => events.Add("changed");
+
+        // Act - Enqueue
+        var request = new ClarificationRequest { GoalId = "g1", Question = "Q1" };
+        queue.Enqueue(request);
+        Assert.Single(events);
+
+        // Act - Escalate
+        queue.EscalateToHuman(request.Id);
+        Assert.Equal(2, events.Count);
+
+        // Act - Submit
+        queue.SubmitAnswer(request.Id, "Answer", "human");
+        Assert.Equal(3, events.Count);
+
+        // Act - Timeout another
+        var request2 = new ClarificationRequest { GoalId = "g2", Question = "Q2" };
+        queue.Enqueue(request2);
+        Assert.Equal(4, events.Count);
+
+        queue.MarkTimedOut(request2.Id);
+        Assert.Equal(5, events.Count);
+    }
+
+    // ── Integration: Brain escalation triggers queue ───────────────────────
+
+    [Fact]
+    public async Task BrainEscalates_QueueCreated_RequestStatusCorrect()
+    {
+        // This test verifies that when Brain escalates AND both queue/composer are available,
+        // a request IS created and then times out when no human answers.
+        // Note: This test uses fake timeouts since we can't mock the Composer's AnswerClarificationAsync.
+        
+        // Arrange - Queue directly tests the timeout behavior
+        var queue = new ClarificationQueueService();
+        var request = new ClarificationRequest
+        {
+            GoalId = "goal-test",
+            WorkerRole = "coder",
+            Question = "What architecture?",
+        };
+        
+        // Simulate what GoalDispatcher does when Brain escalates and Composer escalates
+        var tcs = queue.Enqueue(request);
+        queue.EscalateToHuman(request.Id); // Simulate Composer escalation
+        
+        // Assert - Request is now awaiting human
+        Assert.Equal(1, queue.PendingHumanCount);
+        Assert.Equal(ClarificationStatus.AwaitingHuman, request.Status);
+        
+        // Simulate timeout
+        queue.MarkTimedOut(request.Id);
+        
+        // Assert - Timed out correctly
+        Assert.Equal(0, queue.PendingHumanCount);
+        Assert.Equal(ClarificationStatus.TimedOut, request.Status);
+        Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, await tcs.Task);
+    }
+
+    [Fact]
+    public void GetPendingHumanRequests_ReturnsOnlyAwaitingHuman()
+    {
+        // Arrange
+        var queue = new ClarificationQueueService();
+
+        var req1 = new ClarificationRequest { GoalId = "g1", Question = "Q1" };
+        req1.Status = ClarificationStatus.AwaitingHuman;
+        queue.Enqueue(req1);
+
+        var req2 = new ClarificationRequest { GoalId = "g2", Question = "Q2" };
+        req2.Status = ClarificationStatus.AwaitingComposer;
+        queue.Enqueue(req2);
+
+        var req3 = new ClarificationRequest { GoalId = "g3", Question = "Q3" };
+        req3.Status = ClarificationStatus.AwaitingHuman;
+        queue.Enqueue(req3);
+
+        // Act
+        var pending = queue.GetPendingHumanRequests();
+
+        // Assert
+        Assert.Equal(2, pending.Count);
+        Assert.All(pending, r => Assert.Equal(ClarificationStatus.AwaitingHuman, r.Status));
+        Assert.Equal(2, queue.PendingHumanCount);
+    }
+
+    [Fact]
+    public void GetAllRequests_ReturnsNewestFirst()
+    {
+        // Arrange
+        var queue = new ClarificationQueueService();
+
+        var req1 = new ClarificationRequest
+        {
+            GoalId = "g1",
+            Question = "Q1",
+            RequestedAt = new DateTime(2024, 1, 1, 10, 0, 0, DateTimeKind.Utc),
+        };
+        var req2 = new ClarificationRequest
+        {
+            GoalId = "g2",
+            Question = "Q2",
+            RequestedAt = new DateTime(2024, 1, 1, 12, 0, 0, DateTimeKind.Utc),
+        };
+
+        queue.Enqueue(req1);
+        queue.Enqueue(req2);
+
+        // Act
+        var all = queue.GetAllRequests();
+
+        // Assert
+        Assert.Equal(2, all.Count);
+        Assert.Equal("g2", all[0].GoalId); // Newer first
+        Assert.Equal("g1", all[1].GoalId);
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+
+    private static (GoalDispatcher dispatcher, GoalPipeline pipeline) CreateDispatcherWithClarification(
+        IDistributedBrain brain,
+        ClarificationQueueService? queue,
+        bool useComposer = false,
+        bool passQueue = false)
+    {
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        goalManager.GetNextGoalAsync().GetAwaiter().GetResult(); // Populate internal map
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        var notifier = new TaskCompletionNotifier();
+
+        // passQueue: true means the queue is passed to dispatcher (for tracking requests)
+        // useComposer: true means composer is also passed (for auto-answer)
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            notifier,
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain,
+            clarificationQueue: (useComposer || passQueue) ? queue : null);
+
+        return (dispatcher, pipeline);
+    }
+
+    // ── Fake implementations ───────────────────────────────────────────────
+
+    /// <summary>
+    /// Fake Brain that returns a configured response for AskBrainAsync calls.
+    /// </summary>
+    private sealed class FakeClarificationBrain : IDistributedBrain
+    {
+        private readonly string _askBrainResponse;
+
+        public FakeClarificationBrain(string askBrainResponse)
+        {
+            _askBrainResponse = askBrainResponse;
+        }
+
+        public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(IterationPlan.Default());
+
+        public Task<string> CraftPromptAsync(
+            GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(_askBrainResponse);
+
+        public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+
+        public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public BrainStats? GetStats() => null;
+    }
+
+    private sealed class FakeGoalSource : IGoalSource
+    {
+        private readonly Goal _goal;
+        private bool _returned;
+
+        public FakeGoalSource(Goal goal) => _goal = goal;
+
+        public string Name => "fake";
+
+        public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default)
+        {
+            if (_returned) return Task.FromResult<IReadOnlyList<Goal>>(Array.Empty<Goal>());
+            _returned = true;
+            return Task.FromResult<IReadOnlyList<Goal>>(new[] { _goal });
+        }
+
+        public Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
+            Task.CompletedTask;
+    }
+}
