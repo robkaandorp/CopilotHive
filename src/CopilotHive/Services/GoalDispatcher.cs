@@ -41,7 +41,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly ConcurrentQueue<string> _redispatchQueue = new();
     private DateTime _lastAgentsSync = DateTime.MinValue;
     private readonly TimeSpan _startupDelay;
-    private readonly Composer? _composer;
+    private readonly IClarificationRouter? _clarificationRouter;
     private readonly ClarificationQueueService? _clarificationQueue;
 
     /// <summary>
@@ -60,7 +60,7 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="improvementAnalyzer">Optional analyzer that decides when to run the improver.</param>
     /// <param name="configRepo">Optional config repo manager for syncing AGENTS.md files.</param>
     /// <param name="repoManager">Brain repo manager for persistent repo clones and merge operations.</param>
-    /// <param name="composer">Optional Composer agent for clarification auto-answer.</param>
+    /// <param name="clarificationRouter">Optional clarification router for Composer auto-answer.</param>
     /// <param name="clarificationQueue">Optional clarification queue for human escalation.</param>
     /// <param name="startupDelay">Delay before the first dispatch poll; defaults to 10 seconds to give workers time to connect.</param>
     public GoalDispatcher(
@@ -77,7 +77,7 @@ public sealed class GoalDispatcher : BackgroundService
         AgentsManager? agentsManager = null,
         ImprovementAnalyzer? improvementAnalyzer = null,
         ConfigRepoManager? configRepo = null,
-        Composer? composer = null,
+        IClarificationRouter? clarificationRouter = null,
         ClarificationQueueService? clarificationQueue = null,
         TimeSpan? startupDelay = null)
     {
@@ -93,7 +93,7 @@ public sealed class GoalDispatcher : BackgroundService
         _logger = logger;
         _config = config;
         _configRepo = configRepo;
-        _composer = composer;
+        _clarificationRouter = clarificationRouter;
         _clarificationQueue = clarificationQueue;
         _startupDelay = startupDelay ?? TimeSpan.FromSeconds(10);
 
@@ -206,10 +206,10 @@ public sealed class GoalDispatcher : BackgroundService
             Question = question,
         };
 
-        // If no Composer or clarification queue, return fallback
-        if (_composer is null || _clarificationQueue is null)
+        // If no clarification router or clarification queue, return fallback
+        if (_clarificationRouter is null || _clarificationQueue is null)
         {
-            _logger.LogWarning("No Composer or clarification queue available — returning fallback for goal {GoalId}",
+            _logger.LogWarning("No clarification router or clarification queue available — returning fallback for goal {GoalId}",
                 pipeline.GoalId);
             return ClarificationQueueService.TimeoutFallbackMessage;
         }
@@ -218,7 +218,7 @@ public sealed class GoalDispatcher : BackgroundService
         var tcs = _clarificationQueue.Enqueue(request);
 
         // Step 1: Try Composer auto-answer (30s timeout)
-        var composerAnswer = await _composer.AnswerClarificationAsync(
+        var composerAnswer = await _clarificationRouter.TryAutoAnswerAsync(
             pipeline.GoalId,
             question,
             $"Goal description: {pipeline.Description}. Current phase: {pipeline.Phase}.",

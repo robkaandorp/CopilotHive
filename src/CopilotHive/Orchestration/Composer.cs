@@ -8,6 +8,7 @@ using CopilotHive.Goals;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.DependencyInjection;
 using SharpCoder;
 
 namespace CopilotHive.Orchestration;
@@ -18,7 +19,7 @@ namespace CopilotHive.Orchestration;
 /// and manages the goal lifecycle (create → approve → dispatch).
 /// Uses a persistent SharpCoder session with streaming for real-time interaction.
 /// </summary>
-public sealed class Composer : IAsyncDisposable
+public sealed class Composer : IClarificationRouter, IAsyncDisposable
 {
     private readonly string _model;
     private readonly int _maxContextTokens;
@@ -27,7 +28,7 @@ public sealed class Composer : IAsyncDisposable
     private readonly ILogger<Composer> _logger;
     private readonly IGoalStore _goalStore;
     private readonly IBrainRepoManager? _repoManager;
-    private readonly GoalDispatcher? _goalDispatcher;
+    private readonly IServiceProvider? _serviceProvider;
     private readonly string _stateDir;
     private readonly IHttpClientFactory? _httpClientFactory;
     private readonly string? _ollamaApiKey;
@@ -137,7 +138,7 @@ public sealed class Composer : IAsyncDisposable
         int maxSteps = Constants.DefaultBrainMaxSteps,
         IBrainRepoManager? repoManager = null,
         string? stateDir = null,
-        GoalDispatcher? goalDispatcher = null,
+        IServiceProvider? serviceProvider = null,
         IHttpClientFactory? httpClientFactory = null,
         string? ollamaApiKey = null,
         HiveConfigFile? hiveConfig = null,
@@ -149,7 +150,7 @@ public sealed class Composer : IAsyncDisposable
         _logger = logger;
         _goalStore = goalStore;
         _repoManager = repoManager;
-        _goalDispatcher = goalDispatcher;
+        _serviceProvider = serviceProvider;
         _stateDir = stateDir ?? "/app/state";
         _httpClientFactory = httpClientFactory;
         _ollamaApiKey = string.IsNullOrWhiteSpace(ollamaApiKey) ? null : ollamaApiKey;
@@ -765,10 +766,11 @@ public sealed class Composer : IAsyncDisposable
         if (goal.Status is not (GoalStatus.InProgress or GoalStatus.Pending))
             return $"❌ Goal '{id}' is {goal.Status.ToDisplayName()}. Only InProgress or Pending goals can be cancelled.";
 
-        if (_goalDispatcher is null)
+        var goalDispatcher = _serviceProvider?.GetService<GoalDispatcher>();
+        if (goalDispatcher is null)
             return "❌ Goal dispatcher is not available — cannot cancel goals.";
 
-        var cancelled = await _goalDispatcher.CancelGoalAsync(id);
+        var cancelled = await goalDispatcher.CancelGoalAsync(id);
         if (!cancelled)
             return $"❌ Goal '{id}' could not be cancelled (it may have already completed or failed).";
 
@@ -823,7 +825,7 @@ public sealed class Composer : IAsyncDisposable
                     await _goalStore.ResetGoalIterationDataAsync(id);
 
                     // Clear GoalDispatcher runtime state so the goal can be re-dispatched fresh
-                    _goalDispatcher?.ClearGoalRetryState(id);
+                    _serviceProvider?.GetService<GoalDispatcher>()?.ClearGoalRetryState(id);
 
                     // Clear iteration data on the goal object to prevent overwriting with old values
                     goal.FailureReason = null;
@@ -1856,7 +1858,7 @@ public sealed class Composer : IAsyncDisposable
             responseText = responseText.Trim();
 
             if (string.IsNullOrEmpty(responseText) ||
-                responseText.Contains("ESCALATE_TO_HUMAN", StringComparison.OrdinalIgnoreCase))
+                responseText == "ESCALATE_TO_HUMAN")
             {
                 _logger.LogInformation(
                     "Composer escalating clarification to human for goal {GoalId}: {Question}",
@@ -1886,6 +1888,16 @@ public sealed class Composer : IAsyncDisposable
             return null;
         }
     }
+
+    /// <inheritdoc />
+    Task<string?> IClarificationRouter.TryAutoAnswerAsync(
+        string goalId,
+        string question,
+        string context,
+        ClarificationQueueService clarificationQueue,
+        ClarificationRequest request,
+        CancellationToken ct) =>
+        AnswerClarificationAsync(goalId, question, context, clarificationQueue, request, ct);
 
     /// <inheritdoc />
     public async ValueTask DisposeAsync()

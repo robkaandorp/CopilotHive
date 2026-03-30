@@ -461,6 +461,96 @@ public sealed class ClarificationIntegrationTests
         Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, await tcs.Task);
     }
 
+    // ── Integration: Full escalation chain with IClarificationRouter ────────
+
+    [Fact]
+    public async Task BrainEscalates_RouterAutoAnswers_ReturnsComposerAnswer()
+    {
+        // Arrange: Brain escalates, Router auto-answers successfully
+        var brain = new FakeClarificationBrain("ESCALATE: Cannot determine from codebase");
+        var queue = new ClarificationQueueService();
+        var router = new FakeClarificationRouter("Use the Builder pattern.");
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
+
+        // Act
+        var answer = await dispatcher.AskBrainAsync(pipeline, "What design pattern?", TestContext.Current.CancellationToken);
+
+        // Assert - Router auto-answered, no human escalation
+        Assert.Equal("Use the Builder pattern.", answer);
+        // Queue should have the request, resolved by composer
+        var all = queue.GetAllRequests();
+        Assert.Single(all);
+        Assert.Equal(ClarificationStatus.Answered, all[0].Status);
+        Assert.Equal("composer", all[0].ResolvedBy);
+    }
+
+    [Fact]
+    public async Task BrainEscalates_RouterReturnsNull_EscalatesToHuman_HumanAnswers()
+    {
+        // Arrange: Brain escalates, Router escalates to human, human answers
+        var brain = new FakeClarificationBrain("ESCALATE: Need human input");
+        var queue = new ClarificationQueueService();
+        var router = new FakeClarificationRouter(null); // null = escalate to human
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
+
+        // Act - Start ask in background (it will wait for human answer)
+        var askTask = dispatcher.AskBrainAsync(pipeline, "What timeout value?", TestContext.Current.CancellationToken);
+
+        // Simulate human answering after a short delay
+        await Task.Delay(50, TestContext.Current.CancellationToken);
+        var pending = queue.GetPendingHumanRequests();
+        Assert.Single(pending);
+        Assert.Equal(ClarificationStatus.AwaitingHuman, pending[0].Status);
+
+        queue.SubmitAnswer(pending[0].Id, "Use 30 seconds", "human");
+
+        // Assert
+        var answer = await askTask;
+        Assert.Equal("Use 30 seconds", answer);
+    }
+
+    [Fact]
+    public async Task BrainEscalates_RouterReturnsNull_HumanTimesOut_ReturnsFallback()
+    {
+        // Arrange: Brain escalates, Router escalates to human, human never answers
+        var brain = new FakeClarificationBrain("ESCALATE: Need domain expertise");
+        var queue = new ClarificationQueueService();
+        var router = new FakeClarificationRouter(null); // null = escalate to human
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
+
+        // Act - Start ask in background with a very short timeout
+        // We can't wait 5 minutes in a test, so we simulate timeout by marking as timed out
+        var askTask = dispatcher.AskBrainAsync(pipeline, "Domain-specific question?", TestContext.Current.CancellationToken);
+
+        // Wait briefly for the request to be enqueued, then time it out
+        await Task.Delay(50, TestContext.Current.CancellationToken);
+        var pending = queue.GetPendingHumanRequests();
+        Assert.Single(pending);
+
+        // Simulate timeout by marking the request and completing the TCS
+        queue.MarkTimedOut(pending[0].Id);
+
+        // Assert - askTask should complete with the fallback (or the MarkTimedOut completes the TCS)
+        var answer = await askTask;
+        Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, answer);
+    }
+
+    [Fact]
+    public async Task BrainEscalates_ContainsEscalateToComposer_AlsoTriggersEscalation()
+    {
+        // Arrange: Brain uses ESCALATE_TO_COMPOSER marker
+        var brain = new FakeClarificationBrain("ESCALATE_TO_COMPOSER: I need the Composer's help");
+        var queue = new ClarificationQueueService();
+        var router = new FakeClarificationRouter("Composer knows the answer.");
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
+
+        // Act
+        var answer = await dispatcher.AskBrainAsync(pipeline, "Complex question?", TestContext.Current.CancellationToken);
+
+        // Assert - Router handled it
+        Assert.Equal("Composer knows the answer.", answer);
+    }
+
     [Fact]
     public void GetPendingHumanRequests_ReturnsOnlyAwaitingHuman()
     {
@@ -525,7 +615,8 @@ public sealed class ClarificationIntegrationTests
         IDistributedBrain brain,
         ClarificationQueueService? queue,
         bool useComposer = false,
-        bool passQueue = false)
+        bool passQueue = false,
+        IClarificationRouter? router = null)
     {
         var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
         var goalSource = new FakeGoalSource(goal);
@@ -539,8 +630,8 @@ public sealed class ClarificationIntegrationTests
 
         var notifier = new TaskCompletionNotifier();
 
-        // passQueue: true means the queue is passed to dispatcher (for tracking requests)
-        // useComposer: true means composer is also passed (for auto-answer)
+        // passQueue/useComposer: legacy tests that check queue-only behavior
+        // router: new tests that exercise the full escalation chain
         var dispatcher = new GoalDispatcher(
             goalManager,
             pipelineManager,
@@ -550,7 +641,8 @@ public sealed class ClarificationIntegrationTests
             NullLogger<GoalDispatcher>.Instance,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             brain,
-            clarificationQueue: (useComposer || passQueue) ? queue : null);
+            clarificationRouter: router,
+            clarificationQueue: (useComposer || passQueue || router is not null) ? queue : null);
 
         return (dispatcher, pipeline);
     }
@@ -590,6 +682,40 @@ public sealed class ClarificationIntegrationTests
         public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
 
         public BrainStats? GetStats() => null;
+    }
+
+    /// <summary>
+    /// Fake <see cref="IClarificationRouter"/> that returns a pre-configured answer
+    /// or <c>null</c> to simulate escalation to human.
+    /// </summary>
+    private sealed class FakeClarificationRouter : IClarificationRouter
+    {
+        private readonly string? _autoAnswer;
+
+        /// <param name="autoAnswer">
+        /// If non-null, returned as the auto-answer. If null, escalates to human
+        /// by calling <see cref="ClarificationQueueService.EscalateToHuman"/>.
+        /// </param>
+        public FakeClarificationRouter(string? autoAnswer)
+        {
+            _autoAnswer = autoAnswer;
+        }
+
+        public Task<string?> TryAutoAnswerAsync(
+            string goalId,
+            string question,
+            string context,
+            ClarificationQueueService clarificationQueue,
+            ClarificationRequest request,
+            CancellationToken ct = default)
+        {
+            if (_autoAnswer is not null)
+                return Task.FromResult<string?>(_autoAnswer);
+
+            // Simulate escalation to human
+            clarificationQueue.EscalateToHuman(request.Id);
+            return Task.FromResult<string?>(null);
+        }
     }
 
     private sealed class FakeGoalSource : IGoalSource

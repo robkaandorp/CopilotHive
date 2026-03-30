@@ -108,10 +108,9 @@ static async Task<int> RunServerAsync(string[] args)
 
     builder.Services.AddSingleton<WorkerUtilizationService>();
     builder.Services.AddSingleton<ClarificationQueueService>();
-    builder.Services.AddSingleton<GoalDispatcher>();
-    builder.Services.AddHostedService(sp => sp.GetRequiredService<GoalDispatcher>());
 
     // Composer agent (optional — enabled when config has a composer section or BRAIN_MODEL is set)
+    // Registered BEFORE GoalDispatcher so the IClarificationRouter forwarding is available.
     builder.Services.AddSingleton<Composer>(sp =>
     {
         var config = sp.GetService<HiveConfigFile>();
@@ -132,12 +131,16 @@ static async Task<int> RunServerAsync(string[] args)
             maxCtx, maxSteps,
             sp.GetService<IBrainRepoManager>(),
             stateDir,
-            sp.GetRequiredService<GoalDispatcher>(),
+            sp, // IServiceProvider — lazy resolution of GoalDispatcher to avoid circular DI
             !string.IsNullOrWhiteSpace(ollamaApiKey) ? sp.GetRequiredService<IHttpClientFactory>() : null,
             ollamaApiKey,
             sp.GetService<HiveConfigFile>(),
             sp.GetService<ConfigRepoManager>());
     });
+    builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
+
+    builder.Services.AddSingleton<GoalDispatcher>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<GoalDispatcher>());
 
     // Dashboard: log capture (registered early so logger provider can reference it)
     var dashboardLogSink = new DashboardLogSink();
