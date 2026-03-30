@@ -78,7 +78,7 @@ public sealed class Composer : IAsyncDisposable
         - Cancel InProgress or Pending goals (cancel_goal)
         - Inspect repository history (git_log, git_diff, git_show, git_branch, git_blame)
         - List configured repositories (list_repositories)
-        - Create and manage releases (create_release, list_releases)
+        - Create and manage releases (create_release, list_releases, update_release)
         - Ask the user questions for clarification (ask_user)
 
         Guidelines for goal creation:
@@ -565,6 +565,8 @@ public sealed class Composer : IAsyncDisposable
                 "Create a new release in Planning status."),
             AIFunctionFactory.Create(ListReleasesAsync, "list_releases",
                 "List all releases with their status and goal count."),
+            AIFunctionFactory.Create(UpdateReleaseAsync, "update_release",
+                "Update a field (tag, notes, or repositories) on a Planning release. Non-Planning releases cannot be edited."),
         };
 
         if (_ollamaApiKey is not null)
@@ -1122,6 +1124,61 @@ public sealed class Composer : IAsyncDisposable
         }
 
         return sb.ToString();
+    }
+
+    [Description("Update a field on a Planning release. Only tag, notes, and repositories can be changed. Non-Planning releases cannot be edited.")]
+    internal async Task<string> UpdateReleaseAsync(
+        [Description("Release ID to update")] string id,
+        [Description("Field to update: tag, notes, or repositories")] string field,
+        [Description("New value for the field. For repositories, provide a comma-separated list (or empty to clear)")] string value)
+    {
+        var error = Shared.ToolValidation.Check(
+            (!string.IsNullOrWhiteSpace(id), "id is required"),
+            (!string.IsNullOrWhiteSpace(field), "field is required"));
+        if (error is not null) return error;
+
+        var release = await _goalStore.GetReleaseAsync(id);
+        if (release is null)
+            return $"❌ Release '{id}' not found.";
+
+        if (release.Status != ReleaseStatus.Planning)
+            return $"❌ Release '{id}' is in '{release.Status}' status and cannot be edited. Only Planning releases can be updated.";
+
+        ReleaseUpdateData update;
+        switch (field.ToLowerInvariant())
+        {
+            case "tag":
+                if (string.IsNullOrWhiteSpace(value))
+                    return "❌ tag cannot be empty.";
+                update = new ReleaseUpdateData { Tag = value.Trim() };
+                break;
+
+            case "notes":
+                update = new ReleaseUpdateData { Notes = value };
+                break;
+
+            case "repositories":
+                var repos = string.IsNullOrWhiteSpace(value)
+                    ? new List<string>()
+                    : value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+                update = new ReleaseUpdateData { Repositories = repos };
+                break;
+
+            default:
+                return $"❌ Unknown field '{field}'. Valid fields: tag, notes, repositories.";
+        }
+
+        try
+        {
+            await _goalStore.UpdateReleaseAsync(id, update);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return $"❌ {ex.Message}";
+        }
+
+        _logger.LogInformation("Composer updated release '{ReleaseId}' field '{Field}'", id, field);
+        return $"✅ Release '{id}' {field} updated.";
     }
 
     // ── Git tool implementations ──

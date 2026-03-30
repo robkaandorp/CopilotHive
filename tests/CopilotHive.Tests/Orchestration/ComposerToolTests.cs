@@ -3346,6 +3346,9 @@ internal sealed class FakeGoalSource : IGoalSource, IGoalStore
     public Task UpdateReleaseAsync(Release release, CancellationToken ct = default) =>
         Task.CompletedTask;
 
+    public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
     public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default) =>
         Task.FromResult(false);
 
@@ -3418,5 +3421,155 @@ internal sealed class TestLogger<T> : ILogger<T>
     public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
     {
         LogEntries.Add((logLevel, formatter(state, exception), exception));
+    }
+}
+
+// ── update_release tool tests ─────────────────────────────────────────────────
+
+public sealed class UpdateReleaseComposerToolTests : IDisposable
+{
+    private readonly SqliteConnection _connection;
+    private readonly SqliteGoalStore _store;
+    private readonly Composer _composer;
+
+    public UpdateReleaseComposerToolTests()
+    {
+        _connection = new SqliteConnection("Data Source=:memory:");
+        _connection.Open();
+        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+        _composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath());
+    }
+
+    public void Dispose() => _connection.Dispose();
+
+    [Fact]
+    public async Task UpdateRelease_UpdatesTag_ReturnsSuccess()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0");
+
+        var result = await _composer.UpdateReleaseAsync("v1.0.0", "tag", "v1.0.1");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("tag", result);
+
+        var updated = await _store.GetReleaseAsync("v1.0.0", ct);
+        Assert.Equal("v1.0.1", updated!.Tag);
+    }
+
+    [Fact]
+    public async Task UpdateRelease_UpdatesNotes_ReturnsSuccess()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0");
+
+        var result = await _composer.UpdateReleaseAsync("v1.0.0", "notes", "Initial release notes");
+
+        Assert.Contains("✅", result);
+
+        var updated = await _store.GetReleaseAsync("v1.0.0", ct);
+        Assert.Equal("Initial release notes", updated!.Notes);
+    }
+
+    [Fact]
+    public async Task UpdateRelease_UpdatesRepositories_ReturnsSuccess()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0");
+
+        var result = await _composer.UpdateReleaseAsync("v1.0.0", "repositories", "repo-a, repo-b");
+
+        Assert.Contains("✅", result);
+
+        var updated = await _store.GetReleaseAsync("v1.0.0", ct);
+        Assert.NotNull(updated);
+        Assert.Equal(2, updated!.RepositoryNames.Count);
+        Assert.Contains("repo-a", updated.RepositoryNames);
+        Assert.Contains("repo-b", updated.RepositoryNames);
+    }
+
+    [Fact]
+    public async Task UpdateRelease_ClearsRepositoriesWhenEmpty()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0", repositories: "repo-a");
+
+        var result = await _composer.UpdateReleaseAsync("v1.0.0", "repositories", "");
+
+        Assert.Contains("✅", result);
+
+        var updated = await _store.GetReleaseAsync("v1.0.0", ct);
+        Assert.NotNull(updated);
+        Assert.Empty(updated!.RepositoryNames);
+    }
+
+    [Fact]
+    public async Task UpdateRelease_ReleaseNotFound_ReturnsError()
+    {
+        var result = await _composer.UpdateReleaseAsync("nonexistent", "tag", "v1.0.1");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not found", result);
+    }
+
+    [Fact]
+    public async Task UpdateRelease_NonPlanningRelease_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // Create as Planning then mark Released
+        await _store.CreateReleaseAsync(new Release
+        {
+            Id = "v1.0.0",
+            Tag = "v1.0.0",
+            Status = ReleaseStatus.Released,
+            CreatedAt = DateTime.UtcNow,
+        }, ct);
+
+        var result = await _composer.UpdateReleaseAsync("v1.0.0", "tag", "v1.0.1");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Released", result);
+    }
+
+    [Fact]
+    public async Task UpdateRelease_UnknownField_ReturnsError()
+    {
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0");
+
+        var result = await _composer.UpdateReleaseAsync("v1.0.0", "invalid_field", "some-value");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Unknown field", result);
+    }
+
+    [Fact]
+    public async Task UpdateRelease_EmptyTagValue_ReturnsError()
+    {
+        await _composer.CreateReleaseAsync("v1.0.0", "v1.0.0");
+
+        var result = await _composer.UpdateReleaseAsync("v1.0.0", "tag", "");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("empty", result);
+    }
+
+    [Fact]
+    public async Task UpdateRelease_MissingId_ReturnsError()
+    {
+        var result = await _composer.UpdateReleaseAsync("", "tag", "v1.0.1");
+
+        Assert.Contains("ERROR", result);
+        Assert.Contains("id is required", result);
+    }
+
+    [Fact]
+    public async Task BuildComposerTools_IncludesUpdateRelease()
+    {
+        var tools = _composer.BuildComposerTools();
+        Assert.Contains(tools, t => t.Name == "update_release");
     }
 }

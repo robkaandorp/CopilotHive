@@ -58,6 +58,17 @@ public interface IGoalStore : IGoalSource
     /// <summary>Updates a release's mutable fields. Throws if release not found.</summary>
     Task UpdateReleaseAsync(Release release, CancellationToken ct = default);
 
+    /// <summary>
+    /// Applies a partial update to a Planning release.
+    /// Only non-null fields in <paramref name="update"/> are written.
+    /// Throws <see cref="InvalidOperationException"/> if the release is not in Planning status.
+    /// Throws <see cref="KeyNotFoundException"/> if the release does not exist.
+    /// </summary>
+    /// <param name="releaseId">ID of the release to update.</param>
+    /// <param name="update">Fields to update; null values are ignored.</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default);
+
     /// <summary>Deletes a release. Returns <c>false</c> if not found.</summary>
     Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default);
 

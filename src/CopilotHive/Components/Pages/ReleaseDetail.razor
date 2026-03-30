@@ -30,6 +30,44 @@
         }
     </div>
 
+    <!-- Edit controls (Planning only) -->
+    @if (_release.Status == ReleaseStatus.Planning)
+    {
+        <!-- Tag editor -->
+        <div class="card" style="margin-bottom:1rem">
+            <div class="label" style="margin-bottom:0.5rem">Tag</div>
+            <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+                <input type="text" @bind="_editTag" style="flex:1;min-width:12rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;padding:0.4rem 0.6rem" placeholder="e.g. v1.2.0" />
+                <button class="approve-btn" @onclick="SaveTag">Save Tag</button>
+                @if (!string.IsNullOrEmpty(_tagError))
+                {
+                    <span class="error-msg">@_tagError</span>
+                }
+                @if (_tagSaved)
+                {
+                    <span style="color:var(--green);font-size:0.85rem">✓ Saved</span>
+                }
+            </div>
+        </div>
+
+        <!-- Repositories editor -->
+        <div class="card" style="margin-bottom:1rem">
+            <div class="label" style="margin-bottom:0.5rem">Repositories</div>
+            <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+                <input type="text" @bind="_editRepositories" style="flex:1;min-width:12rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;padding:0.4rem 0.6rem" placeholder="Comma-separated repository names" />
+                <button class="approve-btn" @onclick="SaveRepositories">Save Repositories</button>
+                @if (!string.IsNullOrEmpty(_repositoriesError))
+                {
+                    <span class="error-msg">@_repositoriesError</span>
+                }
+                @if (_repositoriesSaved)
+                {
+                    <span style="color:var(--green);font-size:0.85rem">✓ Saved</span>
+                }
+            </div>
+        </div>
+    }
+
     <!-- Metadata card -->
     <div class="card" style="margin-bottom:1rem;font-size:0.85rem;color:var(--text-muted)">
         <div style="display:flex;gap:1.5rem;flex-wrap:wrap">
@@ -158,6 +196,16 @@ else if (_loaded)
     private string? _notesError;
     private string? _actionError;
 
+    // Tag edit state
+    private string _editTag = "";
+    private bool _tagSaved;
+    private string? _tagError;
+
+    // Repositories edit state
+    private string _editRepositories = "";
+    private bool _repositoriesSaved;
+    private string? _repositoriesError;
+
     protected override async Task OnInitializedAsync()
     {
         var decoded = Uri.UnescapeDataString(ReleaseId);
@@ -165,6 +213,8 @@ else if (_loaded)
         if (_release is not null)
         {
             _editNotes = _release.Notes ?? "";
+            _editTag = _release.Tag;
+            _editRepositories = string.Join(", ", _release.RepositoryNames);
             _goals = (await GoalStore.GetGoalsByReleaseAsync(decoded)).ToList();
         }
         _loaded = true;
@@ -212,6 +262,61 @@ else if (_loaded)
         {
             var error = await response.Content.ReadAsStringAsync();
             _notesError = $"Error {(int)response.StatusCode}: {error}";
+        }
+    }
+
+    private async Task SaveTag()
+    {
+        _tagError = null;
+        _tagSaved = false;
+        if (string.IsNullOrWhiteSpace(_editTag))
+        {
+            _tagError = "Tag cannot be empty.";
+            return;
+        }
+        var body = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new { tag = _editTag.Trim() }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+        var id = Uri.EscapeDataString(ReleaseId);
+        var response = await HttpClient.PatchAsync($"/api/releases/{id}/tag", body);
+        if (response.IsSuccessStatusCode)
+        {
+            _release!.Tag = _editTag.Trim();
+            _tagSaved = true;
+            StateHasChanged();
+        }
+        else
+        {
+            var error = await response.Content.ReadAsStringAsync();
+            _tagError = $"Error {(int)response.StatusCode}: {error}";
+        }
+    }
+
+    private async Task SaveRepositories()
+    {
+        _repositoriesError = null;
+        _repositoriesSaved = false;
+        var repos = string.IsNullOrWhiteSpace(_editRepositories)
+            ? new List<string>()
+            : _editRepositories.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+        var body = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new { repositories = repos }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+        var id = Uri.EscapeDataString(ReleaseId);
+        var response = await HttpClient.PatchAsync($"/api/releases/{id}/repositories", body);
+        if (response.IsSuccessStatusCode)
+        {
+            _release!.RepositoryNames.Clear();
+            _release.RepositoryNames.AddRange(repos);
+            _repositoriesSaved = true;
+            StateHasChanged();
+        }
+        else
+        {
+            var error = await response.Content.ReadAsStringAsync();
+            _repositoriesError = $"Error {(int)response.StatusCode}: {error}";
         }
     }
 

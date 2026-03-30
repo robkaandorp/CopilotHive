@@ -540,6 +540,63 @@ public sealed class SqliteGoalStore : IGoalStore
     }
 
     /// <inheritdoc />
+    public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default)
+    {
+        lock (_lock)
+        {
+            // Fetch current status to enforce Planning-only constraint
+            using var fetchCmd = _db.CreateCommand();
+            fetchCmd.CommandText = "SELECT status FROM releases WHERE id = @id";
+            fetchCmd.Parameters.AddWithValue("@id", releaseId);
+            var statusRaw = fetchCmd.ExecuteScalar();
+
+            if (statusRaw is null)
+                throw new KeyNotFoundException($"Release '{releaseId}' not found in SQLite store.");
+
+            var currentStatus = Enum.Parse<ReleaseStatus>((string)statusRaw, ignoreCase: true);
+            if (currentStatus != ReleaseStatus.Planning)
+                throw new InvalidOperationException(
+                    $"Release '{releaseId}' cannot be edited because it is in '{currentStatus}' status. Only Planning releases can be edited.");
+
+            // Build a partial UPDATE touching only the supplied fields
+            var setClauses = new List<string>();
+            using var cmd = _db.CreateCommand();
+
+            if (update.Tag is not null)
+            {
+                setClauses.Add("tag = @tag");
+                cmd.Parameters.AddWithValue("@tag", update.Tag);
+            }
+
+            if (update.Notes is not null)
+            {
+                setClauses.Add("notes = @notes");
+                cmd.Parameters.AddWithValue("@notes", update.Notes);
+            }
+
+            if (update.Repositories is not null)
+            {
+                setClauses.Add("repositories = @repos");
+                cmd.Parameters.AddWithValue("@repos", update.Repositories.Count > 0
+                    ? JsonSerializer.Serialize(update.Repositories, JsonOptions)
+                    : (object)DBNull.Value);
+            }
+
+            if (setClauses.Count == 0)
+                return Task.CompletedTask; // nothing to update
+
+            cmd.CommandText = $"UPDATE releases SET {string.Join(", ", setClauses)} WHERE id = @id";
+            cmd.Parameters.AddWithValue("@id", releaseId);
+            cmd.ExecuteNonQuery();
+
+            _logger.LogInformation("Updated release {ReleaseId} (fields: {Fields})",
+                releaseId, string.Join(", ", setClauses.Select(c => c.Split('=')[0].Trim())));
+        }
+
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
     public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default)
     {
         lock (_lock)
