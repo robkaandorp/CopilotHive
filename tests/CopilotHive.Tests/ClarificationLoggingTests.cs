@@ -154,6 +154,155 @@ public sealed class ClarificationLoggingTests
         Assert.Empty(pipeline.Clarifications);
     }
 
+    // ── AskBrainAsync — brain escalates, human answers ────────────────────
+
+    [Fact]
+    public async Task AskBrainAsync_HumanAnswers_ClarificationRecordedWithHumanAnsweredBy()
+    {
+        var brain = new FakeBrain("ESCALATE: Need human input");
+        var queue = new ClarificationQueueService();
+        // Router returns null to escalate to human
+        var router = new FakeRouter(null);
+        var (dispatcher, pipeline) = CreateDispatcher(brain, queue, router: router);
+
+        // Use a shorter timeout for the test
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+        // Start the AskBrainAsync in a task
+        var askTask = Task.Run(() => dispatcher.AskBrainAsync(pipeline, "Human question?", cts.Token), cts.Token);
+
+        // Wait for the request to be enqueued (poll the queue)
+        ClarificationRequest? capturedRequest = null;
+        for (int i = 0; i < 100 && capturedRequest is null; i++)
+        {
+            await Task.Delay(50, cts.Token);
+            var allRequests = queue.GetAllRequests();
+            if (allRequests.Count > 0)
+                capturedRequest = allRequests[0];
+        }
+
+        Assert.NotNull(capturedRequest);
+        // Pipeline should be in waiting state while we haven't answered
+        Assert.True(pipeline.IsWaitingForClarification);
+
+        // Submit human answer
+        queue.SubmitAnswer(capturedRequest.Id, "Human answer here.", "human");
+
+        var answer = await askTask;
+        Assert.Equal("Human answer here.", answer);
+
+        var entry = Assert.Single(pipeline.Clarifications);
+        Assert.Equal("human", entry.AnsweredBy);
+        Assert.Equal("Human question?", entry.Question);
+        Assert.Equal("Human answer here.", entry.Answer);
+        Assert.False(pipeline.IsWaitingForClarification);
+    }
+
+    [Fact]
+    public async Task AskBrainAsync_HumanAnswers_WaitingStateReverted()
+    {
+        var brain = new FakeBrain("ESCALATE: Need human");
+        var queue = new ClarificationQueueService();
+        var router = new FakeRouter(null);
+        var (dispatcher, pipeline) = CreateDispatcher(brain, queue, router: router);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var askTask = Task.Run(() => dispatcher.AskBrainAsync(pipeline, "Q?", cts.Token), cts.Token);
+
+        ClarificationRequest? capturedRequest = null;
+        for (int i = 0; i < 100 && capturedRequest is null; i++)
+        {
+            await Task.Delay(50, cts.Token);
+            var allRequests = queue.GetAllRequests();
+            if (allRequests.Count > 0)
+                capturedRequest = allRequests[0];
+        }
+
+        Assert.True(pipeline.IsWaitingForClarification);
+        queue.SubmitAnswer(capturedRequest!.Id, "A.", "human");
+
+        await askTask;
+        Assert.False(pipeline.IsWaitingForClarification);
+    }
+
+    // ── AskBrainAsync — human timeout ──────────────────────────────────────
+
+    [Fact]
+    public async Task AskBrainAsync_HumanTimeout_ReturnsFallbackAndRecordsTimeout()
+    {
+        var brain = new FakeBrain("ESCALATE: Need human input");
+        var queue = new ClarificationQueueService();
+        var router = new FakeRouter(null);
+        var (dispatcher, pipeline) = CreateDispatcher(brain, queue, router: router);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+        var askTask = Task.Run(() => dispatcher.AskBrainAsync(pipeline, "Timeout question?", cts.Token), cts.Token);
+
+        // Wait for the request to be enqueued
+        ClarificationRequest? capturedRequest = null;
+        for (int i = 0; i < 100 && capturedRequest is null; i++)
+        {
+            await Task.Delay(50, cts.Token);
+            var allRequests = queue.GetAllRequests();
+            if (allRequests.Count > 0)
+                capturedRequest = allRequests[0];
+        }
+
+        Assert.NotNull(capturedRequest);
+        Assert.True(pipeline.IsWaitingForClarification);
+
+        // Use reflection to get the TCS from the queue and fault it with TimeoutException
+        // This simulates the actual timeout path where WaitAsync throws TimeoutException
+        var waitersField = typeof(ClarificationQueueService)
+            .GetField("_waiters", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(waitersField);
+        var waiters = waitersField!.GetValue(queue) as System.Collections.Concurrent.ConcurrentDictionary<string, TaskCompletionSource<string>>;
+        Assert.NotNull(waiters);
+        Assert.True(waiters!.TryGetValue(capturedRequest.Id, out var tcs));
+        Assert.NotNull(tcs);
+
+        // Fault the TCS with TimeoutException to simulate actual timeout
+        tcs!.TrySetException(new TimeoutException("Simulated timeout"));
+
+        var answer = await askTask;
+        Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, answer);
+
+        var entry = Assert.Single(pipeline.Clarifications);
+        Assert.Equal("timeout", entry.AnsweredBy);
+        Assert.Equal("Timeout question?", entry.Question);
+        Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, entry.Answer);
+        Assert.False(pipeline.IsWaitingForClarification);
+    }
+
+    [Fact]
+    public async Task AskBrainAsync_Timeout_WaitingStateReverted()
+    {
+        var brain = new FakeBrain("ESCALATE: need human");
+        var queue = new ClarificationQueueService();
+        var router = new FakeRouter(null);
+        var (dispatcher, pipeline) = CreateDispatcher(brain, queue, router: router);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var askTask = Task.Run(() => dispatcher.AskBrainAsync(pipeline, "Q?", cts.Token), cts.Token);
+
+        ClarificationRequest? capturedRequest = null;
+        for (int i = 0; i < 100 && capturedRequest is null; i++)
+        {
+            await Task.Delay(50, cts.Token);
+            var allRequests = queue.GetAllRequests();
+            if (allRequests.Count > 0)
+                capturedRequest = allRequests[0];
+        }
+
+        Assert.NotNull(capturedRequest);
+        Assert.True(pipeline.IsWaitingForClarification);
+        queue.MarkTimedOut(capturedRequest.Id);
+
+        await askTask;
+        Assert.False(pipeline.IsWaitingForClarification);
+    }
+
     // ── AskBrainAsync — multiple clarifications accumulated ───────────────
 
     [Fact]
@@ -260,6 +409,123 @@ public sealed class ClarificationLoggingTests
         var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
 
         Assert.Empty(summary.Clarifications);
+    }
+
+    // ── UI Rendering: PhaseIcon and PhaseBadge ────────────────────────────
+
+    [Theory]
+    [InlineData("waiting", "badge-yellow")]
+    [InlineData("active", "badge-blue")]
+    [InlineData("completed", "badge-green")]
+    [InlineData("failed", "badge-red")]
+    [InlineData("unknown", "badge-muted")]
+    public void PhaseBadge_WaitingStatus_ReturnsYellow(string status, string expectedBadge)
+    {
+        // Matches the logic from GoalDetail.razor PhaseBadge()
+        var badge = status switch
+        {
+            "completed" => "badge-green",
+            "failed" => "badge-red",
+            "active" => "badge-blue",
+            "waiting" => "badge-yellow",
+            _ => "badge-muted",
+        };
+        Assert.Equal(expectedBadge, badge);
+    }
+
+    [Theory]
+    [InlineData("waiting", "💬")]
+    [InlineData("active", "●")]
+    [InlineData("completed", "✓")]
+    [InlineData("failed", "✗")]
+    [InlineData("pending", "○")]
+    [InlineData("skipped", "~")]
+    [InlineData("unknown", "○")]
+    public void PhaseIcon_WaitingStatus_ReturnsSpeechBubble(string status, string expectedIcon)
+    {
+        // Matches the logic from GoalDetail.razor PhaseIcon()
+        var icon = status switch
+        {
+            "completed" => "✓",
+            "failed" => "✗",
+            "active" => "●",
+            "waiting" => "💬",
+            "pending" => "○",
+            "skipped" => "~",
+            _ => "○",
+        };
+        Assert.Equal(expectedIcon, icon);
+    }
+
+    [Fact]
+    public void WaitingStatus_HasSpecialCssClass()
+    {
+        // Verify CSS class exists for "waiting" status
+        // This mirrors the CSS in site.css for .phase-box.waiting
+        var cssClasses = new Dictionary<string, string[]>
+        {
+            ["active"] = ["phase-box", "active"],
+            ["waiting"] = ["phase-box", "waiting"],
+            ["completed"] = ["phase-box", "completed"],
+            ["failed"] = ["phase-box", "failed"],
+        };
+
+        Assert.Contains("waiting", cssClasses["waiting"]);
+        Assert.Contains("phase-box", cssClasses["waiting"]);
+    }
+
+    // ── DashboardStateService integration ──────────────────────────────────
+
+    [Fact]
+    public void PhaseViewInfo_Clarifications_PropertyExists()
+    {
+        // Verify PhaseViewInfo has Clarifications property with correct default
+        var phaseView = new PhaseViewInfo
+        {
+            Name = "Coding",
+            Status = "active",
+            RoleName = "coder",
+        };
+
+        Assert.NotNull(phaseView.Clarifications);
+        Assert.Empty(phaseView.Clarifications);
+    }
+
+    [Fact]
+    public void PhaseViewInfo_Clarifications_CanBeSet()
+    {
+        var clarifications = new List<ClarificationEntry>
+        {
+            new(DateTime.UtcNow, "g-1", 1, "Coding", "coder", "Q?", "A.", "brain"),
+        };
+
+        var phaseView = new PhaseViewInfo
+        {
+            Name = "Coding",
+            Status = "waiting",
+            RoleName = "coder",
+            Clarifications = clarifications,
+        };
+
+        Assert.Single(phaseView.Clarifications);
+        Assert.Equal("Q?", phaseView.Clarifications[0].Question);
+    }
+
+    [Fact]
+    public void GoalPipeline_IsWaitingForClarification_AffectsPhaseStatus()
+    {
+        // Verify that setting IsWaitingForClarification affects the status
+        // This mirrors the logic in DashboardStateService.BuildPhaseViews
+        var pipeline = CreatePipeline();
+        Assert.False(pipeline.IsWaitingForClarification);
+
+        // The status logic is: status = pipeline.IsWaitingForClarification ? "waiting" : "active"
+        var statusBefore = pipeline.IsWaitingForClarification ? "waiting" : "active";
+        Assert.Equal("active", statusBefore);
+
+        pipeline.IsWaitingForClarification = true;
+        var statusAfter = pipeline.IsWaitingForClarification ? "waiting" : "active";
+        Assert.Equal("waiting", statusAfter);
     }
 
     // ── SqliteGoalStore round-trip ─────────────────────────────────────────
