@@ -287,7 +287,7 @@ public sealed class GoalDispatcher : BackgroundService
         _progressLog?.AddClarification(entry);
 
         _logger.LogInformation(
-            "Clarification recorded for goal {goalId} iteration {iteration} phase {phase}: Q={question} | AnsweredBy={answeredBy}",
+            "Clarification recorded for goal {GoalId} iteration {Iteration} phase {Phase}: Q={Question} | AnsweredBy={AnsweredBy}",
             entry.GoalId, entry.Iteration, entry.Phase,
             question.Length > 100 ? question[..100] + "..." : question,
             answeredBy);

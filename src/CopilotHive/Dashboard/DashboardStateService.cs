@@ -239,6 +239,22 @@ public sealed class DashboardStateService : IDisposable
                 },
             };
 
+            // Group persisted clarifications by phase name for this iteration
+            var summaryClarificationsByPhase = summary.Clarifications
+                .GroupBy(c => c.Phase, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    g => g.Key,
+                    g => g.Select(c => new ClarificationEntry(
+                        Timestamp: c.Timestamp,
+                        GoalId: goalId,
+                        Iteration: summary.Iteration,
+                        Phase: c.Phase,
+                        WorkerRole: c.WorkerRole,
+                        Question: c.Question,
+                        Answer: c.Answer,
+                        AnsweredBy: c.AnsweredBy)).ToList(),
+                    StringComparer.OrdinalIgnoreCase);
+
             foreach (var pr in summary.Phases)
             {
                 var roleName = PhaseNameToRoleName(pr.Name);
@@ -252,6 +268,7 @@ public sealed class DashboardStateService : IDisposable
                 var isTestPhase = pr.Name == "Testing";
                 var isReviewPhase = pr.Name == "Review";
 
+                summaryClarificationsByPhase.TryGetValue(pr.Name, out var summaryClarifications);
                 summaryCraftPrompts.TryGetValue(roleName, out var summaryPhasePrompts);
                 phases.Add(new PhaseViewInfo
                 {
@@ -266,6 +283,7 @@ public sealed class DashboardStateService : IDisposable
                     ReviewVerdict = isReviewPhase ? summary.ReviewVerdict : null,
                     BrainPrompt = summaryPhasePrompts.BrainPrompt,
                     WorkerPrompt = summaryPhasePrompts.WorkerPrompt,
+                    Clarifications = summaryClarifications ?? [],
                 });
             }
 
