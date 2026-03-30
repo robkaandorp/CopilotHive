@@ -1147,4 +1147,95 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
         Assert.NotNull(r);
         Assert.Equal("v1.0.0", r!.Tag);
     }
+
+    /// <summary>
+    /// Regression test: verifies that partial updates with null Repositories preserve existing data.
+    /// This tests the fix for a data-loss bug where sending {} or {"repositories": null} would
+    /// incorrectly clear the repositories list. The correct behavior is that null/missing
+    /// means "do not update", preserving existing values.
+    /// </summary>
+    [Fact]
+    public async Task UpdateRelease_Partial_NullRepositories_PreservesExistingRepositories()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // Create a release with repositories
+        var r = new Release
+        {
+            Id = "v1.0.0",
+            Tag = "v1.0.0",
+            RepositoryNames = ["repo-a", "repo-b", "repo-c"],
+            CreatedAt = DateTime.UtcNow
+        };
+        await _store.CreateReleaseAsync(r, ct);
+
+        // Send partial update with null Repositories (simulates PATCH with missing field or explicit null)
+        await _store.UpdateReleaseAsync("v1.0.0", new ReleaseUpdateData { Repositories = null }, ct);
+
+        // Verify repositories are preserved (NOT cleared)
+        var updated = await _store.GetReleaseAsync("v1.0.0", ct);
+        Assert.NotNull(updated);
+        Assert.Equal(3, updated!.RepositoryNames.Count);
+        Assert.Contains("repo-a", updated.RepositoryNames);
+        Assert.Contains("repo-b", updated.RepositoryNames);
+        Assert.Contains("repo-c", updated.RepositoryNames);
+    }
+
+    /// <summary>
+    /// Regression test: verifies that an empty ReleaseUpdateData preserves all existing fields.
+    /// This is the PATCH {} scenario - all fields null means "do not update anything".
+    /// </summary>
+    [Fact]
+    public async Task UpdateRelease_Partial_EmptyUpdate_PreservesExistingRepositories()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // Create a release with repositories and notes
+        var r = new Release
+        {
+            Id = "v1.0.0",
+            Tag = "v1.0.0",
+            Notes = "Original notes",
+            RepositoryNames = ["repo-x", "repo-y"],
+            CreatedAt = DateTime.UtcNow
+        };
+        await _store.CreateReleaseAsync(r, ct);
+
+        // Send empty update (all fields null)
+        await _store.UpdateReleaseAsync("v1.0.0", new ReleaseUpdateData(), ct);
+
+        // Verify all fields are preserved
+        var updated = await _store.GetReleaseAsync("v1.0.0", ct);
+        Assert.NotNull(updated);
+        Assert.Equal("v1.0.0", updated!.Tag);
+        Assert.Equal("Original notes", updated.Notes);
+        Assert.Equal(2, updated.RepositoryNames.Count);
+        Assert.Contains("repo-x", updated.RepositoryNames);
+        Assert.Contains("repo-y", updated.RepositoryNames);
+    }
+
+    /// <summary>
+    /// Ensures that only sending repositories: [] explicitly clears the list.
+    /// This verifies the distinction between null (preserve) and empty list (clear).
+    /// </summary>
+    [Fact]
+    public async Task UpdateRelease_Partial_EmptyList_ClearsRepositories()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // Create a release with repositories
+        var r = new Release
+        {
+            Id = "v1.0.0",
+            Tag = "v1.0.0",
+            RepositoryNames = ["repo-a", "repo-b"],
+            CreatedAt = DateTime.UtcNow
+        };
+        await _store.CreateReleaseAsync(r, ct);
+
+        // Send update with empty list (explicitly clears repositories)
+        await _store.UpdateReleaseAsync("v1.0.0", new ReleaseUpdateData { Repositories = [] }, ct);
+
+        // Verify repositories are cleared
+        var updated = await _store.GetReleaseAsync("v1.0.0", ct);
+        Assert.NotNull(updated);
+        Assert.Empty(updated!.RepositoryNames);
+    }
 }
