@@ -160,6 +160,14 @@ public sealed class GoalPipeline
     public string? MergeCommitHash { get; set; }
 
     /// <summary>
+    /// HEAD SHA of the target repository at the moment the coder was dispatched for this iteration.
+    /// Used to compute an iteration-scoped diff (<c>git diff {sha}..HEAD</c>) for reviewers so they
+    /// can distinguish this iteration's changes from earlier iterations on the same branch.
+    /// <c>null</c> when the SHA could not be captured (e.g. empty repository).
+    /// </summary>
+    public string? IterationStartSha { get; set; }
+
+    /// <summary>
     /// Creates a new pipeline for the specified goal.
     /// </summary>
     /// <param name="goal">The goal to track.</param>

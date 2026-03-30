@@ -153,6 +153,15 @@ public sealed class TaskExecutor(
                 contextLines.Add($"Merge base commit: {mergeBase}");
                 contextLines.Add($"Diff command: git diff {mergeBase}..HEAD");
                 contextLines.Add("IMPORTANT: Use the diff command above to see changes. Do NOT diff against branch names.");
+
+                // For reviewers: also expose an iteration-scoped diff so they can focus
+                // on what changed in the current iteration vs. all previous iterations.
+                if (task.Role == WorkerRole.Reviewer
+                    && task.Metadata.TryGetValue("iteration_start_sha", out var iterationStartSha)
+                    && !string.IsNullOrEmpty(iterationStartSha))
+                {
+                    contextLines.Add($"Iteration diff command: git diff {iterationStartSha}..HEAD");
+                }
             }
             else if (task.BranchInfo is { } bi2 && !string.IsNullOrEmpty(bi2.BaseBranch))
             {

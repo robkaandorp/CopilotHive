@@ -50,6 +50,15 @@ public interface IBrainRepoManager
     /// <param name="repoName">Short name of the repository.</param>
     /// <returns>Absolute path to the clone directory.</returns>
     string GetClonePath(string repoName);
+
+    /// <summary>
+    /// Returns the current HEAD SHA from the local clone of the given repository, or <c>null</c>
+    /// if the clone does not exist or the repository is empty (no commits yet).
+    /// </summary>
+    /// <param name="repoName">Short name of the repository.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The full SHA-1 hash of HEAD, or <c>null</c> when it cannot be determined.</returns>
+    Task<string?> GetHeadShaAsync(string repoName, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -371,6 +380,34 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// </summary>
     public string GetClonePath(string repoName) =>
         Path.Combine(WorkDirectory, repoName);
+
+    /// <summary>
+    /// Returns the current HEAD SHA from the local clone of the given repository, or <c>null</c>
+    /// if the clone does not exist or the repository is empty (no commits yet).
+    /// </summary>
+    /// <param name="repoName">Short name of the repository.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The full SHA-1 hash of HEAD, or <c>null</c> when it cannot be determined.</returns>
+    public async Task<string?> GetHeadShaAsync(string repoName, CancellationToken ct = default)
+    {
+        var clonePath = GetClonePath(repoName);
+        if (!Directory.Exists(Path.Combine(clonePath, ".git")))
+        {
+            _logger.LogDebug("GetHeadShaAsync: no clone found for '{RepoName}' — returning null", repoName);
+            return null;
+        }
+
+        try
+        {
+            var sha = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct);
+            return sha.Trim();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "GetHeadShaAsync: could not read HEAD for '{RepoName}' (empty repo?) — returning null", repoName);
+            return null;
+        }
+    }
 
     /// <summary>
     /// Deletes a directory with retries to handle transient file locks (e.g. from git processes on Windows).

@@ -679,6 +679,27 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogDebug("Model for {Role}: {Model} (tier={Tier}, configLoaded={ConfigLoaded})",
             roleName, model ?? "(null)", phaseTier, _config is not null);
 
+        // Capture HEAD SHA before the coder starts so the reviewer can later compute an
+        // iteration-scoped diff (git diff {sha}..HEAD). Omit gracefully on empty repos.
+        if (role == WorkerRole.Coder && repositories.Count > 0)
+        {
+            var primaryRepo = repositories[0];
+            try
+            {
+                var sha = await _repoManager.GetHeadShaAsync(primaryRepo.Name, ct);
+                pipeline.IterationStartSha = sha; // null → omit iteration diff (empty repo)
+                if (sha is not null)
+                    _logger.LogDebug("Captured iteration start SHA {Sha} for goal {GoalId}",
+                        sha[..Math.Min(sha.Length, 12)], pipeline.GoalId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to capture iteration start SHA for goal {GoalId} — iteration diff will be omitted",
+                    pipeline.GoalId);
+                pipeline.IterationStartSha = null;
+            }
+        }
+
         var task = _taskBuilder.Build(
             goalId: pipeline.GoalId,
             goalDescription: pipeline.Description,
@@ -695,6 +716,11 @@ public sealed class GoalDispatcher : BackgroundService
         {
             task.BranchInfo.Action = BranchAction.Unspecified;
         }
+
+        // Propagate the iteration start SHA to the worker via metadata so reviewers can
+        // compute an iteration-scoped diff alongside the cumulative branch diff.
+        if (pipeline.IterationStartSha is not null)
+            task.Metadata["iteration_start_sha"] = pipeline.IterationStartSha;
 
         pipeline.SetActiveTask(task.TaskId, task.BranchInfo?.FeatureBranch);
         _pipelineManager.RegisterTask(task.TaskId, pipeline.GoalId);

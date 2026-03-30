@@ -820,4 +820,42 @@ public sealed class GoalPipelineManagerTests
     }
 
     #endregion
+
+    #region GoalPipeline — IterationStartSha
+
+    [Fact]
+    public void IterationStartSha_DefaultsToNull()
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+
+        Assert.Null(pipeline.IterationStartSha);
+    }
+
+    [Fact]
+    public void IterationStartSha_CanBeSet()
+    {
+        const string sha = "abc123def456789012345678901234567890abcd";
+        var pipeline = new GoalPipeline(CreateGoal())
+        {
+            IterationStartSha = sha,
+        };
+
+        Assert.Equal(sha, pipeline.IterationStartSha);
+    }
+
+    [Fact]
+    public void IterationStartSha_CanBeResetToNull()
+    {
+        var pipeline = new GoalPipeline(CreateGoal())
+        {
+            IterationStartSha = "someSha",
+        };
+
+        pipeline.IterationStartSha = null;
+
+        Assert.Null(pipeline.IterationStartSha);
+    }
+
+    #endregion
 }
+
