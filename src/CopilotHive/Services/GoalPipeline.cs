@@ -201,6 +201,7 @@ public sealed class GoalPipeline
         CompletedAt = snapshot.CompletedAt;
         GoalStartedAt = snapshot.GoalStartedAt;
         MergeCommitHash = snapshot.MergeCommitHash;
+        IterationStartSha = snapshot.IterationStartSha;
 
         foreach (var (key, value) in snapshot.PhaseOutputs)
             PhaseOutputs[key] = value;

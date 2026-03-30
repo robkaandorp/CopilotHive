@@ -49,6 +49,12 @@ public sealed record TaskResult
     public GitChangeSummary? GitStatus { get; init; }
     /// <summary>Optional model ID for the task that produced this result.</summary>
     public string Model { get; init; } = "";
+    /// <summary>
+    /// HEAD SHA of the worker's feature-branch clone captured immediately before the coder agent ran.
+    /// Populated only for <see cref="WorkerRole.Coder"/> tasks; empty or null otherwise.
+    /// Passed back so the orchestrator can store it on the pipeline for subsequent reviewer tasks.
+    /// </summary>
+    public string? IterationStartSha { get; init; }
 }
 
 /// <summary>Domain-level task completion status.</summary>

@@ -123,6 +123,28 @@ public sealed class TaskExecutor(
                     _log.Info("Could not compute merge-base; falling back to branch name diff");
             }
 
+            // For coder tasks: capture HEAD SHA on the feature branch immediately before the agent runs.
+            // This SHA is returned in the result so the orchestrator can store it and later give it to
+            // the reviewer as the "iteration start" point for a scoped diff (git diff {sha}..HEAD).
+            string? iterationStartSha = null;
+            if (task.Role == WorkerRole.Coder && !isImprover && repoDirectories.Count > 0)
+            {
+                var (_, targetDir) = repoDirectories[0];
+                try
+                {
+                    var (exitCode, stdout, _) = await _git.RunGitCommandAsync(targetDir, "rev-parse HEAD", ct);
+                    if (exitCode == 0 && !string.IsNullOrWhiteSpace(stdout))
+                    {
+                        iterationStartSha = stdout.Trim();
+                        _log.Info($"Captured iteration start SHA: {iterationStartSha[..Math.Min(iterationStartSha.Length, 12)]}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn($"Could not capture iteration start SHA (empty repo?): {ex.Message}");
+                }
+            }
+
             // Determine working directory for Copilot
             // Improver works in the config-repo/agents folder; others in the first cloned repo
             var primaryWorkDir = isImprover
@@ -157,10 +179,10 @@ public sealed class TaskExecutor(
                 // For reviewers: also expose an iteration-scoped diff so they can focus
                 // on what changed in the current iteration vs. all previous iterations.
                 if (task.Role == WorkerRole.Reviewer
-                    && task.Metadata.TryGetValue("iteration_start_sha", out var iterationStartSha)
-                    && !string.IsNullOrEmpty(iterationStartSha))
+                    && task.Metadata.TryGetValue("iteration_start_sha", out var reviewerIterationSha)
+                    && !string.IsNullOrEmpty(reviewerIterationSha))
                 {
-                    contextLines.Add($"Iteration diff command: git diff {iterationStartSha}..HEAD");
+                    contextLines.Add($"Iteration diff command: git diff {reviewerIterationSha}..HEAD");
                 }
             }
             else if (task.BranchInfo is { } bi2 && !string.IsNullOrEmpty(bi2.BaseBranch))
@@ -310,6 +332,7 @@ public sealed class TaskExecutor(
                 Output = copilotOutput,
                 GitStatus = aggregatedStatus ?? new GitChangeSummary(),
                 Metrics = metrics,
+                IterationStartSha = iterationStartSha,
             };
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)

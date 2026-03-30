@@ -282,6 +282,17 @@ public sealed class GoalDispatcher : BackgroundService
 
     private async Task DriveNextPhaseAsync(GoalPipeline pipeline, TaskResult result, CancellationToken ct)
     {
+        // Extract the iteration-start SHA from coder results so the reviewer can later compute
+        // a scoped diff (git diff {sha}..HEAD) showing only this iteration's changes.
+        // The SHA comes from the worker's feature-branch clone, which is correct — unlike the
+        // Brain's persistent clone which stays on the default branch between iterations.
+        if (pipeline.Phase == GoalPhase.Coding && !string.IsNullOrEmpty(result.IterationStartSha))
+        {
+            pipeline.IterationStartSha = result.IterationStartSha;
+            _logger.LogDebug("Stored iteration start SHA {Sha} for goal {GoalId} (from coder task result)",
+                result.IterationStartSha[..Math.Min(result.IterationStartSha.Length, 12)], pipeline.GoalId);
+        }
+
         // No-op detection: if the coder returned without making any file changes,
         // skip verdict extraction and immediately retry with a stronger prompt.
         if (pipeline.Phase == GoalPhase.Coding && (result.GitStatus?.FilesChanged ?? 0) == 0)
@@ -678,27 +689,6 @@ public sealed class GoalDispatcher : BackgroundService
         }
         _logger.LogDebug("Model for {Role}: {Model} (tier={Tier}, configLoaded={ConfigLoaded})",
             roleName, model ?? "(null)", phaseTier, _config is not null);
-
-        // Capture HEAD SHA before the coder starts so the reviewer can later compute an
-        // iteration-scoped diff (git diff {sha}..HEAD). Omit gracefully on empty repos.
-        if (role == WorkerRole.Coder && repositories.Count > 0)
-        {
-            var primaryRepo = repositories[0];
-            try
-            {
-                var sha = await _repoManager.GetHeadShaAsync(primaryRepo.Name, ct);
-                pipeline.IterationStartSha = sha; // null → omit iteration diff (empty repo)
-                if (sha is not null)
-                    _logger.LogDebug("Captured iteration start SHA {Sha} for goal {GoalId}",
-                        sha[..Math.Min(sha.Length, 12)], pipeline.GoalId);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to capture iteration start SHA for goal {GoalId} — iteration diff will be omitted",
-                    pipeline.GoalId);
-                pipeline.IterationStartSha = null;
-            }
-        }
 
         var task = _taskBuilder.Build(
             goalId: pipeline.GoalId,

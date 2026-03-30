@@ -124,6 +124,7 @@ public sealed class PipelineStore : IAsyncDisposable
         ("pipelines",             "role_sessions_json", "TEXT NOT NULL DEFAULT '{}'"),
         ("conversation_entries",  "iteration",         "INTEGER"),
         ("conversation_entries",  "purpose",           "TEXT"),
+        ("pipelines",             "iteration_start_sha", "TEXT"),
     ];
 
     /// <summary>
@@ -255,7 +256,8 @@ public sealed class PipelineStore : IAsyncDisposable
                        review_retries, test_retries, max_retries, max_iterations,
                        active_task_id, coder_branch, phase_outputs, metrics_json,
                        created_at, completed_at, goal_started_at, plan_json, merge_commit_hash,
-                       COALESCE(role_sessions_json, '{}')
+                       COALESCE(role_sessions_json, '{}'),
+                       iteration_start_sha
                 FROM pipelines
                 WHERE phase NOT IN ('Done', 'Failed')
                 """;
@@ -286,6 +288,7 @@ public sealed class PipelineStore : IAsyncDisposable
                     MergeCommitHash = reader.IsDBNull(17) ? null : reader.GetString(17),
                     RoleSessions = JsonSerializer.Deserialize<Dictionary<string, string>>(reader.GetString(18), JsonOptions) ?? [],
                     Conversation = LoadConversationCore(goalId),
+                    IterationStartSha = reader.IsDBNull(19) ? null : reader.GetString(19),
                 });
             }
 
@@ -307,13 +310,13 @@ public sealed class PipelineStore : IAsyncDisposable
                  review_retries, test_retries, max_retries, max_iterations,
                  active_task_id, coder_branch, plan_json, phase_outputs, metrics_json,
                  created_at, completed_at, goal_started_at, merge_commit_hash,
-                 role_sessions_json)
+                 role_sessions_json, iteration_start_sha)
             VALUES
                 (@goalId, @desc, @goalJson, @phase, @iteration,
                  @reviewRetries, @testRetries, @maxRetries, @maxIterations,
                  @activeTaskId, @coderBranch, @planJson, @phaseOutputs, @metricsJson,
                  @createdAt, @completedAt, @goalStartedAt, @mergeCommitHash,
-                 @roleSessionsJson)
+                 @roleSessionsJson, @iterationStartSha)
             """;
         cmd.Parameters.AddWithValue("@goalId", pipeline.GoalId);
         cmd.Parameters.AddWithValue("@desc", pipeline.Description);
@@ -337,6 +340,7 @@ public sealed class PipelineStore : IAsyncDisposable
             pipeline.GoalStartedAt.HasValue ? pipeline.GoalStartedAt.Value.ToString("O") : DBNull.Value);
         cmd.Parameters.AddWithValue("@mergeCommitHash", (object?)pipeline.MergeCommitHash ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@roleSessionsJson", JsonSerializer.Serialize(new Dictionary<string, string>(pipeline.RoleSessions), JsonOptions));
+        cmd.Parameters.AddWithValue("@iterationStartSha", (object?)pipeline.IterationStartSha ?? DBNull.Value);
         cmd.ExecuteNonQuery();
     }
 
@@ -465,4 +469,10 @@ public sealed class PipelineSnapshot
     public string? MergeCommitHash { get; init; }
     /// <summary>Persisted agent session JSON blobs, keyed by role name.</summary>
     public Dictionary<string, string> RoleSessions { get; init; } = [];
+    /// <summary>
+    /// HEAD SHA of the target repository captured on the worker's feature-branch clone immediately
+    /// before the coder agent ran for the current iteration. Used to compute an iteration-scoped
+    /// diff (<c>git diff {sha}..HEAD</c>) for reviewers. <c>null</c> when not yet captured or not applicable.
+    /// </summary>
+    public string? IterationStartSha { get; init; }
 }

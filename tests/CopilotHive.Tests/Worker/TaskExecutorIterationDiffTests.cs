@@ -101,6 +101,132 @@ public sealed class TaskExecutorIterationDiffTests
         return task;
     }
 
+    private sealed class MockGitWithHead : IGitOperations
+    {
+        private readonly string? _mergeBase;
+        private readonly string? _headSha;
+
+        public MockGitWithHead(string? mergeBase = null, string? headSha = "abc123def456789012345678901234567890abcd")
+        {
+            _mergeBase = mergeBase;
+            _headSha = headSha;
+        }
+
+        public Task CloneRepositoryAsync(string url, string targetDir, CancellationToken ct) => Task.CompletedTask;
+        public Task CheckoutBranchAsync(string repoDir, string branch, CancellationToken ct) => Task.CompletedTask;
+        public Task CreateBranchAsync(string repoDir, string branchName, string baseBranch, CancellationToken ct) => Task.CompletedTask;
+        public Task PushBranchAsync(string repoDir, string branch, CancellationToken ct) => Task.CompletedTask;
+        public Task<GitChangeSummary> GetGitStatusAsync(string repoDir, string? baseBranch, CancellationToken ct)
+            => Task.FromResult(new GitChangeSummary { FilesChanged = 0 });
+        public Task<bool> HasUncommittedChangesAsync(string repoDir, CancellationToken ct) => Task.FromResult(false);
+        public Task<string?> GetMergeBaseAsync(string repoDir, string baseBranch, CancellationToken ct)
+            => Task.FromResult(_mergeBase);
+        public Task<(int ExitCode, string Stdout, string Stderr)> RunGitCommandAsync(string workDir, string args, CancellationToken ct)
+        {
+            // Respond to "rev-parse HEAD" with the configured head SHA
+            if (args.Contains("rev-parse") && _headSha is not null)
+                return Task.FromResult((0, _headSha + "\n", ""));
+            return Task.FromResult((0, "", ""));
+        }
+        public Task ForceDeleteDirectoryAsync(string path, int maxRetries = 5) => Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task CoderTask_CapturesHeadSha_InTaskResult()
+    {
+        // Arrange — coder task where git HEAD is known
+        const string expectedSha = "abc123def456789012345678901234567890abcd";
+        var runner = new CapturingAgentRunner();
+        var git = new MockGitWithHead(mergeBase: null, headSha: expectedSha);
+        var executor = new TaskExecutor(runner, gitOperations: git);
+
+        var task = new WorkTask
+        {
+            TaskId = "task-coder-sha",
+            GoalId = "goal-sha",
+            GoalDescription = "Implement feature",
+            Prompt = "Write the code",
+            Role = WorkerRole.Coder,
+            Repositories =
+            [
+                new TargetRepository
+                {
+                    Name = "test-repo",
+                    Url = "https://github.com/test/test.git",
+                    DefaultBranch = "main",
+                },
+            ],
+            BranchInfo = new BranchSpec
+            {
+                Action = BranchAction.Create,
+                BaseBranch = "main",
+                FeatureBranch = "copilothive/feat/test-001",
+            },
+        };
+
+        // Act
+        var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        // Assert — IterationStartSha is populated from git HEAD captured before agent ran
+        Assert.Equal(expectedSha, result.IterationStartSha);
+    }
+
+    [Fact]
+    public async Task CoderTask_WhenGitHeadUnavailable_IterationStartShaIsNull()
+    {
+        // Arrange — git returns non-zero exit for rev-parse (empty repo scenario)
+        var runner = new CapturingAgentRunner();
+        var git = new MockGitWithHead(mergeBase: null, headSha: null); // null → returns exit 0 but empty stdout
+        var executor = new TaskExecutor(runner, gitOperations: git);
+
+        var task = new WorkTask
+        {
+            TaskId = "task-coder-empty",
+            GoalId = "goal-empty",
+            GoalDescription = "Implement feature",
+            Prompt = "Write the code",
+            Role = WorkerRole.Coder,
+            Repositories =
+            [
+                new TargetRepository
+                {
+                    Name = "test-repo",
+                    Url = "https://github.com/test/test.git",
+                    DefaultBranch = "main",
+                },
+            ],
+            BranchInfo = new BranchSpec
+            {
+                Action = BranchAction.Create,
+                BaseBranch = "main",
+                FeatureBranch = "copilothive/feat/test-001",
+            },
+        };
+
+        // Act
+        var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        // Assert — no SHA when git rev-parse returns nothing
+        Assert.Null(result.IterationStartSha);
+    }
+
+    [Fact]
+    public async Task ReviewerTask_DoesNotCaptureIterationStartSha()
+    {
+        // Arrange — reviewer task should not capture SHA (only coder does)
+        const string headSha = "abc123def456789012345678901234567890abcd";
+        var runner = new CapturingAgentRunner();
+        var git = new MockGitWithHead(mergeBase: "aabbccdd1122334455667788", headSha: headSha);
+        var executor = new TaskExecutor(runner, gitOperations: git);
+        var task = BuildReviewerTask();
+
+        // Act
+        var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        // Assert — reviewer result never has IterationStartSha
+        Assert.Null(result.IterationStartSha);
+    }
+
     // ── Tests ────────────────────────────────────────────────────────────────
 
     [Fact]
