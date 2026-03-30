@@ -1028,4 +1028,123 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
         await Assert.ThrowsAsync<KeyNotFoundException>(() =>
             _store.ResetGoalIterationDataAsync("nonexistent-goal", TestContext.Current.CancellationToken));
     }
+
+    // ── UpdateReleaseAsync(string, ReleaseUpdateData) ─────────────────────────
+
+    private static Release MakeRelease(string id = "v1.0.0", ReleaseStatus status = ReleaseStatus.Planning)
+        => new()
+        {
+            Id = id,
+            Tag = id,
+            Status = status,
+            CreatedAt = DateTime.UtcNow,
+        };
+
+    [Fact]
+    public async Task UpdateRelease_Partial_UpdatesTagOnly()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateReleaseAsync(MakeRelease("v1.0.0"), ct);
+
+        await _store.UpdateReleaseAsync("v1.0.0", new ReleaseUpdateData { Tag = "v1.0.1" }, ct);
+
+        var updated = await _store.GetReleaseAsync("v1.0.0", ct);
+        Assert.NotNull(updated);
+        Assert.Equal("v1.0.1", updated!.Tag);
+        Assert.Equal(ReleaseStatus.Planning, updated.Status); // untouched
+    }
+
+    [Fact]
+    public async Task UpdateRelease_Partial_UpdatesNotesOnly()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateReleaseAsync(MakeRelease("v1.0.0"), ct);
+
+        await _store.UpdateReleaseAsync("v1.0.0", new ReleaseUpdateData { Notes = "My notes" }, ct);
+
+        var updated = await _store.GetReleaseAsync("v1.0.0", ct);
+        Assert.NotNull(updated);
+        Assert.Equal("My notes", updated!.Notes);
+        Assert.Equal("v1.0.0", updated.Tag); // untouched
+    }
+
+    [Fact]
+    public async Task UpdateRelease_Partial_UpdatesRepositoriesOnly()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateReleaseAsync(MakeRelease("v1.0.0"), ct);
+
+        await _store.UpdateReleaseAsync("v1.0.0",
+            new ReleaseUpdateData { Repositories = ["repo-a", "repo-b"] }, ct);
+
+        var updated = await _store.GetReleaseAsync("v1.0.0", ct);
+        Assert.NotNull(updated);
+        Assert.Equal(2, updated!.RepositoryNames.Count);
+        Assert.Contains("repo-a", updated.RepositoryNames);
+        Assert.Contains("repo-b", updated.RepositoryNames);
+    }
+
+    [Fact]
+    public async Task UpdateRelease_Partial_ClearsRepositoriesWhenEmptyList()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var r = new Release { Id = "v2.0.0", Tag = "v2.0.0", RepositoryNames = ["repo-a"], CreatedAt = DateTime.UtcNow };
+        await _store.CreateReleaseAsync(r, ct);
+
+        await _store.UpdateReleaseAsync("v2.0.0", new ReleaseUpdateData { Repositories = [] }, ct);
+
+        var updated = await _store.GetReleaseAsync("v2.0.0", ct);
+        Assert.NotNull(updated);
+        Assert.Empty(updated!.RepositoryNames);
+    }
+
+    [Fact]
+    public async Task UpdateRelease_Partial_NullFieldsDoNotOverwrite()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var r = new Release { Id = "v1.0.0", Tag = "original-tag", Notes = "original notes", CreatedAt = DateTime.UtcNow };
+        await _store.CreateReleaseAsync(r, ct);
+
+        // Only update Notes; Tag should remain unchanged
+        await _store.UpdateReleaseAsync("v1.0.0", new ReleaseUpdateData { Notes = "new notes" }, ct);
+
+        var updated = await _store.GetReleaseAsync("v1.0.0", ct);
+        Assert.NotNull(updated);
+        Assert.Equal("original-tag", updated!.Tag);  // unchanged
+        Assert.Equal("new notes", updated.Notes);
+    }
+
+    [Fact]
+    public async Task UpdateRelease_Partial_ThrowsWhenReleased()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var r = MakeRelease("v1.0.0", ReleaseStatus.Released);
+        await _store.CreateReleaseAsync(r, ct);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            _store.UpdateReleaseAsync("v1.0.0", new ReleaseUpdateData { Tag = "v1.0.1" }, ct));
+    }
+
+    [Fact]
+    public async Task UpdateRelease_Partial_ThrowsWhenNotFound()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await Assert.ThrowsAsync<KeyNotFoundException>(() =>
+            _store.UpdateReleaseAsync("nonexistent", new ReleaseUpdateData { Tag = "v0.0.0" }, ct));
+    }
+
+    [Fact]
+    public async Task UpdateRelease_Partial_EmptyUpdateIsNoOp()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateReleaseAsync(MakeRelease("v1.0.0"), ct);
+
+        // Should not throw even when nothing is being updated
+        await _store.UpdateReleaseAsync("v1.0.0", new ReleaseUpdateData(), ct);
+
+        var r = await _store.GetReleaseAsync("v1.0.0", ct);
+        Assert.NotNull(r);
+        Assert.Equal("v1.0.0", r!.Tag);
+    }
 }

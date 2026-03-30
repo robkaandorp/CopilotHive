@@ -549,6 +549,47 @@ static async Task<int> RunServerAsync(string[] args)
         return Results.Ok(existing);
     });
 
+    releasesApi.MapPatch("/{id}/tag", async (string id, UpdateReleaseTagRequest request, SqliteGoalStore store) =>
+    {
+        if (string.IsNullOrWhiteSpace(request.Tag))
+            return Results.BadRequest(new { error = "Tag is required." });
+
+        try
+        {
+            await store.UpdateReleaseAsync(id, new ReleaseUpdateData { Tag = request.Tag.Trim() });
+        }
+        catch (KeyNotFoundException)
+        {
+            return Results.NotFound(new { error = $"Release '{id}' not found." });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+
+        var updated = await store.GetReleaseAsync(id);
+        return Results.Ok(updated);
+    });
+
+    releasesApi.MapPatch("/{id}/repositories", async (string id, UpdateReleaseRepositoriesRequest request, SqliteGoalStore store) =>
+    {
+        try
+        {
+            await store.UpdateReleaseAsync(id, new ReleaseUpdateData { Repositories = request.Repositories ?? [] });
+        }
+        catch (KeyNotFoundException)
+        {
+            return Results.NotFound(new { error = $"Release '{id}' not found." });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+
+        var updated = await store.GetReleaseAsync(id);
+        return Results.Ok(updated);
+    });
+
     goalsApi.MapPatch("/{id}/release", async (string id, AssignGoalReleaseRequest request, SqliteGoalStore store) =>
     {
         var release = await store.GetReleaseAsync(request.ReleaseId);
@@ -606,6 +647,14 @@ record UpdateReleaseStatusRequest(string Status);
 /// <summary>Request body for updating the notes of a release via the HTTP API.</summary>
 /// <param name="Notes">Updated release notes.</param>
 record UpdateReleaseNotesRequest(string? Notes);
+
+/// <summary>Request body for updating the tag of a Planning release via the HTTP API.</summary>
+/// <param name="Tag">New version tag (e.g. "v1.2.1").</param>
+record UpdateReleaseTagRequest(string Tag);
+
+/// <summary>Request body for updating the repository list of a Planning release via the HTTP API.</summary>
+/// <param name="Repositories">New list of repository names. An empty list clears all repositories.</param>
+record UpdateReleaseRepositoriesRequest(List<string>? Repositories);
 
 /// <summary>Request body for assigning a goal to a release via the HTTP API.</summary>
 /// <param name="ReleaseId">The release ID to assign this goal to.</param>

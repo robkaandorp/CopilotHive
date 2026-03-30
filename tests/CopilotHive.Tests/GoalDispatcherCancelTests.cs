@@ -493,6 +493,9 @@ internal sealed class CancelFakeGoalSource : IGoalSource, IGoalStore
     public Task UpdateReleaseAsync(Release release, CancellationToken ct = default) =>
         Task.CompletedTask;
 
+    public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
     public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default) =>
         Task.FromResult(false);
 

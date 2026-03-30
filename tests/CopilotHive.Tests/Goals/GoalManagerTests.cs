@@ -529,6 +529,10 @@ file sealed class DependencyTestGoalStore : IGoalStore
         Task.CompletedTask;
 
     /// <inheritdoc/>
+    public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    /// <inheritdoc/>
     public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default) =>
         Task.FromResult(false);
 
