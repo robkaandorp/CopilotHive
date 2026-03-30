@@ -7,6 +7,7 @@ using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -849,7 +850,7 @@ public sealed class ComposerToolTests : IDisposable
                 _store,
                 repoManager: repoManager,
                 stateDir: tmpDir,
-                goalDispatcher: dispatcher);
+                serviceProvider: BuildServiceProvider(dispatcher));
 
             var result = await composer.CancelGoalAsync("cancel-inprogress");
 
@@ -904,7 +905,7 @@ public sealed class ComposerToolTests : IDisposable
                 _store,
                 repoManager: repoManager,
                 stateDir: tmpDir,
-                goalDispatcher: dispatcher);
+                serviceProvider: BuildServiceProvider(dispatcher));
 
             var result = await composer.CancelGoalAsync("cancel-pending");
 
@@ -3256,6 +3257,17 @@ public sealed class ComposerToolTests : IDisposable
 
         Assert.Contains("No worker prompt is available", result);
         Assert.DoesNotContain("Your task: test the code", result);
+    }
+
+    /// <summary>
+    /// Builds a minimal <see cref="IServiceProvider"/> that resolves the given
+    /// <see cref="GoalDispatcher"/> — used to break the circular DI in tests.
+    /// </summary>
+    private static IServiceProvider BuildServiceProvider(GoalDispatcher dispatcher)
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton(dispatcher);
+        return services.BuildServiceProvider();
     }
 }
 

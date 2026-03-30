@@ -3,6 +3,7 @@
 @using Markdig
 @implements IDisposable
 @inject Composer Composer
+@inject ClarificationQueueService ClarificationQueue
 @inject IJSRuntime JS
 
 <h1>💬 Composer</h1>
@@ -15,148 +16,194 @@
 }
 else
 {
-    <div class="chat-container">
-        <div class="chat-messages" id="chat-messages">
-            @if (_messages.Count == 0 && !Composer.IsStreaming)
-            {
-                <div class="chat-empty">
-                    <p><strong>Welcome to the Composer.</strong></p>
-                    <p>Describe what you'd like to build or improve, and I'll help break it into goals.</p>
-                    <p class="text-muted">Try: <em>"I want to add user authentication to the API"</em></p>
-                </div>
-            }
-
-            @foreach (var msg in _messages)
-            {
-                <div class="chat-msg chat-msg-@msg.Role">
-                    <div class="chat-msg-role">@(msg.Role == "user" ? "You" : "Composer")</div>
-                    <div class="chat-msg-content">@((MarkupString)FormatContent(msg.Content))</div>
-                </div>
-            }
-
-            @if (Composer.IsStreaming)
-            {
-                <div class="chat-msg chat-msg-assistant">
-                    <div class="chat-msg-role">Composer</div>
-                    <div class="chat-msg-content">
-                        @((MarkupString)FormatStreamingContent(Composer.StreamingContent))
-                        <span class="chat-cursor">▊</span>
+    <div class="composer-layout">
+        <div class="chat-container">
+            <div class="chat-messages" id="chat-messages">
+                @if (_messages.Count == 0 && !Composer.IsStreaming)
+                {
+                    <div class="chat-empty">
+                        <p><strong>Welcome to the Composer.</strong></p>
+                        <p>Describe what you'd like to build or improve, and I'll help break it into goals.</p>
+                        <p class="text-muted">Try: <em>"I want to add user authentication to the API"</em></p>
                     </div>
-                </div>
-            }
+                }
 
-            @if (Composer.PendingQuestion is { } pq)
-            {
-                <div class="chat-msg chat-msg-assistant chat-question-widget">
-                    <div class="chat-msg-role">Composer — Question</div>
-                    <div class="chat-msg-content">
-                        <div class="chat-question-text">@((MarkupString)FormatContent(pq.Text))</div>
-
-                        @if (pq.Type == QuestionType.YesNo)
-                        {
-                            <div class="chat-question-actions">
-                                <button class="chat-send chat-question-yes"
-                                        @onclick="() => SubmitYesNo(true, pq)">Yes</button>
-                                <button class="chat-action-btn chat-question-no"
-                                        @onclick="() => SubmitYesNo(false, pq)">No</button>
-                                <button class="chat-action-btn"
-                                        @onclick="() => CancelQuestion(pq)">Cancel</button>
-                            </div>
-                            <textarea class="chat-input chat-question-feedback"
-                                      @bind="_questionFeedback"
-                                      placeholder="Optional additional feedback…"
-                                      rows="2"></textarea>
-                        }
-                        else if (pq.Type == QuestionType.SingleChoice)
-                        {
-                            <div class="chat-question-options">
-                                @foreach (var opt in pq.Options)
-                                {
-                                    <label class="chat-question-option">
-                                        <input type="radio"
-                                               name="single-choice"
-                                               checked="@(_selectedOptions.Contains(opt))"
-                                               @onchange="() => SelectSingle(opt)" />
-                                        @opt
-                                    </label>
-                                }
-                            </div>
-                            <textarea class="chat-input chat-question-feedback"
-                                      @bind="_questionFeedback"
-                                      placeholder="Optional additional feedback…"
-                                      rows="2"></textarea>
-                            <div class="chat-question-actions">
-                                <button class="chat-send"
-                                        disabled="@(_selectedOptions.Count == 0)"
-                                        @onclick="() => SubmitChoice(pq)">Submit</button>
-                                <button class="chat-action-btn"
-                                        @onclick="() => CancelQuestion(pq)">Cancel</button>
-                            </div>
-                        }
-                        else if (pq.Type == QuestionType.MultiChoice)
-                        {
-                            <div class="chat-question-options">
-                                @foreach (var opt in pq.Options)
-                                {
-                                    <label class="chat-question-option">
-                                        <input type="checkbox"
-                                               checked="@(_selectedOptions.Contains(opt))"
-                                               @onchange="() => ToggleOption(opt)" />
-                                        @opt
-                                    </label>
-                                }
-                            </div>
-                            <textarea class="chat-input chat-question-feedback"
-                                      @bind="_questionFeedback"
-                                      placeholder="Optional additional feedback…"
-                                      rows="2"></textarea>
-                            <div class="chat-question-actions">
-                                <button class="chat-send"
-                                        disabled="@(_selectedOptions.Count == 0)"
-                                        @onclick="() => SubmitChoice(pq)">Submit</button>
-                                <button class="chat-action-btn"
-                                        @onclick="() => CancelQuestion(pq)">Cancel</button>
-                            </div>
-                        }
+                @foreach (var msg in _messages)
+                {
+                    <div class="chat-msg chat-msg-@msg.Role">
+                        <div class="chat-msg-role">@(msg.Role == "user" ? "You" : "Composer")</div>
+                        <div class="chat-msg-content">@((MarkupString)FormatContent(msg.Content))</div>
                     </div>
-                </div>
-            }
+                }
 
-            <div id="chat-anchor"></div>
-        </div>
-
-        <div class="chat-input-area">
-            <textarea @bind="_inputText" @bind:event="oninput"
-                      @onkeydown="HandleKeyDown"
-                      placeholder="Describe what you want to build…"
-                      disabled="@Composer.IsStreaming"
-                      rows="2"
-                      class="chat-input"></textarea>
-            <button @onclick="SendMessage" disabled="@(Composer.IsStreaming || string.IsNullOrWhiteSpace(_inputText))"
-                    class="chat-send">
                 @if (Composer.IsStreaming)
                 {
-                    <span>Thinking…</span>
+                    <div class="chat-msg chat-msg-assistant">
+                        <div class="chat-msg-role">Composer</div>
+                        <div class="chat-msg-content">
+                            @((MarkupString)FormatStreamingContent(Composer.StreamingContent))
+                            <span class="chat-cursor">▊</span>
+                        </div>
+                    </div>
                 }
-                else
+
+                @if (Composer.PendingQuestion is { } pq)
                 {
-                    <span>Send</span>
+                    <div class="chat-msg chat-msg-assistant chat-question-widget">
+                        <div class="chat-msg-role">Composer — Question</div>
+                        <div class="chat-msg-content">
+                            <div class="chat-question-text">@((MarkupString)FormatContent(pq.Text))</div>
+
+                            @if (pq.Type == QuestionType.YesNo)
+                            {
+                                <div class="chat-question-actions">
+                                    <button class="chat-send chat-question-yes"
+                                            @onclick="() => SubmitYesNo(true, pq)">Yes</button>
+                                    <button class="chat-action-btn chat-question-no"
+                                            @onclick="() => SubmitYesNo(false, pq)">No</button>
+                                    <button class="chat-action-btn"
+                                            @onclick="() => CancelQuestion(pq)">Cancel</button>
+                                </div>
+                                <textarea class="chat-input chat-question-feedback"
+                                          @bind="_questionFeedback"
+                                          placeholder="Optional additional feedback…"
+                                          rows="2"></textarea>
+                            }
+                            else if (pq.Type == QuestionType.SingleChoice)
+                            {
+                                <div class="chat-question-options">
+                                    @foreach (var opt in pq.Options)
+                                    {
+                                        <label class="chat-question-option">
+                                            <input type="radio"
+                                                   name="single-choice"
+                                                   checked="@(_selectedOptions.Contains(opt))"
+                                                   @onchange="() => SelectSingle(opt)" />
+                                            @opt
+                                        </label>
+                                    }
+                                </div>
+                                <textarea class="chat-input chat-question-feedback"
+                                          @bind="_questionFeedback"
+                                          placeholder="Optional additional feedback…"
+                                          rows="2"></textarea>
+                                <div class="chat-question-actions">
+                                    <button class="chat-send"
+                                            disabled="@(_selectedOptions.Count == 0)"
+                                            @onclick="() => SubmitChoice(pq)">Submit</button>
+                                    <button class="chat-action-btn"
+                                            @onclick="() => CancelQuestion(pq)">Cancel</button>
+                                </div>
+                            }
+                            else if (pq.Type == QuestionType.MultiChoice)
+                            {
+                                <div class="chat-question-options">
+                                    @foreach (var opt in pq.Options)
+                                    {
+                                        <label class="chat-question-option">
+                                            <input type="checkbox"
+                                                   checked="@(_selectedOptions.Contains(opt))"
+                                                   @onchange="() => ToggleOption(opt)" />
+                                            @opt
+                                        </label>
+                                    }
+                                </div>
+                                <textarea class="chat-input chat-question-feedback"
+                                          @bind="_questionFeedback"
+                                          placeholder="Optional additional feedback…"
+                                          rows="2"></textarea>
+                                <div class="chat-question-actions">
+                                    <button class="chat-send"
+                                            disabled="@(_selectedOptions.Count == 0)"
+                                            @onclick="() => SubmitChoice(pq)">Submit</button>
+                                    <button class="chat-action-btn"
+                                            @onclick="() => CancelQuestion(pq)">Cancel</button>
+                                </div>
+                            }
+                        </div>
+                    </div>
                 }
-            </button>
+
+                <div id="chat-anchor"></div>
+            </div>
+
+            <div class="chat-input-area">
+                <textarea @bind="_inputText" @bind:event="oninput"
+                          @onkeydown="HandleKeyDown"
+                          placeholder="Describe what you want to build…"
+                          disabled="@Composer.IsStreaming"
+                          rows="2"
+                          class="chat-input"></textarea>
+                <button @onclick="SendMessage" disabled="@(Composer.IsStreaming || string.IsNullOrWhiteSpace(_inputText))"
+                        class="chat-send">
+                    @if (Composer.IsStreaming)
+                    {
+                        <span>Thinking…</span>
+                    }
+                    else
+                    {
+                        <span>Send</span>
+                    }
+                </button>
+            </div>
+
+            <div class="chat-actions">
+                <button @onclick="ResetSession" disabled="@Composer.IsStreaming" class="chat-action-btn">
+                    🔄 New Session
+                </button>
+                <span class="text-muted chat-hint">
+                    @(_messages.Count) messages
+                    @if (Composer.LastToolCalls > 0)
+                    {
+                        <text> · @Composer.LastToolCalls tool calls</text>
+                    }
+                </span>
+            </div>
         </div>
 
-        <div class="chat-actions">
-            <button @onclick="ResetSession" disabled="@Composer.IsStreaming" class="chat-action-btn">
-                🔄 New Session
-            </button>
-            <span class="text-muted chat-hint">
-                @(_messages.Count) messages
-                @if (Composer.LastToolCalls > 0)
+        @* ── Clarification sidebar panel ── *@
+        @if (_pendingClarifications.Count > 0 || _showClarificationPanel)
+        {
+            <div class="clarification-panel">
+                <div class="clarification-panel-header" @onclick="ToggleClarificationPanel">
+                    <h3>🔔 Clarifications (@_pendingClarifications.Count)</h3>
+                    <button class="chat-action-btn">@(_showClarificationPanel ? "▼" : "▶")</button>
+                </div>
+
+                @if (_showClarificationPanel)
                 {
-                    <text> · @Composer.LastToolCalls tool calls</text>
+                    <div class="clarification-panel-body">
+                        @foreach (var req in _pendingClarifications)
+                        {
+                            <div class="clarification-item">
+                                <div class="clarification-meta">
+                                    <span class="badge badge-muted">@req.GoalId</span>
+                                    <span class="badge badge-yellow">@req.WorkerRole</span>
+                                    <span class="text-muted">@req.RequestedAt.ToString("HH:mm:ss")</span>
+                                </div>
+                                <div class="clarification-question">@req.Question</div>
+                                <div class="clarification-answer-area">
+                                    <textarea class="chat-input clarification-answer-input"
+                                              @bind="_clarificationAnswers[req.Id]"
+                                              placeholder="Type your answer…"
+                                              rows="2"></textarea>
+                                    <button class="chat-send clarification-submit-btn"
+                                            disabled="@(string.IsNullOrWhiteSpace(GetClarificationAnswer(req.Id)))"
+                                            @onclick="() => SubmitClarificationAnswer(req.Id)">
+                                        Submit
+                                    </button>
+                                </div>
+                            </div>
+                        }
+
+                        @if (_pendingClarifications.Count == 0)
+                        {
+                            <div class="text-muted" style="padding: 1rem;">No pending clarifications.</div>
+                        }
+                    </div>
                 }
-            </span>
-        </div>
+            </div>
+        }
     </div>
 }
 
@@ -172,6 +219,11 @@ else
     private HashSet<string> _selectedOptions = [];
     private string _questionFeedback = "";
 
+    // Clarification panel state
+    private List<ClarificationRequest> _pendingClarifications = [];
+    private bool _showClarificationPanel = true;
+    private readonly Dictionary<string, string> _clarificationAnswers = new();
+
     protected override void OnInitialized()
     {
         if (Composer.IsConnected)
@@ -180,6 +232,8 @@ else
         }
         Composer.OnStreamingUpdate += HandleStreamingUpdate;
         Composer.OnQuestionAsked += HandleQuestionAsked;
+        ClarificationQueue.OnChanged += HandleClarificationChanged;
+        RefreshClarifications();
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -258,6 +312,7 @@ else
     {
         Composer.OnStreamingUpdate -= HandleStreamingUpdate;
         Composer.OnQuestionAsked -= HandleQuestionAsked;
+        ClarificationQueue.OnChanged -= HandleClarificationChanged;
     }
 
     private void HandleQuestionAsked()
@@ -308,6 +363,50 @@ else
         _selectedOptions = [];
         _questionFeedback = "";
         Composer.CancelQuestion();
+        StateHasChanged();
+    }
+
+    // ── Clarification panel methods ──
+
+    private void HandleClarificationChanged()
+    {
+        InvokeAsync(() =>
+        {
+            RefreshClarifications();
+            StateHasChanged();
+        });
+    }
+
+    private void RefreshClarifications()
+    {
+        _pendingClarifications = ClarificationQueue.GetPendingHumanRequests().ToList();
+        // Ensure answer inputs exist for all pending requests
+        foreach (var req in _pendingClarifications)
+        {
+            _clarificationAnswers.TryAdd(req.Id, "");
+        }
+    }
+
+    private void ToggleClarificationPanel()
+    {
+        _showClarificationPanel = !_showClarificationPanel;
+    }
+
+    private string GetClarificationAnswer(string requestId)
+    {
+        _clarificationAnswers.TryGetValue(requestId, out var answer);
+        return answer ?? "";
+    }
+
+    private void SubmitClarificationAnswer(string requestId)
+    {
+        if (!_clarificationAnswers.TryGetValue(requestId, out var answer) ||
+            string.IsNullOrWhiteSpace(answer))
+            return;
+
+        ClarificationQueue.SubmitAnswer(requestId, answer.Trim(), "human");
+        _clarificationAnswers.Remove(requestId);
+        RefreshClarifications();
         StateHasChanged();
     }
 }

@@ -107,10 +107,10 @@ static async Task<int> RunServerAsync(string[] args)
     }
 
     builder.Services.AddSingleton<WorkerUtilizationService>();
-    builder.Services.AddSingleton<GoalDispatcher>();
-    builder.Services.AddHostedService(sp => sp.GetRequiredService<GoalDispatcher>());
+    builder.Services.AddSingleton<ClarificationQueueService>();
 
     // Composer agent (optional — enabled when config has a composer section or BRAIN_MODEL is set)
+    // Registered BEFORE GoalDispatcher so the IClarificationRouter forwarding is available.
     builder.Services.AddSingleton<Composer>(sp =>
     {
         var config = sp.GetService<HiveConfigFile>();
@@ -131,12 +131,16 @@ static async Task<int> RunServerAsync(string[] args)
             maxCtx, maxSteps,
             sp.GetService<IBrainRepoManager>(),
             stateDir,
-            sp.GetRequiredService<GoalDispatcher>(),
+            sp, // IServiceProvider — lazy resolution of GoalDispatcher to avoid circular DI
             !string.IsNullOrWhiteSpace(ollamaApiKey) ? sp.GetRequiredService<IHttpClientFactory>() : null,
             ollamaApiKey,
             sp.GetService<HiveConfigFile>(),
             sp.GetService<ConfigRepoManager>());
     });
+    builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
+
+    builder.Services.AddSingleton<GoalDispatcher>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<GoalDispatcher>());
 
     // Dashboard: log capture (registered early so logger provider can reference it)
     var dashboardLogSink = new DashboardLogSink();
@@ -606,6 +610,30 @@ static async Task<int> RunServerAsync(string[] args)
         return Results.Ok(goal);
     });
 
+    // ── Clarifications REST API ──────────────────────────────────────────────
+    var clarificationsApi = app.MapGroup("/api/clarifications");
+
+    clarificationsApi.MapGet("/", (ClarificationQueueService queue) =>
+        Results.Ok(queue.GetAllRequests()));
+
+    clarificationsApi.MapGet("/pending", (ClarificationQueueService queue) =>
+        Results.Ok(queue.GetPendingHumanRequests()));
+
+    clarificationsApi.MapGet("/count", (ClarificationQueueService queue) =>
+        Results.Ok(new { count = queue.PendingHumanCount }));
+
+    clarificationsApi.MapPost("/{id}/answer", (string id, SubmitClarificationRequest body, ClarificationQueueService queue) =>
+    {
+        if (string.IsNullOrWhiteSpace(body.Answer))
+            return Results.BadRequest(new { error = "Answer is required." });
+
+        var answered = queue.SubmitAnswer(id, body.Answer, "human");
+        if (!answered)
+            return Results.NotFound(new { error = $"Clarification '{id}' not found." });
+
+        return Results.Ok(new { message = $"Answer submitted for clarification '{id}'." });
+    });
+
     await app.RunAsync();
     return 0;
 }
@@ -660,6 +688,10 @@ record UpdateReleaseRepositoriesRequest(List<string>? Repositories);
 /// <summary>Request body for assigning a goal to a release via the HTTP API.</summary>
 /// <param name="ReleaseId">The release ID to assign this goal to.</param>
 record AssignGoalReleaseRequest(string ReleaseId);
+
+/// <summary>Request body for submitting an answer to a clarification request via the HTTP API.</summary>
+/// <param name="Answer">The answer text to submit.</param>
+record SubmitClarificationRequest(string Answer);
 
 // Marker class required by WebApplicationFactory<T> in integration tests.
 #pragma warning disable CS1591
