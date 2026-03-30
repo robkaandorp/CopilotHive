@@ -1846,7 +1846,7 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
 
             // Use the agent to get a response via a fresh one-shot session
             // so we don't pollute the main Composer conversation
-            var clarificationSession = AgentSession.Create("clarification");
+            var clarificationSession = _session.Fork($"clarification-{request.Id}");
             string responseText = "";
 
             await foreach (var update in _agent.ExecuteStreamingAsync(clarificationSession, prompt, timeoutCts.Token))
