@@ -164,7 +164,8 @@ public class PremiumModelSelectionTests
         pipeline.AdvanceTo(phase);
 
         // Use the brain's plan so per-phase model tiers are applied
-        var plan = brain.PlanIterationAsync(pipeline).GetAwaiter().GetResult();
+        var planResult = brain.PlanIterationAsync(pipeline).GetAwaiter().GetResult();
+        var plan = planResult.Plan ?? IterationPlan.Default();
         pipeline.SetPlan(plan);
         pipeline.StateMachine.StartIteration(plan.Phases);
 
@@ -241,9 +242,10 @@ public sealed class GoalDispatcherEagerPushCurrentModelTests
         pipeline.AdvanceTo(GoalPhase.Coding);
 
         // Apply the plan so the state machine knows which phases to run
-        var plan = await brain.PlanIterationAsync(pipeline, null, ct);
-        pipeline.SetPlan(plan);
-        pipeline.StateMachine.StartIteration(plan.Phases);
+        var planResult2 = await brain.PlanIterationAsync(pipeline, null, ct);
+        var plan2 = planResult2.Plan ?? IterationPlan.Default();
+        pipeline.SetPlan(plan2);
+        pipeline.StateMachine.StartIteration(plan2.Phases);
 
         var taskId = $"task-{Guid.NewGuid():N}";
         pipelineManager.RegisterTask(taskId, goal.Id);
@@ -290,7 +292,7 @@ file sealed class CapturingBrain : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
-    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
+    public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
     {
         var plan = IterationPlan.Default();
 
@@ -302,13 +304,13 @@ file sealed class CapturingBrain : IDistributedBrain
             plan.PhaseTiers[phase] = _modelTierToReturn;
         }
 
-        return Task.FromResult(plan);
+        return Task.FromResult(PlanResult.Success(plan));
     }
 
-    public Task<string> CraftPromptAsync(
+    public Task<PromptResult> CraftPromptAsync(
         GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
     {
-        return Task.FromResult($"Work on {pipeline.Description} as {phase}");
+        return Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
     }
 
     public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>

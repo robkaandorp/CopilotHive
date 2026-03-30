@@ -87,8 +87,8 @@ public sealed class DistributedBrainTests
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-4", "Some goal");
 
-        var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken);
-        Assert.Contains("Some goal", prompt);
+        var promptResult = await brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken);
+        Assert.Contains("Some goal", promptResult.Prompt);
     }
 
     // -- FakeDistributedBrain (IDistributedBrain stub) --
@@ -98,9 +98,10 @@ public sealed class DistributedBrainTests
     {
         var fake = new FakeDistributedBrain();
         var pipeline = CreatePipeline("g-6", "Update README");
-        var plan = await fake.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
-        Assert.NotNull(plan);
-        Assert.NotEmpty(plan.Phases);
+        var planResult = await fake.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
+        Assert.NotNull(planResult);
+        Assert.False(planResult.IsEscalation);
+        Assert.NotEmpty(planResult.Plan!.Phases);
     }
 
     [Fact]
@@ -108,9 +109,9 @@ public sealed class DistributedBrainTests
     {
         var fake = new FakeDistributedBrain();
         var pipeline = CreatePipeline("g-7", "Add tests");
-        var prompt = await fake.CraftPromptAsync(pipeline, GoalPhase.Testing, "extra context", TestContext.Current.CancellationToken);
-        Assert.Contains("Add tests", prompt);
-        Assert.Contains("Testing", prompt);
+        var promptResult = await fake.CraftPromptAsync(pipeline, GoalPhase.Testing, "extra context", TestContext.Current.CancellationToken);
+        Assert.Contains("Add tests", promptResult.Prompt);
+        Assert.Contains("Testing", promptResult.Prompt);
     }
 
     [Fact]
@@ -384,10 +385,11 @@ public sealed class DistributedBrainTests
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-plan", "Test plan");
 
-        var plan = await brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
+        var planResult = await brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
 
-        Assert.NotNull(plan);
-        Assert.NotEmpty(plan.Phases);
+        Assert.NotNull(planResult);
+        Assert.False(planResult.IsEscalation);
+        Assert.NotEmpty(planResult.Plan!.Phases);
     }
 
     [Fact]
@@ -755,11 +757,12 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("g-fb-craft-1", "Fix authentication bug");
         pipeline.RecordOutput(WorkerRole.Tester, 1, "FALLBACK_TESTER_RESULTS_42");
 
-        var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Review, null, TestContext.Current.CancellationToken);
+        var promptResult = await brain.CraftPromptAsync(pipeline, GoalPhase.Review, null, TestContext.Current.CancellationToken);
 
-        Assert.Contains("FALLBACK_TESTER_RESULTS_42", prompt);
-        Assert.Contains("Current iteration test results (from the tester phase):", prompt);
-        Assert.Contains("do NOT reject because you cannot run tests yourself", prompt);
+        Assert.False(promptResult.IsEscalation);
+        Assert.Contains("FALLBACK_TESTER_RESULTS_42", promptResult.Prompt);
+        Assert.Contains("Current iteration test results (from the tester phase):", promptResult.Prompt);
+        Assert.Contains("do NOT reject because you cannot run tests yourself", promptResult.Prompt);
     }
 
     [Fact]
@@ -769,9 +772,10 @@ public sealed class DistributedBrainTests
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-fb-craft-2", "Implement caching layer");
 
-        var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken);
+        var promptResult = await brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken);
 
-        Assert.Equal("Work on: Implement caching layer", prompt);
+        Assert.False(promptResult.IsEscalation);
+        Assert.Equal("Work on: Implement caching layer", promptResult.Prompt);
     }
 
     // ── AskQuestionAsync — escalate_to_composer tool call ─────────────────
@@ -866,17 +870,17 @@ file sealed class FakeDistributedBrain : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) { Connected = true; return Task.CompletedTask; }
 
-    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
+    public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
     {
         PlanIterationCalls++;
-        return Task.FromResult(IterationPlan.Default());
+        return Task.FromResult(PlanResult.Success(IterationPlan.Default()));
     }
 
-    public Task<string> CraftPromptAsync(
+    public Task<PromptResult> CraftPromptAsync(
         GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
     {
         CraftCalls++;
-        return Task.FromResult($"Work on {pipeline.Description} as {phase}");
+        return Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
     }
 
     public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>

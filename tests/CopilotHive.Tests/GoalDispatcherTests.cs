@@ -219,12 +219,12 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
-    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
-        Task.FromResult(IterationPlan.Default());
+    public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
+        Task.FromResult(PlanResult.Success(IterationPlan.Default()));
 
-    public Task<string> CraftPromptAsync(
+    public Task<PromptResult> CraftPromptAsync(
         GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
-        Task.FromResult($"Work on {pipeline.Description} as {phase}");
+        Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
 
     public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default)
     {
@@ -1592,19 +1592,19 @@ file sealed class RetryCapturingBrain : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
-    public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
+    public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
     {
         PlanIterationCalled = true;
         LastPlanAdditionalContext = additionalContext;
-        return Task.FromResult(IterationPlan.Default());
+        return Task.FromResult(PlanResult.Success(IterationPlan.Default()));
     }
 
-    public Task<string> CraftPromptAsync(
+    public Task<PromptResult> CraftPromptAsync(
         GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
     {
         CraftPromptCalled = true;
         LastCraftAdditionalContext = additionalContext;
-        return Task.FromResult($"Work on {pipeline.Description} as {phase}");
+        return Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
     }
 
     public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
