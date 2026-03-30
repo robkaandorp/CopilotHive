@@ -883,3 +883,106 @@ tr:last-child td { border-bottom: none; }
     color: var(--accent);
     text-decoration: underline;
 }
+
+/* ── Clarification panel & badge ────────────────────────────────────── */
+
+.badge-clarification {
+    background: #e63946;
+    color: #fff;
+    padding: 0.1rem 0.4rem;
+    border-radius: 8px;
+    font-size: 0.7rem;
+    margin-left: 0.3rem;
+    animation: pulse-badge 2s ease-in-out infinite;
+}
+
+@keyframes pulse-badge {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+}
+
+.composer-layout {
+    display: flex;
+    gap: 1rem;
+    align-items: flex-start;
+}
+
+.composer-layout .chat-container {
+    flex: 1;
+    min-width: 0;
+}
+
+.clarification-panel {
+    width: 360px;
+    min-width: 300px;
+    background: var(--bg-secondary, #1a1a2e);
+    border: 1px solid var(--border, #333);
+    border-radius: 8px;
+    overflow: hidden;
+    position: sticky;
+    top: 1rem;
+    max-height: calc(100vh - 120px);
+    overflow-y: auto;
+}
+
+.clarification-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.75rem 1rem;
+    background: var(--bg-tertiary, #16213e);
+    cursor: pointer;
+    border-bottom: 1px solid var(--border, #333);
+}
+
+.clarification-panel-header h3 {
+    margin: 0;
+    font-size: 0.9rem;
+    color: var(--text, #fff);
+}
+
+.clarification-panel-body {
+    padding: 0;
+}
+
+.clarification-item {
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border, #333);
+}
+
+.clarification-item:last-child {
+    border-bottom: none;
+}
+
+.clarification-meta {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+    margin-bottom: 0.4rem;
+    flex-wrap: wrap;
+}
+
+.clarification-question {
+    font-size: 0.85rem;
+    margin-bottom: 0.5rem;
+    line-height: 1.4;
+    color: var(--text, #fff);
+}
+
+.clarification-answer-area {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+}
+
+.clarification-answer-input {
+    font-size: 0.8rem;
+    min-height: 2rem;
+    resize: vertical;
+}
+
+.clarification-submit-btn {
+    align-self: flex-end;
+    font-size: 0.75rem;
+    padding: 0.25rem 0.75rem;
+}

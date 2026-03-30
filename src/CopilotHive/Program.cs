@@ -107,6 +107,7 @@ static async Task<int> RunServerAsync(string[] args)
     }
 
     builder.Services.AddSingleton<WorkerUtilizationService>();
+    builder.Services.AddSingleton<ClarificationQueueService>();
     builder.Services.AddSingleton<GoalDispatcher>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<GoalDispatcher>());
 
@@ -606,6 +607,30 @@ static async Task<int> RunServerAsync(string[] args)
         return Results.Ok(goal);
     });
 
+    // ── Clarifications REST API ──────────────────────────────────────────────
+    var clarificationsApi = app.MapGroup("/api/clarifications");
+
+    clarificationsApi.MapGet("/", (ClarificationQueueService queue) =>
+        Results.Ok(queue.GetAllRequests()));
+
+    clarificationsApi.MapGet("/pending", (ClarificationQueueService queue) =>
+        Results.Ok(queue.GetPendingHumanRequests()));
+
+    clarificationsApi.MapGet("/count", (ClarificationQueueService queue) =>
+        Results.Ok(new { count = queue.PendingHumanCount }));
+
+    clarificationsApi.MapPost("/{id}/answer", (string id, SubmitClarificationRequest body, ClarificationQueueService queue) =>
+    {
+        if (string.IsNullOrWhiteSpace(body.Answer))
+            return Results.BadRequest(new { error = "Answer is required." });
+
+        var answered = queue.SubmitAnswer(id, body.Answer, "human");
+        if (!answered)
+            return Results.NotFound(new { error = $"Clarification '{id}' not found." });
+
+        return Results.Ok(new { message = $"Answer submitted for clarification '{id}'." });
+    });
+
     await app.RunAsync();
     return 0;
 }
@@ -660,6 +685,10 @@ record UpdateReleaseRepositoriesRequest(List<string>? Repositories);
 /// <summary>Request body for assigning a goal to a release via the HTTP API.</summary>
 /// <param name="ReleaseId">The release ID to assign this goal to.</param>
 record AssignGoalReleaseRequest(string ReleaseId);
+
+/// <summary>Request body for submitting an answer to a clarification request via the HTTP API.</summary>
+/// <param name="Answer">The answer text to submit.</param>
+record SubmitClarificationRequest(string Answer);
 
 // Marker class required by WebApplicationFactory<T> in integration tests.
 #pragma warning disable CS1591

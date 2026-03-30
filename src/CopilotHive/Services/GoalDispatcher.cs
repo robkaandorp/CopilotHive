@@ -41,6 +41,8 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly ConcurrentQueue<string> _redispatchQueue = new();
     private DateTime _lastAgentsSync = DateTime.MinValue;
     private readonly TimeSpan _startupDelay;
+    private readonly Composer? _composer;
+    private readonly ClarificationQueueService? _clarificationQueue;
 
     /// <summary>
     /// Initialises a new <see cref="GoalDispatcher"/> with required and optional dependencies.
@@ -58,6 +60,8 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="improvementAnalyzer">Optional analyzer that decides when to run the improver.</param>
     /// <param name="configRepo">Optional config repo manager for syncing AGENTS.md files.</param>
     /// <param name="repoManager">Brain repo manager for persistent repo clones and merge operations.</param>
+    /// <param name="composer">Optional Composer agent for clarification auto-answer.</param>
+    /// <param name="clarificationQueue">Optional clarification queue for human escalation.</param>
     /// <param name="startupDelay">Delay before the first dispatch poll; defaults to 10 seconds to give workers time to connect.</param>
     public GoalDispatcher(
         GoalManager goalManager,
@@ -73,6 +77,8 @@ public sealed class GoalDispatcher : BackgroundService
         AgentsManager? agentsManager = null,
         ImprovementAnalyzer? improvementAnalyzer = null,
         ConfigRepoManager? configRepo = null,
+        Composer? composer = null,
+        ClarificationQueueService? clarificationQueue = null,
         TimeSpan? startupDelay = null)
     {
         _repoManager = repoManager ?? throw new ArgumentNullException(nameof(repoManager));
@@ -87,6 +93,8 @@ public sealed class GoalDispatcher : BackgroundService
         _logger = logger;
         _config = config;
         _configRepo = configRepo;
+        _composer = composer;
+        _clarificationQueue = clarificationQueue;
         _startupDelay = startupDelay ?? TimeSpan.FromSeconds(10);
 
         completionNotifier.OnTaskCompleted+= result => HandleTaskCompletionAsync(result);
@@ -165,10 +173,12 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogInformation("Cleared dispatcher retry state for goal {GoalId}", goalId);
     }
 
-    /// <inheritdoc/>
     /// <summary>
     /// Handles a question from a worker tool call by routing it to the Brain.
-    /// Returns the Brain's response as a string.
+    /// If the Brain's response starts with <c>ESCALATE:</c>, the question is
+    /// forwarded to the Composer LLM for auto-answer. If the Composer cannot
+    /// answer, the question is queued for human resolution with a 5-minute timeout.
+    /// Returns the resolved answer as a string.
     /// </summary>
     public async Task<string> AskBrainAsync(GoalPipeline pipeline, string question, CancellationToken ct)
     {
@@ -178,7 +188,69 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogInformation("Worker asks Brain: {Question}", question);
         var answer = await _brain.CraftPromptAsync(pipeline, pipeline.Phase, $"A worker asks: {question}", ct);
         _logger.LogInformation("Brain answers: {Answer}", answer[..Math.Min(answer.Length, 200)]);
-        return answer;
+
+        // Check if the Brain is escalating this question
+        if (!answer.StartsWith("ESCALATE:", StringComparison.OrdinalIgnoreCase) &&
+            !answer.Contains("ESCALATE_TO_COMPOSER", StringComparison.OrdinalIgnoreCase))
+        {
+            return answer;
+        }
+
+        _logger.LogInformation("Brain escalated question for goal {GoalId} — routing to Composer", pipeline.GoalId);
+
+        // Create a clarification request
+        var request = new ClarificationRequest
+        {
+            GoalId = pipeline.GoalId,
+            WorkerRole = pipeline.Phase.ToWorkerRole().ToRoleName(),
+            Question = question,
+        };
+
+        // If no Composer or clarification queue, return fallback
+        if (_composer is null || _clarificationQueue is null)
+        {
+            _logger.LogWarning("No Composer or clarification queue available — returning fallback for goal {GoalId}",
+                pipeline.GoalId);
+            return ClarificationQueueService.TimeoutFallbackMessage;
+        }
+
+        // Enqueue the request so the human queue is ready if needed
+        var tcs = _clarificationQueue.Enqueue(request);
+
+        // Step 1: Try Composer auto-answer (30s timeout)
+        var composerAnswer = await _composer.AnswerClarificationAsync(
+            pipeline.GoalId,
+            question,
+            $"Goal description: {pipeline.Description}. Current phase: {pipeline.Phase}.",
+            _clarificationQueue,
+            request,
+            ct);
+
+        if (composerAnswer is not null)
+        {
+            // Composer answered successfully — resolve the request
+            _clarificationQueue.SubmitAnswer(request.Id, composerAnswer, "composer");
+            return composerAnswer;
+        }
+
+        // Step 2: Composer escalated to human — wait for human answer (5min timeout)
+        _logger.LogInformation(
+            "Clarification for goal {GoalId} escalated to human. Waiting up to {Timeout} for answer.",
+            pipeline.GoalId, ClarificationQueueService.HumanTimeout);
+
+        try
+        {
+            var humanAnswer = await tcs.Task.WaitAsync(ClarificationQueueService.HumanTimeout, ct);
+            _logger.LogInformation("Human answered clarification for goal {GoalId}", pipeline.GoalId);
+            return humanAnswer;
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning(
+                "Human clarification timed out for goal {GoalId} — returning fallback", pipeline.GoalId);
+            _clarificationQueue.MarkTimedOut(request.Id);
+            return ClarificationQueueService.TimeoutFallbackMessage;
+        }
     }
 
     /// <inheritdoc/>

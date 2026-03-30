@@ -1795,6 +1795,98 @@ public sealed class Composer : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Attempts to answer a worker's clarification question using the Composer LLM.
+    /// If the LLM is confident, returns the answer directly. If the LLM returns
+    /// <c>ESCALATE_TO_HUMAN</c> or times out, escalates the request to the human
+    /// queue and returns <c>null</c>.
+    /// </summary>
+    /// <param name="goalId">The goal that triggered the clarification.</param>
+    /// <param name="question">The worker's question text.</param>
+    /// <param name="context">Additional context about the goal and current state.</param>
+    /// <param name="clarificationQueue">The queue service for human escalation.</param>
+    /// <param name="request">The clarification request to escalate if needed.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The answer string if the Composer is confident; <c>null</c> if escalated to human.</returns>
+    public async Task<string?> AnswerClarificationAsync(
+        string goalId,
+        string question,
+        string context,
+        ClarificationQueueService clarificationQueue,
+        ClarificationRequest request,
+        CancellationToken ct = default)
+    {
+        if (_agent is null)
+        {
+            _logger.LogWarning("Composer not connected — escalating clarification to human for goal {GoalId}", goalId);
+            clarificationQueue.EscalateToHuman(request.Id);
+            return null;
+        }
+
+        var prompt = $"""
+            A worker is blocked and needs clarification. Answer the question if you can.
+
+            **Goal ID:** {goalId}
+            **Worker question:** {question}
+            **Context:** {context}
+
+            INSTRUCTIONS:
+            - If you are confident in the answer, provide it directly as plain text.
+            - If you are NOT confident or the question requires human judgment/domain knowledge
+              that you cannot determine from the codebase, respond with exactly: ESCALATE_TO_HUMAN
+            - Do NOT guess or fabricate information. When in doubt, escalate.
+            """;
+
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(ClarificationQueueService.ComposerTimeout);
+
+            // Use the agent to get a response via a fresh one-shot session
+            // so we don't pollute the main Composer conversation
+            var clarificationSession = AgentSession.Create("clarification");
+            string responseText = "";
+
+            await foreach (var update in _agent.ExecuteStreamingAsync(clarificationSession, prompt, timeoutCts.Token))
+            {
+                if (update.Kind == StreamingUpdateKind.TextDelta)
+                    responseText += update.Text;
+            }
+
+            responseText = responseText.Trim();
+
+            if (string.IsNullOrEmpty(responseText) ||
+                responseText.Contains("ESCALATE_TO_HUMAN", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogInformation(
+                    "Composer escalating clarification to human for goal {GoalId}: {Question}",
+                    goalId, question);
+                clarificationQueue.EscalateToHuman(request.Id);
+                return null;
+            }
+
+            _logger.LogInformation(
+                "Composer auto-answered clarification for goal {GoalId}: {Answer}",
+                goalId, responseText.Length > 200 ? responseText[..200] + "…" : responseText);
+
+            return responseText;
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning(
+                "Composer clarification timed out for goal {GoalId} — escalating to human", goalId);
+            clarificationQueue.EscalateToHuman(request.Id);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Composer clarification failed for goal {GoalId} — escalating to human", goalId);
+            clarificationQueue.EscalateToHuman(request.Id);
+            return null;
+        }
+    }
+
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {

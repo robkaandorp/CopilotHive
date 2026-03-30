@@ -1,7 +1,15 @@
 @using CopilotHive.Dashboard
+@using CopilotHive.Orchestration
+@implements IDisposable
 
 <NavLink href="/" Match="NavLinkMatch.All">Dashboard</NavLink>
-<NavLink href="/composer">Composer</NavLink>
+<NavLink href="/composer">
+    Composer
+    @if (_pendingClarifications > 0)
+    {
+        <span class="badge badge-clarification" title="@_pendingClarifications pending clarification(s)">🔔 @_pendingClarifications</span>
+    }
+</NavLink>
 <NavLink href="/goals">Goals</NavLink>
 <NavLink href="/releases">📦 Releases</NavLink>
 <NavLink href="/orchestrator">Orchestrator</NavLink>
@@ -15,9 +23,11 @@
 
 @code {
     [Inject] private DashboardStateService State { get; set; } = default!;
+    [Inject] private ClarificationQueueService ClarificationQueue { get; set; } = default!;
 
     private string _version = "";
     private bool _isBeta;
+    private int _pendingClarifications;
 
     protected override void OnInitialized()
     {
@@ -26,5 +36,21 @@
                   || _version.Contains("-alpha", StringComparison.OrdinalIgnoreCase)
                   || _version.Contains("-rc", StringComparison.OrdinalIgnoreCase)
                   || _version.StartsWith("0.");
+        _pendingClarifications = ClarificationQueue.PendingHumanCount;
+        ClarificationQueue.OnChanged += HandleClarificationChanged;
+    }
+
+    private void HandleClarificationChanged()
+    {
+        InvokeAsync(() =>
+        {
+            _pendingClarifications = ClarificationQueue.PendingHumanCount;
+            StateHasChanged();
+        });
+    }
+
+    public void Dispose()
+    {
+        ClarificationQueue.OnChanged -= HandleClarificationChanged;
     }
 }
