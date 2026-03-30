@@ -42,9 +42,14 @@ public static class GitOperations
 
     /// <summary>
     /// Creates a new branch from the given base branch.
-    /// If the repository is empty (no commits), creates an orphan branch via
-    /// <c>git checkout --orphan</c> instead of branching from the base branch.
-    /// Throws <see cref="GitOperationException"/> on failure.
+    /// <list type="bullet">
+    ///   <item><description>If the repository is empty (no commits), creates an orphan branch via
+    ///   <c>git checkout --orphan</c>.</description></item>
+    ///   <item><description>If the base branch is missing on a non-empty repo, tries fetching it from
+    ///   <c>origin</c> and sets up a local tracking branch. If the fetch also fails, creates the base
+    ///   branch from the current HEAD so work can continue.</description></item>
+    /// </list>
+    /// Throws <see cref="GitOperationException"/> on unrecoverable failure.
     /// </summary>
     /// <param name="repoDir">Path to the local git repository.</param>
     /// <param name="branchName">Name of the new branch to create.</param>
@@ -53,9 +58,10 @@ public static class GitOperations
     public static async Task CreateBranchAsync(
         string repoDir, string branchName, string baseBranch, CancellationToken ct)
     {
-        var (exitCode1, _, stderr1) = await RunGitCommandAsync(repoDir, $"checkout {baseBranch}", ct);
+        var (exitCode1, _, _) = await RunGitCommandAsync(repoDir, $"checkout {baseBranch}", ct);
         if (exitCode1 != 0)
         {
+            // Empty repo — create an orphan branch (no base commit exists yet).
             if (await IsRepoEmptyAsync(repoDir, ct))
             {
                 var (orphanExit, _, orphanStderr) = await RunGitCommandAsync(
@@ -66,8 +72,28 @@ public static class GitOperations
                 return;
             }
 
-            throw new GitOperationException(
-                $"Failed to checkout base branch '{baseBranch}': {stderr1.Trim()}");
+            // Non-empty repo: base branch not available locally — try fetching from origin.
+            var (fetchExit, _, _) = await RunGitCommandAsync(
+                repoDir, $"fetch origin {baseBranch}", ct);
+
+            if (fetchExit == 0)
+            {
+                // Fetch succeeded — create a local tracking branch and check it out.
+                var (trackExit, _, trackStderr) = await RunGitCommandAsync(
+                    repoDir, $"checkout -b {baseBranch} origin/{baseBranch}", ct);
+                if (trackExit != 0)
+                    throw new GitOperationException(
+                        $"Failed to create tracking branch '{baseBranch}' from origin: {trackStderr.Trim()}");
+            }
+            else
+            {
+                // Fetch failed — create the base branch from the current HEAD so we can continue.
+                var (createBaseExit, _, createBaseStderr) = await RunGitCommandAsync(
+                    repoDir, $"checkout -b {baseBranch}", ct);
+                if (createBaseExit != 0)
+                    throw new GitOperationException(
+                        $"Failed to create base branch '{baseBranch}' from current HEAD: {createBaseStderr.Trim()}");
+            }
         }
 
         var (exitCode2, _, stderr2) = await RunGitCommandAsync(repoDir, $"checkout -b {branchName}", ct);

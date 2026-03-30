@@ -164,16 +164,78 @@ public sealed class GitOperationsTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task CreateBranchAsync_OnNonEmptyRepo_WhenBaseBranchMissing_Throws()
+    public async Task CreateBranchAsync_OnNonEmptyRepo_WhenBaseBranchMissingAndNoRemote_CreatesFromHead()
     {
+        // Arrange — non-empty repo with no remote configured; base branch does not exist locally.
         await CommitFileAsync("readme.md", "# Project");
 
-        var exception = await Record.ExceptionAsync(() =>
-            GitOperations.CreateBranchAsync(
-                _repoDir, "feature/x", "nonexistent-base", CancellationToken.None));
+        // Act — should NOT throw; falls back to creating base branch from current HEAD.
+        await GitOperations.CreateBranchAsync(
+            _repoDir, "feature/x", "nonexistent-base", CancellationToken.None);
 
-        Assert.IsType<GitOperationException>(exception);
-        Assert.Contains("nonexistent-base", exception.Message);
+        // Assert — the feature branch was created successfully.
+        var (_, stdout, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "branch --show-current", CancellationToken.None);
+        Assert.Equal("feature/x", stdout.Trim());
+    }
+
+    [Fact]
+    public async Task CreateBranchAsync_OnNonEmptyRepo_WhenBaseBranchMissingAndNoRemote_BaseCreatedFromHead()
+    {
+        // Arrange — two commits on the default branch.
+        await CommitFileAsync("first.txt", "first");
+        await CommitFileAsync("second.txt", "second");
+
+        var (_, headBefore, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "rev-parse HEAD", CancellationToken.None);
+
+        // Act — missing base, no remote; base branch is created from HEAD, then feature is branched off it.
+        await GitOperations.CreateBranchAsync(
+            _repoDir, "feature/from-head", "missing-base", CancellationToken.None);
+
+        // Assert — feature/from-head points at the same commit as the original HEAD.
+        var (_, headAfter, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "rev-parse HEAD", CancellationToken.None);
+        Assert.Equal(headBefore.Trim(), headAfter.Trim());
+    }
+
+    [Fact]
+    public async Task CreateBranchAsync_OnNonEmptyRepo_WhenBaseBranchFetchedFromOrigin_CreatesFeatureBranch()
+    {
+        // Arrange — set up a "remote" bare repo that has a commit on "main-remote".
+        var bareDir = Path.Combine(Path.GetTempPath(), $"GitOpsBare_{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(bareDir);
+            await RunAsync(bareDir, "init --bare");
+
+            // Push a commit from the working repo to the bare remote as "main-remote".
+            await CommitFileAsync("readme.md", "# Base");
+            var (_, symRefOut, _) = await GitOperations.RunGitCommandAsync(
+                _repoDir, "symbolic-ref --short HEAD", CancellationToken.None);
+            var localDefault = symRefOut.Trim();
+
+            await RunAsync(_repoDir, $"remote add origin {bareDir}");
+            await RunAsync(_repoDir, $"push origin {localDefault}:main-remote");
+
+            // Ensure "main-remote" does NOT exist locally.
+            var (localCheckExit, _, _) = await GitOperations.RunGitCommandAsync(
+                _repoDir, "rev-parse --verify main-remote", CancellationToken.None);
+            Assert.NotEqual(0, localCheckExit);
+
+            // Act — CreateBranchAsync should fetch "main-remote" from origin and then create the feature.
+            await GitOperations.CreateBranchAsync(
+                _repoDir, "feature/from-origin", "main-remote", CancellationToken.None);
+
+            // Assert — landed on the feature branch.
+            var (_, currentBranch, _) = await GitOperations.RunGitCommandAsync(
+                _repoDir, "branch --show-current", CancellationToken.None);
+            Assert.Equal("feature/from-origin", currentBranch.Trim());
+        }
+        finally
+        {
+            await GitOperations.ForceDeleteDirectoryAsync(bareDir);
+        }
     }
 
     // ── GetGitStatusAsync ─────────────────────────────────────────────────────
