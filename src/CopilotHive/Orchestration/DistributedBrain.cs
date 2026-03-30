@@ -318,11 +318,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     /// <summary>
     /// Asks the Brain to plan which phases should run during the current iteration.
+    /// Returns a <see cref="PlanResult"/> that either contains the plan or an escalation request.
     /// </summary>
     /// <param name="pipeline">The goal pipeline containing iteration state and context.</param>
     /// <param name="additionalContext">Optional extra context prepended to the planning prompt (e.g. retry context for a previously failed goal).</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
+    public async Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
     {
         var previousIterationContext = BuildPreviousIterationContext(pipeline);
 
@@ -380,7 +381,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         if (_agent is null)
         {
             _logger.LogWarning("Brain not connected — using default iteration plan for goal {GoalId}", pipeline.GoalId);
-            return IterationPlan.Default();
+            return PlanResult.Success(IterationPlan.Default());
         }
 
         try
@@ -403,6 +404,16 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 pipeline.Conversation.Add(new ConversationEntry("user", currentPrompt, pipeline.Iteration, "planning"));
                 pipeline.Conversation.Add(new ConversationEntry("assistant", response, pipeline.Iteration, "planning"));
 
+                // Check for escalate_to_composer BEFORE report_iteration_plan
+                if (toolCall is { ToolName: "escalate_to_composer" })
+                {
+                    var escalationQuestion = GetStringArg(toolCall.Arguments, "question") ?? "Brain requested clarification during planning";
+                    var escalationReason = GetStringArg(toolCall.Arguments, "reason") ?? "Brain requested escalation";
+                    _logger.LogInformation(
+                        "Brain escalated planning for goal {GoalId}: {Reason}", pipeline.GoalId, escalationReason);
+                    return PlanResult.Escalated(escalationQuestion, escalationReason);
+                }
+
                 if (toolCall is { ToolName: "report_iteration_plan" })
                 {
                     var plan = BuildIterationPlanFromToolCall(toolCall);
@@ -413,7 +424,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                             "Brain planned iteration {Iteration} for goal {GoalId}: [{Phases}] — {Reason}",
                             pipeline.Iteration, pipeline.GoalId,
                             string.Join(", ", plan.Phases), plan.Reason ?? "no reason");
-                        return plan;
+                        return PlanResult.Success(plan);
                     }
 
                     _logger.LogWarning("Failed to parse iteration plan from Brain response: {Response}",
@@ -443,7 +454,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         }
 
         _logger.LogInformation("Using default iteration plan for goal {GoalId}", pipeline.GoalId);
-        return IterationPlan.Default();
+        return PlanResult.Success(IterationPlan.Default());
     }
 
     internal static IterationPlan MapIterationPlan(IterationPlanDto dto)
@@ -734,8 +745,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     /// <summary>
     /// Asks the Brain to craft a prompt for the specified phase's worker.
+    /// Returns a <see cref="PromptResult"/> that either contains the crafted prompt or an escalation request.
     /// </summary>
-    public async Task<string> CraftPromptAsync(
+    public async Task<PromptResult> CraftPromptAsync(
         GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
     {
         var prompt = BuildCraftPromptText(pipeline, phase, additionalContext);
@@ -745,8 +757,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _logger.LogWarning("Brain not connected — using fallback prompt for {GoalId} phase {Phase}",
                 pipeline.GoalId, phase);
             return phase == GoalPhase.Review
-                ? BuildReviewFallbackPrompt(pipeline, additionalContext)
-                : $"Work on: {pipeline.Description}";
+                ? PromptResult.Success(BuildReviewFallbackPrompt(pipeline, additionalContext))
+                : PromptResult.Success($"Work on: {pipeline.Description}");
         }
 
         try
@@ -757,13 +769,25 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     _logger.LogDebug("Brain craft-prompt request for {GoalId} (phase={Phase}):\n{Prompt}",
                         pipeline.GoalId, phase, Truncate(prompt, Constants.TruncationVerbose));
 
-                    var (response, _) = await ExecuteBrainAsync(prompt, ct);
+                    var (response, toolCall) = await ExecuteBrainAsync(prompt, ct);
 
                     _logger.LogDebug("Brain craft-prompt response for {GoalId}:\n{Response}",
                         pipeline.GoalId, Truncate(response, Constants.TruncationVerbose));
 
                     pipeline.Conversation.Add(new ConversationEntry("user", prompt, pipeline.Iteration, "craft-prompt"));
                     pipeline.Conversation.Add(new ConversationEntry("assistant", response, pipeline.Iteration, "craft-prompt"));
+
+                    // Check for escalate_to_composer tool call
+                    if (toolCall is { ToolName: "escalate_to_composer" })
+                    {
+                        var escalationQuestion = GetStringArg(toolCall.Arguments, "question") ?? "Brain requested clarification during prompt crafting";
+                        var escalationReason = GetStringArg(toolCall.Arguments, "reason") ?? "Brain requested escalation";
+                        _logger.LogInformation(
+                            "Brain escalated prompt crafting for {GoalId} phase {Phase}: {Reason}",
+                            pipeline.GoalId, phase, escalationReason);
+                        // Return a sentinel that signals escalation — the caller unwraps it
+                        return $"__ESCALATION__{escalationQuestion}\x00{escalationReason}";
+                    }
 
                     if (string.IsNullOrWhiteSpace(response))
                         throw new InvalidOperationException(
@@ -780,7 +804,17 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 },
                 ct);
 
-            return craftedPrompt;
+            // Unwrap escalation sentinel
+            if (craftedPrompt.StartsWith("__ESCALATION__", StringComparison.Ordinal))
+            {
+                var payload = craftedPrompt["__ESCALATION__".Length..];
+                var sepIdx = payload.IndexOf('\x00');
+                var question = sepIdx >= 0 ? payload[..sepIdx] : payload;
+                var reason = sepIdx >= 0 ? payload[(sepIdx + 1)..] : string.Empty;
+                return PromptResult.Escalated(question, reason);
+            }
+
+            return PromptResult.Success(craftedPrompt);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -791,7 +825,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _logger.LogError(ex, "Brain failed to craft prompt for {GoalId} phase {Phase} — using fallback",
                 pipeline.GoalId, phase);
             pipeline.Conversation.Add(new ConversationEntry("system", $"CraftPrompt error: {ex.Message}", pipeline.Iteration, "error"));
-            return $"Work on: {pipeline.Description}";
+            return PromptResult.Success($"Work on: {pipeline.Description}");
         }
     }
 

@@ -25,6 +25,66 @@ public record BrainResponse(bool IsEscalation, string? Text, string? EscalationQ
 }
 
 /// <summary>
+/// Discriminated result returned by <see cref="IDistributedBrain.PlanIterationAsync"/>.
+/// Either carries an <see cref="IterationPlan"/> or signals that the Brain needs
+/// a clarification answered before it can plan.
+/// </summary>
+public sealed class PlanResult
+{
+    /// <summary>When <c>true</c>, the Brain is requesting clarification before planning.</summary>
+    public bool IsEscalation { get; private init; }
+
+    /// <summary>The iteration plan, populated when <see cref="IsEscalation"/> is <c>false</c>.</summary>
+    public IterationPlan? Plan { get; private init; }
+
+    /// <summary>The question to forward to the Composer; populated when <see cref="IsEscalation"/> is <c>true</c>.</summary>
+    public string? EscalationQuestion { get; private init; }
+
+    /// <summary>The reason the Brain cannot plan without input; populated when <see cref="IsEscalation"/> is <c>true</c>.</summary>
+    public string? EscalationReason { get; private init; }
+
+    /// <summary>Creates a successful planning result.</summary>
+    /// <param name="plan">The iteration plan produced by the Brain.</param>
+    public static PlanResult Success(IterationPlan plan) => new() { IsEscalation = false, Plan = plan };
+
+    /// <summary>Creates an escalation result when the Brain needs external input to plan.</summary>
+    /// <param name="question">The question to forward to the Composer.</param>
+    /// <param name="reason">Why the Brain is escalating.</param>
+    public static PlanResult Escalated(string question, string reason) =>
+        new() { IsEscalation = true, EscalationQuestion = question, EscalationReason = reason };
+}
+
+/// <summary>
+/// Discriminated result returned by <see cref="IDistributedBrain.CraftPromptAsync"/>.
+/// Either carries the crafted prompt text or signals that the Brain needs
+/// a clarification answered before it can craft the prompt.
+/// </summary>
+public sealed class PromptResult
+{
+    /// <summary>When <c>true</c>, the Brain is requesting clarification before crafting the prompt.</summary>
+    public bool IsEscalation { get; private init; }
+
+    /// <summary>The crafted prompt text, populated when <see cref="IsEscalation"/> is <c>false</c>.</summary>
+    public string? Prompt { get; private init; }
+
+    /// <summary>The question to forward to the Composer; populated when <see cref="IsEscalation"/> is <c>true</c>.</summary>
+    public string? EscalationQuestion { get; private init; }
+
+    /// <summary>The reason the Brain cannot craft the prompt without input; populated when <see cref="IsEscalation"/> is <c>true</c>.</summary>
+    public string? EscalationReason { get; private init; }
+
+    /// <summary>Creates a successful prompt-crafting result.</summary>
+    /// <param name="prompt">The crafted prompt text.</param>
+    public static PromptResult Success(string prompt) => new() { IsEscalation = false, Prompt = prompt };
+
+    /// <summary>Creates an escalation result when the Brain needs external input to craft a prompt.</summary>
+    /// <param name="question">The question to forward to the Composer.</param>
+    /// <param name="reason">Why the Brain is escalating.</param>
+    public static PromptResult Escalated(string question, string reason) =>
+        new() { IsEscalation = true, EscalationQuestion = question, EscalationReason = reason };
+}
+
+/// <summary>
 /// LLM-powered brain for the distributed orchestrator.
 /// The Brain maintains a single persistent session across all goals, using
 /// CodingAgent for LLM communication with automatic context compaction.
@@ -37,19 +97,21 @@ public interface IDistributedBrain
 
     /// <summary>
     /// Plan the workflow phases for the current iteration. Called at the start of each
-    /// iteration (new goal or after failure loop-back). Returns an IterationPlan with
-    /// the ordered phase sequence and per-phase instructions.
+    /// iteration (new goal or after failure loop-back). Returns a <see cref="PlanResult"/>
+    /// that either contains the iteration plan or an escalation request for clarification.
     /// </summary>
     /// <param name="pipeline">The goal pipeline containing iteration state and context.</param>
     /// <param name="additionalContext">Optional extra context injected at the top of the planning prompt (e.g. retry context).</param>
     /// <param name="ct">Cancellation token.</param>
-    Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default);
+    Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default);
 
     /// <summary>
     /// Craft a context-aware prompt for a specific phase's worker.
     /// Uses the pipeline's accumulated state and conversation history.
+    /// Returns a <see cref="PromptResult"/> that either contains the crafted prompt
+    /// or an escalation request for clarification.
     /// </summary>
-    Task<string> CraftPromptAsync(
+    Task<PromptResult> CraftPromptAsync(
         GoalPipeline pipeline,
         GoalPhase phase,
         string? additionalContext = null,

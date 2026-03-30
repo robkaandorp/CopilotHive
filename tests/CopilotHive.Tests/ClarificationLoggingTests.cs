@@ -654,10 +654,10 @@ public sealed class ClarificationLoggingTests
         public void SetNextResponse(BrainResponse response) => _response = response;
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
-        public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
-            Task.FromResult(IterationPlan.Default());
-        public Task<string> CraftPromptAsync(GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
-            Task.FromResult(_response.Text ?? string.Empty);
+        public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(PlanResult.Success(IterationPlan.Default()));
+        public Task<PromptResult> CraftPromptAsync(GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(PromptResult.Success(_response.Text ?? string.Empty));
         public Task<BrainResponse> AskQuestionAsync(
             string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
             Task.FromResult(_response);

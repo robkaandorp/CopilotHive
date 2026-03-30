@@ -298,6 +298,165 @@ public sealed class GoalDispatcher : BackgroundService
             answeredBy);
     }
 
+    /// <summary>
+    /// Routes a Brain escalation through the clarification pipeline and returns
+    /// the resolved answer (from Composer, human, or timeout fallback).
+    /// </summary>
+    private async Task<string> RouteEscalationAsync(
+        GoalPipeline pipeline, string question, string reason, CancellationToken ct)
+    {
+        _logger.LogInformation(
+            "Brain escalated for goal {GoalId} — routing clarification to Composer. Reason: {Reason}",
+            pipeline.GoalId, reason);
+
+        if (_clarificationRouter is null || _clarificationQueue is null)
+        {
+            _logger.LogWarning(
+                "No clarification router or clarification queue available — returning fallback for goal {GoalId}",
+                pipeline.GoalId);
+            RecordClarification(pipeline, question, ClarificationQueueService.TimeoutFallbackMessage, "timeout");
+            return ClarificationQueueService.TimeoutFallbackMessage;
+        }
+
+        var request = new ClarificationRequest
+        {
+            GoalId = pipeline.GoalId,
+            WorkerRole = pipeline.Phase.ToWorkerRole().ToRoleName(),
+            Question = question,
+        };
+
+        var tcs = _clarificationQueue.Enqueue(request);
+        pipeline.IsWaitingForClarification = true;
+
+        // Step 1: Try Composer auto-answer (30s timeout)
+        var composerAnswer = await _clarificationRouter.TryAutoAnswerAsync(
+            pipeline.GoalId,
+            question,
+            $"Goal description: {pipeline.Description}. Current phase: {pipeline.Phase}. Reason for escalation: {reason}",
+            _clarificationQueue,
+            request,
+            ct);
+
+        if (composerAnswer is not null)
+        {
+            _clarificationQueue.SubmitAnswer(request.Id, composerAnswer, "composer");
+            pipeline.IsWaitingForClarification = false;
+            RecordClarification(pipeline, question, composerAnswer, "composer");
+            return composerAnswer;
+        }
+
+        // Step 2: Composer escalated to human — wait for human answer (5min timeout)
+        _logger.LogInformation(
+            "Brain escalation for goal {GoalId} escalated to human. Waiting up to {Timeout} for answer.",
+            pipeline.GoalId, ClarificationQueueService.HumanTimeout);
+
+        try
+        {
+            var humanAnswer = await tcs.Task.WaitAsync(ClarificationQueueService.HumanTimeout, ct);
+            _logger.LogInformation("Human answered Brain escalation for goal {GoalId}", pipeline.GoalId);
+            pipeline.IsWaitingForClarification = false;
+            RecordClarification(pipeline, question, humanAnswer, "human");
+            return humanAnswer;
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning(
+                "Brain escalation timed out for goal {GoalId} — returning fallback", pipeline.GoalId);
+            _clarificationQueue.MarkTimedOut(request.Id);
+            pipeline.IsWaitingForClarification = false;
+            RecordClarification(pipeline, question, ClarificationQueueService.TimeoutFallbackMessage, "timeout");
+            return ClarificationQueueService.TimeoutFallbackMessage;
+        }
+    }
+
+    /// <summary>
+    /// Calls <see cref="IDistributedBrain.PlanIterationAsync"/> and handles any escalation
+    /// by routing to the clarification pipeline. On successful clarification, retries planning
+    /// with the answer as additional context. On timeout, returns the default plan.
+    /// Exposed as <c>internal</c> for unit testing via <c>InternalsVisibleTo</c>.
+    /// </summary>
+    internal async Task<IterationPlan> ResolvePlanAsync(
+        GoalPipeline pipeline, string? additionalContext, CancellationToken ct)
+    {
+        if (_brain is null)
+            return IterationPlan.Default();
+
+        var result = await _brain.PlanIterationAsync(pipeline, additionalContext, ct);
+
+        if (!result.IsEscalation)
+            return result.Plan ?? IterationPlan.Default();
+
+        // Brain needs clarification before planning
+        var answer = await RouteEscalationAsync(
+            pipeline,
+            result.EscalationQuestion ?? "Brain requested clarification during planning",
+            result.EscalationReason ?? string.Empty,
+            ct);
+
+        if (answer == ClarificationQueueService.TimeoutFallbackMessage)
+        {
+            _logger.LogWarning(
+                "Brain planning escalation timed out for goal {GoalId} — using default plan", pipeline.GoalId);
+            return IterationPlan.Default();
+        }
+
+        // Retry planning with the answer as additional context
+        _logger.LogInformation(
+            "Retrying Brain planning for goal {GoalId} with clarification answer", pipeline.GoalId);
+        var retryContext = additionalContext is not null
+            ? $"{additionalContext}\n\nClarification answer: {answer}"
+            : $"Clarification answer: {answer}";
+
+        var retryResult = await _brain.PlanIterationAsync(pipeline, retryContext, ct);
+        return retryResult.Plan ?? IterationPlan.Default();
+    }
+
+    /// <summary>
+    /// Calls <see cref="IDistributedBrain.CraftPromptAsync"/> and handles any escalation
+    /// by routing to the clarification pipeline. On successful clarification, retries prompt
+    /// crafting with the answer as additional context. On timeout, returns a fallback prompt.
+    /// Exposed as <c>internal</c> for unit testing via <c>InternalsVisibleTo</c>.
+    /// </summary>
+    internal async Task<string> ResolvePromptAsync(
+        GoalPipeline pipeline, GoalPhase phase, string? additionalContext, CancellationToken ct)
+    {
+        if (_brain is null)
+            return $"Work on: {pipeline.Description} (phase: {phase})";
+
+        var result = await _brain.CraftPromptAsync(pipeline, phase, additionalContext, ct);
+
+        if (!result.IsEscalation)
+            return result.Prompt ?? $"Work on: {pipeline.Description}";
+
+        // Brain needs clarification before crafting the prompt
+        var answer = await RouteEscalationAsync(
+            pipeline,
+            result.EscalationQuestion ?? "Brain requested clarification during prompt crafting",
+            result.EscalationReason ?? string.Empty,
+            ct);
+
+        if (answer == ClarificationQueueService.TimeoutFallbackMessage)
+        {
+            _logger.LogWarning(
+                "Brain prompt escalation timed out for goal {GoalId} phase {Phase} — using fallback prompt",
+                pipeline.GoalId, phase);
+            return phase == GoalPhase.Review
+                ? DistributedBrain.BuildReviewFallbackPrompt(pipeline, additionalContext)
+                : $"Work on: {pipeline.Description}";
+        }
+
+        // Retry prompt crafting with the answer as additional context
+        _logger.LogInformation(
+            "Retrying Brain prompt crafting for goal {GoalId} phase {Phase} with clarification answer",
+            pipeline.GoalId, phase);
+        var retryContext = additionalContext is not null
+            ? $"{additionalContext}\n\nClarification answer: {answer}"
+            : $"Clarification answer: {answer}";
+
+        var retryResult = await _brain.CraftPromptAsync(pipeline, phase, retryContext, ct);
+        return retryResult.Prompt ?? $"Work on: {pipeline.Description}";
+    }
+
 
     /// <inheritdoc/>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -432,7 +591,7 @@ public sealed class GoalDispatcher : BackgroundService
                 $"Previous coder output (for context):\n{(result.Output.Length > 500 ? result.Output[..500] + "..." : result.Output)}";
 
             var retryPrompt = _brain is not null
-                ? await _brain.CraftPromptAsync(pipeline, GoalPhase.Coding, noOpContext, ct)
+                ? await ResolvePromptAsync(pipeline, GoalPhase.Coding, noOpContext, ct)
                 : $"Work on: {pipeline.Description}. {noOpContext}";
             await DispatchToRole(pipeline, WorkerRole.Coder, retryPrompt, ct);
             return;
@@ -607,7 +766,7 @@ public sealed class GoalDispatcher : BackgroundService
         try
         {
             newPlan = _brain is not null
-                ? ValidatePlan(await _brain.PlanIterationAsync(pipeline, null, ct))
+                ? ValidatePlan(await ResolvePlanAsync(pipeline, null, ct))
                 : IterationPlan.Default();
         }
         catch (Exception ex)
@@ -635,7 +794,7 @@ public sealed class GoalDispatcher : BackgroundService
         }
 
         var fixPrompt = _brain is not null
-            ? await _brain.CraftPromptAsync(pipeline, GoalPhase.Coding, context, ct)
+            ? await ResolvePromptAsync(pipeline, GoalPhase.Coding, context, ct)
             : $"Fix issues for: {pipeline.Description}. {context}";
 
         await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
@@ -651,7 +810,7 @@ public sealed class GoalDispatcher : BackgroundService
             case GoalPhase.Review:
             case GoalPhase.Testing:
                 var prompt = _brain is not null
-                    ? await _brain.CraftPromptAsync(pipeline, phase, phaseInstructions, ct)
+                    ? await ResolvePromptAsync(pipeline, phase, phaseInstructions, ct)
                     : $"Work on: {pipeline.Description} (phase: {phase})";
                 await DispatchToRole(pipeline, phase.ToWorkerRole(), prompt, ct);
                 break;
@@ -735,7 +894,7 @@ public sealed class GoalDispatcher : BackgroundService
         telemetryAggregator.ClearTelemetryFiles(stateDir, telemetryRoleNames);
 
         var improvePrompt = _brain is not null
-            ? await _brain.CraftPromptAsync(pipeline, GoalPhase.Improve, improveContext, ct)
+            ? await ResolvePromptAsync(pipeline, GoalPhase.Improve, improveContext, ct)
             : "Update the *.agents.md files based on iteration results.\n\n" + analysis;
         await DispatchToRole(pipeline, WorkerRole.Improver, improvePrompt, ct);
     }
@@ -975,7 +1134,7 @@ public sealed class GoalDispatcher : BackgroundService
         try
         {
             newPlan = _brain is not null
-                ? ValidatePlan(await _brain.PlanIterationAsync(pipeline, null, ct))
+                ? ValidatePlan(await ResolvePlanAsync(pipeline, null, ct))
                 : IterationPlan.Default();
         }
         catch
@@ -987,7 +1146,7 @@ public sealed class GoalDispatcher : BackgroundService
         pipeline.StateMachine.StartIteration(newPlan.Phases);
 
         var fixPrompt = _brain is not null
-            ? await _brain.CraftPromptAsync(pipeline, GoalPhase.Coding, rebaseContext, ct)
+            ? await ResolvePromptAsync(pipeline, GoalPhase.Coding, rebaseContext, ct)
             : rebaseContext;
         await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
     }
@@ -1563,7 +1722,7 @@ public sealed class GoalDispatcher : BackgroundService
                 pipeline.GoalId, pipeline.Phase, role);
 
             var prompt = _brain is not null
-                ? await _brain.CraftPromptAsync(pipeline, pipeline.Phase,
+                ? await ResolvePromptAsync(pipeline, pipeline.Phase,
                     "This task is being re-dispatched after the previous worker was lost. Continue from where the previous worker left off.",
                     ct)
                 : $"Continue task for: {pipeline.Description}";
@@ -1638,7 +1797,7 @@ public sealed class GoalDispatcher : BackgroundService
             try
             {
                 var planContext = isRetry ? RetryPlanContext : null;
-                iterationPlan = ValidatePlan(await _brain.PlanIterationAsync(pipeline, planContext, ct));
+                iterationPlan = ValidatePlan(await ResolvePlanAsync(pipeline, planContext, ct));
             }
             catch (Exception ex)
             {
@@ -1658,7 +1817,7 @@ public sealed class GoalDispatcher : BackgroundService
         // Craft prompt for coder and dispatch
         var coderAdditionalContext = isRetry ? RetryCoderContext : null;
         var coderPrompt = _brain is not null
-            ? await _brain.CraftPromptAsync(pipeline, GoalPhase.Coding, coderAdditionalContext, ct)
+            ? await ResolvePromptAsync(pipeline, GoalPhase.Coding, coderAdditionalContext, ct)
             : BuildCoderPrompt(goal);
 
         await DispatchToRole(pipeline, WorkerRole.Coder, coderPrompt, ct);
