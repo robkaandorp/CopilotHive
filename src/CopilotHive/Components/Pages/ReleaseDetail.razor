@@ -5,6 +5,7 @@
 @inject IJSRuntime JS
 @inject NavigationManager Nav
 @inject HttpClient HttpClient
+@inject CopilotHive.Configuration.HiveConfigFile? HiveConfig
 
 <a href="/releases" style="display:inline-flex;align-items:center;gap:0.35rem;color:var(--accent);text-decoration:none;font-size:0.9rem;margin-bottom:0.5rem">
     ← Releases
@@ -53,8 +54,18 @@
         <!-- Repositories editor -->
         <div class="card" style="margin-bottom:1rem">
             <div class="label" style="margin-bottom:0.5rem">Repositories</div>
+            <div style="display:flex;flex-direction:column;gap:0.4rem;margin-bottom:0.5rem">
+                @foreach (var repo in _configuredRepoNames)
+                {
+                    <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
+                        <input type="checkbox"
+                               checked="@_selectedRepos.Contains(repo)"
+                               @onchange="@(e => ToggleRepo(repo, (bool)(e.Value ?? false)))" />
+                        <span>@repo</span>
+                    </label>
+                }
+            </div>
             <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
-                <input type="text" @bind="_editRepositories" style="flex:1;min-width:12rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;padding:0.4rem 0.6rem" placeholder="Comma-separated repository names" />
                 <button class="approve-btn" @onclick="SaveRepositories">Save Repositories</button>
                 @if (!string.IsNullOrEmpty(_repositoriesError))
                 {
@@ -202,7 +213,7 @@ else if (_loaded)
     private string? _tagError;
 
     // Repositories edit state
-    private string _editRepositories = "";
+    private HashSet<string> _selectedRepos = new(StringComparer.OrdinalIgnoreCase);
     private bool _repositoriesSaved;
     private string? _repositoriesError;
 
@@ -214,7 +225,7 @@ else if (_loaded)
         {
             _editNotes = _release.Notes ?? "";
             _editTag = _release.Tag;
-            _editRepositories = string.Join(", ", _release.RepositoryNames);
+            _selectedRepos = new HashSet<string>(_release.RepositoryNames, StringComparer.OrdinalIgnoreCase);
             _goals = (await GoalStore.GetGoalsByReleaseAsync(decoded)).ToList();
         }
         _loaded = true;
@@ -293,13 +304,29 @@ else if (_loaded)
         }
     }
 
+    /// <summary>
+    /// Combined list of repository names from config plus any orphaned repos
+    /// that are in the release but not in the current HiveConfig.
+    /// </summary>
+    private IEnumerable<string> _configuredRepoNames =>
+        (HiveConfig?.Repositories.Select(r => r.Name) ?? [])
+            .Union(_release?.RepositoryNames.Where(r =>
+                HiveConfig?.Repositories.All(c => !c.Name.Equals(r, StringComparison.OrdinalIgnoreCase)) ?? true) ?? [],
+                StringComparer.OrdinalIgnoreCase);
+
+    private void ToggleRepo(string repo, bool selected)
+    {
+        if (selected)
+            _selectedRepos.Add(repo);
+        else
+            _selectedRepos.Remove(repo);
+    }
+
     private async Task SaveRepositories()
     {
         _repositoriesError = null;
         _repositoriesSaved = false;
-        var repos = string.IsNullOrWhiteSpace(_editRepositories)
-            ? new List<string>()
-            : _editRepositories.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+        var repos = _selectedRepos.ToList();
         var body = new StringContent(
             System.Text.Json.JsonSerializer.Serialize(new { repositories = repos }),
             System.Text.Encoding.UTF8,
