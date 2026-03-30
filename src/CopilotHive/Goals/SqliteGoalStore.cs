@@ -152,6 +152,14 @@ public sealed class SqliteGoalStore : IGoalStore
             alter.ExecuteNonQuery();
             _logger.LogInformation("Migrated goal_iterations table: added 'phase_outputs_json' column");
         }
+
+        if (!iterationColumns.Contains("clarifications_json"))
+        {
+            using var alter = _db.CreateCommand();
+            alter.CommandText = "ALTER TABLE goal_iterations ADD COLUMN clarifications_json TEXT";
+            alter.ExecuteNonQuery();
+            _logger.LogInformation("Migrated goal_iterations table: added 'clarifications_json' column");
+        }
     }
 
     /// <summary>
@@ -829,8 +837,8 @@ public sealed class SqliteGoalStore : IGoalStore
         using var cmd = _db.CreateCommand();
         cmd.Transaction = transaction;
         cmd.CommandText = """
-            INSERT OR REPLACE INTO goal_iterations (goal_id, iteration, phases_json, test_total, test_passed, test_failed, review_verdict, notes_json, phase_outputs_json, created_at)
-            VALUES (@goalId, @iteration, @phases, @testTotal, @testPassed, @testFailed, @reviewVerdict, @notes, @phaseOutputs, @createdAt)
+            INSERT OR REPLACE INTO goal_iterations (goal_id, iteration, phases_json, test_total, test_passed, test_failed, review_verdict, notes_json, phase_outputs_json, clarifications_json, created_at)
+            VALUES (@goalId, @iteration, @phases, @testTotal, @testPassed, @testFailed, @reviewVerdict, @notes, @phaseOutputs, @clarifications, @createdAt)
             """;
         cmd.Parameters.AddWithValue("@goalId", goalId);
         cmd.Parameters.AddWithValue("@iteration", summary.Iteration);
@@ -843,6 +851,8 @@ public sealed class SqliteGoalStore : IGoalStore
             ? JsonSerializer.Serialize(summary.Notes, JsonOptions) : (object)DBNull.Value);
         cmd.Parameters.AddWithValue("@phaseOutputs", summary.PhaseOutputs.Count > 0
             ? JsonSerializer.Serialize(summary.PhaseOutputs, JsonOptions) : (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("@clarifications", summary.Clarifications.Count > 0
+            ? JsonSerializer.Serialize(summary.Clarifications, JsonOptions) : (object)DBNull.Value);
         cmd.Parameters.AddWithValue("@createdAt", DateTime.UtcNow.ToString("O"));
         cmd.ExecuteNonQuery();
     }
@@ -887,6 +897,14 @@ public sealed class SqliteGoalStore : IGoalStore
                     reader.GetString(poOrd), JsonOptions) ?? [];
             }
 
+            // clarifications_json may be absent in databases created before migration
+            List<PersistedClarification> clarifications = [];
+            if (TryGetOrdinal(reader, "clarifications_json", out var clOrd) && !reader.IsDBNull(clOrd))
+            {
+                clarifications = JsonSerializer.Deserialize<List<PersistedClarification>>(
+                    reader.GetString(clOrd), JsonOptions) ?? [];
+            }
+
             summaries.Add(new IterationSummary
             {
                 Iteration = reader.GetInt32(reader.GetOrdinal("iteration")),
@@ -895,6 +913,7 @@ public sealed class SqliteGoalStore : IGoalStore
                 ReviewVerdict = reader.IsDBNull(rvOrd) ? null : reader.GetString(rvOrd),
                 Notes = notes,
                 PhaseOutputs = phaseOutputs,
+                Clarifications = clarifications,
             });
         }
 

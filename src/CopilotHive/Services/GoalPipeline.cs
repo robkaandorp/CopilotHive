@@ -89,6 +89,27 @@ public sealed class IterationPlan
 }
 
 /// <summary>
+/// Records a single clarification Q&amp;A that occurred during goal execution.
+/// </summary>
+/// <param name="Timestamp">UTC time the clarification was created.</param>
+/// <param name="GoalId">The goal this clarification belongs to.</param>
+/// <param name="Iteration">Iteration number when the clarification was asked.</param>
+/// <param name="Phase">Pipeline phase when the clarification was asked.</param>
+/// <param name="WorkerRole">Worker role that triggered the question.</param>
+/// <param name="Question">The question that was asked.</param>
+/// <param name="Answer">The answer that was provided.</param>
+/// <param name="AnsweredBy">Who answered: \"brain\", \"composer\", or \"human\".</param>
+public sealed record ClarificationEntry(
+    DateTime Timestamp,
+    string GoalId,
+    int Iteration,
+    string Phase,
+    string WorkerRole,
+    string Question,
+    string Answer,
+    string AnsweredBy);
+
+/// <summary>
 /// Tracks a single goal's progress through the multi-phase pipeline.
 /// Thread-safe: state mutations are guarded by a lock.
 /// </summary>
@@ -139,6 +160,15 @@ public sealed class GoalPipeline
 
     /// <summary>In-memory iteration summaries for completed iterations (available to dashboard before goal finishes).</summary>
     public List<IterationSummary> CompletedIterationSummaries { get; } = [];
+
+    /// <summary>All clarifications Q&amp;As that occurred during this goal's execution.</summary>
+    public ConcurrentBag<ClarificationEntry> Clarifications { get; } = [];
+
+    /// <summary>
+    /// When <c>true</c>, the active phase is paused waiting for a clarification answer.
+    /// The dashboard displays this phase with status "waiting".
+    /// </summary>
+    public bool IsWaitingForClarification { get; set; }
 
     /// <summary>Metrics extracted by the Brain from worker output.</summary>
     public IterationMetrics Metrics { get; } = new() { Iteration = 1 };

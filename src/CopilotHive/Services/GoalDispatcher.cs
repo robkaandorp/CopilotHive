@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using CopilotHive.Agents;
 using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Improvement;
@@ -43,6 +44,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly TimeSpan _startupDelay;
     private readonly IClarificationRouter? _clarificationRouter;
     private readonly ClarificationQueueService? _clarificationQueue;
+    private readonly ProgressLog? _progressLog;
 
     /// <summary>
     /// Initialises a new <see cref="GoalDispatcher"/> with required and optional dependencies.
@@ -63,6 +65,7 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="clarificationRouter">Optional clarification router for Composer auto-answer.</param>
     /// <param name="clarificationQueue">Optional clarification queue for human escalation.</param>
     /// <param name="startupDelay">Delay before the first dispatch poll; defaults to 10 seconds to give workers time to connect.</param>
+    /// <param name="progressLog">Optional progress log for recording clarification events.</param>
     public GoalDispatcher(
         GoalManager goalManager,
         GoalPipelineManager pipelineManager,
@@ -79,7 +82,8 @@ public sealed class GoalDispatcher : BackgroundService
         ConfigRepoManager? configRepo = null,
         IClarificationRouter? clarificationRouter = null,
         ClarificationQueueService? clarificationQueue = null,
-        TimeSpan? startupDelay = null)
+        TimeSpan? startupDelay = null,
+        ProgressLog? progressLog = null)
     {
         _repoManager = repoManager ?? throw new ArgumentNullException(nameof(repoManager));
         _goalManager = goalManager;
@@ -96,6 +100,7 @@ public sealed class GoalDispatcher : BackgroundService
         _clarificationRouter = clarificationRouter;
         _clarificationQueue = clarificationQueue;
         _startupDelay = startupDelay ?? TimeSpan.FromSeconds(10);
+        _progressLog = progressLog;
 
         completionNotifier.OnTaskCompleted+= result => HandleTaskCompletionAsync(result);
     }
@@ -193,6 +198,7 @@ public sealed class GoalDispatcher : BackgroundService
         if (!answer.StartsWith("ESCALATE:", StringComparison.OrdinalIgnoreCase) &&
             !answer.Contains("ESCALATE_TO_COMPOSER", StringComparison.OrdinalIgnoreCase))
         {
+            RecordClarification(pipeline, question, answer, "brain");
             return answer;
         }
 
@@ -217,6 +223,9 @@ public sealed class GoalDispatcher : BackgroundService
         // Enqueue the request so the human queue is ready if needed
         var tcs = _clarificationQueue.Enqueue(request);
 
+        // Mark current phase as waiting for clarification
+        pipeline.IsWaitingForClarification = true;
+
         // Step 1: Try Composer auto-answer (30s timeout)
         var composerAnswer = await _clarificationRouter.TryAutoAnswerAsync(
             pipeline.GoalId,
@@ -230,6 +239,8 @@ public sealed class GoalDispatcher : BackgroundService
         {
             // Composer answered successfully — resolve the request
             _clarificationQueue.SubmitAnswer(request.Id, composerAnswer, "composer");
+            pipeline.IsWaitingForClarification = false;
+            RecordClarification(pipeline, question, composerAnswer, "composer");
             return composerAnswer;
         }
 
@@ -242,6 +253,8 @@ public sealed class GoalDispatcher : BackgroundService
         {
             var humanAnswer = await tcs.Task.WaitAsync(ClarificationQueueService.HumanTimeout, ct);
             _logger.LogInformation("Human answered clarification for goal {GoalId}", pipeline.GoalId);
+            pipeline.IsWaitingForClarification = false;
+            RecordClarification(pipeline, question, humanAnswer, "human");
             return humanAnswer;
         }
         catch (TimeoutException)
@@ -249,9 +262,37 @@ public sealed class GoalDispatcher : BackgroundService
             _logger.LogWarning(
                 "Human clarification timed out for goal {GoalId} — returning fallback", pipeline.GoalId);
             _clarificationQueue.MarkTimedOut(request.Id);
+            pipeline.IsWaitingForClarification = false;
+            RecordClarification(pipeline, question, ClarificationQueueService.TimeoutFallbackMessage, "timeout");
             return ClarificationQueueService.TimeoutFallbackMessage;
         }
     }
+
+    /// <summary>
+    /// Records a clarification Q&amp;A into the pipeline and emits a structured log entry.
+    /// </summary>
+    private void RecordClarification(GoalPipeline pipeline, string question, string answer, string answeredBy)
+    {
+        var entry = new ClarificationEntry(
+            Timestamp: DateTime.UtcNow,
+            GoalId: pipeline.GoalId,
+            Iteration: pipeline.Iteration,
+            Phase: pipeline.Phase.ToString(),
+            WorkerRole: pipeline.Phase.ToWorkerRole().ToRoleName(),
+            Question: question,
+            Answer: answer,
+            AnsweredBy: answeredBy);
+
+        pipeline.Clarifications.Add(entry);
+        _progressLog?.AddClarification(entry);
+
+        _logger.LogInformation(
+            "Clarification recorded for goal {goalId} iteration {iteration} phase {phase}: Q={question} | AnsweredBy={answeredBy}",
+            entry.GoalId, entry.Iteration, entry.Phase,
+            question.Length > 100 ? question[..100] + "..." : question,
+            answeredBy);
+    }
+
 
     /// <inheritdoc/>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -1304,6 +1345,18 @@ public sealed class GoalDispatcher : BackgroundService
             ReviewVerdict = reviewVerdict,
             Notes = notes,
             PhaseOutputs = phaseOutputs,
+            Clarifications = pipeline.Clarifications
+                .Where(c => c.Iteration == pipeline.Iteration)
+                .Select(c => new PersistedClarification
+                {
+                    Timestamp = c.Timestamp,
+                    Phase = c.Phase,
+                    WorkerRole = c.WorkerRole,
+                    Question = c.Question,
+                    Answer = c.Answer,
+                    AnsweredBy = c.AnsweredBy,
+                })
+                .ToList(),
         };
     }
 

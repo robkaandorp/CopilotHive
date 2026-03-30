@@ -64,6 +64,25 @@ public sealed class IterationSummary
     /// Populated when the iteration summary is built so outputs survive goal completion.
     /// </summary>
     public Dictionary<string, string> PhaseOutputs { get; set; } = [];
+    /// <summary>Clarification Q&amp;As that occurred during this iteration.</summary>
+    public List<PersistedClarification> Clarifications { get; set; } = [];
+}
+
+/// <summary>Serialisable clarification record stored in the database alongside an iteration summary.</summary>
+public sealed class PersistedClarification
+{
+    /// <summary>UTC time the clarification was created.</summary>
+    public DateTime Timestamp { get; init; }
+    /// <summary>Pipeline phase when the clarification was asked (e.g. "Coding").</summary>
+    public string Phase { get; init; } = "";
+    /// <summary>Worker role that triggered the question (e.g. "coder").</summary>
+    public string WorkerRole { get; init; } = "";
+    /// <summary>The question that was asked.</summary>
+    public string Question { get; init; } = "";
+    /// <summary>The answer that was provided.</summary>
+    public string Answer { get; init; } = "";
+    /// <summary>Who answered: "brain", "composer", "human", or "timeout".</summary>
+    public string AnsweredBy { get; init; } = "";
 }
 
 /// <summary>Result of a single pipeline phase within one iteration.</summary>
