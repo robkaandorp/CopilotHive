@@ -1,9 +1,11 @@
 @page "/orchestrator"
 @using CopilotHive.Dashboard
+@using CopilotHive.Goals
 @using CopilotHive.Orchestration
 @implements IDisposable
 @inject DashboardStateService State
 @inject IJSRuntime JS
+@inject IGoalStore GoalStore
 
 <h1>Orchestrator</h1>
 
@@ -147,16 +149,90 @@ else
     <p style="color:var(--text-muted)">Composer not connected.</p>
 }
 
+<h2 style="margin-top:1.5rem">Clarifications</h2>
+
+<div class="cards" style="margin-bottom:1rem">
+    <div class="card">
+        <div class="label">Total</div>
+        <div class="value">@_clarifications.Count</div>
+    </div>
+    <div class="card">
+        <div class="label">Brain</div>
+        <div class="value" style="color:var(--accent)">@_clarifications.Count(c => string.Equals(c.Clarification.AnsweredBy, "brain", StringComparison.OrdinalIgnoreCase))</div>
+    </div>
+    <div class="card">
+        <div class="label">Composer</div>
+        <div class="value" style="color:var(--yellow)">@_clarifications.Count(c => string.Equals(c.Clarification.AnsweredBy, "composer", StringComparison.OrdinalIgnoreCase))</div>
+    </div>
+    <div class="card">
+        <div class="label">Human</div>
+        <div class="value" style="color:var(--green)">@_clarifications.Count(c => string.Equals(c.Clarification.AnsweredBy, "human", StringComparison.OrdinalIgnoreCase))</div>
+    </div>
+    <div class="card">
+        <div class="label">Timeout</div>
+        <div class="value" style="color:var(--red)">@_clarifications.Count(c => string.Equals(c.Clarification.AnsweredBy, "timeout", StringComparison.OrdinalIgnoreCase))</div>
+    </div>
+</div>
+
+@if (_clarifications.Count == 0)
+{
+    <p style="color:var(--text-muted)">No clarifications recorded yet.</p>
+}
+else
+{
+    <div style="overflow-x:auto">
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Goal</th>
+                    <th>Phase</th>
+                    <th>Question</th>
+                    <th>Answered By</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var (goalId, clarif) in _clarifications.Take(100))
+                {
+                    <tr>
+                        <td style="white-space:nowrap;font-size:0.8rem;color:var(--text-muted)">
+                            @clarif.Timestamp.ToString("yyyy-MM-dd HH:mm")
+                        </td>
+                        <td style="font-size:0.85rem">
+                            <a href="/goals/@goalId" style="color:var(--accent);text-decoration:none">@goalId</a>
+                        </td>
+                        <td style="font-size:0.85rem">@clarif.Phase</td>
+                        <td style="font-size:0.85rem;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                            title="@clarif.Question">
+                            @(clarif.Question.Length > 80 ? clarif.Question[..80] + "…" : clarif.Question)
+                        </td>
+                        <td>
+                            <span class="badge @AnsweredByBadgeClass(clarif.AnsweredBy)">@clarif.AnsweredBy</span>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}
+
 @code {
     private BrainStats? _stats;
     private BrainStats? _composerStats;
     private OrchestratorInfo _info = new();
     private bool _resettingBrain;
+    private IReadOnlyList<(string GoalId, PersistedClarification Clarification)> _clarifications = [];
 
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
         Refresh();
         State.OnStateChanged += RefreshState;
+        await LoadClarificationsAsync();
+    }
+
+    private async Task LoadClarificationsAsync()
+    {
+        _clarifications = await GoalStore.GetAllClarificationsAsync();
     }
 
     private void Refresh()
@@ -229,6 +305,15 @@ else
     };
 
     public void Dispose() => State.OnStateChanged -= RefreshState;
+
+    private static string AnsweredByBadgeClass(string answeredBy) => answeredBy.ToLowerInvariant() switch
+    {
+        "brain" => "badge-blue",
+        "composer" => "badge-yellow",
+        "human" => "badge-green",
+        "timeout" => "badge-red",
+        _ => "badge-muted",
+    };
 
     private async Task ResetBrainSessionAsync()
     {

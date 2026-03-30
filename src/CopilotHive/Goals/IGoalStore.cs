@@ -92,4 +92,13 @@ public interface IGoalStore : IGoalSource
     /// <param name="goalId">The ID of the goal to reset.</param>
     /// <param name="ct">Cancellation token.</param>
     Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns a flat list of all clarifications recorded across all goals and iterations,
+    /// each paired with the goal ID it belongs to.
+    /// </summary>
+    /// <param name="limit">Optional maximum number of clarifications to return (most recent first).</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>Clarifications ordered by timestamp descending, up to <paramref name="limit"/> items.</returns>
+    Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(int? limit = null, CancellationToken ct = default);
 }

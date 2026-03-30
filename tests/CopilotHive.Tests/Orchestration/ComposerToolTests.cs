@@ -3372,6 +3372,9 @@ internal sealed class FakeGoalSource : IGoalSource, IGoalStore
 
     public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) =>
         Task.CompletedTask;
+
+    public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(int? limit = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>>([]);
 }
 
 /// <summary>
