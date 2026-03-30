@@ -4047,3 +4047,286 @@ public sealed class ComposerConfigRepoToolTests : IDisposable
         Assert.DoesNotContain("update_agents_md", prompt);
     }
 }
+
+/// <summary>
+/// Integration tests for config repo tools that require a real git repository.
+/// </summary>
+public sealed class ComposerConfigRepoGitIntegrationTests : IDisposable
+{
+    private readonly string _configRepoDir;
+    private readonly string _remoteRepoDir;
+    private readonly SqliteConnection _connection;
+    private readonly SqliteGoalStore _store;
+
+    public ComposerConfigRepoGitIntegrationTests()
+    {
+        _connection = new SqliteConnection("Data Source=:memory:");
+        _connection.Open();
+        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+
+        // Create a temp directory structure for integration tests
+        var baseDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        _configRepoDir = Path.Combine(baseDir, "config-repo");
+        _remoteRepoDir = Path.Combine(baseDir, "remote");
+
+        Directory.CreateDirectory(_configRepoDir);
+        Directory.CreateDirectory(_remoteRepoDir);
+    }
+
+    public void Dispose()
+    {
+        _connection.Dispose();
+        // Clean up temp directories
+        var baseDir = Path.GetDirectoryName(_configRepoDir);
+        if (baseDir is not null)
+        {
+            try { Directory.Delete(baseDir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    private void InitializeGitRepo(string path, string initialCommitMessage = "Initial commit")
+    {
+        // Initialize a git repo with a basic commit
+        RunGit(path, "init");
+        RunGit(path, "config user.email test@example.com");
+        RunGit(path, "config user.name Test");
+        RunGit(path, "checkout -b main");
+        File.WriteAllText(Path.Combine(path, "README.md"), "# Test repo");
+        RunGit(path, "add .");
+        RunGit(path, $"commit -m \"{initialCommitMessage}\"");
+    }
+
+    private void RunGit(string workingDir, string args)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "git",
+            Arguments = args,
+            WorkingDirectory = workingDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        using var proc = System.Diagnostics.Process.Start(psi)!;
+        proc.WaitForExit();
+    }
+
+    private ConfigRepoManager CreateConfigRepoManager()
+    {
+        // Create a bare repo as the "remote" (bare repos accept pushes)
+        RunGit(_remoteRepoDir, "init --bare");
+        RunGit(_remoteRepoDir, "symbolic-ref HEAD refs/heads/main");
+
+        // Create a working repo to make the initial commit, then push to bare
+        var tempWorkingDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempWorkingDir);
+        RunGit(tempWorkingDir, "init");
+        RunGit(tempWorkingDir, "config user.email test@example.com");
+        RunGit(tempWorkingDir, "config user.name Test");
+        RunGit(tempWorkingDir, "checkout -b main");
+        File.WriteAllText(Path.Combine(tempWorkingDir, "README.md"), "# Test repo");
+        RunGit(tempWorkingDir, "add .");
+        RunGit(tempWorkingDir, "commit -m \"Initial commit\"");
+        RunGit(tempWorkingDir, $"remote add origin \"{_remoteRepoDir}\"");
+        RunGit(tempWorkingDir, "push -u origin main");
+        try { Directory.Delete(tempWorkingDir, recursive: true); } catch { /* best-effort */ }
+
+        // Clone the bare repo into the config repo dir
+        RunGit(Path.GetDirectoryName(_configRepoDir)!, $"clone \"{_remoteRepoDir}\" \"{_configRepoDir}\"");
+        RunGit(_configRepoDir, "config user.email test@example.com");
+        RunGit(_configRepoDir, "config user.name Test");
+
+        // Create agents directory and add a file
+        Directory.CreateDirectory(Path.Combine(_configRepoDir, "agents"));
+        File.WriteAllText(Path.Combine(_configRepoDir, "agents", "coder.agents.md"), "# Coder instructions\nOriginal content.");
+        RunGit(_configRepoDir, "add .");
+        RunGit(_configRepoDir, "commit -m \"Add initial agents\"");
+        RunGit(_configRepoDir, "push");
+
+        return new ConfigRepoManager(_remoteRepoDir, _configRepoDir);
+    }
+
+    [Fact]
+    public async Task CommitConfigChanges_WithRealGitRepo_StagesCommitsAndPushes()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configRepo = CreateConfigRepoManager();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: configRepo);
+
+        // Modify a file using update_agents_md
+        await composer.UpdateAgentsMdAsync("Coder", "# Coder instructions\nUpdated content.", ct);
+
+        // Commit the changes
+        var result = await composer.CommitConfigChangesAsync("Update coder instructions", ct);
+
+        Assert.Contains("✅", result);
+        Assert.Contains("committed and pushed", result);
+
+        // Verify the commit exists in the local repo
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "git",
+            Arguments = "log -1 --pretty=format:%s",
+            WorkingDirectory = _configRepoDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        using var proc = System.Diagnostics.Process.Start(psi)!;
+        var output = proc.StandardOutput.ReadToEnd();
+        proc.WaitForExit();
+
+        Assert.Contains("Update coder instructions", output);
+    }
+
+    [Fact]
+    public async Task EditAgentsMd_WithRealGitRepo_PerformsExactReplacement()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configRepo = CreateConfigRepoManager();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: configRepo);
+
+        // Edit using exact string replacement
+        var result = await composer.EditAgentsMdAsync("Coder", "Original content.", "Modified content.", ct);
+
+        Assert.Contains("✅", result);
+        Assert.Contains("coder.agents.md", result);
+
+        // Verify the file content was actually changed
+        var filePath = Path.Combine(_configRepoDir, "agents", "coder.agents.md");
+        var content = await File.ReadAllTextAsync(filePath, ct);
+        Assert.Contains("Modified content.", content);
+        Assert.DoesNotContain("Original content.", content);
+    }
+
+    [Fact]
+    public async Task ListConfigFiles_WithRealGitRepo_ReturnsFilesFromSubdirectories()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configRepo = CreateConfigRepoManager();
+
+        // Add nested subdirectory structure
+        Directory.CreateDirectory(Path.Combine(_configRepoDir, "configs", "templates"));
+        await File.WriteAllTextAsync(Path.Combine(_configRepoDir, "configs", "templates", "default.yaml"), "template: true", ct);
+        RunGit(_configRepoDir, "add .");
+        RunGit(_configRepoDir, "commit -m \"Add templates\"");
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: configRepo);
+
+        var result = await composer.ListConfigFilesAsync(cancellationToken: ct);
+
+        Assert.Contains("agents/coder.agents.md", result);
+        Assert.Contains("configs/templates/default.yaml", result);
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_WithPathTraversal_ReturnsAccessDenied()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configRepo = CreateConfigRepoManager();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: configRepo);
+
+        // Attempt to read a file outside the config repo using path traversal
+        var result = await composer.ReadConfigFileAsync("../../../../etc/passwd", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("outside the config repo", result);
+        Assert.Contains("Access denied", result);
+    }
+
+    [Fact]
+    public async Task UpdateAgentsMd_InvalidRole_ReturnsErrorListingValidRoles()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configRepo = CreateConfigRepoManager();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: configRepo);
+
+        var result = await composer.UpdateAgentsMdAsync("NotAValidRole", "# Content", ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid role", result);
+        // Verify all valid roles are listed
+        Assert.Contains("Coder", result);
+        Assert.Contains("Tester", result);
+        Assert.Contains("Reviewer", result);
+        Assert.Contains("Improver", result);
+        Assert.Contains("Orchestrator", result);
+        Assert.Contains("DocWriter", result);
+        Assert.Contains("MergeWorker", result);
+    }
+
+    [Fact]
+    public async Task EditAgentsMd_InvalidRole_ReturnsErrorListingValidRoles()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configRepo = CreateConfigRepoManager();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: configRepo);
+
+        var result = await composer.EditAgentsMdAsync("FakeRole", "old", "new", ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid role", result);
+        // Verify all valid roles are listed
+        Assert.Contains("Coder", result);
+        Assert.Contains("Tester", result);
+    }
+
+    [Fact]
+    public async Task UpdateAgentsMd_CreatesAgentsDirectoryIfMissing()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configRepo = CreateConfigRepoManager();
+
+        // Delete the agents directory
+        Directory.Delete(Path.Combine(_configRepoDir, "agents"), recursive: true);
+        Assert.False(Directory.Exists(Path.Combine(_configRepoDir, "agents")));
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: configRepo);
+
+        var result = await composer.UpdateAgentsMdAsync("Tester", "# Tester instructions", ct);
+
+        Assert.Contains("✅", result);
+        Assert.True(Directory.Exists(Path.Combine(_configRepoDir, "agents")));
+        Assert.True(File.Exists(Path.Combine(_configRepoDir, "agents", "tester.agents.md")));
+    }
+}
