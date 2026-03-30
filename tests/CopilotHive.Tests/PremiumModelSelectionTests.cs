@@ -319,7 +319,7 @@ file sealed class CapturingBrain : IDistributedBrain
     public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) => Task.CompletedTask;
 
     public Task<BrainResponse> AskQuestionAsync(
-        string goalId, int iteration, string phase, string workerRole, string question) =>
+        string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
         Task.FromResult(BrainResponse.Answer("Brain is not available. Please proceed with your best judgment."));
 
     public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;

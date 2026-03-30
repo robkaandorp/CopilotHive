@@ -797,7 +797,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     /// <inheritdoc />
     public async Task<BrainResponse> AskQuestionAsync(
-        string goalId, int iteration, string phase, string workerRole, string question)
+        string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default)
     {
         if (_agent is null)
         {
@@ -819,14 +819,14 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         try
         {
             var (response, toolCall) = await Shared.CopilotRetryPolicy.ExecuteAsync(
-                () => ExecuteBrainAsync(prompt, CancellationToken.None),
+                () => ExecuteBrainAsync(prompt, ct),
                 onRetry: (attempt, delay, ex) =>
                 {
                     _logger.LogWarning(
                         "Brain AskQuestion call failed (attempt {Attempt}/{Max}): {Error}. Retrying in {Delay}s",
                         attempt, Shared.CopilotRetryPolicy.MaxRetries + 1, ex.Message, delay.TotalSeconds);
                 },
-                CancellationToken.None);
+                ct);
 
             if (toolCall is { ToolName: "escalate_to_composer" })
             {

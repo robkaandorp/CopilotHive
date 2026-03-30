@@ -196,7 +196,8 @@ public sealed class GoalDispatcher : BackgroundService
             pipeline.Iteration,
             pipeline.Phase.ToString(),
             pipeline.Phase.ToWorkerRole().ToRoleName(),
-            question);
+            question,
+            ct);
 
         if (!brainResponse.IsEscalation)
         {

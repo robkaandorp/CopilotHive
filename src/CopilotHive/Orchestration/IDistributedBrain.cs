@@ -88,11 +88,12 @@ public interface IDistributedBrain
     /// <param name="phase">The current pipeline phase name.</param>
     /// <param name="workerRole">The worker role asking the question.</param>
     /// <param name="question">The question text from the worker.</param>
+    /// <param name="ct">Cancellation token.</param>
     /// <returns>
     /// A <see cref="BrainResponse"/> that is either a direct answer (<see cref="BrainResponse.IsEscalation"/> = <c>false</c>)
     /// or an escalation request (<see cref="BrainResponse.IsEscalation"/> = <c>true</c>).
     /// </returns>
-    Task<BrainResponse> AskQuestionAsync(string goalId, int iteration, string phase, string workerRole, string question);
+    Task<BrainResponse> AskQuestionAsync(string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default);
 
     /// <summary>Returns current Brain context and usage statistics, or null if not connected.</summary>
     BrainStats? GetStats();

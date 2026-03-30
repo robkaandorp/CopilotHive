@@ -2,6 +2,7 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging.Abstractions;
 
 using WorkerRole = CopilotHive.Workers.WorkerRole;
@@ -773,6 +774,85 @@ public sealed class DistributedBrainTests
         Assert.Equal("Work on: Implement caching layer", prompt);
     }
 
+    // ── AskQuestionAsync — escalate_to_composer tool call ─────────────────
+
+    /// <summary>
+    /// Verifies the production path: when the AI client returns a response that triggers
+    /// the <c>escalate_to_composer</c> tool call, <see cref="DistributedBrain.AskQuestionAsync"/>
+    /// must return <see cref="BrainResponse.Escalated"/> with the correct question and reason.
+    /// </summary>
+    [Fact]
+    public async Task AskQuestionAsync_EscalateToComposerToolCall_ReturnsBrainResponseEscalated()
+    {
+        // Arrange: create a DistributedBrain with a fake IChatClient that
+        // returns a tool call for escalate_to_composer on the first request,
+        // then a plain text response on the second (after the tool result is injected).
+        var tmpDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tmpDir);
+
+        try
+        {
+            const string ExpectedQuestion = "What is the retry limit?";
+            const string ExpectedReason = "Requires domain knowledge outside the codebase";
+
+            var brain = new DistributedBrain(
+                "test-model",
+                NullLogger<DistributedBrain>.Instance,
+                stateDir: tmpDir);
+
+            // Inject a fake IChatClient that drives the tool-call loop:
+            // Call 1: returns escalate_to_composer tool call
+            // Call 2: returns plain text (after tool result is processed by CodingAgent)
+            var stubClient = new EscalateToolCallStubClient(
+                callId: "call-escalate-1",
+                toolName: "escalate_to_composer",
+                toolArguments: new Dictionary<string, object?> { ["question"] = ExpectedQuestion, ["reason"] = ExpectedReason },
+                finalReply: "Escalation recorded.");
+
+            InjectFakeChatClient(brain, stubClient);
+
+            // Act
+            var response = await brain.AskQuestionAsync(
+                "goal-test-42",
+                iteration: 1,
+                phase: "Coding",
+                workerRole: "coder",
+                question: ExpectedQuestion,
+                ct: TestContext.Current.CancellationToken);
+
+            // Assert: the discriminated union must be an escalation response
+            Assert.True(response.IsEscalation,
+                $"Expected IsEscalation=true but got Answer: '{response.Text}'");
+            Assert.Equal(ExpectedQuestion, response.EscalationQuestion);
+            Assert.Equal(ExpectedReason, response.EscalationReason);
+            Assert.Null(response.Text);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// Uses reflection to inject a fake <see cref="IChatClient"/> into a
+    /// <see cref="DistributedBrain"/> and call <c>RecreateAgent()</c> so the
+    /// internal <c>CodingAgent</c> is built without a real LLM endpoint.
+    /// </summary>
+    private static void InjectFakeChatClient(DistributedBrain brain, IChatClient fakeClient)
+    {
+        var brainType = typeof(DistributedBrain);
+
+        var chatClientField = brainType.GetField("_chatClient",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("_chatClient field not found on DistributedBrain");
+        chatClientField.SetValue(brain, fakeClient);
+
+        var recreateAgent = brainType.GetMethod("RecreateAgent",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("RecreateAgent method not found on DistributedBrain");
+        recreateAgent.Invoke(brain, null);
+    }
+
 }
 
 /// <summary>
@@ -807,10 +887,68 @@ file sealed class FakeDistributedBrain : IDistributedBrain
     public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) => Task.CompletedTask;
 
     public Task<BrainResponse> AskQuestionAsync(
-        string goalId, int iteration, string phase, string workerRole, string question) =>
+        string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
         Task.FromResult(BrainResponse.Answer("Brain is not available. Please proceed with your best judgment."));
 
     public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
 
     public BrainStats? GetStats() => null;
+}
+
+/// <summary>
+/// Minimal <see cref="IChatClient"/> stub that, on its first call, returns a tool-call
+/// response for <paramref name="toolName"/> with the given <paramref name="toolArguments"/>,
+/// then on subsequent calls returns a plain assistant text reply.
+/// This drives <see cref="SharpCoder.CodingAgent"/>'s tool-call loop without a real LLM.
+/// </summary>
+file sealed class EscalateToolCallStubClient(
+    string callId,
+    string toolName,
+    Dictionary<string, object?> toolArguments,
+    string finalReply) : IChatClient
+{
+    private int _callCount;
+
+    /// <inheritdoc />
+    public ChatClientMetadata Metadata => new("stub", null, "stub-model");
+
+    /// <inheritdoc />
+    public Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        var call = Interlocked.Increment(ref _callCount);
+
+        if (call == 1)
+        {
+            // First call: return the escalate_to_composer tool call
+            var toolCallContent = new FunctionCallContent(callId, toolName, toolArguments);
+            var response = new ChatResponse(new ChatMessage(ChatRole.Assistant, [toolCallContent]))
+            {
+                FinishReason = ChatFinishReason.ToolCalls,
+            };
+            return Task.FromResult(response);
+        }
+
+        // Subsequent calls: final text response after tool invocation
+        var finalResponse = new ChatResponse(new ChatMessage(ChatRole.Assistant, finalReply))
+        {
+            FinishReason = ChatFinishReason.Stop,
+        };
+        return Task.FromResult(finalResponse);
+    }
+
+    /// <inheritdoc />
+    public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException("Streaming is not used in this test.");
+
+    /// <inheritdoc />
+    public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+    /// <inheritdoc />
+    public void Dispose() { }
 }

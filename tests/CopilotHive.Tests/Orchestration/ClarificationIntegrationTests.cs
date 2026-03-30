@@ -22,8 +22,8 @@ public sealed class ClarificationIntegrationTests
     [Fact]
     public async Task BrainAnswersDirectly_ReturnsAnswerWithoutEscalation()
     {
-        // Arrange: Brain returns a confident answer (no ESCALATE marker)
-        var brain = new FakeClarificationBrain("Use JSON format for the output.");
+        // Arrange: Brain returns a confident answer (BrainResponse.Answer)
+        var brain = new FakeClarificationBrain(BrainResponse.Answer("Use JSON format for the output."));
         var queue = new ClarificationQueueService();
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, useComposer: false);
 
@@ -40,7 +40,7 @@ public sealed class ClarificationIntegrationTests
     public async Task BrainAnswersDirectly_NoClarificationQueueNeeded()
     {
         // Arrange: Brain returns a confident answer, no queue/composer configured
-        var brain = new FakeClarificationBrain("The answer is 42.");
+        var brain = new FakeClarificationBrain(BrainResponse.Answer("The answer is 42."));
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, null, useComposer: false);
 
         // Act
@@ -51,20 +51,19 @@ public sealed class ClarificationIntegrationTests
     }
 
     [Fact]
-    public async Task BrainReturnsPartialEscalateMarker_NotTreatedAsEscalation()
+    public async Task BrainAnswers_TextContainsEscalateWord_NotTreatedAsEscalation()
     {
-        // Arrange: Brain returns a response containing "escalate" but not as a marker
-        // The implementation uses exact string match: StartsWith("ESCALATE:") or Contains("ESCALATE_TO_COMPOSER")
-        // A response like "I should escalate this" should NOT trigger escalation
-        var brain = new FakeClarificationBrain("I should escalate this to someone else.");
+        // Arrange: Brain returns a non-escalating answer (BrainResponse.Answer)
+        // A response like "I should escalate this" should NOT trigger escalation —
+        // only BrainResponse.Escalated() signals escalation; text content is irrelevant.
+        var brain = new FakeClarificationBrain(BrainResponse.Answer("I should escalate this to someone else."));
         var queue = new ClarificationQueueService();
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, useComposer: false);
 
         // Act
         var answer = await dispatcher.AskBrainAsync(pipeline, "Question?", TestContext.Current.CancellationToken);
 
-        // Assert - The response doesn't START with "ESCALATE:" (exact match), so it's returned as-is
-        // and doesn't trigger the escalation chain
+        // Assert - BrainResponse.Answer is returned as-is; IsEscalation=false
         Assert.Equal("I should escalate this to someone else.", answer);
     }
 
@@ -74,7 +73,7 @@ public sealed class ClarificationIntegrationTests
     public async Task BrainEscalates_NoComposerOrQueue_ReturnsFallback()
     {
         // Arrange: Brain escalates but no Composer/Queue available
-        var brain = new FakeClarificationBrain("ESCALATE: Cannot answer from codebase");
+        var brain = new FakeClarificationBrain(BrainResponse.Escalated("Cannot answer from codebase", "Cannot answer from codebase"));
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, null, useComposer: false);
 
         // Act
@@ -88,7 +87,7 @@ public sealed class ClarificationIntegrationTests
     public async Task BrainEscalates_NoComposer_ReturnsFallback()
     {
         // Arrange: Brain escalates, queue exists but no composer
-        var brain = new FakeClarificationBrain("ESCALATE: Need clarification");
+        var brain = new FakeClarificationBrain(BrainResponse.Escalated("Need clarification", "Need clarification"));
         var queue = new ClarificationQueueService();
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, useComposer: false);
 
@@ -470,7 +469,7 @@ public sealed class ClarificationIntegrationTests
     public async Task BrainEscalates_RouterAutoAnswers_ReturnsComposerAnswer()
     {
         // Arrange: Brain escalates, Router auto-answers successfully
-        var brain = new FakeClarificationBrain("ESCALATE: Cannot determine from codebase");
+        var brain = new FakeClarificationBrain(BrainResponse.Escalated("Cannot determine from codebase", "Cannot determine from codebase"));
         var queue = new ClarificationQueueService();
         var router = new FakeClarificationRouter("Use the Builder pattern.");
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
@@ -491,7 +490,7 @@ public sealed class ClarificationIntegrationTests
     public async Task BrainEscalates_RouterReturnsNull_EscalatesToHuman_HumanAnswers()
     {
         // Arrange: Brain escalates, Router escalates to human, human answers
-        var brain = new FakeClarificationBrain("ESCALATE: Need human input");
+        var brain = new FakeClarificationBrain(BrainResponse.Escalated("Need human input", "Need human input"));
         var queue = new ClarificationQueueService();
         var router = new FakeClarificationRouter(null); // null = escalate to human
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
@@ -516,7 +515,7 @@ public sealed class ClarificationIntegrationTests
     public async Task BrainEscalates_RouterReturnsNull_HumanTimesOut_ReturnsFallback()
     {
         // Arrange: Brain escalates, Router escalates to human, human never answers
-        var brain = new FakeClarificationBrain("ESCALATE: Need domain expertise");
+        var brain = new FakeClarificationBrain(BrainResponse.Escalated("Need domain expertise", "Need domain expertise"));
         var queue = new ClarificationQueueService();
         var router = new FakeClarificationRouter(null); // null = escalate to human
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
@@ -539,10 +538,10 @@ public sealed class ClarificationIntegrationTests
     }
 
     [Fact]
-    public async Task BrainEscalates_ContainsEscalateToComposer_AlsoTriggersEscalation()
+    public async Task BrainEscalates_EscalationResponse_TriggersComposerRouting()
     {
-        // Arrange: Brain uses ESCALATE_TO_COMPOSER marker
-        var brain = new FakeClarificationBrain("ESCALATE_TO_COMPOSER: I need the Composer's help");
+        // Arrange: Brain escalates to Composer
+        var brain = new FakeClarificationBrain(BrainResponse.Escalated("I need the Composer's help", "I need the Composer's help"));
         var queue = new ClarificationQueueService();
         var router = new FakeClarificationRouter("Composer knows the answer.");
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
@@ -560,7 +559,7 @@ public sealed class ClarificationIntegrationTests
     public async Task Composer_ReturnsEscalateToHuman_EscalatesToHuman()
     {
         // Arrange: Brain escalates, Composer returns exactly "ESCALATE_TO_HUMAN"
-        var brain = new FakeClarificationBrain("ESCALATE: Need human judgment");
+        var brain = new FakeClarificationBrain(BrainResponse.Escalated("Need human judgment", "Need human judgment"));
         var queue = new ClarificationQueueService();
         var router = new FakeClarificationRouter("ESCALATE_TO_HUMAN"); // Exact match triggers escalation
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
@@ -586,7 +585,7 @@ public sealed class ClarificationIntegrationTests
     public async Task Composer_ReturnsEmptyResponse_EscalatesToHuman()
     {
         // Arrange: Brain escalates, Composer returns empty string (should escalate)
-        var brain = new FakeClarificationBrain("ESCALATE: Cannot determine");
+        var brain = new FakeClarificationBrain(BrainResponse.Escalated("Cannot determine", "Cannot determine from codebase"));
         var queue = new ClarificationQueueService();
         var router = new FakeClarificationRouter(""); // Empty string should escalate
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
@@ -615,7 +614,7 @@ public sealed class ClarificationIntegrationTests
     {
         // Arrange: Brain escalates, Router simulates timeout by returning null (escalate to human)
         // This simulates the Composer catching OperationCanceledException internally and returning null
-        var brain = new FakeClarificationBrain("ESCALATE: Need clarification");
+        var brain = new FakeClarificationBrain(BrainResponse.Escalated("Need clarification", "Need clarification"));
         var queue = new ClarificationQueueService();
         var router = new TimeoutClarificationRouter();
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
@@ -682,7 +681,7 @@ public sealed class ClarificationIntegrationTests
         // triggering the dispatcher's catch block.
 
         // Arrange: Router escalates to human and then faults the TCS with TimeoutException
-        var brain = new FakeClarificationBrain("ESCALATE: Need human input");
+        var brain = new FakeClarificationBrain(BrainResponse.Escalated("Need human input", "Need human input"));
         var queue = new ClarificationQueueService();
         var router = new TimeoutFaultingClarificationRouter();
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
@@ -772,7 +771,7 @@ public sealed class ClarificationIntegrationTests
         // so this test documents the expected behavior if a custom router throws.
 
         // Arrange: Router throws OperationCanceledException
-        var brain = new FakeClarificationBrain("ESCALATE: Need help");
+        var brain = new FakeClarificationBrain(BrainResponse.Escalated("Need help", "Need help"));
         var queue = new ClarificationQueueService();
         var router = new ThrowingClarificationRouter(new OperationCanceledException());
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
@@ -881,15 +880,13 @@ public sealed class ClarificationIntegrationTests
     // ── Fake implementations ───────────────────────────────────────────────
 
     /// <summary>
-    /// Fake Brain that returns a configured response for AskBrainAsync calls.
-    /// When the response text starts with "ESCALATE:", it returns a BrainResponse.Escalated
-    /// variant, otherwise a BrainResponse.Answer variant.
+    /// Fake Brain that returns a configured BrainResponse for AskQuestionAsync calls.
     /// </summary>
     private sealed class FakeClarificationBrain : IDistributedBrain
     {
-        private readonly string _askBrainResponse;
+        private readonly BrainResponse _askBrainResponse;
 
-        public FakeClarificationBrain(string askBrainResponse)
+        public FakeClarificationBrain(BrainResponse askBrainResponse)
         {
             _askBrainResponse = askBrainResponse;
         }
@@ -901,21 +898,11 @@ public sealed class ClarificationIntegrationTests
 
         public Task<string> CraftPromptAsync(
             GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
-            Task.FromResult(_askBrainResponse);
+            Task.FromResult(_askBrainResponse.Text ?? string.Empty);
 
         public Task<BrainResponse> AskQuestionAsync(
-            string goalId, int iteration, string phase, string workerRole, string question)
-        {
-            // Simulate escalation when the configured response starts with "ESCALATE:"
-            if (_askBrainResponse.StartsWith("ESCALATE:", StringComparison.OrdinalIgnoreCase) ||
-                _askBrainResponse.StartsWith("ESCALATE_TO_COMPOSER", StringComparison.OrdinalIgnoreCase))
-            {
-                var reason = _askBrainResponse.Length > 9 ? _askBrainResponse[9..].Trim() : "Brain requested escalation";
-                return Task.FromResult(BrainResponse.Escalated(question, reason));
-            }
-
-            return Task.FromResult(BrainResponse.Answer(_askBrainResponse));
-        }
+            string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+            Task.FromResult(_askBrainResponse);
 
         public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
             Task.FromResult<string?>(null);

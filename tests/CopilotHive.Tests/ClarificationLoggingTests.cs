@@ -63,7 +63,7 @@ public sealed class ClarificationLoggingTests
     [Fact]
     public async Task AskBrainAsync_BrainAnswers_ClarificationAddedToPipeline()
     {
-        var brain = new FakeBrain("Direct brain answer.");
+        var brain = new FakeBrain(BrainResponse.Answer("Direct brain answer."));
         var (dispatcher, pipeline) = CreateDispatcher(brain, queue: null);
 
         var answer = await dispatcher.AskBrainAsync(pipeline, "What format?", TestContext.Current.CancellationToken);
@@ -81,7 +81,7 @@ public sealed class ClarificationLoggingTests
     [Fact]
     public async Task AskBrainAsync_BrainAnswers_ClarificationAddedToProgressLog()
     {
-        var brain = new FakeBrain("My direct answer.");
+        var brain = new FakeBrain(BrainResponse.Answer("My direct answer."));
         var progressLog = new ProgressLog();
         var (dispatcher, pipeline) = CreateDispatcher(brain, queue: null, progressLog: progressLog);
 
@@ -114,7 +114,7 @@ public sealed class ClarificationLoggingTests
     [Fact]
     public async Task AskBrainAsync_ComposerAnswers_ClarificationRecordedWithComposerAnsweredBy()
     {
-        var brain = new FakeBrain("ESCALATE: Need composer input");
+        var brain = new FakeBrain(BrainResponse.Escalated("Need composer input", "Need composer input"));
         var queue = new ClarificationQueueService();
         var router = new FakeRouter("Composer answer here.");
         var (dispatcher, pipeline) = CreateDispatcher(brain, queue, router: router);
@@ -130,7 +130,7 @@ public sealed class ClarificationLoggingTests
     [Fact]
     public async Task AskBrainAsync_ComposerAnswers_IsWaitingReverted()
     {
-        var brain = new FakeBrain("ESCALATE: Need composer input");
+        var brain = new FakeBrain(BrainResponse.Escalated("Need composer input", "Need composer input"));
         var queue = new ClarificationQueueService();
         var router = new FakeRouter("Composer answer.");
         var (dispatcher, pipeline) = CreateDispatcher(brain, queue, router: router);
@@ -145,7 +145,7 @@ public sealed class ClarificationLoggingTests
     [Fact]
     public async Task AskBrainAsync_EscalatesNoRouterOrQueue_NoClarificationRecorded()
     {
-        var brain = new FakeBrain("ESCALATE: Cannot answer");
+        var brain = new FakeBrain(BrainResponse.Escalated("Cannot answer", "Cannot answer from codebase"));
         var (dispatcher, pipeline) = CreateDispatcher(brain, queue: null);
 
         var answer = await dispatcher.AskBrainAsync(pipeline, "Question?", TestContext.Current.CancellationToken);
@@ -159,7 +159,7 @@ public sealed class ClarificationLoggingTests
     [Fact]
     public async Task AskBrainAsync_HumanAnswers_ClarificationRecordedWithHumanAnsweredBy()
     {
-        var brain = new FakeBrain("ESCALATE: Need human input");
+        var brain = new FakeBrain(BrainResponse.Escalated("Need human input", "Need human input"));
         var queue = new ClarificationQueueService();
         // Router returns null to escalate to human
         var router = new FakeRouter(null);
@@ -201,7 +201,7 @@ public sealed class ClarificationLoggingTests
     [Fact]
     public async Task AskBrainAsync_HumanAnswers_WaitingStateReverted()
     {
-        var brain = new FakeBrain("ESCALATE: Need human");
+        var brain = new FakeBrain(BrainResponse.Escalated("Need human", "Need human input"));
         var queue = new ClarificationQueueService();
         var router = new FakeRouter(null);
         var (dispatcher, pipeline) = CreateDispatcher(brain, queue, router: router);
@@ -230,7 +230,7 @@ public sealed class ClarificationLoggingTests
     [Fact]
     public async Task AskBrainAsync_HumanTimeout_ReturnsFallbackAndRecordsTimeout()
     {
-        var brain = new FakeBrain("ESCALATE: Need human input");
+        var brain = new FakeBrain(BrainResponse.Escalated("Need human input", "Need human input"));
         var queue = new ClarificationQueueService();
         var router = new FakeRouter(null);
         var (dispatcher, pipeline) = CreateDispatcher(brain, queue, router: router);
@@ -278,7 +278,7 @@ public sealed class ClarificationLoggingTests
     [Fact]
     public async Task AskBrainAsync_Timeout_WaitingStateReverted()
     {
-        var brain = new FakeBrain("ESCALATE: need human");
+        var brain = new FakeBrain(BrainResponse.Escalated("need human", "Need human input"));
         var queue = new ClarificationQueueService();
         var router = new FakeRouter(null);
         var (dispatcher, pipeline) = CreateDispatcher(brain, queue, router: router);
@@ -308,13 +308,13 @@ public sealed class ClarificationLoggingTests
     [Fact]
     public async Task AskBrainAsync_MultipleCalls_AllClarificationsRecorded()
     {
-        var brain = new FakeBrain("Answer one.");
+        var brain = new FakeBrain(BrainResponse.Answer("Answer one."));
         var (dispatcher, pipeline) = CreateDispatcher(brain, queue: null);
 
         await dispatcher.AskBrainAsync(pipeline, "Q1?", TestContext.Current.CancellationToken);
 
         // Change response for second call
-        brain.SetNextResponse("Answer two.");
+        brain.SetNextResponse(BrainResponse.Answer("Answer two."));
         await dispatcher.AskBrainAsync(pipeline, "Q2?", TestContext.Current.CancellationToken);
 
         Assert.Equal(2, pipeline.Clarifications.Count);
@@ -649,26 +649,18 @@ public sealed class ClarificationLoggingTests
 
     private sealed class FakeBrain : IDistributedBrain
     {
-        private string _response;
-        public FakeBrain(string response) => _response = response;
-        public void SetNextResponse(string response) => _response = response;
+        private BrainResponse _response;
+        public FakeBrain(BrainResponse response) => _response = response;
+        public void SetNextResponse(BrainResponse response) => _response = response;
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task<IterationPlan> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
             Task.FromResult(IterationPlan.Default());
         public Task<string> CraftPromptAsync(GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
-            Task.FromResult(_response);
+            Task.FromResult(_response.Text ?? string.Empty);
         public Task<BrainResponse> AskQuestionAsync(
-            string goalId, int iteration, string phase, string workerRole, string question)
-        {
-            if (_response.StartsWith("ESCALATE:", StringComparison.OrdinalIgnoreCase) ||
-                _response.StartsWith("ESCALATE_TO_COMPOSER", StringComparison.OrdinalIgnoreCase))
-            {
-                var reason = _response.Length > 9 ? _response[9..].Trim() : "Brain requested escalation";
-                return Task.FromResult(BrainResponse.Escalated(question, reason));
-            }
-            return Task.FromResult(BrainResponse.Answer(_response));
-        }
+            string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+            Task.FromResult(_response);
         public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
             Task.FromResult<string?>(null);
         public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
