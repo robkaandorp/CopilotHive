@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Reflection;
 using CopilotHive.Configuration;
 using CopilotHive.Workers;
 
@@ -305,5 +307,212 @@ public class ConfigRepoManagerTests : IDisposable
         var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
         await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
         return manager;
+    }
+
+    // ── Semaphore serialization ───────────────────────────────────────────────
+
+    [Fact]
+    public async Task SyncRepoAsync_ConcurrentCalls_AreSerializedBySemaphore()
+    {
+        // Arrange — grab the _gitLock semaphore via reflection and hold it.
+        var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
+        var gitLock = GetGitLock(manager);
+
+        // Pre-acquire the semaphore to block any git operation.
+        await gitLock.WaitAsync(TestContext.Current.CancellationToken);
+
+        var ct = TestContext.Current.CancellationToken;
+        var started = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // Start a SyncRepoAsync that will block waiting for the semaphore.
+        var blockingTask = Task.Run(async () =>
+        {
+            started.TrySetResult(true);
+            // This will block on WaitAsync until we release the semaphore below.
+            await manager.SyncRepoAsync(ct);
+        }, ct);
+
+        // Wait until the task has at least started.
+        await started.Task;
+
+        // The task should NOT complete while the semaphore is held.
+        var completedEarly = await Task.WhenAny(blockingTask, Task.Delay(100, ct)) == blockingTask;
+        Assert.False(completedEarly, "SyncRepoAsync should be blocked while the semaphore is held");
+
+        // Release the semaphore — note: the call will fail (no .git, no real remote),
+        // but it will at least proceed past the lock.
+        gitLock.Release();
+
+        // The task should now run and eventually throw (no real git repo), but it must
+        // have been unblocked by the semaphore release.
+        await Assert.ThrowsAsync<InvalidOperationException>(() => blockingTask);
+    }
+
+    [Fact]
+    public async Task CommitAllChangesAsync_ConcurrentCalls_AreSerializedBySemaphore()
+    {
+        // Arrange — grab the _gitLock semaphore via reflection and hold it.
+        var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
+        var gitLock = GetGitLock(manager);
+
+        await gitLock.WaitAsync(TestContext.Current.CancellationToken);
+
+        var ct = TestContext.Current.CancellationToken;
+        var started = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var blockingTask = Task.Run(async () =>
+        {
+            started.TrySetResult(true);
+            await manager.CommitAllChangesAsync("test commit", ct);
+        }, ct);
+
+        await started.Task;
+
+        var completedEarly = await Task.WhenAny(blockingTask, Task.Delay(100, ct)) == blockingTask;
+        Assert.False(completedEarly, "CommitAllChangesAsync should be blocked while the semaphore is held");
+
+        gitLock.Release();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => blockingTask);
+    }
+
+    [Fact]
+    public async Task CommitFileAsync_ConcurrentCalls_AreSerializedBySemaphore()
+    {
+        // Arrange — grab the _gitLock semaphore via reflection and hold it.
+        var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
+        var gitLock = GetGitLock(manager);
+
+        await gitLock.WaitAsync(TestContext.Current.CancellationToken);
+
+        var ct = TestContext.Current.CancellationToken;
+        var started = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var blockingTask = Task.Run(async () =>
+        {
+            started.TrySetResult(true);
+            await manager.CommitFileAsync("goals.yaml", "update goals", ct);
+        }, ct);
+
+        await started.Task;
+
+        var completedEarly = await Task.WhenAny(blockingTask, Task.Delay(100, ct)) == blockingTask;
+        Assert.False(completedEarly, "CommitFileAsync should be blocked while the semaphore is held");
+
+        gitLock.Release();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => blockingTask);
+    }
+
+    // ── Merge conflict abort ──────────────────────────────────────────────────
+
+    [Fact]
+    public async Task SyncRepoAsync_WhenPullFails_AttemptsMergeAbortAndRethrows()
+    {
+        // Arrange — set up a local bare remote and two clones that create a conflict.
+        var bareDir = Path.Combine(Path.GetTempPath(), $"cfgtest-bare-{Guid.NewGuid():N}");
+        var clone1Dir = Path.Combine(Path.GetTempPath(), $"cfgtest-clone1-{Guid.NewGuid():N}");
+        var clone2Dir = Path.Combine(Path.GetTempPath(), $"cfgtest-clone2-{Guid.NewGuid():N}");
+
+        try
+        {
+            // Create bare repo and initial commit.
+            Directory.CreateDirectory(bareDir);
+            await RunGitCommandAsync(bareDir, ["init", "--bare"]);
+            Directory.CreateDirectory(clone1Dir);
+            await RunGitCommandAsync(Path.GetDirectoryName(clone1Dir)!,
+                ["clone", bareDir, Path.GetFileName(clone1Dir)]);
+            await RunGitCommandAsync(clone1Dir, ["config", "user.email", "test@test.com"]);
+            await RunGitCommandAsync(clone1Dir, ["config", "user.name", "Test"]);
+
+            // Write initial file and push.
+            var filePath = Path.Combine(clone1Dir, "conflict.txt");
+            await File.WriteAllTextAsync(filePath, "line1\n", TestContext.Current.CancellationToken);
+            await RunGitCommandAsync(clone1Dir, ["add", "conflict.txt"]);
+            await RunGitCommandAsync(clone1Dir, ["commit", "-m", "initial"]);
+            await RunGitCommandAsync(clone1Dir, ["push", "origin", "HEAD"]);
+
+            // Clone2: clone from bare, modify conflict.txt, commit but DON'T push yet.
+            Directory.CreateDirectory(clone2Dir);
+            await RunGitCommandAsync(Path.GetDirectoryName(clone2Dir)!,
+                ["clone", bareDir, Path.GetFileName(clone2Dir)]);
+            await RunGitCommandAsync(clone2Dir, ["config", "user.email", "test2@test.com"]);
+            await RunGitCommandAsync(clone2Dir, ["config", "user.name", "Test2"]);
+            await File.WriteAllTextAsync(Path.Combine(clone2Dir, "conflict.txt"), "clone2 change\n",
+                TestContext.Current.CancellationToken);
+            await RunGitCommandAsync(clone2Dir, ["add", "conflict.txt"]);
+            await RunGitCommandAsync(clone2Dir, ["commit", "-m", "clone2 local commit"]);
+
+            // Clone1: push a conflicting change to the same file.
+            await File.WriteAllTextAsync(filePath, "clone1 different change\n",
+                TestContext.Current.CancellationToken);
+            await RunGitCommandAsync(clone1Dir, ["add", "conflict.txt"]);
+            await RunGitCommandAsync(clone1Dir, ["commit", "-m", "clone1 conflict"]);
+            await RunGitCommandAsync(clone1Dir, ["push", "origin", "HEAD"]);
+
+            // Now clone2 has a local commit that conflicts with the remote.
+            // Set merge strategy to always merge (not fast-forward) so a conflict occurs.
+            await RunGitCommandAsync(clone2Dir, ["config", "pull.rebase", "false"]);
+
+            // Act — SyncRepoAsync on clone2 should fail (merge conflict) and
+            // attempt git merge --abort before rethrowing.
+            var manager = new ConfigRepoManager(bareDir, clone2Dir);
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => manager.SyncRepoAsync(TestContext.Current.CancellationToken));
+
+            // Assert — the exception comes from the pull failure (not abort).
+            Assert.Contains("git exited with code", ex.Message);
+
+            // After TryAbortMergeAsync the repo should be in a clean non-merging state.
+            // git status should not show "MERGING".
+            var (statusOutput, _) = await RunGitCommandRawAsync(clone2Dir, ["status"]);
+            Assert.DoesNotContain("MERGING", statusOutput, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            foreach (var dir in new[] { bareDir, clone1Dir, clone2Dir })
+                if (Directory.Exists(dir))
+                    try { Directory.Delete(dir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    // ── Git helper for tests ──────────────────────────────────────────────────
+
+    private static SemaphoreSlim GetGitLock(ConfigRepoManager manager)
+    {
+        var field = typeof(ConfigRepoManager).GetField(
+            "_gitLock", BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(field);
+        var semaphore = field!.GetValue(manager) as SemaphoreSlim;
+        Assert.NotNull(semaphore);
+        return semaphore!;
+    }
+
+    private static async Task RunGitCommandAsync(string workingDir, string[] args)
+    {
+        var (_, error) = await RunGitCommandRawAsync(workingDir, args);
+        _ = error; // errors allowed during test setup
+    }
+
+    private static async Task<(string output, string error)> RunGitCommandRawAsync(
+        string workingDir, string[] args)
+    {
+        var psi = new ProcessStartInfo("git")
+        {
+            WorkingDirectory = workingDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
+
+        using var proc = Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to start git");
+        var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+        var stderrTask = proc.StandardError.ReadToEndAsync();
+        await Task.WhenAll(stdoutTask, stderrTask);
+        await proc.WaitForExitAsync();
+        return (stdoutTask.Result, stderrTask.Result);
     }
 }

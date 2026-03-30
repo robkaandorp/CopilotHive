@@ -14,6 +14,23 @@ public sealed class ConfigRepoManager
     private readonly string _configRepoUrl;
     private readonly string _localPath;
     private HiveConfigFile? _cachedConfig;
+    private readonly SemaphoreSlim _gitLock = new(1, 1);
+
+    /// <summary>
+    /// Attempts to run <c>git merge --abort</c> on a best-effort basis.
+    /// Any failure is silently ignored so the original exception can propagate.
+    /// </summary>
+    private static async Task TryAbortMergeAsync(string localPath, CancellationToken ct)
+    {
+        try
+        {
+            await RunGitAsync(localPath, ["merge", "--abort"], ct);
+        }
+        catch
+        {
+            // Best-effort: ignore failures (e.g., no merge in progress).
+        }
+    }
 
     private static readonly IDeserializer YamlDeserializer = new DeserializerBuilder()
         .WithNamingConvention(UnderscoredNamingConvention.Instance)
@@ -41,25 +58,38 @@ public sealed class ConfigRepoManager
     /// </summary>
     public async Task SyncRepoAsync(CancellationToken ct = default)
     {
-        if (Directory.Exists(Path.Combine(_localPath, ".git")))
+        await _gitLock.WaitAsync(ct);
+        try
         {
-            // Discard any uncommitted changes (e.g. from a failed improver commit)
-            // before pulling to prevent merge conflicts with incoming changes.
-            await RunGitAsync(_localPath, ["checkout", "--", "."], ct);
-            await RunGitAsync(_localPath, ["pull", "--ff-only"], ct);
-        }
-        else
-        {
-            var parent = Path.GetDirectoryName(_localPath)!;
-            Directory.CreateDirectory(parent);
-            var dirName = Path.GetFileName(_localPath);
-            var cloneUrl = InjectTokenIntoUrl(_configRepoUrl);
-            await RunGitAsync(parent, ["clone", cloneUrl, dirName], ct);
-            await RunGitAsync(_localPath, ["config", "user.email", "copilothive@local"], ct);
-            await RunGitAsync(_localPath, ["config", "user.name", "CopilotHive"], ct);
-        }
+            if (Directory.Exists(Path.Combine(_localPath, ".git")))
+            {
+                try
+                {
+                    await RunGitAsync(_localPath, ["pull"], ct);
+                }
+                catch
+                {
+                    await TryAbortMergeAsync(_localPath, ct);
+                    throw;
+                }
+            }
+            else
+            {
+                var parent = Path.GetDirectoryName(_localPath)!;
+                Directory.CreateDirectory(parent);
+                var dirName = Path.GetFileName(_localPath);
+                var cloneUrl = InjectTokenIntoUrl(_configRepoUrl);
+                await RunGitAsync(parent, ["clone", cloneUrl, dirName], ct);
+                await RunGitAsync(_localPath, ["config", "user.email", "copilothive@local"], ct);
+                await RunGitAsync(_localPath, ["config", "user.name", "CopilotHive"], ct);
+            }
 
-        _cachedConfig = null;
+            _cachedConfig = null;
+        }
+        finally
+        {
+            _gitLock.Release();
+        }
     }
 
     /// <summary>
@@ -135,10 +165,26 @@ public sealed class ConfigRepoManager
     /// </summary>
     public async Task CommitFileAsync(string filePath, string commitMessage, CancellationToken ct = default)
     {
-        await RunGitAsync(_localPath, ["add", filePath], ct);
-        await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
-        await RunGitAsync(_localPath, ["pull", "--no-rebase"], ct);
-        await RunGitAsync(_localPath, ["push"], ct);
+        await _gitLock.WaitAsync(ct);
+        try
+        {
+            await RunGitAsync(_localPath, ["add", filePath], ct);
+            await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
+            try
+            {
+                await RunGitAsync(_localPath, ["pull"], ct);
+            }
+            catch
+            {
+                await TryAbortMergeAsync(_localPath, ct);
+                throw;
+            }
+            await RunGitAsync(_localPath, ["push"], ct);
+        }
+        finally
+        {
+            _gitLock.Release();
+        }
     }
 
     /// <summary>
@@ -149,10 +195,26 @@ public sealed class ConfigRepoManager
     /// <param name="ct">Cancellation token.</param>
     public async Task CommitAllChangesAsync(string commitMessage, CancellationToken ct = default)
     {
-        await RunGitAsync(_localPath, ["add", "--all"], ct);
-        await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
-        await RunGitAsync(_localPath, ["pull", "--no-rebase"], ct);
-        await RunGitAsync(_localPath, ["push"], ct);
+        await _gitLock.WaitAsync(ct);
+        try
+        {
+            await RunGitAsync(_localPath, ["add", "--all"], ct);
+            await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
+            try
+            {
+                await RunGitAsync(_localPath, ["pull"], ct);
+            }
+            catch
+            {
+                await TryAbortMergeAsync(_localPath, ct);
+                throw;
+            }
+            await RunGitAsync(_localPath, ["push"], ct);
+        }
+        finally
+        {
+            _gitLock.Release();
+        }
     }
 
     private static string NormalizeUrl(string url)
