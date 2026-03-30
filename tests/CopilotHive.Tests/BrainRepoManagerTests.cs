@@ -18,9 +18,7 @@ public sealed class BrainRepoManagerTests : IDisposable
     public void Dispose()
     {
         if (Directory.Exists(_tempDir))
-        {
-            Directory.Delete(_tempDir, recursive: true);
-        }
+            TestHelpers.ForceDeleteDirectory(_tempDir);
     }
 
     [Fact]
@@ -438,7 +436,7 @@ public sealed class BrainRepoManagerGetHeadShaTests : IDisposable
     public void Dispose()
     {
         if (Directory.Exists(_tempDir))
-            Directory.Delete(_tempDir, recursive: true);
+            TestHelpers.ForceDeleteDirectory(_tempDir);
     }
 
     [Fact]

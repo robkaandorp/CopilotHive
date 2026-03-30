@@ -1661,7 +1661,7 @@ public sealed class ComposerToolTests : IDisposable
         }
         finally
         {
-            Directory.Delete(tmpDir, recursive: true);
+            TestHelpers.ForceDeleteDirectory(tmpDir);
         }
     }
 
@@ -2406,7 +2406,7 @@ public sealed class ComposerToolTests : IDisposable
         }
         finally
         {
-            Directory.Delete(tmpDir, recursive: true);
+            TestHelpers.ForceDeleteDirectory(tmpDir);
         }
     }
 
@@ -2432,7 +2432,7 @@ public sealed class ComposerToolTests : IDisposable
         }
         finally
         {
-            Directory.Delete(tmpDir, recursive: true);
+            TestHelpers.ForceDeleteDirectory(tmpDir);
         }
     }
 
@@ -2458,7 +2458,7 @@ public sealed class ComposerToolTests : IDisposable
         }
         finally
         {
-            Directory.Delete(tmpDir, recursive: true);
+            TestHelpers.ForceDeleteDirectory(tmpDir);
         }
     }
 
@@ -2484,7 +2484,7 @@ public sealed class ComposerToolTests : IDisposable
         }
         finally
         {
-            Directory.Delete(tmpDir, recursive: true);
+            TestHelpers.ForceDeleteDirectory(tmpDir);
         }
     }
 

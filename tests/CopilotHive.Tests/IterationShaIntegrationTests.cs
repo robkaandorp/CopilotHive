@@ -32,7 +32,7 @@ public sealed class IterationShaIntegrationTests : IAsyncDisposable
     {
         await _store.DisposeAsync();
         if (Directory.Exists(_tempDir))
-            Directory.Delete(_tempDir, recursive: true);
+            TestHelpers.ForceDeleteDirectory(_tempDir);
     }
 
     private static Goal CreateGoal(string id = "goal-sha-test") =>

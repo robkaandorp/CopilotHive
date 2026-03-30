@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using CopilotHive.Configuration;
 using CopilotHive.Orchestration;
@@ -733,7 +734,7 @@ public sealed class SqliteGoalStore : IGoalStore
             Status = Enum.Parse<GoalStatus>(reader.GetString(reader.GetOrdinal("status")), ignoreCase: true),
             Priority = Enum.Parse<GoalPriority>(reader.GetString(reader.GetOrdinal("priority")), ignoreCase: true),
             Scope = goalScope,
-            CreatedAt = DateTime.Parse(reader.GetString(reader.GetOrdinal("created_at"))),
+            CreatedAt = DateTime.Parse(reader.GetString(reader.GetOrdinal("created_at")), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
         };
 
         var reposOrd = reader.GetOrdinal("repositories");
@@ -754,11 +755,11 @@ public sealed class SqliteGoalStore : IGoalStore
 
         var startedOrd = reader.GetOrdinal("started_at");
         if (!reader.IsDBNull(startedOrd))
-            goal.StartedAt = DateTime.Parse(reader.GetString(startedOrd));
+            goal.StartedAt = DateTime.Parse(reader.GetString(startedOrd), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
 
         var completedOrd = reader.GetOrdinal("completed_at");
         if (!reader.IsDBNull(completedOrd))
-            goal.CompletedAt = DateTime.Parse(reader.GetString(completedOrd));
+            goal.CompletedAt = DateTime.Parse(reader.GetString(completedOrd), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
 
         var iterOrd = reader.GetOrdinal("iterations");
         if (!reader.IsDBNull(iterOrd))
@@ -952,7 +953,7 @@ public sealed class SqliteGoalStore : IGoalStore
             Id = reader.GetString(reader.GetOrdinal("id")),
             Tag = reader.GetString(reader.GetOrdinal("tag")),
             Status = Enum.Parse<ReleaseStatus>(reader.GetString(reader.GetOrdinal("status")), ignoreCase: true),
-            CreatedAt = DateTime.Parse(reader.GetString(reader.GetOrdinal("created_at"))),
+            CreatedAt = DateTime.Parse(reader.GetString(reader.GetOrdinal("created_at")), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
         };
 
         var notesOrd = reader.GetOrdinal("notes");
@@ -961,7 +962,7 @@ public sealed class SqliteGoalStore : IGoalStore
 
         var releasedOrd = reader.GetOrdinal("released_at");
         if (!reader.IsDBNull(releasedOrd))
-            release.ReleasedAt = DateTime.Parse(reader.GetString(releasedOrd));
+            release.ReleasedAt = DateTime.Parse(reader.GetString(releasedOrd), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
 
         var reposOrd = reader.GetOrdinal("repositories");
         if (!reader.IsDBNull(reposOrd))

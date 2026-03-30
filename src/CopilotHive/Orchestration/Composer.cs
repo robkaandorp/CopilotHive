@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Globalization;
 using System.Net.Http.Json;
 using System.Text.Json;
 using CopilotHive.Configuration;
@@ -922,7 +923,7 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
                 sb.AppendLine($"\n### Iteration {iter.Iteration}{reviewSuffix}");
                 foreach (var phase in iter.Phases)
                 {
-                    var durationStr = $"{phase.DurationSeconds:F1}s";
+                    var durationStr = phase.DurationSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s";
                     var line = $"- {phase.Name}: {phase.Result} ({durationStr})";
                     if (phase.Name.Equals("Testing", StringComparison.OrdinalIgnoreCase) && iter.TestCounts is not null)
                         line += $" — {iter.TestCounts.Passed}/{iter.TestCounts.Total}";
@@ -938,7 +939,7 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
                 sb.AppendLine($"- {note}");
         }
 
-        return sb.ToString();
+        return sb.ToString().Replace("\r\n", "\n");
     }
 
     private static readonly Dictionary<string, string> PhaseOutputKeys = new(StringComparer.OrdinalIgnoreCase)
