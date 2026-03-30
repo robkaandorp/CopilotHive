@@ -24,7 +24,7 @@
 
 **Worker base branch fallback.** Fixed a crash where the worker failed to create a feature branch when the configured base branch didn't exist in the cloned repository. The worker now attempts to fetch the base branch from origin, or creates it from the current HEAD if it doesn't exist anywhere, instead of throwing an exception.
 
-## [0.5.0] - 2025-07-15
+## [0.5.0] - 2026-03-28
 
 ### Added
 
