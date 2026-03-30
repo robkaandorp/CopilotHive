@@ -238,6 +238,124 @@ public sealed class GitOperationsTests : IAsyncLifetime
         }
     }
 
+    [Fact]
+    public async Task CreateBranchAsync_OnNonEmptyRepo_WhenBaseBranchMissingLocally_ExistsOnRemote_FetchesAndCreatesTrackingBranch()
+    {
+        // Arrange — set up a remote bare repo with a distinct commit on a branch that doesn't exist locally.
+        var bareDir = Path.Combine(Path.GetTempPath(), $"GitOpsBare_{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(bareDir);
+            await RunAsync(bareDir, "init --bare");
+
+            // Create a commit on the local default branch, push to remote as "remote-base".
+            await CommitFileAsync("initial.txt", "initial content");
+            var (_, symRefOut, _) = await GitOperations.RunGitCommandAsync(
+                _repoDir, "symbolic-ref --short HEAD", CancellationToken.None);
+            var localDefault = symRefOut.Trim();
+
+            await RunAsync(_repoDir, $"remote add origin {bareDir}");
+            await RunAsync(_repoDir, $"push origin {localDefault}:remote-base");
+
+            // Get the commit hash from the remote for later verification.
+            var (_, remoteCommit, _) = await GitOperations.RunGitCommandAsync(
+                _repoDir, $"rev-parse {localDefault}", CancellationToken.None);
+            var expectedCommitHash = remoteCommit.Trim();
+
+            // Create a second commit locally so HEAD diverges from the remote.
+            await CommitFileAsync("local-only.txt", "local changes");
+
+            // Verify "remote-base" does NOT exist locally before the operation.
+            var (localCheckExit, _, _) = await GitOperations.RunGitCommandAsync(
+                _repoDir, "rev-parse --verify remote-base", CancellationToken.None);
+            Assert.NotEqual(0, localCheckExit);
+
+            // Act — CreateBranchAsync should fetch "remote-base" from origin, create a local tracking branch,
+            //       and then create the feature branch from it.
+            await GitOperations.CreateBranchAsync(
+                _repoDir, "feature/remote-based", "remote-base", CancellationToken.None);
+
+            // Assert 1 — landed on the feature branch.
+            var (_, currentBranch, _) = await GitOperations.RunGitCommandAsync(
+                _repoDir, "branch --show-current", CancellationToken.None);
+            Assert.Equal("feature/remote-based", currentBranch.Trim());
+
+            // Assert 2 — the base branch "remote-base" now exists locally as a tracking branch.
+            var (baseBranchExit, baseBranchList, _) = await GitOperations.RunGitCommandAsync(
+                _repoDir, "branch --list remote-base", CancellationToken.None);
+            Assert.Equal(0, baseBranchExit);
+            Assert.Contains("remote-base", baseBranchList);
+
+            // Assert 3 — "remote-base" points to the commit from the remote (not the local HEAD).
+            var (_, baseCommit, _) = await GitOperations.RunGitCommandAsync(
+                _repoDir, "rev-parse remote-base", CancellationToken.None);
+            Assert.Equal(expectedCommitHash, baseCommit.Trim());
+
+            // Assert 4 — the feature branch points to the same commit as the remote base branch.
+            var (_, featureCommit, _) = await GitOperations.RunGitCommandAsync(
+                _repoDir, "rev-parse feature/remote-based", CancellationToken.None);
+            Assert.Equal(expectedCommitHash, featureCommit.Trim());
+
+            // Assert 5 — git operations from a fresh process see the same state (simulating "fresh manager" pattern).
+            // Re-run git commands to verify the repository state is persisted on disk.
+            var (_, freshBranchCheck, _) = await GitOperations.RunGitCommandAsync(
+                _repoDir, "branch --show-current", CancellationToken.None);
+            Assert.Equal("feature/remote-based", freshBranchCheck.Trim());
+        }
+        finally
+        {
+            await GitOperations.ForceDeleteDirectoryAsync(bareDir);
+        }
+    }
+
+    [Fact]
+    public async Task CreateBranchAsync_OnNonEmptyRepo_WhenBaseBranchExistsNowhere_CreatesBaseFromHeadAndFeatureBranch()
+    {
+        // Arrange — create commits on the default branch, no remote configured.
+        await CommitFileAsync("first.txt", "first commit content");
+        await CommitFileAsync("second.txt", "second commit content");
+
+        var (_, headCommitBefore, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "rev-parse HEAD", CancellationToken.None);
+        var headHash = headCommitBefore.Trim();
+
+        // Verify the base branch "missing-base" does NOT exist.
+        var (baseCheckExit, _, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "rev-parse --verify missing-base", CancellationToken.None);
+        Assert.NotEqual(0, baseCheckExit);
+
+        // Act — CreateBranchAsync should create "missing-base" from HEAD, then create feature branch.
+        await GitOperations.CreateBranchAsync(
+            _repoDir, "feature/fresh-base", "missing-base", CancellationToken.None);
+
+        // Assert 1 — landed on the feature branch.
+        var (_, currentBranch, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "branch --show-current", CancellationToken.None);
+        Assert.Equal("feature/fresh-base", currentBranch.Trim());
+
+        // Assert 2 — the base branch "missing-base" was created.
+        var (_, baseBranchList, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "branch --list missing-base", CancellationToken.None);
+        Assert.Contains("missing-base", baseBranchList);
+
+        // Assert 3 — the base branch points to the original HEAD commit.
+        var (_, baseCommit, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "rev-parse missing-base", CancellationToken.None);
+        Assert.Equal(headHash, baseCommit.Trim());
+
+        // Assert 4 — the feature branch points to the same commit as the base branch.
+        var (_, featureCommit, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "rev-parse feature/fresh-base", CancellationToken.None);
+        Assert.Equal(headHash, featureCommit.Trim());
+
+        // Assert 5 — verify repository state persists (simulating "fresh manager" verification).
+        // A fresh process reading the repository should see both branches.
+        var (_, allBranches, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "branch --list", CancellationToken.None);
+        Assert.Contains("missing-base", allBranches);
+        Assert.Contains("feature/fresh-base", allBranches);
+    }
+
     // ── GetGitStatusAsync ─────────────────────────────────────────────────────
 
     [Fact]
