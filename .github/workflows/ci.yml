@@ -57,7 +57,13 @@ jobs:
         id: version
         run: |
           PREFIX=$(grep -oPm1 '(?<=<VersionPrefix>)[^<]+' Directory.Build.props)
-          echo "version=${PREFIX}-beta.${{ github.run_number }}" >> $GITHUB_OUTPUT
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "version=${PREFIX}" >> $GITHUB_OUTPUT
+            echo "is_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "version=${PREFIX}-beta.${{ github.run_number }}" >> $GITHUB_OUTPUT
+            echo "is_release=false" >> $GITHUB_OUTPUT
+          fi
           echo "prefix=${PREFIX}" >> $GITHUB_OUTPUT
 
       # ── Orchestrator ──────────────────────────────────────────────
@@ -68,8 +74,9 @@ jobs:
           images: ${{ env.ORCHESTRATOR_IMAGE }}
           tags: |
             type=sha
-            type=raw,value=latest
             type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_release }}
+            type=raw,value=beta,enable=${{ steps.version.outputs.is_release == 'false' }}
 
       - name: Orchestrator — build & push
         uses: docker/build-push-action@v6
@@ -93,9 +100,10 @@ jobs:
           images: ${{ env.WORKER_IMAGE }}
           tags: |
             type=sha
-            type=raw,value=latest
             type=raw,value=${{ steps.version.outputs.version }}
-
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_release }}
+            type=raw,value=beta,enable=${{ steps.version.outputs.is_release == 'false' }}
+            
       - name: Worker — build & push
         uses: docker/build-push-action@v6
         with:
