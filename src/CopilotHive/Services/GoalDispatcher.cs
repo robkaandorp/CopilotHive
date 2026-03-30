@@ -282,6 +282,17 @@ public sealed class GoalDispatcher : BackgroundService
 
     private async Task DriveNextPhaseAsync(GoalPipeline pipeline, TaskResult result, CancellationToken ct)
     {
+        // Extract the iteration-start SHA from coder results so the reviewer can later compute
+        // a scoped diff (git diff {sha}..HEAD) showing only this iteration's changes.
+        // The SHA comes from the worker's feature-branch clone, which is correct — unlike the
+        // Brain's persistent clone which stays on the default branch between iterations.
+        if (pipeline.Phase == GoalPhase.Coding && !string.IsNullOrEmpty(result.IterationStartSha))
+        {
+            pipeline.IterationStartSha = result.IterationStartSha;
+            _logger.LogDebug("Stored iteration start SHA {Sha} for goal {GoalId} (from coder task result)",
+                result.IterationStartSha[..Math.Min(result.IterationStartSha.Length, 12)], pipeline.GoalId);
+        }
+
         // No-op detection: if the coder returned without making any file changes,
         // skip verdict extraction and immediately retry with a stronger prompt.
         if (pipeline.Phase == GoalPhase.Coding && (result.GitStatus?.FilesChanged ?? 0) == 0)
@@ -695,6 +706,11 @@ public sealed class GoalDispatcher : BackgroundService
         {
             task.BranchInfo.Action = BranchAction.Unspecified;
         }
+
+        // Propagate the iteration start SHA to the worker via metadata so reviewers can
+        // compute an iteration-scoped diff alongside the cumulative branch diff.
+        if (pipeline.IterationStartSha is not null)
+            task.Metadata["iteration_start_sha"] = pipeline.IterationStartSha;
 
         pipeline.SetActiveTask(task.TaskId, task.BranchInfo?.FeatureBranch);
         _pipelineManager.RegisterTask(task.TaskId, pipeline.GoalId);

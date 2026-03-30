@@ -1633,3 +1633,109 @@ file sealed class RetryFakeGoalSource : IGoalSource
         string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
         Task.CompletedTask;
 }
+
+/// <summary>
+/// Tests for IterationStartSha capture: the dispatcher stores the SHA
+/// from the coder's <see cref="TaskResult"/> onto the pipeline.
+/// </summary>
+public sealed class GoalDispatcherIterationShaTests
+{
+    private static (GoalDispatcher dispatcher, GoalPipeline pipeline, string taskId)
+        CreateDispatcherInCodingPhase(int maxRetries = 1)
+    {
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        goalManager.GetNextGoalAsync().GetAwaiter().GetResult();
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        var taskId = $"task-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+
+        var notifier = new TaskCompletionNotifier();
+        var brain = new FakeDispatcherBrain();
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            notifier,
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain);
+
+        return (dispatcher, pipeline, taskId);
+    }
+
+    [Fact]
+    public async Task CoderTaskComplete_WithIterationStartSha_StoresOnPipeline()
+    {
+        // Arrange
+        const string sha = "feedbabe1234567890abcdef1234567890abcdef";
+        var (dispatcher, pipeline, taskId) = CreateDispatcherInCodingPhase();
+
+        // Act — coder completes with an IterationStartSha in the result
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "Made changes",
+            GitStatus = new GitChangeSummary { FilesChanged = 2 },
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+            IterationStartSha = sha,
+        }, TestContext.Current.CancellationToken);
+
+        // Assert — pipeline stores the SHA for use by the subsequent reviewer task
+        Assert.Equal(sha, pipeline.IterationStartSha);
+    }
+
+    [Fact]
+    public async Task CoderTaskComplete_WithoutIterationStartSha_LeavesExistingPipelineShaUnchanged()
+    {
+        // Arrange — pipeline already has a SHA from a previous dispatch
+        const string existingSha = "previous1234567890abcdef1234567890abcdef";
+        var (dispatcher, pipeline, taskId) = CreateDispatcherInCodingPhase();
+        pipeline.IterationStartSha = existingSha;
+
+        // Act — coder result has no SHA (e.g. empty repo or worker couldn't capture it)
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "Made changes",
+            GitStatus = new GitChangeSummary { FilesChanged = 1 },
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+            IterationStartSha = null, // no SHA
+        }, TestContext.Current.CancellationToken);
+
+        // Assert — existing SHA is NOT overwritten by a null result
+        Assert.Equal(existingSha, pipeline.IterationStartSha);
+    }
+
+    [Fact]
+    public async Task CoderTaskComplete_WithEmptyIterationStartSha_LeavesExistingPipelineShaUnchanged()
+    {
+        // Arrange
+        const string existingSha = "previous1234567890abcdef1234567890abcdef";
+        var (dispatcher, pipeline, taskId) = CreateDispatcherInCodingPhase();
+        pipeline.IterationStartSha = existingSha;
+
+        // Act — coder result has empty string SHA (treated same as null)
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "Made changes",
+            GitStatus = new GitChangeSummary { FilesChanged = 1 },
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+            IterationStartSha = "", // empty
+        }, TestContext.Current.CancellationToken);
+
+        // Assert — existing SHA is not overwritten
+        Assert.Equal(existingSha, pipeline.IterationStartSha);
+    }
+}

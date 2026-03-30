@@ -738,6 +738,7 @@ public sealed class PipelineStoreSchemaMigrationTests
             Assert.Contains("metrics_json", columns);
             Assert.Contains("completed_at", columns);
             Assert.Contains("merge_commit_hash", columns);
+            Assert.Contains("iteration_start_sha", columns);
         }
     }
 
@@ -980,6 +981,68 @@ public sealed class PipelineStoreRoleSessionTests : IAsyncDisposable
         Assert.Equal("uppercase-stored", restored.GetRoleSession("coder"));
         Assert.Equal("uppercase-stored", restored.GetRoleSession("Coder"));
         Assert.Equal("uppercase-stored", restored.GetRoleSession("CODER"));
+    }
+
+    [Fact]
+    public void RoundTrip_IterationStartSha_IsPersistedAndRestored()
+    {
+        // Arrange — pipeline with a non-null IterationStartSha
+        const string sha = "abc123def456789012345678901234567890abcd";
+        var pipeline = CreatePipeline("g-sha-persist");
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipeline.IterationStartSha = sha;
+
+        // Act — save and reload
+        _store.SavePipeline(pipeline);
+        var snap = Assert.Single(_store.LoadActivePipelines());
+
+        // Assert — snapshot carries the SHA
+        Assert.Equal(sha, snap.IterationStartSha);
+
+        // Assert — restored pipeline also carries the SHA
+        var restored = new GoalPipeline(snap);
+        Assert.Equal(sha, restored.IterationStartSha);
+    }
+
+    [Fact]
+    public void RoundTrip_IterationStartSha_NullIsPreservedAsNull()
+    {
+        // Arrange — pipeline without a SHA (empty repo or first-dispatch edge case)
+        var pipeline = CreatePipeline("g-sha-null");
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        // IterationStartSha is not set — defaults to null
+
+        // Act
+        _store.SavePipeline(pipeline);
+        var snap = Assert.Single(_store.LoadActivePipelines());
+
+        // Assert — null survives the round-trip
+        Assert.Null(snap.IterationStartSha);
+        var restored = new GoalPipeline(snap);
+        Assert.Null(restored.IterationStartSha);
+    }
+
+    [Fact]
+    public void RoundTrip_IterationStartSha_UpdatedValueOverwritesPrevious()
+    {
+        // Arrange — pipeline whose SHA is updated between saves (new iteration)
+        const string sha1 = "1111111111111111111111111111111111111111";
+        const string sha2 = "2222222222222222222222222222222222222222";
+        var pipeline = CreatePipeline("g-sha-update");
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        pipeline.IterationStartSha = sha1;
+        _store.SavePipeline(pipeline);
+
+        // Simulate a new iteration: update SHA
+        pipeline.IterationStartSha = sha2;
+        _store.SavePipeline(pipeline);
+
+        // Act — reload
+        var snap = Assert.Single(_store.LoadActivePipelines());
+
+        // Assert — latest SHA wins
+        Assert.Equal(sha2, snap.IterationStartSha);
     }
 }
 

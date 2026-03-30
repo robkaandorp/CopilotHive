@@ -66,6 +66,7 @@ public static class GrpcMapper
             Output = complete.Output,
             Metrics = complete.Metrics is not null ? ToDomain(complete.Metrics) : null,
             GitStatus = complete.GitStatus is not null ? ToDomain(complete.GitStatus) : null,
+            IterationStartSha = string.IsNullOrEmpty(complete.IterationStartSha) ? null : complete.IterationStartSha,
         };
     }
 
@@ -164,6 +165,7 @@ public static class GrpcMapper
                 _ => throw new InvalidOperationException($"Unknown TaskOutcome: {result.Status}"),
             },
             Output = result.Output,
+            IterationStartSha = result.IterationStartSha ?? "",
         };
         if (result.Metrics is not null)
         {

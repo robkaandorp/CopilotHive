@@ -139,6 +139,7 @@ message TaskComplete {
   string output = 3;              // Full worker output
   GitStatus git_status = 4;
   TaskMetrics metrics = 5;
+  string iteration_start_sha = 6; // HEAD SHA captured before the coder ran; used for iteration-scoped diff
 }
 
 message WorkerReady {

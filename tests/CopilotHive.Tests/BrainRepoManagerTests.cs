@@ -423,6 +423,131 @@ public sealed class BrainRepoManagerTests : IDisposable
 }
 
 /// <summary>
+/// Tests for <see cref="BrainRepoManager.GetHeadShaAsync"/>.
+/// </summary>
+public sealed class BrainRepoManagerGetHeadShaTests : IDisposable
+{
+    private readonly string _tempDir;
+
+    public BrainRepoManagerGetHeadShaTests()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(_tempDir);
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_tempDir))
+            Directory.Delete(_tempDir, recursive: true);
+    }
+
+    [Fact]
+    public async Task GetHeadShaAsync_NoCloneExists_ReturnsNull()
+    {
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        var ct = TestContext.Current.CancellationToken;
+
+        var sha = await manager.GetHeadShaAsync("nonexistent-repo", ct);
+
+        Assert.Null(sha);
+    }
+
+    [Fact]
+    public async Task GetHeadShaAsync_EmptyGitDir_ReturnsNull()
+    {
+        // Create a minimal .git structure without any commits
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        var ct = TestContext.Current.CancellationToken;
+        var clonePath = manager.GetClonePath("empty-repo");
+        Directory.CreateDirectory(Path.Combine(clonePath, ".git"));
+
+        // No commits — rev-parse HEAD should fail; method must return null gracefully
+        var sha = await manager.GetHeadShaAsync("empty-repo", ct);
+
+        Assert.Null(sha);
+    }
+
+    [Fact]
+    public async Task GetHeadShaAsync_RepoWithCommit_ReturnsSha()
+    {
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        var ct = TestContext.Current.CancellationToken;
+
+        // Initialise a real git repo with a commit so HEAD resolves
+        var clonePath = manager.GetClonePath("sha-test-repo");
+        Directory.CreateDirectory(clonePath);
+        Git(clonePath, "init", "-b", "main");
+        Git(clonePath, "config", "user.email", "test@test.com");
+        Git(clonePath, "config", "user.name", "Test");
+        File.WriteAllText(Path.Combine(clonePath, "file.txt"), "hello");
+        Git(clonePath, "add", "file.txt");
+        Git(clonePath, "commit", "-m", "Initial commit");
+
+        var expectedSha = GitOutput(clonePath, "rev-parse", "HEAD").Trim();
+
+        var sha = await manager.GetHeadShaAsync("sha-test-repo", ct);
+
+        Assert.NotNull(sha);
+        Assert.Equal(expectedSha, sha);
+    }
+
+    [Fact]
+    public async Task GetHeadShaAsync_ReturnsFullFortyCharSha()
+    {
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        var ct = TestContext.Current.CancellationToken;
+
+        var clonePath = manager.GetClonePath("sha-full-test");
+        Directory.CreateDirectory(clonePath);
+        Git(clonePath, "init", "-b", "main");
+        Git(clonePath, "config", "user.email", "test@test.com");
+        Git(clonePath, "config", "user.name", "Test");
+        File.WriteAllText(Path.Combine(clonePath, "file.txt"), "content");
+        Git(clonePath, "add", "file.txt");
+        Git(clonePath, "commit", "-m", "Commit");
+
+        var sha = await manager.GetHeadShaAsync("sha-full-test", ct);
+
+        // Full SHA is 40 hex characters
+        Assert.NotNull(sha);
+        Assert.Equal(40, sha!.Length);
+        Assert.All(sha, c => Assert.True(
+            (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'),
+            $"Non-hex character '{c}' in SHA"));
+    }
+
+    private static void Git(string workDir, params string[] args)
+    {
+        var psi = new ProcessStartInfo("git")
+        {
+            WorkingDirectory = workDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        using var p = Process.Start(psi)!;
+        p.WaitForExit();
+    }
+
+    private static string GitOutput(string workDir, params string[] args)
+    {
+        var psi = new ProcessStartInfo("git")
+        {
+            WorkingDirectory = workDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        using var p = Process.Start(psi)!;
+        var output = p.StandardOutput.ReadToEnd();
+        p.WaitForExit();
+        return output;
+    }
+}
+
+/// <summary>
 /// Test logger that captures log entries for verification.
 /// </summary>
 internal sealed class TestLogger<T> : ILogger<T>

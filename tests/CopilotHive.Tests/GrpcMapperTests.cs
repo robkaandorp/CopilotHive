@@ -189,6 +189,35 @@ public sealed class GrpcMapperTests
         Assert.Null(restored.GitStatus);
     }
 
+    [Fact]
+    public void TaskResult_RoundTrip_IterationStartSha_IsPreserved()
+    {
+        // Arrange — TaskResult with an IterationStartSha (coder path)
+        const string sha = "abc123def456789012345678901234567890abcd";
+        var original = BuildFullTaskResult() with { IterationStartSha = sha };
+
+        // Act — round-trip through gRPC mapper
+        var complete = GrpcMapper.ToGrpc(original);
+        var restored = GrpcMapper.ToDomain(complete);
+
+        // Assert — SHA survives the gRPC boundary
+        Assert.Equal(sha, restored.IterationStartSha);
+    }
+
+    [Fact]
+    public void TaskResult_RoundTrip_NullIterationStartSha_RestoredAsNull()
+    {
+        // Arrange — TaskResult without a SHA (reviewer path)
+        var original = BuildFullTaskResult() with { IterationStartSha = null };
+
+        // Act
+        var complete = GrpcMapper.ToGrpc(original);
+        var restored = GrpcMapper.ToDomain(complete);
+
+        // Assert — null SHA survives as null (not empty string)
+        Assert.Null(restored.IterationStartSha);
+    }
+
     // ── BranchAction enum ─────────────────────────────────────────────────────
 
     [Theory]
