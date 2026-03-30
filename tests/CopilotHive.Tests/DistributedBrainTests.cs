@@ -498,44 +498,149 @@ public sealed class DistributedBrainTests
         Assert.Contains("Changes to CHANGELOG.md, README.md, and XML doc comments are EXPECTED", source);
     }
 
-    // -- CraftPromptAsync Review Phase Test Results Tests --
+    // -- BuildCraftPromptText / Review Phase Test Results Tests --
 
     [Fact]
-    public async Task CraftPromptAsync_ReviewPhase_WithTesterOutput_IncludesTestResultsInPromptSentToBrain()
+    public void BuildCraftPromptText_ReviewPhase_WithTesterOutput_ContainsTesterString()
     {
         // Arrange: pipeline with tester output recorded for iteration 1
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-rev-1", "Add null checks to UserService");
         pipeline.RecordOutput(WorkerRole.Tester, 1, "All 42 tests pass. No failures.");
 
-        // Act: without a connected agent the fallback prompt is returned,
-        // but the important thing to verify here is that the source-level logic
-        // (reading PhaseOutputs) doesn't throw and the real method is reachable.
-        var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Review, null, TestContext.Current.CancellationToken);
+        // Act: call the internal method directly to get the raw prompt text
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
-        // Even the fallback prompt must not throw; the connection-free path just
-        // returns the description-based fallback, which is fine for this smoke test.
-        Assert.NotNull(prompt);
-        Assert.NotEmpty(prompt);
+        // Assert: the tester output string appears verbatim in the prompt
+        Assert.Contains("All 42 tests pass. No failures.", prompt);
+        Assert.Contains("Current iteration test results (from the tester phase):", prompt);
     }
 
     [Fact]
-    public async Task CraftPromptAsync_CodingPhase_TesterOutputPresent_DoesNotThrow()
+    public void BuildCraftPromptText_CodingPhase_TesterOutputPresent_OmitsTestResults()
     {
         // Arrange: even if tester output is present, a Coding phase prompt must not include it
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-coding-1", "Implement feature Y");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "Some test output");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "Some test output that should not appear");
 
-        // Act & Assert: no exception
-        var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken);
-        Assert.NotNull(prompt);
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Coding);
+
+        // Assert: tester output is NOT in the prompt for Coding phase
+        Assert.DoesNotContain("Some test output that should not appear", prompt);
+        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
     }
 
     [Fact]
-    public void ReviewPhaseGuidance_ContainsTestResultsInstruction()
+    public void BuildCraftPromptText_TestingPhase_TesterOutputPresent_OmitsTestResults()
     {
-        // Verify the reviewer role instruction mentions test results for BOTH Review branches.
+        // Arrange: tester output present but Testing phase should not include it
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-test-1", "Run integration tests");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "Previous test output should not appear");
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Testing);
+
+        // Assert: tester output is NOT in the prompt for Testing phase
+        Assert.DoesNotContain("Previous test output should not appear", prompt);
+        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_TesterOutputAppearsAfterAdditionalContext()
+    {
+        // Arrange: pipeline with tester output and additional context
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-rev-order", "Review ordering test");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "UNIQUE_TESTER_MARKER_XYZ");
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review, "UNIQUE_CONTEXT_MARKER_ABC");
+
+        // Assert: both markers are present
+        Assert.Contains("UNIQUE_CONTEXT_MARKER_ABC", prompt);
+        Assert.Contains("UNIQUE_TESTER_MARKER_XYZ", prompt);
+
+        // Assert ordering: additionalContext appears BEFORE currentTestResults
+        var contextIdx = prompt.IndexOf("Additional context:", StringComparison.Ordinal);
+        var testResultsIdx = prompt.IndexOf("Current iteration test results (from the tester phase):", StringComparison.Ordinal);
+        Assert.True(contextIdx >= 0, "Additional context header should be in prompt");
+        Assert.True(testResultsIdx >= 0, "Test results header should be in prompt");
+        Assert.True(contextIdx < testResultsIdx,
+            $"Additional context (at {contextIdx}) should appear before test results (at {testResultsIdx})");
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_WithoutTesterOutput_OmitsTestResultsSection()
+    {
+        // Arrange: no tester output recorded
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-review-notest", "Review the implementation");
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: the test results section header should NOT be present
+        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_WhitespaceOnlyTesterOutput_OmitsTestResultsSection()
+    {
+        // Arrange: tester output is only whitespace
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-review-ws", "Review with whitespace tester output");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "   \n  \t  ");
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: whitespace-only output should be treated as absent
+        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_UsesCurrentIterationTesterOutput()
+    {
+        // Arrange: record tester output for two iterations, advance to iteration 2
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-review-iter", "Multi-iteration review");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "ITER1_OUTPUT_SHOULD_NOT_APPEAR");
+        pipeline.IncrementIteration();
+        pipeline.RecordOutput(WorkerRole.Tester, 2, "ITER2_OUTPUT_EXPECTED");
+
+        // Act: at iteration 2, should use tester-2 key
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: only iteration 2's output appears
+        Assert.Contains("ITER2_OUTPUT_EXPECTED", prompt);
+        Assert.DoesNotContain("ITER1_OUTPUT_SHOULD_NOT_APPEAR", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_ContainsReviewerInstructionText()
+    {
+        // Verify the reviewer role instruction includes the exact required text
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-rev-instr", "Review instruction test");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "All tests pass.");
+
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        Assert.Contains(
+            "Use the testing phase results to verify that all tests pass",
+            prompt);
+        Assert.Contains(
+            "do NOT reject because you cannot run tests yourself",
+            prompt);
+    }
+
+    [Fact]
+    public void ReviewPhaseGuidance_BothBranches_ContainExactInstruction()
+    {
+        // Verify the exact reviewer instruction appears in BOTH Review branches in source.
         var repoRoot = Environment.CurrentDirectory;
         while (repoRoot != null && !Directory.GetFiles(repoRoot, "*.slnx").Any())
             repoRoot = Directory.GetParent(repoRoot)?.FullName;
@@ -546,149 +651,13 @@ public sealed class DistributedBrainTests
 
         var source = File.ReadAllText(sourcePath);
 
-        // Both Review branches must include the test-results instruction
-        Assert.Contains(
-            "Test results from the current iteration's tester phase are provided in the prompt.",
-            source);
-        Assert.Contains(
-            "do NOT reject changes on the grounds that you cannot run tests yourself",
-            source);
+        const string expectedInstruction =
+            "Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.";
 
         // Count occurrences — both GoalPhase.Review branches should have it
-        var occurrences = source.Split("do NOT reject changes on the grounds that you cannot run tests yourself").Length - 1;
+        var occurrences = source.Split(expectedInstruction).Length - 1;
         Assert.True(occurrences >= 2,
             $"Expected the test-results instruction to appear in at least 2 Review branches, but found {occurrences}.");
-    }
-
-    [Fact]
-    public void CraftPromptAsync_ReviewPhase_CurrentTestResultsBlock_IsPresentInSource()
-    {
-        // Structural check: the source must contain the currentTestResults extraction logic
-        var repoRoot = Environment.CurrentDirectory;
-        while (repoRoot != null && !Directory.GetFiles(repoRoot, "*.slnx").Any())
-            repoRoot = Directory.GetParent(repoRoot)?.FullName;
-        Assert.NotNull(repoRoot);
-
-        var sourcePath = Path.Combine(repoRoot, "src", "CopilotHive", "Orchestration", "DistributedBrain.cs");
-        var source = File.ReadAllText(sourcePath);
-
-        // The variable must be declared and keyed off the tester phase output
-        Assert.Contains("currentTestResults", source);
-        Assert.Contains("tester-{pipeline.Iteration}", source);
-
-        // The prompt template must embed it after the additionalContext block
-        Assert.Contains(
-            "Current iteration test results (from the tester phase):",
-            source);
-    }
-
-    // -- CraftPromptAsync Review Phase Integration Tests --
-
-    [Fact]
-    public async Task CraftPromptAsync_ReviewPhase_WithTesterOutput_PromptTemplateContainsTestResultsExtractionLogic()
-    {
-        // Integration test: Verify that when CraftPromptAsync is called for Review phase
-        // with tester output in PhaseOutputs, the extraction logic works correctly.
-        // Since we can't connect a real agent, we verify:
-        // 1. No exception is thrown when tester output exists
-        // 2. The PhaseOutputs dictionary is correctly accessed with the key "tester-{iteration}"
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
-        var pipeline = CreatePipeline("g-review-test", "Review the changes");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "PASSED: All 150 tests pass. Coverage: 87%");
-
-        // Act: Call CraftPromptAsync for Review phase - this should not throw
-        // The method will build the prompt template (which includes currentTestResults extraction)
-        // before checking if agent is null and returning fallback
-        var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Review, null, TestContext.Current.CancellationToken);
-
-        // Assert: No exception and non-empty result
-        Assert.NotNull(prompt);
-        Assert.NotEmpty(prompt);
-
-        // Verify the PhaseOutputs was correctly populated with the tester output
-        Assert.True(pipeline.PhaseOutputs.TryGetValue("tester-1", out var storedOutput));
-        Assert.Contains("150 tests pass", storedOutput);
-    }
-
-    [Fact]
-    public async Task CraftPromptAsync_ReviewPhase_WithoutTesterOutput_GeneratesPromptWithoutErrors()
-    {
-        // Integration test: Verify that when CraftPromptAsync is called for Review phase
-        // with no tester output in PhaseOutputs, the method completes successfully
-        // without throwing NullReferenceException or other errors.
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
-        var pipeline = CreatePipeline("g-review-notest", "Review the implementation");
-
-        // No tester output recorded - PhaseOutputs will be empty
-        // This tests the !string.IsNullOrWhiteSpace(testerOut) check in the extraction logic
-
-        // Act: Call CraftPromptAsync for Review phase - this should not throw
-        // even though PhaseOutputs is empty
-        var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Review, null, TestContext.Current.CancellationToken);
-
-        // Assert: No exception and non-empty result
-        Assert.NotNull(prompt);
-        Assert.NotEmpty(prompt);
-
-        // Verify that PhaseOutputs is indeed empty (no tester output was recorded)
-        Assert.False(pipeline.PhaseOutputs.TryGetValue("tester-1", out _));
-    }
-
-    [Fact]
-    public async Task CraftPromptAsync_ReviewPhase_TesterOutputForDifferentIteration_UsesCorrectIterationKey()
-    {
-        // Integration test: Verify that the currentTestResults extraction uses the current iteration,
-        // not a hardcoded iteration value.
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
-        var pipeline = CreatePipeline("g-review-iter", "Multi-iteration review");
-
-        // Record tester output for iteration 1
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "Iteration 1 test results: 10 tests passed");
-
-        // Increment to iteration 2
-        pipeline.IncrementIteration();
-
-        // Record tester output for iteration 2
-        pipeline.RecordOutput(WorkerRole.Tester, 2, "Iteration 2 test results: 15 tests passed");
-
-        // Act: Call CraftPromptAsync for Review phase at iteration 2
-        // The extraction logic should use tester-{pipeline.Iteration} = tester-2
-        var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Review, null, TestContext.Current.CancellationToken);
-
-        // Assert: No exception and non-empty result
-        Assert.NotNull(prompt);
-        Assert.NotEmpty(prompt);
-
-        // Verify both tester outputs exist but the current iteration's key is tester-2
-        Assert.True(pipeline.PhaseOutputs.TryGetValue("tester-1", out var iter1Output));
-        Assert.True(pipeline.PhaseOutputs.TryGetValue("tester-2", out var iter2Output));
-        Assert.Contains("10 tests", iter1Output);
-        Assert.Contains("15 tests", iter2Output);
-        Assert.Equal(2, pipeline.Iteration); // Verify we're at iteration 2
-    }
-
-    [Fact]
-    public async Task CraftPromptAsync_NonReviewPhase_WithTesterOutput_DoesNotIncludeTestResults()
-    {
-        // Integration test: Verify that the currentTestResults extraction is only done
-        // for Review phase, not for other phases like Coding or Testing.
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
-        var pipeline = CreatePipeline("g-coding", "Implement new feature");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "Test results should not be included for Coding phase");
-
-        // Act: Call CraftPromptAsync for Coding phase - tester output should be ignored
-        var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken);
-
-        // Assert: No exception and non-empty result
-        Assert.NotNull(prompt);
-        Assert.NotEmpty(prompt);
-
-        // The tester output exists in PhaseOutputs but should not be included in Coding phase prompt
-        Assert.True(pipeline.PhaseOutputs.ContainsKey("tester-1"));
     }
 
 }

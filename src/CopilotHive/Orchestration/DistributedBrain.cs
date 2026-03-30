@@ -590,10 +590,14 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
-    /// Asks the Brain to craft a prompt for the specified phase's worker.
+    /// Builds the raw prompt text that will be sent to the Brain to craft a worker prompt.
+    /// Extracted for testability — allows verifying prompt content without a connected agent.
     /// </summary>
-    public async Task<string> CraftPromptAsync(
-        GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
+    /// <param name="pipeline">The goal pipeline with phase outputs and iteration state.</param>
+    /// <param name="phase">The current goal phase.</param>
+    /// <param name="additionalContext">Optional additional context to include.</param>
+    /// <returns>The assembled prompt text.</returns>
+    internal string BuildCraftPromptText(GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null)
     {
         var roleName = phase.ToWorkerRole().ToRoleName();
         var historyContext = BuildMetricsHistoryContext(3);
@@ -621,7 +625,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 - "Files NOT to change" in the goal IS a strict prohibition — flag any changes to those files as MAJOR.
                 - The goal description defines WHAT to do. New behavior described in the goal is IN SCOPE — do not reject changes just because the base branch doesn't have them yet.
                 - Only flag issues that are clearly bugs, security problems, or genuine scope violations (touching unrelated code/features).
-                - Test results from the current iteration's tester phase are provided in the prompt. Use them to verify correctness — do NOT reject changes on the grounds that you cannot run tests yourself.
+                - Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
                 """,
             GoalPhase.Review => """
                 - For reviewers: Do NOT include any git diff commands in your prompt — the worker's WORKSPACE CONTEXT already provides the correct diff command with the exact merge-base hash. If an "Iteration diff command" is also listed there, tell reviewers they can use it to focus on changes made in this specific iteration. Just tell them to review the branch changes using the diff commands from their workspace context, focus only on the diff lines (+ and -), and call the report_review_verdict tool when done.
@@ -629,7 +633,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 - "Files NOT to change" in the goal IS a strict prohibition — flag any changes to those files as MAJOR.
                 - The goal description defines WHAT to do. New behavior described in the goal is IN SCOPE — do not reject changes just because the base branch doesn't have them yet.
                 - Only flag issues that are clearly bugs, security problems, or genuine scope violations (touching unrelated code/features).
-                - Test results from the current iteration's tester phase are provided in the prompt. Use them to verify correctness — do NOT reject changes on the grounds that you cannot run tests yourself.
+                - Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
                 """,
             GoalPhase.Testing => """
                 - For testers: tell them to build, run the test skill, write integration tests, and call the report_test_results tool when done. Do NOT tell them to create report files.
@@ -657,7 +661,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             ? testerOut
             : "";
 
-        var prompt = $$"""
+        return $$"""
             Craft a prompt for the {{roleName}} worker.
 
             Goal: {{pipeline.Description}}
@@ -682,6 +686,15 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             Respond with ONLY the prompt text — no tool calls, no JSON, no markdown wrapping.
             """;
+    }
+
+    /// <summary>
+    /// Asks the Brain to craft a prompt for the specified phase's worker.
+    /// </summary>
+    public async Task<string> CraftPromptAsync(
+        GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
+    {
+        var prompt = BuildCraftPromptText(pipeline, phase, additionalContext);
 
         if (_agent is null)
         {
