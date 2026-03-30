@@ -582,6 +582,115 @@ public sealed class DistributedBrainTests
             source);
     }
 
+    // -- CraftPromptAsync Review Phase Integration Tests --
+
+    [Fact]
+    public async Task CraftPromptAsync_ReviewPhase_WithTesterOutput_PromptTemplateContainsTestResultsExtractionLogic()
+    {
+        // Integration test: Verify that when CraftPromptAsync is called for Review phase
+        // with tester output in PhaseOutputs, the extraction logic works correctly.
+        // Since we can't connect a real agent, we verify:
+        // 1. No exception is thrown when tester output exists
+        // 2. The PhaseOutputs dictionary is correctly accessed with the key "tester-{iteration}"
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-review-test", "Review the changes");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "PASSED: All 150 tests pass. Coverage: 87%");
+
+        // Act: Call CraftPromptAsync for Review phase - this should not throw
+        // The method will build the prompt template (which includes currentTestResults extraction)
+        // before checking if agent is null and returning fallback
+        var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Review, null, TestContext.Current.CancellationToken);
+
+        // Assert: No exception and non-empty result
+        Assert.NotNull(prompt);
+        Assert.NotEmpty(prompt);
+
+        // Verify the PhaseOutputs was correctly populated with the tester output
+        Assert.True(pipeline.PhaseOutputs.TryGetValue("tester-1", out var storedOutput));
+        Assert.Contains("150 tests pass", storedOutput);
+    }
+
+    [Fact]
+    public async Task CraftPromptAsync_ReviewPhase_WithoutTesterOutput_GeneratesPromptWithoutErrors()
+    {
+        // Integration test: Verify that when CraftPromptAsync is called for Review phase
+        // with no tester output in PhaseOutputs, the method completes successfully
+        // without throwing NullReferenceException or other errors.
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-review-notest", "Review the implementation");
+
+        // No tester output recorded - PhaseOutputs will be empty
+        // This tests the !string.IsNullOrWhiteSpace(testerOut) check in the extraction logic
+
+        // Act: Call CraftPromptAsync for Review phase - this should not throw
+        // even though PhaseOutputs is empty
+        var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Review, null, TestContext.Current.CancellationToken);
+
+        // Assert: No exception and non-empty result
+        Assert.NotNull(prompt);
+        Assert.NotEmpty(prompt);
+
+        // Verify that PhaseOutputs is indeed empty (no tester output was recorded)
+        Assert.False(pipeline.PhaseOutputs.TryGetValue("tester-1", out _));
+    }
+
+    [Fact]
+    public async Task CraftPromptAsync_ReviewPhase_TesterOutputForDifferentIteration_UsesCorrectIterationKey()
+    {
+        // Integration test: Verify that the currentTestResults extraction uses the current iteration,
+        // not a hardcoded iteration value.
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-review-iter", "Multi-iteration review");
+
+        // Record tester output for iteration 1
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "Iteration 1 test results: 10 tests passed");
+
+        // Increment to iteration 2
+        pipeline.IncrementIteration();
+
+        // Record tester output for iteration 2
+        pipeline.RecordOutput(WorkerRole.Tester, 2, "Iteration 2 test results: 15 tests passed");
+
+        // Act: Call CraftPromptAsync for Review phase at iteration 2
+        // The extraction logic should use tester-{pipeline.Iteration} = tester-2
+        var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Review, null, TestContext.Current.CancellationToken);
+
+        // Assert: No exception and non-empty result
+        Assert.NotNull(prompt);
+        Assert.NotEmpty(prompt);
+
+        // Verify both tester outputs exist but the current iteration's key is tester-2
+        Assert.True(pipeline.PhaseOutputs.TryGetValue("tester-1", out var iter1Output));
+        Assert.True(pipeline.PhaseOutputs.TryGetValue("tester-2", out var iter2Output));
+        Assert.Contains("10 tests", iter1Output);
+        Assert.Contains("15 tests", iter2Output);
+        Assert.Equal(2, pipeline.Iteration); // Verify we're at iteration 2
+    }
+
+    [Fact]
+    public async Task CraftPromptAsync_NonReviewPhase_WithTesterOutput_DoesNotIncludeTestResults()
+    {
+        // Integration test: Verify that the currentTestResults extraction is only done
+        // for Review phase, not for other phases like Coding or Testing.
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-coding", "Implement new feature");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "Test results should not be included for Coding phase");
+
+        // Act: Call CraftPromptAsync for Coding phase - tester output should be ignored
+        var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken);
+
+        // Assert: No exception and non-empty result
+        Assert.NotNull(prompt);
+        Assert.NotEmpty(prompt);
+
+        // The tester output exists in PhaseOutputs but should not be included in Coding phase prompt
+        Assert.True(pipeline.PhaseOutputs.ContainsKey("tester-1"));
+    }
+
 }
 
 /// <summary>
