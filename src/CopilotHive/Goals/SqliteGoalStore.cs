@@ -685,6 +685,7 @@ public sealed class SqliteGoalStore : IGoalStore
             {
                 var goalId = reader.GetString(0);
                 var json = reader.GetString(1);
+                if (string.IsNullOrWhiteSpace(json)) continue;
                 var clarifications = JsonSerializer.Deserialize<List<PersistedClarification>>(json, JsonOptions);
                 if (clarifications is null) continue;
 

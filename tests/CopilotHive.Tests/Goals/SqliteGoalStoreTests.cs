@@ -1376,4 +1376,31 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
 
         Assert.Empty(results);
     }
+
+    /// <summary>
+    /// Verifies that rows with an empty-string clarifications_json are skipped
+    /// and do not cause a JsonException.
+    /// </summary>
+    [Fact]
+    public async Task GetAllClarificationsAsync_EmptyStringJson_SkippedWithoutException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = MakeGoal("g-clarif-emptystr");
+        await _store.CreateGoalAsync(goal, ct);
+
+        // Insert a row directly with an empty-string clarifications_json to simulate
+        // legacy / corrupted data that bypasses the '[]' SQL filter.
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO goal_iterations (goal_id, iteration, phases_json, clarifications_json, created_at)
+            VALUES ('g-clarif-emptystr', 99, '[]', '', datetime('now'))
+            """;
+        cmd.ExecuteNonQuery();
+
+        // Must not throw and must return no clarifications.
+        var results = await _store.GetAllClarificationsAsync(ct: ct);
+
+        Assert.Empty(results);
+    }
 }
