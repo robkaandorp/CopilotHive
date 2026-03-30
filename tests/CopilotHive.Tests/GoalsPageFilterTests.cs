@@ -29,11 +29,13 @@ public sealed class GoalsPageFilterTests
 
     /// <summary>
     /// Applies the release filter exactly as <c>Goals.razor ApplyFilters</c> does.
+    /// When a specific release is selected, filters goals from all releases sharing the same tag.
     /// </summary>
     private static List<Goal> ApplyReleaseFilter(
         List<Goal> goals,
         string releaseFilter,
-        Dictionary<string, ReleaseStatus> releaseStatusById)
+        Dictionary<string, ReleaseStatus> releaseStatusById,
+        List<Release>? allReleases = null)
     {
         IEnumerable<Goal> query = goals;
 
@@ -45,7 +47,12 @@ public sealed class GoalsPageFilterTests
         }
         else if (releaseFilter != ReleaseFilterAll)
         {
-            query = query.Where(g => g.ReleaseId == releaseFilter);
+            var releases = allReleases ?? [];
+            var selectedTag = releases.FirstOrDefault(r => r.Id == releaseFilter)?.Tag;
+            var taggedReleaseIds = selectedTag is not null
+                ? releases.Where(r => r.Tag == selectedTag).Select(r => r.Id).ToHashSet()
+                : new HashSet<string> { releaseFilter };
+            query = query.Where(g => g.ReleaseId is not null && taggedReleaseIds.Contains(g.ReleaseId));
         }
 
         return query.ToList();
@@ -63,11 +70,14 @@ public sealed class GoalsPageFilterTests
             .ToList();
 
     /// <summary>
-    /// Computes the Released releases list exactly as <c>Goals.razor _releasedReleases</c> does.
+    /// Computes the Released releases list exactly as <c>Goals.razor _releasedReleases</c> does,
+    /// including deduplication by tag.
     /// </summary>
     private static List<Release> ComputeReleasedReleases(List<Release> releases) =>
         releases
             .Where(r => r.Status == ReleaseStatus.Released)
+            .GroupBy(r => r.Tag)
+            .Select(g => g.First())
             .OrderByDescending(r => r.CreatedAt)
             .ToList();
 
@@ -429,5 +439,100 @@ public sealed class GoalsPageFilterTests
 
         Assert.Single(result);
         Assert.Equal("g2", result[0].Id);
+    }
+
+    // ── _releasedReleases deduplication by tag ────────────────────────────────
+
+    [Fact]
+    public void ReleasedReleases_DeduplicatesByTag_RetainsFirstOccurrence()
+    {
+        var older = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var newer = new DateTime(2024, 6, 1, 0, 0, 0, DateTimeKind.Utc);
+        var releases = new List<Release>
+        {
+            new() { Id = "rel-a", Tag = "v1.0.0", Status = ReleaseStatus.Released, CreatedAt = older },
+            new() { Id = "rel-b", Tag = "v1.0.0", Status = ReleaseStatus.Released, CreatedAt = newer },
+        };
+
+        var result = ComputeReleasedReleases(releases);
+
+        Assert.Single(result);
+        Assert.Equal("v1.0.0", result[0].Tag);
+    }
+
+    [Fact]
+    public void ReleasedReleases_DistinctTags_AllRetained()
+    {
+        var releases = new List<Release>
+        {
+            new() { Id = "rel-a", Tag = "v1.0.0", Status = ReleaseStatus.Released, CreatedAt = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc) },
+            new() { Id = "rel-b", Tag = "v2.0.0", Status = ReleaseStatus.Released, CreatedAt = new DateTime(2024, 2, 1, 0, 0, 0, DateTimeKind.Utc) },
+        };
+
+        var result = ComputeReleasedReleases(releases);
+
+        Assert.Equal(2, result.Count);
+    }
+
+    // ── release filter: tag-based matching across releases ───────────────────
+
+    [Fact]
+    public void ReleaseFilter_SpecificId_IncludesGoalsFromAllReleasesWithSameTag()
+    {
+        var releases = new List<Release>
+        {
+            new() { Id = "rel-a", Tag = "v1.0.0", Status = ReleaseStatus.Released },
+            new() { Id = "rel-b", Tag = "v1.0.0", Status = ReleaseStatus.Released },
+            new() { Id = "rel-c", Tag = "v2.0.0", Status = ReleaseStatus.Released },
+        };
+        var goals = new List<Goal>
+        {
+            new() { Id = "g1", Description = "d", ReleaseId = "rel-a" },
+            new() { Id = "g2", Description = "d", ReleaseId = "rel-b" },
+            new() { Id = "g3", Description = "d", ReleaseId = "rel-c" },
+            new() { Id = "g4", Description = "d", ReleaseId = null },
+        };
+
+        var result = ApplyReleaseFilter(goals, "rel-a", [], releases);
+
+        Assert.Equal(2, result.Count);
+        Assert.Contains(result, g => g.Id == "g1");
+        Assert.Contains(result, g => g.Id == "g2");
+    }
+
+    [Fact]
+    public void ReleaseFilter_SpecificId_NoMatchingTag_FallsBackToIdMatch()
+    {
+        // When selected release ID is not found in allReleases, fall back to direct ID match.
+        var goals = new List<Goal>
+        {
+            new() { Id = "g1", Description = "d", ReleaseId = "unknown-id" },
+            new() { Id = "g2", Description = "d", ReleaseId = "other-id" },
+        };
+
+        var result = ApplyReleaseFilter(goals, "unknown-id", [], []);
+
+        Assert.Single(result);
+        Assert.Equal("g1", result[0].Id);
+    }
+
+    [Fact]
+    public void ReleaseFilter_SpecificId_OnlyReturnsGoalsWithTagMatchingRelease_NotOtherTags()
+    {
+        var releases = new List<Release>
+        {
+            new() { Id = "rel-v1", Tag = "v1.0.0", Status = ReleaseStatus.Released },
+            new() { Id = "rel-v2", Tag = "v2.0.0", Status = ReleaseStatus.Released },
+        };
+        var goals = new List<Goal>
+        {
+            new() { Id = "g1", Description = "d", ReleaseId = "rel-v1" },
+            new() { Id = "g2", Description = "d", ReleaseId = "rel-v2" },
+        };
+
+        var result = ApplyReleaseFilter(goals, "rel-v1", [], releases);
+
+        Assert.Single(result);
+        Assert.Equal("g1", result[0].Id);
     }
 }

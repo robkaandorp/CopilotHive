@@ -164,9 +164,11 @@ else if (_loaded)
     private Dictionary<string, string> _retryErrors = new();
     private Dictionary<string, GoalStatus> _goalStatusById = new();
 
-    /// <summary>All releases with status Released, ordered descending by creation date.</summary>
+    /// <summary>All releases with status Released, deduplicated by tag, ordered descending by creation date.</summary>
     private List<Release> _releasedReleases => _allReleases
         .Where(r => r.Status == ReleaseStatus.Released)
+        .GroupBy(r => r.Tag)
+        .Select(g => g.First())
         .OrderByDescending(r => r.CreatedAt)
         .ToList();
 
@@ -215,7 +217,12 @@ else if (_loaded)
         }
         else if (_releaseFilter != ReleaseFilterAll)
         {
-            query = query.Where(g => g.ReleaseId == _releaseFilter);
+            // Find the tag for the selected release ID, then include goals from all releases sharing that tag.
+            var selectedTag = _allReleases.FirstOrDefault(r => r.Id == _releaseFilter)?.Tag;
+            var taggedReleaseIds = selectedTag is not null
+                ? _allReleases.Where(r => r.Tag == selectedTag).Select(r => r.Id).ToHashSet()
+                : new HashSet<string> { _releaseFilter };
+            query = query.Where(g => g.ReleaseId is not null && taggedReleaseIds.Contains(g.ReleaseId));
         }
 
         if (!string.IsNullOrWhiteSpace(_searchText))
