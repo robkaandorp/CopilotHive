@@ -167,6 +167,7 @@ else if (_loaded)
     private Dictionary<string, string> _revertErrors = new();
     private Dictionary<string, string> _retryErrors = new();
     private Dictionary<string, GoalStatus> _goalStatusById = new();
+    private Dictionary<string, ReleaseStatus> _releaseStatusById = new();
 
     /// <summary>All releases with status Released, deduplicated by tag, ordered descending by creation date.</summary>
     private List<Release> _releasedReleases => _allReleases
@@ -195,6 +196,7 @@ else if (_loaded)
         _allGoals = (await GoalStore.GetAllGoalsAsync()).ToList();
         _allReleases = (await GoalStore.GetReleasesAsync()).ToList();
         _goalStatusById = _allGoals.ToDictionary(g => g.Id, g => g.Status);
+        _releaseStatusById = _allReleases.ToDictionary(r => r.Id, r => r.Status);
         _loaded = true;
         ApplyFilters();
     }
@@ -218,14 +220,22 @@ else if (_loaded)
         //   any other value         → specific release ID
         if (_releaseFilter == ReleaseFilterUnreleased)
         {
-            query = query.Where(g => string.IsNullOrEmpty(g.ReleaseId));
+            // Include goals with no release assignment OR goals assigned to a Planning release
+            // (Planning releases are not yet shipped, so their goals are still "unreleased").
+            query = query.Where(g =>
+                string.IsNullOrEmpty(g.ReleaseId) ||
+                (_releaseStatusById.TryGetValue(g.ReleaseId, out var releaseStatus) && releaseStatus == ReleaseStatus.Planning));
         }
         else if (_releaseFilter != ReleaseFilterAll)
         {
-            // Find the tag for the selected release ID, then include goals from all releases sharing that tag.
-            var selectedTag = _allReleases.FirstOrDefault(r => r.Id == _releaseFilter)?.Tag;
-            var taggedReleaseIds = selectedTag is not null
-                ? _allReleases.Where(r => r.Tag == selectedTag).Select(r => r.Id).ToHashSet()
+            // Find the selected release, then include goals from all releases sharing the same tag
+            // AND the same status, so Released and Planning releases with identical tags don't bleed.
+            var selectedRelease = _allReleases.FirstOrDefault(r => r.Id == _releaseFilter);
+            var taggedReleaseIds = selectedRelease is not null
+                ? _allReleases
+                    .Where(r => r.Tag == selectedRelease.Tag && r.Status == selectedRelease.Status)
+                    .Select(r => r.Id)
+                    .ToHashSet()
                 : new HashSet<string> { _releaseFilter };
             query = query.Where(g => g.ReleaseId is not null && taggedReleaseIds.Contains(g.ReleaseId));
         }
