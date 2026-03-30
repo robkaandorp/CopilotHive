@@ -48,9 +48,12 @@ public sealed class GoalsPageFilterTests
         else if (releaseFilter != ReleaseFilterAll)
         {
             var releases = allReleases ?? [];
-            var selectedTag = releases.FirstOrDefault(r => r.Id == releaseFilter)?.Tag;
-            var taggedReleaseIds = selectedTag is not null
-                ? releases.Where(r => r.Tag == selectedTag).Select(r => r.Id).ToHashSet()
+            var selectedRelease = releases.FirstOrDefault(r => r.Id == releaseFilter);
+            var taggedReleaseIds = selectedRelease is not null
+                ? releases
+                    .Where(r => r.Tag == selectedRelease.Tag && r.Status == selectedRelease.Status)
+                    .Select(r => r.Id)
+                    .ToHashSet()
                 : new HashSet<string> { releaseFilter };
             query = query.Where(g => g.ReleaseId is not null && taggedReleaseIds.Contains(g.ReleaseId));
         }
@@ -534,5 +537,48 @@ public sealed class GoalsPageFilterTests
 
         Assert.Single(result);
         Assert.Equal("g1", result[0].Id);
+    }
+
+    [Fact]
+    public void ReleaseFilter_SpecificId_DoesNotIncludeGoalsFromReleasesWithSameTagButDifferentStatus()
+    {
+        // A Released release and a Planning release share the same tag.
+        // Selecting the Released release must NOT include goals from the Planning release.
+        var releases = new List<Release>
+        {
+            new() { Id = "rel-released", Tag = "v1.0.0", Status = ReleaseStatus.Released },
+            new() { Id = "rel-planning", Tag = "v1.0.0", Status = ReleaseStatus.Planning },
+        };
+        var goals = new List<Goal>
+        {
+            new() { Id = "g1", Description = "in released", ReleaseId = "rel-released" },
+            new() { Id = "g2", Description = "in planning", ReleaseId = "rel-planning" },
+        };
+
+        var result = ApplyReleaseFilter(goals, "rel-released", [], releases);
+
+        Assert.Single(result);
+        Assert.Equal("g1", result[0].Id);
+    }
+
+    [Fact]
+    public void ReleaseFilter_SpecificId_PlanningRelease_DoesNotIncludeGoalsFromReleasedReleasesWithSameTag()
+    {
+        // Selecting the Planning release must NOT include goals from the Released release.
+        var releases = new List<Release>
+        {
+            new() { Id = "rel-released", Tag = "v1.0.0", Status = ReleaseStatus.Released },
+            new() { Id = "rel-planning", Tag = "v1.0.0", Status = ReleaseStatus.Planning },
+        };
+        var goals = new List<Goal>
+        {
+            new() { Id = "g1", Description = "in released", ReleaseId = "rel-released" },
+            new() { Id = "g2", Description = "in planning", ReleaseId = "rel-planning" },
+        };
+
+        var result = ApplyReleaseFilter(goals, "rel-planning", [], releases);
+
+        Assert.Single(result);
+        Assert.Equal("g2", result[0].Id);
     }
 }
