@@ -590,10 +590,14 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
-    /// Asks the Brain to craft a prompt for the specified phase's worker.
+    /// Builds the raw prompt text that will be sent to the Brain to craft a worker prompt.
+    /// Extracted for testability — allows verifying prompt content without a connected agent.
     /// </summary>
-    public async Task<string> CraftPromptAsync(
-        GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
+    /// <param name="pipeline">The goal pipeline with phase outputs and iteration state.</param>
+    /// <param name="phase">The current goal phase.</param>
+    /// <param name="additionalContext">Optional additional context to include.</param>
+    /// <returns>The assembled prompt text.</returns>
+    internal string BuildCraftPromptText(GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null)
     {
         var roleName = phase.ToWorkerRole().ToRoleName();
         var historyContext = BuildMetricsHistoryContext(3);
@@ -621,6 +625,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 - "Files NOT to change" in the goal IS a strict prohibition — flag any changes to those files as MAJOR.
                 - The goal description defines WHAT to do. New behavior described in the goal is IN SCOPE — do not reject changes just because the base branch doesn't have them yet.
                 - Only flag issues that are clearly bugs, security problems, or genuine scope violations (touching unrelated code/features).
+                - Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
                 """,
             GoalPhase.Review => """
                 - For reviewers: Do NOT include any git diff commands in your prompt — the worker's WORKSPACE CONTEXT already provides the correct diff command with the exact merge-base hash. If an "Iteration diff command" is also listed there, tell reviewers they can use it to focus on changes made in this specific iteration. Just tell them to review the branch changes using the diff commands from their workspace context, focus only on the diff lines (+ and -), and call the report_review_verdict tool when done.
@@ -628,6 +633,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 - "Files NOT to change" in the goal IS a strict prohibition — flag any changes to those files as MAJOR.
                 - The goal description defines WHAT to do. New behavior described in the goal is IN SCOPE — do not reject changes just because the base branch doesn't have them yet.
                 - Only flag issues that are clearly bugs, security problems, or genuine scope violations (touching unrelated code/features).
+                - Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
                 """,
             GoalPhase.Testing => """
                 - For testers: tell them to build, run the test skill, write integration tests, and call the report_test_results tool when done. Do NOT tell them to create report files.
@@ -647,7 +653,15 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             ? BuildPreviousIterationContext(pipeline)
             : "";
 
-        var prompt = $$"""
+        // For review phase, extract the tester output from the current iteration so the reviewer
+        // can verify test results without needing to run tests themselves.
+        var currentTestResults = (phase == GoalPhase.Review
+            && pipeline.PhaseOutputs.TryGetValue($"tester-{pipeline.Iteration}", out var testerOut)
+            && !string.IsNullOrWhiteSpace(testerOut))
+            ? testerOut
+            : "";
+
+        return $$"""
             Craft a prompt for the {{roleName}} worker.
 
             Goal: {{pipeline.Description}}
@@ -657,6 +671,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {{phaseInstructions}}
             {{(previousFeedback.Length > 0 ? $"\n{previousFeedback}" : "")}}
             {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
+            {{(currentTestResults.Length > 0 ? $"\nCurrent iteration test results (from the tester phase):\n{currentTestResults}" : "")}}
             {{(historyContext.Length > 0 ? $"\n{historyContext}" : "")}}
 
             The worker has access to project skills (e.g. build, test) that describe how to build and test this project.
@@ -671,12 +686,54 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             Respond with ONLY the prompt text — no tool calls, no JSON, no markdown wrapping.
             """;
+    }
+
+    /// <summary>
+    /// Builds a direct worker prompt for the Review phase when the Brain agent is not connected.
+    /// Includes tester output and reviewer guidance so reviewers always get test results
+    /// and the "verify that all tests pass" instruction, regardless of agent availability.
+    /// </summary>
+    /// <param name="pipeline">The goal pipeline with phase outputs and iteration state.</param>
+    /// <param name="additionalContext">Optional additional context to include.</param>
+    /// <returns>A reviewer-ready fallback prompt containing test results and guidance.</returns>
+    internal static string BuildReviewFallbackPrompt(GoalPipeline pipeline, string? additionalContext = null)
+    {
+        var currentTestResults = (pipeline.PhaseOutputs.TryGetValue($"tester-{pipeline.Iteration}", out var testerOut)
+            && !string.IsNullOrWhiteSpace(testerOut))
+            ? testerOut
+            : "";
+
+        return $$"""
+            Review the changes for: {{pipeline.Description}}
+
+            Use the diff commands from your workspace context to review the branch changes.
+            Focus only on the diff lines (+ and -), then call the report_review_verdict tool when done.
+
+            - "Files to change" in the goal is GUIDANCE, not an exhaustive whitelist. Test files and test changes that cover the modified code are ALWAYS acceptable and expected.
+            - "Files NOT to change" in the goal IS a strict prohibition — flag any changes to those files as MAJOR.
+            - The goal description defines WHAT to do. New behavior described in the goal is IN SCOPE — do not reject changes just because the base branch doesn't have them yet.
+            - Only flag issues that are clearly bugs, security problems, or genuine scope violations (touching unrelated code/features).
+            - Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
+            {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
+            {{(currentTestResults.Length > 0 ? $"\nCurrent iteration test results (from the tester phase):\n{currentTestResults}" : "")}}
+            """;
+    }
+
+    /// <summary>
+    /// Asks the Brain to craft a prompt for the specified phase's worker.
+    /// </summary>
+    public async Task<string> CraftPromptAsync(
+        GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
+    {
+        var prompt = BuildCraftPromptText(pipeline, phase, additionalContext);
 
         if (_agent is null)
         {
             _logger.LogWarning("Brain not connected — using fallback prompt for {GoalId} phase {Phase}",
                 pipeline.GoalId, phase);
-            return $"Work on: {pipeline.Description}";
+            return phase == GoalPhase.Review
+                ? BuildReviewFallbackPrompt(pipeline, additionalContext)
+                : $"Work on: {pipeline.Description}";
         }
 
         try

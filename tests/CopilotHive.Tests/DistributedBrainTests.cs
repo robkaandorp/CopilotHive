@@ -498,6 +498,281 @@ public sealed class DistributedBrainTests
         Assert.Contains("Changes to CHANGELOG.md, README.md, and XML doc comments are EXPECTED", source);
     }
 
+    // -- BuildCraftPromptText / Review Phase Test Results Tests --
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_WithTesterOutput_ContainsTesterString()
+    {
+        // Arrange: pipeline with tester output recorded for iteration 1
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-rev-1", "Add null checks to UserService");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "All 42 tests pass. No failures.");
+
+        // Act: call the internal method directly to get the raw prompt text
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: the tester output string appears verbatim in the prompt
+        Assert.Contains("All 42 tests pass. No failures.", prompt);
+        Assert.Contains("Current iteration test results (from the tester phase):", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_CodingPhase_TesterOutputPresent_OmitsTestResults()
+    {
+        // Arrange: even if tester output is present, a Coding phase prompt must not include it
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-coding-1", "Implement feature Y");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "Some test output that should not appear");
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Coding);
+
+        // Assert: tester output is NOT in the prompt for Coding phase
+        Assert.DoesNotContain("Some test output that should not appear", prompt);
+        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_TestingPhase_TesterOutputPresent_OmitsTestResults()
+    {
+        // Arrange: tester output present but Testing phase should not include it
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-test-1", "Run integration tests");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "Previous test output should not appear");
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Testing);
+
+        // Assert: tester output is NOT in the prompt for Testing phase
+        Assert.DoesNotContain("Previous test output should not appear", prompt);
+        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_TesterOutputAppearsAfterAdditionalContext()
+    {
+        // Arrange: pipeline with tester output and additional context
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-rev-order", "Review ordering test");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "UNIQUE_TESTER_MARKER_XYZ");
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review, "UNIQUE_CONTEXT_MARKER_ABC");
+
+        // Assert: both markers are present
+        Assert.Contains("UNIQUE_CONTEXT_MARKER_ABC", prompt);
+        Assert.Contains("UNIQUE_TESTER_MARKER_XYZ", prompt);
+
+        // Assert ordering: additionalContext appears BEFORE currentTestResults
+        var contextIdx = prompt.IndexOf("Additional context:", StringComparison.Ordinal);
+        var testResultsIdx = prompt.IndexOf("Current iteration test results (from the tester phase):", StringComparison.Ordinal);
+        Assert.True(contextIdx >= 0, "Additional context header should be in prompt");
+        Assert.True(testResultsIdx >= 0, "Test results header should be in prompt");
+        Assert.True(contextIdx < testResultsIdx,
+            $"Additional context (at {contextIdx}) should appear before test results (at {testResultsIdx})");
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_WithoutTesterOutput_OmitsTestResultsSection()
+    {
+        // Arrange: no tester output recorded
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-review-notest", "Review the implementation");
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: the test results section header should NOT be present
+        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_WhitespaceOnlyTesterOutput_OmitsTestResultsSection()
+    {
+        // Arrange: tester output is only whitespace
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-review-ws", "Review with whitespace tester output");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "   \n  \t  ");
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: whitespace-only output should be treated as absent
+        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_UsesCurrentIterationTesterOutput()
+    {
+        // Arrange: record tester output for two iterations, advance to iteration 2
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-review-iter", "Multi-iteration review");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "ITER1_OUTPUT_SHOULD_NOT_APPEAR");
+        pipeline.IncrementIteration();
+        pipeline.RecordOutput(WorkerRole.Tester, 2, "ITER2_OUTPUT_EXPECTED");
+
+        // Act: at iteration 2, should use tester-2 key
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: only iteration 2's output appears
+        Assert.Contains("ITER2_OUTPUT_EXPECTED", prompt);
+        Assert.DoesNotContain("ITER1_OUTPUT_SHOULD_NOT_APPEAR", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_ContainsReviewerInstructionText()
+    {
+        // Verify the reviewer role instruction includes the exact required text
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-rev-instr", "Review instruction test");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "All tests pass.");
+
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        Assert.Contains(
+            "Use the testing phase results to verify that all tests pass",
+            prompt);
+        Assert.Contains(
+            "do NOT reject because you cannot run tests yourself",
+            prompt);
+    }
+
+    [Fact]
+    public void ReviewPhaseGuidance_BothBranches_ContainExactInstruction()
+    {
+        // Verify the exact reviewer instruction appears in BOTH Review branches in source.
+        var repoRoot = Environment.CurrentDirectory;
+        while (repoRoot != null && !Directory.GetFiles(repoRoot, "*.slnx").Any())
+            repoRoot = Directory.GetParent(repoRoot)?.FullName;
+        Assert.NotNull(repoRoot);
+
+        var sourcePath = Path.Combine(repoRoot, "src", "CopilotHive", "Orchestration", "DistributedBrain.cs");
+        Assert.True(File.Exists(sourcePath), $"Source file not found at {sourcePath}");
+
+        var source = File.ReadAllText(sourcePath);
+
+        const string expectedInstruction =
+            "Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.";
+
+        // Count occurrences — both GoalPhase.Review branches + BuildReviewFallbackPrompt should have it
+        var occurrences = source.Split(expectedInstruction).Length - 1;
+        Assert.True(occurrences >= 3,
+            $"Expected the test-results instruction to appear in at least 3 locations (2 Review branches + fallback), but found {occurrences}.");
+    }
+
+    // -- BuildReviewFallbackPrompt Tests --
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_WithTesterOutput_ContainsTestResults()
+    {
+        var pipeline = CreatePipeline("g-fb-1", "Fix null reference in OrderService");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "Passed: 87, Failed: 0");
+
+        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+
+        Assert.Contains("Passed: 87, Failed: 0", prompt);
+        Assert.Contains("Current iteration test results (from the tester phase):", prompt);
+    }
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_ContainsReviewerGuidance()
+    {
+        var pipeline = CreatePipeline("g-fb-2", "Update API controller");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "All tests pass");
+
+        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+
+        Assert.Contains(
+            "Use the testing phase results to verify that all tests pass",
+            prompt);
+        Assert.Contains(
+            "do NOT reject because you cannot run tests yourself",
+            prompt);
+    }
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_ContainsGoalDescription()
+    {
+        var pipeline = CreatePipeline("g-fb-3", "Refactor PaymentGateway module");
+
+        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+
+        Assert.Contains("Refactor PaymentGateway module", prompt);
+    }
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_WithAdditionalContext_ContainsContext()
+    {
+        var pipeline = CreatePipeline("g-fb-4", "Add logging");
+
+        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline, "EXTRA_CONTEXT_MARKER");
+
+        Assert.Contains("Additional context:", prompt);
+        Assert.Contains("EXTRA_CONTEXT_MARKER", prompt);
+    }
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_NoTesterOutput_OmitsTestResultsSection()
+    {
+        var pipeline = CreatePipeline("g-fb-5", "Remove deprecated endpoints");
+
+        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+
+        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
+    }
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_WhitespaceOnlyTesterOutput_OmitsTestResultsSection()
+    {
+        var pipeline = CreatePipeline("g-fb-6", "Clean up imports");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "  \n\t  ");
+
+        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+
+        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
+    }
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_UsesCurrentIterationTesterOutput()
+    {
+        var pipeline = CreatePipeline("g-fb-7", "Multi-iteration fallback review");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "ITER1_FALLBACK_SHOULD_NOT_APPEAR");
+        pipeline.IncrementIteration();
+        pipeline.RecordOutput(WorkerRole.Tester, 2, "ITER2_FALLBACK_EXPECTED");
+
+        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+
+        Assert.Contains("ITER2_FALLBACK_EXPECTED", prompt);
+        Assert.DoesNotContain("ITER1_FALLBACK_SHOULD_NOT_APPEAR", prompt);
+    }
+
+    [Fact]
+    public async Task CraftPromptAsync_NullAgent_ReviewPhase_ContainsTesterOutput()
+    {
+        // When agent is null, Review phase must still get tester output and guidance
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-fb-craft-1", "Fix authentication bug");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "FALLBACK_TESTER_RESULTS_42");
+
+        var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Review, null, TestContext.Current.CancellationToken);
+
+        Assert.Contains("FALLBACK_TESTER_RESULTS_42", prompt);
+        Assert.Contains("Current iteration test results (from the tester phase):", prompt);
+        Assert.Contains("do NOT reject because you cannot run tests yourself", prompt);
+    }
+
+    [Fact]
+    public async Task CraftPromptAsync_NullAgent_CodingPhase_ReturnsGenericFallback()
+    {
+        // Non-review phases should still get the generic fallback
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-fb-craft-2", "Implement caching layer");
+
+        var prompt = await brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken);
+
+        Assert.Equal("Work on: Implement caching layer", prompt);
+    }
+
 }
 
 /// <summary>
