@@ -2,7 +2,7 @@
 
 # CopilotHive
 
-CopilotHive is a **self-improving multi-agent orchestration system** powered by **SharpCoder** (an autonomous coding agent library). A pool of generic worker agents collaborate autonomously inside Docker containers — dynamically taking on roles (coder, tester, doc-writer, reviewer, improver) per task — to implement software goals without human intervention. A conversational **Composer** agent helps decompose high-level intent into actionable goals through a streaming chat interface.
+CopilotHive is a **self-improving multi-agent orchestration system** powered by **[SharpCoder](https://github.com/ChrisLibbee/SharpCoder)** (an autonomous coding agent library). A pool of generic worker agents collaborate autonomously inside Docker containers — dynamically taking on roles (coder, tester, doc-writer, reviewer, improver) per task — to implement software goals without human intervention. A conversational **Composer** agent helps decompose high-level intent into actionable goals through a streaming chat interface.
 
 ## Architecture
 
