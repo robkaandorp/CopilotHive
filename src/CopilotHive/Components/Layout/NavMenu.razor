@@ -2,20 +2,20 @@
 @using CopilotHive.Orchestration
 @implements IDisposable
 
-<NavLink href="/" Match="NavLinkMatch.All">Dashboard</NavLink>
+<NavLink href="/" Match="NavLinkMatch.All">🏠 Dashboard</NavLink>
 <NavLink href="/composer">
-    Composer
+    💬 Composer
     @if (_pendingClarifications > 0)
     {
         <span class="badge badge-clarification" title="@_pendingClarifications pending clarification(s)">🔔 @_pendingClarifications</span>
     }
 </NavLink>
-<NavLink href="/goals">Goals</NavLink>
+<NavLink href="/goals">🎯 Goals</NavLink>
 <NavLink href="/releases">📦 Releases</NavLink>
-<NavLink href="/orchestrator">Orchestrator</NavLink>
-<NavLink href="/workers">Workers</NavLink>
-<NavLink href="/configuration">Configuration</NavLink>
-<NavLink href="/logs">Logs</NavLink>
+<NavLink href="/orchestrator">🎵 Orchestrator</NavLink>
+<NavLink href="/workers">🐝 Workers</NavLink>
+<NavLink href="/configuration">⚙️ Configuration</NavLink>
+<NavLink href="/logs">🪵 Logs</NavLink>
 
 <div class="nav-version">
     <span class="badge @(_isBeta ? "badge-yellow" : "badge-muted")">v@(_version)</span>
