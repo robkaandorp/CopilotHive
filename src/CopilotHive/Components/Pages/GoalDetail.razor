@@ -2,6 +2,7 @@
 @using CopilotHive.Dashboard
 @using CopilotHive.Goals
 @using CopilotHive.Orchestration
+@using CopilotHive.Services
 @using Markdig
 @implements IDisposable
 @inject DashboardStateService State
@@ -295,6 +296,26 @@
                                         </tbody>
                                     </table>
                                 </div>
+                            }
+
+                            @if (phase.Clarifications.Count > 0)
+                            {
+                                <details class="collapsible-output" open="@(phase.Status == "waiting")">
+                                    <summary>💬 Clarifications (@phase.Clarifications.Count)</summary>
+                                    <div style="margin-top:0.5rem">
+                                        @foreach (var clarification in phase.Clarifications)
+                                        {
+                                            <div style="margin-bottom:0.75rem;padding:0.5rem 0.75rem;border-left:3px solid var(--yellow);background:rgba(227,179,65,0.08);border-radius:4px">
+                                                <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">
+                                                    @clarification.Timestamp.ToString("HH:mm:ss") UTC
+                                                </div>
+                                                <div style="margin-bottom:0.35rem"><strong>Q:</strong> @clarification.Question</div>
+                                                <div style="margin-bottom:0.25rem"><strong>A:</strong> @clarification.Answer</div>
+                                                <div style="font-size:0.75rem;color:var(--text-muted)">answered by: @clarification.AnsweredBy</div>
+                                            </div>
+                                        }
+                                    </div>
+                                </details>
                             }
 
                             @if (phase.Name == "Planning")
@@ -742,6 +763,7 @@ else
         "completed" => "badge-green",
         "failed" => "badge-red",
         "active" => "badge-blue",
+        "waiting" => "badge-yellow",
         _ => "badge-muted",
     };
 
@@ -750,6 +772,7 @@ else
         "completed" => "✓",
         "failed" => "✗",
         "active" => "●",
+        "waiting" => "💬",
         "pending" => "○",
         "skipped" => "~",
         _ => "○",

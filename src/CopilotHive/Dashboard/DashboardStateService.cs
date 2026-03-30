@@ -239,6 +239,22 @@ public sealed class DashboardStateService : IDisposable
                 },
             };
 
+            // Group persisted clarifications by phase name for this iteration
+            var summaryClarificationsByPhase = summary.Clarifications
+                .GroupBy(c => c.Phase, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    g => g.Key,
+                    g => g.Select(c => new ClarificationEntry(
+                        Timestamp: c.Timestamp,
+                        GoalId: goalId,
+                        Iteration: summary.Iteration,
+                        Phase: c.Phase,
+                        WorkerRole: c.WorkerRole,
+                        Question: c.Question,
+                        Answer: c.Answer,
+                        AnsweredBy: c.AnsweredBy)).ToList(),
+                    StringComparer.OrdinalIgnoreCase);
+
             foreach (var pr in summary.Phases)
             {
                 var roleName = PhaseNameToRoleName(pr.Name);
@@ -252,6 +268,7 @@ public sealed class DashboardStateService : IDisposable
                 var isTestPhase = pr.Name == "Testing";
                 var isReviewPhase = pr.Name == "Review";
 
+                summaryClarificationsByPhase.TryGetValue(pr.Name, out var summaryClarifications);
                 summaryCraftPrompts.TryGetValue(roleName, out var summaryPhasePrompts);
                 phases.Add(new PhaseViewInfo
                 {
@@ -266,6 +283,7 @@ public sealed class DashboardStateService : IDisposable
                     ReviewVerdict = isReviewPhase ? summary.ReviewVerdict : null,
                     BrainPrompt = summaryPhasePrompts.BrainPrompt,
                     WorkerPrompt = summaryPhasePrompts.WorkerPrompt,
+                    Clarifications = summaryClarifications ?? [],
                 });
             }
 
@@ -290,6 +308,12 @@ public sealed class DashboardStateService : IDisposable
 
             var craftPrompts = ExtractCraftPrompts(pipeline.Conversation, currentIter);
             var (planningBrainPrompt, planningBrainResponse) = ExtractPlanningPrompts(pipeline.Conversation, currentIter);
+
+            // Collect all clarifications from this pipeline, grouped by phase name
+            var clarificationsByPhase = pipeline.Clarifications
+                .Where(c => c.Iteration == currentIter)
+                .GroupBy(c => c.Phase, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.OrdinalIgnoreCase);
 
             var currentPhases = new List<PhaseViewInfo>
             {
@@ -317,7 +341,7 @@ public sealed class DashboardStateService : IDisposable
                     if (pipeline.StateMachine.CompletedPhases.Contains(phase))
                         status = "completed";
                     else if (isCurrent && phase == pipeline.Phase)
-                        status = "active";
+                        status = pipeline.IsWaitingForClarification ? "waiting" : "active";
                     else if (pipeline.Phase == GoalPhase.Failed && !failedFound)
                         { status = "failed"; failedFound = true; }
                     else if (pipeline.Phase == GoalPhase.Done)
@@ -333,8 +357,9 @@ public sealed class DashboardStateService : IDisposable
                     var isTestPhase = phase == GoalPhase.Testing;
                     var isReviewPhase = phase == GoalPhase.Review;
                     var metrics = pipeline.Metrics;
-                    var hasMetrics = status is "completed" or "active" or "failed";
+                    var hasMetrics = status is "completed" or "active" or "failed" or "waiting";
 
+                    clarificationsByPhase.TryGetValue(phase.ToString(), out var phaseClarifications);
                     craftPrompts.TryGetValue(roleName, out var phasePrompts);
                     currentPhases.Add(new PhaseViewInfo
                     {
@@ -353,11 +378,12 @@ public sealed class DashboardStateService : IDisposable
                         Issues = hasMetrics && isReviewPhase ? metrics.ReviewIssues.ToList() :
                                  hasMetrics && isTestPhase ? metrics.Issues.ToList() : [],
                         Verdict = hasMetrics && isTestPhase ? metrics.Verdict?.ToString() : null,
-                        ProgressReports = status == "active" && pipeline.PhaseStartedAt.HasValue
+                        ProgressReports = (status == "active" || status == "waiting") && pipeline.PhaseStartedAt.HasValue
                             ? progress.Where(p => p.Timestamp >= pipeline.PhaseStartedAt.Value).ToList()
                             : [],
                         BrainPrompt = phasePrompts.BrainPrompt,
                         WorkerPrompt = phasePrompts.WorkerPrompt,
+                        Clarifications = phaseClarifications ?? [],
                     });
                 }
             }
@@ -816,4 +842,6 @@ public sealed class PhaseViewInfo
     public string? BrainPrompt { get; init; }
     /// <summary>Crafted worker prompt (Brain assistant message) for this phase, or null if not available.</summary>
     public string? WorkerPrompt { get; init; }
+    /// <summary>Clarification Q&amp;As that occurred during this phase (matched by iteration and phase name).</summary>
+    public List<ClarificationEntry> Clarifications { get; init; } = [];
 }

@@ -1818,6 +1818,170 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Equal("release-goal-1", goals[0].Id);
     }
 
+    // ── Clarification display for summarized/completed iterations ────────────
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetGoalDetail"/> populates
+    /// <see cref="PhaseViewInfo.Clarifications"/> from <see cref="IterationSummary.Clarifications"/>
+    /// for completed (summarized) iterations so historical clarifications are visible in the UI.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_CompletedIteration_PopulatesClarificationsOnPhaseView()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "clarif-completed-goal",
+            Description = "Goal with clarifications in completed iteration",
+            Status = GoalStatus.Completed,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 45.0 },
+            ],
+            Clarifications =
+            [
+                new PersistedClarification
+                {
+                    Timestamp = new DateTime(2024, 6, 1, 12, 0, 0, DateTimeKind.Utc),
+                    Phase = "Coding",
+                    WorkerRole = "coder",
+                    Question = "Which pattern should I use?",
+                    Answer = "Use the repository pattern.",
+                    AnsweredBy = "brain",
+                },
+            ],
+        };
+        await _store.AddIterationAsync(goal.Id, summary, ct);
+
+        using var service = CreateService();
+        var detail = service.GetGoalDetail("clarif-completed-goal");
+
+        Assert.NotNull(detail);
+        var iter = Assert.Single(detail.Iterations);
+        var codingPhase = iter.Phases.FirstOrDefault(p => p.Name == "Coding");
+        Assert.NotNull(codingPhase);
+        var clarif = Assert.Single(codingPhase.Clarifications);
+        Assert.Equal("Which pattern should I use?", clarif.Question);
+        Assert.Equal("Use the repository pattern.", clarif.Answer);
+        Assert.Equal("brain", clarif.AnsweredBy);
+        Assert.Equal("Coding", clarif.Phase);
+        Assert.Equal("clarif-completed-goal", clarif.GoalId);
+        Assert.Equal(1, clarif.Iteration);
+    }
+
+    /// <summary>
+    /// Verifies that when a completed iteration has no clarifications,
+    /// all <see cref="PhaseViewInfo.Clarifications"/> lists remain empty.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_CompletedIteration_NoClarifications_EmptyLists()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "no-clarif-completed-goal",
+            Description = "Goal with no clarifications",
+            Status = GoalStatus.Completed,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 30.0 },
+            ],
+            Clarifications = [],
+        };
+        await _store.AddIterationAsync(goal.Id, summary, ct);
+
+        using var service = CreateService();
+        var detail = service.GetGoalDetail("no-clarif-completed-goal");
+
+        Assert.NotNull(detail);
+        var iter = Assert.Single(detail.Iterations);
+        var codingPhase = iter.Phases.FirstOrDefault(p => p.Name == "Coding");
+        Assert.NotNull(codingPhase);
+        Assert.Empty(codingPhase.Clarifications);
+    }
+
+    /// <summary>
+    /// Verifies that clarifications are matched to the correct phase —
+    /// a Testing-phase clarification does not appear on the Coding phase.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_CompletedIteration_ClarificationsMatchedToCorrectPhase()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "multi-phase-clarif-goal",
+            Description = "Goal with clarifications in multiple phases",
+            Status = GoalStatus.Completed,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 50.0 },
+                new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 20.0 },
+            ],
+            Clarifications =
+            [
+                new PersistedClarification
+                {
+                    Timestamp = new DateTime(2024, 6, 1, 12, 0, 0, DateTimeKind.Utc),
+                    Phase = "Coding",
+                    WorkerRole = "coder",
+                    Question = "Coding question?",
+                    Answer = "Coding answer.",
+                    AnsweredBy = "brain",
+                },
+                new PersistedClarification
+                {
+                    Timestamp = new DateTime(2024, 6, 1, 13, 0, 0, DateTimeKind.Utc),
+                    Phase = "Testing",
+                    WorkerRole = "tester",
+                    Question = "Testing question?",
+                    Answer = "Testing answer.",
+                    AnsweredBy = "composer",
+                },
+            ],
+        };
+        await _store.AddIterationAsync(goal.Id, summary, ct);
+
+        using var service = CreateService();
+        var detail = service.GetGoalDetail("multi-phase-clarif-goal");
+
+        Assert.NotNull(detail);
+        var iter = Assert.Single(detail.Iterations);
+
+        var codingPhase = iter.Phases.FirstOrDefault(p => p.Name == "Coding");
+        Assert.NotNull(codingPhase);
+        var codingClarif = Assert.Single(codingPhase.Clarifications);
+        Assert.Equal("Coding question?", codingClarif.Question);
+        Assert.Equal("brain", codingClarif.AnsweredBy);
+
+        var testingPhase = iter.Phases.FirstOrDefault(p => p.Name == "Testing");
+        Assert.NotNull(testingPhase);
+        var testingClarif = Assert.Single(testingPhase.Clarifications);
+        Assert.Equal("Testing question?", testingClarif.Question);
+        Assert.Equal("composer", testingClarif.AnsweredBy);
+    }
+
     private DashboardStateService CreateService()
     {
         var workerPool = new WorkerPool();

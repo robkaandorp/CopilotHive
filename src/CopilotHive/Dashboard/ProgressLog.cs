@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using CopilotHive.Services;
 
 namespace CopilotHive.Dashboard;
 
@@ -24,6 +25,25 @@ public sealed class ProgressLog
             GoalId = goalId,
             Status = status,
             Details = details,
+        });
+
+        while (_entries.Count > _maxEntries)
+            _entries.TryDequeue(out _);
+    }
+
+    /// <summary>
+    /// Records a clarification event as a distinct progress entry with status <c>"clarification"</c>.
+    /// </summary>
+    /// <param name="clarification">The clarification entry to record.</param>
+    public void AddClarification(ClarificationEntry clarification)
+    {
+        _entries.Enqueue(new ProgressEntry
+        {
+            Timestamp = clarification.Timestamp,
+            WorkerId = clarification.WorkerRole,
+            GoalId = clarification.GoalId,
+            Status = "clarification",
+            Details = $"Q: {clarification.Question} | A: {clarification.Answer} (answered by: {clarification.AnsweredBy})",
         });
 
         while (_entries.Count > _maxEntries)
