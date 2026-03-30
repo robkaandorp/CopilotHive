@@ -170,6 +170,19 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         return
         [
             AIFunctionFactory.Create(
+                ([Description("The question to forward to the Composer for resolution.")] string question,
+                 [Description("The reason why the Brain cannot answer this question from the codebase.")] string reason) =>
+                {
+                    _lastToolCallResult = new BrainToolCallResult("escalate_to_composer", new Dictionary<string, object?>
+                    {
+                        ["question"] = question,
+                        ["reason"] = reason,
+                    });
+                    return "Escalation recorded.";
+                },
+                "escalate_to_composer",
+                "Escalate a question to the Composer when the Brain cannot answer from the codebase alone."),
+            AIFunctionFactory.Create(
                 ([Description("Ordered phase names, e.g. [\"coding\",\"testing\",\"docwriting\",\"review\",\"merging\"]")] string[] phases,
                  [Description("JSON-encoded dict of phase name to instruction, e.g. {\"coding\":\"focus on...\",\"review\":\"check...\"}")] string phase_instructions,
                  [Description("Why you chose this iteration plan")] string reason,
@@ -779,6 +792,61 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 pipeline.GoalId, phase);
             pipeline.Conversation.Add(new ConversationEntry("system", $"CraftPrompt error: {ex.Message}", pipeline.Iteration, "error"));
             return $"Work on: {pipeline.Description}";
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<BrainResponse> AskQuestionAsync(
+        string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default)
+    {
+        if (_agent is null)
+        {
+            _logger.LogWarning(
+                "Brain not connected — returning direct fallback answer for question in goal {GoalId}", goalId);
+            return BrainResponse.Answer("Brain is not available. Please proceed with your best judgment.");
+        }
+
+        var prompt = $"""
+            A worker ({workerRole}) in goal {goalId} (iteration {iteration}, phase {phase}) has a question:
+
+            {question}
+
+            If you can answer this from the codebase and project context, respond with ONLY the answer text.
+            If the question requires domain knowledge, business context, or a decision that cannot be
+            determined from the codebase alone, call the escalate_to_composer tool with the question and reason.
+            """;
+
+        try
+        {
+            var (response, toolCall) = await Shared.CopilotRetryPolicy.ExecuteAsync(
+                () => ExecuteBrainAsync(prompt, ct),
+                onRetry: (attempt, delay, ex) =>
+                {
+                    _logger.LogWarning(
+                        "Brain AskQuestion call failed (attempt {Attempt}/{Max}): {Error}. Retrying in {Delay}s",
+                        attempt, Shared.CopilotRetryPolicy.MaxRetries + 1, ex.Message, delay.TotalSeconds);
+                },
+                ct);
+
+            if (toolCall is { ToolName: "escalate_to_composer" })
+            {
+                var escalationQuestion = GetStringArg(toolCall.Arguments, "question") ?? question;
+                var escalationReason = GetStringArg(toolCall.Arguments, "reason") ?? "Brain requested escalation";
+                _logger.LogInformation(
+                    "Brain escalated question for goal {GoalId} via tool call: {Reason}", goalId, escalationReason);
+                return BrainResponse.Escalated(escalationQuestion, escalationReason);
+            }
+
+            return BrainResponse.Answer(response);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Brain AskQuestionAsync failed for goal {GoalId} — returning fallback", goalId);
+            return BrainResponse.Answer("Brain encountered an error. Please proceed with your best judgment.");
         }
     }
 
