@@ -58,15 +58,13 @@ public sealed class BrainEscalationTests
             "What model should I use?", "Need domain knowledge");
 
         var queue = new ClarificationQueueService();
-        var router = new TimeoutRouter(); // Always escalates to human (who never answers)
+        var router = new TimeoutRouter(); // Escalates to human, then MarkTimedOut after short delay
 
         var (dispatcher, pipeline) = CreateDispatcher(planBrain, queue, router);
 
-        // Act — use a short-lived cancellation so we don't wait 5 minutes.
-        // RouteEscalationAsync catches OperationCanceledException and returns
-        // the timeout fallback message, which ResolvePlanAsync maps to IterationPlan.Default().
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-        var plan = await dispatcher.ResolvePlanAsync(pipeline, null, cts.Token);
+        // Act — TimeoutRouter schedules MarkTimedOut after 200ms, which completes the TCS
+        // with the fallback message. ResolvePlanAsync maps that to IterationPlan.Default().
+        var plan = await dispatcher.ResolvePlanAsync(pipeline, null, TestContext.Current.CancellationToken);
 
         // Assert — should fall back to default plan
         var defaultPhases = IterationPlan.Default().Phases;
@@ -123,16 +121,13 @@ public sealed class BrainEscalationTests
         var (dispatcher, pipeline, goalDescription) = CreateDispatcherWithDescription(
             promptBrain, queue, router, GoalDescription, advanceTo: GoalPhase.Coding);
 
-        // Act — use a short-lived cancellation so we don't wait 5 minutes.
-        // RouteEscalationAsync catches OperationCanceledException and returns
-        // the timeout fallback message, which ResolvePromptAsync maps to the generic prompt.
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        // Act — TimeoutRouter schedules MarkTimedOut after 200ms, which completes the TCS
+        // with the fallback message. ResolvePromptAsync maps that to the generic prompt.
         var prompt = await dispatcher.ResolvePromptAsync(
-            pipeline, GoalPhase.Coding, null, cts.Token);
+            pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken);
 
-        // Assert — should fall back to generic "Work on:" prompt
-        Assert.NotNull(prompt);
-        Assert.Contains(GoalDescription, prompt);
+        // Assert — should fall back to exact generic "Work on:" prompt
+        Assert.Equal($"Work on: {GoalDescription}", prompt);
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────
@@ -298,8 +293,9 @@ public sealed class BrainEscalationTests
     }
 
     /// <summary>
-    /// Timeout router: escalates to human without answering,
-    /// simulating a Composer timeout scenario.
+    /// Timeout router: escalates to human and then marks the request as timed out
+    /// after a short delay, simulating the Composer timeout → human timeout scenario
+    /// without relying on the caller's cancellation token.
     /// </summary>
     private sealed class TimeoutRouter : IClarificationRouter
     {
@@ -310,6 +306,15 @@ public sealed class BrainEscalationTests
             CancellationToken ct = default)
         {
             clarificationQueue.EscalateToHuman(request.Id);
+
+            // Schedule MarkTimedOut after a brief delay to complete the TCS
+            // with the fallback message, simulating real human-answer timeout.
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(200), CancellationToken.None);
+                clarificationQueue.MarkTimedOut(request.Id);
+            });
+
             return Task.FromResult<string?>(null);
         }
     }

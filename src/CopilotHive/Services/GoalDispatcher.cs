@@ -356,20 +356,26 @@ public sealed class GoalDispatcher : BackgroundService
         }
 
         // Step 2: Composer escalated to human — wait for human answer (5min timeout)
+        // Use a dedicated timeout token linked with the caller's token so we can
+        // distinguish "clarification timed out" from "caller requested cancellation".
         _logger.LogInformation(
             "Brain escalation for goal {GoalId} escalated to human. Waiting up to {Timeout} for answer.",
             pipeline.GoalId, ClarificationQueueService.HumanTimeout);
 
+        using var timeoutCts = new CancellationTokenSource(ClarificationQueueService.HumanTimeout);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, ct);
+
         try
         {
-            var humanAnswer = await tcs.Task.WaitAsync(ClarificationQueueService.HumanTimeout, ct);
+            var humanAnswer = await tcs.Task.WaitAsync(linkedCts.Token);
             _logger.LogInformation("Human answered Brain escalation for goal {GoalId}", pipeline.GoalId);
             pipeline.IsWaitingForClarification = false;
             RecordClarification(pipeline, question, humanAnswer, "human");
             return humanAnswer;
         }
-        catch (TimeoutException)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
+            // The clarification timeout token fired (not the caller's token) — treat as timeout fallback
             _logger.LogWarning(
                 "Brain escalation timed out for goal {GoalId} — returning fallback", pipeline.GoalId);
             _clarificationQueue.MarkTimedOut(request.Id);
@@ -377,15 +383,8 @@ public sealed class GoalDispatcher : BackgroundService
             RecordClarification(pipeline, question, ClarificationQueueService.TimeoutFallbackMessage, "timeout");
             return ClarificationQueueService.TimeoutFallbackMessage;
         }
-        catch (OperationCanceledException)
-        {
-            _logger.LogWarning(
-                "Brain escalation cancelled for goal {GoalId} — returning fallback", pipeline.GoalId);
-            _clarificationQueue.MarkTimedOut(request.Id);
-            pipeline.IsWaitingForClarification = false;
-            RecordClarification(pipeline, question, ClarificationQueueService.TimeoutFallbackMessage, "timeout");
-            return ClarificationQueueService.TimeoutFallbackMessage;
-        }
+        // OperationCanceledException where ct.IsCancellationRequested propagates naturally
+        // (caller requested cancellation — do NOT fall back, re-throw)
     }
 
     /// <summary>
