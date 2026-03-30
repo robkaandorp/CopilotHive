@@ -674,6 +674,37 @@ public sealed class ClarificationIntegrationTests
     }
 
     [Fact]
+    public async Task AskBrainAsync_WaitAsyncThrowsTimeoutException_ReturnsFallbackMessage()
+    {
+        // This test exercises the catch (TimeoutException) block in AskBrainAsync (lines 247-252).
+        // We use a custom router that faults the TCS with TimeoutException after enqueue.
+        // When WaitAsync is called on a faulted task, it throws the fault exception immediately,
+        // triggering the dispatcher's catch block.
+
+        // Arrange: Router escalates to human and then faults the TCS with TimeoutException
+        var brain = new FakeClarificationBrain("ESCALATE: Need human input");
+        var queue = new ClarificationQueueService();
+        var router = new TimeoutFaultingClarificationRouter();
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
+
+        // Act - AskBrainAsync will:
+        // 1. Enqueue request (creates TCS)
+        // 2. Call router.TryAutoAnswerAsync which faults the TCS with TimeoutException
+        // 3. Router returns null (escalate to human)
+        // 4. Dispatcher calls tcs.Task.WaitAsync() which throws TimeoutException
+        // 5. Dispatcher catches TimeoutException and returns fallback
+        var answer = await dispatcher.AskBrainAsync(pipeline, "What should I do?", TestContext.Current.CancellationToken);
+
+        // Assert - Dispatcher caught TimeoutException and returned fallback
+        Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, answer);
+
+        // Verify the request was marked as timed out
+        var allRequests = queue.GetAllRequests();
+        Assert.Single(allRequests);
+        Assert.Equal(ClarificationStatus.TimedOut, allRequests[0].Status);
+    }
+
+    [Fact]
     public async Task HumanWait_WithCancellation_ThrowsTaskCanceledException()
     {
         // This test verifies the cancellation path when waiting for human answer.
@@ -962,6 +993,45 @@ public sealed class ClarificationIntegrationTests
             CancellationToken ct = default)
         {
             throw _exception;
+        }
+    }
+
+    /// <summary>
+    /// Router that escalates to human and faults the TCS with TimeoutException.
+    /// When the dispatcher calls WaitAsync on the faulted task, it throws TimeoutException,
+    /// exercising the catch block in AskBrainAsync.
+    /// </summary>
+    private sealed class TimeoutFaultingClarificationRouter : IClarificationRouter
+    {
+        public Task<string?> TryAutoAnswerAsync(
+            string goalId,
+            string question,
+            string context,
+            ClarificationQueueService clarificationQueue,
+            ClarificationRequest request,
+            CancellationToken ct = default)
+        {
+            // First, escalate to human (this is required for the flow)
+            clarificationQueue.EscalateToHuman(request.Id);
+
+            // Now use reflection to get the TCS and fault it with TimeoutException.
+            // The TCS is stored in ClarificationQueueService._waiters ConcurrentDictionary.
+            var waitersField = typeof(ClarificationQueueService)
+                .GetField("_waiters", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+                ?? throw new InvalidOperationException("Could not find _waiters field");
+
+            var waiters = waitersField.GetValue(clarificationQueue)
+                as System.Collections.Concurrent.ConcurrentDictionary<string, TaskCompletionSource<string>>
+                ?? throw new InvalidOperationException("_waiters is not a ConcurrentDictionary<string, TaskCompletionSource<string>>");
+
+            if (waiters.TryGetValue(request.Id, out var tcs))
+            {
+                // Fault the TCS with TimeoutException - when WaitAsync is called on this,
+                // it will throw TimeoutException immediately
+                tcs.SetException(new TimeoutException("Simulated human timeout"));
+            }
+
+            return Task.FromResult<string?>(null);
         }
     }
 
