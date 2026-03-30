@@ -1746,8 +1746,8 @@ public sealed class Composer : IAsyncDisposable
         if (!Enum.TryParse<WorkerRole>(role, ignoreCase: true, out var workerRole) || workerRole == WorkerRole.Unspecified)
             return $"❌ Invalid role '{role}'. Valid roles: Coder, Tester, Reviewer, Improver, Orchestrator, DocWriter, MergeWorker.";
 
-        if (old_string is null)
-            return "❌ old_string is required.";
+        if (string.IsNullOrEmpty(old_string))
+            return "❌ old_string is required and must not be empty.";
 
         new_string ??= "";
 

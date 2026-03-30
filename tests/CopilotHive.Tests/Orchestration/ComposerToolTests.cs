@@ -3950,6 +3950,28 @@ public sealed class ComposerConfigRepoToolTests : IDisposable
         Assert.Contains("role is required", result);
     }
 
+    [Fact]
+    public async Task EditAgentsMd_EmptyOldString_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.EditAgentsMdAsync("Coder", "", "new", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("old_string is required", result);
+        Assert.Contains("must not be empty", result);
+    }
+
+    [Fact]
+    public async Task EditAgentsMd_NullOldString_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.EditAgentsMdAsync("Coder", null!, "new", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("old_string is required", result);
+        Assert.Contains("must not be empty", result);
+    }
+
     // ── commit_config_changes ──
 
     [Fact]
