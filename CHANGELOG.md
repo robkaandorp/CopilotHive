@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Fixed
+
+**Release filter dropdown deduplication.** The release filter dropdown on the Goals page now deduplicates entries by tag, so selecting a tag like `v0.5.0` shows goals from all releases sharing that tag (e.g., both CopilotHive and SharpCoder v0.5.0 releases) rather than creating duplicate dropdown entries.
+
 ## [0.5.1] - 2026-03-29
 
 ### Fixed
