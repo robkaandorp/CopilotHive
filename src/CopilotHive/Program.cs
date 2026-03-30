@@ -575,7 +575,7 @@ static async Task<int> RunServerAsync(string[] args)
     {
         try
         {
-            await store.UpdateReleaseAsync(id, new ReleaseUpdateData { Repositories = request.Repositories ?? [] });
+            await store.UpdateReleaseAsync(id, new ReleaseUpdateData { Repositories = request.Repositories });
         }
         catch (KeyNotFoundException)
         {
