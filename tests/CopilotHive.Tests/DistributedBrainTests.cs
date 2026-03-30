@@ -806,6 +806,10 @@ file sealed class FakeDistributedBrain : IDistributedBrain
 
     public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) => Task.CompletedTask;
 
+    public Task<BrainResponse> AskQuestionAsync(
+        string goalId, int iteration, string phase, string workerRole, string question) =>
+        Task.FromResult(BrainResponse.Answer("Brain is not available. Please proceed with your best judgment."));
+
     public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
 
     public BrainStats? GetStats() => null;

@@ -658,6 +658,17 @@ public sealed class ClarificationLoggingTests
             Task.FromResult(IterationPlan.Default());
         public Task<string> CraftPromptAsync(GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
             Task.FromResult(_response);
+        public Task<BrainResponse> AskQuestionAsync(
+            string goalId, int iteration, string phase, string workerRole, string question)
+        {
+            if (_response.StartsWith("ESCALATE:", StringComparison.OrdinalIgnoreCase) ||
+                _response.StartsWith("ESCALATE_TO_COMPOSER", StringComparison.OrdinalIgnoreCase))
+            {
+                var reason = _response.Length > 9 ? _response[9..].Trim() : "Brain requested escalation";
+                return Task.FromResult(BrainResponse.Escalated(question, reason));
+            }
+            return Task.FromResult(BrainResponse.Answer(_response));
+        }
         public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
             Task.FromResult<string?>(null);
         public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>

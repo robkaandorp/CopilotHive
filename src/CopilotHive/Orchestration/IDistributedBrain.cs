@@ -3,6 +3,28 @@ using CopilotHive.Services;
 namespace CopilotHive.Orchestration;
 
 /// <summary>
+/// Discriminated result returned by <see cref="IDistributedBrain.AskQuestionAsync"/>.
+/// Either carries a text answer (<see cref="IsEscalation"/> is <c>false</c>) or
+/// signals that the Brain wants the question routed to the Composer
+/// (<see cref="IsEscalation"/> is <c>true</c>).
+/// </summary>
+/// <param name="IsEscalation">When <c>true</c>, the Brain cannot answer and requests escalation.</param>
+/// <param name="Text">The answer text when <see cref="IsEscalation"/> is <c>false</c>; otherwise <c>null</c>.</param>
+/// <param name="EscalationQuestion">The original question forwarded to the Composer; <c>null</c> when not escalating.</param>
+/// <param name="EscalationReason">The reason the Brain is escalating; <c>null</c> when not escalating.</param>
+public record BrainResponse(bool IsEscalation, string? Text, string? EscalationQuestion, string? EscalationReason)
+{
+    /// <summary>Creates a direct-answer response.</summary>
+    /// <param name="text">The answer text.</param>
+    public static BrainResponse Answer(string text) => new(false, text, null, null);
+
+    /// <summary>Creates an escalation response.</summary>
+    /// <param name="question">The question to forward to the Composer.</param>
+    /// <param name="reason">Why the Brain is escalating.</param>
+    public static BrainResponse Escalated(string question, string reason) => new(true, null, question, reason);
+}
+
+/// <summary>
 /// LLM-powered brain for the distributed orchestrator.
 /// The Brain maintains a single persistent session across all goals, using
 /// CodingAgent for LLM communication with automatic context compaction.
@@ -56,6 +78,21 @@ public interface IDistributedBrain
     /// after context compaction to ensure the Brain always has fresh rules.
     /// </summary>
     Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default);
+
+    /// <summary>
+    /// Asks the Brain a question on behalf of a worker, returning a structured response that
+    /// either contains an answer or signals escalation to the Composer.
+    /// </summary>
+    /// <param name="goalId">The goal identifier this question relates to.</param>
+    /// <param name="iteration">The current iteration number.</param>
+    /// <param name="phase">The current pipeline phase name.</param>
+    /// <param name="workerRole">The worker role asking the question.</param>
+    /// <param name="question">The question text from the worker.</param>
+    /// <returns>
+    /// A <see cref="BrainResponse"/> that is either a direct answer (<see cref="BrainResponse.IsEscalation"/> = <c>false</c>)
+    /// or an escalation request (<see cref="BrainResponse.IsEscalation"/> = <c>true</c>).
+    /// </returns>
+    Task<BrainResponse> AskQuestionAsync(string goalId, int iteration, string phase, string workerRole, string question);
 
     /// <summary>Returns current Brain context and usage statistics, or null if not connected.</summary>
     BrainStats? GetStats();

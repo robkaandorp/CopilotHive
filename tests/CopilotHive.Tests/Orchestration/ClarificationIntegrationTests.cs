@@ -882,6 +882,8 @@ public sealed class ClarificationIntegrationTests
 
     /// <summary>
     /// Fake Brain that returns a configured response for AskBrainAsync calls.
+    /// When the response text starts with "ESCALATE:", it returns a BrainResponse.Escalated
+    /// variant, otherwise a BrainResponse.Answer variant.
     /// </summary>
     private sealed class FakeClarificationBrain : IDistributedBrain
     {
@@ -900,6 +902,20 @@ public sealed class ClarificationIntegrationTests
         public Task<string> CraftPromptAsync(
             GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
             Task.FromResult(_askBrainResponse);
+
+        public Task<BrainResponse> AskQuestionAsync(
+            string goalId, int iteration, string phase, string workerRole, string question)
+        {
+            // Simulate escalation when the configured response starts with "ESCALATE:"
+            if (_askBrainResponse.StartsWith("ESCALATE:", StringComparison.OrdinalIgnoreCase) ||
+                _askBrainResponse.StartsWith("ESCALATE_TO_COMPOSER", StringComparison.OrdinalIgnoreCase))
+            {
+                var reason = _askBrainResponse.Length > 9 ? _askBrainResponse[9..].Trim() : "Brain requested escalation";
+                return Task.FromResult(BrainResponse.Escalated(question, reason));
+            }
+
+            return Task.FromResult(BrainResponse.Answer(_askBrainResponse));
+        }
 
         public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
             Task.FromResult<string?>(null);

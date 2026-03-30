@@ -179,11 +179,11 @@ public sealed class GoalDispatcher : BackgroundService
     }
 
     /// <summary>
-    /// Handles a question from a worker tool call by routing it to the Brain.
-    /// If the Brain's response starts with <c>ESCALATE:</c>, the question is
-    /// forwarded to the Composer LLM for auto-answer. If the Composer cannot
-    /// answer, the question is queued for human resolution with a 5-minute timeout.
-    /// Returns the resolved answer as a string.
+    /// Handles a question from a worker tool call by routing it to the Brain via
+    /// <see cref="IDistributedBrain.AskQuestionAsync"/>. If the Brain returns an escalation
+    /// response, the question is forwarded to the Composer LLM for auto-answer. If the
+    /// Composer cannot answer, the question is queued for human resolution with a 5-minute
+    /// timeout. Returns the resolved answer as a string.
     /// </summary>
     public async Task<string> AskBrainAsync(GoalPipeline pipeline, string question, CancellationToken ct)
     {
@@ -191,13 +191,17 @@ public sealed class GoalDispatcher : BackgroundService
             return "Brain is not available. Please proceed with your best judgment.";
 
         _logger.LogInformation("Worker asks Brain: {Question}", question);
-        var answer = await _brain.CraftPromptAsync(pipeline, pipeline.Phase, $"A worker asks: {question}", ct);
-        _logger.LogInformation("Brain answers: {Answer}", answer[..Math.Min(answer.Length, 200)]);
+        var brainResponse = await _brain.AskQuestionAsync(
+            pipeline.GoalId,
+            pipeline.Iteration,
+            pipeline.Phase.ToString(),
+            pipeline.Phase.ToWorkerRole().ToRoleName(),
+            question);
 
-        // Check if the Brain is escalating this question
-        if (!answer.StartsWith("ESCALATE:", StringComparison.OrdinalIgnoreCase) &&
-            !answer.Contains("ESCALATE_TO_COMPOSER", StringComparison.OrdinalIgnoreCase))
+        if (!brainResponse.IsEscalation)
         {
+            var answer = brainResponse.Text ?? string.Empty;
+            _logger.LogInformation("Brain answers: {Answer}", answer[..Math.Min(answer.Length, 200)]);
             RecordClarification(pipeline, question, answer, "brain");
             return answer;
         }
