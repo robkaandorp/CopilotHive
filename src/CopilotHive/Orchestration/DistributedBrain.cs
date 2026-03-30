@@ -621,6 +621,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 - "Files NOT to change" in the goal IS a strict prohibition — flag any changes to those files as MAJOR.
                 - The goal description defines WHAT to do. New behavior described in the goal is IN SCOPE — do not reject changes just because the base branch doesn't have them yet.
                 - Only flag issues that are clearly bugs, security problems, or genuine scope violations (touching unrelated code/features).
+                - Test results from the current iteration's tester phase are provided in the prompt. Use them to verify correctness — do NOT reject changes on the grounds that you cannot run tests yourself.
                 """,
             GoalPhase.Review => """
                 - For reviewers: Do NOT include any git diff commands in your prompt — the worker's WORKSPACE CONTEXT already provides the correct diff command with the exact merge-base hash. If an "Iteration diff command" is also listed there, tell reviewers they can use it to focus on changes made in this specific iteration. Just tell them to review the branch changes using the diff commands from their workspace context, focus only on the diff lines (+ and -), and call the report_review_verdict tool when done.
@@ -628,6 +629,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 - "Files NOT to change" in the goal IS a strict prohibition — flag any changes to those files as MAJOR.
                 - The goal description defines WHAT to do. New behavior described in the goal is IN SCOPE — do not reject changes just because the base branch doesn't have them yet.
                 - Only flag issues that are clearly bugs, security problems, or genuine scope violations (touching unrelated code/features).
+                - Test results from the current iteration's tester phase are provided in the prompt. Use them to verify correctness — do NOT reject changes on the grounds that you cannot run tests yourself.
                 """,
             GoalPhase.Testing => """
                 - For testers: tell them to build, run the test skill, write integration tests, and call the report_test_results tool when done. Do NOT tell them to create report files.
@@ -647,6 +649,14 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             ? BuildPreviousIterationContext(pipeline)
             : "";
 
+        // For review phase, extract the tester output from the current iteration so the reviewer
+        // can verify test results without needing to run tests themselves.
+        var currentTestResults = (phase == GoalPhase.Review
+            && pipeline.PhaseOutputs.TryGetValue($"tester-{pipeline.Iteration}", out var testerOut)
+            && !string.IsNullOrWhiteSpace(testerOut))
+            ? testerOut
+            : "";
+
         var prompt = $$"""
             Craft a prompt for the {{roleName}} worker.
 
@@ -657,6 +667,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {{phaseInstructions}}
             {{(previousFeedback.Length > 0 ? $"\n{previousFeedback}" : "")}}
             {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
+            {{(currentTestResults.Length > 0 ? $"\nCurrent iteration test results (from the tester phase):\n{currentTestResults}" : "")}}
             {{(historyContext.Length > 0 ? $"\n{historyContext}" : "")}}
 
             The worker has access to project skills (e.g. build, test) that describe how to build and test this project.
