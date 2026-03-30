@@ -613,7 +613,8 @@ public sealed class ClarificationIntegrationTests
     [Fact]
     public async Task Composer_TimesOut_EscalatesToHuman()
     {
-        // Arrange: Brain escalates, Router simulates timeout by throwing OperationCanceledException
+        // Arrange: Brain escalates, Router simulates timeout by returning null (escalate to human)
+        // This simulates the Composer catching OperationCanceledException internally and returning null
         var brain = new FakeClarificationBrain("ESCALATE: Need clarification");
         var queue = new ClarificationQueueService();
         var router = new TimeoutClarificationRouter();
@@ -623,7 +624,7 @@ public sealed class ClarificationIntegrationTests
         var askTask = dispatcher.AskBrainAsync(pipeline, "What timeout?", TestContext.Current.CancellationToken);
 
         // Wait briefly for Router to time out and escalate to human
-        await Task.Delay(100, TestContext.Current.CancellationToken);
+        await Task.Delay(50, TestContext.Current.CancellationToken);
         var pending = queue.GetPendingHumanRequests();
 
         // Assert - Request escalated to human after timeout
@@ -634,6 +635,120 @@ public sealed class ClarificationIntegrationTests
         queue.SubmitAnswer(pending[0].Id, "Human answer after timeout", "human");
         var answer = await askTask;
         Assert.Equal("Human answer after timeout", answer);
+    }
+
+    // ── Human timeout (WaitAsync throws TimeoutException) ────────────────────
+
+    [Fact]
+    public async Task HumanWait_TimesOut_ReturnsFallbackMessage()
+    {
+        // This test exercises the TimeoutException catch block in AskBrainAsync (lines 247-252).
+        // Since HumanTimeout is static readonly (5 minutes), we can't change it at runtime.
+        // Instead, we directly test the ClarificationQueueService timeout behavior:
+        // 1. Enqueue creates a TCS
+        // 2. MarkTimedOut sets status and completes TCS with fallback message
+        // This simulates what happens when WaitAsync(TimeSpan) throws TimeoutException
+        // and the dispatcher calls MarkTimedOut.
+
+        // Arrange: Enqueue a request and simulate timeout
+        var queue = new ClarificationQueueService();
+        var request = new ClarificationRequest
+        {
+            GoalId = "goal-timeout-test",
+            WorkerRole = "coder",
+            Question = "Question that times out?",
+            Status = ClarificationStatus.AwaitingHuman,
+        };
+        var tcs = queue.Enqueue(request);
+
+        // Act - Simulate timeout (this is what MarkTimedOut does when TimeoutException is caught)
+        queue.MarkTimedOut(request.Id);
+
+        // Assert - The TCS is completed with the fallback message
+        Assert.True(tcs.Task.IsCompleted);
+        Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, await tcs.Task);
+        Assert.Equal(ClarificationStatus.TimedOut, request.Status);
+
+        // This verifies the queue behavior: when MarkTimedOut is called (by the dispatcher's
+        // TimeoutException catch block), the TCS completes with the fallback message.
+    }
+
+    [Fact]
+    public async Task HumanWait_WithCancellation_ThrowsTaskCanceledException()
+    {
+        // This test verifies the cancellation path when waiting for human answer.
+        // When the cancellation token is cancelled, WaitAsync throws TaskCanceledException
+        // (a subclass of OperationCanceledException).
+        // Note: This tests the cancellation path, not the timeout path.
+
+        // Arrange
+        var queue = new ClarificationQueueService();
+        var request = new ClarificationRequest
+        {
+            GoalId = "goal-cancel-test",
+            WorkerRole = "coder",
+            Question = "Question?",
+            Status = ClarificationStatus.AwaitingHuman,
+        };
+        var tcs = queue.Enqueue(request);
+
+        // Create a cancellation token that's already cancelled
+        var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        // Act & Assert - WaitAsync throws TaskCanceledException when cancelled
+        // (This is a different path than TimeoutException)
+        await Assert.ThrowsAsync<TaskCanceledException>(
+            () => tcs.Task.WaitAsync(TimeSpan.FromMinutes(5), cts.Token));
+    }
+
+    [Fact]
+    public async Task MarkTimedOut_SetsStatusAndCompletesTcsWithFallback()
+    {
+        // Direct unit test for MarkTimedOut behavior used by TimeoutException catch block.
+        // Arrange
+        var queue = new ClarificationQueueService();
+        var request = new ClarificationRequest
+        {
+            GoalId = "goal-mark-test",
+            WorkerRole = "coder",
+            Question = "Question?",
+        };
+        var tcs = queue.Enqueue(request);
+        queue.EscalateToHuman(request.Id);
+
+        // Pre-condition
+        Assert.Equal(ClarificationStatus.AwaitingHuman, request.Status);
+        Assert.False(tcs.Task.IsCompleted);
+
+        // Act
+        queue.MarkTimedOut(request.Id);
+
+        // Assert
+        Assert.True(tcs.Task.IsCompleted);
+        Assert.Equal(ClarificationStatus.TimedOut, request.Status);
+        Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, await tcs.Task);
+    }
+
+    // ── Composer throws OperationCanceledException (unhandled in GoalDispatcher) ──────
+
+    [Fact]
+    public async Task Composer_ThrowsOperationCanceled_PropagatesUp()
+    {
+        // This test verifies that if the IClarificationRouter throws OperationCanceledException,
+        // it propagates up unhandled (GoalDispatcher does NOT catch it for the router call).
+        // Note: The real Composer catches OperationCanceledException internally and returns null,
+        // so this test documents the expected behavior if a custom router throws.
+
+        // Arrange: Router throws OperationCanceledException
+        var brain = new FakeClarificationBrain("ESCALATE: Need help");
+        var queue = new ClarificationQueueService();
+        var router = new ThrowingClarificationRouter(new OperationCanceledException());
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
+
+        // Act & Assert - OperationCanceledException propagates up
+        var ex = await Assert.ThrowsAsync<OperationCanceledException>(
+            () => dispatcher.AskBrainAsync(pipeline, "Question?", TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -806,8 +921,8 @@ public sealed class ClarificationIntegrationTests
     }
 
     /// <summary>
-    /// Fake <see cref="IClarificationRouter"/> that simulates a timeout by throwing
-    /// <see cref="OperationCanceledException"/>.
+    /// Fake <see cref="IClarificationRouter"/> that simulates a timeout by escalating to human.
+    /// This matches the real Composer behavior when the 30-second timeout expires.
     /// </summary>
     private sealed class TimeoutClarificationRouter : IClarificationRouter
     {
@@ -822,6 +937,31 @@ public sealed class ClarificationIntegrationTests
             // Simulate the Composer timing out (as if ClarificationQueueService.ComposerTimeout elapsed)
             clarificationQueue.EscalateToHuman(request.Id);
             return Task.FromResult<string?>(null);
+        }
+    }
+
+    /// <summary>
+    /// Fake <see cref="IClarificationRouter"/> that throws an exception.
+    /// Used to verify exception propagation behavior.
+    /// </summary>
+    private sealed class ThrowingClarificationRouter : IClarificationRouter
+    {
+        private readonly Exception _exception;
+
+        public ThrowingClarificationRouter(Exception exception)
+        {
+            _exception = exception;
+        }
+
+        public Task<string?> TryAutoAnswerAsync(
+            string goalId,
+            string question,
+            string context,
+            ClarificationQueueService clarificationQueue,
+            ClarificationRequest request,
+            CancellationToken ct = default)
+        {
+            throw _exception;
         }
     }
 
