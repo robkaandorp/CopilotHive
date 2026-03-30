@@ -3573,3 +3573,782 @@ public sealed class UpdateReleaseComposerToolTests : IDisposable
         Assert.Contains(tools, t => t.Name == "update_release");
     }
 }
+
+/// <summary>
+/// Tests for the Composer's config repo tools (list_config_files, read_config_file,
+/// update_agents_md, edit_agents_md, commit_config_changes).
+/// </summary>
+public sealed class ComposerConfigRepoToolTests : IDisposable
+{
+    private readonly SqliteConnection _connection;
+    private readonly SqliteGoalStore _store;
+    private readonly string _configRepoDir;
+    private readonly ConfigRepoManager _configRepo;
+    private readonly Composer _composerWithConfigRepo;
+    private readonly Composer _composerWithoutConfigRepo;
+
+    public ComposerConfigRepoToolTests()
+    {
+        _connection = new SqliteConnection("Data Source=:memory:");
+        _connection.Open();
+        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+
+        // Create a real temporary directory to act as the config repo
+        _configRepoDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(_configRepoDir);
+        Directory.CreateDirectory(Path.Combine(_configRepoDir, "agents"));
+
+        _configRepo = new ConfigRepoManager("https://example.com/config.git", _configRepoDir);
+
+        _composerWithConfigRepo = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: _configRepo);
+
+        _composerWithoutConfigRepo = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath());
+    }
+
+    public void Dispose()
+    {
+        _connection.Dispose();
+        try { Directory.Delete(_configRepoDir, recursive: true); } catch { /* best-effort */ }
+    }
+
+    // ── list_config_files ──
+
+    [Fact]
+    public async Task ListConfigFiles_NoConfigRepo_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithoutConfigRepo.ListConfigFilesAsync(cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not available", result);
+    }
+
+    [Fact]
+    public async Task ListConfigFiles_RootDir_ReturnsAllFiles()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await File.WriteAllTextAsync(Path.Combine(_configRepoDir, "hive-config.yaml"), "config: true", ct);
+        await File.WriteAllTextAsync(Path.Combine(_configRepoDir, "agents", "coder.agents.md"), "# Coder", ct);
+
+        var result = await _composerWithConfigRepo.ListConfigFilesAsync(cancellationToken: ct);
+
+        Assert.Contains("hive-config.yaml", result);
+        Assert.Contains("agents/coder.agents.md", result);
+    }
+
+    [Fact]
+    public async Task ListConfigFiles_Subdirectory_FiltersToSubdir()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await File.WriteAllTextAsync(Path.Combine(_configRepoDir, "hive-config.yaml"), "config: true", ct);
+        await File.WriteAllTextAsync(Path.Combine(_configRepoDir, "agents", "coder.agents.md"), "# Coder", ct);
+
+        var result = await _composerWithConfigRepo.ListConfigFilesAsync("agents", cancellationToken: ct);
+
+        Assert.Contains("agents/coder.agents.md", result);
+        Assert.DoesNotContain("hive-config.yaml", result);
+    }
+
+    [Fact]
+    public async Task ListConfigFiles_PathTraversal_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.ListConfigFilesAsync("../../etc", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("outside the config repo", result);
+    }
+
+    [Fact]
+    public async Task ListConfigFiles_NonExistentSubdir_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.ListConfigFilesAsync("nonexistent-dir", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not found", result);
+    }
+
+    [Fact]
+    public async Task ListConfigFiles_EmptyDir_ReturnsNoFilesMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // Remove all files from agents dir
+        foreach (var f in Directory.GetFiles(_configRepoDir, "*", SearchOption.AllDirectories))
+            File.Delete(f);
+
+        var result = await _composerWithConfigRepo.ListConfigFilesAsync(cancellationToken: ct);
+
+        Assert.Contains("no files found", result);
+    }
+
+    // ── read_config_file ──
+
+    [Fact]
+    public async Task ReadConfigFile_NoConfigRepo_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithoutConfigRepo.ReadConfigFileAsync("agents/coder.agents.md", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not available", result);
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_ValidFile_ReturnsContentWithLineNumbers()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var content = "Line one\nLine two\nLine three";
+        await File.WriteAllTextAsync(Path.Combine(_configRepoDir, "agents", "coder.agents.md"), content, ct);
+
+        var result = await _composerWithConfigRepo.ReadConfigFileAsync("agents/coder.agents.md", cancellationToken: ct);
+
+        Assert.Contains("1: Line one", result);
+        Assert.Contains("2: Line two", result);
+        Assert.Contains("3: Line three", result);
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_WithOffset_StartsAtCorrectLine()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var content = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5";
+        await File.WriteAllTextAsync(Path.Combine(_configRepoDir, "test.txt"), content, ct);
+
+        var result = await _composerWithConfigRepo.ReadConfigFileAsync("test.txt", offset: 3, cancellationToken: ct);
+
+        Assert.DoesNotContain("1: Line 1", result);
+        Assert.DoesNotContain("2: Line 2", result);
+        Assert.Contains("3: Line 3", result);
+        Assert.Contains("4: Line 4", result);
+        Assert.Contains("5: Line 5", result);
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_WithLimit_ReturnsOnlyRequestedLines()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var content = string.Join('\n', Enumerable.Range(1, 20).Select(i => $"Line {i}"));
+        await File.WriteAllTextAsync(Path.Combine(_configRepoDir, "many-lines.txt"), content, ct);
+
+        var result = await _composerWithConfigRepo.ReadConfigFileAsync("many-lines.txt", limit: 3, cancellationToken: ct);
+
+        Assert.Contains("1: Line 1", result);
+        Assert.Contains("2: Line 2", result);
+        Assert.Contains("3: Line 3", result);
+        Assert.DoesNotContain("4: Line 4", result);
+        Assert.Contains("more lines", result);
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_PathTraversal_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.ReadConfigFileAsync("../../etc/passwd", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("outside the config repo", result);
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_NonExistentFile_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.ReadConfigFileAsync("nonexistent.txt", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not found", result);
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_EmptyPath_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.ReadConfigFileAsync("", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("path is required", result);
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_OffsetBeyondEnd_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await File.WriteAllTextAsync(Path.Combine(_configRepoDir, "short.txt"), "One\nTwo", ct);
+
+        var result = await _composerWithConfigRepo.ReadConfigFileAsync("short.txt", offset: 100, cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("beyond end of file", result);
+    }
+
+    // ── update_agents_md ──
+
+    [Fact]
+    public async Task UpdateAgentsMd_NoConfigRepo_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithoutConfigRepo.UpdateAgentsMdAsync("Coder", "# Content", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not available", result);
+    }
+
+    [Fact]
+    public async Task UpdateAgentsMd_ValidRole_WritesFile()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.UpdateAgentsMdAsync("Coder", "# Coder Instructions\nDo stuff.", cancellationToken: ct);
+
+        Assert.Contains("✅", result);
+        Assert.Contains("coder.agents.md", result);
+
+        var filePath = Path.Combine(_configRepoDir, "agents", "coder.agents.md");
+        Assert.True(File.Exists(filePath));
+        var written = await File.ReadAllTextAsync(filePath, ct);
+        Assert.Equal("# Coder Instructions\nDo stuff.", written);
+    }
+
+    [Fact]
+    public async Task UpdateAgentsMd_CaseInsensitiveRole_Accepted()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.UpdateAgentsMdAsync("tester", "# Tester", cancellationToken: ct);
+
+        Assert.Contains("✅", result);
+        Assert.Contains("tester.agents.md", result);
+    }
+
+    [Fact]
+    public async Task UpdateAgentsMd_InvalidRole_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.UpdateAgentsMdAsync("InvalidRole", "content", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid role", result);
+        Assert.Contains("Coder", result);
+    }
+
+    [Fact]
+    public async Task UpdateAgentsMd_EmptyRole_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.UpdateAgentsMdAsync("", "content", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("role is required", result);
+    }
+
+    [Fact]
+    public async Task UpdateAgentsMd_UnspecifiedRole_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.UpdateAgentsMdAsync("Unspecified", "content", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid role", result);
+    }
+
+    [Theory]
+    [InlineData("Coder", "coder")]
+    [InlineData("Tester", "tester")]
+    [InlineData("Reviewer", "reviewer")]
+    [InlineData("Improver", "improver")]
+    [InlineData("Orchestrator", "orchestrator")]
+    [InlineData("DocWriter", "docwriter")]
+    [InlineData("MergeWorker", "mergeworker")]
+    public async Task UpdateAgentsMd_AllValidRoles_WriteCorrectFile(string roleInput, string expectedFileName)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.UpdateAgentsMdAsync(roleInput, $"# {roleInput}", cancellationToken: ct);
+
+        Assert.Contains("✅", result);
+        var filePath = Path.Combine(_configRepoDir, "agents", $"{expectedFileName}.agents.md");
+        Assert.True(File.Exists(filePath));
+    }
+
+    // ── edit_agents_md ──
+
+    [Fact]
+    public async Task EditAgentsMd_NoConfigRepo_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithoutConfigRepo.EditAgentsMdAsync("Coder", "old", "new", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not available", result);
+    }
+
+    [Fact]
+    public async Task EditAgentsMd_ExactMatch_ReplacesText()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var filePath = Path.Combine(_configRepoDir, "agents", "coder.agents.md");
+        await File.WriteAllTextAsync(filePath, "Line A\nLine B\nLine C", ct);
+
+        var result = await _composerWithConfigRepo.EditAgentsMdAsync("Coder", "Line B", "Line B EDITED", cancellationToken: ct);
+
+        Assert.Contains("✅", result);
+        Assert.Contains("coder.agents.md", result);
+
+        var content = await File.ReadAllTextAsync(filePath, ct);
+        Assert.Contains("Line B EDITED", content);
+        Assert.DoesNotContain("Line B\n", content);
+    }
+
+    [Fact]
+    public async Task EditAgentsMd_OldStringNotFound_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var filePath = Path.Combine(_configRepoDir, "agents", "tester.agents.md");
+        await File.WriteAllTextAsync(filePath, "Some content here", ct);
+
+        var result = await _composerWithConfigRepo.EditAgentsMdAsync("Tester", "does not exist in file", "replacement", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not found", result);
+        Assert.Contains("exact text", result);
+    }
+
+    [Fact]
+    public async Task EditAgentsMd_FileDoesNotExist_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.EditAgentsMdAsync("Reviewer", "something", "else", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not found", result);
+    }
+
+    [Fact]
+    public async Task EditAgentsMd_InvalidRole_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.EditAgentsMdAsync("NotARole", "old", "new", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid role", result);
+    }
+
+    [Fact]
+    public async Task EditAgentsMd_EmptyRole_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.EditAgentsMdAsync("", "old", "new", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("role is required", result);
+    }
+
+    [Fact]
+    public async Task EditAgentsMd_EmptyOldString_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.EditAgentsMdAsync("Coder", "", "new", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("old_string is required", result);
+        Assert.Contains("must not be empty", result);
+    }
+
+    [Fact]
+    public async Task EditAgentsMd_NullOldString_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.EditAgentsMdAsync("Coder", null!, "new", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("old_string is required", result);
+        Assert.Contains("must not be empty", result);
+    }
+
+    // ── commit_config_changes ──
+
+    [Fact]
+    public async Task CommitConfigChanges_NoConfigRepo_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithoutConfigRepo.CommitConfigChangesAsync("test commit", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not available", result);
+    }
+
+    [Fact]
+    public async Task CommitConfigChanges_EmptyMessage_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.CommitConfigChangesAsync("", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("message is required", result);
+    }
+
+    [Fact]
+    public async Task CommitConfigChanges_WhitespaceMessage_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composerWithConfigRepo.CommitConfigChangesAsync("   ", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("message is required", result);
+    }
+
+    [Fact]
+    public async Task CommitConfigChanges_GitFailure_ReturnsErrorMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // The config repo dir has no .git — git commit will fail
+        var result = await _composerWithConfigRepo.CommitConfigChangesAsync("test commit", cancellationToken: ct);
+
+        // Should return an error message, not throw
+        Assert.Contains("❌", result);
+        Assert.Contains("Failed to commit", result);
+    }
+
+    // ── BuildComposerTools — config repo tools registration ──
+
+    [Fact]
+    public void BuildComposerTools_WithConfigRepo_IncludesConfigRepoTools()
+    {
+        var tools = _composerWithConfigRepo.BuildComposerTools();
+        var names = tools.OfType<AIFunction>().Select(t => t.Name).ToHashSet();
+
+        Assert.Contains("list_config_files", names);
+        Assert.Contains("read_config_file", names);
+        Assert.Contains("update_agents_md", names);
+        Assert.Contains("edit_agents_md", names);
+        Assert.Contains("commit_config_changes", names);
+    }
+
+    [Fact]
+    public void BuildComposerTools_WithoutConfigRepo_ExcludesConfigRepoTools()
+    {
+        var tools = _composerWithoutConfigRepo.BuildComposerTools();
+        var names = tools.OfType<AIFunction>().Select(t => t.Name).ToHashSet();
+
+        Assert.DoesNotContain("list_config_files", names);
+        Assert.DoesNotContain("read_config_file", names);
+        Assert.DoesNotContain("update_agents_md", names);
+        Assert.DoesNotContain("edit_agents_md", names);
+        Assert.DoesNotContain("commit_config_changes", names);
+    }
+
+    // ── System prompt ──
+
+    [Fact]
+    public void SystemPrompt_WithConfigRepo_IncludesConfigRepoSection()
+    {
+        var prompt = _composerWithConfigRepo.GetSystemPrompt();
+
+        Assert.Contains("Config Repository", prompt);
+        Assert.Contains("list_config_files", prompt);
+        Assert.Contains("read_config_file", prompt);
+        Assert.Contains("update_agents_md", prompt);
+        Assert.Contains("edit_agents_md", prompt);
+        Assert.Contains("commit_config_changes", prompt);
+    }
+
+    [Fact]
+    public void SystemPrompt_WithoutConfigRepo_DoesNotIncludeConfigRepoSection()
+    {
+        var prompt = _composerWithoutConfigRepo.GetSystemPrompt();
+
+        Assert.DoesNotContain("Config Repository", prompt);
+        Assert.DoesNotContain("list_config_files", prompt);
+        Assert.DoesNotContain("update_agents_md", prompt);
+    }
+}
+
+/// <summary>
+/// Integration tests for config repo tools that require a real git repository.
+/// </summary>
+public sealed class ComposerConfigRepoGitIntegrationTests : IDisposable
+{
+    private readonly string _configRepoDir;
+    private readonly string _remoteRepoDir;
+    private readonly SqliteConnection _connection;
+    private readonly SqliteGoalStore _store;
+
+    public ComposerConfigRepoGitIntegrationTests()
+    {
+        _connection = new SqliteConnection("Data Source=:memory:");
+        _connection.Open();
+        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+
+        // Create a temp directory structure for integration tests
+        var baseDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        _configRepoDir = Path.Combine(baseDir, "config-repo");
+        _remoteRepoDir = Path.Combine(baseDir, "remote");
+
+        Directory.CreateDirectory(_configRepoDir);
+        Directory.CreateDirectory(_remoteRepoDir);
+    }
+
+    public void Dispose()
+    {
+        _connection.Dispose();
+        // Clean up temp directories
+        var baseDir = Path.GetDirectoryName(_configRepoDir);
+        if (baseDir is not null)
+        {
+            try { Directory.Delete(baseDir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    private void InitializeGitRepo(string path, string initialCommitMessage = "Initial commit")
+    {
+        // Initialize a git repo with a basic commit
+        RunGit(path, "init");
+        RunGit(path, "config user.email test@example.com");
+        RunGit(path, "config user.name Test");
+        RunGit(path, "checkout -b main");
+        File.WriteAllText(Path.Combine(path, "README.md"), "# Test repo");
+        RunGit(path, "add .");
+        RunGit(path, $"commit -m \"{initialCommitMessage}\"");
+    }
+
+    private void RunGit(string workingDir, string args)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "git",
+            Arguments = args,
+            WorkingDirectory = workingDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        using var proc = System.Diagnostics.Process.Start(psi)!;
+        proc.WaitForExit();
+    }
+
+    private ConfigRepoManager CreateConfigRepoManager()
+    {
+        // Create a bare repo as the "remote" (bare repos accept pushes)
+        RunGit(_remoteRepoDir, "init --bare");
+        RunGit(_remoteRepoDir, "symbolic-ref HEAD refs/heads/main");
+
+        // Create a working repo to make the initial commit, then push to bare
+        var tempWorkingDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempWorkingDir);
+        RunGit(tempWorkingDir, "init");
+        RunGit(tempWorkingDir, "config user.email test@example.com");
+        RunGit(tempWorkingDir, "config user.name Test");
+        RunGit(tempWorkingDir, "checkout -b main");
+        File.WriteAllText(Path.Combine(tempWorkingDir, "README.md"), "# Test repo");
+        RunGit(tempWorkingDir, "add .");
+        RunGit(tempWorkingDir, "commit -m \"Initial commit\"");
+        RunGit(tempWorkingDir, $"remote add origin \"{_remoteRepoDir}\"");
+        RunGit(tempWorkingDir, "push -u origin main");
+        try { Directory.Delete(tempWorkingDir, recursive: true); } catch { /* best-effort */ }
+
+        // Clone the bare repo into the config repo dir
+        RunGit(Path.GetDirectoryName(_configRepoDir)!, $"clone \"{_remoteRepoDir}\" \"{_configRepoDir}\"");
+        RunGit(_configRepoDir, "config user.email test@example.com");
+        RunGit(_configRepoDir, "config user.name Test");
+
+        // Create agents directory and add a file
+        Directory.CreateDirectory(Path.Combine(_configRepoDir, "agents"));
+        File.WriteAllText(Path.Combine(_configRepoDir, "agents", "coder.agents.md"), "# Coder instructions\nOriginal content.");
+        RunGit(_configRepoDir, "add .");
+        RunGit(_configRepoDir, "commit -m \"Add initial agents\"");
+        RunGit(_configRepoDir, "push");
+
+        return new ConfigRepoManager(_remoteRepoDir, _configRepoDir);
+    }
+
+    [Fact]
+    public async Task CommitConfigChanges_WithRealGitRepo_StagesCommitsAndPushes()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configRepo = CreateConfigRepoManager();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: configRepo);
+
+        // Modify a file using update_agents_md
+        await composer.UpdateAgentsMdAsync("Coder", "# Coder instructions\nUpdated content.", ct);
+
+        // Commit the changes
+        var result = await composer.CommitConfigChangesAsync("Update coder instructions", ct);
+
+        Assert.Contains("✅", result);
+        Assert.Contains("committed and pushed", result);
+
+        // Verify the commit exists in the local repo
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "git",
+            Arguments = "log -1 --pretty=format:%s",
+            WorkingDirectory = _configRepoDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        using var proc = System.Diagnostics.Process.Start(psi)!;
+        var output = proc.StandardOutput.ReadToEnd();
+        proc.WaitForExit();
+
+        Assert.Contains("Update coder instructions", output);
+    }
+
+    [Fact]
+    public async Task EditAgentsMd_WithRealGitRepo_PerformsExactReplacement()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configRepo = CreateConfigRepoManager();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: configRepo);
+
+        // Edit using exact string replacement
+        var result = await composer.EditAgentsMdAsync("Coder", "Original content.", "Modified content.", ct);
+
+        Assert.Contains("✅", result);
+        Assert.Contains("coder.agents.md", result);
+
+        // Verify the file content was actually changed
+        var filePath = Path.Combine(_configRepoDir, "agents", "coder.agents.md");
+        var content = await File.ReadAllTextAsync(filePath, ct);
+        Assert.Contains("Modified content.", content);
+        Assert.DoesNotContain("Original content.", content);
+    }
+
+    [Fact]
+    public async Task ListConfigFiles_WithRealGitRepo_ReturnsFilesFromSubdirectories()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configRepo = CreateConfigRepoManager();
+
+        // Add nested subdirectory structure
+        Directory.CreateDirectory(Path.Combine(_configRepoDir, "configs", "templates"));
+        await File.WriteAllTextAsync(Path.Combine(_configRepoDir, "configs", "templates", "default.yaml"), "template: true", ct);
+        RunGit(_configRepoDir, "add .");
+        RunGit(_configRepoDir, "commit -m \"Add templates\"");
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: configRepo);
+
+        var result = await composer.ListConfigFilesAsync(cancellationToken: ct);
+
+        Assert.Contains("agents/coder.agents.md", result);
+        Assert.Contains("configs/templates/default.yaml", result);
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_WithPathTraversal_ReturnsAccessDenied()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configRepo = CreateConfigRepoManager();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: configRepo);
+
+        // Attempt to read a file outside the config repo using path traversal
+        var result = await composer.ReadConfigFileAsync("../../../../etc/passwd", cancellationToken: ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("outside the config repo", result);
+        Assert.Contains("Access denied", result);
+    }
+
+    [Fact]
+    public async Task UpdateAgentsMd_InvalidRole_ReturnsErrorListingValidRoles()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configRepo = CreateConfigRepoManager();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: configRepo);
+
+        var result = await composer.UpdateAgentsMdAsync("NotAValidRole", "# Content", ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid role", result);
+        // Verify all valid roles are listed
+        Assert.Contains("Coder", result);
+        Assert.Contains("Tester", result);
+        Assert.Contains("Reviewer", result);
+        Assert.Contains("Improver", result);
+        Assert.Contains("Orchestrator", result);
+        Assert.Contains("DocWriter", result);
+        Assert.Contains("MergeWorker", result);
+    }
+
+    [Fact]
+    public async Task EditAgentsMd_InvalidRole_ReturnsErrorListingValidRoles()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configRepo = CreateConfigRepoManager();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: configRepo);
+
+        var result = await composer.EditAgentsMdAsync("FakeRole", "old", "new", ct);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid role", result);
+        // Verify all valid roles are listed
+        Assert.Contains("Coder", result);
+        Assert.Contains("Tester", result);
+    }
+
+    [Fact]
+    public async Task UpdateAgentsMd_CreatesAgentsDirectoryIfMissing()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configRepo = CreateConfigRepoManager();
+
+        // Delete the agents directory
+        Directory.Delete(Path.Combine(_configRepoDir, "agents"), recursive: true);
+        Assert.False(Directory.Exists(Path.Combine(_configRepoDir, "agents")));
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: configRepo);
+
+        var result = await composer.UpdateAgentsMdAsync("Tester", "# Tester instructions", ct);
+
+        Assert.Contains("✅", result);
+        Assert.True(Directory.Exists(Path.Combine(_configRepoDir, "agents")));
+        Assert.True(File.Exists(Path.Combine(_configRepoDir, "agents", "tester.agents.md")));
+    }
+}

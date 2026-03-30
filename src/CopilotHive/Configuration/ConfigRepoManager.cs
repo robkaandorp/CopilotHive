@@ -141,6 +141,20 @@ public sealed class ConfigRepoManager
         await RunGitAsync(_localPath, ["push"], ct);
     }
 
+    /// <summary>
+    /// Stages all changes, commits with the given message, and pushes to the remote.
+    /// Used by the Composer to persist AGENTS.md updates made via config repo tools.
+    /// </summary>
+    /// <param name="commitMessage">Commit message to use.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task CommitAllChangesAsync(string commitMessage, CancellationToken ct = default)
+    {
+        await RunGitAsync(_localPath, ["add", "--all"], ct);
+        await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
+        await RunGitAsync(_localPath, ["pull", "--no-rebase"], ct);
+        await RunGitAsync(_localPath, ["push"], ct);
+    }
+
     private static string NormalizeUrl(string url)
     {
         return url.Trim().TrimEnd('/').ToLowerInvariant();
