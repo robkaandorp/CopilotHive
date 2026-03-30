@@ -51,9 +51,11 @@ public sealed class ClarificationIntegrationTests
     }
 
     [Fact]
-    public async Task BrainReturnsPartialEscalateMarker_TreatedAsEscalation()
+    public async Task BrainReturnsPartialEscalateMarker_NotTreatedAsEscalation()
     {
         // Arrange: Brain returns a response containing "escalate" but not as a marker
+        // The implementation uses exact string match: StartsWith("ESCALATE:") or Contains("ESCALATE_TO_COMPOSER")
+        // A response like "I should escalate this" should NOT trigger escalation
         var brain = new FakeClarificationBrain("I should escalate this to someone else.");
         var queue = new ClarificationQueueService();
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, useComposer: false);
@@ -61,7 +63,8 @@ public sealed class ClarificationIntegrationTests
         // Act
         var answer = await dispatcher.AskBrainAsync(pipeline, "Question?", TestContext.Current.CancellationToken);
 
-        // Assert - The response doesn't START with ESCALATE:, so it's returned as-is
+        // Assert - The response doesn't START with "ESCALATE:" (exact match), so it's returned as-is
+        // and doesn't trigger the escalation chain
         Assert.Equal("I should escalate this to someone else.", answer);
     }
 
@@ -551,6 +554,88 @@ public sealed class ClarificationIntegrationTests
         Assert.Equal("Composer knows the answer.", answer);
     }
 
+    // ── Composer exact string match for ESCALATE_TO_HUMAN ────────────────────
+
+    [Fact]
+    public async Task Composer_ReturnsEscalateToHuman_EscalatesToHuman()
+    {
+        // Arrange: Brain escalates, Composer returns exactly "ESCALATE_TO_HUMAN"
+        var brain = new FakeClarificationBrain("ESCALATE: Need human judgment");
+        var queue = new ClarificationQueueService();
+        var router = new FakeClarificationRouter("ESCALATE_TO_HUMAN"); // Exact match triggers escalation
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
+
+        // Act - Start ask in background
+        var askTask = dispatcher.AskBrainAsync(pipeline, "What should the timeout be?", TestContext.Current.CancellationToken);
+
+        // Wait briefly for request to be enqueued
+        await Task.Delay(50, TestContext.Current.CancellationToken);
+        var pending = queue.GetPendingHumanRequests();
+
+        // Assert - Request escalated to human (not answered by Composer)
+        Assert.Single(pending);
+        Assert.Equal(ClarificationStatus.AwaitingHuman, pending[0].Status);
+
+        // Simulate human answering to complete the task
+        queue.SubmitAnswer(pending[0].Id, "Use 5 minutes", "human");
+        var answer = await askTask;
+        Assert.Equal("Use 5 minutes", answer);
+    }
+
+    [Fact]
+    public async Task Composer_ReturnsEmptyResponse_EscalatesToHuman()
+    {
+        // Arrange: Brain escalates, Composer returns empty string (should escalate)
+        var brain = new FakeClarificationBrain("ESCALATE: Cannot determine");
+        var queue = new ClarificationQueueService();
+        var router = new FakeClarificationRouter(""); // Empty string should escalate
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
+
+        // Act - Start ask in background
+        var askTask = dispatcher.AskBrainAsync(pipeline, "What timeout?", TestContext.Current.CancellationToken);
+
+        // Wait briefly for request to be enqueued
+        await Task.Delay(50, TestContext.Current.CancellationToken);
+        var pending = queue.GetPendingHumanRequests();
+
+        // Assert - Request escalated to human (empty response treated as escalation)
+        Assert.Single(pending);
+        Assert.Equal(ClarificationStatus.AwaitingHuman, pending[0].Status);
+
+        // Complete the task
+        queue.SubmitAnswer(pending[0].Id, "Use 30 seconds", "human");
+        var answer = await askTask;
+        Assert.Equal("Use 30 seconds", answer);
+    }
+
+    // ── Composer timeout simulation ───────────────────────────────────────────
+
+    [Fact]
+    public async Task Composer_TimesOut_EscalatesToHuman()
+    {
+        // Arrange: Brain escalates, Router simulates timeout by throwing OperationCanceledException
+        var brain = new FakeClarificationBrain("ESCALATE: Need clarification");
+        var queue = new ClarificationQueueService();
+        var router = new TimeoutClarificationRouter();
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
+
+        // Act - Start ask in background (Router will time out immediately)
+        var askTask = dispatcher.AskBrainAsync(pipeline, "What timeout?", TestContext.Current.CancellationToken);
+
+        // Wait briefly for Router to time out and escalate to human
+        await Task.Delay(100, TestContext.Current.CancellationToken);
+        var pending = queue.GetPendingHumanRequests();
+
+        // Assert - Request escalated to human after timeout
+        Assert.Single(pending);
+        Assert.Equal(ClarificationStatus.AwaitingHuman, pending[0].Status);
+
+        // Complete the task
+        queue.SubmitAnswer(pending[0].Id, "Human answer after timeout", "human");
+        var answer = await askTask;
+        Assert.Equal("Human answer after timeout", answer);
+    }
+
     [Fact]
     public void GetPendingHumanRequests_ReturnsOnlyAwaitingHuman()
     {
@@ -693,8 +778,8 @@ public sealed class ClarificationIntegrationTests
         private readonly string? _autoAnswer;
 
         /// <param name="autoAnswer">
-        /// If non-null, returned as the auto-answer. If null, escalates to human
-        /// by calling <see cref="ClarificationQueueService.EscalateToHuman"/>.
+        /// If non-null and not "ESCALATE_TO_HUMAN", returned as the auto-answer.
+        /// If null or "ESCALATE_TO_HUMAN", escalates to human.
         /// </param>
         public FakeClarificationRouter(string? autoAnswer)
         {
@@ -709,10 +794,32 @@ public sealed class ClarificationIntegrationTests
             ClarificationRequest request,
             CancellationToken ct = default)
         {
-            if (_autoAnswer is not null)
-                return Task.FromResult<string?>(_autoAnswer);
+            // Match the Composer's behavior: empty or ESCALATE_TO_HUMAN means escalate
+            if (_autoAnswer is null || _autoAnswer == "ESCALATE_TO_HUMAN" || string.IsNullOrEmpty(_autoAnswer))
+            {
+                clarificationQueue.EscalateToHuman(request.Id);
+                return Task.FromResult<string?>(null);
+            }
 
-            // Simulate escalation to human
+            return Task.FromResult<string?>(_autoAnswer);
+        }
+    }
+
+    /// <summary>
+    /// Fake <see cref="IClarificationRouter"/> that simulates a timeout by throwing
+    /// <see cref="OperationCanceledException"/>.
+    /// </summary>
+    private sealed class TimeoutClarificationRouter : IClarificationRouter
+    {
+        public Task<string?> TryAutoAnswerAsync(
+            string goalId,
+            string question,
+            string context,
+            ClarificationQueueService clarificationQueue,
+            ClarificationRequest request,
+            CancellationToken ct = default)
+        {
+            // Simulate the Composer timing out (as if ClarificationQueueService.ComposerTimeout elapsed)
             clarificationQueue.EscalateToHuman(request.Id);
             return Task.FromResult<string?>(null);
         }
