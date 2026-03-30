@@ -36,6 +36,10 @@
 
     <select @bind="_releaseFilter" @bind:after="ApplyFilters">
         <option value="@ReleaseFilterUnreleased">Unreleased</option>
+        @foreach (var rel in _planningReleases)
+        {
+            <option value="@rel.Id">📋 @rel.Tag</option>
+        }
         <option value="@ReleaseFilterAll">All releases</option>
         @foreach (var rel in _releasedReleases)
         {
@@ -172,9 +176,13 @@ else if (_loaded)
         .OrderByDescending(r => r.CreatedAt)
         .ToList();
 
-    /// <summary>Lookup dictionary from release ID to its status.</summary>
-    private Dictionary<string, ReleaseStatus> _releaseStatusById => _allReleases
-        .ToDictionary(r => r.Id, r => r.Status);
+    /// <summary>All releases with status Planning, deduplicated by tag, ordered descending by creation date.</summary>
+    private List<Release> _planningReleases => _allReleases
+        .Where(r => r.Status == ReleaseStatus.Planning)
+        .GroupBy(r => r.Tag)
+        .Select(g => g.First())
+        .OrderByDescending(r => r.CreatedAt)
+        .ToList();
 
     private List<string> _allRepoNames => _allGoals
         .SelectMany(g => g.RepositoryNames)
@@ -205,15 +213,12 @@ else if (_loaded)
             query = query.Where(g => g.RepositoryNames.Contains(_repoFilter, StringComparer.OrdinalIgnoreCase));
 
         // Release filter:
-        //   ReleaseFilterUnreleased → goals where ReleaseId is null/empty OR the release status is Planning
+        //   ReleaseFilterUnreleased → goals not assigned to any release (ReleaseId is null/empty)
         //   ReleaseFilterAll        → no release filter applied
         //   any other value         → specific release ID
         if (_releaseFilter == ReleaseFilterUnreleased)
         {
-            var statusById = _releaseStatusById;
-            query = query.Where(g =>
-                string.IsNullOrEmpty(g.ReleaseId) ||
-                (statusById.TryGetValue(g.ReleaseId, out var releaseStatus) && releaseStatus == ReleaseStatus.Planning));
+            query = query.Where(g => string.IsNullOrEmpty(g.ReleaseId));
         }
         else if (_releaseFilter != ReleaseFilterAll)
         {
