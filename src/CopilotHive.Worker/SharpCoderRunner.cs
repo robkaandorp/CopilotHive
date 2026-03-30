@@ -328,15 +328,15 @@ public sealed class SharpCoderRunner : IAgentRunner
             ));
 
             tools.Add(AIFunctionFactory.Create(
-                async ([Description("The question to ask the user or orchestrator")] string question) =>
+                async ([Description("The question to ask the orchestrator")] string question) =>
                 {
                     if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";
-                    _log.Info($"Tool call: ask_user({question})");
-                    var response = await _toolBridge.AskOrchestratorAsync(_currentTaskId, question, CancellationToken.None);
+                    _log.Info($"Tool call: request_clarification({question})");
+                    var response = await _toolBridge.RequestClarificationAsync(_currentTaskId, question, CancellationToken.None);
                     return response;
                 },
-                "ask_user",
-                "Ask a question to the user or orchestrator to get clarification or additional information."
+                "request_clarification",
+                "Ask the orchestrator for clarification when the goal description is ambiguous, files-to-change seem incomplete, or acceptance criteria conflict. Do NOT silently work around ambiguities — ask first."
             ));
         }
 

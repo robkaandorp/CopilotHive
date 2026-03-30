@@ -318,7 +318,7 @@ public sealed class HiveOrchestratorService(
 
             switch (request.ToolName)
             {
-                case "ask_orchestrator":
+                case "request_clarification":
                     var pipeline = pipelineManager.GetByTaskId(request.TaskId);
                     if (pipeline is null)
                     {

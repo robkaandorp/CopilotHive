@@ -210,7 +210,7 @@ public sealed class WorkerService(
     #region IToolCallBridge
 
     /// <inheritdoc/>
-    public async Task<string> AskOrchestratorAsync(string taskId, string question, CancellationToken ct)
+    public async Task<string> RequestClarificationAsync(string taskId, string question, CancellationToken ct)
     {
         var requestId = Guid.NewGuid().ToString("N");
         var tcs = new TaskCompletionSource<ToolCallResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -220,7 +220,7 @@ public sealed class WorkerService(
 
         try
         {
-            await SendToolCallRequest(requestId, taskId, "ask_orchestrator",
+            await SendToolCallRequest(requestId, taskId, "request_clarification",
                 System.Text.Json.JsonSerializer.Serialize(new { question }), ct);
 
             var response = await tcs.Task;

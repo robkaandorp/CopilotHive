@@ -8,10 +8,10 @@ namespace CopilotHive.Worker;
 public interface IToolCallBridge
 {
     /// <summary>
-    /// Ask the orchestrator's Brain a question and return the answer.
+    /// Ask the orchestrator's Brain for clarification and return the answer.
     /// Used when the Copilot model needs clarification about the task.
     /// </summary>
-    Task<string> AskOrchestratorAsync(string taskId, string question, CancellationToken ct);
+    Task<string> RequestClarificationAsync(string taskId, string question, CancellationToken ct);
 
     /// <summary>
     /// Report progress back to the orchestrator for logging/monitoring.
