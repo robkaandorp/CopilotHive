@@ -62,18 +62,11 @@ public sealed class BrainEscalationTests
 
         var (dispatcher, pipeline) = CreateDispatcher(planBrain, queue, router);
 
-        // Act — use a short-lived cancellation so we don't wait 5 minutes
+        // Act — use a short-lived cancellation so we don't wait 5 minutes.
+        // RouteEscalationAsync catches OperationCanceledException and returns
+        // the timeout fallback message, which ResolvePlanAsync maps to IterationPlan.Default().
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-        IterationPlan plan;
-        try
-        {
-            plan = await dispatcher.ResolvePlanAsync(pipeline, null, cts.Token);
-        }
-        catch (OperationCanceledException)
-        {
-            // Timeout fallback reached via cancellation is also acceptable
-            return;
-        }
+        var plan = await dispatcher.ResolvePlanAsync(pipeline, null, cts.Token);
 
         // Assert — should fall back to default plan
         var defaultPhases = IterationPlan.Default().Phases;
@@ -98,7 +91,7 @@ public sealed class BrainEscalationTests
         var promptBrain = new EscalatingPromptBrain(EscalationQuestion, "Cannot determine from codebase", ExpectedPrompt);
         var queue = new ClarificationQueueService();
         var router = new AutoAnswerRouter(ComposerAnswer);
-        var (dispatcher, pipeline) = CreateDispatcher(promptBrain, queue, router);
+        var (dispatcher, pipeline) = CreateDispatcher(promptBrain, queue, router, advanceTo: GoalPhase.Coding);
 
         // Act
         var prompt = await dispatcher.ResolvePromptAsync(
@@ -128,21 +121,14 @@ public sealed class BrainEscalationTests
         var router = new TimeoutRouter();
 
         var (dispatcher, pipeline, goalDescription) = CreateDispatcherWithDescription(
-            promptBrain, queue, router, GoalDescription);
+            promptBrain, queue, router, GoalDescription, advanceTo: GoalPhase.Coding);
 
-        // Act — use a short-lived cancellation so we don't wait 5 minutes
+        // Act — use a short-lived cancellation so we don't wait 5 minutes.
+        // RouteEscalationAsync catches OperationCanceledException and returns
+        // the timeout fallback message, which ResolvePromptAsync maps to the generic prompt.
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-        string prompt;
-        try
-        {
-            prompt = await dispatcher.ResolvePromptAsync(
-                pipeline, GoalPhase.Coding, null, cts.Token);
-        }
-        catch (OperationCanceledException)
-        {
-            // Timeout reached via cancellation is acceptable for fallback
-            return;
-        }
+        var prompt = await dispatcher.ResolvePromptAsync(
+            pipeline, GoalPhase.Coding, null, cts.Token);
 
         // Assert — should fall back to generic "Work on:" prompt
         Assert.NotNull(prompt);
@@ -154,10 +140,11 @@ public sealed class BrainEscalationTests
     private static (GoalDispatcher dispatcher, GoalPipeline pipeline) CreateDispatcher(
         IDistributedBrain brain,
         ClarificationQueueService queue,
-        IClarificationRouter router)
+        IClarificationRouter router,
+        GoalPhase? advanceTo = null)
     {
         const string desc = "Test goal";
-        var (dispatcher, pipeline, _) = CreateDispatcherWithDescription(brain, queue, router, desc);
+        var (dispatcher, pipeline, _) = CreateDispatcherWithDescription(brain, queue, router, desc, advanceTo);
         return (dispatcher, pipeline);
     }
 
@@ -165,7 +152,8 @@ public sealed class BrainEscalationTests
         IDistributedBrain brain,
         ClarificationQueueService queue,
         IClarificationRouter router,
-        string goalDescription)
+        string goalDescription,
+        GoalPhase? advanceTo = null)
     {
         var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = goalDescription };
         var goalSource = new SimpleGoalSource(goal);
@@ -175,7 +163,8 @@ public sealed class BrainEscalationTests
 
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
-        pipeline.AdvanceTo(GoalPhase.Coding);
+        if (advanceTo is not null)
+            pipeline.AdvanceTo(advanceTo.Value);
 
         var dispatcher = new GoalDispatcher(
             goalManager,

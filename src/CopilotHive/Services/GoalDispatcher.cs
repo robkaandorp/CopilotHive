@@ -278,12 +278,17 @@ public sealed class GoalDispatcher : BackgroundService
     /// </summary>
     private void RecordClarification(GoalPipeline pipeline, string question, string answer, string answeredBy)
     {
+        // Planning, Merging, Done, Failed phases have no worker role — use "brain" as the role
+        var workerRole = pipeline.Phase is GoalPhase.Planning or GoalPhase.Merging or GoalPhase.Done or GoalPhase.Failed
+            ? "brain"
+            : pipeline.Phase.ToWorkerRole().ToRoleName();
+
         var entry = new ClarificationEntry(
             Timestamp: DateTime.UtcNow,
             GoalId: pipeline.GoalId,
             Iteration: pipeline.Iteration,
             Phase: pipeline.Phase.ToString(),
-            WorkerRole: pipeline.Phase.ToWorkerRole().ToRoleName(),
+            WorkerRole: workerRole,
             Question: question,
             Answer: answer,
             AnsweredBy: answeredBy);
@@ -318,10 +323,15 @@ public sealed class GoalDispatcher : BackgroundService
             return ClarificationQueueService.TimeoutFallbackMessage;
         }
 
+        // Planning, Merging, Done, Failed phases have no worker role — use "brain" as the role
+        var workerRole = pipeline.Phase is GoalPhase.Planning or GoalPhase.Merging or GoalPhase.Done or GoalPhase.Failed
+            ? "brain"
+            : pipeline.Phase.ToWorkerRole().ToRoleName();
+
         var request = new ClarificationRequest
         {
             GoalId = pipeline.GoalId,
-            WorkerRole = pipeline.Phase.ToWorkerRole().ToRoleName(),
+            WorkerRole = workerRole,
             Question = question,
         };
 
@@ -362,6 +372,15 @@ public sealed class GoalDispatcher : BackgroundService
         {
             _logger.LogWarning(
                 "Brain escalation timed out for goal {GoalId} — returning fallback", pipeline.GoalId);
+            _clarificationQueue.MarkTimedOut(request.Id);
+            pipeline.IsWaitingForClarification = false;
+            RecordClarification(pipeline, question, ClarificationQueueService.TimeoutFallbackMessage, "timeout");
+            return ClarificationQueueService.TimeoutFallbackMessage;
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning(
+                "Brain escalation cancelled for goal {GoalId} — returning fallback", pipeline.GoalId);
             _clarificationQueue.MarkTimedOut(request.Id);
             pipeline.IsWaitingForClarification = false;
             RecordClarification(pipeline, question, ClarificationQueueService.TimeoutFallbackMessage, "timeout");

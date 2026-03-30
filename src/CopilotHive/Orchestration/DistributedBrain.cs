@@ -63,7 +63,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         RULES:
         - When planning iterations, always call report_iteration_plan
-        - When crafting prompts, respond with ONLY the prompt text — no tool calls, no JSON, no markdown formatting
+        - When crafting prompts, respond with ONLY the prompt text — no JSON, no markdown formatting
+        - If you need clarification during planning or prompt crafting that cannot be determined from the codebase, call the escalate_to_composer tool with a question and reason
         - Never include git checkout/branch/switch/push commands in prompts — infrastructure handles branching
         - Never include framework-specific build/test commands — workers use build and test skills
         """;
@@ -376,6 +377,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
               (e.g. {"coding": "premium"}). Valid phases: coding, testing, docwriting, review, improve.
               Only use premium when previous iterations failed and you believe the task requires
               stronger reasoning. Omitted phases use the default tier.
+
+            If the goal description is ambiguous or you need domain knowledge to plan properly,
+            call the `escalate_to_composer` tool instead with a question and reason.
             """;
 
         if (_agent is null)
@@ -708,7 +712,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {{roleInstruction}}
             - Include any context from previous phases that would help the worker
 
-            Respond with ONLY the prompt text — no tool calls, no JSON, no markdown wrapping.
+            Respond with ONLY the prompt text — no JSON, no markdown wrapping.
+            If you need clarification that cannot be determined from the codebase, call escalate_to_composer instead.
             """;
     }
 
