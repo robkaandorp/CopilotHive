@@ -689,6 +689,37 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
+    /// Builds a direct worker prompt for the Review phase when the Brain agent is not connected.
+    /// Includes tester output and reviewer guidance so reviewers always get test results
+    /// and the "verify that all tests pass" instruction, regardless of agent availability.
+    /// </summary>
+    /// <param name="pipeline">The goal pipeline with phase outputs and iteration state.</param>
+    /// <param name="additionalContext">Optional additional context to include.</param>
+    /// <returns>A reviewer-ready fallback prompt containing test results and guidance.</returns>
+    internal static string BuildReviewFallbackPrompt(GoalPipeline pipeline, string? additionalContext = null)
+    {
+        var currentTestResults = (pipeline.PhaseOutputs.TryGetValue($"tester-{pipeline.Iteration}", out var testerOut)
+            && !string.IsNullOrWhiteSpace(testerOut))
+            ? testerOut
+            : "";
+
+        return $$"""
+            Review the changes for: {{pipeline.Description}}
+
+            Use the diff commands from your workspace context to review the branch changes.
+            Focus only on the diff lines (+ and -), then call the report_review_verdict tool when done.
+
+            - "Files to change" in the goal is GUIDANCE, not an exhaustive whitelist. Test files and test changes that cover the modified code are ALWAYS acceptable and expected.
+            - "Files NOT to change" in the goal IS a strict prohibition — flag any changes to those files as MAJOR.
+            - The goal description defines WHAT to do. New behavior described in the goal is IN SCOPE — do not reject changes just because the base branch doesn't have them yet.
+            - Only flag issues that are clearly bugs, security problems, or genuine scope violations (touching unrelated code/features).
+            - Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
+            {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
+            {{(currentTestResults.Length > 0 ? $"\nCurrent iteration test results (from the tester phase):\n{currentTestResults}" : "")}}
+            """;
+    }
+
+    /// <summary>
     /// Asks the Brain to craft a prompt for the specified phase's worker.
     /// </summary>
     public async Task<string> CraftPromptAsync(
@@ -700,7 +731,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             _logger.LogWarning("Brain not connected — using fallback prompt for {GoalId} phase {Phase}",
                 pipeline.GoalId, phase);
-            return $"Work on: {pipeline.Description}";
+            return phase == GoalPhase.Review
+                ? BuildReviewFallbackPrompt(pipeline, additionalContext)
+                : $"Work on: {pipeline.Description}";
         }
 
         try
