@@ -508,6 +508,9 @@ internal sealed class CancelFakeGoalSource : IGoalSource, IGoalStore
     public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) =>
         Task.CompletedTask;
 
+    public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(int? limit = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>>([]);
+
     /// <summary>
     /// Resets the goal status to Pending so GetPendingGoalsAsync returns it again.
     /// Used to simulate re-queuing after ClearGoalRetryState.

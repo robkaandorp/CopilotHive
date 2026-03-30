@@ -659,6 +659,49 @@ public sealed class SqliteGoalStore : IGoalStore
         return Task.FromResult<IReadOnlyList<ConversationEntry>>(conversation);
     }
 
+    // ── All Clarifications ────────────────────────────────────────────────
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(int? limit = null, CancellationToken ct = default)
+    {
+        lock (_lock)
+        {
+            var sql = """
+                SELECT goal_id, clarifications_json
+                FROM goal_iterations
+                WHERE clarifications_json IS NOT NULL AND clarifications_json != '[]'
+                ORDER BY id DESC
+                """;
+
+            if (limit.HasValue)
+                sql += $" LIMIT {limit.Value * 10}"; // fetch extra rows to account for multi-clarification rows
+
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = sql;
+
+            var results = new List<(string GoalId, PersistedClarification Clarification)>();
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                var goalId = reader.GetString(0);
+                var json = reader.GetString(1);
+                if (string.IsNullOrWhiteSpace(json)) continue;
+                var clarifications = JsonSerializer.Deserialize<List<PersistedClarification>>(json, JsonOptions);
+                if (clarifications is null) continue;
+
+                foreach (var clarification in clarifications)
+                    results.Add((goalId, clarification));
+            }
+
+            // Sort by timestamp descending and apply limit
+            results.Sort((a, b) => b.Clarification.Timestamp.CompareTo(a.Clarification.Timestamp));
+            if (limit.HasValue && results.Count > limit.Value)
+                results = results[..limit.Value];
+
+            return Task.FromResult<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>>(results);
+        }
+    }
+
     // ── Iteration reset ──────────────────────────────────────────────────
 
     /// <inheritdoc />

@@ -1238,4 +1238,169 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
         Assert.NotNull(updated);
         Assert.Empty(updated!.RepositoryNames);
     }
+
+    // ── GetAllClarificationsAsync ──────────────────────────────────────────
+
+    /// <summary>
+    /// Verifies that GetAllClarificationsAsync returns an empty list when no clarifications exist.
+    /// </summary>
+    [Fact]
+    public async Task GetAllClarificationsAsync_NoData_ReturnsEmpty()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var results = await _store.GetAllClarificationsAsync(ct: ct);
+
+        Assert.Empty(results);
+    }
+
+    /// <summary>
+    /// Verifies that clarifications from all goals and iterations are returned,
+    /// each paired with the correct goal ID.
+    /// </summary>
+    [Fact]
+    public async Task GetAllClarificationsAsync_MultipleClarifications_ReturnsFlatList()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal1 = MakeGoal("g-clarif-all-1");
+        var goal2 = MakeGoal("g-clarif-all-2");
+        await _store.CreateGoalAsync(goal1, ct);
+        await _store.CreateGoalAsync(goal2, ct);
+
+        var ts1 = new DateTime(2024, 6, 1, 10, 0, 0, DateTimeKind.Utc);
+        var ts2 = new DateTime(2024, 6, 2, 12, 0, 0, DateTimeKind.Utc);
+
+        await _store.AddIterationAsync(goal1.Id, new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 5 }],
+            Clarifications =
+            [
+                new PersistedClarification
+                {
+                    Timestamp = ts1,
+                    Phase = "Coding",
+                    WorkerRole = "coder",
+                    Question = "Which pattern?",
+                    Answer = "Repository pattern.",
+                    AnsweredBy = "brain",
+                },
+            ],
+        }, ct);
+
+        await _store.AddIterationAsync(goal2.Id, new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 3 }],
+            Clarifications =
+            [
+                new PersistedClarification
+                {
+                    Timestamp = ts2,
+                    Phase = "Testing",
+                    WorkerRole = "tester",
+                    Question = "Mock or real?",
+                    Answer = "Use mocks.",
+                    AnsweredBy = "composer",
+                },
+            ],
+        }, ct);
+
+        var results = await _store.GetAllClarificationsAsync(ct: ct);
+
+        Assert.Equal(2, results.Count);
+        // Ordered by timestamp descending: ts2 first
+        Assert.Equal(goal2.Id, results[0].GoalId);
+        Assert.Equal("Mock or real?", results[0].Clarification.Question);
+        Assert.Equal(goal1.Id, results[1].GoalId);
+        Assert.Equal("Which pattern?", results[1].Clarification.Question);
+    }
+
+    /// <summary>
+    /// Verifies that the limit parameter restricts the number of returned clarifications.
+    /// </summary>
+    [Fact]
+    public async Task GetAllClarificationsAsync_WithLimit_RespectsLimit()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = MakeGoal("g-clarif-limit");
+        await _store.CreateGoalAsync(goal, ct);
+
+        var baseTime = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var clarifications = Enumerable.Range(1, 5).Select(i => new PersistedClarification
+        {
+            Timestamp = baseTime.AddHours(i),
+            Phase = "Coding",
+            WorkerRole = "coder",
+            Question = $"Question {i}?",
+            Answer = $"Answer {i}.",
+            AnsweredBy = "brain",
+        }).ToList();
+
+        await _store.AddIterationAsync(goal.Id, new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 1 }],
+            Clarifications = clarifications,
+        }, ct);
+
+        var results = await _store.GetAllClarificationsAsync(limit: 3, ct: ct);
+
+        Assert.Equal(3, results.Count);
+        // Should be most recent first (highest timestamps)
+        Assert.All(results, r => Assert.Equal(goal.Id, r.GoalId));
+    }
+
+    /// <summary>
+    /// Verifies that rows with null or empty clarifications_json are excluded.
+    /// </summary>
+    [Fact]
+    public async Task GetAllClarificationsAsync_GoalWithNoClarifications_Excluded()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = MakeGoal("g-clarif-exclude");
+        await _store.CreateGoalAsync(goal, ct);
+
+        // Add an iteration with no clarifications
+        await _store.AddIterationAsync(goal.Id, new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 2 }],
+            Clarifications = [],
+        }, ct);
+
+        var results = await _store.GetAllClarificationsAsync(ct: ct);
+
+        Assert.Empty(results);
+    }
+
+    /// <summary>
+    /// Verifies that rows with an empty-string clarifications_json are skipped
+    /// and do not cause a JsonException.
+    /// </summary>
+    [Fact]
+    public async Task GetAllClarificationsAsync_EmptyStringJson_SkippedWithoutException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = MakeGoal("g-clarif-emptystr");
+        await _store.CreateGoalAsync(goal, ct);
+
+        // Insert a row directly with an empty-string clarifications_json to simulate
+        // legacy / corrupted data that bypasses the '[]' SQL filter.
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO goal_iterations (goal_id, iteration, phases_json, clarifications_json, created_at)
+            VALUES ('g-clarif-emptystr', 99, '[]', '', datetime('now'))
+            """;
+        cmd.ExecuteNonQuery();
+
+        // Must not throw and must return no clarifications.
+        var results = await _store.GetAllClarificationsAsync(ct: ct);
+
+        Assert.Empty(results);
+    }
 }
