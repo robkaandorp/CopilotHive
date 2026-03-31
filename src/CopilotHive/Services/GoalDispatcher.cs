@@ -827,15 +827,11 @@ public sealed class GoalDispatcher : BackgroundService
             case GoalPhase.Coding:
             case GoalPhase.Review:
             case GoalPhase.Testing:
+            case GoalPhase.DocWriting:
                 var prompt = _brain is not null
                     ? await ResolvePromptAsync(pipeline, phase, null, ct)
                     : $"Work on: {pipeline.Description} (phase: {phase})";
                 await DispatchToRole(pipeline, phase.ToWorkerRole(), prompt, ct);
-                break;
-
-            case GoalPhase.DocWriting:
-                var docPrompt = BuildDocWriterPrompt(pipeline, phaseInstructions);
-                await DispatchToRole(pipeline, WorkerRole.DocWriter, docPrompt, ct);
                 break;
 
             case GoalPhase.Improve:
@@ -1912,45 +1908,6 @@ public sealed class GoalDispatcher : BackgroundService
             5. Run `git add -A && git commit` with a descriptive message
 
             A response that only describes changes without actually editing files is a FAILURE.
-            """;
-    }
-
-    /// <summary>
-    /// Builds a doc-writer prompt directly (bypasses Brain to avoid goal-description echo).
-    /// </summary>
-    private string BuildDocWriterPrompt(GoalPipeline pipeline, string? phaseInstructions)
-    {
-        var additionalContext = phaseInstructions is not null
-            ? $"\nAdditional context from the Brain:\n{phaseInstructions}\n"
-            : "";
-
-        return $"""
-            You are the doc-writer. Your ONLY job is to update the documentation files
-            that the goal explicitly requests. Do NOT update files that are not mentioned
-            in the goal description.
-
-            Goal description: {pipeline.Description}
-            {additionalContext}
-            Your tasks:
-            1. Re-read the goal description above to identify EXACTLY which documentation
-               files you are asked to update (e.g. README.md, CHANGELOG.md, specific .md files)
-            2. Run `git diff origin/<base-branch>...HEAD --stat` to see ALL files changed on this branch
-            3. Run `git diff origin/<base-branch>...HEAD` to review the full diff
-            4. Update ONLY the documentation files explicitly requested in the goal description
-            5. Verify XML doc comments on new/changed public APIs are present and accurate — flag missing or incorrect ones in your report but do NOT edit source code files (that is the coder's job)
-            6. Run `git add -A && git commit` with message "docs: update documentation for [brief description]"
-
-            CRITICAL RULES:
-            - Do NOT edit source code (.cs files) — that is the coder's job
-            - Do NOT write or run tests — that is the tester's job
-            - Do NOT run git push — the orchestrator handles that
-            - Only edit documentation files explicitly requested in the goal description
-            - Do NOT update CHANGELOG.md or README.md unless the goal description says to
-
-            When done, call the `report_doc_changes` tool with:
-            - verdict: "PASS" if you successfully updated documentation, "FAIL" if you could not
-            - filesUpdated: array of files you changed (e.g. ["CHANGELOG.md", "README.md"])
-            - summary: brief description of what you documented
             """;
     }
 

@@ -1747,3 +1747,168 @@ public sealed class GoalDispatcherIterationShaTests
         Assert.Equal(existingSha, pipeline.IterationStartSha);
     }
 }
+
+/// <summary>
+/// Tests that verify <see cref="GoalDispatcher"/> routes <see cref="GoalPhase.DocWriting"/>
+/// through <see cref="IDistributedBrain.CraftPromptAsync"/> exactly like Coding, Testing, and Review,
+/// and that the old <c>BuildDocWriterPrompt</c> method has been removed.
+/// </summary>
+public sealed class GoalDispatcherDocWritingPhaseTests
+{
+    /// <summary>
+    /// When the Testing phase completes successfully, the next phase is DocWriting.
+    /// The dispatcher must call <see cref="IDistributedBrain.CraftPromptAsync"/> with
+    /// <see cref="GoalPhase.DocWriting"/>, not use a hardcoded prompt.
+    /// </summary>
+    [Fact]
+    public async Task DocWritingPhase_AfterTestingSucceeds_CallsBrainCraftPromptWithDocWritingPhase()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Arrange — tracking brain that records every CraftPromptAsync call
+        var brain = new PhaseCapturingBrain();
+
+        var goal = new Goal { Id = $"goal-docwriting-{Guid.NewGuid():N}", Description = "Update docs" };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        await goalManager.GetNextGoalAsync(ct); // populate internal map
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+
+        // Start the state machine with a plan that includes DocWriting after Testing
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.DocWriting, GoalPhase.Review, GoalPhase.Merging],
+            Reason = "Test plan",
+        };
+        pipeline.SetPlan(plan);
+        // Restore state machine at Testing so the next transition goes to DocWriting
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Testing);
+        pipeline.AdvanceTo(GoalPhase.Testing); // simulate pipeline already in Testing
+
+        var taskId = $"task-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain);
+
+        // Act — Testing phase succeeds → dispatcher should advance to DocWriting and call Brain
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "All tests pass",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = new TaskMetrics { Verdict = "PASS", TotalTests = 5, PassedTests = 5 },
+        }, ct);
+
+        // Assert — Brain was called for DocWriting
+        Assert.Contains(GoalPhase.DocWriting, brain.CraftPromptPhases);
+    }
+
+    /// <summary>
+    /// When <see cref="GoalPhase.DocWriting"/> is dispatched and the Brain is null,
+    /// <see cref="GoalDispatcher.ResolvePromptAsync"/> falls back to the generic "Work on:"
+    /// prompt — not the old hardcoded <c>BuildDocWriterPrompt</c> with its
+    /// <c>&lt;base-branch&gt;</c> placeholder.
+    /// </summary>
+    [Fact]
+    public async Task DocWritingPhase_NoBrain_ResolvePromptReturnsGenericFallback()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        const string Description = "My doc task";
+
+        var goal = new Goal { Id = $"goal-docwriting-nobrain-{Guid.NewGuid():N}", Description = Description };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        await goalManager.GetNextGoalAsync(ct);
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.DocWriting);
+
+        // Dispatcher with no brain — uses the fallback branch
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain: null);
+
+        // Act — call ResolvePromptAsync directly (internal, accessible via InternalsVisibleTo)
+        var prompt = await dispatcher.ResolvePromptAsync(pipeline, GoalPhase.DocWriting, null, ct);
+
+        // Assert — generic fallback is used, not the old hardcoded BuildDocWriterPrompt
+        Assert.Contains("Work on:", prompt);
+        Assert.Contains("DocWriting", prompt);
+    }
+
+    /// <summary>
+    /// Verifies that the <c>BuildDocWriterPrompt</c> method has been removed from
+    /// <see cref="GoalDispatcher"/> and no longer exists.
+    /// </summary>
+    [Fact]
+    public void BuildDocWriterPrompt_MethodDoesNotExist()
+    {
+        var method = typeof(GoalDispatcher).GetMethod(
+            "BuildDocWriterPrompt",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance |
+            System.Reflection.BindingFlags.Static);
+
+        Assert.Null(method);
+    }
+
+    // ── Fakes ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Brain stub that records every phase passed to <see cref="CraftPromptAsync"/>.
+    /// </summary>
+    private sealed class PhaseCapturingBrain : IDistributedBrain
+    {
+        /// <summary>All phases for which <see cref="CraftPromptAsync"/> was called.</summary>
+        public List<GoalPhase> CraftPromptPhases { get; } = [];
+
+        public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<PlanResult> PlanIterationAsync(
+            GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(PlanResult.Success(IterationPlan.Default()));
+
+        public Task<PromptResult> CraftPromptAsync(
+            GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
+        {
+            CraftPromptPhases.Add(phase);
+            return Task.FromResult(PromptResult.Success($"Brain prompt for {phase}"));
+        }
+
+        public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+
+        public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task<BrainResponse> AskQuestionAsync(
+            string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+            Task.FromResult(BrainResponse.Answer("proceed"));
+
+        public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public BrainStats? GetStats() => null;
+    }
+}
