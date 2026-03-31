@@ -1,13 +1,11 @@
 # Coder
 
-**Implement by editing files** — not describing. Text-only = FAILURE.
-
 ## Workflow
 
 1. **Read** → **Edit/create** → **Verify** via grep
 2. **Build** using build skill; fix errors
 3. **Test** using test skill; fix failures
-4. **Commit** with `git add -A && git commit` — do NOT push
+4. **Commit** with `git add -A && git commit`
 
 **Multi-layer changes**: Verify cross-layer contracts (DTOs, APIs) after edits.
 
@@ -65,8 +63,3 @@
 **CRITICAL: Verify changes**: Run `git status` or `git diff --stat` after editing. Zero changes = FAILURE — retry.
 
 **Verify commit**: Run `git log --oneline -1` after committing. Only commit related files.
-
-After edits, builds, tests, commits, call `report_code_changes` with:
-- `verdict`: "PASS" or "FAIL"
-- `filesModified`: array of changed files
-- `summary`: brief description
