@@ -460,6 +460,145 @@ public sealed class GoalDispatcherValidatePlanTests
         Assert.Equal(1, result.Phases.Count(p => p == GoalPhase.Coding));
         Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
     }
+
+    // ── Code-plan enforcement ─────────────────────────────────────────────────
+
+    [Fact]
+    public void CodingPlan_MissingReview_ReviewInserted()
+    {
+        // Arrange: code plan with Testing but no Review
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Merging],
+        };
+
+        // Act
+        var result = GoalDispatcher.ValidatePlan(plan);
+
+        // Assert: Review inserted
+        Assert.Contains(GoalPhase.Review, result.Phases);
+        Assert.Contains(GoalPhase.Testing, result.Phases);
+        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
+    }
+
+    [Fact]
+    public void CodingPlan_MissingTesting_TestingInserted()
+    {
+        // Arrange: code plan with Review but no Testing
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.Review, GoalPhase.Merging],
+        };
+
+        // Act
+        var result = GoalDispatcher.ValidatePlan(plan);
+
+        // Assert: Testing inserted
+        Assert.Contains(GoalPhase.Testing, result.Phases);
+        Assert.Contains(GoalPhase.Review, result.Phases);
+        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
+    }
+
+    [Fact]
+    public void CodingPlan_MissingBothTestingAndReview_BothInserted()
+    {
+        // Arrange: code plan with neither Testing nor Review
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.Merging],
+        };
+
+        // Act
+        var result = GoalDispatcher.ValidatePlan(plan);
+
+        // Assert: both Testing and Review inserted
+        Assert.Contains(GoalPhase.Testing, result.Phases);
+        Assert.Contains(GoalPhase.Review, result.Phases);
+        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
+    }
+
+    [Fact]
+    public void CodingPlan_WithTestingAndReview_Unchanged()
+    {
+        // Arrange: code plan already has both Testing and Review
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
+        };
+
+        // Act
+        var result = GoalDispatcher.ValidatePlan(plan);
+
+        // Assert: no duplicates, order preserved, Merging at end
+        Assert.Equal(1, result.Phases.Count(p => p == GoalPhase.Testing));
+        Assert.Equal(1, result.Phases.Count(p => p == GoalPhase.Review));
+        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
+        // Verify ordering: Coding < Testing < Review < Merging
+        var codingIdx = result.Phases.IndexOf(GoalPhase.Coding);
+        var testingIdx = result.Phases.IndexOf(GoalPhase.Testing);
+        var reviewIdx = result.Phases.IndexOf(GoalPhase.Review);
+        Assert.True(codingIdx < testingIdx);
+        Assert.True(testingIdx < reviewIdx);
+    }
+
+    // ── Docs-only plan behavior ───────────────────────────────────────────────
+
+    [Fact]
+    public void DocsOnlyPlan_WithTesting_ReviewNotInserted()
+    {
+        // Arrange: docs-only plan with Testing but no Review — Review must NOT be inserted
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.DocWriting, GoalPhase.Testing, GoalPhase.Merging],
+        };
+
+        // Act
+        var result = GoalDispatcher.ValidatePlan(plan);
+
+        // Assert: Review absent, Coding absent
+        Assert.DoesNotContain(GoalPhase.Review, result.Phases);
+        Assert.DoesNotContain(GoalPhase.Coding, result.Phases);
+        Assert.Contains(GoalPhase.DocWriting, result.Phases);
+        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
+    }
+
+    [Fact]
+    public void DocsOnlyPlan_WithoutTestingOrReview_TestingInserted_ReviewNotRequired()
+    {
+        // Arrange: docs-only plan with neither Testing nor Review
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.DocWriting, GoalPhase.Merging],
+        };
+
+        // Act
+        var result = GoalDispatcher.ValidatePlan(plan);
+
+        // Assert: Testing inserted; Review NOT inserted; Coding absent
+        Assert.Contains(GoalPhase.Testing, result.Phases);
+        Assert.DoesNotContain(GoalPhase.Review, result.Phases);
+        Assert.DoesNotContain(GoalPhase.Coding, result.Phases);
+        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
+    }
+
+    [Fact]
+    public void DocsOnlyPlan_WithReview_Unchanged()
+    {
+        // Arrange: docs-only plan that already has Review — should not change
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.DocWriting, GoalPhase.Review, GoalPhase.Merging],
+        };
+
+        // Act
+        var result = GoalDispatcher.ValidatePlan(plan);
+
+        // Assert: Review retained, Testing NOT inserted, Coding absent
+        Assert.Contains(GoalPhase.Review, result.Phases);
+        Assert.DoesNotContain(GoalPhase.Testing, result.Phases);
+        Assert.DoesNotContain(GoalPhase.Coding, result.Phases);
+        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
+    }
 }
 
 /// <summary>

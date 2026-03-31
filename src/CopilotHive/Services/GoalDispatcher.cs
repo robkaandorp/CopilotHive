@@ -929,11 +929,32 @@ public sealed class GoalDispatcher : BackgroundService
             phases.Insert(0, GoalPhase.Coding);
         }
 
-        // Must contain at least one of Testing or Review
-        if (!phases.Contains(GoalPhase.Testing) && !phases.Contains(GoalPhase.Review))
+        if (phases.Contains(GoalPhase.Coding))
         {
-            var codingIndex = phases.IndexOf(GoalPhase.Coding);
-            phases.Insert(codingIndex + 1, GoalPhase.Testing);
+            // Code-change plans: both Testing and Review are mandatory.
+            // Insert Testing after Coding if missing.
+            if (!phases.Contains(GoalPhase.Testing))
+            {
+                var codingIndex = phases.IndexOf(GoalPhase.Coding);
+                phases.Insert(codingIndex + 1, GoalPhase.Testing);
+            }
+
+            // Insert Review after Testing (or after Coding if Testing absent) if missing.
+            if (!phases.Contains(GoalPhase.Review))
+            {
+                var testingIndex = phases.IndexOf(GoalPhase.Testing);
+                phases.Insert(testingIndex + 1, GoalPhase.Review);
+            }
+        }
+        else
+        {
+            // Docs-only plans: insert Testing only when neither Testing nor Review is present.
+            if (!phases.Contains(GoalPhase.Testing) && !phases.Contains(GoalPhase.Review))
+            {
+                var docWritingIndex = phases.IndexOf(GoalPhase.DocWriting);
+                var insertAt = docWritingIndex >= 0 ? docWritingIndex + 1 : phases.Count;
+                phases.Insert(insertAt, GoalPhase.Testing);
+            }
         }
 
         // Must end with Merging — remove any misplaced Merging entries, then ensure it's last
