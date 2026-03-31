@@ -915,15 +915,16 @@ public sealed class GoalDispatcher : BackgroundService
 
     /// <summary>
     /// Validates an IterationPlan to ensure safety invariants:
-    /// must contain Coding, at least one of Testing or Review, and end with Merging.
+    /// must contain Coding or DocWriting, at least one of Testing or Review, and end with Merging.
     /// Missing phases are inserted in the correct position.
+    /// Docs-only plans (containing DocWriting but not Coding) are valid and Coding is not inserted.
     /// </summary>
     internal static IterationPlan ValidatePlan(IterationPlan plan)
     {
         var phases = plan.Phases;
 
-        // Must contain Coding
-        if (!phases.Contains(GoalPhase.Coding))
+        // Must contain Coding OR DocWriting (docs-only plans are valid)
+        if (!phases.Contains(GoalPhase.Coding) && !phases.Contains(GoalPhase.DocWriting))
         {
             phases.Insert(0, GoalPhase.Coding);
         }

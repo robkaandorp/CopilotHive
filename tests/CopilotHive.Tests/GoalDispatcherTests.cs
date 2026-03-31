@@ -369,6 +369,100 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
 }
 
 /// <summary>
+/// Tests for <see cref="GoalDispatcher.ValidatePlan"/> logic.
+/// </summary>
+public sealed class GoalDispatcherValidatePlanTests
+{
+    [Fact]
+    public void DocsOnlyPlan_WithReview_CodingNotInserted()
+    {
+        // Arrange: docs-only plan with Review — Coding should NOT be inserted
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.DocWriting, GoalPhase.Review, GoalPhase.Merging],
+        };
+
+        // Act
+        var result = GoalDispatcher.ValidatePlan(plan);
+
+        // Assert: Coding absent, DocWriting retained
+        Assert.DoesNotContain(GoalPhase.Coding, result.Phases);
+        Assert.Contains(GoalPhase.DocWriting, result.Phases);
+        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
+    }
+
+    [Fact]
+    public void DocsOnlyPlan_WithoutReview_CodingNotInserted()
+    {
+        // Arrange: docs-only plan with no Testing/Review — Testing will be inserted, but Coding must NOT be
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.DocWriting, GoalPhase.Merging],
+        };
+
+        // Act
+        var result = GoalDispatcher.ValidatePlan(plan);
+
+        // Assert: Coding absent, DocWriting retained, ends with Merging
+        Assert.DoesNotContain(GoalPhase.Coding, result.Phases);
+        Assert.Contains(GoalPhase.DocWriting, result.Phases);
+        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
+    }
+
+    [Fact]
+    public void PlanWithNeitherCodingNorDocWriting_CodingInserted()
+    {
+        // Arrange: safety fallback — no Coding and no DocWriting
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.Review, GoalPhase.Merging],
+        };
+
+        // Act
+        var result = GoalDispatcher.ValidatePlan(plan);
+
+        // Assert: Coding inserted as fallback
+        Assert.Contains(GoalPhase.Coding, result.Phases);
+        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
+    }
+
+    [Fact]
+    public void PlanWithBothCodingAndDocWriting_NeitherInsertedAgain()
+    {
+        // Arrange: plan already has both Coding and DocWriting
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.DocWriting, GoalPhase.Review, GoalPhase.Merging],
+        };
+
+        // Act
+        var result = GoalDispatcher.ValidatePlan(plan);
+
+        // Assert: plan is unchanged — Coding appears exactly once
+        Assert.Equal(1, result.Phases.Count(p => p == GoalPhase.Coding));
+        Assert.Contains(GoalPhase.DocWriting, result.Phases);
+        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
+    }
+
+    [Fact]
+    public void StandardCodingPlan_CodingNotDuplicated()
+    {
+        // Arrange: standard plan already containing Coding
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
+        };
+
+        // Act
+        var result = GoalDispatcher.ValidatePlan(plan);
+
+        // Assert: Coding still present exactly once, Merging at end
+        Assert.Equal(1, result.Phases.Count(p => p == GoalPhase.Coding));
+        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
+    }
+}
+
+/// <summary>
 /// Tests for <see cref="GoalDispatcher.BuildWorkerOutputSummary"/> logic.
 /// </summary>
 public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
