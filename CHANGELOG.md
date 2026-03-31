@@ -1,8 +1,42 @@
-## [Unreleased]
+## [0.6.0]
+
+### Added
+
+**Three-tier clarification system.** Workers can call `request_clarification` (renamed from `ask_user`) when facing ambiguous goals. Questions route through a three-tier resolution chain: first the Brain attempts to answer from its accumulated context, then the Composer LLM tries using a forked session (`AgentSession.Fork()`) for a one-shot auto-answer, and finally the question surfaces to the human via the Composer chat UI. The `escalate_to_composer` tool replaced the fragile string-based escalation mechanism with a proper tool call. Escalation now works during all Brain phases including planning and prompt crafting. Clarification exchanges (Q&A with answerer attribution) are logged and displayed on the goal detail page, and aggregated stats appear on the Orchestrator dashboard.
+
+**Hardcoded worker system prompts.** Mandatory safety rules (git push prohibition, role identity, tool call contracts, scope boundaries, clarification instructions) are now hardcoded in `SharpCoderRunner.BuildRoleSystemPrompt()` per worker role. AGENTS.md files are appended as supplementary "Learned Heuristics" after a separator. This prevents the improver from accidentally weakening or removing safety-critical instructions.
+
+**Docs-only iteration plans.** `ValidatePlan` no longer forces a Coding phase when the Brain plans a docs-only iteration (e.g. `[DocWriting, Review, Merging]`). Previously, every iteration required a coder, which wasted time on documentation-only goals.
+
+**Reviewer iteration context.** The reviewer now receives the current iteration's test results in its prompt, giving it visibility into test outcomes before producing a verdict. The reviewer also receives an iteration-scoped diff command (`git diff {iterationStartSha}..HEAD`) so it reviews only the current iteration's changes rather than the cumulative branch diff.
+
+**Composer config repo access.** The Composer gained five new tools for managing the config repository: `list_config_files`, `read_config_file`, `update_agents_md`, `edit_agents_md`, and `commit_config_changes`. This allows the Composer to inspect and update AGENTS.md files directly.
+
+**Editable Planning releases.** Releases in Planning status can now be edited from both the dashboard UI and the Composer's `update_release` tool.
+
+**Release repo picker.** The release detail page uses a multi-select checkbox picker for repository assignment instead of a plain text input.
+
+**Release filter on Goals page.** A release filter dropdown on the Goals page lets users filter by release tag. Planning (unreleased) versions are included in the dropdown. Entries are deduplicated by tag when multiple releases share the same version.
+
+**Dashboard layout improvements.** Page titles are extracted into a shared header bar component (`PageHeaderState`). The navigation sidebar, header bar, and footer are sticky/fixed so they remain visible while scrolling content. A footer with a GitHub project link is displayed on every page. All nav menu items have emoji icons for visual identification.
+
+### Changed
+
+**Brain prompt optimization.** The Brain's `DefaultSystemPrompt` now contains static role-specific rules that were previously generated dynamically in `BuildCraftPromptText()`. Cross-goal metrics history has been removed from Brain prompts to reduce noise and token usage. The Brain gained a `get_goal` tool for accessing goal details during planning.
+
+**DocWriting phase routing.** The DocWriting phase is now routed through the Brain for prompt crafting, like Coding, Testing, and Review. Previously it used a hardcoded `BuildDocWriterPrompt` method that bypassed the Brain entirely.
+
+**SharpCoder updated to 0.6.0.** Both CopilotHive projects now reference the stable SharpCoder 0.6.0 NuGet package (from 0.5.0), which includes `AgentSession.Fork()` used by the clarification session fork feature.
 
 ### Fixed
 
-**Release filter dropdown deduplication.** The release filter dropdown on the Goals page now deduplicates entries by tag, so selecting a tag like `v0.5.0` shows goals from all releases sharing that tag (e.g., both CopilotHive and SharpCoder v0.5.0 releases) rather than creating duplicate dropdown entries.
+**Release filter dropdown deduplication.** The release filter dropdown on the Goals page now deduplicates entries by tag, so selecting a tag like `v0.5.0` shows goals from all releases sharing that tag rather than creating duplicate dropdown entries.
+
+**Config repo git safety.** Fixed race conditions in `ConfigRepoManager` git operations that could cause data loss when concurrent operations accessed the config repository.
+
+**Version prefix double-beta.** Fixed CopilotHive version infrastructure that produced double-beta Docker image tags (e.g. `0.6.0-beta-beta.42`).
+
+**SharpCoder README URL.** Fixed a hallucinated SharpCoder GitHub URL in the README that pointed to a non-existent repository path.
 
 ## [0.5.1] - 2026-03-29
 
