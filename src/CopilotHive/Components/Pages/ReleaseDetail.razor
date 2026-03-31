@@ -297,6 +297,7 @@ else if (_loaded)
         {
             _release!.Tag = _editTag.Trim();
             _tagSaved = true;
+            PageHeader.SetTitle($"📦 {_release.Tag}");
             StateHasChanged();
         }
         else
