@@ -980,19 +980,59 @@ public sealed class GoalDispatcher : BackgroundService
     /// <summary>
     /// Builds a system note describing how the Brain's iteration plan was modified by
     /// <see cref="ValidatePlan"/> to satisfy safety requirements.
+    /// Generates accurate per-change reasons for each adjustment made.
     /// </summary>
     /// <param name="original">The phases from the Brain's original plan.</param>
     /// <param name="final">The phases after validation was applied.</param>
-    /// <returns>A human-readable note describing what was added and why.</returns>
+    /// <returns>A human-readable note describing what was adjusted and why.</returns>
     internal static string BuildPlanAdjustmentNote(List<GoalPhase> original, List<GoalPhase> final)
     {
-        var added = final.Except(original).ToList();
+        var originalSet = new HashSet<GoalPhase>(original);
+        var adjustments = new List<string>();
+
+        // Coding was added as safety fallback (neither Coding nor DocWriting was present)
+        if (!originalSet.Contains(GoalPhase.Coding) && !originalSet.Contains(GoalPhase.DocWriting)
+            && final.Contains(GoalPhase.Coding))
+        {
+            adjustments.Add("- Coding was inserted at the start (required: every plan must contain Coding or DocWriting)");
+        }
+
+        // Testing was added to a code-change plan
+        if (!originalSet.Contains(GoalPhase.Testing) && final.Contains(GoalPhase.Testing))
+        {
+            var reason = final.Contains(GoalPhase.Coding)
+                ? "required for code-change plans"
+                : "required: docs-only plan had neither Testing nor Review";
+            adjustments.Add($"- Testing was inserted after Coding ({reason})");
+        }
+
+        // Review was added to a code-change plan
+        if (!originalSet.Contains(GoalPhase.Review) && final.Contains(GoalPhase.Review))
+        {
+            adjustments.Add("- Review was inserted after Testing (required for code-change plans)");
+        }
+
+        // Merging was moved to the end (it was present but misplaced, or simply re-added)
+        var originalMergingIndex = original.IndexOf(GoalPhase.Merging);
+        var finalMergingIndex = final.IndexOf(GoalPhase.Merging);
+        var mergingWasMoved = originalSet.Contains(GoalPhase.Merging)
+            && originalMergingIndex != original.Count - 1
+            && finalMergingIndex == final.Count - 1;
+        if (mergingWasMoved)
+        {
+            adjustments.Add("- Merging was moved to the end (always required as the last phase)");
+        }
+
+        var adjustmentsText = adjustments.Count > 0
+            ? string.Join("\n", adjustments)
+            : "- (phases were reordered to satisfy safety invariants)";
+
         return $"""
 Your iteration plan was adjusted by the system to meet safety requirements.
 Original plan: [{string.Join(", ", original)}]
 Final plan: [{string.Join(", ", final)}]
-Added phases: {string.Join(", ", added)}
-Reason: Review is required for plans that contain Coding (code changes).
+Adjustments:
+{adjustmentsText}
 You will be asked to craft prompts for ALL phases in the final plan, including any that were added.
 """;
     }
