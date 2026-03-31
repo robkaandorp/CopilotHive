@@ -783,9 +783,22 @@ public sealed class GoalDispatcher : BackgroundService
         IterationPlan newPlan;
         try
         {
-            newPlan = _brain is not null
-                ? ValidatePlan(await ResolvePlanAsync(pipeline, null, ct))
-                : IterationPlan.Default();
+            if (_brain is not null)
+            {
+                var rawPlan = await ResolvePlanAsync(pipeline, null, ct);
+                var originalPhases = rawPlan.Phases.ToList();
+                newPlan = ValidatePlan(rawPlan);
+
+                if (!originalPhases.SequenceEqual(newPlan.Phases))
+                {
+                    var note = BuildPlanAdjustmentNote(originalPhases, newPlan.Phases);
+                    await _brain.InjectSystemNoteAsync(pipeline, note, ct);
+                }
+            }
+            else
+            {
+                newPlan = IterationPlan.Default();
+            }
         }
         catch (Exception ex)
         {
@@ -962,6 +975,78 @@ public sealed class GoalDispatcher : BackgroundService
         phases.Add(GoalPhase.Merging);
 
         return plan;
+    }
+
+    /// <summary>
+    /// Builds a system note describing how the Brain's iteration plan was modified by
+    /// <see cref="ValidatePlan"/> to satisfy safety requirements.
+    /// Generates accurate per-change reasons for each adjustment made.
+    /// </summary>
+    /// <param name="original">The phases from the Brain's original plan.</param>
+    /// <param name="final">The phases after validation was applied.</param>
+    /// <returns>A human-readable note describing what was adjusted and why.</returns>
+    internal static string BuildPlanAdjustmentNote(List<GoalPhase> original, List<GoalPhase> final)
+    {
+        var originalSet = new HashSet<GoalPhase>(original);
+        var adjustments = new List<string>();
+
+        // Coding was added as safety fallback (neither Coding nor DocWriting was present)
+        if (!originalSet.Contains(GoalPhase.Coding) && !originalSet.Contains(GoalPhase.DocWriting)
+            && final.Contains(GoalPhase.Coding))
+        {
+            adjustments.Add("- Coding was inserted at the start (required: every plan must contain Coding or DocWriting)");
+        }
+
+        // Testing was added — reference the actual preceding phase
+        if (!originalSet.Contains(GoalPhase.Testing) && final.Contains(GoalPhase.Testing))
+        {
+            if (final.Contains(GoalPhase.Coding))
+            {
+                adjustments.Add("- Testing was inserted after Coding (required for code-change plans)");
+            }
+            else
+            {
+                // Docs-only plan: Testing inserted after DocWriting
+                adjustments.Add("- Testing was inserted after DocWriting (required: docs-only plan had neither Testing nor Review)");
+            }
+        }
+
+        // Review was added to a code-change plan
+        if (!originalSet.Contains(GoalPhase.Review) && final.Contains(GoalPhase.Review))
+        {
+            adjustments.Add("- Review was inserted after Testing (required for code-change plans)");
+        }
+
+        // Merging adjustments: appended (absent) or moved to the end (misplaced)
+        if (!originalSet.Contains(GoalPhase.Merging) && final.Contains(GoalPhase.Merging))
+        {
+            adjustments.Add("- Merging was appended as the final phase (always required)");
+        }
+        else
+        {
+            var originalMergingIndex = original.IndexOf(GoalPhase.Merging);
+            var finalMergingIndex = final.IndexOf(GoalPhase.Merging);
+            var mergingWasMoved = originalSet.Contains(GoalPhase.Merging)
+                && originalMergingIndex != original.Count - 1
+                && finalMergingIndex == final.Count - 1;
+            if (mergingWasMoved)
+            {
+                adjustments.Add("- Merging was moved to the end (always required as the last phase)");
+            }
+        }
+
+        var adjustmentsText = adjustments.Count > 0
+            ? string.Join("\n", adjustments)
+            : "- (phases were reordered to satisfy safety invariants)";
+
+        return $"""
+Your iteration plan was adjusted by the system to meet safety requirements.
+Original plan: [{string.Join(", ", original)}]
+Final plan: [{string.Join(", ", final)}]
+Adjustments:
+{adjustmentsText}
+You will be asked to craft prompts for ALL phases in the final plan, including any that were added.
+""";
     }
 
     private async Task DispatchToRole(GoalPipeline pipeline, WorkerRole role, string? prompt, CancellationToken ct)
@@ -1169,9 +1254,22 @@ public sealed class GoalDispatcher : BackgroundService
         IterationPlan newPlan;
         try
         {
-            newPlan = _brain is not null
-                ? ValidatePlan(await ResolvePlanAsync(pipeline, null, ct))
-                : IterationPlan.Default();
+            if (_brain is not null)
+            {
+                var rawPlan = await ResolvePlanAsync(pipeline, null, ct);
+                var originalPhases = rawPlan.Phases.ToList();
+                newPlan = ValidatePlan(rawPlan);
+
+                if (!originalPhases.SequenceEqual(newPlan.Phases))
+                {
+                    var note = BuildPlanAdjustmentNote(originalPhases, newPlan.Phases);
+                    await _brain.InjectSystemNoteAsync(pipeline, note, ct);
+                }
+            }
+            else
+            {
+                newPlan = IterationPlan.Default();
+            }
         }
         catch
         {
@@ -1845,7 +1943,15 @@ public sealed class GoalDispatcher : BackgroundService
             try
             {
                 var planContext = isRetry ? RetryPlanContext : null;
-                iterationPlan = ValidatePlan(await ResolvePlanAsync(pipeline, planContext, ct));
+                var rawPlan = await ResolvePlanAsync(pipeline, planContext, ct);
+                var originalPhases = rawPlan.Phases.ToList();
+                iterationPlan = ValidatePlan(rawPlan);
+
+                if (!originalPhases.SequenceEqual(iterationPlan.Phases))
+                {
+                    var note = BuildPlanAdjustmentNote(originalPhases, iterationPlan.Phases);
+                    await _brain.InjectSystemNoteAsync(pipeline, note, ct);
+                }
             }
             catch (Exception ex)
             {

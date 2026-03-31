@@ -142,6 +142,15 @@ public interface IDistributedBrain
     Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default);
 
     /// <summary>
+    /// Injects a system note into the pipeline's conversation history to inform the Brain
+    /// that the iteration plan was adjusted by safety validation rules.
+    /// </summary>
+    /// <param name="pipeline">The active goal pipeline whose conversation receives the note.</param>
+    /// <param name="note">The note text describing the plan adjustment.</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct);
+
+    /// <summary>
     /// Asks the Brain a question on behalf of a worker, returning a structured response that
     /// either contains an answer or signals escalation to the Composer.
     /// </summary>

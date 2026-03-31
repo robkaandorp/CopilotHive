@@ -367,6 +367,23 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <inheritdoc/>
+    public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct)
+    {
+        pipeline.Conversation.Add(new ConversationEntry("system", note, pipeline.Iteration, "plan-adjustment"));
+
+        // Also inject directly into the Brain's live session so the note is included
+        // when the Brain crafts the next prompt. Adding as a user message followed by
+        // an assistant acknowledgement keeps the conversation in a valid turn sequence.
+        _session.MessageHistory.Add(new ChatMessage(ChatRole.User,
+            $"SYSTEM NOTE (plan adjustment for goal {pipeline.GoalId}):\n\n{note}"));
+        _session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
+            "Acknowledged. I have noted the plan adjustment and will craft prompts for all phases in the final plan."));
+
+        _logger.LogInformation("Injected plan adjustment note for goal {GoalId}: {Note}", pipeline.GoalId, note);
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc/>
     public async Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(instructions)) return;
