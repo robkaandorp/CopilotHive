@@ -625,25 +625,38 @@ public sealed class DistributedBrainTests
     [Fact]
     public void BuildCraftPromptText_ReviewPhase_ContainsReviewerInstructionText()
     {
-        // Verify the reviewer role instruction includes the exact required text
+        // With change D, reviewer-specific rules are now in DefaultSystemPrompt (the system prompt),
+        // not in BuildCraftPromptText. Verify that:
+        // 1. The system prompt (accessible via _systemPrompt field) contains the reviewer guidance.
+        // 2. The craft prompt still includes the tester output section as expected.
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-rev-instr", "Review instruction test");
         pipeline.RecordOutput(WorkerRole.Tester, 1, "All tests pass.");
 
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        // Verify the craft prompt includes tester output (key observable behavior)
+        var craftPrompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        Assert.Contains("Current iteration test results (from the tester phase):", craftPrompt);
+        Assert.Contains("All tests pass.", craftPrompt);
 
+        // Verify the system prompt contains the reviewer guidance
+        var systemPromptField = typeof(DistributedBrain)
+            .GetField("_systemPrompt", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var systemPrompt = (string)systemPromptField.GetValue(brain)!;
         Assert.Contains(
             "Use the testing phase results to verify that all tests pass",
-            prompt);
+            systemPrompt);
         Assert.Contains(
             "do NOT reject because you cannot run tests yourself",
-            prompt);
+            systemPrompt);
     }
 
     [Fact]
     public void ReviewPhaseGuidance_BothBranches_ContainExactInstruction()
     {
-        // Verify the exact reviewer instruction appears in BOTH Review branches in source.
+        // With change D, reviewer-specific rules are now in DefaultSystemPrompt (not in BuildCraftPromptText).
+        // Verify that:
+        // 1. The system prompt contains the reviewer guidance (at least once via DefaultSystemPrompt constant).
+        // 2. BuildReviewFallbackPrompt still contains the guidance (for the no-brain fallback path).
         var repoRoot = Environment.CurrentDirectory;
         while (repoRoot != null && !Directory.GetFiles(repoRoot, "*.slnx").Any())
             repoRoot = Directory.GetParent(repoRoot)?.FullName;
@@ -657,10 +670,10 @@ public sealed class DistributedBrainTests
         const string expectedInstruction =
             "Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.";
 
-        // Count occurrences — both GoalPhase.Review branches + BuildReviewFallbackPrompt should have it
+        // Now the instruction appears in DefaultSystemPrompt + BuildReviewFallbackPrompt (at least 2 locations)
         var occurrences = source.Split(expectedInstruction).Length - 1;
-        Assert.True(occurrences >= 3,
-            $"Expected the test-results instruction to appear in at least 3 locations (2 Review branches + fallback), but found {occurrences}.");
+        Assert.True(occurrences >= 2,
+            $"Expected the test-results instruction to appear in at least 2 locations (DefaultSystemPrompt + fallback), but found {occurrences}.");
     }
 
     // -- BuildReviewFallbackPrompt Tests --

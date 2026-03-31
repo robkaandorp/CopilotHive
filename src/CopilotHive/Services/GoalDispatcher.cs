@@ -828,7 +828,7 @@ public sealed class GoalDispatcher : BackgroundService
             case GoalPhase.Review:
             case GoalPhase.Testing:
                 var prompt = _brain is not null
-                    ? await ResolvePromptAsync(pipeline, phase, phaseInstructions, ct)
+                    ? await ResolvePromptAsync(pipeline, phase, null, ct)
                     : $"Work on: {pipeline.Description} (phase: {phase})";
                 await DispatchToRole(pipeline, phase.ToWorkerRole(), prompt, ct);
                 break;
