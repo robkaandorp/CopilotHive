@@ -38,12 +38,14 @@ body {
     background: var(--bg);
     color: var(--text);
     line-height: 1.5;
+    overflow: hidden;
 }
 
 .hive-layout {
     display: grid;
     grid-template-columns: 200px 1fr;
-    min-height: 100vh;
+    grid-template-rows: 1fr auto;
+    height: 100vh;
 }
 
 .hive-nav {
@@ -53,6 +55,8 @@ body {
     display: flex;
     flex-direction: column;
     gap: 0.25rem;
+    grid-row: 1 / span 2;
+    overflow-y: auto;
 }
 
 .hive-nav .hive-brand {
@@ -85,8 +89,18 @@ body {
     overflow-y: auto;
 }
 
+.hive-main > h1 {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: var(--bg);
+    padding-bottom: 0.5rem;
+    margin-bottom: 1rem;
+}
+
 .hive-footer {
-    grid-column: 1 / -1;
+    grid-column: 2;
+    grid-row: 2;
     border-top: 1px solid var(--border);
     padding: 0.75rem 1.5rem;
     font-size: 0.8rem;
