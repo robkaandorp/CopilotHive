@@ -367,6 +367,14 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <inheritdoc/>
+    public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct)
+    {
+        pipeline.Conversation.Add(new ConversationEntry("system", note, pipeline.Iteration, "plan-adjustment"));
+        _logger.LogInformation("Injected plan adjustment note for goal {GoalId}: {Note}", pipeline.GoalId, note);
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc/>
     public async Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(instructions)) return;

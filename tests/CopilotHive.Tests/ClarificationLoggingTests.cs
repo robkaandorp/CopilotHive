@@ -667,6 +667,8 @@ public sealed class ClarificationLoggingTests
             Task.CompletedTask;
         public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) =>
             Task.CompletedTask;
+        public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct) =>
+            Task.CompletedTask;
         public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
         public BrainStats? GetStats() => null;
     }

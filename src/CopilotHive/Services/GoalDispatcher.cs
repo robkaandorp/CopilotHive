@@ -783,9 +783,22 @@ public sealed class GoalDispatcher : BackgroundService
         IterationPlan newPlan;
         try
         {
-            newPlan = _brain is not null
-                ? ValidatePlan(await ResolvePlanAsync(pipeline, null, ct))
-                : IterationPlan.Default();
+            if (_brain is not null)
+            {
+                var rawPlan = await ResolvePlanAsync(pipeline, null, ct);
+                var originalPhases = rawPlan.Phases.ToList();
+                newPlan = ValidatePlan(rawPlan);
+
+                if (!originalPhases.SequenceEqual(newPlan.Phases))
+                {
+                    var note = BuildPlanAdjustmentNote(originalPhases, newPlan.Phases);
+                    await _brain.InjectSystemNoteAsync(pipeline, note, ct);
+                }
+            }
+            else
+            {
+                newPlan = IterationPlan.Default();
+            }
         }
         catch (Exception ex)
         {
@@ -962,6 +975,26 @@ public sealed class GoalDispatcher : BackgroundService
         phases.Add(GoalPhase.Merging);
 
         return plan;
+    }
+
+    /// <summary>
+    /// Builds a system note describing how the Brain's iteration plan was modified by
+    /// <see cref="ValidatePlan"/> to satisfy safety requirements.
+    /// </summary>
+    /// <param name="original">The phases from the Brain's original plan.</param>
+    /// <param name="final">The phases after validation was applied.</param>
+    /// <returns>A human-readable note describing what was added and why.</returns>
+    internal static string BuildPlanAdjustmentNote(List<GoalPhase> original, List<GoalPhase> final)
+    {
+        var added = final.Except(original).ToList();
+        return $"""
+Your iteration plan was adjusted by the system to meet safety requirements.
+Original plan: [{string.Join(", ", original)}]
+Final plan: [{string.Join(", ", final)}]
+Added phases: {string.Join(", ", added)}
+Reason: Review is required for plans that contain Coding (code changes).
+You will be asked to craft prompts for ALL phases in the final plan, including any that were added.
+""";
     }
 
     private async Task DispatchToRole(GoalPipeline pipeline, WorkerRole role, string? prompt, CancellationToken ct)
@@ -1169,9 +1202,22 @@ public sealed class GoalDispatcher : BackgroundService
         IterationPlan newPlan;
         try
         {
-            newPlan = _brain is not null
-                ? ValidatePlan(await ResolvePlanAsync(pipeline, null, ct))
-                : IterationPlan.Default();
+            if (_brain is not null)
+            {
+                var rawPlan = await ResolvePlanAsync(pipeline, null, ct);
+                var originalPhases = rawPlan.Phases.ToList();
+                newPlan = ValidatePlan(rawPlan);
+
+                if (!originalPhases.SequenceEqual(newPlan.Phases))
+                {
+                    var note = BuildPlanAdjustmentNote(originalPhases, newPlan.Phases);
+                    await _brain.InjectSystemNoteAsync(pipeline, note, ct);
+                }
+            }
+            else
+            {
+                newPlan = IterationPlan.Default();
+            }
         }
         catch
         {
@@ -1845,7 +1891,15 @@ public sealed class GoalDispatcher : BackgroundService
             try
             {
                 var planContext = isRetry ? RetryPlanContext : null;
-                iterationPlan = ValidatePlan(await ResolvePlanAsync(pipeline, planContext, ct));
+                var rawPlan = await ResolvePlanAsync(pipeline, planContext, ct);
+                var originalPhases = rawPlan.Phases.ToList();
+                iterationPlan = ValidatePlan(rawPlan);
+
+                if (!originalPhases.SequenceEqual(iterationPlan.Phases))
+                {
+                    var note = BuildPlanAdjustmentNote(originalPhases, iterationPlan.Phases);
+                    await _brain.InjectSystemNoteAsync(pipeline, note, ct);
+                }
             }
             catch (Exception ex)
             {
