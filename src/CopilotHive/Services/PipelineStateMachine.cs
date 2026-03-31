@@ -96,24 +96,24 @@ public sealed class PipelineStateMachine
 
     /// <summary>
     /// Initialize the state machine for a new iteration with the given phase plan.
-    /// Resets the phase queue and sets Phase to Coding (the first phase).
+    /// Resets the phase queue and sets Phase to the first phase (Coding or DocWriting).
     /// </summary>
-    /// <param name="phases">Ordered phases for this iteration. Must start with Coding and end with Merging.</param>
-    /// <exception cref="ArgumentException">If the plan is empty, doesn't start with Coding, or doesn't end with Merging.</exception>
+    /// <param name="phases">Ordered phases for this iteration. Must start with Coding or DocWriting and end with Merging.</param>
+    /// <exception cref="ArgumentException">If the plan is empty, doesn't start with Coding or DocWriting, or doesn't end with Merging.</exception>
     public void StartIteration(IReadOnlyList<GoalPhase> phases)
     {
         ArgumentNullException.ThrowIfNull(phases);
         if (phases.Count == 0)
             throw new ArgumentException("Phase plan must not be empty.", nameof(phases));
-        if (phases[0] != GoalPhase.Coding)
-            throw new ArgumentException($"Phase plan must start with Coding, got {phases[0]}.", nameof(phases));
+        if (phases[0] != GoalPhase.Coding && phases[0] != GoalPhase.DocWriting)
+            throw new ArgumentException($"Phase plan must start with Coding or DocWriting, got {phases[0]}.", nameof(phases));
         if (phases[^1] != GoalPhase.Merging)
             throw new ArgumentException($"Phase plan must end with Merging, got {phases[^1]}.", nameof(phases));
 
         _remainingPhases.Clear();
         _completedPhases.Clear();
 
-        // First phase (Coding) becomes current; rest goes in the queue
+        // First phase (Coding or DocWriting) becomes current; rest goes in the queue
         Phase = phases[0];
         for (var i = 1; i < phases.Count; i++)
             _remainingPhases.Enqueue(phases[i]);
