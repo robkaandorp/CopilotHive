@@ -348,11 +348,63 @@ public class PipelineStateMachineTests
     }
 
     [Fact]
-    public void StartIteration_NotStartingWithCoding_Throws()
+    public void StartIteration_NotStartingWithCodingOrDocWriting_Throws()
     {
         var sm = new PipelineStateMachine();
         Assert.Throws<ArgumentException>(() =>
             sm.StartIteration([GoalPhase.Testing, GoalPhase.Merging]));
+    }
+
+    [Fact]
+    public void StartIteration_StartingWithDocWriting_IsAccepted()
+    {
+        var sm = new PipelineStateMachine();
+        sm.StartIteration([GoalPhase.DocWriting, GoalPhase.Merging]);
+        Assert.Equal(GoalPhase.DocWriting, sm.Phase);
+    }
+
+    [Fact]
+    public void StartIteration_StartingWithCoding_StillAccepted()
+    {
+        var sm = new PipelineStateMachine();
+        sm.StartIteration([GoalPhase.Coding, GoalPhase.Merging]);
+        Assert.Equal(GoalPhase.Coding, sm.Phase);
+    }
+
+    [Fact]
+    public void StartIteration_DocWritingPlan_NotEndingWithMerging_Throws()
+    {
+        var sm = new PipelineStateMachine();
+        Assert.Throws<ArgumentException>(() =>
+            sm.StartIteration([GoalPhase.DocWriting, GoalPhase.Review]));
+    }
+
+    [Fact]
+    public void DocWritingOnlyPlan_FullFlow_Completes()
+    {
+        var sm = new PipelineStateMachine();
+        sm.StartIteration([GoalPhase.DocWriting, GoalPhase.Review, GoalPhase.Merging]);
+        Assert.Equal(GoalPhase.DocWriting, sm.Phase);
+
+        var r1 = sm.Transition(PhaseInput.Succeeded);
+        Assert.Equal(GoalPhase.Review, r1.NextPhase);
+        Assert.Equal(TransitionEffect.Continue, r1.Effect);
+
+        var r2 = sm.Transition(PhaseInput.Succeeded);
+        Assert.Equal(GoalPhase.Merging, r2.NextPhase);
+        Assert.Equal(TransitionEffect.Continue, r2.Effect);
+
+        var r3 = sm.Transition(PhaseInput.Succeeded);
+        Assert.Equal(GoalPhase.Done, r3.NextPhase);
+        Assert.Equal(TransitionEffect.Completed, r3.Effect);
+    }
+
+    [Fact]
+    public void StartIteration_StartingWithReview_Throws()
+    {
+        var sm = new PipelineStateMachine();
+        Assert.Throws<ArgumentException>(() =>
+            sm.StartIteration([GoalPhase.Review, GoalPhase.Merging]));
     }
 
     [Fact]
