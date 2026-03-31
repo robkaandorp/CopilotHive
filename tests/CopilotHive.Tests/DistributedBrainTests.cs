@@ -975,6 +975,129 @@ public sealed class DistributedBrainTests
         Assert.True(brainTools.Count >= 3, "Brain should have at least 3 tools (escalate_to_composer, get_goal, report_iteration_plan)");
     }
 
+    [Fact]
+    public void GetGoalTool_HasCorrectNameAndGoalIdParameter()
+    {
+        // Arrange
+        var goalStore = new FakeGoalStore();
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            goalStore: goalStore);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+
+        // Act: find the get_goal tool
+        var getGoalTool = brainTools.OfType<AIFunction>().FirstOrDefault(t => t.Name == "get_goal");
+
+        // Assert: tool exists and has correct name
+        Assert.NotNull(getGoalTool);
+        Assert.Equal("get_goal", getGoalTool.Name);
+
+        // Assert: tool JSON schema contains a goal_id property
+        var schema = getGoalTool.JsonSchema.ToString();
+        Assert.Contains("goal_id", schema);
+    }
+
+    [Fact]
+    public async Task GetGoalTool_ReturnsGoalDetails_WhenCalledWithValidId()
+    {
+        // Arrange: Create a brain with a goal store that has a known goal
+        var goalStore = new FakeGoalStore();
+        goalStore.AddGoal(new Goal
+        {
+            Id = "test-goal-42",
+            Description = "Implement user authentication with JWT tokens",
+            Status = GoalStatus.InProgress,
+            RepositoryNames = ["my-repo", "auth-service"],
+        });
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            goalStore: goalStore);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
+
+        // Act: invoke the get_goal tool with a valid goal ID
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "test-goal-42" });
+        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: result contains the expected goal details
+        Assert.Contains("test-goal-42", result);
+        Assert.Contains("Implement user authentication with JWT tokens", result);
+        Assert.Contains("InProgress", result);
+        Assert.Contains("my-repo", result);
+        Assert.Contains("auth-service", result);
+    }
+
+    [Fact]
+    public async Task GetGoalTool_ReturnsNotFound_WhenGoalDoesNotExist()
+    {
+        // Arrange
+        var goalStore = new FakeGoalStore();
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            goalStore: goalStore);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
+
+        // Act: invoke with a non-existent goal ID
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "does-not-exist" });
+        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: result indicates the goal was not found
+        Assert.Contains("not found", result);
+    }
+
+    [Fact]
+    public async Task GetGoalTool_ReturnsIterationInfo_WhenPipelineIsRegistered()
+    {
+        // Arrange
+        var goalStore = new FakeGoalStore();
+        goalStore.AddGoal(new Goal { Id = "active-goal", Description = "Active pipeline goal", Status = GoalStatus.InProgress });
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            goalStore: goalStore);
+
+        var pipeline = CreatePipeline("active-goal", "Active pipeline goal");
+        brain.RegisterActivePipeline(pipeline);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
+
+        // Act: invoke with the active goal ID
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "active-goal" });
+        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: result contains iteration info from the registered pipeline
+        Assert.Contains("iteration", result.ToLowerInvariant());
+    }
+
+    [Fact]
+    public async Task GetGoalTool_ReturnsNotAvailable_WhenGoalStoreIsNull()
+    {
+        // Arrange: Brain without goal store
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
+
+        // Act
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "any-goal" });
+        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: graceful error when no goal store
+        Assert.Contains("not available", result);
+    }
+
     // -- BuildCraftPromptText Goal ID Reference Tests (Change C) --
 
     [Fact]
@@ -1119,6 +1242,64 @@ public sealed class DistributedBrainTests
         Assert.Contains("Target repositories:", prompt);
         Assert.Contains("repo-alpha", prompt);
         Assert.Contains("repo-beta", prompt);
+    }
+
+    // -- Tester Output Truncation Tests (Change E) --
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_TruncatesTesterOutputTo2000Chars()
+    {
+        // Arrange: create a pipeline with a very long tester output
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("goal-truncate", "Test tester output truncation");
+        const int largeTesterOutputLength = 5000;
+        var largeTesterOutput = new string('X', largeTesterOutputLength);
+        pipeline.PhaseOutputs[$"tester-{pipeline.Iteration}"] = largeTesterOutput;
+
+        // Act: craft a Review-phase prompt
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: the full tester output does NOT appear in the prompt
+        Assert.DoesNotContain(largeTesterOutput, prompt);
+
+        // Assert: the prompt contains an ellipsis truncation marker (truncated portion)
+        Assert.Contains("...", prompt);
+
+        // Assert: the truncated tester output (first 2000 chars) appears in the prompt
+        var first2000Chars = largeTesterOutput[..2000];
+        Assert.Contains(first2000Chars, prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_DoesNotTruncate_WhenTesterOutputShort()
+    {
+        // Arrange: short tester output that should not be truncated
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("goal-short-output", "Test short tester output");
+        var shortOutput = "All 42 tests passed. Build succeeded.";
+        pipeline.PhaseOutputs[$"tester-{pipeline.Iteration}"] = shortOutput;
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: full short output appears verbatim in the prompt (no truncation)
+        Assert.Contains(shortOutput, prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_WithExactly2000CharTesterOutput_NotTruncated()
+    {
+        // Arrange: exactly 2000 chars — should NOT be truncated
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("goal-exact-2000", "Test exact 2000 char boundary");
+        var exactly2000 = new string('Y', 2000);
+        pipeline.PhaseOutputs[$"tester-{pipeline.Iteration}"] = exactly2000;
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: exactly 2000 chars should appear as-is (no truncation)
+        Assert.Contains(exactly2000, prompt);
     }
 
 }

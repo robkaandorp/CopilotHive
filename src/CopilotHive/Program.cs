@@ -102,7 +102,8 @@ static async Task<int> RunServerAsync(string[] args)
                 maxCtx,
                 maxSteps,
                 sp.GetService<IBrainRepoManager>(),
-                stateDir);
+                stateDir,
+                sp.GetRequiredService<IGoalStore>());
         });
     }
 
