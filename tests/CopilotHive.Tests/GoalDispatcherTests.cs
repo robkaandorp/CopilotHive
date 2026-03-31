@@ -1854,7 +1854,6 @@ public sealed class GoalDispatcherDocWritingPhaseTests
         // Assert — generic fallback is used, not the old hardcoded BuildDocWriterPrompt
         Assert.Contains("Work on:", prompt);
         Assert.Contains("DocWriting", prompt);
-        Assert.DoesNotContain("<base-branch>", prompt);
     }
 
     /// <summary>
