@@ -1860,15 +1860,17 @@ public sealed class GoalDispatcher : BackgroundService
 
         pipeline.SetPlan(iterationPlan);
         pipeline.StateMachine.StartIteration(iterationPlan.Phases);
-        pipeline.AdvanceTo(GoalPhase.Coding);
+        var firstPhase = iterationPlan.Phases[0];
+        pipeline.AdvanceTo(firstPhase);
 
-        // Craft prompt for coder and dispatch
+        // Craft prompt for first phase and dispatch
         var coderAdditionalContext = isRetry ? RetryCoderContext : null;
-        var coderPrompt = _brain is not null
-            ? await ResolvePromptAsync(pipeline, GoalPhase.Coding, coderAdditionalContext, ct)
-            : BuildCoderPrompt(goal);
+        var firstPhasePrompt = _brain is not null
+            ? await ResolvePromptAsync(pipeline, firstPhase, coderAdditionalContext, ct)
+            : (firstPhase == GoalPhase.Coding ? BuildCoderPrompt(goal) : $"Work on: {pipeline.Description}");
 
-        await DispatchToRole(pipeline, WorkerRole.Coder, coderPrompt, ct);
+        var firstRole = firstPhase.ToWorkerRole();
+        await DispatchToRole(pipeline, firstRole, firstPhasePrompt, ct);
 
         // Dispatch succeeded — consume the retry marker so subsequent dispatches of
         // this goal (e.g. after a new failure+retry cycle) are treated as fresh starts.
