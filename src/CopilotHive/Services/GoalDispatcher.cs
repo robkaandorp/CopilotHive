@@ -828,7 +828,7 @@ public sealed class GoalDispatcher : BackgroundService
             case GoalPhase.Review:
             case GoalPhase.Testing:
                 var prompt = _brain is not null
-                    ? await ResolvePromptAsync(pipeline, phase, phaseInstructions, ct)
+                    ? await ResolvePromptAsync(pipeline, phase, null, ct)
                     : $"Work on: {pipeline.Description} (phase: {phase})";
                 await DispatchToRole(pipeline, phase.ToWorkerRole(), prompt, ct);
                 break;
@@ -1332,6 +1332,9 @@ public sealed class GoalDispatcher : BackgroundService
             pipeline.GoalId, pipeline.Iteration, duration.TotalMinutes,
             pipeline.Metrics.PassedTests, pipeline.Metrics.TotalTests,
             pipeline.Metrics.CoveragePercent);
+
+        // Deregister from Brain — goal is no longer active
+        (_brain as DistributedBrain)?.DeregisterActivePipeline(pipeline.GoalId);
     }
 
     /// <summary>
@@ -1407,6 +1410,9 @@ public sealed class GoalDispatcher : BackgroundService
         await CommitMetricsToConfigRepoAsync(pipeline, ct);
 
         _logger.LogWarning("Goal {GoalId} failed: {Reason}", pipeline.GoalId, reason);
+
+        // Deregister from Brain — goal is no longer active
+        (_brain as DistributedBrain)?.DeregisterActivePipeline(pipeline.GoalId);
     }
 
     /// <summary>
@@ -1668,8 +1674,9 @@ public sealed class GoalDispatcher : BackgroundService
         {
             _dispatchedGoals.TryAdd(pipeline.GoalId, true);
 
-            // Brain session is loaded from file at startup (single persistent session),
-            // so no per-goal re-priming is needed.
+            // Register restored active pipelines with the Brain so get_goal tool works
+            if (pipeline.Phase is not (GoalPhase.Done or GoalPhase.Failed))
+                (_brain as DistributedBrain)?.RegisterActivePipeline(pipeline);
 
             if (pipeline.Phase is GoalPhase.Done or GoalPhase.Failed)
                 continue;
@@ -1683,6 +1690,8 @@ public sealed class GoalDispatcher : BackgroundService
 
                 _pipelineManager.RemovePipeline(pipeline.GoalId);
                 _dispatchedGoals.TryRemove(pipeline.GoalId, out _);
+                // Pipeline was registered above — clean it up from Brain's _activePipelines
+                (_brain as DistributedBrain)?.DeregisterActivePipeline(pipeline.GoalId);
                 await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Pending, null, ct);
                 continue;
             }
@@ -1797,6 +1806,9 @@ public sealed class GoalDispatcher : BackgroundService
         var maxIterations = _config?.Orchestrator?.MaxIterations ?? Constants.DefaultMaxIterations;
         var pipeline = _pipelineManager.CreatePipeline(goal, maxRetries, maxIterations);
         pipeline.GoalStartedAt = startedMeta.StartedAt;
+
+        // Register with Brain so the get_goal tool can return live iteration/phase info
+        (_brain as DistributedBrain)?.RegisterActivePipeline(pipeline);
 
         // Build retry context strings injected into Brain calls when this goal was previously failed and re-dispatched
         const string RetryPlanContext =

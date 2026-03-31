@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using CopilotHive.Agents;
 using CopilotHive.Git;
+using CopilotHive.Goals;
 using CopilotHive.Metrics;
 using CopilotHive.Services;
 using CopilotHive.Telemetry;
@@ -28,6 +29,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly ILogger<DistributedBrain> _logger;
     private readonly MetricsTracker? _metricsTracker;
     private readonly IBrainRepoManager? _repoManager;
+    private readonly IGoalStore? _goalStore;
     private readonly string _stateDir;
     private IChatClient? _chatClient;
     private CodingAgent? _agent;
@@ -36,6 +38,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private string _systemPrompt;
     private readonly List<AITool> _brainTools;
     private readonly AgentsManager? _agentsManager;
+
+    /// <summary>
+    /// Active pipeline snapshots keyed by goal ID. Used by the <c>get_goal</c> tool to return
+    /// iteration and phase information for a goal without requiring a full <see cref="IGoalStore"/> query.
+    /// Updated by <see cref="RegisterActivePipeline"/> when goal dispatch begins.
+    /// </summary>
+    private Dictionary<string, GoalPipeline>? _activePipelines;
 
     /// <summary>
     /// Serialises all Brain LLM calls so that <see cref="_lastToolCallResult"/> is
@@ -67,6 +76,14 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         - If you need clarification during planning or prompt crafting that cannot be determined from the codebase, call the escalate_to_composer tool with a question and reason
         - Never include git checkout/branch/switch/push commands in prompts — infrastructure handles branching
         - Never include framework-specific build/test commands — workers use build and test skills
+
+        WORKER PROMPT RULES:
+        When crafting worker prompts, follow these rules per role:
+        - Coders: Tell them to implement immediately, read files, use build/test skills, commit with git add -A && git commit. Never include git branch or push commands.
+        - Testers: Tell them to build, run test skill, write integration tests, call report_test_results. Never tell them to create report files.
+        - Reviewers: Do NOT include git diff commands — the worker's workspace context provides the correct diff. Tell them to review using their workspace diff commands, focus on +/- lines, call report_review_verdict. Files to change is guidance, Files NOT to change is strict. Test changes are always acceptable. Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
+        - DocWriters: Do NOT include git diff commands. Tell them to use workspace context diff, update only requested docs, build to verify, call report_doc_changes.
+        - Improvers: Tell them to analyze results and update *.agents.md files using file tools. No git commands.
         """;
 
     /// <summary>
@@ -80,12 +97,14 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <param name="maxSteps">Maximum tool-call steps per Brain request. Defaults to <see cref="Constants.DefaultBrainMaxSteps"/>.</param>
     /// <param name="repoManager">Optional manager for persistent Brain repo clones (read-only file access).</param>
     /// <param name="stateDir">Directory for persistent state (session files). Defaults to <c>/app/state</c>.</param>
+    /// <param name="goalStore">Optional goal store used by the <c>get_goal</c> tool to retrieve goal details on demand.</param>
     public DistributedBrain(string modelOverride, ILogger<DistributedBrain> logger,
         MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null,
         int maxContextTokens = Constants.DefaultBrainContextWindow,
         int maxSteps = Constants.DefaultBrainMaxSteps,
         IBrainRepoManager? repoManager = null,
-        string? stateDir = null)
+        string? stateDir = null,
+        IGoalStore? goalStore = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -94,6 +113,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _metricsTracker = metricsTracker;
         _repoManager = repoManager;
         _agentsManager = agentsManager;
+        _goalStore = goalStore;
         _stateDir = stateDir ?? "/app/state";
         _session = AgentSession.Create("brain");
 
@@ -156,6 +176,26 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
+    /// Registers a pipeline as active so the <c>get_goal</c> tool can include iteration
+    /// and phase context in its response.
+    /// </summary>
+    /// <param name="pipeline">The active goal pipeline.</param>
+    public void RegisterActivePipeline(GoalPipeline pipeline)
+    {
+        _activePipelines ??= [];
+        _activePipelines[pipeline.GoalId] = pipeline;
+    }
+
+    /// <summary>
+    /// Removes a pipeline from the active-pipeline registry once a goal completes or fails.
+    /// </summary>
+    /// <param name="goalId">The goal ID whose pipeline to deregister.</param>
+    public void DeregisterActivePipeline(string goalId)
+    {
+        _activePipelines?.Remove(goalId);
+    }
+
+    /// <summary>
     /// Builds the AIFunction tools that the Brain LLM can call.
     /// Only <c>report_iteration_plan</c> — prompt crafting uses plain text responses.
     /// </summary>
@@ -183,6 +223,31 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 },
                 "escalate_to_composer",
                 "Escalate a question to the Composer when the Brain cannot answer from the codebase alone."),
+            AIFunctionFactory.Create(
+                async ([Description("The goal ID to retrieve details for.")] string goal_id) =>
+                {
+                    if (_goalStore is null)
+                        return "Goal store is not available.";
+
+                    var goal = await _goalStore.GetGoalAsync(goal_id);
+                    if (goal is null)
+                        return $"Goal '{goal_id}' not found.";
+
+                    var pipeline = _activePipelines?.GetValueOrDefault(goal_id);
+                    var iterationInfo = pipeline is not null
+                        ? $"Current iteration: {pipeline.Iteration}, Phase: {pipeline.Phase}"
+                        : "Pipeline not active.";
+
+                    return $"""
+                        Goal ID: {goal.Id}
+                        Description: {goal.Description}
+                        Status: {goal.Status}
+                        Repositories: {string.Join(", ", goal.RepositoryNames)}
+                        {iterationInfo}
+                        """;
+                },
+                "get_goal",
+                "Retrieve goal details (description, status, repositories, iteration info) by goal ID."),
             AIFunctionFactory.Create(
                 ([Description("Ordered phase names, e.g. [\"coding\",\"testing\",\"docwriting\",\"review\",\"merging\"]")] string[] phases,
                  [Description("JSON-encoded dict of phase name to instruction, e.g. {\"coding\":\"focus on...\",\"review\":\"check...\"}")] string phase_instructions,
@@ -636,40 +701,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             && phases.IndexOf(GoalPhase.Review) is >= 0 and var rvIdx
             && dwIdx < rvIdx;
 
-        var roleInstruction = phase switch
-        {
-            GoalPhase.Coding => """
-                - For coders: Tell them to start implementing immediately — read the relevant files, make code changes, use build skill, use test skill, and commit with `git add -A && git commit`. NEVER include git checkout, git branch, or git push commands. NEVER include dotnet/npm/cargo commands — only reference build and test skills.
-                """,
-            GoalPhase.Review when docWritingPrecededReview => """
-                - For reviewers: Do NOT include any git diff commands in your prompt — the worker's WORKSPACE CONTEXT already provides the correct diff command with the exact merge-base hash. If an "Iteration diff command" is also listed there, tell reviewers they can use it to focus on changes made in this specific iteration. Just tell them to review the branch changes using the diff commands from their workspace context, focus only on the diff lines (+ and -), and call the report_review_verdict tool when done.
-                - IMPORTANT: The docwriting phase already ran before this review. Changes to CHANGELOG.md, README.md, and XML doc comments are EXPECTED and should NOT be flagged as scope violations.
-                - "Files to change" in the goal is GUIDANCE, not an exhaustive whitelist. Test files and test changes that cover the modified code are ALWAYS acceptable and expected.
-                - "Files NOT to change" in the goal IS a strict prohibition — flag any changes to those files as MAJOR.
-                - The goal description defines WHAT to do. New behavior described in the goal is IN SCOPE — do not reject changes just because the base branch doesn't have them yet.
-                - Only flag issues that are clearly bugs, security problems, or genuine scope violations (touching unrelated code/features).
-                - Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
-                """,
-            GoalPhase.Review => """
-                - For reviewers: Do NOT include any git diff commands in your prompt — the worker's WORKSPACE CONTEXT already provides the correct diff command with the exact merge-base hash. If an "Iteration diff command" is also listed there, tell reviewers they can use it to focus on changes made in this specific iteration. Just tell them to review the branch changes using the diff commands from their workspace context, focus only on the diff lines (+ and -), and call the report_review_verdict tool when done.
-                - "Files to change" in the goal is GUIDANCE, not an exhaustive whitelist. Test files and test changes that cover the modified code are ALWAYS acceptable and expected.
-                - "Files NOT to change" in the goal IS a strict prohibition — flag any changes to those files as MAJOR.
-                - The goal description defines WHAT to do. New behavior described in the goal is IN SCOPE — do not reject changes just because the base branch doesn't have them yet.
-                - Only flag issues that are clearly bugs, security problems, or genuine scope violations (touching unrelated code/features).
-                - Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
-                """,
-            GoalPhase.Testing => """
-                - For testers: tell them to build, run the test skill, write integration tests, and call the report_test_results tool when done. Do NOT tell them to create report files.
-                """,
-            GoalPhase.DocWriting => """
-                - For docwriters: Do NOT include any git diff commands in your prompt — the worker's WORKSPACE CONTEXT already provides the correct diff command. Tell them to use the diff command from their workspace context to see what changed, then update ONLY the documentation files the goal explicitly requests (e.g. README.md, CHANGELOG.md). Do NOT update files not mentioned in the goal. Build to verify and commit. Call the report_doc_changes tool when done.
-                """,
-            GoalPhase.Improve => """
-                - For improvers: tell them to analyze iteration results and update *.agents.md files directly using file tools. Do NOT tell them to run git commands — the infrastructure commits and pushes automatically.
-                """,
-            _ => throw new InvalidOperationException($"Unhandled phase in CraftPromptAsync: '{phase}'"),
-        };
-
         // When retrying after review/test rejection, include the specific feedback
         // so the coder/tester knows exactly what to fix.
         var previousFeedback = (phase is GoalPhase.Coding or GoalPhase.Testing && pipeline.Iteration > 1)
@@ -678,36 +709,43 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         // For review phase, extract the tester output from the current iteration so the reviewer
         // can verify test results without needing to run tests themselves.
-        var currentTestResults = (phase == GoalPhase.Review
+        string currentTestResults;
+        if (phase == GoalPhase.Review
             && pipeline.PhaseOutputs.TryGetValue($"tester-{pipeline.Iteration}", out var testerOut)
             && !string.IsNullOrWhiteSpace(testerOut))
-            ? testerOut
+        {
+            const int maxTesterOutputChars = 2000;
+            currentTestResults = testerOut.Length > maxTesterOutputChars
+                ? testerOut[..maxTesterOutputChars] + "..."
+                : testerOut;
+        }
+        else
+        {
+            currentTestResults = "";
+        }
+
+        // Include docwriting-preceded-review guidance inline when relevant
+        var docWritingNote = (phase == GoalPhase.Review && docWritingPrecededReview)
+            ? "\nNote: The docwriting phase already ran before this review. Changes to CHANGELOG.md, README.md, and XML doc comments are EXPECTED and should NOT be flagged as scope violations."
             : "";
 
         return $$"""
             Craft a prompt for the {{roleName}} worker.
 
-            Goal: {{pipeline.Description}}
-            Iteration: {{pipeline.Iteration}}
-            Current phase: {{phase}}
+            Goal: {{pipeline.GoalId}} (iteration {{pipeline.Iteration}}, phase {{phase}})
             Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
             {{phaseInstructions}}
             {{(previousFeedback.Length > 0 ? $"\n{previousFeedback}" : "")}}
             {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
             {{(currentTestResults.Length > 0 ? $"\nCurrent iteration test results (from the tester phase):\n{currentTestResults}" : "")}}
+            {{docWritingNote}}
 
             The worker has access to project skills (e.g. build, test) that describe how to build and test this project.
             Tell the worker to use those skills instead of hardcoding framework-specific commands.
 
-            Rules for the prompt you craft:
-            - The branch is already checked out by the infrastructure — do NOT mention branch names
-            - NEVER include git checkout, git branch, git switch, or git push commands — the infrastructure handles all branching
-            - NEVER include framework-specific build/test commands (dotnet build, npm test, etc.) — tell workers to use build and test skills
-            {{roleInstruction}}
-            - Include any context from previous phases that would help the worker
-
             Respond with ONLY the prompt text — no JSON, no markdown wrapping.
             If you need clarification that cannot be determined from the codebase, call escalate_to_composer instead.
+            Use the get_goal tool if you need the full goal description.
             """;
     }
 
