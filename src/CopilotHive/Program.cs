@@ -159,6 +159,7 @@ static async Task<int> RunServerAsync(string[] args)
 
     // Dashboard: Blazor Server + real-time state aggregation
     builder.Services.AddSingleton<DashboardStateService>();
+    builder.Services.AddScoped<PageHeaderState>();
     builder.Services.AddRazorComponents().AddInteractiveServerComponents();
     // HttpClient for Blazor Server components to call the local REST API
     builder.Services.AddScoped<HttpClient>(_ => new HttpClient

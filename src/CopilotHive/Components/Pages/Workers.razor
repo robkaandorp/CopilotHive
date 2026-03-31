@@ -2,8 +2,7 @@
 @using CopilotHive.Dashboard
 @implements IDisposable
 @inject DashboardStateService State
-
-<h1>🐝 Workers</h1>
+@inject PageHeaderState PageHeader
 
 <div class="cards">
     <div class="card">
@@ -87,6 +86,7 @@ else
 
     protected override void OnInitialized()
     {
+        PageHeader.SetTitle("🐝 Workers");
         _snap = State.GetSnapshot();
         _info = State.GetOrchestratorInfo();
         State.OnStateChanged += RefreshState;

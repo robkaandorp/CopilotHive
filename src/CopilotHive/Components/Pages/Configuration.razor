@@ -4,8 +4,8 @@
 @using Markdig
 @implements IDisposable
 @inject ConfigRepoManager ConfigRepo
+@inject PageHeaderState PageHeader
 
-<h1>⚙️ Configuration</h1>
 <p style="color:var(--text-muted);margin-bottom:1.5rem">
     Config repo: <code style="font-size:0.85rem">@ConfigRepo.LocalPath</code>
 </p>
@@ -55,6 +55,7 @@ else
 
     protected override async Task OnInitializedAsync()
     {
+        PageHeader.SetTitle("⚙️ Configuration");
         try
         {
             await LoadFilesAsync();

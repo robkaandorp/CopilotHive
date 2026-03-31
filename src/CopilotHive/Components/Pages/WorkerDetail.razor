@@ -2,6 +2,7 @@
 @using CopilotHive.Dashboard
 @implements IDisposable
 @inject DashboardStateService State
+@inject PageHeaderState PageHeader
 
 <div style="margin-bottom:1rem">
     <a href="/workers" style="color:var(--accent);text-decoration:none">← Back to Workers</a>
@@ -9,13 +10,10 @@
 
 @if (_worker is null)
 {
-    <h1>Worker Not Found</h1>
     <p style="color:var(--text-muted)">Worker <code>@WorkerId</code> is not connected.</p>
 }
 else
 {
-    <h1>Worker @_worker.Id[..Math.Min(12, _worker.Id.Length)]</h1>
-
     <div class="cards">
         <div class="card">
             <div class="label">Status</div>
@@ -107,6 +105,9 @@ else
     protected override void OnInitialized()
     {
         Refresh();
+        PageHeader.SetTitle(_worker is not null
+            ? $"🐝 Worker {_worker.Id[..Math.Min(12, _worker.Id.Length)]}"
+            : $"🐝 Worker {WorkerId}");
         State.OnStateChanged += RefreshState;
     }
 

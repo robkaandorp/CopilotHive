@@ -10,12 +10,12 @@
 @inject IJSRuntime JS
 @inject NavigationManager Nav
 @inject HttpClient HttpClient
+@inject PageHeaderState PageHeader
 
 <a href="/goals" style="display:inline-flex;align-items:center;gap:0.35rem;color:var(--accent);text-decoration:none;font-size:0.9rem;margin-bottom:0.5rem">
     ← Goals
 </a>
 <div class="goal-header" style="display:flex;align-items:center;gap:1rem;">
-    <h1>Goal: @GoalId</h1>
     @{ var repoNames = _storedGoal?.RepositoryNames ?? _detail?.RepositoryNames ?? []; }
     @foreach (var repo in repoNames)
     {
@@ -664,7 +664,11 @@ else
         State.OnStateChanged += RefreshState;
     }
 
-    protected override void OnParametersSet() => Refresh();
+    protected override void OnParametersSet()
+    {
+        PageHeader.SetTitle($"🎯 Goal: {GoalId}");
+        Refresh();
+    }
 
     private void Refresh()
     {

@@ -1,11 +1,11 @@
 @page "/releases"
+@using CopilotHive.Dashboard
 @using CopilotHive.Goals
 @inject IGoalStore GoalStore
 @inject NavigationManager Nav
 @inject HttpClient HttpClient
 @inject CopilotHive.Configuration.HiveConfigFile? HiveConfig
-
-<h1>📦 Releases</h1>
+@inject PageHeaderState PageHeader
 
 <!-- Filter Bar -->
 <div class="filter-bar">
@@ -163,6 +163,7 @@ else if (_loaded)
 
     protected override async Task OnInitializedAsync()
     {
+        PageHeader.SetTitle("📦 Releases");
         _allReleases = (await GoalStore.GetReleasesAsync()).ToList();
         await LoadGoalCountsAsync();
         _loaded = true;

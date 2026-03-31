@@ -1,10 +1,10 @@
 @page "/goals"
+@using CopilotHive.Dashboard
 @using CopilotHive.Goals
 @inject IGoalStore GoalStore
 @inject IJSRuntime JS
 @inject HttpClient HttpClient
-
-<h1>🎯 Goals</h1>
+@inject PageHeaderState PageHeader
 
 <!-- Filter Bar -->
 <div class="filter-bar">
@@ -193,6 +193,7 @@ else if (_loaded)
 
     protected override async Task OnInitializedAsync()
     {
+        PageHeader.SetTitle("🎯 Goals");
         _allGoals = (await GoalStore.GetAllGoalsAsync()).ToList();
         _allReleases = (await GoalStore.GetReleasesAsync()).ToList();
         _goalStatusById = _allGoals.ToDictionary(g => g.Id, g => g.Status);

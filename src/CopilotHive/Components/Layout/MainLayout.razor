@@ -1,10 +1,15 @@
 @inherits LayoutComponentBase
+@inject CopilotHive.Dashboard.PageHeaderState PageHeader
+@implements IDisposable
 
 <div class="hive-layout">
     <nav class="hive-nav">
         <div class="hive-brand">🐝 CopilotHive</div>
         <NavMenu />
     </nav>
+    <header class="hive-header">
+        <h1>@PageHeader.Title</h1>
+    </header>
     <main class="hive-main">
         @Body
     </main>
@@ -12,3 +17,14 @@
         <a href="https://github.com/robkaandorp/CopilotHive" target="_blank" rel="noopener noreferrer">CopilotHive on GitHub</a>
     </footer>
 </div>
+
+@code {
+    protected override void OnInitialized()
+    {
+        PageHeader.OnChanged += HandleTitleChanged;
+    }
+
+    private void HandleTitleChanged() => InvokeAsync(StateHasChanged);
+
+    public void Dispose() => PageHeader.OnChanged -= HandleTitleChanged;
+}

@@ -3,8 +3,7 @@
 @implements IDisposable
 @inject DashboardStateService State
 @inject IJSRuntime JS
-
-<h1>🪵 Live Logs</h1>
+@inject PageHeaderState PageHeader
 
 <div class="toolbar">
     <button class="@(_level is null ? "active" : "")" @onclick="() => SetLevel(null)">All</button>
@@ -34,6 +33,7 @@
 
     protected override void OnInitialized()
     {
+        PageHeader.SetTitle("🪵 Live Logs");
         _entries = State.GetRecentLogs(500).ToList();
         State.OnStateChanged += RefreshLogs;
     }
