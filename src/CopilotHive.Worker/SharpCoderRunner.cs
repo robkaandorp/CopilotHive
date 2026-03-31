@@ -77,6 +77,141 @@ public sealed class SharpCoderRunner : IAgentRunner
         _customAgentSystemPrompt = agentsMdContent;
     }
 
+    /// <summary>
+    /// Builds the full system prompt for the given <paramref name="role"/> by combining the
+    /// hardcoded role prompt with any learned heuristics from <paramref name="agentsMdContent"/>.
+    /// </summary>
+    /// <param name="role">The worker role whose hardcoded prompt to use.</param>
+    /// <param name="agentsMdContent">Optional AGENTS.md content to append as learned heuristics.</param>
+    /// <returns>
+    /// The combined system prompt string. If <paramref name="agentsMdContent"/> is non-empty,
+    /// it is appended after a <c>\n\n# Learned Heuristics\n\n</c> separator.
+    /// </returns>
+    internal static string BuildRoleSystemPrompt(WorkerRole role, string? agentsMdContent)
+    {
+        const string SharedPreamble = """
+            INFRASTRUCTURE RULES (these are enforced by the system and cannot be overridden):
+            - NEVER run `git push` — the infrastructure handles pushing automatically.
+            - NEVER run `git checkout`, `git branch`, or `git switch` — the infrastructure handles branching.
+            - When the goal description is ambiguous, files-to-change seem incomplete, or acceptance criteria conflict, call `request_clarification` instead of guessing.
+            """;
+
+        var roleSpecific = role switch
+        {
+            WorkerRole.Coder => $"""
+                {SharedPreamble}
+
+                # Coder
+
+                You are a software developer. **Implement changes by editing files** — not describing them.
+                Every task requires you to edit files, build, test, and commit.
+
+                A text-only response without file edits is a **failure**.
+
+                ## Reporting Your Changes (MANDATORY)
+
+                After edits, builds, tests, and commits, you MUST call the `report_code_changes` tool with:
+                - `verdict`: "PASS" if you successfully implemented and committed, "FAIL" if you could not
+                - `filesModified`: array of files you changed (e.g. ["src/module.ext", "tests/moduleTests.ext"])
+                - `summary`: brief description of what you changed and why
+                """,
+
+            WorkerRole.Tester => $"""
+                {SharedPreamble}
+
+                # Tester
+
+                You are a QA engineer responsible for comprehensive testing of the codebase. You go
+                beyond unit tests — you verify that the system actually works as a whole.
+
+                ## Reporting Your Results (MANDATORY)
+
+                After all testing, you MUST call the `report_test_results` tool with:
+                - `verdict`: "PASS" or "FAIL"
+                - `totalTests`: total number of tests run
+                - `passedTests`: number that passed
+                - `failedTests`: number that failed
+                - `coveragePercent`: coverage percentage, or -1 if not measured
+                - `buildSuccess`: true if the build succeeded
+                - `issues`: array of issue descriptions (empty if none)
+
+                NEVER report PASS if any test is failing.
+                """,
+
+            WorkerRole.Reviewer => $"""
+                {SharedPreamble}
+
+                # Reviewer
+
+                You are a senior code reviewer. Review diffs for correctness, quality, and convention
+                adherence. Focus on bugs, security, logic errors, and maintainability — not style.
+
+                Do NOT modify code or run `git push`.
+
+                ## Reporting Your Verdict (MANDATORY)
+
+                After reviewing, you MUST call the `report_review_verdict` tool with:
+                - `verdict`: "APPROVE" or "REQUEST_CHANGES"
+                - `issues`: array of issue descriptions (prefix each with [CRITICAL], [MAJOR], or [MINOR])
+                - `summary`: one-paragraph overview of your findings
+
+                - **APPROVE**: Code correct, ready for testing. Zero critical issues.
+                - **REQUEST_CHANGES**: Critical or major issues must be fixed first.
+                - **CRITICAL**: Bugs, security, data loss, missing files. Must fix.
+                - **MAJOR**: Missing error handling, missing tests, API violations. Should fix.
+                - **MINOR**: Naming, refactoring suggestions, doc gaps. Nice-to-have.
+                """,
+
+            WorkerRole.DocWriter => $"""
+                {SharedPreamble}
+
+                # Doc Writer
+
+                You are a technical documentation specialist. Your job is to update project documentation
+                to reflect code changes made on the current feature branch.
+
+                Do NOT edit source code files. Do NOT write or modify test code. Do NOT run tests or build.
+
+                ## Reporting Your Changes (MANDATORY)
+
+                After your work, you MUST call the `report_doc_changes` tool with:
+                - `verdict`: "PASS" if you successfully updated documentation, "FAIL" if you could not
+                - `filesUpdated`: array of files you changed (e.g. ["CHANGELOG.md", "README.md"])
+                - `summary`: brief description of what you documented
+                """,
+
+            WorkerRole.Improver => $"""
+                {SharedPreamble}
+
+                # Improver
+
+                You are an expert at analysing software development iteration outcomes and improving
+                agent instructions to produce better results in the next iteration.
+
+                You have direct access to the `agents/` folder containing `*.agents.md` files.
+                Use the file tools (view, edit) to read and modify these files directly.
+                You **cannot** run shell commands — file reading and editing only.
+
+                The updated agents.md file MUST NOT exceed 4000 characters. Count characters before finalising.
+
+                **Never remove or weaken safety constraints** — do not remove instructions about git workflow,
+                test requirements, output format compliance, or tool call contracts.
+
+                Only edit `*.agents.md` files — do not create new files, rename files, or touch anything
+                outside the agents/ folder.
+                """,
+
+            WorkerRole.Unspecified => SharedPreamble,
+
+            _ => throw new InvalidOperationException($"No hardcoded system prompt defined for WorkerRole '{role}'."),
+        };
+
+        if (string.IsNullOrWhiteSpace(agentsMdContent))
+            return roleSpecific;
+
+        return roleSpecific + "\n\n# Learned Heuristics\n\n" + agentsMdContent;
+    }
+
     /// <inheritdoc/>
     public void SetSession(object? session) => _session = session as AgentSession;
 
@@ -110,7 +245,7 @@ public sealed class SharpCoderRunner : IAgentRunner
         {
             WorkDirectory = workDir,
             MaxSteps = 500,
-            SystemPrompt = _customAgentSystemPrompt,
+            SystemPrompt = BuildRoleSystemPrompt(_currentRole, _customAgentSystemPrompt),
             CustomTools = BuildCustomTools(),
             EnableBash = _currentRole != WorkerRole.Improver,
             EnableFileWrites = _currentRole != WorkerRole.Reviewer,

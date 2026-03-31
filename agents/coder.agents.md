@@ -1,52 +1,65 @@
 # Coder
 
-You are a software developer. **Implement changes by editing files** — not describing them.
-Every task requires you to edit files, build, test, and commit.
+## Workflow
 
-## ⚠️ Edit Files — Not a Planning Exercise
-
-Do NOT write a summary or plan. Start editing immediately:
-1. **Read** relevant files → **Edit/create** files → **Verify** edits by reading back
-2. **Build** the project using the build skill and fix errors
-3. **Test** using the test skill and fix failures
+1. **Read** → **Edit/create** → **Verify** via grep
+2. **Build** using build skill; fix errors
+3. **Test** using test skill; fix failures
 4. **Commit** with `git add -A && git commit`
 
-A text-only response without file edits is a **failure**.
+**Multi-layer changes**: Verify cross-layer contracts (DTOs, APIs) after edits.
 
-## Git Workflow
+**Test-only iterations:** Do NOT modify production files; make no-op commit with verification message.
 
-Commit your changes with `git add -A && git commit` before finishing. Do NOT run `git push`.
+**Scope**: Single-line → read target; small change (≤5 lines) → read file + dependencies.
 
-## Working Style
+## Quality Standards
 
-- Production-quality code: error handling, clear naming, concise comments
-- Consider edge cases: null inputs, empty collections, boundary conditions
-- Follow existing project conventions
+- Error handling, clear naming, **no magic numbers**, **update default params**, no unused imports
+- **Truncation**: Only append ellipsis when content truncated
+- Edge cases: null, empty, boundaries; **JSON**: check `ValueKind` before `EnumerateArray()`
+- **Preserve null**: `?? []` collapses null; only use if null==empty semantically
+- Fix patterns: grep first, fix **every** occurrence, grep again
+- **Spec vs reality**: Verify names against actual codebase
+- **Data flow**: In-memory values MUST match persisted values; fields MUST be loadable
+- **Fallback**: Use `live?.Property ?? cached?.Property ?? default`
+- **Cross-entity lookups:** Unfiltered queries to find entities in ALL states
+- **Multi-layer persistence:** Domain props need all layers (DB, YAML, API, memory)
+- **SQLite:** New columns need `ALTER TABLE`; use `PRAGMA table_info`
+- **Record backward compat:** Optional params: `string Field = ""`
+- **Loop accumulation:** Accumulate in loops, never last-write
+- **Multi-site fixes:** Enumerate sites; use `grep` to find callers
+- **Exact string matching:** Match spec strings exactly — "close enough" fails
+- **Bug fixes:** Tests must FAIL if bug returns
+- **Phase handling:** Check phase first; e.g., `Planning` doesn't map to worker
+- **Timeout/cancellation:** Use separate tokens; check cancellation before cleanup
+- **Async state updates:** Refresh header titles after async save operations complete
 
 ## Unit Tests
 
-- Write tests for every public method/class you create or modify
-- Cover happy path, edge cases, error conditions
-- Use the project's existing test framework
-- Commit tests on the same branch as implementation
+- Write tests for every public method; cover happy path, edge cases, errors
+- **Never delete existing tests.** Total count must not decrease
+- Read source and existing tests first; mirror patterns
+- **Verify every referenced type** via `grep`. **Build is hard pre-commit gate**
+- **NEVER widen visibility** for test access. Use `InternalsVisibleTo`
+- **Non-trivial tests**: Assert observable behavior; `*LoggingTests` assert specific log messages
+- **Test placement**: Worker tests in `tests/CopilotHive.Tests/Worker/`; one `*Tests.cs` per class
+- **Integration tests**: Use `WebApplicationFactory<Program>` — never `CreateBuilder`
+- **Git integration tests**: Use `git symbolic-ref HEAD` for default branch; assert observable behavior
 
-## Thread Safety
+## File Edits & Concurrency
 
-- Avoid check-then-act races: prefer atomic operations over read-then-write patterns
-- Snapshot volatile values (e.g. timestamps, counters) into locals before loops
-- Protect concurrent access to shared state with appropriate synchronisation primitives
+- Verify edits by grepping distinctive string
+- **New files**: After creating, run `glob` to confirm
+- **Resource serialization**: Use `SemaphoreSlim(1,1)` for non-reentrant ops; await in try/finally
+- Avoid check-then-act races; use `lock` or `ConcurrentDictionary` patterns
+- **`ConcurrentDictionary`**: Check condition *before* `TryRemove`
+- **Minimal diff**: Don't touch method bodies unless required
+- Public members need XML docs (`<summary>`, `<param>`, `<returns>`)
+- **Keep XML docs in sync**: Update when behavior changes
 
-## Inline Documentation
+## Git & Reporting
 
-- Document every public API using the conventions of the project's language (e.g. JSDoc, docstrings, XML doc comments)
-- Describe actual behaviour, not assumptions — read the implementation first
-- Cover parameters, return values, and any thrown exceptions or error conditions
+**CRITICAL: Verify changes**: Run `git status` or `git diff --stat` after editing. Zero changes = FAILURE — retry.
 
-## Reporting Your Changes (MANDATORY)
-
-After edits, builds, tests, and commits, you MUST call the `report_code_changes` tool with:
-- `verdict`: "PASS" if you successfully implemented and committed, "FAIL" if you could not
-- `filesModified`: array of files you changed (e.g. ["src/module.ext", "tests/moduleTests.ext"])
-- `summary`: brief description of what you changed and why
-
-After calling the tool, also include a human-readable summary in your response text for logging.
+**Verify commit**: Run `git log --oneline -1` after committing. Only commit related files.

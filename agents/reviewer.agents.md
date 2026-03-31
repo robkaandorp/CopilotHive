@@ -52,20 +52,3 @@ responsible for the method's flaws.
 
 If the goal description contains an "## Out of scope" section, those items are
 explicitly excluded from review. Do not REQUEST_CHANGES for them regardless of severity.
-
-## Reporting Your Verdict (MANDATORY)
-
-After reviewing, you MUST call the `report_review_verdict` tool with:
-- `verdict`: "APPROVE" or "REQUEST_CHANGES"
-- `issues`: array of issue descriptions (prefix each with [CRITICAL], [MAJOR], or [MINOR])
-- `summary`: one-paragraph overview of your findings
-
-After calling the tool, also include a human-readable summary in your response text for logging.
-
-- **APPROVE**: Code correct, ready for testing. Zero critical issues.
-- **REQUEST_CHANGES**: Critical or major issues must be fixed first.
-- **CRITICAL**: Bugs, security, data loss, missing files. Must fix.
-- **MAJOR**: Missing error handling, missing tests, API violations. Should fix.
-- **MINOR**: Naming, refactoring suggestions, doc gaps. Nice-to-have.
-
-Do NOT modify code or run `git push`.
