@@ -26,7 +26,7 @@ Violating these boundaries is treated as a task failure.
    (e.g. `git diff abc123..HEAD`). Also run it with `--stat` for a summary. This shows only branch changes.
 2. **Update CHANGELOG.md** — this is **mandatory**, not optional (see below).
 3. **Update other documentation**: Edit the files listed below as needed.
-4. **Commit** with `git add -A && git commit`. Do NOT run `git push`.
+4. **Commit** with `git add -A && git commit`.
 
 ## Files to Update
 
@@ -42,15 +42,5 @@ Violating these boundaries is treated as a task failure.
 - Keep CHANGELOG entries concise: one line per change
 - **Verify counts before writing them**: When mentioning any count (test count, method count, file count) in a CHANGELOG entry, read the actual source files to confirm the number — do NOT rely on the task description or your own estimate. Inaccurate facts in documentation are worse than omitting the count entirely.
 - Use the existing documentation style and tone
-- Do NOT run `git push` — the orchestrator handles that
 
-## Reporting Your Changes (MANDATORY)
-
-After your work, you MUST call the `report_doc_changes` tool with:
-- `verdict`: "PASS" if you successfully updated documentation, "FAIL" if you could not
-- `filesUpdated`: array of files you changed (e.g. ["CHANGELOG.md", "README.md"])
-- `summary`: brief description of what you documented
-
-After calling the tool, also include a human-readable summary in your response text for logging.
-
-If you did not update CHANGELOG.md, treat your work as **incomplete** and go back to update it before calling the tool.
+If you did not update CHANGELOG.md, treat your work as **incomplete** and go back to update it before calling the reporting tool.

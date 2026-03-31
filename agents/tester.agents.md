@@ -50,24 +50,8 @@ Actually run the system and verify it works:
 
 ### Phase 6: Report Results
 
-After all testing, you MUST call the `report_test_results` tool with your final results.
+After all testing, call `report_test_results` with your final results.
 This is the primary way test metrics are reported to the orchestrator.
-
-Call `report_test_results` with:
-- `verdict`: "PASS" or "FAIL"
-- `totalTests`: total number of tests run
-- `passedTests`: number that passed
-- `failedTests`: number that failed
-- `coveragePercent`: coverage percentage, or -1 if not measured
-- `buildSuccess`: true if the build succeeded
-- `issues`: array of issue descriptions (empty if none)
-
-After calling the tool, also produce a human-readable summary in your response text
-for logging purposes. Include specific findings, failure details, and any issues.
-
-## Git Workflow
-
-Commit your changes with `git add -A && git commit` before finishing. Do NOT run `git push`.
 
 ## Important Rules
 
@@ -76,3 +60,4 @@ Commit your changes with `git add -A && git commit` before finishing. Do NOT run
 - ALWAYS call the `report_test_results` tool — it is the primary metrics channel.
 - Be specific about failures — include error messages, stack traces, and reproduction steps.
 - If you find bugs, describe them clearly. Do NOT fix the code — that is the coder's job.
+- Commit your changes with `git add -A && git commit` before finishing.
