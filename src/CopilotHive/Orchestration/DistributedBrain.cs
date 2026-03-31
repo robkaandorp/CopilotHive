@@ -338,8 +338,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
               """
             : "This is the first iteration — no previous feedback.";
 
-        var historyContext = BuildMetricsHistoryContext();
-
         var conversationSummary = pipeline.Conversation.Count > 0
             ? $"Conversation history ({pipeline.Conversation.Count} messages): " +
               Truncate(string.Join(" | ", pipeline.Conversation.Select(e => $"[{e.Role}] {e.Content}")), Constants.TruncationConversationSummary)
@@ -353,13 +351,11 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             {{retryContext}}
             {{previousIterationContext}}
-            {{historyContext}}
             {{conversationSummary}}
 
             Decide the ordered phases for this iteration. Consider:
             - Is this a documentation-only change? (coder edits, then docwriter — may skip testing)
             - Is this a retry after failure? (what phases need re-running)
-            - What does the metrics history suggest?
             IMPORTANT: Only include the docwriting phase when the goal explicitly requests
             documentation updates (e.g. "update README", "add changelog entry", "update docs").
             Skip docwriting for purely internal changes (refactors, bug fixes, test additions)
@@ -628,7 +624,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     internal string BuildCraftPromptText(GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null)
     {
         var roleName = phase.ToWorkerRole().ToRoleName();
-        var historyContext = BuildMetricsHistoryContext(3);
 
         var phaseInstructions = "";
         if (pipeline.Plan?.PhaseInstructions.TryGetValue(phase, out var instructions) == true)
@@ -700,7 +695,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {{(previousFeedback.Length > 0 ? $"\n{previousFeedback}" : "")}}
             {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
             {{(currentTestResults.Length > 0 ? $"\nCurrent iteration test results (from the tester phase):\n{currentTestResults}" : "")}}
-            {{(historyContext.Length > 0 ? $"\n{historyContext}" : "")}}
 
             The worker has access to project skills (e.g. build, test) that describe how to build and test this project.
             Tell the worker to use those skills instead of hardcoding framework-specific commands.
@@ -1036,54 +1030,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             _brainCallGate.Release();
         }
-    }
-
-    /// <summary>
-    /// Builds a concise metrics history summary from the last N iterations.
-    /// </summary>
-    private string BuildMetricsHistoryContext(int maxIterations = 5)
-    {
-        if (_metricsTracker is null || _metricsTracker.History.Count == 0)
-            return "";
-
-        var history = _metricsTracker.History;
-        var recent = history.Skip(Math.Max(0, history.Count - maxIterations)).ToList();
-        var sb = new StringBuilder();
-
-        sb.AppendLine("Metrics History (last " + recent.Count + " iterations):");
-        foreach (var m in recent)
-        {
-            var issues = m.Issues.Count > 0 ? $", issues: [{string.Join(", ", m.Issues)}]" : "";
-            sb.AppendLine($"  - Iteration {m.Iteration}: {m.Verdict}, " +
-                $"{m.PassedTests}/{m.TotalTests} tests, {m.CoveragePercent:F1}% coverage{issues}");
-        }
-
-        if (recent.Count >= 2)
-        {
-            var first = recent[0];
-            var last = recent[^1];
-            var coverageDelta = last.CoveragePercent - first.CoveragePercent;
-            var testDelta = last.TotalTests - first.TotalTests;
-
-            var coverageTrend = coverageDelta switch
-            {
-                > 1.0 => $"improving (+{coverageDelta:F1}% over {recent.Count} iterations)",
-                < -1.0 => $"degrading ({coverageDelta:F1}% over {recent.Count} iterations)",
-                _ => "stable",
-            };
-
-            sb.AppendLine($"Trend: Coverage {coverageTrend}, " +
-                $"test count {(testDelta > 0 ? "growing" : testDelta < 0 ? "shrinking" : "stable")}");
-        }
-
-        if (history.Count >= 2)
-        {
-            var comparison = _metricsTracker.CompareWithPrevious(history[^1]);
-            if (comparison is not null)
-                sb.AppendLine($"Delta vs previous: {comparison}");
-        }
-
-        return sb.ToString();
     }
 
     private void EnsureConnected()
