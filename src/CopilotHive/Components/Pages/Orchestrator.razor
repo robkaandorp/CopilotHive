@@ -6,8 +6,7 @@
 @inject DashboardStateService State
 @inject IJSRuntime JS
 @inject IGoalStore GoalStore
-
-<h1>🎵 Orchestrator</h1>
+@inject PageHeaderState PageHeader
 
 <div class="cards">
     <div class="card">
@@ -225,6 +224,7 @@ else
 
     protected override async Task OnInitializedAsync()
     {
+        PageHeader.SetTitle("🎵 Orchestrator");
         Refresh();
         State.OnStateChanged += RefreshState;
         await LoadClarificationsAsync();

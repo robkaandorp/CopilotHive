@@ -1,4 +1,5 @@
 @page "/releases/{ReleaseId}"
+@using CopilotHive.Dashboard
 @using CopilotHive.Goals
 @using Markdig
 @inject IGoalStore GoalStore
@@ -6,6 +7,7 @@
 @inject NavigationManager Nav
 @inject HttpClient HttpClient
 @inject CopilotHive.Configuration.HiveConfigFile? HiveConfig
+@inject PageHeaderState PageHeader
 
 <a href="/releases" style="display:inline-flex;align-items:center;gap:0.35rem;color:var(--accent);text-decoration:none;font-size:0.9rem;margin-bottom:0.5rem">
     ← Releases
@@ -15,7 +17,6 @@
 {
     <!-- Header -->
     <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:1rem">
-        <h1>@_release.Tag</h1>
         @foreach (var repo in _release.RepositoryNames)
         {
             <span class="repo-tag">@repo</span>
@@ -223,6 +224,7 @@ else if (_loaded)
         _release = await GoalStore.GetReleaseAsync(decoded);
         if (_release is not null)
         {
+            PageHeader.SetTitle($"📦 {_release.Tag}");
             _editNotes = _release.Notes ?? "";
             _editTag = _release.Tag;
             _selectedRepos = new HashSet<string>(_release.RepositoryNames, StringComparer.OrdinalIgnoreCase);

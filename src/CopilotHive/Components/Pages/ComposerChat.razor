@@ -1,12 +1,12 @@
 @page "/composer"
+@using CopilotHive.Dashboard
 @using CopilotHive.Orchestration
 @using Markdig
 @implements IDisposable
 @inject Composer Composer
 @inject ClarificationQueueService ClarificationQueue
 @inject IJSRuntime JS
-
-<h1>💬 Composer</h1>
+@inject PageHeaderState PageHeader
 
 @if (!Composer.IsConnected)
 {
@@ -226,6 +226,7 @@ else
 
     protected override void OnInitialized()
     {
+        PageHeader.SetTitle("💬 Composer");
         if (Composer.IsConnected)
         {
             LoadHistory();
