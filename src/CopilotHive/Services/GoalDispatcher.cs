@@ -997,13 +997,18 @@ public sealed class GoalDispatcher : BackgroundService
             adjustments.Add("- Coding was inserted at the start (required: every plan must contain Coding or DocWriting)");
         }
 
-        // Testing was added to a code-change plan
+        // Testing was added — reference the actual preceding phase
         if (!originalSet.Contains(GoalPhase.Testing) && final.Contains(GoalPhase.Testing))
         {
-            var reason = final.Contains(GoalPhase.Coding)
-                ? "required for code-change plans"
-                : "required: docs-only plan had neither Testing nor Review";
-            adjustments.Add($"- Testing was inserted after Coding ({reason})");
+            if (final.Contains(GoalPhase.Coding))
+            {
+                adjustments.Add("- Testing was inserted after Coding (required for code-change plans)");
+            }
+            else
+            {
+                // Docs-only plan: Testing inserted after DocWriting
+                adjustments.Add("- Testing was inserted after DocWriting (required: docs-only plan had neither Testing nor Review)");
+            }
         }
 
         // Review was added to a code-change plan
@@ -1012,15 +1017,22 @@ public sealed class GoalDispatcher : BackgroundService
             adjustments.Add("- Review was inserted after Testing (required for code-change plans)");
         }
 
-        // Merging was moved to the end (it was present but misplaced, or simply re-added)
-        var originalMergingIndex = original.IndexOf(GoalPhase.Merging);
-        var finalMergingIndex = final.IndexOf(GoalPhase.Merging);
-        var mergingWasMoved = originalSet.Contains(GoalPhase.Merging)
-            && originalMergingIndex != original.Count - 1
-            && finalMergingIndex == final.Count - 1;
-        if (mergingWasMoved)
+        // Merging adjustments: appended (absent) or moved to the end (misplaced)
+        if (!originalSet.Contains(GoalPhase.Merging) && final.Contains(GoalPhase.Merging))
         {
-            adjustments.Add("- Merging was moved to the end (always required as the last phase)");
+            adjustments.Add("- Merging was appended as the final phase (always required)");
+        }
+        else
+        {
+            var originalMergingIndex = original.IndexOf(GoalPhase.Merging);
+            var finalMergingIndex = final.IndexOf(GoalPhase.Merging);
+            var mergingWasMoved = originalSet.Contains(GoalPhase.Merging)
+                && originalMergingIndex != original.Count - 1
+                && finalMergingIndex == final.Count - 1;
+            if (mergingWasMoved)
+            {
+                adjustments.Add("- Merging was moved to the end (always required as the last phase)");
+            }
         }
 
         var adjustmentsText = adjustments.Count > 0

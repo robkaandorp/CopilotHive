@@ -148,6 +148,33 @@ public sealed class BuildPlanAdjustmentNoteTests
 
         Assert.Contains("Adjustments:", note);
     }
+
+    [Fact]
+    public void BuildPlanAdjustmentNote_TestingAddedToDocsPlan_MentionsAfterDocWriting()
+    {
+        // Docs-only plan with no Testing or Review — Testing inserted after DocWriting
+        var original = new List<GoalPhase> { GoalPhase.DocWriting, GoalPhase.Merging };
+        var final    = new List<GoalPhase> { GoalPhase.DocWriting, GoalPhase.Testing, GoalPhase.Merging };
+
+        var note = GoalDispatcher.BuildPlanAdjustmentNote(original, final);
+
+        Assert.Contains("Testing was inserted after DocWriting", note);
+        // Must NOT say "after Coding" for a docs-only plan
+        Assert.DoesNotContain("after Coding", note);
+    }
+
+    [Fact]
+    public void BuildPlanAdjustmentNote_MergingAbsent_MentionsMergingAppended()
+    {
+        // Merging is entirely missing from the original plan
+        var original = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review };
+        var final    = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
+
+        var note = GoalDispatcher.BuildPlanAdjustmentNote(original, final);
+
+        Assert.Contains("Merging was appended", note);
+        Assert.Contains("always required", note);
+    }
 }
 
 /// <summary>
