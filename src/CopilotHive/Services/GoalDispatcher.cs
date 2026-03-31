@@ -1690,6 +1690,8 @@ public sealed class GoalDispatcher : BackgroundService
 
                 _pipelineManager.RemovePipeline(pipeline.GoalId);
                 _dispatchedGoals.TryRemove(pipeline.GoalId, out _);
+                // Pipeline was registered above — clean it up from Brain's _activePipelines
+                (_brain as DistributedBrain)?.DeregisterActivePipeline(pipeline.GoalId);
                 await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Pending, null, ct);
                 continue;
             }
