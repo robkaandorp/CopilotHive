@@ -227,6 +227,11 @@ else if (_loaded)
             _selectedRepos = new HashSet<string>(_release.RepositoryNames, StringComparer.OrdinalIgnoreCase);
             _goals = (await GoalStore.GetGoalsByReleaseAsync(decoded)).ToList();
         }
+        if (_release is null)
+        {
+            PageHeader.SetTitle("Release Not Found");
+            PageHeader.SetBack("/releases");
+        }
         _loaded = true;
     }
 
@@ -295,6 +300,7 @@ else if (_loaded)
             _release!.Tag = _editTag.Trim();
             _tagSaved = true;
             PageHeader.SetTitle($"📦 {_release.Tag}");
+            PageHeader.SetBack("/releases");
             StateHasChanged();
         }
         else
