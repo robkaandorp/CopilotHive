@@ -922,6 +922,8 @@ public sealed class ClarificationIntegrationTests
 
         public void DeleteGoalSession(string goalId) { }
 
+    public bool GoalSessionExists(string goalId) => false;
+
         public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
             Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
 

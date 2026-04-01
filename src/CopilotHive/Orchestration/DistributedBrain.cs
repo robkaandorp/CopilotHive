@@ -32,6 +32,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly IBrainRepoManager? _repoManager;
     private readonly IGoalStore? _goalStore;
     private readonly string _stateDir;
+
+    /// <summary>
+    /// Directory used for persistent Brain state (session files).
+    /// </summary>
+    public string StateDirectory => _stateDir;
+
     private IChatClient? _chatClient;
     private CodingAgent? _agent;
     private AgentSession _masterSession;
@@ -448,6 +454,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _logger.LogInformation("Cleared active goal session for '{GoalId}'", goalId);
         }
     }
+
+    /// <inheritdoc />
+    public bool GoalSessionExists(string goalId) =>
+        File.Exists(GetGoalSessionFilePath(goalId));
 
     /// <summary>Persists the master Brain session to disk.</summary>
     internal async Task SaveSessionAsync(CancellationToken ct = default)

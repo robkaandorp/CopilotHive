@@ -250,6 +250,8 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
 
     public void DeleteGoalSession(string goalId) { }
 
+    public bool GoalSessionExists(string goalId) => false;
+
     public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
         Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
 
@@ -1963,6 +1965,8 @@ file sealed class RetryCapturingBrain : IDistributedBrain
 
     public void DeleteGoalSession(string goalId) { }
 
+    public bool GoalSessionExists(string goalId) => false;
+
     public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
         Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
 
@@ -2287,6 +2291,8 @@ file sealed class FirstPhasePlanningBrain : IDistributedBrain
 
     public void DeleteGoalSession(string goalId) { }
 
+    public bool GoalSessionExists(string goalId) => false;
+
     public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
         Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
 
@@ -2477,6 +2483,296 @@ public sealed class GoalDispatcherDocWritingPhaseTests
         public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
         public void DeleteGoalSession(string goalId) { }
+
+    public bool GoalSessionExists(string goalId) => false;
+
+        public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+            Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
+
+        public BrainStats? GetStats() => null;
+    }
+}
+
+/// <summary>
+/// Tests for parallel goal dispatch feature controlled by MaxParallelGoals.
+/// </summary>
+public sealed class GoalDispatcherParallelDispatchTests
+{
+    /// <summary>
+    /// When MaxParallelGoals > 1, multiple goals can be dispatched concurrently.
+    /// This test verifies that with MaxParallelGoals = 2 and 1 active pipeline,
+    /// a second dispatch succeeds (1 active &lt; limit of 2).
+    /// </summary>
+    [Fact]
+    public async Task MaxParallelGoals_greater_than_1_allows_concurrent_dispatch()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Arrange: config with MaxParallelGoals = 2
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { MaxParallelGoals = 2 },
+            Repositories =
+            [
+                new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
+            ],
+        };
+
+        // Create two goals
+        var goal1 = new Goal { Id = $"goal-parallel-1-{Guid.NewGuid():N}", Description = "First parallel goal", RepositoryNames = ["test-repo"] };
+        var goal2 = new Goal { Id = $"goal-parallel-2-{Guid.NewGuid():N}", Description = "Second parallel goal", RepositoryNames = ["test-repo"] };
+        var goalSource = new ParallelFakeGoalSource([goal1, goal2]);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+
+        var brain = new ParallelDispatchBrain();
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain,
+            config: config,
+            startupDelay: TimeSpan.Zero);
+
+        // Act: dispatch twice in sequence
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Assert: both goals dispatched (2 pipelines created)
+        var activePipelines = pipelineManager.GetActivePipelines();
+        Assert.Equal(2, activePipelines.Count);
+        Assert.Contains(activePipelines, p => p.GoalId == goal1.Id);
+        Assert.Contains(activePipelines, p => p.GoalId == goal2.Id);
+    }
+
+    /// <summary>
+    /// When MaxParallelGoals = 1 (default), only one goal runs at a time.
+    /// This test verifies that with 1 active pipeline and MaxParallelGoals = 1,
+    /// no additional goal is dispatched.
+    /// </summary>
+    [Fact]
+    public async Task MaxParallelGoals_equals_1_prevents_concurrent_dispatch()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Arrange: config with MaxParallelGoals = 1 (default sequential behavior)
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { MaxParallelGoals = 1 },
+            Repositories =
+            [
+                new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
+            ],
+        };
+
+        // Create two goals
+        var goal1 = new Goal { Id = $"goal-seq-1-{Guid.NewGuid():N}", Description = "First sequential goal", RepositoryNames = ["test-repo"] };
+        var goal2 = new Goal { Id = $"goal-seq-2-{Guid.NewGuid():N}", Description = "Second sequential goal", RepositoryNames = ["test-repo"] };
+        var goalSource = new ParallelFakeGoalSource([goal1, goal2]);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+
+        var brain = new ParallelDispatchBrain();
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain,
+            config: config,
+            startupDelay: TimeSpan.Zero);
+
+        // Act: dispatch twice
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Assert: only 1 active pipeline (second dispatch blocked)
+        var activePipelines = pipelineManager.GetActivePipelines();
+        Assert.Single(activePipelines);
+        Assert.Equal(goal1.Id, activePipelines[0].GoalId);
+    }
+
+    /// <summary>
+    /// When dispatching a goal, the Brain must fork a session for that goal.
+    /// This test verifies ForkSessionForGoalAsync is called exactly once
+    /// with the correct goal ID.
+    /// </summary>
+    [Fact]
+    public async Task DispatchNextGoalAsync_forks_session_for_new_goal()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Arrange
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { MaxParallelGoals = 1 },
+            Repositories =
+            [
+                new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
+            ],
+        };
+
+        var goalId = $"goal-fork-{Guid.NewGuid():N}";
+        var goal = new Goal { Id = goalId, Description = "Goal to test session fork", RepositoryNames = ["test-repo"] };
+        var goalSource = new ParallelFakeGoalSource([goal]);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+
+        var brain = new ForkTrackingBrain();
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain,
+            config: config,
+            startupDelay: TimeSpan.Zero);
+
+        // Act: dispatch the goal
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Assert: ForkSessionForGoalAsync was called exactly once with the correct goal ID
+        Assert.Single(brain.ForkCalls);
+        Assert.Equal(goalId, brain.ForkCalls[0]);
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────────────────
+
+    private static Task InvokeDispatchNextGoalAsync(GoalDispatcher dispatcher, CancellationToken ct)
+    {
+        var method = typeof(GoalDispatcher).GetMethod(
+            "DispatchNextGoalAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        return (Task)method.Invoke(dispatcher, [ct])!;
+    }
+
+    /// <summary>Goal source that returns a pre-configured list of goals.</summary>
+    private sealed class ParallelFakeGoalSource : IGoalSource
+    {
+        private readonly List<Goal> _goals;
+        private int _index;
+
+        public ParallelFakeGoalSource(List<Goal> goals) => _goals = goals;
+
+        public string Name => "parallel-fake";
+
+        public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default)
+        {
+            // Return goals one at a time so GoalManager.GetNextGoalAsync gets them in priority order
+            if (_index >= _goals.Count)
+                return Task.FromResult<IReadOnlyList<Goal>>([]);
+
+            var goal = _goals[_index++];
+            return Task.FromResult<IReadOnlyList<Goal>>([goal]);
+        }
+
+        public Task UpdateGoalStatusAsync(
+            string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
+            Task.CompletedTask;
+    }
+
+    /// <summary>Brain stub for parallel dispatch tests.</summary>
+    private sealed class ParallelDispatchBrain : IDistributedBrain
+    {
+        public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(PlanResult.Success(IterationPlan.Default()));
+
+        public Task<PromptResult> CraftPromptAsync(
+            GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+
+        public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+
+        public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct) =>
+            Task.CompletedTask;
+
+        public Task<BrainResponse> AskQuestionAsync(
+            string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+            Task.FromResult(BrainResponse.Answer("proceed"));
+
+        public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public void DeleteGoalSession(string goalId) { }
+
+    public bool GoalSessionExists(string goalId) => false;
+
+        public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+            Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
+
+        public BrainStats? GetStats() => null;
+    }
+
+    /// <summary>Brain stub that tracks ForkSessionForGoalAsync calls.</summary>
+    private sealed class ForkTrackingBrain : IDistributedBrain
+    {
+        public List<string> ForkCalls { get; } = [];
+
+        public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(PlanResult.Success(IterationPlan.Default()));
+
+        public Task<PromptResult> CraftPromptAsync(
+            GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+
+        public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+
+        public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct) =>
+            Task.CompletedTask;
+
+        public Task<BrainResponse> AskQuestionAsync(
+            string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+            Task.FromResult(BrainResponse.Answer("proceed"));
+
+        public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default)
+        {
+            ForkCalls.Add(goalId);
+            return Task.CompletedTask;
+        }
+
+        public void DeleteGoalSession(string goalId) { }
+
+    public bool GoalSessionExists(string goalId) => false;
 
         public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
             Task.FromResult($"Goal '{pipeline.GoalId}' completed.");

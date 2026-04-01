@@ -1816,6 +1816,16 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
             if (pipeline.Phase is not (GoalPhase.Done or GoalPhase.Failed))
                 (_brain as DistributedBrain)?.RegisterActivePipeline(pipeline);
 
+            // Ensure the goal session exists on disk. If the orchestrator restarted mid-dispatch,
+            // the session may not have been forked yet. Fork from master to recover.
+            if (_brain is not null && pipeline.Phase is not (GoalPhase.Done or GoalPhase.Failed))
+            {
+                if (!_brain.GoalSessionExists(pipeline.GoalId))
+                {
+                    await _brain.ForkSessionForGoalAsync(pipeline.GoalId, ct);
+                }
+            }
+
             if (pipeline.Phase is GoalPhase.Done or GoalPhase.Failed)
                 continue;
 
@@ -1898,10 +1908,12 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
 
     private async Task DispatchNextGoalAsync(CancellationToken ct)
     {
-        // Sequential gate: only one goal runs at a time so the Brain
-        // can accumulate context across goals in its single session.
+        // Parallelism gate: allow multiple goals to run concurrently when MaxParallelGoals > 1.
+        // Each goal has its own Brain session, so the Brain's per-call gate (_brainCallGate)
+        // still serializes individual Brain calls — parallelism is in worker execution.
+        var maxParallel = _config?.Orchestrator?.MaxParallelGoals ?? 1;
         var activePipelines = _pipelineManager.GetActivePipelines();
-        if (activePipelines.Count > 0)
+        if (activePipelines.Count >= maxParallel)
             return;
 
         var goal = await _goalManager.GetNextGoalAsync(ct);
@@ -1947,6 +1959,13 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
 
         // Register with Brain so the get_goal tool can return live iteration/phase info
         (_brain as DistributedBrain)?.RegisterActivePipeline(pipeline);
+
+        // Fork a per-goal Brain session from the master so this goal's context
+        // is isolated from other concurrent goals.
+        if (_brain is not null)
+        {
+            await _brain.ForkSessionForGoalAsync(goal.Id, ct);
+        }
 
         // Build retry context strings injected into Brain calls when this goal was previously failed and re-dispatched
         const string RetryPlanContext =
