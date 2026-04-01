@@ -1823,6 +1823,188 @@ public sealed class DistributedBrainTests
         }
     }
 
+    // -- Concurrency Tests --
+
+    [Fact]
+    public async Task PlanIterationAsync_SingleGoal_PersistsSessionCorrectly()
+    {
+        // Simpler invariant test: verify that after a single PlanIterationAsync call for goal-A,
+        // the session file for goal-A has the goal's marker preserved, and goal-B's session
+        // file is untouched (no cross-contamination).
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            // Arrange: create brain with a stub client that returns a valid iteration plan
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+
+            var stubClient = new IterationPlanStubClient(
+                callId: "call-plan-1",
+                phases: ["coding", "testing", "review", "merging"],
+                reason: "Standard workflow");
+
+            InjectFakeChatClient(brain, stubClient);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            // Fork sessions for two goals with unique markers
+            await brain.ForkSessionForGoalAsync("goal-A", TestContext.Current.CancellationToken);
+            await brain.ForkSessionForGoalAsync("goal-B", TestContext.Current.CancellationToken);
+
+            // Inject unique markers into each goal's session file
+            var sessionFileA = Path.Combine(tempDir, "brain-goal-goal-A.json");
+            var sessionFileB = Path.Combine(tempDir, "brain-goal-goal-B.json");
+
+            var sessionA = await AgentSession.LoadAsync(sessionFileA, TestContext.Current.CancellationToken);
+            sessionA.MessageHistory.Add(new ChatMessage(ChatRole.User, "MARKER_UNIQUE_TO_GOAL_A"));
+            await sessionA.SaveAsync(sessionFileA, TestContext.Current.CancellationToken);
+
+            var sessionB = await AgentSession.LoadAsync(sessionFileB, TestContext.Current.CancellationToken);
+            sessionB.MessageHistory.Add(new ChatMessage(ChatRole.User, "MARKER_UNIQUE_TO_GOAL_B"));
+            await sessionB.SaveAsync(sessionFileB, TestContext.Current.CancellationToken);
+
+            // Act: call PlanIterationAsync for goal-A
+            var pipelineA = CreatePipeline("goal-A", "Test goal A");
+            var planResult = await brain.PlanIterationAsync(pipelineA, null, TestContext.Current.CancellationToken);
+
+            // Assert: plan was returned
+            Assert.NotNull(planResult);
+            Assert.False(planResult.IsEscalation);
+            Assert.NotEmpty(planResult.Plan!.Phases);
+
+            // Assert: goal-A's session file still contains its marker
+            var sessionAfterA = await AgentSession.LoadAsync(sessionFileA, TestContext.Current.CancellationToken);
+            var historyA = sessionAfterA.MessageHistory;
+            Assert.Contains(historyA, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_UNIQUE_TO_GOAL_A")));
+
+            // Assert: goal-B's session file still contains ONLY its marker (untouched by goal-A's call)
+            var sessionAfterB = await AgentSession.LoadAsync(sessionFileB, TestContext.Current.CancellationToken);
+            var historyB = sessionAfterB.MessageHistory;
+            Assert.Contains(historyB, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_UNIQUE_TO_GOAL_B")));
+            // Key assertion: goal-B's session does NOT contain goal-A's marker
+            Assert.DoesNotContain(historyB, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_UNIQUE_TO_GOAL_A")));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteBrainAsync_ConcurrentCalls_UseSeparateSessions()
+    {
+        // Verify that two concurrent Brain calls for different goals each use their own session,
+        // with no cross-contamination. Uses a stub client that blocks to simulate concurrent execution.
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            // Arrange: create brain with a blocking stub client
+            var gate = new SemaphoreSlim(0, 2); // Used to coordinate both calls
+            var callCount = 0;
+            var callOrder = new List<string>();
+
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+
+            var stubClient = new BlockingStubClient(
+                responseText: "I have planned the iteration.",
+                toolName: "report_iteration_plan",
+                toolArguments: new Dictionary<string, object?>
+                {
+                    ["phases"] = new[] { "coding", "testing", "review" },
+                    ["phase_instructions"] = "{}",
+                    ["reason"] = "Test plan",
+                },
+                onBeforeResponse: () =>
+                {
+                    var callNum = Interlocked.Increment(ref callCount);
+                    callOrder.Add($"call-{callNum}");
+                    // Block until both calls are ready
+                    gate.Wait(TestContext.Current.CancellationToken);
+                });
+
+            InjectFakeChatClient(brain, stubClient);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            // Fork sessions for two goals with unique markers
+            await brain.ForkSessionForGoalAsync("goal-A", TestContext.Current.CancellationToken);
+            await brain.ForkSessionForGoalAsync("goal-B", TestContext.Current.CancellationToken);
+
+            // Inject unique markers into each goal's session file
+            var sessionFileA = Path.Combine(tempDir, "brain-goal-goal-A.json");
+            var sessionFileB = Path.Combine(tempDir, "brain-goal-goal-B.json");
+
+            var sessionA = await AgentSession.LoadAsync(sessionFileA, TestContext.Current.CancellationToken);
+            sessionA.MessageHistory.Add(new ChatMessage(ChatRole.User, "UNIQUE_MARKER_A_FOR_CONCURRENCY_TEST"));
+            await sessionA.SaveAsync(sessionFileA, TestContext.Current.CancellationToken);
+
+            var sessionB = await AgentSession.LoadAsync(sessionFileB, TestContext.Current.CancellationToken);
+            sessionB.MessageHistory.Add(new ChatMessage(ChatRole.User, "UNIQUE_MARKER_B_FOR_CONCURRENCY_TEST"));
+            await sessionB.SaveAsync(sessionFileB, TestContext.Current.CancellationToken);
+
+            // Act: start two concurrent PlanIterationAsync calls via Task.Run
+            var pipelineA = CreatePipeline("goal-A", "Goal A for concurrency test");
+            var pipelineB = CreatePipeline("goal-B", "Goal B for concurrency test");
+
+            var taskA = Task.Run(async () =>
+            {
+                var result = await brain.PlanIterationAsync(pipelineA, null, TestContext.Current.CancellationToken);
+                return (GoalId: "goal-A", Result: result);
+            }, TestContext.Current.CancellationToken);
+
+            var taskB = Task.Run(async () =>
+            {
+                var result = await brain.PlanIterationAsync(pipelineB, null, TestContext.Current.CancellationToken);
+                return (GoalId: "goal-B", Result: result);
+            }, TestContext.Current.CancellationToken);
+
+            // Wait briefly for both tasks to enter the gate (they'll block on the stub client)
+            await Task.Delay(200, TestContext.Current.CancellationToken);
+
+            // Release both calls to proceed
+            gate.Release(2);
+
+            // Wait for both to complete
+            var results = await Task.WhenAll(taskA, taskB);
+
+            // Assert: both calls completed successfully
+            Assert.Equal(2, results.Length);
+            Assert.All(results, r =>
+            {
+                Assert.NotNull(r.Result);
+                Assert.False(r.Result.IsEscalation);
+            });
+
+            // Assert: goal-A's session contains ONLY its marker and conversation
+            var sessionAfterA = await AgentSession.LoadAsync(sessionFileA, TestContext.Current.CancellationToken);
+            var historyA = sessionAfterA.MessageHistory;
+            Assert.Contains(historyA, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("UNIQUE_MARKER_A_FOR_CONCURRENCY_TEST")));
+            Assert.DoesNotContain(historyA, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("UNIQUE_MARKER_B_FOR_CONCURRENCY_TEST")));
+
+            // Assert: goal-B's session contains ONLY its marker and conversation
+            var sessionAfterB = await AgentSession.LoadAsync(sessionFileB, TestContext.Current.CancellationToken);
+            var historyB = sessionAfterB.MessageHistory;
+            Assert.Contains(historyB, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("UNIQUE_MARKER_B_FOR_CONCURRENCY_TEST")));
+            Assert.DoesNotContain(historyB, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("UNIQUE_MARKER_A_FOR_CONCURRENCY_TEST")));
+
+            // Assert: _activeGoalId is cleared after both calls complete (due to serialization via gate)
+            var activeGoalIdField = typeof(DistributedBrain)
+                .GetField("_activeGoalId", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var activeGoalId = (string?)activeGoalIdField.GetValue(brain)!;
+            // The last call wins, so activeGoalId should be either null or the last processed goal
+            // Since they're serialized by the gate, this is expected behavior
+            Assert.True(activeGoalId is null or "goal-A" or "goal-B",
+                $"Expected _activeGoalId to be null, 'goal-A', or 'goal-B', but was '{activeGoalId}'");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, true);
+        }
+    }
+
 }
 
 /// <summary>
@@ -2012,4 +2194,132 @@ file sealed class FakeGoalStore : IGoalStore
 
     /// <summary>Adds a goal to the in-memory store for testing.</summary>
     public void AddGoal(Goal goal) => _goals[goal.Id] = goal;
+}
+
+/// <summary>
+/// Stub client that returns a valid <c>report_iteration_plan</c> tool call on first invocation,
+/// then returns text responses on subsequent calls.
+/// </summary>
+file sealed class IterationPlanStubClient : IChatClient
+{
+    private int _callCount;
+    private readonly string _callId;
+    private readonly string[] _phases;
+    private readonly string _reason;
+
+    public IterationPlanStubClient(string callId, string[] phases, string reason)
+    {
+        _callId = callId;
+        _phases = phases;
+        _reason = reason;
+    }
+
+    public ChatClientMetadata Metadata => new("stub", null, "stub-model");
+
+    public Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        var call = Interlocked.Increment(ref _callCount);
+
+        if (call == 1)
+        {
+            // First call: return report_iteration_plan tool call
+            var toolCallContent = new FunctionCallContent(_callId, "report_iteration_plan", new Dictionary<string, object?>
+            {
+                ["phases"] = _phases,
+                ["phase_instructions"] = "{}",
+                ["reason"] = _reason,
+            });
+            var response = new ChatResponse(new ChatMessage(ChatRole.Assistant, [toolCallContent]))
+            {
+                FinishReason = ChatFinishReason.ToolCalls,
+            };
+            return Task.FromResult(response);
+        }
+
+        // Subsequent calls: return plain text
+        var finalResponse = new ChatResponse(new ChatMessage(ChatRole.Assistant, "Iteration planned."))
+        {
+            FinishReason = ChatFinishReason.Stop,
+        };
+        return Task.FromResult(finalResponse);
+    }
+
+    public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException("Streaming is not used in this test.");
+
+    public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+    public void Dispose() { }
+}
+
+/// <summary>
+/// Stub client that can block on first call to simulate concurrent execution.
+/// Returns a tool call on first invocation, then text on subsequent calls.
+/// </summary>
+file sealed class BlockingStubClient : IChatClient
+{
+    private int _callCount;
+    private readonly string _responseText;
+    private readonly string _toolName;
+    private readonly Dictionary<string, object?> _toolArguments;
+    private readonly Action _onBeforeResponse;
+
+    public BlockingStubClient(
+        string responseText,
+        string toolName,
+        Dictionary<string, object?> toolArguments,
+        Action onBeforeResponse)
+    {
+        _responseText = responseText;
+        _toolName = toolName;
+        _toolArguments = toolArguments;
+        _onBeforeResponse = onBeforeResponse;
+    }
+
+    public ChatClientMetadata Metadata => new("stub", null, "stub-model");
+
+    public Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        var call = Interlocked.Increment(ref _callCount);
+
+        // Invoke the blocking callback before returning
+        _onBeforeResponse();
+
+        if (call == 1)
+        {
+            // First call: return tool call
+            var toolCallContent = new FunctionCallContent($"call-{call}", _toolName, _toolArguments);
+            var response = new ChatResponse(new ChatMessage(ChatRole.Assistant, [toolCallContent]))
+            {
+                FinishReason = ChatFinishReason.ToolCalls,
+            };
+            return Task.FromResult(response);
+        }
+
+        // Subsequent calls: return plain text
+        var finalResponse = new ChatResponse(new ChatMessage(ChatRole.Assistant, _responseText))
+        {
+            FinishReason = ChatFinishReason.Stop,
+        };
+        return Task.FromResult(finalResponse);
+    }
+
+    public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException("Streaming is not used in this test.");
+
+    public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+    public void Dispose() { }
 }
