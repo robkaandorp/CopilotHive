@@ -1810,7 +1810,12 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
     {
         var restored = _pipelineManager.RestoreFromStore();
         if (restored.Count == 0)
+        {
+            // Even when there are no active pipelines to restore, clean up any orphaned
+            // session files that may have been left by a previous crash.
+            await CleanupOrphanedGoalSessionsAsync(ct);
             return;
+        }
 
         _logger.LogInformation("Restoring {Count} active pipeline(s) from persistence store", restored.Count);
 

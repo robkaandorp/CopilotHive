@@ -825,7 +825,7 @@ public sealed class GoalDispatcherSessionCleanupTests
     }
 
     [Fact]
-    public async Task RestoreActivePipelinesAsync_WithNoActivePipelines_LeavesSessionFiles()
+    public async Task RestoreActivePipelinesAsync_WithNoActivePipelines_DeletesOrphanedSessionFiles()
     {
         var ct = TestContext.Current.CancellationToken;
         var tempDir = Path.Combine(Path.GetTempPath(), $"brain-sessions-{Guid.NewGuid():N}");
@@ -870,11 +870,11 @@ public sealed class GoalDispatcherSessionCleanupTests
 
             await (Task)restoreMethod.Invoke(dispatcher, [ct])!;
 
-            // When there are NO active pipelines, RestoreActivePipelinesAsync returns early
-            // before calling CleanupOrphanedGoalSessionsAsync. So session files remain.
-            // This is correct behavior - no cleanup needed if nothing to restore.
-            Assert.True(File.Exists(orphanedSessionFile1), "Session files remain when no pipelines to restore");
-            Assert.True(File.Exists(orphanedSessionFile2), "Session files remain when no pipelines to restore");
+            // When there are NO active pipelines, RestoreActivePipelinesAsync still calls
+            // CleanupOrphanedGoalSessionsAsync before returning early. Since the active set
+            // is empty, both session files are orphans and are deleted.
+            Assert.False(File.Exists(orphanedSessionFile1), "Orphaned session file should be deleted");
+            Assert.False(File.Exists(orphanedSessionFile2), "Orphaned session file should be deleted");
 
             await pipelineStore.DisposeAsync();
         }
