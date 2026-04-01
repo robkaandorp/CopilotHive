@@ -22,10 +22,10 @@ namespace CopilotHive.Orchestration;
 /// </summary>
 public sealed class Composer : IClarificationRouter, IAsyncDisposable
 {
-    private readonly string _model;
+    private string _model;
     private readonly int _maxContextTokens;
     private readonly int _maxSteps;
-    private readonly ReasoningEffort? _reasoningEffort;
+    private ReasoningEffort? _reasoningEffort;
     private readonly ILogger<Composer> _logger;
     private readonly IGoalStore _goalStore;
     private readonly IBrainRepoManager? _repoManager;
@@ -41,6 +41,9 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
     private readonly string _systemPrompt;
     private readonly List<AITool> _composerTools;
     private readonly ConfigRepoManager? _configRepo;
+
+    /// <summary>Models the Composer can switch between at runtime.</summary>
+    public IReadOnlyList<string> AvailableModels { get; }
 
     // Streaming state owned by the service (survives component navigation)
     private string _streamingContent = "";
@@ -143,7 +146,8 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
         IHttpClientFactory? httpClientFactory = null,
         string? ollamaApiKey = null,
         HiveConfigFile? hiveConfig = null,
-        ConfigRepoManager? configRepo = null)
+        ConfigRepoManager? configRepo = null,
+        IEnumerable<string>? availableModels = null)
     {
         _model = model;
         _maxContextTokens = maxContextTokens;
@@ -158,6 +162,8 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
         _hiveConfig = hiveConfig;
         _configRepo = configRepo;
         _session = AgentSession.Create("composer");
+
+        AvailableModels = (availableModels?.ToList() ?? [model]).AsReadOnly();
 
         var (_, _, reasoning) = SDK.ChatClientFactory.ParseProviderModelAndReasoning(model);
         _reasoningEffort = reasoning;
@@ -206,6 +212,39 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
             MaxSteps = _maxSteps,
             IsConnected = true,
         };
+    }
+
+    /// <summary>
+    /// Switches to a different model, disposing the old chat client and recreating the agent.
+    /// The session history is preserved.
+    /// </summary>
+    /// <param name="model">The model identifier to switch to.</param>
+    /// <exception cref="ArgumentException">Thrown when <paramref name="model"/> is not in <see cref="AvailableModels"/>.</exception>
+    public async Task SwitchModelAsync(string model)
+    {
+        if (!AvailableModels.Contains(model, StringComparer.OrdinalIgnoreCase))
+            throw new ArgumentException($"Model '{model}' is not available. Available models: {string.Join(", ", AvailableModels)}.", nameof(model));
+
+        _logger.LogInformation("Switching Composer model from '{OldModel}' to '{NewModel}'", _model, model);
+
+        // Dispose old client
+        if (_chatClient is IAsyncDisposable asyncDisposable)
+            await asyncDisposable.DisposeAsync();
+        else if (_chatClient is IDisposable disposable)
+            disposable.Dispose();
+
+        // Update model and re-parse reasoning effort
+        _model = model;
+        var (_, _, reasoning) = SDK.ChatClientFactory.ParseProviderModelAndReasoning(model);
+        _reasoningEffort = reasoning;
+
+        // Create new client
+        _chatClient = SDK.ChatClientFactory.Create(model);
+
+        // Rebuild agent — session is preserved
+        RecreateAgent();
+
+        _logger.LogInformation("Composer switched to model '{Model}'", _model);
     }
 
     /// <summary>
