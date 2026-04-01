@@ -126,6 +126,7 @@ static async Task<int> RunServerAsync(string[] args)
 
         var maxCtx = composerConfig?.ContextWindow ?? config?.Orchestrator.BrainContextWindow ?? Constants.DefaultBrainContextWindow;
         var maxSteps = composerConfig?.MaxSteps ?? config?.Orchestrator.BrainMaxSteps ?? Constants.DefaultBrainMaxSteps;
+        var availableModels = composerConfig?.GetAvailableModels(model) ?? [model];
 
         return new Composer(model, sp.GetRequiredService<ILogger<Composer>>(),
             sp.GetRequiredService<IGoalStore>(),
@@ -136,7 +137,8 @@ static async Task<int> RunServerAsync(string[] args)
             !string.IsNullOrWhiteSpace(ollamaApiKey) ? sp.GetRequiredService<IHttpClientFactory>() : null,
             ollamaApiKey,
             sp.GetService<HiveConfigFile>(),
-            sp.GetService<ConfigRepoManager>());
+            sp.GetService<ConfigRepoManager>(),
+            availableModels);
     });
     builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 
@@ -273,6 +275,9 @@ static async Task<int> RunServerAsync(string[] args)
             logger.LogWarning(ex, "Composer failed to connect — chat will be unavailable");
         }
     }
+
+    // Composer model-management REST API
+    app.MapComposerEndpoints(composer);
 
     // Eager clone all configured repos at startup
     var repoManager = app.Services.GetService<IBrainRepoManager>();
