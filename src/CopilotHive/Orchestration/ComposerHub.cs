@@ -15,6 +15,9 @@ public static class ComposerHub
     {
         if (composer is null) return;
 
+        routes.MapGet("/api/composer/current-model", () =>
+            Results.Ok(new { model = composer.GetStats()?.Model ?? composer.AvailableModels.FirstOrDefault() ?? "" }));
+
         routes.MapGet("/api/composer/models", () =>
             Results.Ok(new { models = composer.AvailableModels }));
 

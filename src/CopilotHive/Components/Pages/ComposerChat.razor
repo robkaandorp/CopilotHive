@@ -233,13 +233,15 @@ else
     private bool _showClarificationPanel = true;
     private readonly Dictionary<string, string> _clarificationAnswers = new();
 
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
         PageHeader.SetTitle("💬 Composer");
         if (Composer.IsConnected)
         {
             LoadHistory();
-            _ = LoadAvailableModelsAsync();
+            await LoadAvailableModelsAsync();
+            await LoadCurrentModelAsync();
+            StateHasChanged();
         }
         Composer.OnStreamingUpdate += HandleStreamingUpdate;
         Composer.OnQuestionAsked += HandleQuestionAsked;
@@ -302,12 +304,41 @@ else
             if (response?.Models is { Count: > 0 })
             {
                 _availableModels = response.Models;
-                _selectedModel = _availableModels[0];
             }
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[ComposerChat] Failed to load available models: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Fetches the Composer's actual current model and sets it as the initial
+    /// dropdown selection, ensuring correctness after a runtime model switch.
+    /// </summary>
+    private async Task LoadCurrentModelAsync()
+    {
+        try
+        {
+            var response = await HttpClient.GetFromJsonAsync<CurrentModelResponse>("/api/composer/current-model");
+            if (!string.IsNullOrWhiteSpace(response?.Model) && _availableModels.Contains(response.Model))
+            {
+                _selectedModel = response.Model;
+            }
+            else if (_availableModels.Count > 0)
+            {
+                // Fallback: Composer model not in list or API returned empty, use first available
+                _selectedModel = _availableModels[0];
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ComposerChat] Failed to load current model: {ex.Message}");
+            // Fallback to first available model on error
+            if (_availableModels.Count > 0)
+            {
+                _selectedModel = _availableModels[0];
+            }
         }
     }
 
@@ -463,5 +494,6 @@ else
     }
 
     private sealed record ModelsResponse(List<string> Models);
+    private sealed record CurrentModelResponse(string Model);
     private sealed record ErrorResponse(string Error);
 }
