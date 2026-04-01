@@ -86,8 +86,8 @@ public sealed class PromptResult
 
 /// <summary>
 /// LLM-powered brain for the distributed orchestrator.
-/// The Brain maintains a single persistent session across all goals, using
-/// CodingAgent for LLM communication with automatic context compaction.
+/// The Brain maintains a master persistent session and forks per-goal sessions
+/// from it, using CodingAgent for LLM communication with automatic context compaction.
 /// It has two jobs: plan iteration phases and craft worker prompts.
 /// </summary>
 public interface IDistributedBrain
@@ -168,6 +168,15 @@ public interface IDistributedBrain
 
     /// <summary>Returns current Brain context and usage statistics, or null if not connected.</summary>
     BrainStats? GetStats();
+
+    /// <summary>Fork the master session for a new goal.</summary>
+    /// <param name="goalId">The goal identifier to fork for.</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default);
+
+    /// <summary>Delete the goal session after completion or failure.</summary>
+    /// <param name="goalId">The goal identifier whose session to delete.</param>
+    void DeleteGoalSession(string goalId);
 
     /// <summary>
     /// Resets the Brain session by reloading orchestrator instructions from disk,

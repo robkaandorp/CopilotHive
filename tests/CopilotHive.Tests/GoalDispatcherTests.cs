@@ -246,6 +246,10 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
 
     public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
 
+    public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public void DeleteGoalSession(string goalId) { }
+
     public BrainStats? GetStats() => null;
 }
 
@@ -1952,6 +1956,10 @@ file sealed class RetryCapturingBrain : IDistributedBrain
 
     public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
 
+    public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public void DeleteGoalSession(string goalId) { }
+
     public BrainStats? GetStats() => null;
 }
 
@@ -2269,6 +2277,10 @@ file sealed class FirstPhasePlanningBrain : IDistributedBrain
 
     public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
 
+    public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public void DeleteGoalSession(string goalId) { }
+
     public BrainStats? GetStats() => null;
 }
 
@@ -2452,6 +2464,10 @@ public sealed class GoalDispatcherDocWritingPhaseTests
             Task.FromResult(BrainResponse.Answer("proceed"));
 
         public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public void DeleteGoalSession(string goalId) { }
 
         public BrainStats? GetStats() => null;
     }

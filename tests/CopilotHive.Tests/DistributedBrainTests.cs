@@ -367,7 +367,7 @@ public sealed class DistributedBrainTests
 
             await brain.SaveSessionAsync(TestContext.Current.CancellationToken);
 
-            var sessionFile = Path.Combine(tempDir, "brain-session.json");
+            var sessionFile = Path.Combine(tempDir, "brain-master.json");
             Assert.True(File.Exists(sessionFile), $"Session file should exist at {sessionFile}");
 
             var content = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
@@ -1561,6 +1561,10 @@ file sealed class FakeDistributedBrain : IDistributedBrain
         Task.FromResult(BrainResponse.Answer("Brain is not available. Please proceed with your best judgment."));
 
     public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public void DeleteGoalSession(string goalId) { }
 
     public BrainStats? GetStats() => null;
 }

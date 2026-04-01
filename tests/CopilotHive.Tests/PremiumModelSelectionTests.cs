@@ -328,6 +328,10 @@ file sealed class CapturingBrain : IDistributedBrain
 
     public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
 
+    public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public void DeleteGoalSession(string goalId) { }
+
     public BrainStats? GetStats() => null;
 }
 
