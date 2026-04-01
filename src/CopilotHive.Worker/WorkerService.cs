@@ -15,7 +15,7 @@ namespace CopilotHive.Worker;
 public sealed class WorkerService(
     string orchestratorUrl,
     string workerId,
-    string[] capabilities) : IToolCallBridge, ISessionClient
+    string[] capabilities) : IToolCallBridge, ISessionClient, IDisposable
 {
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(30);
 
@@ -349,5 +349,13 @@ public sealed class WorkerService(
         {
             yield return reader.Current;
         }
+    }
+
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        // Dispose the agent runner (which disposes the IChatClient) so each
+        // retry gets a fresh connection without leaking the previous one.
+        _agentRunner.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(5));
     }
 }
