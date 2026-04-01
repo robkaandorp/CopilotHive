@@ -4,10 +4,6 @@
 @inject DashboardStateService State
 @inject PageHeaderState PageHeader
 
-<div style="margin-bottom:1rem">
-    <a href="/workers" style="color:var(--accent);text-decoration:none">← Back to Workers</a>
-</div>
-
 @if (_worker is null)
 {
     <p style="color:var(--text-muted)">Worker <code>@WorkerId</code> is not connected.</p>
@@ -108,6 +104,7 @@ else
         PageHeader.SetTitle(_worker is not null
             ? $"🐝 Worker {_worker.Id[..Math.Min(12, _worker.Id.Length)]}"
             : $"🐝 Worker {WorkerId}");
+        PageHeader.SetBack("/workers");
         State.OnStateChanged += RefreshState;
     }
 

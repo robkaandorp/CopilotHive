@@ -12,9 +12,6 @@
 @inject HttpClient HttpClient
 @inject PageHeaderState PageHeader
 
-<a href="/goals" style="display:inline-flex;align-items:center;gap:0.35rem;color:var(--accent);text-decoration:none;font-size:0.9rem;margin-bottom:0.5rem">
-    ← Goals
-</a>
 <div class="goal-header" style="display:flex;align-items:center;gap:1rem;">
     @{ var repoNames = _storedGoal?.RepositoryNames ?? _detail?.RepositoryNames ?? []; }
     @foreach (var repo in repoNames)
@@ -667,6 +664,7 @@ else
     protected override void OnParametersSet()
     {
         PageHeader.SetTitle($"🎯 Goal: {GoalId}");
+        PageHeader.SetBack("/goals");
         Refresh();
     }
 
