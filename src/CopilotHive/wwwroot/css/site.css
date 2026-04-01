@@ -97,6 +97,18 @@ body {
     z-index: 10;
 }
 
+.hive-header-back {
+    font-size: 1.25rem;
+    color: var(--text-muted);
+    text-decoration: none;
+    line-height: 1;
+    margin-right: 0.5rem;
+    transition: color 0.15s;
+}
+.hive-header-back:hover {
+    color: var(--accent);
+}
+
 .hive-main {
     padding: 1.5rem;
     overflow-y: auto;

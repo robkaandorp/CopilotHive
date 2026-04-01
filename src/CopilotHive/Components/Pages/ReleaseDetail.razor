@@ -9,10 +9,6 @@
 @inject CopilotHive.Configuration.HiveConfigFile? HiveConfig
 @inject PageHeaderState PageHeader
 
-<a href="/releases" style="display:inline-flex;align-items:center;gap:0.35rem;color:var(--accent);text-decoration:none;font-size:0.9rem;margin-bottom:0.5rem">
-    ← Releases
-</a>
-
 @if (_release is not null)
 {
     <!-- Header -->
@@ -225,10 +221,16 @@ else if (_loaded)
         if (_release is not null)
         {
             PageHeader.SetTitle($"📦 {_release.Tag}");
+            PageHeader.SetBack("/releases");
             _editNotes = _release.Notes ?? "";
             _editTag = _release.Tag;
             _selectedRepos = new HashSet<string>(_release.RepositoryNames, StringComparer.OrdinalIgnoreCase);
             _goals = (await GoalStore.GetGoalsByReleaseAsync(decoded)).ToList();
+        }
+        if (_release is null)
+        {
+            PageHeader.SetTitle("Release Not Found");
+            PageHeader.SetBack("/releases");
         }
         _loaded = true;
     }
@@ -298,6 +300,7 @@ else if (_loaded)
             _release!.Tag = _editTag.Trim();
             _tagSaved = true;
             PageHeader.SetTitle($"📦 {_release.Tag}");
+            PageHeader.SetBack("/releases");
             StateHasChanged();
         }
         else
