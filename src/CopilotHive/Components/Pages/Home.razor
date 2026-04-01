@@ -71,7 +71,7 @@
                         }
                     </td>
                     <td>@(p.CoveragePercent > 0 ? $"{p.CoveragePercent:F1}%" : "—")</td>
-                    <td style="color:var(--text-muted)">@FormatElapsed(p.CreatedAt)</td>
+                    <td style="color:var(--text-muted)">@FormatElapsed(p)</td>
                 </tr>
             }
         </tbody>
@@ -140,9 +140,11 @@
         _ => "badge-muted",
     };
 
-    private static string FormatElapsed(DateTime start)
+    private static string FormatElapsed(PipelineInfo p)
     {
-        var elapsed = DateTime.UtcNow - start;
+        var start = p.GoalStartedAt ?? p.CreatedAt;
+        var end = p.CompletedAt ?? DateTime.UtcNow;
+        var elapsed = end - start;
         return elapsed.TotalHours >= 1
             ? $"{(int)elapsed.TotalHours}h {elapsed.Minutes}m"
             : $"{elapsed.Minutes}m {elapsed.Seconds}s";

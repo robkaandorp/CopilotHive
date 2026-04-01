@@ -137,6 +137,8 @@ public sealed class DashboardStateService : IDisposable
                 Iteration = p.Iteration,
                 ActiveTaskId = p.ActiveTaskId,
                 CreatedAt = p.CreatedAt,
+                GoalStartedAt = p.GoalStartedAt,
+                CompletedAt = p.CompletedAt,
                 TotalTests = p.Metrics.TotalTests,
                 PassedTests = p.Metrics.PassedTests,
                 FailedTests = p.Metrics.FailedTests,
@@ -718,6 +720,10 @@ public sealed class PipelineInfo
     public string? ActiveTaskId { get; init; }
     /// <summary>Pipeline creation timestamp.</summary>
     public DateTime CreatedAt { get; init; }
+    /// <summary>When the goal started executing (first non-planning phase).</summary>
+    public DateTime? GoalStartedAt { get; init; }
+    /// <summary>When the pipeline completed or failed, if finished.</summary>
+    public DateTime? CompletedAt { get; init; }
     /// <summary>Total test count.</summary>
     public int TotalTests { get; init; }
     /// <summary>Passed test count.</summary>
