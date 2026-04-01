@@ -41,6 +41,7 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
     private readonly string _systemPrompt;
     private readonly List<AITool> _composerTools;
     private readonly ConfigRepoManager? _configRepo;
+    private readonly Func<string, IChatClient>? _chatClientFactory;
 
     /// <summary>Models the Composer can switch between at runtime.</summary>
     public IReadOnlyList<string> AvailableModels { get; }
@@ -147,7 +148,8 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
         string? ollamaApiKey = null,
         HiveConfigFile? hiveConfig = null,
         ConfigRepoManager? configRepo = null,
-        IEnumerable<string>? availableModels = null)
+        IEnumerable<string>? availableModels = null,
+        Func<string, IChatClient>? chatClientFactory = null)
     {
         _model = model;
         _maxContextTokens = maxContextTokens;
@@ -161,6 +163,7 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
         _ollamaApiKey = string.IsNullOrWhiteSpace(ollamaApiKey) ? null : ollamaApiKey;
         _hiveConfig = hiveConfig;
         _configRepo = configRepo;
+        _chatClientFactory = chatClientFactory;
         _session = AgentSession.Create("composer");
 
         AvailableModels = (availableModels?.ToList() ?? [model]).AsReadOnly();
@@ -239,7 +242,7 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
         _reasoningEffort = reasoning;
 
         // Create new client
-        _chatClient = SDK.ChatClientFactory.Create(model);
+        _chatClient = (_chatClientFactory ?? SDK.ChatClientFactory.Create)(model);
 
         // Rebuild agent — session is preserved
         RecreateAgent();
@@ -254,7 +257,7 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
     {
         _logger.LogInformation("Composer connecting with model '{Model}'…", _model);
 
-        _chatClient = SDK.ChatClientFactory.Create(_model);
+        _chatClient = (_chatClientFactory ?? SDK.ChatClientFactory.Create)(_model);
 
         var sessionFile = GetSessionFilePath();
         if (File.Exists(sessionFile))
