@@ -676,6 +676,26 @@ tr:last-child td { border-bottom: none; }
     cursor: not-allowed;
 }
 
+.chat-model-select {
+    background: transparent;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.35rem 0.6rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+
+.chat-model-select:hover:not(:disabled) {
+    color: var(--text);
+    border-color: var(--text-muted);
+}
+
+.chat-model-select:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
 .chat-action-btn--danger:hover:not(:disabled) {
     color: var(--red);
     border-color: var(--red);

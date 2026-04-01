@@ -7,6 +7,7 @@
 @inject ClarificationQueueService ClarificationQueue
 @inject IJSRuntime JS
 @inject PageHeaderState PageHeader
+@inject HttpClient HttpClient
 
 @if (!Composer.IsConnected)
 {
@@ -148,6 +149,12 @@ else
             </div>
 
             <div class="chat-actions">
+                <select disabled="@Composer.IsStreaming" class="chat-model-select" @onchange="HandleModelChange">
+                    @foreach (var model in _availableModels)
+                    {
+                        <option value="@model" selected="@(_selectedModel == model)">@model</option>
+                    }
+                </select>
                 <button @onclick="ResetSession" disabled="@Composer.IsStreaming" class="chat-action-btn">
                     🔄 New Session
                 </button>
@@ -218,6 +225,8 @@ else
     private string _inputText = "";
     private HashSet<string> _selectedOptions = [];
     private string _questionFeedback = "";
+    private List<string> _availableModels = [];
+    private string _selectedModel = "";
 
     // Clarification panel state
     private List<ClarificationRequest> _pendingClarifications = [];
@@ -230,6 +239,7 @@ else
         if (Composer.IsConnected)
         {
             LoadHistory();
+            _ = LoadAvailableModelsAsync();
         }
         Composer.OnStreamingUpdate += HandleStreamingUpdate;
         Composer.OnQuestionAsked += HandleQuestionAsked;
@@ -282,6 +292,47 @@ else
         await Composer.ResetSessionAsync();
         _messages.Clear();
         StateHasChanged();
+    }
+
+    private async Task LoadAvailableModelsAsync()
+    {
+        try
+        {
+            var response = await HttpClient.GetFromJsonAsync<ModelsResponse>("/api/composer/models");
+            if (response?.Models is { Count: > 0 })
+            {
+                _availableModels = response.Models;
+                _selectedModel = _availableModels[0];
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ComposerChat] Failed to load available models: {ex.Message}");
+        }
+    }
+
+    private async Task HandleModelChange(ChangeEventArgs e)
+    {
+        if (e.Value is not string model || string.IsNullOrWhiteSpace(model)) return;
+        if (!_availableModels.Contains(model)) return;
+
+        try
+        {
+            var response = await HttpClient.PostAsJsonAsync($"/api/composer/models/switch?model={Uri.EscapeDataString(model)}", (object?)null);
+            if (response.IsSuccessStatusCode)
+            {
+                _selectedModel = model;
+            }
+            else
+            {
+                var error = await response.Content.ReadFromJsonAsync<ErrorResponse>();
+                Console.Error.WriteLine($"[ComposerChat] Model switch failed: {error?.Error ?? response.ReasonPhrase}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ComposerChat] Model switch failed: {ex.Message}");
+        }
     }
 
     private void HandleKeyDown(KeyboardEventArgs e)
@@ -410,4 +461,7 @@ else
         RefreshClarifications();
         StateHasChanged();
     }
+
+    private sealed record ModelsResponse(List<string> Models);
+    private sealed record ErrorResponse(string Error);
 }
