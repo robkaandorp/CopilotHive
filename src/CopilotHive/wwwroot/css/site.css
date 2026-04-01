@@ -678,8 +678,8 @@ tr:last-child td { border-bottom: none; }
 }
 
 .chat-model-select {
-    background: transparent;
-    color: var(--text-muted);
+    background: var(--bg-card);
+    color: var(--text);
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 0.35rem 0.6rem;
@@ -688,7 +688,6 @@ tr:last-child td { border-bottom: none; }
 }
 
 .chat-model-select:hover:not(:disabled) {
-    color: var(--text);
     border-color: var(--text-muted);
 }
 
