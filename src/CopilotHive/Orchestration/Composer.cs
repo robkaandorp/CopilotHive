@@ -104,6 +104,9 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
         - Files NOT to change: if certain files must not be modified (e.g. source files for a
           docs-only goal, or docs files for an internal refactor), list them explicitly in the
           description so workers know to leave them untouched.
+        - Always call list_goals (or get_goal) to check the current live status of goals before
+          making any statement about them — e.g. whether a goal is still in progress, completed,
+          or failed. Never rely on previously seen status from earlier in the conversation.
         """;
 
     private const string ConfigRepoSystemPromptSection = """
