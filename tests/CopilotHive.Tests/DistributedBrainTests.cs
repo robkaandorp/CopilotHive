@@ -4,6 +4,7 @@ using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging.Abstractions;
+using SharpCoder;
 
 using WorkerRole = CopilotHive.Workers.WorkerRole;
 
@@ -1519,6 +1520,243 @@ public sealed class DistributedBrainTests
         var first2000Chars = largeCoderOutput[..2000];
         Assert.Contains(first2000Chars, prompt);
         Assert.Contains("...", prompt);
+    }
+
+    // -- ForkSessionForGoalAsync Tests --
+
+    [Fact]
+    public async Task ForkSessionForGoalAsync_CreatesSessionFileOnDisk()
+    {
+        // Arrange
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+
+            // Need to connect to initialize the agent
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            // Act
+            await brain.ForkSessionForGoalAsync("goal-123", TestContext.Current.CancellationToken);
+
+            // Assert: session file exists
+            var sessionFile = Path.Combine(tempDir, "brain-goal-goal-123.json");
+            Assert.True(File.Exists(sessionFile), $"Session file should exist at {sessionFile}");
+
+            // Assert: file contains valid JSON
+            var content = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
+            Assert.Contains("brain", content); // AgentSession JSON should contain agent name
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ForkSessionForGoalAsync_ForksFromMasterSession()
+    {
+        // Arrange
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            // Inject a message into the master session using reflection
+            var masterSessionField = typeof(DistributedBrain)
+                .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+            masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User, "INJECTED_TEST_MESSAGE_FOR_FORK"));
+
+            // Act
+            await brain.ForkSessionForGoalAsync("goal-fork-test", TestContext.Current.CancellationToken);
+
+            // Assert: goal session file contains the injected message
+            var sessionFile = Path.Combine(tempDir, "brain-goal-goal-fork-test.json");
+            Assert.True(File.Exists(sessionFile));
+            var content = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
+            Assert.Contains("INJECTED_TEST_MESSAGE_FOR_FORK", content);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task LoadGoalSessionAsync_LoadsCorrectGoalSession()
+    {
+        // Arrange
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            // Create two different goal sessions with different message histories
+            var masterSessionField = typeof(DistributedBrain)
+                .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+
+            // Fork and save goal-A session with unique marker
+            masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User, "MARKER_GOAL_A_UNIQUE"));
+            await brain.ForkSessionForGoalAsync("goal-A", TestContext.Current.CancellationToken);
+
+            // Clear and add different marker for goal-B
+            masterSession.MessageHistory.RemoveAt(masterSession.MessageHistory.Count - 1);
+            masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User, "MARKER_GOAL_B_UNIQUE"));
+            await brain.ForkSessionForGoalAsync("goal-B", TestContext.Current.CancellationToken);
+
+            // Reset master session
+            masterSession.MessageHistory.RemoveAt(masterSession.MessageHistory.Count - 1);
+
+            // Get private LoadGoalSessionAsync method via reflection
+            var loadSessionMethod = typeof(DistributedBrain)
+                .GetMethod("LoadGoalSessionAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+
+            // Get _session field
+            var sessionField = typeof(DistributedBrain)
+                .GetField("_session", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+
+            // Act: load goal-B session
+            await (Task)loadSessionMethod.Invoke(brain, ["goal-B", TestContext.Current.CancellationToken])!;
+
+            // Assert: _session contains goal-B's history
+            var session = (AgentSession)sessionField.GetValue(brain)!;
+            var sessionHistory = session.MessageHistory;
+            Assert.Contains(sessionHistory, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_GOAL_B_UNIQUE")));
+            Assert.DoesNotContain(sessionHistory, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_GOAL_A_UNIQUE")));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteGoalSession_RemovesFile()
+    {
+        // Arrange
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            // Fork a goal session
+            await brain.ForkSessionForGoalAsync("goal-delete-test", TestContext.Current.CancellationToken);
+
+            var sessionFile = Path.Combine(tempDir, "brain-goal-goal-delete-test.json");
+
+            // Assert: file exists before deletion
+            Assert.True(File.Exists(sessionFile), "Session file should exist before deletion");
+
+            // Act
+            brain.DeleteGoalSession("goal-delete-test");
+
+            // Assert: file no longer exists
+            Assert.False(File.Exists(sessionFile), "Session file should not exist after deletion");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Migration_BrainSessionToBrainMaster()
+    {
+        // Arrange
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            // Create a legacy session file manually
+            var legacySession = AgentSession.Create("brain");
+            legacySession.MessageHistory.Add(new ChatMessage(ChatRole.User, "LEGACY_SESSION_CONTENT"));
+            var legacyFile = Path.Combine(tempDir, "brain-session.json");
+            await legacySession.SaveAsync(legacyFile, TestContext.Current.CancellationToken);
+
+            // Assert: legacy file exists, master file does not
+            Assert.True(File.Exists(legacyFile), "Legacy session file should exist");
+            var masterFile = Path.Combine(tempDir, "brain-master.json");
+            Assert.False(File.Exists(masterFile), "Master file should not exist yet");
+
+            // Act: connect triggers migration
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            // Assert: migration occurred
+            Assert.False(File.Exists(legacyFile), "Legacy file should be removed after migration");
+            Assert.True(File.Exists(masterFile), "Master file should exist after migration");
+
+            // Assert: session was loaded correctly (content preserved)
+            var masterSessionField = typeof(DistributedBrain)
+                .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+            Assert.Contains(masterSession.MessageHistory, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("LEGACY_SESSION_CONTENT")));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_ResetsMasterSession()
+    {
+        // Arrange
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            // Add a message to the master session
+            var masterSessionField = typeof(DistributedBrain)
+                .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+            masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User, "MESSAGE_TO_BE_CLEARED"));
+
+            // Save to disk
+            await brain.SaveSessionAsync(TestContext.Current.CancellationToken);
+
+            // Assert: file exists before reset
+            var masterFile = Path.Combine(tempDir, "brain-master.json");
+            Assert.True(File.Exists(masterFile), "Master file should exist before reset");
+
+            // Act
+            await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+            // Assert: file no longer exists
+            Assert.False(File.Exists(masterFile), "Master file should not exist after reset");
+
+            // Assert: master session is fresh (no messages)
+            masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+            Assert.Empty(masterSession.MessageHistory);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
     }
 
 }
