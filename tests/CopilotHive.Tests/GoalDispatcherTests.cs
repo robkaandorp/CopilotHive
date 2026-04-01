@@ -688,7 +688,7 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
 
         var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
 
-        Assert.Contains("Worker output:", summary);
+        Assert.Contains("Worker output (no summary):", summary);
         Assert.Contains("...", summary);
         // Should be significantly shorter than 3000 chars of raw output
         Assert.True(summary.Length < 2000);
@@ -702,6 +702,98 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
         var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
 
         Assert.DoesNotContain("Worker output:", summary);
+    }
+
+    // ── Summary vs raw output ───────────────────────────────────────────────
+
+    /// <summary>
+    /// When <see cref="TaskMetrics.Summary"/> is present, it must be used as the worker output
+    /// (prefixed with "Worker summary:") and raw output must be ignored.
+    /// </summary>
+    [Fact]
+    public void WithMetricsSummary_UsesSummary_NotRawOutput()
+    {
+        var result = new TaskResult
+        {
+            TaskId = "t1",
+            Status = TaskOutcome.Completed,
+            Output = "This raw output should be ignored.",
+            Metrics = new TaskMetrics
+            {
+                Summary = "Implemented feature X. All tests pass.",
+            },
+        };
+
+        var output = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.Contains("Worker summary:", output);
+        Assert.Contains("Implemented feature X. All tests pass.", output);
+        Assert.DoesNotContain("This raw output should be ignored", output);
+        Assert.DoesNotContain("Worker output (no summary)", output);
+    }
+
+    /// <summary>
+    /// When <see cref="TaskMetrics.Summary"/> is absent, raw output must be used as fallback
+    /// (prefixed with "Worker output (no summary):").
+    /// </summary>
+    [Fact]
+    public void WithoutMetricsSummary_UsesRawOutput_FallsBackToOutput()
+    {
+        var result = new TaskResult
+        {
+            TaskId = "t1",
+            Status = TaskOutcome.Completed,
+            Output = "Raw agent output text.",
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+        };
+
+        var output = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.Contains("Worker output (no summary):", output);
+        Assert.Contains("Raw agent output text.", output);
+        Assert.DoesNotContain("Worker summary:", output);
+    }
+
+    /// <summary>
+    /// When both Summary and raw output are absent, no worker output section is added.
+    /// </summary>
+    [Fact]
+    public void WithoutMetricsSummary_AndWithoutRawOutput_OmitsOutputSection()
+    {
+        var result = new TaskResult
+        {
+            TaskId = "t1",
+            Status = TaskOutcome.Completed,
+            Output = "",
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+        };
+
+        var output = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.DoesNotContain("Worker summary:", output);
+        Assert.DoesNotContain("Worker output", output);
+    }
+
+    /// <summary>
+    /// Raw output is truncated at 1500 characters when Summary is absent.
+    /// </summary>
+    [Fact]
+    public void WithoutMetricsSummary_TruncatesLongRawOutput()
+    {
+        var longOutput = new string('x', 3000);
+        var result = new TaskResult
+        {
+            TaskId = "t1",
+            Status = TaskOutcome.Completed,
+            Output = longOutput,
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+        };
+
+        var output = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.Contains("Worker output (no summary):", output);
+        Assert.Contains("...", output);
+        Assert.True(output.Length < 2000, "Output should be significantly shorter than raw 3000 chars");
     }
 
     [Fact]

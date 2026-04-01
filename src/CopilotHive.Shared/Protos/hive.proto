@@ -184,6 +184,7 @@ message TaskMetrics {
   double coverage_percent = 5;
   string verdict = 6;             // "PASS", "FAIL", "APPROVE", "REQUEST_CHANGES"
   repeated string issues = 7;
+  string summary = 8;             // Human-readable summary from worker report tool
 }
 
 // === Heartbeat ===

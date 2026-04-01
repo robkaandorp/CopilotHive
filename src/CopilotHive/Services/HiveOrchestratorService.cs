@@ -399,10 +399,10 @@ public sealed class HiveOrchestratorService(
             pipeline.ClearActiveTask();
             if (workerRole != Workers.WorkerRole.Unspecified)
             {
-                pipeline.RecordOutput(
-                    workerRole,
-                    pipeline.Iteration,
-                    complete.Output);
+                var outputText = !string.IsNullOrWhiteSpace(complete.Metrics?.Summary)
+                    ? complete.Metrics.Summary
+                    : complete.Output;
+                pipeline.RecordOutput(workerRole, pipeline.Iteration, outputText);
             }
         }
 
