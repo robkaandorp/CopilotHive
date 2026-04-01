@@ -672,6 +672,10 @@ public sealed class ClarificationLoggingTests
         public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
         public void DeleteGoalSession(string goalId) { }
+
+        public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+            Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
+
         public BrainStats? GetStats() => null;
     }
 

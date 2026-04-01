@@ -724,6 +724,66 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         public string? Reason { get; init; }
     }
 
+    /// <summary>
+    /// Generates a summary of the completed goal's work and appends it to the master session.
+    /// Should be called after a goal completes successfully, before deleting the goal session.
+    /// </summary>
+    public async Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default)
+    {
+        await _brainCallGate.WaitAsync(ct);
+        try
+        {
+            await LoadGoalSessionAsync(pipeline.GoalId, ct);
+
+            var prompt = $"""
+                This goal has been completed successfully and merged.
+                
+                Goal: {pipeline.GoalId}
+                Description: {Truncate(pipeline.Description, 500)}
+                Iterations: {pipeline.Iteration}
+                
+                Summarize what was accomplished in 2-4 sentences. Focus on:
+                - What was changed (files, components, patterns)
+                - Key decisions or trade-offs made
+                - Any important context for future goals
+                
+                Respond with ONLY the summary text.
+                """;
+
+            string summary;
+            if (_agent is not null)
+            {
+                var result = await _agent.ExecuteAsync(_session, prompt, ct);
+                summary = result.Message?.Trim() ?? $"Goal '{pipeline.GoalId}' completed.";
+            }
+            else
+            {
+                summary = $"Goal '{pipeline.GoalId}' completed ({pipeline.Iteration} iteration(s)).";
+            }
+
+            await SaveCurrentSessionAsync(ct);
+
+            // Append summary to master session
+            _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User,
+                $"[Goal completed: {pipeline.GoalId}] Summarize what was done."));
+            _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.Assistant, summary));
+            await SaveSessionAsync(ct);
+
+            // Clean up goal session
+            DeleteGoalSession(pipeline.GoalId);
+            _activeGoalId = null;
+
+            _logger.LogInformation("Merged summary for goal '{GoalId}' into master session: {Summary}",
+                pipeline.GoalId, Truncate(summary, 200));
+
+            return summary;
+        }
+        finally
+        {
+            _brainCallGate.Release();
+        }
+    }
+
     /// <inheritdoc />
     public async Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default)
     {

@@ -118,6 +118,12 @@ public interface IDistributedBrain
         CancellationToken ct = default);
 
     /// <summary>
+    /// Generates a summary of the completed goal's work and appends it to the master session.
+    /// Should be called after a goal completes successfully, before deleting the goal session.
+    /// </summary>
+    Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default);
+
+    /// <summary>
     /// Generates a concise squash-merge commit message for the specified pipeline.
     /// Returns a short subject (~72 chars) with 2–4 bullet body lines, or <c>null</c>
     /// if the Brain is not connected or any error occurs.

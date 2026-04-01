@@ -1190,6 +1190,20 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
                     pipeline.CoderBranch, repo.DefaultBranch, repo.Name, mergeCommitHash);
             }
 
+            // Summarize and merge goal session into master
+            if (_brain is not null)
+            {
+                try
+                {
+                    await _brain.SummarizeAndMergeAsync(pipeline, ct);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to summarize goal '{GoalId}' — deleting goal session without merge", pipeline.GoalId);
+                    _brain.DeleteGoalSession(pipeline.GoalId);
+                }
+            }
+
             await MarkGoalCompleted(pipeline, ct);
         }
         catch (Exception ex)
@@ -1532,6 +1546,10 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
 
         // Deregister from Brain — goal is no longer active
         (_brain as DistributedBrain)?.DeregisterActivePipeline(pipeline.GoalId);
+
+        // Delete goal session on failure (no summary to merge)
+        if (_brain is not null)
+            _brain.DeleteGoalSession(pipeline.GoalId);
     }
 
     /// <summary>
