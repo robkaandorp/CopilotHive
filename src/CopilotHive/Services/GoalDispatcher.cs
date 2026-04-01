@@ -1820,10 +1820,7 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
             // the session may not have been forked yet. Fork from master to recover.
             if (_brain is not null && pipeline.Phase is not (GoalPhase.Done or GoalPhase.Failed))
             {
-                var goalSessionPath = Path.Combine(
-                    ((DistributedBrain)_brain).StateDirectory,
-                    $"brain-goal-{pipeline.GoalId}.json");
-                if (!File.Exists(goalSessionPath))
+                if (!_brain.GoalSessionExists(pipeline.GoalId))
                 {
                     await _brain.ForkSessionForGoalAsync(pipeline.GoalId, ct);
                 }

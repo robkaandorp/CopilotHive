@@ -250,6 +250,8 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
 
     public void DeleteGoalSession(string goalId) { }
 
+    public bool GoalSessionExists(string goalId) => false;
+
     public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
         Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
 
@@ -1963,6 +1965,8 @@ file sealed class RetryCapturingBrain : IDistributedBrain
 
     public void DeleteGoalSession(string goalId) { }
 
+    public bool GoalSessionExists(string goalId) => false;
+
     public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
         Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
 
@@ -2287,6 +2291,8 @@ file sealed class FirstPhasePlanningBrain : IDistributedBrain
 
     public void DeleteGoalSession(string goalId) { }
 
+    public bool GoalSessionExists(string goalId) => false;
+
     public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
         Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
 
@@ -2477,6 +2483,8 @@ public sealed class GoalDispatcherDocWritingPhaseTests
         public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
         public void DeleteGoalSession(string goalId) { }
+
+    public bool GoalSessionExists(string goalId) => false;
 
         public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
             Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
@@ -2716,6 +2724,8 @@ public sealed class GoalDispatcherParallelDispatchTests
 
         public void DeleteGoalSession(string goalId) { }
 
+    public bool GoalSessionExists(string goalId) => false;
+
         public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
             Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
 
@@ -2761,6 +2771,8 @@ public sealed class GoalDispatcherParallelDispatchTests
         }
 
         public void DeleteGoalSession(string goalId) { }
+
+    public bool GoalSessionExists(string goalId) => false;
 
         public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
             Task.FromResult($"Goal '{pipeline.GoalId}' completed.");

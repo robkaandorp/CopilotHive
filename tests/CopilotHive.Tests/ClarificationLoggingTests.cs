@@ -673,6 +673,8 @@ public sealed class ClarificationLoggingTests
         public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
         public void DeleteGoalSession(string goalId) { }
 
+    public bool GoalSessionExists(string goalId) => false;
+
         public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
             Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
 

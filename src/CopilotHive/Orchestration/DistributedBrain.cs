@@ -455,6 +455,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         }
     }
 
+    /// <inheritdoc />
+    public bool GoalSessionExists(string goalId) =>
+        File.Exists(GetGoalSessionFilePath(goalId));
+
     /// <summary>Persists the master Brain session to disk.</summary>
     internal async Task SaveSessionAsync(CancellationToken ct = default)
     {

@@ -185,6 +185,14 @@ public interface IDistributedBrain
     void DeleteGoalSession(string goalId);
 
     /// <summary>
+    /// Returns true if a persisted goal session file exists for the given goal.
+    /// Used by GoalDispatcher during pipeline restoration to determine whether
+    /// a session needs to be forked from the master session.
+    /// </summary>
+    /// <param name="goalId">The goal identifier to check.</param>
+    bool GoalSessionExists(string goalId);
+
+    /// <summary>
     /// Resets the Brain session by reloading orchestrator instructions from disk,
     /// clearing message history, and creating a fresh <see cref="SharpCoder.AgentSession"/>.
     /// Also deletes the persisted session file. Thread-safe via the Brain call gate.
