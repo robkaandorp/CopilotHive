@@ -516,7 +516,8 @@ public sealed class DistributedBrainTests
 
         // Assert: the tester output string appears verbatim in the prompt
         Assert.Contains("All 42 tests pass. No failures.", prompt);
-        Assert.Contains("Current iteration test results (from the tester phase):", prompt);
+        Assert.Contains("=== Tester output (iteration 1) ===", prompt);
+        Assert.Contains("=== End tester output ===", prompt);
     }
 
     [Fact]
@@ -532,7 +533,7 @@ public sealed class DistributedBrainTests
 
         // Assert: tester output is NOT in the prompt for Coding phase
         Assert.DoesNotContain("Some test output that should not appear", prompt);
-        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
+        Assert.DoesNotContain("=== Tester output (iteration", prompt);
     }
 
     [Fact]
@@ -548,7 +549,7 @@ public sealed class DistributedBrainTests
 
         // Assert: tester output is NOT in the prompt for Testing phase
         Assert.DoesNotContain("Previous test output should not appear", prompt);
-        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
+        Assert.DoesNotContain("=== Tester output (iteration", prompt);
     }
 
     [Fact]
@@ -568,11 +569,11 @@ public sealed class DistributedBrainTests
 
         // Assert ordering: additionalContext appears BEFORE currentTestResults
         var contextIdx = prompt.IndexOf("Additional context:", StringComparison.Ordinal);
-        var testResultsIdx = prompt.IndexOf("Current iteration test results (from the tester phase):", StringComparison.Ordinal);
+        var testResultsIdx = prompt.IndexOf("=== Tester output (iteration", StringComparison.Ordinal);
         Assert.True(contextIdx >= 0, "Additional context header should be in prompt");
-        Assert.True(testResultsIdx >= 0, "Test results header should be in prompt");
+        Assert.True(testResultsIdx >= 0, "Tester output header should be in prompt");
         Assert.True(contextIdx < testResultsIdx,
-            $"Additional context (at {contextIdx}) should appear before test results (at {testResultsIdx})");
+            $"Additional context (at {contextIdx}) should appear before tester output (at {testResultsIdx})");
     }
 
     [Fact]
@@ -585,8 +586,8 @@ public sealed class DistributedBrainTests
         // Act
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
-        // Assert: the test results section header should NOT be present
-        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
+        // Assert: the tester output section header should NOT be present
+        Assert.DoesNotContain("=== Tester output (iteration", prompt);
     }
 
     [Fact]
@@ -601,7 +602,7 @@ public sealed class DistributedBrainTests
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: whitespace-only output should be treated as absent
-        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
+        Assert.DoesNotContain("=== Tester output (iteration", prompt);
     }
 
     [Fact]
@@ -635,7 +636,7 @@ public sealed class DistributedBrainTests
 
         // Verify the craft prompt includes tester output (key observable behavior)
         var craftPrompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
-        Assert.Contains("Current iteration test results (from the tester phase):", craftPrompt);
+        Assert.Contains("=== Tester output (iteration 1) ===", craftPrompt);
         Assert.Contains("All tests pass.", craftPrompt);
 
         // Verify the system prompt contains the reviewer guidance
@@ -687,7 +688,8 @@ public sealed class DistributedBrainTests
         var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
 
         Assert.Contains("Passed: 87, Failed: 0", prompt);
-        Assert.Contains("Current iteration test results (from the tester phase):", prompt);
+        Assert.Contains("=== Tester output (iteration 1) ===", prompt);
+        Assert.Contains("=== End tester output ===", prompt);
     }
 
     [Fact]
@@ -734,7 +736,7 @@ public sealed class DistributedBrainTests
 
         var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
 
-        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
+        Assert.DoesNotContain("=== Tester output (iteration", prompt);
     }
 
     [Fact]
@@ -745,7 +747,7 @@ public sealed class DistributedBrainTests
 
         var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
 
-        Assert.DoesNotContain("Current iteration test results (from the tester phase):", prompt);
+        Assert.DoesNotContain("=== Tester output (iteration", prompt);
     }
 
     [Fact]
@@ -774,7 +776,7 @@ public sealed class DistributedBrainTests
 
         Assert.False(promptResult.IsEscalation);
         Assert.Contains("FALLBACK_TESTER_RESULTS_42", promptResult.Prompt);
-        Assert.Contains("Current iteration test results (from the tester phase):", promptResult.Prompt);
+        Assert.Contains("=== Tester output (iteration 1) ===", promptResult.Prompt);
         Assert.Contains("do NOT reject because you cannot run tests yourself", promptResult.Prompt);
     }
 
@@ -1300,6 +1302,220 @@ public sealed class DistributedBrainTests
 
         // Assert: exactly 2000 chars should appear as-is (no truncation)
         Assert.Contains(exactly2000, prompt);
+    }
+
+    // -- Coder Output Tests --
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_WithCoderOutput_ContainsFencedCoderBlock()
+    {
+        // Arrange: pipeline with coder output recorded for iteration 1
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-coder-1", "Implement user service");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "Added UserService.cs with GetById, Create, Update methods.");
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: coder output appears with fenced block format
+        Assert.Contains("Added UserService.cs with GetById, Create, Update methods.", prompt);
+        Assert.Contains("=== Coder output (iteration 1) ===", prompt);
+        Assert.Contains("=== End coder output ===", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_WithoutCoderOutput_OmitsCoderBlock()
+    {
+        // Arrange: no coder output recorded
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-no-coder", "Review without coder output");
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: coder block should NOT be present
+        Assert.DoesNotContain("=== Coder output (iteration", prompt);
+        Assert.DoesNotContain("=== End coder output ===", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_WhitespaceOnlyCoderOutput_OmitsCoderBlock()
+    {
+        // Arrange: coder output is only whitespace
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-ws-coder", "Review with whitespace coder output");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "   \n  \t  ");
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: whitespace-only output should be treated as absent
+        Assert.DoesNotContain("=== Coder output (iteration", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_CoderOutputTruncatedAt2000Chars()
+    {
+        // Arrange: create a pipeline with a very long coder output
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-coder-truncate", "Test coder output truncation");
+        const int largeCoderOutputLength = 5000;
+        var largeCoderOutput = new string('Z', largeCoderOutputLength);
+        pipeline.PhaseOutputs[$"coder-{pipeline.Iteration}"] = largeCoderOutput;
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: the full coder output does NOT appear in the prompt
+        Assert.DoesNotContain(largeCoderOutput, prompt);
+
+        // Assert: the prompt contains an ellipsis truncation marker
+        Assert.Contains("...", prompt);
+
+        // Assert: the truncated coder output (first 2000 chars) appears in the prompt
+        var first2000Chars = largeCoderOutput[..2000];
+        Assert.Contains(first2000Chars, prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_CoderOutputNotTruncated_WhenShort()
+    {
+        // Arrange: short coder output that should not be truncated
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-short-coder", "Test short coder output");
+        var shortOutput = "Implemented feature X as requested.";
+        pipeline.PhaseOutputs[$"coder-{pipeline.Iteration}"] = shortOutput;
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: full short output appears verbatim in the prompt (no truncation)
+        Assert.Contains(shortOutput, prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_CoderOutputUsesCurrentIteration()
+    {
+        // Arrange: record coder output for two iterations, advance to iteration 2
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-coder-iter", "Multi-iteration coder review");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "CODER_ITER1_SHOULD_NOT_APPEAR");
+        pipeline.IncrementIteration();
+        pipeline.RecordOutput(WorkerRole.Coder, 2, "CODER_ITER2_EXPECTED");
+
+        // Act: at iteration 2, should use coder-2 key
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: only iteration 2's output appears
+        Assert.Contains("CODER_ITER2_EXPECTED", prompt);
+        Assert.DoesNotContain("CODER_ITER1_SHOULD_NOT_APPEAR", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_CoderOutputAppearsAfterTesterOutput()
+    {
+        // Arrange: pipeline with both tester and coder output
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-both-outputs", "Test both outputs ordering");
+        pipeline.RecordOutput(WorkerRole.Tester, 1, "TESTER_MARKER_UNIQUE");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "CODER_MARKER_UNIQUE");
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: both outputs appear
+        Assert.Contains("TESTER_MARKER_UNIQUE", prompt);
+        Assert.Contains("CODER_MARKER_UNIQUE", prompt);
+
+        // Assert ordering: tester block appears BEFORE coder block
+        var testerIdx = prompt.IndexOf("=== Tester output (iteration", StringComparison.Ordinal);
+        var coderIdx = prompt.IndexOf("=== Coder output (iteration", StringComparison.Ordinal);
+        Assert.True(testerIdx >= 0, "Tester output header should be in prompt");
+        Assert.True(coderIdx >= 0, "Coder output header should be in prompt");
+        Assert.True(testerIdx < coderIdx,
+            $"Tester output (at {testerIdx}) should appear before coder output (at {coderIdx})");
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_CodingPhase_CoderOutputNotIncluded()
+    {
+        // Arrange: coder output present but Coding phase should not include it
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-coding-coder", "Coding phase with coder output");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "CODER_OUTPUT_SHOULD_NOT_APPEAR");
+
+        // Act
+        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Coding);
+
+        // Assert: coder output is NOT in the prompt for Coding phase
+        Assert.DoesNotContain("CODER_OUTPUT_SHOULD_NOT_APPEAR", prompt);
+        Assert.DoesNotContain("=== Coder output (iteration", prompt);
+    }
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_WithCoderOutput_ContainsFencedCoderBlock()
+    {
+        // Arrange
+        var pipeline = CreatePipeline("g-fb-coder-1", "Fallback review with coder output");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "Added feature with async support.");
+
+        // Act
+        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+
+        // Assert
+        Assert.Contains("Added feature with async support.", prompt);
+        Assert.Contains("=== Coder output (iteration 1) ===", prompt);
+        Assert.Contains("=== End coder output ===", prompt);
+    }
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_WithoutCoderOutput_OmitsCoderBlock()
+    {
+        // Arrange
+        var pipeline = CreatePipeline("g-fb-no-coder", "Fallback review without coder output");
+
+        // Act
+        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+
+        // Assert
+        Assert.DoesNotContain("=== Coder output (iteration", prompt);
+        Assert.DoesNotContain("=== End coder output ===", prompt);
+    }
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_WhitespaceOnlyCoderOutput_OmitsCoderBlock()
+    {
+        // Arrange: coder output is only whitespace
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-fb-ws-coder", "Fallback review with whitespace coder output");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "   \n  \t  ");
+
+        // Act
+        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+
+        // Assert: whitespace-only output should be treated as absent
+        Assert.DoesNotContain("=== Coder output (iteration", prompt);
+    }
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_CoderOutputTruncatedAt2000Chars()
+    {
+        // Arrange
+        var pipeline = CreatePipeline("g-fb-coder-trunc", "Fallback coder truncation test");
+        const int largeCoderOutputLength = 5000;
+        var largeCoderOutput = new string('W', largeCoderOutputLength);
+        pipeline.PhaseOutputs[$"coder-{pipeline.Iteration}"] = largeCoderOutput;
+
+        // Act
+        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+
+        // Assert: the full coder output does NOT appear
+        Assert.DoesNotContain(largeCoderOutput, prompt);
+
+        // Assert: truncated coder output appears with ellipsis
+        var first2000Chars = largeCoderOutput[..2000];
+        Assert.Contains(first2000Chars, prompt);
+        Assert.Contains("...", prompt);
     }
 
 }

@@ -741,6 +741,23 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             currentTestResults = "";
         }
 
+        // For review phase, also include coder output so the reviewer understands the rationale
+        // behind code decisions. Cap at 2000 chars with ellipsis if truncated.
+        string currentCoderOutput;
+        if (phase == GoalPhase.Review
+            && pipeline.PhaseOutputs.TryGetValue($"coder-{pipeline.Iteration}", out var coderOut)
+            && !string.IsNullOrWhiteSpace(coderOut))
+        {
+            const int maxCoderOutputChars = 2000;
+            currentCoderOutput = coderOut.Length > maxCoderOutputChars
+                ? coderOut[..maxCoderOutputChars] + "..."
+                : coderOut;
+        }
+        else
+        {
+            currentCoderOutput = "";
+        }
+
         // Include docwriting-preceded-review guidance inline when relevant
         var docWritingNote = (phase == GoalPhase.Review && docWritingPrecededReview)
             ? "\nNote: The docwriting phase already ran before this review. Changes to CHANGELOG.md, README.md, and XML doc comments are EXPECTED and should NOT be flagged as scope violations."
@@ -754,7 +771,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             {{phaseInstructions}}
             {{(previousFeedback.Length > 0 ? $"\n{previousFeedback}" : "")}}
             {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
-            {{(currentTestResults.Length > 0 ? $"\nCurrent iteration test results (from the tester phase):\n{currentTestResults}" : "")}}
+            {{(currentTestResults.Length > 0 ? $"\n=== Tester output (iteration {pipeline.Iteration}) ===\n{currentTestResults}\n=== End tester output ===" : "")}}
+            {{(currentCoderOutput.Length > 0 ? $"\n=== Coder output (iteration {pipeline.Iteration}) ===\n{currentCoderOutput}\n=== End coder output ===" : "")}}
             {{docWritingNote}}
 
             The worker has access to project skills (e.g. build, test) that describe how to build and test this project.
@@ -781,6 +799,18 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             ? testerOut
             : "";
 
+        // Include coder output so the reviewer understands the rationale behind code decisions.
+        // Cap at 2000 chars with ellipsis if truncated.
+        string currentCoderOutput = "";
+        if (pipeline.PhaseOutputs.TryGetValue($"coder-{pipeline.Iteration}", out var coderOut)
+            && !string.IsNullOrWhiteSpace(coderOut))
+        {
+            const int maxCoderOutputChars = 2000;
+            currentCoderOutput = coderOut.Length > maxCoderOutputChars
+                ? coderOut[..maxCoderOutputChars] + "..."
+                : coderOut;
+        }
+
         return $$"""
             Review the changes for: {{pipeline.Description}}
 
@@ -793,7 +823,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - Only flag issues that are clearly bugs, security problems, or genuine scope violations (touching unrelated code/features).
             - Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
             {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
-            {{(currentTestResults.Length > 0 ? $"\nCurrent iteration test results (from the tester phase):\n{currentTestResults}" : "")}}
+            {{(currentTestResults.Length > 0 ? $"\n=== Tester output (iteration {pipeline.Iteration}) ===\n{currentTestResults}\n=== End tester output ===" : "")}}
+            {{(currentCoderOutput.Length > 0 ? $"\n=== Coder output (iteration {pipeline.Iteration}) ===\n{currentCoderOutput}\n=== End coder output ===" : "")}}
             """;
     }
 
