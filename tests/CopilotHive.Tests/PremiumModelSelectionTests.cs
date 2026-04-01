@@ -332,6 +332,9 @@ file sealed class CapturingBrain : IDistributedBrain
 
     public void DeleteGoalSession(string goalId) { }
 
+    public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
+
     public BrainStats? GetStats() => null;
 }
 
