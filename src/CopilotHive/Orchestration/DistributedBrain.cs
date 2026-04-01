@@ -1139,7 +1139,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         var prevIteration = pipeline.Iteration - 1;
         var sb = new StringBuilder();
-        sb.AppendLine($"Previous iteration ({prevIteration}) feedback:");
+        sb.AppendLine($"=== Previous iteration ({prevIteration}) feedback ===");
 
         var hasAnyFeedback = false;
 

@@ -100,8 +100,10 @@ public sealed class BrainEscalationTests
         // Assert — should contain the clarification answer context
         Assert.NotNull(prompt);
         Assert.NotEmpty(prompt);
-        // The retry was called with clarification answer as additional context
+        // The retry was called with clarification answer as additional context (fenced format)
         Assert.Contains(ComposerAnswer, promptBrain.LastAdditionalContext ?? string.Empty);
+        Assert.Contains("=== Clarification answer ===", promptBrain.LastAdditionalContext ?? string.Empty);
+        Assert.Contains("=== End clarification answer ===", promptBrain.LastAdditionalContext ?? string.Empty);
     }
 
     /// <summary>

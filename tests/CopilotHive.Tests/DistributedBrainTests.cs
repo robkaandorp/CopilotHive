@@ -233,7 +233,7 @@ public sealed class DistributedBrainTests
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
 
-        Assert.Contains("Previous iteration (1) feedback:", result);
+        Assert.Contains($"=== Previous iteration (1) feedback ===", result);
         Assert.Contains("=== Reviewer feedback (iteration 1) ===", result);
         Assert.Contains("Missing null check", result);
     }
@@ -288,7 +288,7 @@ public sealed class DistributedBrainTests
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
 
-        Assert.Contains("Previous iteration (1) feedback:", result);
+        Assert.Contains($"=== Previous iteration (1) feedback ===", result);
         Assert.Contains("No phase outputs recorded", result);
         Assert.Contains("=== End previous iteration feedback ===", result);
     }
@@ -304,7 +304,7 @@ public sealed class DistributedBrainTests
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
 
-        Assert.Contains("Previous iteration (2) feedback:", result);
+        Assert.Contains($"=== Previous iteration (2) feedback ===", result);
         Assert.Contains("Iteration 2 issue", result);
         Assert.DoesNotContain("Iteration 1 issue", result);
     }
@@ -570,11 +570,12 @@ public sealed class DistributedBrainTests
 
         // Assert ordering: additionalContext appears BEFORE currentTestResults
         var contextIdx = prompt.IndexOf("=== Additional context ===", StringComparison.Ordinal);
+        var contextEndIdx = prompt.IndexOf("=== End additional context ===", StringComparison.Ordinal);
         var testResultsIdx = prompt.IndexOf("=== Tester output (iteration", StringComparison.Ordinal);
         Assert.True(contextIdx >= 0, "Additional context header should be in prompt");
-        Assert.True(testResultsIdx >= 0, "Tester output header should be in prompt");
-        Assert.True(contextIdx < testResultsIdx,
-            $"Additional context (at {contextIdx}) should appear before tester output (at {testResultsIdx})");
+        Assert.True(contextEndIdx >= 0, "End additional context fence should be in prompt");
+        Assert.True(contextIdx < contextEndIdx, "Opening fence should come before closing fence");
+        Assert.True(contextEndIdx < testResultsIdx, "Closing fence should come before tester output");
     }
 
     [Fact]
@@ -728,6 +729,7 @@ public sealed class DistributedBrainTests
 
         Assert.Contains("=== Additional context ===", prompt);
         Assert.Contains("EXTRA_CONTEXT_MARKER", prompt);
+        Assert.Contains("=== End additional context ===", prompt);
     }
 
     [Fact]
