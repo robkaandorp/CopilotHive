@@ -396,7 +396,7 @@ public sealed class GoalPipeline
         foreach (var (key, output) in PhaseOutputs)
         {
             var truncated = output.Length > 2000 ? output[..2000] + "..." : output;
-            parts.Add($"\n--- Output from {key} ---\n{truncated}");
+            parts.Add($"\n=== Output from {key} ===\n{truncated}\n=== End output from {key} ===");
         }
 
         return string.Join("\n", parts);

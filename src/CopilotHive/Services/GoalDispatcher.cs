@@ -422,8 +422,8 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogInformation(
             "Retrying Brain planning for goal {GoalId} with clarification answer", pipeline.GoalId);
         var retryContext = additionalContext is not null
-            ? $"{additionalContext}\n\nClarification answer: {answer}"
-            : $"Clarification answer: {answer}";
+            ? $"{additionalContext}\n\n=== Clarification answer ===\n{answer}\n=== End clarification answer ==="
+            : $"=== Clarification answer ===\n{answer}\n=== End clarification answer ===";
 
         var retryResult = await _brain.PlanIterationAsync(pipeline, retryContext, ct);
         return retryResult.Plan ?? IterationPlan.Default();
@@ -468,8 +468,8 @@ public sealed class GoalDispatcher : BackgroundService
             "Retrying Brain prompt crafting for goal {GoalId} phase {Phase} with clarification answer",
             pipeline.GoalId, phase);
         var retryContext = additionalContext is not null
-            ? $"{additionalContext}\n\nClarification answer: {answer}"
-            : $"Clarification answer: {answer}";
+            ? $"{additionalContext}\n\n=== Clarification answer ===\n{answer}\n=== End clarification answer ==="
+            : $"=== Clarification answer ===\n{answer}\n=== End clarification answer ===";
 
         var retryResult = await _brain.CraftPromptAsync(pipeline, phase, retryContext, ct);
         return retryResult.Prompt ?? $"Work on: {pipeline.Description}";

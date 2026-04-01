@@ -234,7 +234,7 @@ public sealed class DistributedBrainTests
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
 
         Assert.Contains("Previous iteration (1) feedback:", result);
-        Assert.Contains("REVIEWER feedback", result);
+        Assert.Contains("=== Reviewer feedback (iteration 1) ===", result);
         Assert.Contains("Missing null check", result);
     }
 
@@ -247,7 +247,7 @@ public sealed class DistributedBrainTests
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
 
-        Assert.Contains("TESTER feedback", result);
+        Assert.Contains("=== Tester feedback (iteration 1) ===", result);
         Assert.Contains("3 tests failed", result);
     }
 
@@ -260,7 +260,7 @@ public sealed class DistributedBrainTests
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
 
-        Assert.Contains("CODER output", result);
+        Assert.Contains("=== Coder output (iteration 1) ===", result);
         Assert.Contains("Added UserService", result);
     }
 
@@ -275,9 +275,9 @@ public sealed class DistributedBrainTests
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
 
-        Assert.Contains("REVIEWER feedback", result);
-        Assert.Contains("TESTER feedback", result);
-        Assert.Contains("CODER output", result);
+        Assert.Contains("=== Reviewer feedback (iteration 1) ===", result);
+        Assert.Contains("=== Tester feedback (iteration 1) ===", result);
+        Assert.Contains("=== Coder output (iteration 1) ===", result);
     }
 
     [Fact]
@@ -290,6 +290,7 @@ public sealed class DistributedBrainTests
 
         Assert.Contains("Previous iteration (1) feedback:", result);
         Assert.Contains("No phase outputs recorded", result);
+        Assert.Contains("=== End previous iteration feedback ===", result);
     }
 
     [Fact]
@@ -568,7 +569,7 @@ public sealed class DistributedBrainTests
         Assert.Contains("UNIQUE_TESTER_MARKER_XYZ", prompt);
 
         // Assert ordering: additionalContext appears BEFORE currentTestResults
-        var contextIdx = prompt.IndexOf("Additional context:", StringComparison.Ordinal);
+        var contextIdx = prompt.IndexOf("=== Additional context ===", StringComparison.Ordinal);
         var testResultsIdx = prompt.IndexOf("=== Tester output (iteration", StringComparison.Ordinal);
         Assert.True(contextIdx >= 0, "Additional context header should be in prompt");
         Assert.True(testResultsIdx >= 0, "Tester output header should be in prompt");
@@ -725,7 +726,7 @@ public sealed class DistributedBrainTests
 
         var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline, "EXTRA_CONTEXT_MARKER");
 
-        Assert.Contains("Additional context:", prompt);
+        Assert.Contains("=== Additional context ===", prompt);
         Assert.Contains("EXTRA_CONTEXT_MARKER", prompt);
     }
 
