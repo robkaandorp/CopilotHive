@@ -1483,6 +1483,21 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
+    public void BuildReviewFallbackPrompt_WhitespaceOnlyCoderOutput_OmitsCoderBlock()
+    {
+        // Arrange: coder output is only whitespace
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+        var pipeline = CreatePipeline("g-fb-ws-coder", "Fallback review with whitespace coder output");
+        pipeline.RecordOutput(WorkerRole.Coder, 1, "   \n  \t  ");
+
+        // Act
+        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+
+        // Assert: whitespace-only output should be treated as absent
+        Assert.DoesNotContain("=== Coder output (iteration", prompt);
+    }
+
+    [Fact]
     public void BuildReviewFallbackPrompt_CoderOutputTruncatedAt2000Chars()
     {
         // Arrange
