@@ -390,32 +390,6 @@ public sealed class GoalDispatcherClearRetryStateTests
         var totalDispatchLogs = logger.Logs.Count(l => l.Message.Contains($"Dispatching goal '{goal.Id}'"));
         Assert.Equal(2, totalDispatchLogs);
     }
-
-    /// <summary>
-    /// Verifies that <see cref="GoalDispatcher.ClearGoalRetryState"/> adds the goal ID
-    /// to the internal _retriedGoals tracking dictionary, enabling retry context injection
-    /// on the next dispatch.
-    /// </summary>
-    [Fact]
-    public void ClearGoalRetryState_AddsGoalIdToRetriedGoalsTracking()
-    {
-        var goalId = $"goal-{Guid.NewGuid():N}";
-        var goalManager = new GoalManager();
-        var pipelineManager = new GoalPipelineManager();
-        var dispatcher = CreateDispatcher(goalManager, pipelineManager);
-
-        // Act: Call ClearGoalRetryState to mark goal for retry
-        dispatcher.ClearGoalRetryState(goalId);
-
-        // Assert: Verify the entry exists in _retriedGoals using reflection
-        var retriedGoalsField = typeof(GoalDispatcher).GetField(
-            "_retriedGoals",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var retriedGoals = (System.Collections.Concurrent.ConcurrentDictionary<string, bool>)retriedGoalsField.GetValue(dispatcher)!;
-
-        Assert.True(retriedGoals.ContainsKey(goalId), $"Expected goal ID '{goalId}' to be present in _retriedGoals after ClearGoalRetryState");
-        Assert.True(retriedGoals.TryGetValue(goalId, out var value) && value, "The _retriedGoals entry value should be true");
-    }
 }
 
 /// <summary>
