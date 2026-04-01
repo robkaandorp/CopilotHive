@@ -397,6 +397,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <param name="ct">Cancellation token.</param>
     private async Task LoadGoalSessionAsync(string goalId, CancellationToken ct)
     {
+        // Idempotent: already loaded for this goal
+        if (_activeGoalId == goalId && _session != null)
+            return;
+
         if (_activeGoalId != null && _activeGoalId != goalId)
             await SaveCurrentSessionAsync(ct);
 
@@ -558,8 +562,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             const int maxToolAttempts = 3;
             string currentPrompt = prompt;
-
-            await LoadGoalSessionAsync(pipeline.GoalId, ct);
 
             for (int attempt = 1; attempt <= maxToolAttempts; attempt++)
             {
@@ -749,8 +751,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             string? message = null;
 
-            await LoadGoalSessionAsync(pipeline.GoalId, ct);
-
             await Shared.CopilotRetryPolicy.ExecuteAsync(
                 async () =>
                 {
@@ -769,8 +769,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                         pipeline.GoalId, attempt, Shared.CopilotRetryPolicy.MaxRetries + 1, ex.Message, delay.TotalSeconds);
                 },
                 ct);
-
-            await SaveCurrentSessionAsync(ct);
 
             _logger.LogDebug("Brain generated commit message for goal {GoalId}: {Message}",
                 pipeline.GoalId, message);
@@ -942,8 +940,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         try
         {
-            await LoadGoalSessionAsync(pipeline.GoalId, ct);
-
             var craftedPrompt = await Shared.CopilotRetryPolicy.ExecuteAsync(
                 async () =>
                 {
@@ -1033,8 +1029,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         try
         {
-            await LoadGoalSessionAsync(goalId, ct);
-
             var (response, toolCall) = await Shared.CopilotRetryPolicy.ExecuteAsync(
                 () => ExecuteBrainAsync(prompt, goalId, ct),
                 onRetry: (attempt, delay, ex) =>
