@@ -16,9 +16,10 @@ namespace CopilotHive.Orchestration;
 /// <summary>
 /// LLM-powered brain that runs inside the orchestrator container.
 /// The Brain has two jobs: plan iteration phases and craft worker prompts.
-/// Uses a single SharpCoder CodingAgent with one persistent AgentSession
-/// that carries context across all goals. File tools give the Brain
-/// read-only access to target repositories via BrainRepoManager clones.
+/// Maintains a master AgentSession with shared context (system notes,
+/// orchestrator instructions) and forks per-goal sessions from it to
+/// isolate each goal's conversation. File tools give the Brain read-only
+/// access to target repositories via BrainRepoManager clones.
 /// </summary>
 public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 {
@@ -33,7 +34,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly string _stateDir;
     private IChatClient? _chatClient;
     private CodingAgent? _agent;
+    private AgentSession _masterSession;
     private AgentSession _session;
+    private string? _activeGoalId;
 
     private string _systemPrompt;
     private readonly List<AITool> _brainTools;
@@ -115,7 +118,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _agentsManager = agentsManager;
         _goalStore = goalStore;
         _stateDir = stateDir ?? "/app/state";
-        _session = AgentSession.Create("brain");
+        _masterSession = AgentSession.Create("brain");
+        _session = _masterSession;
 
         var (_, _, reasoning) = SDK.ChatClientFactory.ParseProviderModelAndReasoning(modelOverride);
         _reasoningEffort = reasoning;
@@ -138,22 +142,30 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         _chatClient = SDK.ChatClientFactory.Create(_modelOverride);
 
-        // Try to load a persisted session from a previous run
-        var sessionFile = GetSessionFilePath();
-        if (File.Exists(sessionFile))
+        // Try to load a persisted master session from a previous run.
+        // Migrate legacy brain-session.json to brain-master.json if needed.
+        var masterFile = GetMasterSessionFilePath();
+        var oldFile = Path.Combine(_stateDir, "brain-session.json");
+        if (File.Exists(oldFile) && !File.Exists(masterFile))
+        {
+            File.Move(oldFile, masterFile);
+            _logger.LogInformation("Migrated brain-session.json to brain-master.json");
+        }
+        if (File.Exists(masterFile))
         {
             try
             {
-                _session = await AgentSession.LoadAsync(sessionFile, ct);
-                _logger.LogInformation("Loaded Brain session with {Count} messages from {File}",
-                    _session.MessageHistory.Count, sessionFile);
+                _masterSession = await AgentSession.LoadAsync(masterFile, ct);
+                _logger.LogInformation("Loaded Brain master session with {Count} messages from {File}",
+                    _masterSession.MessageHistory.Count, masterFile);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Failed to load Brain session from {File} — starting fresh", sessionFile);
-                _session = AgentSession.Create("brain");
+                _logger.LogWarning(ex, "Failed to load Brain master session from {File} — starting fresh", masterFile);
+                _masterSession = AgentSession.Create("brain");
             }
         }
+        _session = _masterSession;
 
         RecreateAgent();
 
@@ -341,9 +353,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 var instructions = _agentsManager?.GetAgentsMd(WorkerRole.Orchestrator);
                 if (!string.IsNullOrWhiteSpace(instructions))
                 {
-                    _session.MessageHistory.Add(new ChatMessage(ChatRole.User,
+                    _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User,
                         $"ORCHESTRATOR INSTRUCTIONS (re-injected after context compaction):\n\n{instructions}"));
-                    _session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
+                    _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
                         "Acknowledged. Orchestrator instructions refreshed."));
                     _logger.LogInformation("Re-injected orchestrator instructions after compaction");
                 }
@@ -354,16 +366,96 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             workDir, _repoManager is not null);
     }
 
-    /// <summary>Returns the file path for persisting the Brain session.</summary>
-    private string GetSessionFilePath() => Path.Combine(_stateDir, "brain-session.json");
+    /// <summary>Returns the file path for a goal-specific forked session.</summary>
+    /// <param name="goalId">The goal identifier.</param>
+    private string GetGoalSessionFilePath(string goalId)
+        => Path.Combine(_stateDir, $"brain-goal-{goalId}.json");
 
-    /// <summary>Persists the current Brain session to disk.</summary>
+    /// <summary>Returns the file path for the master Brain session.</summary>
+    private string GetMasterSessionFilePath() => Path.Combine(_stateDir, "brain-master.json");
+
+    /// <summary>
+    /// Forks the master session to create an isolated goal session and persists it to disk.
+    /// </summary>
+    /// <param name="goalId">The goal identifier to fork for.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <inheritdoc />
+    public async Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default)
+    {
+        var goalSession = _masterSession.Fork($"brain-goal-{goalId}");
+        var goalSessionFile = GetGoalSessionFilePath(goalId);
+        await goalSession.SaveAsync(goalSessionFile, ct);
+        _logger.LogInformation("Forked master session for goal '{GoalId}' ({Messages} messages)",
+            goalId, goalSession.MessageHistory.Count);
+    }
+
+    /// <summary>
+    /// Loads the goal-specific session into <c>_session</c>, saving the current session first
+    /// if switching goals. Falls back to forking from master if no persisted goal session exists.
+    /// </summary>
+    /// <param name="goalId">The goal identifier whose session to load.</param>
+    /// <param name="ct">Cancellation token.</param>
+    private async Task LoadGoalSessionAsync(string goalId, CancellationToken ct)
+    {
+        // Idempotent: already loaded for this goal
+        if (_activeGoalId == goalId && _session != null)
+            return;
+
+        if (_activeGoalId != null && _activeGoalId != goalId)
+            await SaveCurrentSessionAsync(ct);
+
+        var goalSessionFile = GetGoalSessionFilePath(goalId);
+        if (File.Exists(goalSessionFile))
+            _session = await AgentSession.LoadAsync(goalSessionFile, ct);
+        else
+            _session = _masterSession.Fork($"brain-goal-{goalId}");
+
+        _activeGoalId = goalId;
+        RecreateAgent();
+    }
+
+    /// <summary>
+    /// Persists the currently active goal session to disk.
+    /// No-op if no goal is active.
+    /// </summary>
+    /// <param name="ct">Cancellation token.</param>
+    private async Task SaveCurrentSessionAsync(CancellationToken ct)
+    {
+        if (_activeGoalId == null) return;
+        var goalSessionFile = GetGoalSessionFilePath(_activeGoalId);
+        await _session.SaveAsync(goalSessionFile, ct);
+    }
+
+    /// <summary>
+    /// Deletes the persisted goal session file after goal completion or failure.
+    /// </summary>
+    /// <param name="goalId">The goal identifier whose session to delete.</param>
+    /// <inheritdoc />
+    public void DeleteGoalSession(string goalId)
+    {
+        var goalSessionFile = GetGoalSessionFilePath(goalId);
+        if (File.Exists(goalSessionFile))
+        {
+            File.Delete(goalSessionFile);
+            _logger.LogInformation("Deleted goal session for '{GoalId}'", goalId);
+        }
+        // Clear active state if this was the currently-loaded goal
+        if (_activeGoalId == goalId)
+        {
+            _activeGoalId = null;
+            _session = _masterSession;
+            RecreateAgent();
+            _logger.LogInformation("Cleared active goal session for '{GoalId}'", goalId);
+        }
+    }
+
+    /// <summary>Persists the master Brain session to disk.</summary>
     internal async Task SaveSessionAsync(CancellationToken ct = default)
     {
-        var path = GetSessionFilePath();
+        var path = GetMasterSessionFilePath();
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        await _session.SaveAsync(path, ct);
-        _logger.LogDebug("Brain session saved ({Count} messages)", _session.MessageHistory.Count);
+        await _masterSession.SaveAsync(path, ct);
+        _logger.LogDebug("Brain master session saved ({Count} messages)", _masterSession.MessageHistory.Count);
     }
 
     /// <inheritdoc/>
@@ -371,12 +463,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     {
         pipeline.Conversation.Add(new ConversationEntry("system", note, pipeline.Iteration, "plan-adjustment"));
 
-        // Also inject directly into the Brain's live session so the note is included
+        // Also inject directly into the Brain's master session so the note is included
         // when the Brain crafts the next prompt. Adding as a user message followed by
         // an assistant acknowledgement keeps the conversation in a valid turn sequence.
-        _session.MessageHistory.Add(new ChatMessage(ChatRole.User,
+        _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User,
             $"SYSTEM NOTE (plan adjustment for goal {pipeline.GoalId}):\n\n{note}"));
-        _session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
+        _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
             "Acknowledged. I have noted the plan adjustment and will craft prompts for all phases in the final plan."));
 
         _logger.LogInformation("Injected plan adjustment note for goal {GoalId}: {Note}", pipeline.GoalId, note);
@@ -388,9 +480,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     {
         if (string.IsNullOrWhiteSpace(instructions)) return;
 
-        _session.MessageHistory.Add(new ChatMessage(ChatRole.User,
+        _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User,
             $"ORCHESTRATOR INSTRUCTIONS UPDATE:\n\n{instructions}"));
-        _session.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
+        _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
             "Acknowledged. I will follow the updated orchestrator instructions for all future goals."));
 
         _logger.LogInformation("Injected orchestrator instructions into Brain session ({Chars} chars)",
@@ -474,7 +566,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             for (int attempt = 1; attempt <= maxToolAttempts; attempt++)
             {
                 var (response, toolCall) = await Shared.CopilotRetryPolicy.ExecuteAsync(
-                    () => ExecuteBrainAsync(currentPrompt, ct),
+                    () => ExecuteBrainAsync(currentPrompt, pipeline.GoalId, ct),
                     onRetry: (retryAttempt, delay, ex) =>
                     {
                         _logger.LogWarning(
@@ -662,7 +754,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             await Shared.CopilotRetryPolicy.ExecuteAsync(
                 async () =>
                 {
-                    var (response, _) = await ExecuteBrainAsync(prompt, ct);
+                    var (response, _) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct);
 
                     if (!string.IsNullOrWhiteSpace(response))
                         message = response.Trim();
@@ -854,7 +946,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     _logger.LogDebug("Brain craft-prompt request for {GoalId} (phase={Phase}):\n{Prompt}",
                         pipeline.GoalId, phase, Truncate(prompt, Constants.TruncationVerbose));
 
-                    var (response, toolCall) = await ExecuteBrainAsync(prompt, ct);
+                    var (response, toolCall) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct);
 
                     _logger.LogDebug("Brain craft-prompt response for {GoalId}:\n{Response}",
                         pipeline.GoalId, Truncate(response, Constants.TruncationVerbose));
@@ -938,7 +1030,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         try
         {
             var (response, toolCall) = await Shared.CopilotRetryPolicy.ExecuteAsync(
-                () => ExecuteBrainAsync(prompt, ct),
+                () => ExecuteBrainAsync(prompt, goalId, ct),
                 onRetry: (attempt, delay, ex) =>
                 {
                     _logger.LogWarning(
@@ -1018,7 +1110,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     private async Task<(string Text, BrainToolCallResult? ToolCall)> ExecuteBrainAsync(
-        string prompt, CancellationToken ct,
+        string prompt, string? goalId, CancellationToken ct,
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         EnsureConnected();
@@ -1027,6 +1119,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         try
         {
             _lastToolCallResult = null;
+
+            // Load the goal session for this call if a goalId is provided
+            if (!string.IsNullOrEmpty(goalId))
+                await LoadGoalSessionAsync(goalId, ct);
 
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromMinutes(Constants.TaskTimeoutMinutes));
@@ -1057,7 +1153,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 responseText.Length, _lastToolCallResult?.ToolName ?? "none");
 
             // Auto-save session after each Brain call
-            try { await SaveSessionAsync(ct); }
+            try { await SaveCurrentSessionAsync(ct); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to save Brain session"); }
 
             return (responseText, _lastToolCallResult);
@@ -1103,10 +1199,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 ? DefaultSystemPrompt
                 : $"{DefaultSystemPrompt}\n\n{freshInstructions}";
 
-            _session = AgentSession.Create("brain");
+            _masterSession = AgentSession.Create("brain");
+            _session = _masterSession;
+            _activeGoalId = null;
             RecreateAgent();
 
-            var sessionFile = GetSessionFilePath();
+            var sessionFile = GetMasterSessionFilePath();
             if (File.Exists(sessionFile))
                 File.Delete(sessionFile);
 

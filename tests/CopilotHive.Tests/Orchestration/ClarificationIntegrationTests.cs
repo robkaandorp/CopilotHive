@@ -918,6 +918,10 @@ public sealed class ClarificationIntegrationTests
 
         public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
 
+        public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public void DeleteGoalSession(string goalId) { }
+
         public BrainStats? GetStats() => null;
     }
 
