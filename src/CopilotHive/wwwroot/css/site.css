@@ -651,6 +651,7 @@ tr:last-child td { border-bottom: none; }
 
 .chat-actions {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 1rem;
     padding: 0.25rem 0;
@@ -672,6 +673,26 @@ tr:last-child td { border-bottom: none; }
 }
 
 .chat-action-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.chat-model-select {
+    background: transparent;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.35rem 0.6rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+
+.chat-model-select:hover:not(:disabled) {
+    color: var(--text);
+    border-color: var(--text-muted);
+}
+
+.chat-model-select:disabled {
     opacity: 0.4;
     cursor: not-allowed;
 }
