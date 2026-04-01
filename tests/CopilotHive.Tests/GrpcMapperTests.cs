@@ -487,4 +487,34 @@ public sealed class GrpcMapperTests
 
         Assert.Equal(issues, restored.Metrics!.Issues);
     }
+
+    [Fact]
+    public void TaskResult_WithMetricsSummary_RoundTripsThroughGrpcMapper()
+    {
+        // Arrange
+        var original = new TaskResult
+        {
+            TaskId = "task-1",
+            Status = TaskOutcome.Completed,
+            Output = "some output",
+            Metrics = new DomainTaskMetrics
+            {
+                Verdict = "PASS",
+                BuildSuccess = true,
+                TotalTests = 10,
+                PassedTests = 10,
+                FailedTests = 0,
+                CoveragePercent = 85.0,
+                Issues = [],
+                Summary = "Coder implemented feature X; all tests passed",
+            },
+        };
+
+        // Act
+        var grpc = GrpcMapper.ToGrpc(original);
+        var roundTripped = GrpcMapper.ToDomain(grpc);
+
+        // Assert
+        Assert.Equal(original.Metrics!.Summary, roundTripped.Metrics!.Summary);
+    }
 }

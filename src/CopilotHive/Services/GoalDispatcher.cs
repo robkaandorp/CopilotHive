@@ -602,11 +602,14 @@ public sealed class GoalDispatcher : BackgroundService
                 return;
             }
 
+            var prevContext = !string.IsNullOrWhiteSpace(result.Metrics?.Summary)
+                ? result.Metrics.Summary
+                : (result.Output.Length > 500 ? result.Output[..500] + "..." : result.Output);
             var noOpContext =
                 "CRITICAL: Your previous attempt produced ZERO file changes. " +
                 "You MUST edit files and commit them with `git add -A && git commit`. " +
                 "Do NOT just describe or discuss changes — actually make them.\n\n" +
-                $"Previous coder output (for context):\n{(result.Output.Length > 500 ? result.Output[..500] + "..." : result.Output)}";
+                $"Previous coder context:\n{prevContext}";
 
             var retryPrompt = _brain is not null
                 ? await ResolvePromptAsync(pipeline, GoalPhase.Coding, noOpContext, ct)
@@ -1559,16 +1562,17 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
             }
         }
 
-        // Include a truncated portion of the raw output for additional context
-        // (e.g. reviewer's detailed explanation, test failure stack traces)
-        var rawOutput = result.Output;
-        if (!string.IsNullOrWhiteSpace(rawOutput))
+        // Include summary from structured metrics when available; fall back to truncated raw output
+        var summary = result.Metrics?.Summary;
+        if (!string.IsNullOrWhiteSpace(summary))
+            parts.Add($"Worker summary:\n{summary}");
+        else if (!string.IsNullOrWhiteSpace(result.Output))
         {
             const int maxOutputChars = 1500;
-            var truncated = rawOutput.Length > maxOutputChars
-                ? rawOutput[..maxOutputChars] + "..."
-                : rawOutput;
-            parts.Add($"Worker output:\n{truncated}");
+            var truncated = result.Output.Length > maxOutputChars
+                ? result.Output[..maxOutputChars] + "..."
+                : result.Output;
+            parts.Add($"Worker output (no summary):\n{truncated}");
         }
 
         return string.Join("\n", parts);

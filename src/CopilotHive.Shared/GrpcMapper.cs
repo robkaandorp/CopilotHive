@@ -82,6 +82,7 @@ public static class GrpcMapper
             FailedTests = metrics.FailedTests,
             CoveragePercent = metrics.CoveragePercent,
             Issues = [.. metrics.Issues],
+            Summary = metrics.Summary,
         };
     }
 
@@ -177,6 +178,7 @@ public static class GrpcMapper
                 PassedTests = result.Metrics.PassedTests,
                 FailedTests = result.Metrics.FailedTests,
                 CoveragePercent = result.Metrics.CoveragePercent,
+                Summary = result.Metrics.Summary,
             };
             complete.Metrics.Issues.AddRange(result.Metrics.Issues);
         }

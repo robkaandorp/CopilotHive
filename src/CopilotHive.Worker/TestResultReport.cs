@@ -22,4 +22,7 @@ public sealed record TestResultReport
     public bool BuildSuccess { get; init; }
     /// <summary>Issues found during testing.</summary>
     public List<string> Issues { get; init; } = [];
+
+    /// <summary>Human-readable summary of test results, issues found, and any relevant context.</summary>
+    public string Summary { get; init; } = "";
 }

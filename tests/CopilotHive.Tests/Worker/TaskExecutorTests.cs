@@ -68,8 +68,21 @@ public sealed class TaskExecutorTests
     /// </summary>
     private sealed class MockAgentRunner : IAgentRunner
     {
-        public TestResultReport? LastTestReport { get; private set; }
+        /// <summary>
+        /// The WorkerReport to inject into <see cref="LastWorkerReport"/> when <see cref="SendPromptAsync"/> is called.
+        /// Set this before calling the code under test.
+        /// </summary>
+        public WorkerReport? WorkerReportToReturn { get; set; }
+
+        /// <summary>
+        /// The TestResultReport to inject into <see cref="LastTestReport"/> when <see cref="SendPromptAsync"/> is called.
+        /// Set this before calling the code under test.
+        /// </summary>
+        public TestResultReport? TestReportToReturn { get; set; }
+
+        // Internally tracked; set to null when Clear is called, set to ToReturn when SendPrompt is called.
         public WorkerReport? LastWorkerReport { get; private set; }
+        public TestResultReport? LastTestReport { get; private set; }
 
         private object? _session;
 
@@ -84,7 +97,13 @@ public sealed class TaskExecutorTests
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ResetSessionAsync(string? model = null, CancellationToken ct = default) => Task.CompletedTask;
         public Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
-            => Task.FromResult("Mock agent response");
+        {
+            // After TaskExecutor clears reports (ClearWorkerReport/ClearTestReport), inject the
+            // mock reports here so they are visible to the code that reads LastWorkerReport/LastTestReport.
+            LastWorkerReport = WorkerReportToReturn;
+            LastTestReport = TestReportToReturn;
+            return Task.FromResult("Mock agent response");
+        }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
@@ -349,5 +368,151 @@ public sealed class TaskExecutorTests
         Assert.Equal(2, result.Metrics!.Issues.Count);
         Assert.Contains("Push failed for repo1", result.Metrics.Issues[0]);
         Assert.Contains("Push failed for repo2", result.Metrics.Issues[1]);
+    }
+
+    // ── Summary population ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Verifies that <see cref="TaskMetrics.Summary"/> is populated from
+    /// <see cref="WorkerReport.Summary"/> when a WorkerReport is available.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_WithWorkerReport_PopulatesSummaryFromWorkerReport()
+    {
+        // Arrange
+        var git = new MockGitOperations { FilesChanged = 0 };
+        var agentRunner = new MockAgentRunner(); // Start with no reports
+        agentRunner.WorkerReportToReturn = new WorkerReport // Set AFTER construction so it survives ClearWorkerReport()
+        {
+            TaskVerdict = TaskVerdict.Pass,
+            Summary = "Added feature X to module Y",
+            Issues = [],
+        };
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        var task = new WorkTask
+        {
+            TaskId = "test-summary-worker",
+            GoalId = "goal-summary",
+            GoalDescription = "Test goal",
+            Prompt = "Test prompt",
+            Role = WorkerRole.Coder,
+            Repositories = [new TargetRepository { Name = "test-repo", Url = "https://github.com/test/test.git", DefaultBranch = "main" }],
+        };
+
+        // Act
+        var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.Equal("Added feature X to module Y", result.Metrics!.Summary);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="TaskMetrics.Summary"/> is populated from
+    /// <see cref="TestResultReport.Summary"/> when a TestResultReport is available
+    /// but no WorkerReport is present.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_WithTestResultReport_PopulatesSummaryFromTestReport()
+    {
+        // Arrange
+        var git = new MockGitOperations { FilesChanged = 0 };
+        var agentRunner = new MockAgentRunner(); // Start with no reports
+        agentRunner.TestReportToReturn = new TestResultReport // Set AFTER construction so it survives ClearTestReport()
+        {
+            Verdict = TaskVerdict.Pass,
+            TotalTests = 10,
+            PassedTests = 10,
+            FailedTests = 0,
+            Summary = "All 10 tests passed, build succeeded",
+        };
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        var task = new WorkTask
+        {
+            TaskId = "test-summary-test",
+            GoalId = "goal-test-summary",
+            GoalDescription = "Test goal",
+            Prompt = "Test prompt",
+            Role = WorkerRole.Tester,
+            Repositories = [new TargetRepository { Name = "test-repo", Url = "https://github.com/test/test.git", DefaultBranch = "main" }],
+        };
+
+        // Act
+        var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.Equal("All 10 tests passed, build succeeded", result.Metrics!.Summary);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="WorkerReport.Summary"/> takes priority over
+    /// <see cref="TestResultReport.Summary"/> when both are available.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_WithBothReports_WorkerReportTakesPriority()
+    {
+        // Arrange
+        var git = new MockGitOperations { FilesChanged = 0 };
+        var agentRunner = new MockAgentRunner(); // Start with no reports
+        agentRunner.WorkerReportToReturn = new WorkerReport // Set AFTER construction
+        {
+            TaskVerdict = TaskVerdict.Pass,
+            Summary = "Coder summary — implemented feature X",
+        };
+        agentRunner.TestReportToReturn = new TestResultReport // Set AFTER construction
+        {
+            Verdict = TaskVerdict.Pass,
+            TotalTests = 5,
+            PassedTests = 5,
+            FailedTests = 0,
+            Summary = "Tester summary — tests passed",
+        };
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        var task = new WorkTask
+        {
+            TaskId = "test-summary-both",
+            GoalId = "goal-both-summary",
+            GoalDescription = "Test goal",
+            Prompt = "Test prompt",
+            Role = WorkerRole.Coder,
+            Repositories = [new TargetRepository { Name = "test-repo", Url = "https://github.com/test/test.git", DefaultBranch = "main" }],
+        };
+
+        // Act
+        var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.Equal("Coder summary — implemented feature X", result.Metrics!.Summary);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="TaskMetrics.Summary"/> defaults to empty string
+    /// when neither report provides a summary.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_WithNoReports_SummaryIsEmpty()
+    {
+        // Arrange
+        var git = new MockGitOperations { FilesChanged = 0 };
+        var agentRunner = new MockAgentRunner(); // No reports set
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        var task = new WorkTask
+        {
+            TaskId = "test-summary-none",
+            GoalId = "goal-no-summary",
+            GoalDescription = "Test goal",
+            Prompt = "Test prompt",
+            Role = WorkerRole.Coder,
+            Repositories = [new TargetRepository { Name = "test-repo", Url = "https://github.com/test/test.git", DefaultBranch = "main" }],
+        };
+
+        // Act
+        var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.Equal("", result.Metrics!.Summary);
     }
 }

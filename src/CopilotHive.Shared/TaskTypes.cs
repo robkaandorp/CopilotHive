@@ -87,6 +87,8 @@ public sealed record TaskMetrics
     public double CoveragePercent { get; init; }
     /// <summary>List of issue descriptions.</summary>
     public List<string> Issues { get; init; } = [];
+    /// <summary>Human-readable summary from the worker's report tool call.</summary>
+    public string Summary { get; init; } = "";
 }
 
 /// <summary>

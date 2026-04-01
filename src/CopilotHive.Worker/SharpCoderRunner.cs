@@ -113,7 +113,11 @@ public sealed class SharpCoderRunner : IAgentRunner
                 After edits, builds, tests, and commits, you MUST call the `report_code_changes` tool with:
                 - `verdict`: "PASS" if you successfully implemented and committed, "FAIL" if you could not
                 - `filesModified`: array of files you changed (e.g. ["src/module.ext", "tests/moduleTests.ext"])
-                - `summary`: brief description of what you changed and why
+                - `summary`: put EVERYTHING relevant here — what you implemented, files changed and why,
+                  decisions made, build/test status, any issues encountered. This is the sole output the
+                  system reads; your text response is ignored.
+
+                After calling the tool, respond with a single word only: `done` (or `fail` if verdict is FAIL).
                 """,
 
             WorkerRole.Tester => $"""
@@ -134,8 +138,12 @@ public sealed class SharpCoderRunner : IAgentRunner
                 - `coveragePercent`: coverage percentage, or -1 if not measured
                 - `buildSuccess`: true if the build succeeded
                 - `issues`: array of issue descriptions (empty if none)
+                - `summary`: put EVERYTHING relevant here — test counts, any failures with names and error
+                  messages, build status, coverage, observations. This is the sole output the system reads;
+                  your text response is ignored.
 
                 NEVER report PASS if any test is failing.
+                After calling the tool, respond with a single word only: `pass` or `fail`.
                 """,
 
             WorkerRole.Reviewer => $"""
@@ -153,13 +161,16 @@ public sealed class SharpCoderRunner : IAgentRunner
                 After reviewing, you MUST call the `report_review_verdict` tool with:
                 - `verdict`: "APPROVE" or "REQUEST_CHANGES"
                 - `issues`: array of issue descriptions (prefix each with [CRITICAL], [MAJOR], or [MINOR])
-                - `summary`: one-paragraph overview of your findings
+                - `summary`: put EVERYTHING relevant here — your overall verdict with reasoning, each issue
+                  with severity/location/description, and what was done well. This is the sole output the
+                  system reads; your text response is ignored.
 
                 - **APPROVE**: Code correct, ready for testing. Zero critical issues.
                 - **REQUEST_CHANGES**: Critical or major issues must be fixed first.
                 - **CRITICAL**: Bugs, security, data loss, missing files. Must fix.
                 - **MAJOR**: Missing error handling, missing tests, API violations. Should fix.
                 - **MINOR**: Naming, refactoring suggestions, doc gaps. Nice-to-have.
+                After calling the tool, respond with a single word only: `approved` or `changes`.
                 """,
 
             WorkerRole.DocWriter => $"""
@@ -177,7 +188,11 @@ public sealed class SharpCoderRunner : IAgentRunner
                 After your work, you MUST call the `report_doc_changes` tool with:
                 - `verdict`: "PASS" if you successfully updated documentation, "FAIL" if you could not
                 - `filesUpdated`: array of files you changed (e.g. ["CHANGELOG.md", "README.md"])
-                - `summary`: brief description of what you documented
+                - `summary`: put EVERYTHING relevant here — which files were updated and what changed in
+                  each, changelog entries added, decisions about scope. This is the sole output the system
+                  reads; your text response is ignored.
+
+                After calling the tool, respond with a single word only: `done` (or `fail` if verdict is FAIL).
                 """,
 
             WorkerRole.Improver => $"""
@@ -500,7 +515,8 @@ public sealed class SharpCoderRunner : IAgentRunner
          [Description("Number of tests that failed")] int failedTests,
          [Description("Code coverage percentage (0-100), or -1 if not available")] double coveragePercent,
          [Description("Build succeeded (true/false)")] bool buildSuccess,
-         [Description("List of issues found, empty if none")] string[] issues) =>
+         [Description("List of issues found, empty if none")] string[] issues,
+         [Description("Summary of test results, issues found, and any relevant context")] string summary) =>
         {
             var parsed = TaskVerdictExtensions.ParseTaskVerdict(verdict);
             var error = ToolValidation.Check(
@@ -525,6 +541,7 @@ public sealed class SharpCoderRunner : IAgentRunner
                 CoveragePercent = coveragePercent >= 0 ? coveragePercent : null,
                 BuildSuccess = buildSuccess,
                 Issues = issues.ToList(),
+                Summary = summary,
             };
             return "Test results recorded.";
         },

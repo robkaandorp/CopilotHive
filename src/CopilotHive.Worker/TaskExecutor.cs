@@ -298,6 +298,7 @@ public sealed class TaskExecutor(
                     FailedTests = testReport.FailedTests,
                     CoveragePercent = testReport.CoveragePercent ?? 0,
                     Issues = [.. testReport.Issues],
+                    Summary = workerReport?.Summary ?? testReport.Summary,
                 };
             }
             else if (workerReport is not null)
@@ -309,6 +310,7 @@ public sealed class TaskExecutor(
                 {
                     Verdict = verdictStr,
                     Issues = [.. workerReport.Issues],
+                    Summary = workerReport.Summary,
                 };
             }
             else
