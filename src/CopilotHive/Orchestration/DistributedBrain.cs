@@ -435,6 +435,14 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             File.Delete(goalSessionFile);
             _logger.LogInformation("Deleted goal session for '{GoalId}'", goalId);
         }
+        // Clear active state if this was the currently-loaded goal
+        if (_activeGoalId == goalId)
+        {
+            _activeGoalId = null;
+            _session = _masterSession;
+            RecreateAgent();
+            _logger.LogInformation("Cleared active goal session for '{GoalId}'", goalId);
+        }
     }
 
     /// <summary>Persists the master Brain session to disk.</summary>
@@ -551,10 +559,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             const int maxToolAttempts = 3;
             string currentPrompt = prompt;
 
+            await LoadGoalSessionAsync(pipeline.GoalId, ct);
+
             for (int attempt = 1; attempt <= maxToolAttempts; attempt++)
             {
                 var (response, toolCall) = await Shared.CopilotRetryPolicy.ExecuteAsync(
-                    () => ExecuteBrainAsync(currentPrompt, ct),
+                    () => ExecuteBrainAsync(currentPrompt, pipeline.GoalId, ct),
                     onRetry: (retryAttempt, delay, ex) =>
                     {
                         _logger.LogWarning(
@@ -739,10 +749,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             string? message = null;
 
+            await LoadGoalSessionAsync(pipeline.GoalId, ct);
+
             await Shared.CopilotRetryPolicy.ExecuteAsync(
                 async () =>
                 {
-                    var (response, _) = await ExecuteBrainAsync(prompt, ct);
+                    var (response, _) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct);
 
                     if (!string.IsNullOrWhiteSpace(response))
                         message = response.Trim();
@@ -757,6 +769,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                         pipeline.GoalId, attempt, Shared.CopilotRetryPolicy.MaxRetries + 1, ex.Message, delay.TotalSeconds);
                 },
                 ct);
+
+            await SaveCurrentSessionAsync(ct);
 
             _logger.LogDebug("Brain generated commit message for goal {GoalId}: {Message}",
                 pipeline.GoalId, message);
@@ -928,13 +942,15 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         try
         {
+            await LoadGoalSessionAsync(pipeline.GoalId, ct);
+
             var craftedPrompt = await Shared.CopilotRetryPolicy.ExecuteAsync(
                 async () =>
                 {
                     _logger.LogDebug("Brain craft-prompt request for {GoalId} (phase={Phase}):\n{Prompt}",
                         pipeline.GoalId, phase, Truncate(prompt, Constants.TruncationVerbose));
 
-                    var (response, toolCall) = await ExecuteBrainAsync(prompt, ct);
+                    var (response, toolCall) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct);
 
                     _logger.LogDebug("Brain craft-prompt response for {GoalId}:\n{Response}",
                         pipeline.GoalId, Truncate(response, Constants.TruncationVerbose));
@@ -1017,8 +1033,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         try
         {
+            await LoadGoalSessionAsync(goalId, ct);
+
             var (response, toolCall) = await Shared.CopilotRetryPolicy.ExecuteAsync(
-                () => ExecuteBrainAsync(prompt, ct),
+                () => ExecuteBrainAsync(prompt, goalId, ct),
                 onRetry: (attempt, delay, ex) =>
                 {
                     _logger.LogWarning(
@@ -1098,7 +1116,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     private async Task<(string Text, BrainToolCallResult? ToolCall)> ExecuteBrainAsync(
-        string prompt, CancellationToken ct,
+        string prompt, string? goalId, CancellationToken ct,
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         EnsureConnected();
@@ -1108,8 +1126,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             _lastToolCallResult = null;
 
-            if (_activeGoalId != null)
-                await LoadGoalSessionAsync(_activeGoalId, ct);
+            // Load the goal session for this call if a goalId is provided
+            if (!string.IsNullOrEmpty(goalId))
+                await LoadGoalSessionAsync(goalId, ct);
 
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromMinutes(Constants.TaskTimeoutMinutes));
@@ -1140,10 +1159,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 responseText.Length, _lastToolCallResult?.ToolName ?? "none");
 
             // Auto-save session after each Brain call
-            try { await SaveSessionAsync(ct); }
+            try { await SaveCurrentSessionAsync(ct); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to save Brain session"); }
-
-            await SaveCurrentSessionAsync(ct);
 
             return (responseText, _lastToolCallResult);
         }
