@@ -5,6 +5,8 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.AI;
+using Moq;
 using System.Net;
 using System.Text.Json;
 
@@ -145,7 +147,8 @@ public sealed class ComposerMultiModelTests : IDisposable
             NullLogger<Composer>.Instance,
             _store,
             stateDir: Path.GetTempPath(),
-            availableModels: ["claude-sonnet-4", "gpt-4", "claude-opus"]);
+            availableModels: ["claude-sonnet-4", "gpt-4", "claude-opus"],
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
     }
 
     public void Dispose()
@@ -173,7 +176,8 @@ public sealed class ComposerMultiModelTests : IDisposable
             "default-model",
             NullLogger<Composer>.Instance,
             _store,
-            stateDir: Path.GetTempPath());
+            stateDir: Path.GetTempPath(),
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
 
         var models = composer.AvailableModels;
 
@@ -250,11 +254,13 @@ public sealed class ComposerHubTests : IAsyncLifetime
             NullLogger<Composer>.Instance,
             _store,
             stateDir: Path.GetTempPath(),
-            availableModels: ["claude-sonnet-4", "gpt-4", "claude-opus"]);
+            availableModels: ["claude-sonnet-4", "gpt-4", "claude-opus"],
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
     }
 
     public async ValueTask InitializeAsync()
     {
+        Environment.SetEnvironmentVariable("ASPNETCORE_URLS", "http://127.0.0.1:0");
         var builder = WebApplication.CreateBuilder();
         builder.Services.AddSingleton<Composer>(_composer);
         _app = builder.Build();
