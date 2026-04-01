@@ -1677,6 +1677,70 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
+    public async Task DeleteGoalSession_ClearsActiveGoalAndResetsSession()
+    {
+        // Arrange
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            // Get fields via reflection
+            var masterSessionField = typeof(DistributedBrain)
+                .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var sessionField = typeof(DistributedBrain)
+                .GetField("_session", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var activeGoalIdField = typeof(DistributedBrain)
+                .GetField("_activeGoalId", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+
+            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+
+            // Add a unique marker to master session
+            masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User, "MASTER_SESSION_MARKER"));
+
+            // Fork and load goal session
+            await brain.ForkSessionForGoalAsync("active-goal-test", TestContext.Current.CancellationToken);
+
+            // Load goal session via reflection (simulating what ExecuteBrainAsync would do)
+            var loadSessionMethod = typeof(DistributedBrain)
+                .GetMethod("LoadGoalSessionAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            await (Task)loadSessionMethod.Invoke(brain, ["active-goal-test", TestContext.Current.CancellationToken])!;
+
+            // Verify session is now the goal session (different from master)
+            var currentSession = (AgentSession)sessionField.GetValue(brain)!;
+            var activeGoalId = (string?)activeGoalIdField.GetValue(brain)!;
+            Assert.Equal("active-goal-test", activeGoalId);
+            Assert.NotSame(masterSession, currentSession);
+
+            // Verify file exists
+            var sessionFile = Path.Combine(tempDir, "brain-goal-active-goal-test.json");
+            Assert.True(File.Exists(sessionFile), "Session file should exist");
+
+            // Act: delete the active goal session
+            brain.DeleteGoalSession("active-goal-test");
+
+            // Assert: file deleted
+            Assert.False(File.Exists(sessionFile), "Session file should not exist after deletion");
+
+            // Assert: activeGoalId cleared
+            activeGoalId = (string?)activeGoalIdField.GetValue(brain)!;
+            Assert.Null(activeGoalId);
+
+            // Assert: _session reset to _masterSession
+            currentSession = (AgentSession)sessionField.GetValue(brain)!;
+            Assert.Same(masterSession, currentSession);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task Migration_BrainSessionToBrainMaster()
     {
         // Arrange
