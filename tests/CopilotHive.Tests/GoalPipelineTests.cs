@@ -281,8 +281,9 @@ public sealed class GoalPipelineTests
 
         var summary = pipeline.BuildContextSummary();
 
-        Assert.Contains("--- Output from coder-1 ---", summary);
+        Assert.Contains("=== Output from coder-1 ===", summary);
         Assert.Contains("hello world", summary);
+        Assert.Contains("=== End output from coder-1 ===", summary);
     }
 
     [Fact]

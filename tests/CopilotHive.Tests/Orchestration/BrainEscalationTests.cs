@@ -28,7 +28,7 @@ public sealed class BrainEscalationTests
         // Arrange
         const string EscalationQuestion = "Should the plan include the review phase?";
         const string ComposerAnswer = "Yes, always include review.";
-        const string ExpectedRetryContext = $"Clarification answer: {ComposerAnswer}";
+        const string ExpectedRetryContext = $"=== Clarification answer ===\n{ComposerAnswer}\n=== End clarification answer ===";
 
         // Brain: first call escalates, second call succeeds
         var planBrain = new EscalatingPlanBrain(EscalationQuestion, "Cannot determine from codebase");
@@ -42,8 +42,10 @@ public sealed class BrainEscalationTests
         // Assert — second call should have received clarification context and returned a non-default plan marker
         Assert.NotNull(plan);
         Assert.False(plan.Phases.Count == 0);
-        // The retry context should have been passed through
+        // The retry context should have been passed through (fenced format)
         Assert.Contains(ComposerAnswer, planBrain.LastAdditionalContext ?? string.Empty);
+        Assert.Contains("=== Clarification answer ===", planBrain.LastAdditionalContext ?? string.Empty);
+        Assert.Contains("=== End clarification answer ===", planBrain.LastAdditionalContext ?? string.Empty);
     }
 
     /// <summary>
@@ -98,8 +100,10 @@ public sealed class BrainEscalationTests
         // Assert — should contain the clarification answer context
         Assert.NotNull(prompt);
         Assert.NotEmpty(prompt);
-        // The retry was called with clarification answer as additional context
+        // The retry was called with clarification answer as additional context (fenced format)
         Assert.Contains(ComposerAnswer, promptBrain.LastAdditionalContext ?? string.Empty);
+        Assert.Contains("=== Clarification answer ===", promptBrain.LastAdditionalContext ?? string.Empty);
+        Assert.Contains("=== End clarification answer ===", promptBrain.LastAdditionalContext ?? string.Empty);
     }
 
     /// <summary>

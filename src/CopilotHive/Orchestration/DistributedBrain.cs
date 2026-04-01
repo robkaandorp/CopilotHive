@@ -426,7 +426,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             : "";
 
         var prompt = $$"""
-            {{(additionalContext is not null ? $"{additionalContext}\n\n" : "")}}Plan the workflow for iteration {{pipeline.Iteration}} of goal: {{pipeline.Description}}
+            {{(additionalContext is not null ? $"=== Additional context ===\n{additionalContext}\n=== End additional context ===\n\n" : "")}}Plan the workflow for iteration {{pipeline.Iteration}} of goal: {{pipeline.Description}}
 
             Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
             (You can browse the code under these folder names in your working directory)
@@ -770,7 +770,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
             {{phaseInstructions}}
             {{(previousFeedback.Length > 0 ? $"\n{previousFeedback}" : "")}}
-            {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
+            {{(additionalContext is not null ? $"\n=== Additional context ===\n{additionalContext}\n=== End additional context ===" : "")}}
             {{(currentTestResults.Length > 0 ? $"\n=== Tester output (iteration {pipeline.Iteration}) ===\n{currentTestResults}\n=== End tester output ===" : "")}}
             {{(currentCoderOutput.Length > 0 ? $"\n=== Coder output (iteration {pipeline.Iteration}) ===\n{currentCoderOutput}\n=== End coder output ===" : "")}}
             {{docWritingNote}}
@@ -822,7 +822,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             - The goal description defines WHAT to do. New behavior described in the goal is IN SCOPE — do not reject changes just because the base branch doesn't have them yet.
             - Only flag issues that are clearly bugs, security problems, or genuine scope violations (touching unrelated code/features).
             - Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
-            {{(additionalContext is not null ? $"\nAdditional context:\n{additionalContext}" : "")}}
+            {{(additionalContext is not null ? $"\n=== Additional context ===\n{additionalContext}\n=== End additional context ===" : "")}}
             {{(currentTestResults.Length > 0 ? $"\n=== Tester output (iteration {pipeline.Iteration}) ===\n{currentTestResults}\n=== End tester output ===" : "")}}
             {{(currentCoderOutput.Length > 0 ? $"\n=== Coder output (iteration {pipeline.Iteration}) ===\n{currentCoderOutput}\n=== End coder output ===" : "")}}
             """;
@@ -1139,7 +1139,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         var prevIteration = pipeline.Iteration - 1;
         var sb = new StringBuilder();
-        sb.AppendLine($"Previous iteration ({prevIteration}) feedback:");
+        sb.AppendLine($"=== Previous iteration ({prevIteration}) feedback ===");
 
         var hasAnyFeedback = false;
 
@@ -1149,8 +1149,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             && !string.IsNullOrWhiteSpace(reviewerOutput))
         {
             hasAnyFeedback = true;
-            sb.AppendLine("  REVIEWER feedback (this is why the iteration was rejected):");
-            sb.AppendLine($"  {Truncate(reviewerOutput, Constants.TruncationConversationSummary)}");
+            sb.AppendLine($"=== Reviewer feedback (iteration {prevIteration}) ===");
+            sb.AppendLine(Truncate(reviewerOutput, Constants.TruncationConversationSummary));
+            sb.AppendLine("=== End reviewer feedback ===");
         }
 
         // Include tester feedback if tests failed
@@ -1159,8 +1160,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             && !string.IsNullOrWhiteSpace(testerOutput))
         {
             hasAnyFeedback = true;
-            sb.AppendLine("  TESTER feedback:");
-            sb.AppendLine($"  {Truncate(testerOutput, Constants.TruncationConversationSummary)}");
+            sb.AppendLine($"=== Tester feedback (iteration {prevIteration}) ===");
+            sb.AppendLine(Truncate(testerOutput, Constants.TruncationConversationSummary));
+            sb.AppendLine("=== End tester feedback ===");
         }
 
         // Include coder output for context on what was attempted
@@ -1169,8 +1171,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             && !string.IsNullOrWhiteSpace(coderOutput))
         {
             hasAnyFeedback = true;
-            sb.AppendLine("  CODER output (what was attempted):");
-            sb.AppendLine($"  {Truncate(coderOutput, Constants.TruncationMedium)}");
+            sb.AppendLine($"=== Coder output (iteration {prevIteration}) ===");
+            sb.AppendLine(Truncate(coderOutput, Constants.TruncationMedium));
+            sb.AppendLine("=== End coder output ===");
         }
 
         if (!hasAnyFeedback)
@@ -1178,6 +1181,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             sb.AppendLine("  (No phase outputs recorded for the previous iteration)");
         }
 
+        sb.AppendLine("=== End previous iteration feedback ===");
         return sb.ToString();
     }
 
