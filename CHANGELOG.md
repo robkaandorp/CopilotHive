@@ -6,9 +6,13 @@
 
 **Hardcoded worker system prompts.** Mandatory safety rules (git push prohibition, role identity, tool call contracts, scope boundaries, clarification instructions) are now hardcoded in `SharpCoderRunner.BuildRoleSystemPrompt()` per worker role. AGENTS.md files are appended as supplementary "Learned Heuristics" after a separator. This prevents the improver from accidentally weakening or removing safety-critical instructions.
 
-**Docs-only iteration plans.** `ValidatePlan` no longer forces a Coding phase when the Brain plans a docs-only iteration (e.g. `[DocWriting, Review, Merging]`). Previously, every iteration required a coder, which wasted time on documentation-only goals.
+**Docs-only iteration plans.** The Brain can plan documentation-only iterations (e.g. `[DocWriting, Review, Merging]`) that execute without a Coding phase. `ValidatePlan` accepts DocWriting as a valid alternative to Coding, `PipelineStateMachine` accepts DocWriting as a valid first phase, and `GoalDispatcher` dispatches the plan's actual first phase instead of hardcoding Coder. Previously, every iteration forced a coder, which wasted time on documentation-only goals.
 
 **Reviewer iteration context.** The reviewer now receives the current iteration's test results in its prompt, giving it visibility into test outcomes before producing a verdict. The reviewer also receives an iteration-scoped diff command (`git diff {iterationStartSha}..HEAD`) so it reviews only the current iteration's changes rather than the cumulative branch diff.
+
+**Mandatory code review for code changes.** `ValidatePlan` now enforces that all iteration plans containing a Coding phase include both Testing and Review. Previously, the Brain could skip Review as long as Testing was present, which allowed cross-cutting bugs to slip through unreviewed. Docs-only plans (DocWriting without Coding) still only require at least one of Testing or Review.
+
+**Plan validation feedback to Brain.** When `ValidatePlan` modifies the Brain's proposed iteration plan (e.g. inserting a Review phase), a system note is injected into the Brain's conversation describing the adjustment — original plan, final plan, added phases, and reason. This ensures the Brain knows which phases will actually execute and can craft tailored prompts for all of them, including phases it didn't originally plan.
 
 **Composer config repo access.** The Composer gained five new tools for managing the config repository: `list_config_files`, `read_config_file`, `update_agents_md`, `edit_agents_md`, and `commit_config_changes`. This allows the Composer to inspect and update AGENTS.md files directly.
 
@@ -33,6 +37,8 @@
 **Release filter dropdown deduplication.** The release filter dropdown on the Goals page now deduplicates entries by tag, so selecting a tag like `v0.5.0` shows goals from all releases sharing that tag rather than creating duplicate dropdown entries.
 
 **Config repo git safety.** Fixed race conditions in `ConfigRepoManager` git operations that could cause data loss when concurrent operations accessed the config repository.
+
+**Docs-only iteration dispatch.** Fixed three issues preventing docs-only iteration plans from executing correctly: (1) `ValidatePlan` unconditionally inserted a Coding phase — now accepts plans with DocWriting as a valid alternative. (2) `PipelineStateMachine.StartIteration` rejected plans not starting with Coding — now accepts DocWriting as a valid first phase. (3) `DispatchNextGoalAsync` hardcoded Coder dispatch regardless of the plan — now reads the first phase from the plan and dispatches the corresponding role (DocWriter for docs-only, Coder for code changes).
 
 **Version prefix double-beta.** Fixed CopilotHive version infrastructure that produced double-beta Docker image tags (e.g. `0.6.0-beta-beta.42`).
 
