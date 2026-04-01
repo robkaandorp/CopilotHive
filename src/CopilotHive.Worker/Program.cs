@@ -34,18 +34,34 @@ var service = new WorkerService(
     workerId: workerId,
     capabilities: capabilities);
 
-try
-{
-    await service.RunAsync(cts.Token);
-}
-catch (OperationCanceledException)
-{
-    Console.WriteLine("[Worker] Shutting down gracefully.");
-}
-catch (Exception ex)
-{
-    Console.Error.WriteLine($"[Worker] Fatal error: {ex}");
-    return 1;
-}
+var delay = TimeSpan.FromSeconds(5);
+var maxDelay = TimeSpan.FromSeconds(60);
 
+while (!cts.IsCancellationRequested)
+{
+    try
+    {
+        await service.RunAsync(cts.Token);
+        break; // clean exit
+    }
+    catch (OperationCanceledException)
+    {
+        Console.WriteLine("[Worker] Shutting down gracefully.");
+        break;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[Worker] Connection failed: {ex.Message}. Retrying in {delay.TotalSeconds}s...");
+        try
+        {
+            await Task.Delay(delay, cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("[Worker] Shutting down gracefully.");
+            break;
+        }
+        delay = delay * 2 > maxDelay ? maxDelay : delay * 2;
+    }
+}
 return 0;
