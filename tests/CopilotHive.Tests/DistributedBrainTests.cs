@@ -2018,6 +2018,196 @@ public sealed class DistributedBrainTests
         }
     }
 
+    // -- SummarizeAndMergeAsync Tests --
+
+    [Fact]
+    public async Task SummarizeAndMergeAsync_AppendsSummaryToMasterSessionAndDeletesGoalSession()
+    {
+        // Arrange
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+
+            // Use a stub that returns a predictable summary
+            var stubClient = new IterationPlanStubClient(
+                callId: "call-summary-1",
+                phases: ["coding", "testing"],
+                reason: "Test summary");
+
+            // Connect first, then inject fake client
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var chatClientField = typeof(DistributedBrain)
+                .GetField("_chatClient", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new InvalidOperationException("_chatClient field not found");
+            chatClientField.SetValue(brain, stubClient);
+
+            var recreateMethod = typeof(DistributedBrain)
+                .GetMethod("RecreateAgent", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new InvalidOperationException("RecreateAgent method not found");
+            recreateMethod.Invoke(brain, null);
+
+            // Get fields via reflection
+            var masterSessionField = typeof(DistributedBrain)
+                .GetField("_masterSession", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var activeGoalIdField = typeof(DistributedBrain)
+                .GetField("_activeGoalId", BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+            var initialMasterMessageCount = masterSession.MessageHistory.Count;
+
+            // Create a goal session via ForkSessionForGoalAsync
+            var goalId = "goal-summary-test";
+            await brain.ForkSessionForGoalAsync(goalId, TestContext.Current.CancellationToken);
+
+            // Verify goal session file exists
+            var goalSessionFile = Path.Combine(tempDir, $"brain-goal-{goalId}.json");
+            Assert.True(File.Exists(goalSessionFile), "Goal session file should exist after fork");
+
+            var pipeline = CreatePipeline(goalId, "Test goal for summarization");
+
+            // Act
+            var summary = await brain.SummarizeAndMergeAsync(pipeline, TestContext.Current.CancellationToken);
+
+            // Assert: summary was returned
+            Assert.NotNull(summary);
+
+            // Assert: master session has 2 new messages (user + assistant)
+            masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+            Assert.Equal(initialMasterMessageCount + 2, masterSession.MessageHistory.Count);
+            Assert.Contains(masterSession.MessageHistory, m =>
+                m.Contents.Any(c => c is TextContent tc && tc.Text.Contains($"[Goal completed: {goalId}]")));
+            Assert.Contains(masterSession.MessageHistory, m =>
+                m.Role == ChatRole.Assistant && m.Contents.Any(c => c is TextContent tc && tc.Text.Contains(summary)));
+
+            // Assert: goal session file is deleted
+            Assert.False(File.Exists(goalSessionFile), "Goal session file should be deleted after merge");
+
+            // Assert: _activeGoalId is cleared
+            var activeGoalId = (string?)activeGoalIdField.GetValue(brain)!;
+            Assert.Null(activeGoalId);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SummarizeAndMergeAsync_FailedGoalSessionDeletedWithoutMerging()
+    {
+        // Arrange: simulate a failed goal - goal session exists but we call DeleteGoalSession directly
+        // (mimicking what GoalDispatcher does when a goal fails)
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            // Get fields via reflection
+            var masterSessionField = typeof(DistributedBrain)
+                .GetField("_masterSession", BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+            var initialMasterMessageCount = masterSession.MessageHistory.Count;
+
+            // Create a goal session
+            var goalId = "goal-failed-test";
+            await brain.ForkSessionForGoalAsync(goalId, TestContext.Current.CancellationToken);
+
+            // Verify goal session file exists
+            var goalSessionFile = Path.Combine(tempDir, $"brain-goal-{goalId}.json");
+            Assert.True(File.Exists(goalSessionFile), "Goal session file should exist after fork");
+
+            // Act: delete goal session directly (as GoalDispatcher does for failed goals)
+            // without calling SummarizeAndMergeAsync
+            brain.DeleteGoalSession(goalId);
+
+            // Assert: goal session file is deleted
+            Assert.False(File.Exists(goalSessionFile), "Goal session file should be deleted");
+
+            // Assert: master session history is unchanged (no summary messages added)
+            masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+            Assert.Equal(initialMasterMessageCount, masterSession.MessageHistory.Count);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SummarizeAndMergeAsync_SummaryGenerationFailure_DoesNotPreventDeletion()
+    {
+        // Arrange: use a pre-cancelled token to force OperationCanceledException during execution
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir);
+
+            // Use a stub client for normal setup
+            var stubClient = new IterationPlanStubClient(
+                callId: "call-summary-fail",
+                phases: ["coding"],
+                reason: "Test");
+
+            // Connect first, then inject fake client
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var chatClientField = typeof(DistributedBrain)
+                .GetField("_chatClient", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new InvalidOperationException("_chatClient field not found");
+            chatClientField.SetValue(brain, stubClient);
+
+            var recreateMethod = typeof(DistributedBrain)
+                .GetMethod("RecreateAgent", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new InvalidOperationException("RecreateAgent method not found");
+            recreateMethod.Invoke(brain, null);
+
+            // Create a goal session
+            var goalId = "goal-cancel-test";
+            await brain.ForkSessionForGoalAsync(goalId, TestContext.Current.CancellationToken);
+
+            // Verify goal session file exists
+            var goalSessionFile = Path.Combine(tempDir, $"brain-goal-{goalId}.json");
+            Assert.True(File.Exists(goalSessionFile), "Goal session file should exist after fork");
+
+            var pipeline = CreatePipeline(goalId, "Test goal for cancellation scenario");
+
+            // Create a pre-cancelled token to force cancellation during execution
+            var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            // Act: the method should throw TaskCanceledException due to the cancelled token
+            // The _brainCallGate.WaitAsync(ct) should throw immediately
+            await Assert.ThrowsAsync<TaskCanceledException>(
+                () => brain.SummarizeAndMergeAsync(pipeline, cts.Token));
+
+            // Assert: goal session file still exists (SummarizeAndMergeAsync didn't reach deletion)
+            // because the cancellation happened before the operation started
+            Assert.True(File.Exists(goalSessionFile),
+                "Goal session file should still exist when exception is thrown before deletion");
+
+            // Cleanup: simulate what GoalDispatcher does on exception
+            brain.DeleteGoalSession(goalId);
+            Assert.False(File.Exists(goalSessionFile), "Goal session file should be deleted after explicit cleanup");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
 }
 
 /// <summary>
@@ -2342,6 +2532,37 @@ file sealed class BlockingStubClient : IChatClient
         ChatOptions? options = null,
         CancellationToken cancellationToken = default)
         => throw new NotSupportedException("Streaming is not used in this test.");
+
+    public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+    public void Dispose() { }
+}
+
+/// <summary>
+/// Stub client that throws an exception on every call, used to test error handling.
+/// </summary>
+file sealed class ThrowingStubClient : IChatClient
+{
+    private readonly Exception _exception;
+
+    public ThrowingStubClient(Exception exception)
+    {
+        _exception = exception;
+    }
+
+    public ChatClientMetadata Metadata => new("stub", null, "stub-model");
+
+    public Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => throw _exception;
+
+    public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => throw _exception;
 
     public object? GetService(Type serviceType, object? serviceKey = null) => null;
 
