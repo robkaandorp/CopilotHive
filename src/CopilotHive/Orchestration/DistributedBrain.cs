@@ -32,6 +32,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly IBrainRepoManager? _repoManager;
     private readonly IGoalStore? _goalStore;
     private readonly string _stateDir;
+
+    /// <summary>
+    /// Directory used for persistent Brain state (session files).
+    /// </summary>
+    public string StateDirectory => _stateDir;
+
     private IChatClient? _chatClient;
     private CodingAgent? _agent;
     private AgentSession _masterSession;
