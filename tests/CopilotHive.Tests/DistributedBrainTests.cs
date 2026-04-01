@@ -1,3 +1,5 @@
+using System.Reflection;
+
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
@@ -832,7 +834,18 @@ public sealed class DistributedBrainTests
                 toolArguments: new Dictionary<string, object?> { ["question"] = ExpectedQuestion, ["reason"] = ExpectedReason },
                 finalReply: "Escalation recorded.");
 
-            InjectFakeChatClient(brain, stubClient);
+            // Connect first (creates real client/agent state), then inject fake client
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var chatClientField = typeof(DistributedBrain)
+                .GetField("_chatClient", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new InvalidOperationException("_chatClient field not found");
+            chatClientField.SetValue(brain, stubClient);
+
+            var recreateMethod = typeof(DistributedBrain)
+                .GetMethod("RecreateAgent", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new InvalidOperationException("RecreateAgent method not found");
+            recreateMethod.Invoke(brain, null);
 
             // Act
             var response = await brain.AskQuestionAsync(
@@ -1844,8 +1857,18 @@ public sealed class DistributedBrainTests
                 phases: ["coding", "testing", "review", "merging"],
                 reason: "Standard workflow");
 
-            InjectFakeChatClient(brain, stubClient);
+            // Connect first (creates real client/agent state), then inject fake client
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var chatClientField = typeof(DistributedBrain)
+                .GetField("_chatClient", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new InvalidOperationException("_chatClient field not found");
+            chatClientField.SetValue(brain, stubClient);
+
+            var recreateMethod = typeof(DistributedBrain)
+                .GetMethod("RecreateAgent", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new InvalidOperationException("RecreateAgent method not found");
+            recreateMethod.Invoke(brain, null);
 
             // Fork sessions for two goals with unique markers
             await brain.ForkSessionForGoalAsync("goal-A", TestContext.Current.CancellationToken);
@@ -1894,39 +1917,35 @@ public sealed class DistributedBrainTests
     [Fact]
     public async Task ExecuteBrainAsync_ConcurrentCalls_UseSeparateSessions()
     {
-        // Verify that two concurrent Brain calls for different goals each use their own session,
-        // with no cross-contamination. Uses a stub client that blocks to simulate concurrent execution.
+        // Verify that two Brain calls for different goals each use their own session,
+        // with no cross-contamination. The _brainCallGate serializes access (capacity=1)
+        // to protect _session/_activeGoalId/_agent — both calls go through it one at a time.
+        // After each call completes, we verify its session was not contaminated by the other.
         var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
         try
         {
-            // Arrange: create brain with a blocking stub client
-            var gate = new SemaphoreSlim(0, 2); // Used to coordinate both calls
-            var callCount = 0;
-            var callOrder = new List<string>();
-
+            // Arrange: create brain with a stub client
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
                 stateDir: tempDir);
 
-            var stubClient = new BlockingStubClient(
-                responseText: "I have planned the iteration.",
-                toolName: "report_iteration_plan",
-                toolArguments: new Dictionary<string, object?>
-                {
-                    ["phases"] = new[] { "coding", "testing", "review" },
-                    ["phase_instructions"] = "{}",
-                    ["reason"] = "Test plan",
-                },
-                onBeforeResponse: () =>
-                {
-                    var callNum = Interlocked.Increment(ref callCount);
-                    callOrder.Add($"call-{callNum}");
-                    // Block until both calls are ready
-                    gate.Wait(TestContext.Current.CancellationToken);
-                });
+            var stubClient = new IterationPlanStubClient(
+                callId: "call-plan-concurrent",
+                phases: ["coding", "testing", "review"],
+                reason: "Concurrent test plan");
 
-            InjectFakeChatClient(brain, stubClient);
+            // Connect first (creates real client/agent state), then inject fake client
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var chatClientField = typeof(DistributedBrain)
+                .GetField("_chatClient", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new InvalidOperationException("_chatClient field not found");
+            chatClientField.SetValue(brain, stubClient);
+
+            var recreateMethod = typeof(DistributedBrain)
+                .GetMethod("RecreateAgent", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new InvalidOperationException("RecreateAgent method not found");
+            recreateMethod.Invoke(brain, null);
 
             // Fork sessions for two goals with unique markers
             await brain.ForkSessionForGoalAsync("goal-A", TestContext.Current.CancellationToken);
@@ -1944,7 +1963,7 @@ public sealed class DistributedBrainTests
             sessionB.MessageHistory.Add(new ChatMessage(ChatRole.User, "UNIQUE_MARKER_B_FOR_CONCURRENCY_TEST"));
             await sessionB.SaveAsync(sessionFileB, TestContext.Current.CancellationToken);
 
-            // Act: start two concurrent PlanIterationAsync calls via Task.Run
+            // Act: start two PlanIterationAsync calls — they serialize through _brainCallGate (capacity=1)
             var pipelineA = CreatePipeline("goal-A", "Goal A for concurrency test");
             var pipelineB = CreatePipeline("goal-B", "Goal B for concurrency test");
 
@@ -1960,13 +1979,7 @@ public sealed class DistributedBrainTests
                 return (GoalId: "goal-B", Result: result);
             }, TestContext.Current.CancellationToken);
 
-            // Wait briefly for both tasks to enter the gate (they'll block on the stub client)
-            await Task.Delay(200, TestContext.Current.CancellationToken);
-
-            // Release both calls to proceed
-            gate.Release(2);
-
-            // Wait for both to complete
+            // Wait for both to complete — _brainCallGate serializes them; one finishes, then the other
             var results = await Task.WhenAll(taskA, taskB);
 
             // Assert: both calls completed successfully
@@ -2259,7 +2272,9 @@ file sealed class IterationPlanStubClient : IChatClient
 }
 
 /// <summary>
-/// Stub client that can block on first call to simulate concurrent execution.
+/// Stub client that blocks on entry to simulate concurrent execution.
+/// Each call waits on the provided SemaphoreSlim before returning a response,
+/// allowing callers to verify that multiple calls are inside the gate simultaneously.
 /// Returns a tool call on first invocation, then text on subsequent calls.
 /// </summary>
 file sealed class BlockingStubClient : IChatClient
@@ -2268,18 +2283,21 @@ file sealed class BlockingStubClient : IChatClient
     private readonly string _responseText;
     private readonly string _toolName;
     private readonly Dictionary<string, object?> _toolArguments;
-    private readonly Action _onBeforeResponse;
+    private readonly SemaphoreSlim _entryGate;
+    private readonly Action? _onEnteredGate;
 
     public BlockingStubClient(
         string responseText,
         string toolName,
         Dictionary<string, object?> toolArguments,
-        Action onBeforeResponse)
+        SemaphoreSlim entryGate,
+        Action? onEnteredGate = null)
     {
         _responseText = responseText;
         _toolName = toolName;
         _toolArguments = toolArguments;
-        _onBeforeResponse = onBeforeResponse;
+        _entryGate = entryGate;
+        _onEnteredGate = onEnteredGate;
     }
 
     public ChatClientMetadata Metadata => new("stub", null, "stub-model");
@@ -2291,8 +2309,11 @@ file sealed class BlockingStubClient : IChatClient
     {
         var call = Interlocked.Increment(ref _callCount);
 
-        // Invoke the blocking callback before returning
-        _onBeforeResponse();
+        // Signal that this call has entered so the test can release both at the right moment
+        _onEnteredGate?.Invoke();
+
+        // Wait until the gate is released (both calls are inside the gate by now)
+        _entryGate.Wait(cancellationToken);
 
         if (call == 1)
         {
