@@ -135,6 +135,8 @@ public sealed class GoalDispatcher : BackgroundService
             _pipelineManager.RemovePipeline(goalId);
             _dispatchedGoals.TryRemove(goalId, out _);
             _logger.LogInformation("Goal {GoalId} cancelled (was InProgress, phase={Phase})", goalId, pipeline.Phase);
+            if (_brain is not null)
+                _brain.DeleteGoalSession(goalId);
             return true;
         }
 
@@ -150,6 +152,8 @@ public sealed class GoalDispatcher : BackgroundService
             new GoalUpdateMetadata { FailureReason = "Cancelled by user" }, ct);
         _dispatchedGoals.TryRemove(goalId, out _);
         _logger.LogInformation("Goal {GoalId} cancelled (was {Status})", goalId, goal.Status);
+        if (_brain is not null)
+            _brain.DeleteGoalSession(goalId);
         return true;
     }
 
@@ -172,6 +176,8 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="goalId">The goal being retried.</param>
     public void ClearGoalRetryState(string goalId)
     {
+        if (_brain is not null)
+            _brain.DeleteGoalSession(goalId);
         _dispatchedGoals.TryRemove(goalId, out _);
         _pipelineManager.RemovePipeline(goalId);
         _retriedGoals[goalId] = true;
@@ -1860,6 +1866,41 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
 
         _logger.LogInformation("Restored {Count} pipeline(s): {GoalIds}",
             restored.Count, string.Join(", ", restored.Select(p => p.GoalId)));
+
+        // Clean up any orphaned goal session files whose goals are no longer active
+        await CleanupOrphanedGoalSessionsAsync(ct);
+    }
+
+    /// <summary>
+    /// Scans for orphaned brain-goal-*.json files and deletes any whose goalId is not
+    /// in the active pipeline set. Called at the end of <see cref="RestoreActivePipelinesAsync"/>
+    /// to remove stale session files left behind by crashed or interrupted runs.
+    /// </summary>
+    private async Task CleanupOrphanedGoalSessionsAsync(CancellationToken ct)
+    {
+        if (_brain is not DistributedBrain db)
+            return;
+
+        var stateDir = db.StateDirectory;
+        if (string.IsNullOrEmpty(stateDir) || !Directory.Exists(stateDir))
+            return;
+
+        var activeGoalIds = _pipelineManager.GetActivePipelines()
+            .Select(p => p.GoalId)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var file in Directory.GetFiles(stateDir, "brain-goal-*.json"))
+        {
+            var fileName = Path.GetFileNameWithoutExtension(file);
+            var goalId = fileName.Replace("brain-goal-", "");
+            if (!activeGoalIds.Contains(goalId))
+            {
+                File.Delete(file);
+                _logger.LogInformation("Cleaned up orphaned goal session: {GoalId}", goalId);
+            }
+        }
+
+        await Task.CompletedTask;
     }
 
     /// <summary>
