@@ -273,7 +273,7 @@ public sealed class TaskExecutorTests
             PushShouldFail = true, // Would fail if called
             FilesChanged = 5
         };
-        var agentRunner = new MockAgentRunner();
+        var agentRunner = new MockAgentRunner(); // No worker report - but Reviewer doesn't push so this is OK
         var executor = new TaskExecutor(agentRunner, gitOperations: git);
 
         var task = new WorkTask
@@ -282,7 +282,7 @@ public sealed class TaskExecutorTests
             GoalId = "goal-6",
             GoalDescription = "Test goal",
             Prompt = "Review the changes",
-            Role = WorkerRole.Reviewer, // Reviewer role - read-only
+            Role = WorkerRole.Reviewer, // Reviewer never pushes (read-only role)
             Repositories = [new TargetRepository { Name = "test-repo", Url = "https://github.com/test/test.git", DefaultBranch = "main" }],
             BranchInfo = new BranchSpec { Action = BranchAction.Checkout, BaseBranch = "main", FeatureBranch = "feature-branch" }
         };
@@ -365,9 +365,10 @@ public sealed class TaskExecutorTests
         var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
 
         // Assert
-        Assert.Equal(2, result.Metrics!.Issues.Count);
-        Assert.Contains("Push failed for repo1", result.Metrics.Issues[0]);
-        Assert.Contains("Push failed for repo2", result.Metrics.Issues[1]);
+        Assert.NotEmpty(result.Metrics!.Issues);
+        // Verify both push errors are in the issues (there may be additional issues like missing report)
+        Assert.Contains(result.Metrics.Issues, i => i.Contains("Push failed for repo1"));
+        Assert.Contains(result.Metrics.Issues, i => i.Contains("Push failed for repo2"));
     }
 
     // ── Summary population ─────────────────────────────────────────────────────
@@ -505,7 +506,7 @@ public sealed class TaskExecutorTests
             GoalId = "goal-no-summary",
             GoalDescription = "Test goal",
             Prompt = "Test prompt",
-            Role = WorkerRole.Coder,
+            Role = WorkerRole.Improver, // Improver has no report tool
             Repositories = [new TargetRepository { Name = "test-repo", Url = "https://github.com/test/test.git", DefaultBranch = "main" }],
         };
 
@@ -514,5 +515,103 @@ public sealed class TaskExecutorTests
 
         // Assert
         Assert.Equal("", result.Metrics!.Summary);
+    }
+
+    // ── Missing report tool tests ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Verifies that when a non-Improver worker (e.g. Coder) completes without filing a report,
+    /// the verdict is FAIL with a descriptive issue message explaining the missing report.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_NonImproverWithoutReport_FailsWithDescriptiveIssue()
+    {
+        // Arrange
+        var git = new MockGitOperations { FilesChanged = 0 };
+        var agentRunner = new MockAgentRunner(); // No reports set — simulates worker completing without calling report tool
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        var task = new WorkTask
+        {
+            TaskId = "test-no-report",
+            GoalId = "goal-no-report",
+            GoalDescription = "Test goal",
+            Prompt = "Test prompt",
+            Role = WorkerRole.Coder, // Coder has a mandatory report tool
+            Repositories = [new TargetRepository { Name = "test-repo", Url = "https://github.com/test/test.git", DefaultBranch = "main" }],
+        };
+
+        // Act
+        var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Single(result.Metrics.Issues);
+        Assert.Contains("Worker (coder) completed without calling its mandatory report tool", result.Metrics.Issues[0]);
+        Assert.Contains("API errors, timeouts, or the worker hallucinating tool calls as text", result.Metrics.Issues[0]);
+    }
+
+    /// <summary>
+    /// Verifies that when a Reviewer completes without filing a report,
+    /// the verdict is REQUEST_CHANGES (not FAIL) with a descriptive issue message.
+    /// Reviewer missing-report must not route through the test-retry path.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerWithoutReport_ProducesRequestChanges()
+    {
+        // Arrange
+        var git = new MockGitOperations { FilesChanged = 0 };
+        var agentRunner = new MockAgentRunner(); // No reports set — simulates reviewer completing without calling report tool
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        var task = new WorkTask
+        {
+            TaskId = "test-reviewer-no-report",
+            GoalId = "goal-reviewer-no-report",
+            GoalDescription = "Test goal",
+            Prompt = "Review the changes",
+            Role = WorkerRole.Reviewer, // Reviewer has a mandatory report tool
+            Repositories = [new TargetRepository { Name = "test-repo", Url = "https://github.com/test/test.git", DefaultBranch = "main" }],
+            BranchInfo = new BranchSpec { Action = BranchAction.Checkout, BaseBranch = "main", FeatureBranch = "feature-branch" }
+        };
+
+        // Act
+        var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.Equal("REQUEST_CHANGES", result.Metrics!.Verdict);
+        Assert.Single(result.Metrics.Issues);
+        Assert.Contains("Worker (reviewer) completed without calling its mandatory report tool", result.Metrics.Issues[0]);
+        Assert.Contains("API errors, timeouts, or the worker hallucinating tool calls as text", result.Metrics.Issues[0]);
+    }
+
+    /// <summary>
+    /// Verifies that when an Improver completes without filing a report, the verdict is PASS
+    /// (since Improver does not have a mandatory report tool).
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ImproverWithoutReport_Passes()
+    {
+        // Arrange
+        var git = new MockGitOperations { FilesChanged = 0 };
+        var agentRunner = new MockAgentRunner(); // No reports set
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        var task = new WorkTask
+        {
+            TaskId = "test-improver-no-report",
+            GoalId = "goal-improver-no-report",
+            GoalDescription = "Test goal",
+            Prompt = "Test prompt",
+            Role = WorkerRole.Improver, // Improver has no report tool
+            Repositories = [new TargetRepository { Name = "test-repo", Url = "https://github.com/test/test.git", DefaultBranch = "main" }],
+        };
+
+        // Act
+        var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.Empty(result.Metrics.Issues);
     }
 }
