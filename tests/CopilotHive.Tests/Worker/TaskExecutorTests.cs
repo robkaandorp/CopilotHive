@@ -552,6 +552,40 @@ public sealed class TaskExecutorTests
     }
 
     /// <summary>
+    /// Verifies that when a Reviewer completes without filing a report,
+    /// the verdict is REQUEST_CHANGES (not FAIL) with a descriptive issue message.
+    /// Reviewer missing-report must not route through the test-retry path.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerWithoutReport_ProducesRequestChanges()
+    {
+        // Arrange
+        var git = new MockGitOperations { FilesChanged = 0 };
+        var agentRunner = new MockAgentRunner(); // No reports set — simulates reviewer completing without calling report tool
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        var task = new WorkTask
+        {
+            TaskId = "test-reviewer-no-report",
+            GoalId = "goal-reviewer-no-report",
+            GoalDescription = "Test goal",
+            Prompt = "Review the changes",
+            Role = WorkerRole.Reviewer, // Reviewer has a mandatory report tool
+            Repositories = [new TargetRepository { Name = "test-repo", Url = "https://github.com/test/test.git", DefaultBranch = "main" }],
+            BranchInfo = new BranchSpec { Action = BranchAction.Checkout, BaseBranch = "main", FeatureBranch = "feature-branch" }
+        };
+
+        // Act
+        var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.Equal("REQUEST_CHANGES", result.Metrics!.Verdict);
+        Assert.Single(result.Metrics.Issues);
+        Assert.Contains("Worker (reviewer) completed without calling its mandatory report tool", result.Metrics.Issues[0]);
+        Assert.Contains("API errors, timeouts, or the worker hallucinating tool calls as text", result.Metrics.Issues[0]);
+    }
+
+    /// <summary>
     /// Verifies that when an Improver completes without filing a report, the verdict is PASS
     /// (since Improver does not have a mandatory report tool).
     /// </summary>
