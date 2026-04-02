@@ -349,6 +349,8 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
             _logger.LogWarning(ex, "Composer context overflow detected — resetting session");
             _streamingContent += "\n\n⚠️ Context limit reached. Session has been reset automatically. Please repeat your request.";
             _session = AgentSession.Create("composer");
+            IsCompacting = false;
+            WasCompacted = false;
             RecreateAgent();
             var sessionFile = GetSessionFilePath();
             if (File.Exists(sessionFile))
