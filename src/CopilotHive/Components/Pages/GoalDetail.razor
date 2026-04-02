@@ -325,34 +325,28 @@
                     @* _detail iterations *@
                     @if (_detail is not null && _detail.Iterations.Count > 0)
                     {
-                        @for (int i = 0; i < _detail.Iterations.Count; i++)
+                        var iterations = _detail.Iterations;
+                        <div class="iter-tabs">
+                            @foreach (var iter in iterations)
+                            {
+                                <button class="@GetTabClass(iter)"
+                                        selected="@(GetActiveIteration() == iter.Number)"
+                                        @onclick="() => SelectIteration(iter.Number)">
+                                    Iter @iter.Number
+                                </button>
+                            }
+                        </div>
+
+                        @foreach (var iter in iterations)
                         {
-                            var iteration = _detail.Iterations[i];
-                            var idx = i;
-                            var hasFailed = iteration.Phases.Any(p => p.Status == "failed");
-
-                            <div class="iteration-section">
-                                <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem">
-                                    <strong>Iteration @iteration.Number</strong>
-                                    @if (iteration.IsCurrent)
-                                    {
-                                        <span class="badge badge-blue">current</span>
-                                    }
-                                    else if (hasFailed)
-                                    {
-                                        <span class="badge badge-red">retry</span>
-                                    }
-                                    else
-                                    {
-                                        <span class="badge badge-green">done</span>
-                                    }
-                                </div>
-
+                            @if (GetActiveIteration() == iter.Number)
+                            {
                                 <div class="phase-bar" style="margin-bottom:0.5rem">
-                                    @foreach (var phase in iteration.Phases)
+                                    @foreach (var phase in iter.Phases)
                                     {
-                                        var phaseKey = $"{iteration.Number}-{phase.Name}";
-                                        <button class="phase-box @phase.Status" @onclick="() => TogglePhase(phaseKey)">
+                                        var phaseKey = $"{iter.Number}-{phase.Name}";
+                                        <button class="phase-box @phase.Status @(_selectedPhase == phaseKey ? "selected" : "")"
+                                                @onclick="() => TogglePhase(phaseKey)">
                                             <span class="phase-box-icon">@PhaseIcon(phase.Status)</span>
                                             @phase.Name
                                             @if (phase.DurationSeconds.HasValue)
@@ -363,16 +357,16 @@
                                     }
                                 </div>
 
-                                @if (!string.IsNullOrEmpty(iteration.PlanReason))
+                                @if (!string.IsNullOrEmpty(iter.PlanReason))
                                 {
                                     <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.5rem;font-style:italic">
-                                        📋 @iteration.PlanReason
+                                        🗋 @iter.PlanReason
                                     </div>
                                 }
 
-                                @foreach (var phase in iteration.Phases)
+                                @foreach (var phase in iter.Phases)
                                 {
-                                    var phaseKey = $"{iteration.Number}-{phase.Name}";
+                                    var phaseKey = $"{iter.Number}-{phase.Name}";
                                     @if (_selectedPhase == phaseKey)
                                     {
                                         <div class="phase-detail">
@@ -387,6 +381,7 @@
                                                 {
                                                     <span style="color:var(--text-muted)">Duration: @FormatDuration(phase.DurationSeconds.Value)</span>
                                                 }
+                                                <button class="phase-detail-close" @onclick="ClearSelectedPhase" title="Close">✕</button>
                                             </div>
 
                                             @if (phase.TotalTests > 0)
@@ -454,38 +449,44 @@
 
                                             @if (phase.Clarifications.Count > 0)
                                             {
-                                                <details class="collapsible-output" open="@(phase.Status == "waiting")">
-                                                    <summary>💬 Clarifications (@phase.Clarifications.Count)</summary>
-                                                    <div style="margin-top:0.5rem">
-                                                        @foreach (var clarification in phase.Clarifications)
-                                                        {
-                                                            <div style="margin-bottom:0.75rem;padding:0.5rem 0.75rem;border-left:3px solid var(--yellow);background:rgba(227,179,65,0.08);border-radius:4px">
-                                                                <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">
-                                                                    @clarification.Timestamp.ToString("HH:mm:ss") UTC
-                                                                </div>
-                                                                <div style="margin-bottom:0.35rem"><strong>Q:</strong> @clarification.Question</div>
-                                                                <div style="margin-bottom:0.25rem"><strong>A:</strong> @clarification.Answer</div>
-                                                                <div style="font-size:0.75rem;color:var(--text-muted)">answered by: @clarification.AnsweredBy</div>
+                                                <div style="margin-bottom:0.75rem">
+                                                    <div class="label" style="margin-bottom:0.5rem">Clarifications (@phase.Clarifications.Count)</div>
+                                                    @foreach (var clarification in phase.Clarifications)
+                                                    {
+                                                        <div style="margin-bottom:0.75rem;padding:0.5rem 0.75rem;border-left:3px solid var(--yellow);background:rgba(227,179,65,0.08);border-radius:4px">
+                                                            <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">
+                                                                @clarification.Timestamp.ToString("HH:mm:ss") UTC
                                                             </div>
-                                                        }
-                                                    </div>
-                                                </details>
+                                                            <div style="margin-bottom:0.35rem"><strong>Q:</strong> @clarification.Question</div>
+                                                            <div style="margin-bottom:0.25rem"><strong>A:</strong> @clarification.Answer</div>
+                                                            <div style="font-size:0.75rem;color:var(--text-muted)">answered by: @clarification.AnsweredBy</div>
+                                                        </div>
+                                                    }
+                                                </div>
+                                            }
+
+                                            @if (!string.IsNullOrEmpty(phase.WorkerOutput))
+                                            {
+                                                <div style="margin-bottom:0.75rem">
+                                                    <div class="label" style="margin-bottom:0.5rem">Worker Output (@phase.RoleName)</div>
+                                                    <div class="chat-msg-content">@((MarkupString)RenderMarkdown(phase.WorkerOutput))</div>
+                                                </div>
                                             }
 
                                             @if (phase.Name == "Planning")
                                             {
-                                                @if (!string.IsNullOrEmpty(iteration.PlanningBrainResponse))
+                                                @if (!string.IsNullOrEmpty(iter.PlanningBrainResponse))
                                                 {
                                                     <details class="collapsible-output">
                                                         <summary>Planning Response</summary>
-                                                        <div class="chat-msg-content">@((MarkupString)RenderMarkdown(iteration.PlanningBrainResponse))</div>
+                                                        <div class="chat-msg-content">@((MarkupString)RenderMarkdown(iter.PlanningBrainResponse))</div>
                                                     </details>
                                                 }
-                                                @if (!string.IsNullOrEmpty(iteration.PlanningBrainPrompt))
+                                                @if (!string.IsNullOrEmpty(iter.PlanningBrainPrompt))
                                                 {
                                                     <details class="collapsible-output">
                                                         <summary style="color:var(--text-muted)">Planning Prompt</summary>
-                                                        <div class="chat-msg-content">@((MarkupString)RenderMarkdown(iteration.PlanningBrainPrompt))</div>
+                                                        <div class="chat-msg-content">@((MarkupString)RenderMarkdown(iter.PlanningBrainPrompt))</div>
                                                     </details>
                                                 }
                                             }
@@ -503,55 +504,42 @@
                                                     <div class="chat-msg-content">@((MarkupString)RenderMarkdown(phase.WorkerPrompt))</div>
                                                 </details>
                                             }
-                                            @if (!string.IsNullOrEmpty(phase.WorkerOutput))
-                                            {
-                                                <details class="collapsible-output">
-                                                    <summary>Worker Output (@phase.RoleName)</summary>
-                                                    <div class="chat-msg-content">@((MarkupString)RenderMarkdown(phase.WorkerOutput))</div>
-                                                </details>
-                                            }
                                         </div>
                                     }
                                 }
-
-                                @if (hasFailed && idx < _detail.Iterations.Count - 1)
-                                {
-                                    <div class="iteration-arrow">↻ Retry — iteration failed, advancing to next</div>
-                                }
-                            </div>
+                            }
                         }
                     }
 
                     @* _storedIterations (from SQLite) *@
                     @if (_storedIterations.Count > 0)
                     {
+                        <div class="iter-tabs">
+                            @foreach (var iter in _storedIterations)
+                            {
+                                <button class="iter-tab selected done" @onclick="() => SelectIteration(iter.Iteration)">
+                                    Iter @iter.Iteration
+                                </button>
+                            }
+                        </div>
+
                         @foreach (var iter in _storedIterations)
                         {
-                            <div class="iteration-section">
-                                <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem">
-                                    <strong>Iteration @iter.Iteration</strong>
-                                    @if (!string.IsNullOrEmpty(iter.ReviewVerdict))
+                            @if ((_selectedIteration > 0 ? _selectedIteration : _storedIterations.First().Iteration) == iter.Iteration)
+                            {
+                                <div class="phase-bar" style="margin-bottom:0.5rem">
+                                    @foreach (var phase in iter.Phases)
                                     {
-                                        <span class="badge @ReviewBadge(iter.ReviewVerdict)">@iter.ReviewVerdict</span>
+                                        <span class="phase-box @(phase.Result == "pass" ? "completed" : phase.Result == "fail" ? "failed" : "skipped")">
+                                            <span class="phase-box-icon">@(phase.Result == "pass" ? "✓" : phase.Result == "fail" ? "✗" : "~")</span>
+                                            @phase.Name
+                                            @if (phase.DurationSeconds > 0)
+                                            {
+                                                <span class="phase-box-duration">@FormatDuration(phase.DurationSeconds)</span>
+                                            }
+                                        </span>
                                     }
                                 </div>
-
-                                @if (iter.Phases.Count > 0)
-                                {
-                                    <div class="phase-bar" style="margin-bottom:0.5rem">
-                                        @foreach (var phase in iter.Phases)
-                                        {
-                                            <span class="phase-box @(phase.Result == "pass" ? "completed" : phase.Result == "fail" ? "failed" : "skipped")">
-                                                <span class="phase-box-icon">@(phase.Result == "pass" ? "✓" : phase.Result == "fail" ? "✗" : "~")</span>
-                                                @phase.Name
-                                                @if (phase.DurationSeconds > 0)
-                                                {
-                                                    <span class="phase-box-duration">@FormatDuration(phase.DurationSeconds)</span>
-                                                }
-                                            </span>
-                                        }
-                                    </div>
-                                }
 
                                 @if (iter.TestCounts is { } tc)
                                 {
@@ -583,7 +571,7 @@
                                         }
                                     </ul>
                                 }
-                            </div>
+                            }
                         }
                     }
                 </div>
@@ -652,6 +640,7 @@ else
     private Goal? _storedGoal;
     private IReadOnlyList<IterationSummary> _storedIterations = [];
     private IReadOnlyList<ProgressEntry> _progress = [];
+    private int _selectedIteration; // 0 = auto-select
     private string? _selectedPhase;
     private string? _approveError;
     private string? _revertError;
@@ -757,6 +746,31 @@ else
     {
         _selectedPhase = _selectedPhase == phaseKey ? null : phaseKey;
     }
+
+    private void SelectIteration(int number)
+    {
+        _selectedIteration = number;
+        _selectedPhase = null; // reset phase selection when switching tabs
+    }
+
+    private void ClearSelectedPhase()
+    {
+        _selectedPhase = null;
+    }
+
+    private int GetActiveIteration()
+    {
+        if (_selectedIteration > 0) return _selectedIteration;
+        var current = _detail?.Iterations.FirstOrDefault(i => i.IsCurrent);
+        return current?.Number ?? _detail?.Iterations.LastOrDefault()?.Number ?? 0;
+    }
+
+    private static string GetTabClass(IterationViewInfo iter) => iter switch
+    {
+        { IsCurrent: true } => "iter-tab selected current",
+        _ when iter.Phases.Any(p => p.Status == "failed") => "iter-tab selected failed",
+        _ => "iter-tab selected done",
+    };
 
     private static string StatusBadge(GoalStatus s) => s switch
     {
