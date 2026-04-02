@@ -211,6 +211,10 @@ public sealed class FileGoalSource : IGoalSource
             Result = p.Result ?? throw new InvalidOperationException("PhaseResultEntry.Result must not be null"),
             DurationSeconds = p.DurationSeconds,
             WorkerOutput = p.WorkerOutput,
+            BrainPrompt = p.BrainPrompt,
+            WorkerPrompt = p.WorkerPrompt,
+            PlanningPrompt = p.PlanningPrompt,
+            PlanningResponse = p.PlanningResponse,
         }).ToList() ?? [],
         TestCounts = e.TestCounts is null ? null : new TestCounts
         {
@@ -233,6 +237,10 @@ public sealed class FileGoalSource : IGoalSource
                 Result = p.Result,
                 DurationSeconds = p.DurationSeconds,
                 WorkerOutput = p.WorkerOutput,
+                BrainPrompt = p.BrainPrompt,
+                WorkerPrompt = p.WorkerPrompt,
+                PlanningPrompt = p.PlanningPrompt,
+                PlanningResponse = p.PlanningResponse,
             }).ToList()
             : null,
         TestCounts = s.TestCounts is null ? null : new TestCountEntry
@@ -296,6 +304,14 @@ public sealed class FileGoalSource : IGoalSource
         public double DurationSeconds { get; set; }
         /// <summary>Raw worker output for this phase, or <c>null</c> if not recorded.</summary>
         public string? WorkerOutput { get; set; }
+        /// <summary>Brain prompt (user message) sent when crafting the worker prompt for this phase.</summary>
+        public string? BrainPrompt { get; set; }
+        /// <summary>Crafted worker prompt (Brain assistant message) for this phase.</summary>
+        public string? WorkerPrompt { get; set; }
+        /// <summary>Planning prompt sent to the Brain during the Planning phase.</summary>
+        public string? PlanningPrompt { get; set; }
+        /// <summary>Brain response to the Planning prompt.</summary>
+        public string? PlanningResponse { get; set; }
     }
 
     /// <summary>YAML-serializable representation of <see cref="TestCounts"/>.</summary>

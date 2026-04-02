@@ -516,7 +516,7 @@
                     {
                         var storedActive = _selectedIteration > 0
                             ? _selectedIteration
-                            : _storedIterations.FirstOrDefault()?.Iteration ?? 0;
+                            : _storedIterations.LastOrDefault()?.Iteration ?? 0;
                         <div class="iter-tabs">
                             @foreach (var iter in _storedIterations)
                             {
@@ -626,6 +626,35 @@
                                                         </div>
                                                     }
                                                 </div>
+                                            }
+
+                                            @if (!string.IsNullOrEmpty(phase.BrainPrompt))
+                                            {
+                                                <details class="collapsible-output">
+                                                    <summary style="color:var(--text-muted)">Brain Prompt</summary>
+                                                    <div class="chat-msg-content">@((MarkupString)RenderMarkdown(phase.BrainPrompt))</div>
+                                                </details>
+                                            }
+                                            @if (!string.IsNullOrEmpty(phase.WorkerPrompt))
+                                            {
+                                                <details class="collapsible-output">
+                                                    <summary>Worker Prompt</summary>
+                                                    <div class="chat-msg-content">@((MarkupString)RenderMarkdown(phase.WorkerPrompt))</div>
+                                                </details>
+                                            }
+                                            @if (!string.IsNullOrEmpty(phase.PlanningPrompt))
+                                            {
+                                                <details class="collapsible-output">
+                                                    <summary style="color:var(--text-muted)">Planning Prompt</summary>
+                                                    <div class="chat-msg-content">@((MarkupString)RenderMarkdown(phase.PlanningPrompt))</div>
+                                                </details>
+                                            }
+                                            @if (!string.IsNullOrEmpty(phase.PlanningResponse))
+                                            {
+                                                <details class="collapsible-output">
+                                                    <summary>Planning Response</summary>
+                                                    <div class="chat-msg-content">@((MarkupString)RenderMarkdown(phase.PlanningResponse))</div>
+                                                </details>
                                             }
                                         </div>
                                     }
