@@ -416,6 +416,22 @@ tr:last-child td { border-bottom: none; }
     white-space: nowrap;
 }
 
+.filter-reset-btn {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    border-radius: 6px;
+    padding: 0.3rem 0.75rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color 0.15s, border-color 0.15s;
+}
+.filter-reset-btn:hover {
+    color: var(--red);
+    border-color: var(--red);
+}
+
 /* Goals Browser: goal row styling */
 .goal-link {
     color: var(--accent);
