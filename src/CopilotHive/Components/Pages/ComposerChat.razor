@@ -159,10 +159,28 @@ else
                     🔄 New Session
                 </button>
                 <span class="text-muted chat-hint">
-                    @(_messages.Count) messages
+                    @(_messages.Count) msgs
                     @if (Composer.LastToolCalls > 0)
                     {
-                        <text> · @Composer.LastToolCalls tool calls</text>
+                        <text> · @Composer.LastToolCalls tools</text>
+                    }
+                    @{
+                        var stats = Composer.GetStats();
+                        var ctxClass = stats is not null
+                            ? (stats.ContextUsagePercent >= 90 ? "chat-ctx-danger" : stats.ContextUsagePercent >= 70 ? "chat-ctx-warn" : "chat-ctx-ok")
+                            : "";
+                    }
+                    @if (stats is not null)
+                    {
+                        <text> · ctx <span class="@ctxClass">@stats.ContextUsagePercent%</span></text>
+                    }
+                    @if (Composer.IsCompacting)
+                    {
+                        <span class="chat-ctx-compacting"> · Compacting…</span>
+                    }
+                    else if (Composer.WasCompacted)
+                    {
+                        <span class="chat-ctx-compacted"> · Compacted</span>
                     }
                 </span>
             </div>
@@ -245,6 +263,8 @@ else
         }
         Composer.OnStreamingUpdate += HandleStreamingUpdate;
         Composer.OnQuestionAsked += HandleQuestionAsked;
+        Composer.OnCompactingStarted += HandleCompactingStarted;
+        Composer.OnCompacted += HandleCompacted;
         ClarificationQueue.OnChanged += HandleClarificationChanged;
         RefreshClarifications();
     }
@@ -395,7 +415,19 @@ else
     {
         Composer.OnStreamingUpdate -= HandleStreamingUpdate;
         Composer.OnQuestionAsked -= HandleQuestionAsked;
+        Composer.OnCompactingStarted -= HandleCompactingStarted;
+        Composer.OnCompacted -= HandleCompacted;
         ClarificationQueue.OnChanged -= HandleClarificationChanged;
+    }
+
+    private void HandleCompactingStarted()
+    {
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void HandleCompacted()
+    {
+        InvokeAsync(StateHasChanged);
     }
 
     private void HandleQuestionAsked()

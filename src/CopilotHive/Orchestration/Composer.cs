@@ -61,8 +61,20 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
     /// <summary>Tool call count from the last completed response.</summary>
     public int LastToolCalls => _lastToolCalls;
 
+    /// <summary>Whether context compaction is currently running.</summary>
+    public bool IsCompacting { get; private set; }
+
+    /// <summary>Whether context compaction has occurred in the current session.</summary>
+    public bool WasCompacted { get; private set; }
+
     /// <summary>Raised when streaming state changes (new text, completion, error).</summary>
     public event Action? OnStreamingUpdate;
+
+    /// <summary>Raised when context compaction starts.</summary>
+    public event Action? OnCompactingStarted;
+
+    /// <summary>Raised when context compaction completes.</summary>
+    public event Action? OnCompacted;
 
     /// <summary>The question currently waiting for a user answer, or <c>null</c> if none.</summary>
     public ComposerQuestion? PendingQuestion { get; private set; }
@@ -388,6 +400,8 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
     public async Task ResetSessionAsync(CancellationToken ct = default)
     {
         _session = AgentSession.Create("composer");
+        IsCompacting = false;
+        WasCompacted = false;
         RecreateAgent();
 
         var sessionFile = GetSessionFilePath();
@@ -526,9 +540,20 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
             ReasoningEffort = _reasoningEffort,
             ShowToolCallsInStream = true,
             Logger = _logger,
-            OnCompacted = r => _logger.LogInformation(
-                "Composer context compaction: {TokensBefore} → {TokensAfter} tokens ({ReductionPercent}% reduction)",
-                r.TokensBefore, r.TokensAfter, r.ReductionPercent),
+            OnCompacting = () =>
+            {
+                IsCompacting = true;
+                OnCompactingStarted?.Invoke();
+            },
+            OnCompacted = r =>
+            {
+                _logger.LogInformation(
+                    "Composer context compaction: {TokensBefore} → {TokensAfter} tokens ({ReductionPercent}% reduction)",
+                    r.TokensBefore, r.TokensAfter, r.ReductionPercent);
+                IsCompacting = false;
+                WasCompacted = true;
+                OnCompacted?.Invoke();
+            },
         });
 
         _logger.LogDebug("Composer CodingAgent created with WorkDirectory={WorkDir}, FileOps={FileOps}",

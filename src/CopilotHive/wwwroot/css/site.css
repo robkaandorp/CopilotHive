@@ -733,6 +733,20 @@ tr:last-child td { border-bottom: none; }
     font-size: 0.8rem;
 }
 
+.chat-ctx-ok { color: var(--green); }
+.chat-ctx-warn { color: var(--yellow); }
+.chat-ctx-danger { color: var(--red); font-weight: 600; }
+.chat-ctx-compacting {
+    color: var(--yellow);
+    animation: chat-ctx-pulse 1.5s ease-in-out infinite;
+}
+.chat-ctx-compacted { color: var(--text-muted); }
+
+@keyframes chat-ctx-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
 .chat-status { padding: 1rem; border-radius: 8px; }
 .chat-status-error { background: rgba(248, 81, 73, 0.15); border: 1px solid var(--red); color: var(--red); }
 
