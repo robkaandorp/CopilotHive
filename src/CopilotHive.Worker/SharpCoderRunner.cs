@@ -53,6 +53,7 @@ public sealed class SharpCoderRunner : IAgentRunner
 
     private IToolCallBridge? _toolBridge;
     private string? _currentTaskId;
+    private string? _currentGoalId;
     private WorkerRole _currentRole;
     private string? _customAgentSystemPrompt;
 
@@ -70,6 +71,7 @@ public sealed class SharpCoderRunner : IAgentRunner
 
     public void SetToolBridge(IToolCallBridge? bridge) => _toolBridge = bridge;
     public void SetCurrentTaskId(string? taskId) => _currentTaskId = taskId;
+    public void SetCurrentGoalId(string? goalId) => _currentGoalId = goalId;
 
     public void SetCustomAgent(WorkerRole role, string agentsMdContent)
     {
@@ -137,7 +139,7 @@ public sealed class SharpCoderRunner : IAgentRunner
                 verdict to FAIL. Passing existing tests is necessary but not sufficient — the goal's
                 acceptance criteria must be met.
 
-                Use `get_goal` to fetch the full description if needed.
+                Use `get_goal (no argument)` to fetch the full description if needed.
 
                 ## Reporting Your Results (MANDATORY)
 
@@ -169,7 +171,7 @@ public sealed class SharpCoderRunner : IAgentRunner
 
                 ## Acceptance Criteria Verification (MANDATORY)
 
-                You MUST read the full goal description (use `get_goal` to fetch it if needed).
+                You MUST read the full goal description (use `get_goal (no argument)` to fetch it if needed).
                 and verify that EVERY acceptance criterion is satisfied by the changes in the diff. If the diff
                 is technically correct but only implements a fraction of the goal's requirements, that is a
                 **[CRITICAL]** issue — you MUST REQUEST_CHANGES. Do not accept the brain's or coder's framing
@@ -510,11 +512,12 @@ public sealed class SharpCoderRunner : IAgentRunner
             ));
 
             tools.Add(AIFunctionFactory.Create(
-                async ([Description("The goal ID to fetch")] string goal_id) =>
+                async () =>
                 {
                     if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";
-                    _log.Info($"Tool call: get_goal({goal_id})");
-                    var response = await _toolBridge.GetGoalAsync(_currentTaskId, goal_id, CancellationToken.None);
+                    if (string.IsNullOrEmpty(_currentGoalId)) return "Error: Goal ID not set.";
+                    _log.Info($"Tool call: get_goal()");
+                    var response = await _toolBridge.GetGoalAsync(_currentTaskId, _currentGoalId, CancellationToken.None);
                     return response;
                 },
                 "get_goal",

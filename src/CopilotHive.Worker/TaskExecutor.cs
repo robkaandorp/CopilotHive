@@ -38,6 +38,7 @@ public sealed class TaskExecutor(
         // Wire tool bridge and task context into CopilotRunner
         agentRunner.SetToolBridge(toolBridge);
         agentRunner.SetCurrentTaskId(task.TaskId);
+        agentRunner.SetCurrentGoalId(task.GoalId);
         agentRunner.ClearTestReport();
         agentRunner.ClearWorkerReport();
 
