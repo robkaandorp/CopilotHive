@@ -315,7 +315,16 @@ public sealed class TaskExecutor(
             }
             else
             {
-                metrics = new TaskMetrics { Verdict = "PASS" };
+                // Improver has no report tool — default to PASS.
+                // All other roles MUST call their report tool; missing report = FAIL.
+                var hasReportTool = task.Role is not WorkerRole.Improver;
+                metrics = new TaskMetrics
+                {
+                    Verdict = hasReportTool ? "FAIL" : "PASS",
+                    Issues = hasReportTool
+                        ? [$"Worker ({task.Role.ToRoleName()}) completed without calling its mandatory report tool. This usually indicates API errors, timeouts, or the worker hallucinating tool calls as text."]
+                        : [],
+                };
             }
 
             foreach (var err in pushErrors)
