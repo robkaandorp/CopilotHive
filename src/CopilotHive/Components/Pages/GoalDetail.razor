@@ -332,7 +332,7 @@
                                 <button class="@GetTabClass(iter)"
                                         selected="@(GetActiveIteration() == iter.Number)"
                                         @onclick="() => SelectIteration(iter.Number)">
-                                    Iter @iter.Number
+                                    Iteration @iter.Number
                                 </button>
                             }
                         </div>
@@ -356,11 +356,12 @@
                                         </button>
                                     }
                                 </div>
+                                <div class="iter-content">
 
                                 @if (!string.IsNullOrEmpty(iter.PlanReason))
                                 {
                                     <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.5rem;font-style:italic">
-                                        🗋 @iter.PlanReason
+                                        📋 @iter.PlanReason
                                     </div>
                                 }
 
@@ -565,6 +566,7 @@
                                 {
                                     <div class="timeline-empty">No activity yet.</div>
                                 }
+                                </div>
                             }
                         }
                     }
@@ -581,7 +583,7 @@
                                 var iterIsSelected = iter.Iteration == storedActive;
                                 <button class="iter-tab done @(iterIsSelected ? "selected" : "")"
                                         @onclick="() => SelectIteration(iter.Iteration)">
-                                    Iter @iter.Iteration
+                                    Iteration @iter.Iteration
                                 </button>
                             }
                         </div>
@@ -605,6 +607,7 @@
                                         </button>
                                     }
                                 </div>
+                                <div class="iter-content">
 
                                 @if (iter.TestCounts is { } tc)
                                 {
@@ -642,6 +645,7 @@
                                 {
                                     <div class="timeline-empty">No live progress — goal is not running.</div>
                                 }
+                                </div>
 
                                 @* Phase detail panel for stored iterations *@
                                 @foreach (var phase in iter.Phases)
