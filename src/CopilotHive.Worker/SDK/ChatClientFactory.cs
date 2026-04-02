@@ -190,7 +190,7 @@ public static class ChatClientFactory
                     return default;
                 },
             })
-            .AddTimeout(TimeSpan.FromMinutes(2))
+            .AddTimeout(TimeSpan.FromMinutes(10))
             .Build();
 
         var resilienceHandler = new ResilienceHandler(retryPipeline)
