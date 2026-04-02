@@ -647,6 +647,38 @@ public sealed class GoalPipelineManagerTests
         Assert.False(removed);
     }
 
+    /// <summary>
+    /// Verifies the bug fix: RemovePipeline must clean up the store record even when
+    /// the pipeline is not in the in-memory dictionary (e.g. a Failed pipeline that
+    /// LoadActivePipelines skipped on startup).
+    /// </summary>
+    [Fact]
+    public async Task RemovePipeline_NotInMemory_CleansUpStoreRecord()
+    {
+        // Create a manager backed by a real in-memory store
+        await using var store = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        // Create and persist a pipeline, then manually remove it from memory
+        // to simulate a Failed pipeline that RestoreFromStore did not reload.
+        var goal = CreateGoal("store-only-goal", "Store-only test");
+        var pipeline = new GoalPipeline(goal);
+        store.SavePipeline(pipeline);  // write directly to store, bypassing manager
+
+        // Confirm it is NOT in the manager's in-memory dictionary
+        Assert.Null(manager.GetByGoalId("store-only-goal"));
+
+        // Act — remove via manager (pipeline is not in memory)
+        var removed = manager.RemovePipeline("store-only-goal");
+
+        // Assert
+        Assert.False(removed);  // not in memory
+
+        // Verify the store record was cleaned up by querying LoadActivePipelines
+        var active = store.LoadActivePipelines();
+        Assert.DoesNotContain(active, p => p.GoalId == "store-only-goal");
+    }
+
     #endregion
 
     #region GetAllPipelines
