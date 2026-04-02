@@ -1249,3 +1249,135 @@ tr:last-child td { border-bottom: none; }
     border-top: 1px solid var(--border);
     margin-top: 0.75rem;
 }
+
+/* ── Live Progress Timeline ─────────────────────────────────────────── */
+
+.timeline {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 0.5rem 0;
+}
+
+.timeline-entry {
+    display: flex;
+    gap: 0.75rem;
+    align-items: flex-start;
+}
+
+.timeline-ts {
+    font-family: monospace;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+    padding-top: 0.1rem;
+    min-width: 60px;
+}
+
+.timeline-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+}
+
+.timeline-progress {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+}
+
+.timeline-phase {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    margin-left: 0.25rem;
+}
+
+.timeline-details {
+    font-size: 0.85rem;
+    color: var(--text);
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.timeline-worker {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    font-family: monospace;
+}
+
+/* Role badges */
+.role-badge {
+    display: inline-block;
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.role-coder { background: rgba(88,166,255,0.2); color: var(--accent); }
+.role-tester { background: rgba(63,185,80,0.2); color: var(--green); }
+.role-reviewer { background: rgba(227,179,65,0.2); color: var(--yellow); }
+.role-docwriter { background: rgba(219,109,40,0.2); color: var(--orange); }
+.role-improver { background: rgba(188,140,255,0.2); color: #bc8cff; }
+.role-brain { background: rgba(110,118,129,0.2); color: var(--text-muted); }
+.role-default { background: rgba(110,118,129,0.15); color: var(--text-muted); }
+
+/* Clarification entries */
+.timeline-clarification {
+    background: rgba(227,179,65,0.08);
+    border: 1px solid rgba(210,153,34,0.3);
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+}
+
+.timeline-pending {
+    background: rgba(227,179,65,0.04);
+    border: 1px dashed rgba(210,153,34,0.4);
+}
+
+.clarification-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.clarification-role {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+}
+
+.clarification-q {
+    font-size: 0.85rem;
+    color: var(--text);
+    line-height: 1.4;
+}
+
+.clarification-a {
+    font-size: 0.85rem;
+    color: var(--green);
+    line-height: 1.4;
+}
+
+.clarification-answered-by {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+}
+
+.clarification-pending {
+    font-size: 0.8rem;
+    color: var(--yellow);
+    font-style: italic;
+}
+
+.timeline-empty {
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    padding: 2rem 1rem;
+}

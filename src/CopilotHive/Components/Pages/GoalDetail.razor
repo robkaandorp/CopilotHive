@@ -507,6 +507,64 @@
                                         </div>
                                     }
                                 }
+                                @* Live view timeline when no phase is selected *@
+                                @if (_selectedPhase is null && _timeline.Count > 0)
+                                {
+                                    <div class="timeline" @ref="_timelineRef">
+                                        @foreach (var entry in _timeline)
+                                        {
+                                            @if (entry.Type == TimelineEntryType.Progress)
+                                            {
+                                                <div class="timeline-entry timeline-progress">
+                                                    <div class="timeline-ts">@entry.Timestamp.ToString("HH:mm:ss")</div>
+                                                    <div class="timeline-body">
+                                                        <span class="role-badge @RoleBadgeColor(entry.RoleName)">@entry.RoleName</span>
+                                                        @if (!string.IsNullOrEmpty(entry.Status))
+                                                        {
+                                                            <span class="badge badge-blue">@entry.Status</span>
+                                                        }
+                                                        <span class="timeline-phase">[@entry.PhaseName]</span>
+                                                        <div class="timeline-details">@entry.Details</div>
+                                                        @if (!string.IsNullOrEmpty(entry.WorkerId))
+                                                        {
+                                                            <div class="timeline-worker">worker: @entry.WorkerId</div>
+                                                        }
+                                                    </div>
+                                                </div>
+                                            }
+                                            else
+                                            {
+                                                <div class="timeline-entry timeline-clarification @(entry.Type == TimelineEntryType.PendingClarification ? "timeline-pending" : "")">
+                                                    <div class="timeline-ts">@entry.Timestamp.ToString("HH:mm:ss")</div>
+                                                    <div class="timeline-body">
+                                                        <div class="clarification-card">
+                                                            <div class="clarification-role">
+                                                                <span class="role-badge @RoleBadgeColor(entry.RoleName)">@entry.RoleName</span>
+                                                                <span class="timeline-phase">[@entry.PhaseName]</span>
+                                                            </div>
+                                                            <div class="clarification-q"><strong>Q:</strong> @entry.Question</div>
+                                                            @if (!string.IsNullOrEmpty(entry.Answer))
+                                                            {
+                                                                <div class="clarification-a"><strong>A:</strong> @entry.Answer</div>
+                                                                <div class="clarification-answered-by">answered by: @entry.AnsweredBy</div>
+                                                            }
+                                                            else
+                                                            {
+                                                                <div class="clarification-pending">awaiting answer…</div>
+                                                            }
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            }
+                                        }
+                                    </div>
+                                }
+
+                                @* Empty timeline state *@
+                                @if (_selectedPhase is null && _timeline.Count == 0)
+                                {
+                                    <div class="timeline-empty">No activity yet.</div>
+                                }
                             }
                         }
                     }
@@ -577,6 +635,65 @@
                                             <li style="color:var(--text-muted)">@note</li>
                                         }
                                     </ul>
+                                }
+
+                                @* Live view timeline when no phase is selected *@
+                                @if (_selectedPhase is null && _timeline.Count > 0)
+                                {
+                                    <div class="timeline" @ref="_timelineRef">
+                                        @foreach (var entry in _timeline)
+                                        {
+                                            @if (entry.Type == TimelineEntryType.Progress)
+                                            {
+                                                <div class="timeline-entry timeline-progress">
+                                                    <div class="timeline-ts">@entry.Timestamp.ToString("HH:mm:ss")</div>
+                                                    <div class="timeline-body">
+                                                        <span class="role-badge @RoleBadgeColor(entry.RoleName)">@entry.RoleName</span>
+                                                        @if (!string.IsNullOrEmpty(entry.Status))
+                                                        {
+                                                            <span class="badge badge-blue">@entry.Status</span>
+                                                        }
+                                                        <span class="timeline-phase">[@entry.PhaseName]</span>
+                                                        <div class="timeline-details">@entry.Details</div>
+                                                        @if (!string.IsNullOrEmpty(entry.WorkerId))
+                                                        {
+                                                            <div class="timeline-worker">worker: @entry.WorkerId</div>
+                                                        }
+                                                    </div>
+                                                </div>
+                                            }
+                                            else
+                                            {
+                                                <div class="timeline-entry timeline-clarification @(entry.Type == TimelineEntryType.PendingClarification ? "timeline-pending" : "")">
+                                                    <div class="timeline-ts">@entry.Timestamp.ToString("HH:mm:ss")</div>
+                                                    <div class="timeline-body">
+                                                        <div class="clarification-card">
+                                                            <div class="clarification-role">
+                                                                <span class="role-badge @RoleBadgeColor(entry.RoleName)">@entry.RoleName</span>
+                                                                <span class="timeline-phase">[@entry.PhaseName]</span>
+                                                            </div>
+                                                            <div class="clarification-q"><strong>Q:</strong> @entry.Question</div>
+                                                            @if (!string.IsNullOrEmpty(entry.Answer))
+                                                            {
+                                                                <div class="clarification-a"><strong>A:</strong> @entry.Answer</div>
+                                                                <div class="clarification-answered-by">answered by: @entry.AnsweredBy</div>
+                                                            }
+                                                            else
+                                                            {
+                                                                <div class="clarification-pending">awaiting answer…</div>
+                                                            }
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            }
+                                        }
+                                    </div>
+                                }
+
+                                @* Empty timeline state *@
+                                @if (_selectedPhase is null && _timeline.Count == 0)
+                                {
+                                    <div class="timeline-empty">No activity yet.</div>
                                 }
 
                                 @* Phase detail panel for stored iterations *@
@@ -730,6 +847,8 @@ else
     private IReadOnlyList<ProgressEntry> _progress = [];
     private int _selectedIteration; // 0 = auto-select
     private string? _selectedPhase;
+    private List<TimelineEntry> _timeline = [];
+    private ElementReference _timelineRef;
     private string? _approveError;
     private string? _revertError;
     private string? _cancelError;
@@ -773,6 +892,9 @@ else
             _storedGoal = null;
             _storedIterations = [];
         }
+
+        // Build timeline for the active iteration
+        BuildActiveTimeline();
 
         // Resolve release ID — load from store for _detail branch (pipeline goals don't carry ReleaseId)
         if (_detail is not null)
@@ -832,6 +954,69 @@ else
 
     private void RefreshState() => InvokeAsync(() => { Refresh(); StateHasChanged(); });
 
+    private void BuildActiveTimeline()
+    {
+        if (_detail is not null && _detail.Iterations.Count > 0)
+        {
+            var active = GetActiveIteration();
+            var iter = _detail.Iterations.FirstOrDefault(i => i.Number == active)
+                ?? _detail.Iterations.LastOrDefault();
+            _timeline = iter is not null ? BuildTimeline(iter) : [];
+        }
+        else if (_storedIterations.Count > 0)
+        {
+            var storedActive = _selectedIteration > 0
+                ? _selectedIteration
+                : _storedIterations.LastOrDefault()?.Iteration ?? 0;
+            var storedIter = _storedIterations.FirstOrDefault(i => i.Iteration == storedActive)
+                ?? _storedIterations.LastOrDefault();
+            _timeline = storedIter is not null ? BuildStoredTimeline(storedIter) : [];
+        }
+        else
+        {
+            _timeline = [];
+        }
+    }
+
+    private List<TimelineEntry> BuildStoredTimeline(IterationSummary iter)
+    {
+        var entries = new List<TimelineEntry>();
+
+        foreach (var phase in iter.Phases)
+        {
+            var clarifications = iter.Clarifications
+                .Where(c => string.Equals(c.Phase, phase.Name, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            foreach (var clar in clarifications)
+            {
+                entries.Add(new TimelineEntry
+                {
+                    Timestamp = clar.Timestamp,
+                    Type = string.IsNullOrEmpty(clar.Answer) ? TimelineEntryType.PendingClarification : TimelineEntryType.Clarification,
+                    PhaseName = phase.Name,
+                    RoleName = clar.WorkerRole,
+                    Question = clar.Question,
+                    Answer = clar.Answer,
+                    AnsweredBy = clar.AnsweredBy,
+                });
+            }
+        }
+
+        return entries.OrderBy(e => e.Timestamp).ToList();
+    }
+
+    private static string RoleBadgeColor(string role) => role.ToLowerInvariant() switch
+    {
+        "coder" => "role-coder",
+        "tester" => "role-tester",
+        "reviewer" => "role-reviewer",
+        "docwriter" => "role-docwriter",
+        "improver" => "role-improver",
+        "orchestrator" or "brain" => "role-brain",
+        _ => "role-default",
+    };
+
     private void TogglePhase(string phaseKey)
     {
         _selectedPhase = _selectedPhase == phaseKey ? null : phaseKey;
@@ -841,11 +1026,13 @@ else
     {
         _selectedIteration = number;
         _selectedPhase = null; // reset phase selection when switching tabs
+        BuildActiveTimeline();
     }
 
     private void ClearSelectedPhase()
     {
         _selectedPhase = null;
+        BuildActiveTimeline();
     }
 
     private int GetActiveIteration()
@@ -940,6 +1127,21 @@ else
 
     public void Dispose() => State.OnStateChanged -= RefreshState;
 
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_selectedPhase is null && _timelineRef.Context is not null)
+        {
+            try
+            {
+                await JS.InvokeVoidAsync("scrollToBottom", _timelineRef);
+            }
+            catch
+            {
+                // Ignore JS interop errors (e.g., element not found)
+            }
+        }
+    }
+
     private async Task ApproveGoal()
     {
         _approveError = null;
@@ -1023,6 +1225,60 @@ else
             _deleteError = $"Error {(int)response.StatusCode}: {errorContent}";
             StateHasChanged();
         }
+    }
+
+    private enum TimelineEntryType { Progress, Clarification, PendingClarification }
+
+    private sealed class TimelineEntry
+    {
+        public DateTime Timestamp { get; init; }
+        public TimelineEntryType Type { get; init; }
+        public string PhaseName { get; init; } = "";
+        public string RoleName { get; init; } = "";
+        public string? Status { get; init; }
+        public string? Details { get; init; }
+        public string? WorkerId { get; init; }
+        public string? Question { get; init; }
+        public string? Answer { get; init; }
+        public string? AnsweredBy { get; init; }
+    }
+
+    private List<TimelineEntry> BuildTimeline(IterationViewInfo iter)
+    {
+        var entries = new List<TimelineEntry>();
+
+        foreach (var phase in iter.Phases)
+        {
+            foreach (var rpt in phase.ProgressReports)
+            {
+                entries.Add(new TimelineEntry
+                {
+                    Timestamp = rpt.Timestamp,
+                    Type = TimelineEntryType.Progress,
+                    PhaseName = phase.Name,
+                    RoleName = phase.RoleName,
+                    Status = rpt.Status,
+                    Details = rpt.Details,
+                    WorkerId = rpt.WorkerId,
+                });
+            }
+
+            foreach (var clar in phase.Clarifications)
+            {
+                entries.Add(new TimelineEntry
+                {
+                    Timestamp = clar.Timestamp,
+                    Type = string.IsNullOrEmpty(clar.Answer) ? TimelineEntryType.PendingClarification : TimelineEntryType.Clarification,
+                    PhaseName = phase.Name,
+                    RoleName = phase.RoleName,
+                    Question = clar.Question,
+                    Answer = clar.Answer,
+                    AnsweredBy = clar.AnsweredBy,
+                });
+            }
+        }
+
+        return entries.OrderBy(e => e.Timestamp).ToList();
     }
 
     private async Task AssignToRelease()
