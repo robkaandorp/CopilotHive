@@ -136,6 +136,8 @@ public sealed class SharpCoderRunner : IAgentRunner
                 verdict to FAIL. Passing existing tests is necessary but not sufficient — the goal's
                 acceptance criteria must be met.
 
+                Use `get_goal` to fetch the full description if needed.
+
                 ## Reporting Your Results (MANDATORY)
 
                 After all testing, you MUST call the `report_test_results` tool with:
@@ -166,7 +168,7 @@ public sealed class SharpCoderRunner : IAgentRunner
 
                 ## Acceptance Criteria Verification (MANDATORY)
 
-                You MUST read the full goal description provided in the task details.
+                You MUST read the full goal description (use `get_goal` to fetch it if needed).
                 and verify that EVERY acceptance criterion is satisfied by the changes in the diff. If the diff
                 is technically correct but only implements a fraction of the goal's requirements, that is a
                 **[CRITICAL]** issue — you MUST REQUEST_CHANGES. Do not accept the brain's or coder's framing
@@ -504,6 +506,18 @@ public sealed class SharpCoderRunner : IAgentRunner
                 },
                 "request_clarification",
                 "Ask the orchestrator for clarification when the goal description is ambiguous, files-to-change seem incomplete, or acceptance criteria conflict. Do NOT silently work around ambiguities — ask first."
+            ));
+
+            tools.Add(AIFunctionFactory.Create(
+                async ([Description("The goal ID to fetch")] string goal_id) =>
+                {
+                    if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";
+                    _log.Info($"Tool call: get_goal({goal_id})");
+                    var response = await _toolBridge.GetGoalAsync(_currentTaskId, goal_id, CancellationToken.None);
+                    return response;
+                },
+                "get_goal",
+                "Fetch the full goal description and acceptance criteria directly from the orchestrator."
             ));
         }
 

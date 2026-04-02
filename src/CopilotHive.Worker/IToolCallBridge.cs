@@ -18,4 +18,10 @@ public interface IToolCallBridge
     /// Fire-and-forget — does not block on a response.
     /// </summary>
     Task ReportProgressAsync(string taskId, string status, string details, CancellationToken ct);
+
+    /// <summary>
+    /// Fetch the full goal description and acceptance criteria directly from the orchestrator.
+    /// Returns id/status/description/repositories/priority as JSON.
+    /// </summary>
+    Task<string> GetGoalAsync(string taskId, string goalId, CancellationToken ct);
 }
