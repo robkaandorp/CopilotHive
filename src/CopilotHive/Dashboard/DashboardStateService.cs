@@ -372,11 +372,9 @@ public sealed class DashboardStateService : IDisposable
                     Name = "Planning",
                     RoleName = "",
                     Status = planningStatus,
-                    ProgressReports = planningStatus == "active"
-                        ? pipeline.ProgressReports
-                            .Where(p => p.Iteration == currentIter && p.Phase == "Planning")
-                            .ToList()
-                        : [],
+                    ProgressReports = pipeline.ProgressReports
+                        .Where(p => p.Iteration == currentIter && p.Phase == "Planning")
+                        .ToList(),
                 },
             };
 
@@ -430,11 +428,9 @@ public sealed class DashboardStateService : IDisposable
                         Issues = hasMetrics && isReviewPhase ? metrics.ReviewIssues.ToList() :
                                  hasMetrics && isTestPhase ? metrics.Issues.ToList() : [],
                         Verdict = hasMetrics && isTestPhase ? metrics.Verdict?.ToString() : null,
-                        ProgressReports = (status == "active" || status == "waiting")
-                            ? pipeline.ProgressReports
-                                .Where(p => p.Iteration == currentIter && p.Phase == phase.ToString())
-                                .ToList()
-                            : [],
+                        ProgressReports = pipeline.ProgressReports
+                            .Where(p => p.Iteration == currentIter && p.Phase == phase.ToString())
+                            .ToList(),
                         BrainPrompt = phasePrompts.BrainPrompt,
                         WorkerPrompt = phasePrompts.WorkerPrompt,
                         Clarifications = phaseClarifications ?? [],
