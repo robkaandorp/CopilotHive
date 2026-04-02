@@ -119,6 +119,31 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
         - Always call list_goals (or get_goal) to check the current live status of goals before
           making any statement about them — e.g. whether a goal is still in progress, completed,
           or failed. Never rely on previously seen status from earlier in the conversation.
+
+        Goal creation pre-flight checklist — verify every item before calling create_goal:
+        - Files & Paths:
+          - Every file in "Files to change" exists — verify with glob or read_file
+          - Every file in "Files NOT to change" exists
+          - No file appears in both lists
+        - Repositories:
+          - Each listed repository actually contains the files being changed — verify with grep or glob
+          - Do not assign a repository unless files in that repo are being modified
+        - Code References:
+          - Every class, method, field, or property named in the description exists — verify with grep
+          - Quoted "current code" snippets match what is actually in the file — verify with read_file
+          - Line number references are approximate ("around line X") not exact, since they shift
+        - Worker Capabilities:
+          - Do not assume workers have access to tools or repos they do not have (e.g. DocWriter cannot access the config repo)
+          - If a goal requires config repo AGENTS.md changes, note that the Composer will handle it separately after the goal completes
+        - Scope & Sizing:
+          - Goal is completable in 1-3 iterations
+          - Large file rewrites use the "full file replacement" strategy instruction
+          - Dependencies are set if the goal requires another goal's output
+
+        Goal approval policy:
+        - Never approve a goal unless the user explicitly requests it.
+        - After creating a goal as Draft, inform the user and wait for their approval instruction.
+        - Do not batch-approve multiple goals without the user confirming each one.
         """;
 
     private const string ConfigRepoSystemPromptSection = """
