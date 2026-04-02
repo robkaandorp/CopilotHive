@@ -7,6 +7,7 @@
 @inject PageHeaderState PageHeader
 @inject GoalsFilterState FilterState
 
+<div class="goals-page">
 <!-- Filter Bar -->
 <div class="filter-bar">
     <input type="text" placeholder="Search goals…" @bind="FilterState.SearchText" @bind:event="oninput" @bind:after="ApplyFilters" />
@@ -59,7 +60,8 @@
 <!-- Goals Table -->
 @if (_filtered.Count > 0)
 {
-    <table>
+    <div class="goals-table-wrap">
+    <table class="goals-table">
         <thead>
             <tr>
                 <th>Goal</th>
@@ -150,11 +152,13 @@
             }
         </tbody>
     </table>
+    </div>
 }
 else if (_loaded)
 {
     <p style="color:var(--text-muted);margin-top:1rem">No goals match the current filters.</p>
 }
+</div>
 
 @code {
     private List<Goal> _allGoals = [];

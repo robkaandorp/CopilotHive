@@ -1083,3 +1083,47 @@ tr:last-child td { border-bottom: none; }
     font-size: 0.75rem;
     padding: 0.25rem 0.75rem;
 }
+
+/* Goals page: fill height, pin filter bar, scroll table body */
+.goals-page {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+.goals-table-wrap {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
+.goals-table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--bg-card);
+}
+
+.goals-table th,
+.goals-table td {
+    padding: 0.6rem 1rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+}
+
+.goals-table th {
+    position: sticky;
+    top: 0;
+    background: var(--bg-card);
+    z-index: 1;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 500;
+}
+
+.goals-table tr:last-child td {
+    border-bottom: none;
+}
