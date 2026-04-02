@@ -64,7 +64,7 @@ public sealed class TaskExecutor(
                     if (Directory.Exists(targetDir))
                         await _git.ForceDeleteDirectoryAsync(targetDir);
 
-                    Console.WriteLine($"[Task] Cloning {repo.Name} from {repo.Url}");
+                    _log.Info($"Cloning {repo.Name} from {repo.Url}");
                     await _git.CloneRepositoryAsync(repo.Url, targetDir, ct);
 
                     // Handle branch operations

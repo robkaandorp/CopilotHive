@@ -2,6 +2,7 @@ using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -373,6 +374,7 @@ public sealed class ComposerHubNullTests : IAsyncLifetime
     public async ValueTask InitializeAsync()
     {
         var builder = WebApplication.CreateBuilder();
+        ((IWebHostBuilder)builder.WebHost).UseUrls("http://127.0.0.1:0");
         _app = builder.Build();
         // Map endpoints with null composer - should not throw
         _app.MapComposerEndpoints(null!);

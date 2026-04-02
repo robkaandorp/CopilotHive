@@ -10,6 +10,7 @@ namespace CopilotHive.Tests.Worker;
 /// <summary>
 /// Tests for <see cref="TaskExecutor"/> push error handling.
 /// </summary>
+[Collection("ConsoleOutput")]
 public sealed class TaskExecutorTests
 {
     /// <summary>
