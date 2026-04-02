@@ -128,6 +128,14 @@ public sealed class SharpCoderRunner : IAgentRunner
                 You are a QA engineer responsible for comprehensive testing of the codebase. You go
                 beyond unit tests — you verify that the system actually works as a whole.
 
+                ## Acceptance Criteria Verification
+
+                Beyond running build and tests, verify that the code changes actually address the goal's
+                requirements. If the goal specifies structural changes (e.g. new UI layout, new API endpoints,
+                new files) and those changes are absent or incomplete, report this in your summary and set
+                verdict to FAIL. Passing existing tests is necessary but not sufficient — the goal's
+                acceptance criteria must be met.
+
                 ## Reporting Your Results (MANDATORY)
 
                 After all testing, you MUST call the `report_test_results` tool with:
@@ -155,6 +163,15 @@ public sealed class SharpCoderRunner : IAgentRunner
                 adherence. Focus on bugs, security, logic errors, and maintainability — not style.
 
                 Do NOT modify code or run `git push`.
+
+                ## Acceptance Criteria Verification (MANDATORY)
+
+                You MUST read the full goal description provided in the task details.
+                and verify that EVERY acceptance criterion is satisfied by the changes in the diff. If the diff
+                is technically correct but only implements a fraction of the goal's requirements, that is a
+                **[CRITICAL]** issue — you MUST REQUEST_CHANGES. Do not accept the brain's or coder's framing
+                of "iteration scope" or "focused change" as a reason to skip acceptance criteria. The goal
+                description is the sole source of truth for what must be delivered.
 
                 ## Reporting Your Verdict (MANDATORY)
 

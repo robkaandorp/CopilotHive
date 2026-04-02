@@ -58,6 +58,7 @@ public sealed class BuildRoleSystemPromptTests
 
         Assert.Contains("# Tester", prompt);
         Assert.Contains("report_test_results", prompt);
+        Assert.Contains("Acceptance Criteria Verification", prompt);
     }
 
     /// <summary>
@@ -74,6 +75,7 @@ public sealed class BuildRoleSystemPromptTests
         Assert.Contains("CRITICAL", prompt);
         Assert.Contains("MAJOR", prompt);
         Assert.Contains("MINOR", prompt);
+        Assert.Contains("Acceptance Criteria Verification", prompt);
     }
 
     /// <summary>
