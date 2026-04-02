@@ -397,7 +397,7 @@ public sealed class HiveOrchestratorService(
         if (pipeline is not null)
         {
             pipeline.ClearActiveTask();
-            if (workerRole != Workers.WorkerRole.Unspecified)
+            if (workerRole != Workers.WorkerRole.Unspecified && complete.Status != Shared.Grpc.TaskStatus.Failed)
             {
                 var outputText = !string.IsNullOrWhiteSpace(complete.Metrics?.Summary)
                     ? complete.Metrics.Summary
