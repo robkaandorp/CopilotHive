@@ -606,6 +606,8 @@ tr:last-child td { border-bottom: none; }
     border-radius: 6px;
     padding: 0.5rem 0.75rem;
     overflow-x: auto;
+    max-height: 400px;
+    overflow-y: auto;
     margin: 0.3em 0;
 }
 

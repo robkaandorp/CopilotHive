@@ -514,10 +514,15 @@
                     @* _storedIterations (from SQLite) *@
                     @if (_storedIterations.Count > 0)
                     {
+                        var storedActive = _selectedIteration > 0
+                            ? _selectedIteration
+                            : _storedIterations.FirstOrDefault()?.Iteration ?? 0;
                         <div class="iter-tabs">
                             @foreach (var iter in _storedIterations)
                             {
-                                <button class="iter-tab selected done" @onclick="() => SelectIteration(iter.Iteration)">
+                                var iterIsSelected = iter.Iteration == storedActive;
+                                <button class="iter-tab done @(iterIsSelected ? "selected" : "")"
+                                        @onclick="() => SelectIteration(iter.Iteration)">
                                     Iter @iter.Iteration
                                 </button>
                             }
@@ -525,19 +530,21 @@
 
                         @foreach (var iter in _storedIterations)
                         {
-                            @if ((_selectedIteration > 0 ? _selectedIteration : _storedIterations.First().Iteration) == iter.Iteration)
+                            @if (iter.Iteration == storedActive)
                             {
                                 <div class="phase-bar" style="margin-bottom:0.5rem">
                                     @foreach (var phase in iter.Phases)
                                     {
-                                        <span class="phase-box @(phase.Result == "pass" ? "completed" : phase.Result == "fail" ? "failed" : "skipped")">
+                                        var phaseKey = $"s{iter.Iteration}-{phase.Name}";
+                                        <button class="phase-box @(phase.Result == "pass" ? "completed" : phase.Result == "fail" ? "failed" : "skipped") @(_selectedPhase == phaseKey ? "selected" : "")"
+                                                @onclick="() => TogglePhase(phaseKey)">
                                             <span class="phase-box-icon">@(phase.Result == "pass" ? "✓" : phase.Result == "fail" ? "✗" : "~")</span>
                                             @phase.Name
                                             @if (phase.DurationSeconds > 0)
                                             {
                                                 <span class="phase-box-duration">@FormatDuration(phase.DurationSeconds)</span>
                                             }
-                                        </span>
+                                        </button>
                                     }
                                 </div>
 
@@ -570,6 +577,58 @@
                                             <li style="color:var(--text-muted)">@note</li>
                                         }
                                     </ul>
+                                }
+
+                                @* Phase detail panel for stored iterations *@
+                                @foreach (var phase in iter.Phases)
+                                {
+                                    var phaseKey = $"s{iter.Iteration}-{phase.Name}";
+                                    @if (_selectedPhase == phaseKey)
+                                    {
+                                        <div class="phase-detail">
+                                            <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem">
+                                                <strong>@phase.Name</strong>
+                                                <span class="badge @PhaseBadge(phase.Result == "pass" ? "completed" : phase.Result == "fail" ? "failed" : "pending")">@phase.Result</span>
+                                                @if (phase.DurationSeconds > 0)
+                                                {
+                                                    <span style="color:var(--text-muted)">Duration: @FormatDuration(phase.DurationSeconds)</span>
+                                                }
+                                                <button class="phase-detail-close" @onclick="ClearSelectedPhase" title="Close">✕</button>
+                                            </div>
+
+                                            @if (!string.IsNullOrEmpty(phase.WorkerOutput))
+                                            {
+                                                <div style="margin-bottom:0.75rem">
+                                                    <div class="label" style="margin-bottom:0.5rem">Worker Output</div>
+                                                    <div class="chat-msg-content">@((MarkupString)RenderMarkdown(phase.WorkerOutput))</div>
+                                                </div>
+                                            }
+
+                                            @* Show clarifications for this iteration, optionally filtered by phase *@
+                                            @{
+                                                var iterClars = iter.Clarifications
+                                                    .Where(c => string.Equals(c.Phase, phase.Name, StringComparison.OrdinalIgnoreCase))
+                                                    .ToList();
+                                            }
+                                            @if (iterClars.Count > 0)
+                                            {
+                                                <div style="margin-bottom:0.75rem">
+                                                    <div class="label" style="margin-bottom:0.5rem">Clarifications (@iterClars.Count)</div>
+                                                    @foreach (var clarification in iterClars)
+                                                    {
+                                                        <div style="margin-bottom:0.75rem;padding:0.5rem 0.75rem;border-left:3px solid var(--yellow);background:rgba(227,179,65,0.08);border-radius:4px">
+                                                            <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">
+                                                                @clarification.Timestamp.ToString("HH:mm:ss") UTC
+                                                            </div>
+                                                            <div style="margin-bottom:0.35rem"><strong>Q:</strong> @clarification.Question</div>
+                                                            <div style="margin-bottom:0.25rem"><strong>A:</strong> @clarification.Answer</div>
+                                                            <div style="font-size:0.75rem;color:var(--text-muted)">answered by: @clarification.AnsweredBy</div>
+                                                        </div>
+                                                    }
+                                                </div>
+                                            }
+                                        </div>
+                                    }
                                 }
                             }
                         }
@@ -765,12 +824,14 @@ else
         return current?.Number ?? _detail?.Iterations.LastOrDefault()?.Number ?? 0;
     }
 
-    private static string GetTabClass(IterationViewInfo iter) => iter switch
+    private string GetTabClass(IterationViewInfo iter)
     {
-        { IsCurrent: true } => "iter-tab selected current",
-        _ when iter.Phases.Any(p => p.Status == "failed") => "iter-tab selected failed",
-        _ => "iter-tab selected done",
-    };
+        var active = _selectedIteration > 0 ? _selectedIteration : GetActiveIteration();
+        var baseClass = iter.IsCurrent ? "iter-tab current"
+            : iter.Phases.Any(p => p.Status == "failed") ? "iter-tab failed"
+            : "iter-tab done";
+        return iter.Number == active ? baseClass + " selected" : baseClass;
+    }
 
     private static string StatusBadge(GoalStatus s) => s switch
     {
