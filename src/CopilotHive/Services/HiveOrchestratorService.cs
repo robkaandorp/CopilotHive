@@ -354,7 +354,7 @@ public sealed class HiveOrchestratorService(
                 case "get_goal":
                     var getGoalArgs = System.Text.Json.JsonDocument.Parse(request.ArgumentsJson);
                     var targetGoalId = getGoalArgs.RootElement.GetProperty("goal_id").GetString() ?? "";
-                    var targetGoal = goalStore != null ? await goalStore.GetGoalAsync(targetGoalId) : null;
+                    var targetGoal = goalStore != null ? await goalStore.GetGoalAsync(targetGoalId, ct) : null;
                     if (targetGoal is null)
                     {
                         resultJson = System.Text.Json.JsonSerializer.Serialize(
@@ -367,7 +367,7 @@ public sealed class HiveOrchestratorService(
                         status = targetGoal.Status.ToString(),
                         description = targetGoal.Description,
                         repositories = targetGoal.RepositoryNames,
-                        priority = targetGoal.Priority,
+                        priority = targetGoal.Priority.ToString(),
                     });
                     break;
 
