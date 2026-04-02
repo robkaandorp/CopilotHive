@@ -1,8 +1,50 @@
-## [Unreleased]
+## [0.7.0]
+
+### Added
+
+**GoalDetail page redesigned with 3-panel layout.** The Goal Detail page has been restructured into a top metadata strip, a two-column body (left: description/notes/failure info; right: iterations), and a bottom action strip. Iterations are now displayed as horizontal tabs instead of a vertical stack, with colour-coded tab states (green for completed, red for failed, blue for active). When no phase is selected, a live progress timeline shows a chronological feed of progress reports and clarifications from all phases of the current iteration, with auto-scroll.
+
+**Progress reports are now phase and iteration aware.** Progress reports (`report_progress` tool calls) are stored per pipeline rather than in a global circular buffer. Each entry carries the phase name and iteration number, so the dashboard can display progress history for all phases — including completed ones — not just the currently active phase. Clarification entries in the timeline also carry phase and iteration attribution.
+
+**Worker `get_goal` tool is now parameterless.** Workers can call `get_goal` with no arguments to recover the current goal's description after context compaction. The goal ID is injected by the worker runtime, preventing workers from accidentally fetching a different goal (e.g. a predecessor). The `IAgentRunner` interface gained `SetCurrentGoalId()` and `TaskExecutor` calls it when wiring up tasks.
+
+**Parallel goal dispatch.** Goals now execute concurrently up to a configurable `MaxParallelGoals` limit. Each goal runs with its own Brain session forked from a shared master session, allowing multiple goals to progress simultaneously without blocking on each other. When a goal completes, a summary is merged back into the master session so accumulated learnings are retained.
+
+**Composer multi-model support.** The Composer can switch between available LLM models via a dropdown in the chat UI. The model selection is persisted and applied to all subsequent Composer calls. Available models are read from the `hive-config.yaml` configuration.
+
+**Composer context status bar.** A context usage indicator in the Composer chat footer shows the current context window utilisation percentage and displays a live "compacting…" status when context compaction is running.
+
+**Composer goal creation pre-flight checklist.** The Composer's system prompt now includes a checklist of verification steps to run before creating a goal (file existence, repository assignment, code reference accuracy, worker capability constraints, scope sizing) and a policy requiring explicit user approval before dispatching any goal.
+
+**Worker resilient reconnect.** Workers now use an exponential-backoff retry loop when the orchestrator is unavailable at startup, making the system resilient to container startup ordering. Previously, workers would crash if the orchestrator was not yet ready.
+
+**Goals page filter persistence.** The Goals page filter settings (status, priority, repository, release) are now persisted across navigation so they survive page transitions and browser refreshes. A reset button clears all filters.
+
+**Goals page sticky header.** The filter bar and table headers on the Goals page remain pinned while scrolling through goal rows.
 
 ### Changed
 
-**Worker `get_goal` tool now takes no argument.** The worker-side `get_goal` tool has been simplified to take no parameters. The goal ID is now injected by the worker runtime, ensuring workers can only fetch their own current goal's description — not arbitrary goals. This prevents workers from fetching the wrong goal after context compaction while still allowing them to recover their own goal description when needed. The `IAgentRunner` interface gained `SetCurrentGoalId()`, `TaskExecutor` calls it when wiring up tasks, and `SharpCoderRunner` stores the goal ID for use in the parameterless tool.
+**Per-goal Brain sessions.** Each goal now receives its own Brain session forked from a persistent master session, replacing the previous single shared session. This prevents context from one goal polluting another, while still allowing the Brain to accumulate learnings across goals via the master session.
+
+**Worker report summary as authoritative output.** Workers' `report_*` tool call summaries are now used as the canonical output across the pipeline (stored in `PhaseOutputs`, shown in the dashboard). Previously, narrative text responses were used, which were less structured.
+
+**Reviewer receives coder output.** The reviewer's prompt now includes the coder's output from the current iteration, giving the reviewer context about what was implemented before inspecting the diff.
+
+**Prompt injections standardised with fenced blocks.** All prompt construction in `DistributedBrain.cs`, `GoalPipeline`, and worker prompts now wraps injected content in fenced delimiters to prevent prompt injection attacks and improve LLM parsing.
+
+**Acceptance criteria verification in hardcoded prompts.** The Reviewer and Tester hardcoded system prompts now include mandatory acceptance criteria verification blocks, instructing them to always read the full goal description and verify every criterion is met — not just that tests pass.
+
+### Fixed
+
+**Worker crashes now fail the goal immediately.** When a worker task returns `TaskOutcome.Failed` (infrastructure failure, unhandled exception), the goal is now immediately marked as failed rather than silently retrying or hanging.
+
+**Missing worker report treated as failure.** When a worker completes its session without calling the mandatory report tool (`report_test_results`, `report_review_verdict`, etc.), the phase is now treated as a failure rather than a silent pass.
+
+**Pipeline store cleanup on goal reset.** When a failed goal is reset to Draft, any out-of-memory pipeline state is now properly cleaned up from the pipeline store, preventing stale state from interfering with the next dispatch.
+
+**Composer model dropdown contrast.** Fixed the model selector dropdown in the Composer chat UI being illegible in dark theme due to insufficient contrast between text and background colours.
+
+**Dashboard elapsed time display.** Fixed the elapsed time display in the Active Goals table to freeze at the final value when goals complete, rather than continuing to increment.
 
 ## [0.6.0]
 
