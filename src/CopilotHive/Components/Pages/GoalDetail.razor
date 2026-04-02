@@ -609,6 +609,13 @@
                                 </div>
                                 <div class="iter-content">
 
+                                @if (!string.IsNullOrEmpty(iter.PlanReason))
+                                {
+                                    <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.5rem;font-style:italic">
+                                        \uD83D\uDCCB @iter.PlanReason
+                                    </div>
+                                }
+
                                 @if (iter.TestCounts is { } tc)
                                 {
                                     <div class="iter-summary-cards">
@@ -645,7 +652,6 @@
                                 {
                                     <div class="timeline-empty">No live progress — goal is not running.</div>
                                 }
-                                </div>
 
                                 @* Phase detail panel for stored iterations *@
                                 @foreach (var phase in iter.Phases)
@@ -727,6 +733,7 @@
                                         </div>
                                     }
                                 }
+                                </div>
                             }
                         }
                     }
