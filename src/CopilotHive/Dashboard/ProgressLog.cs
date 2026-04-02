@@ -64,6 +64,10 @@ public sealed class ProgressEntry
     public string WorkerId { get; init; } = "";
     /// <summary>Goal being worked on.</summary>
     public string GoalId { get; init; } = "";
+    /// <summary>Pipeline phase when the report was generated.</summary>
+    public string Phase { get; init; } = "";
+    /// <summary>Iteration number when the report was generated.</summary>
+    public int Iteration { get; init; }
     /// <summary>Status string from the worker.</summary>
     public string Status { get; init; } = "";
     /// <summary>Details message.</summary>

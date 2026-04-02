@@ -19,7 +19,6 @@ public sealed class HiveOrchestratorService(
     GoalDispatcher goalDispatcher,
     ILogger<HiveOrchestratorService> logger,
     AgentsManager? agentsManager = null,
-    Dashboard.ProgressLog? progressLog = null,
     IGoalStore? goalStore = null) : HiveOrchestrator.HiveOrchestratorBase
 {
 
@@ -347,7 +346,7 @@ public sealed class HiveOrchestratorService(
                     logger.LogInformation("Progress from {WorkerId}: [{Status}] {Details}",
                         worker.Id, status, details);
                     var progressPipeline = pipelineManager.GetByTaskId(request.TaskId);
-                    progressLog?.Add(worker.Id, progressPipeline?.GoalId ?? "", status, details);
+                    progressPipeline?.AddProgressReport(worker.Id, status, details);
                     resultJson = System.Text.Json.JsonSerializer.Serialize(new { acknowledged = true });
                     break;
 
