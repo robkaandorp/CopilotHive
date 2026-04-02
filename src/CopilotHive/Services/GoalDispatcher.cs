@@ -1622,12 +1622,19 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
     {
         var metrics = pipeline.Metrics;
 
+        // Extract craft-prompt pairs and planning prompts from the conversation
+        // so they are persisted on the PhaseResult and survive goal completion.
+        var craftPrompts = DashboardStateService.ExtractCraftPrompts(pipeline.Conversation, pipeline.Iteration);
+        var (planningPrompt, planningResponse) = DashboardStateService.ExtractPlanningPrompts(pipeline.Conversation, pipeline.Iteration);
+
         var phases = metrics.PhaseDurations
-            .Select(kvp =>
+            .Select((kvp, index) =>
             {
                 // Determine role key from phase name to look up output
                 var roleName = PhaseNameToRoleName(kvp.Key);
                 pipeline.PhaseOutputs.TryGetValue($"{roleName}-{pipeline.Iteration}", out var output);
+
+                craftPrompts.TryGetValue(roleName, out var prompts);
 
                 return new PhaseResult
                 {
@@ -1635,6 +1642,11 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
                     Result = failedPhase.HasValue && kvp.Key == failedPhase.Value.ToString() ? "fail" : "pass",
                     DurationSeconds = kvp.Value.TotalSeconds,
                     WorkerOutput = string.IsNullOrEmpty(output) ? null : output,
+                    BrainPrompt = prompts.BrainPrompt,
+                    WorkerPrompt = prompts.WorkerPrompt,
+                    // Attach planning prompts to the first phase (planning is per-iteration)
+                    PlanningPrompt = index == 0 ? planningPrompt : null,
+                    PlanningResponse = index == 0 ? planningResponse : null,
                 };
             })
             .ToList();
