@@ -69,14 +69,14 @@ public sealed class GoalPipelineManager
     /// <summary>Remove a completed pipeline to free memory and clean up storage.</summary>
     public bool RemovePipeline(string goalId)
     {
-        if (_pipelines.TryRemove(goalId, out _))
+        var wasInMemory = _pipelines.TryRemove(goalId, out _);
+        if (wasInMemory)
         {
             foreach (var key in _taskToGoal.Where(kv => kv.Value == goalId).Select(kv => kv.Key).ToList())
                 _taskToGoal.TryRemove(key, out _);
-            _store?.RemovePipeline(goalId);
-            return true;
         }
-        return false;
+        _store?.RemovePipeline(goalId);  // always clean up the store, even if not in memory
+        return wasInMemory;
     }
 
     /// <summary>Restore pipelines from persistent store (called once at startup).</summary>
