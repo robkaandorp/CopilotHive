@@ -2,6 +2,8 @@
 
 ### Added
 
+**Goal detail page layout.** The goal detail page now uses a structured flexbox layout with dedicated areas for the top metadata strip, side-by-side content panels (40%/60% split), and bottom action buttons. Added `.goal-detail-page` CSS class with `.goal-detail-top`, `.goal-detail-body`, `.goal-detail-left`, `.goal-detail-right`, and `.goal-detail-bottom` selectors for consistent spacing and scroll behavior.
+
 **Three-tier clarification system.** Workers can call `request_clarification` (renamed from `ask_user`) when facing ambiguous goals. Questions route through a three-tier resolution chain: first the Brain attempts to answer from its accumulated context, then the Composer LLM tries using a forked session (`AgentSession.Fork()`) for a one-shot auto-answer, and finally the question surfaces to the human via the Composer chat UI. The `escalate_to_composer` tool replaced the fragile string-based escalation mechanism with a proper tool call. Escalation now works during all Brain phases including planning and prompt crafting. Clarification exchanges (Q&A with answerer attribution) are logged and displayed on the goal detail page, and aggregated stats appear on the Orchestrator dashboard.
 
 **Hardcoded worker system prompts.** Mandatory safety rules (git push prohibition, role identity, tool call contracts, scope boundaries, clarification instructions) are now hardcoded in `SharpCoderRunner.BuildRoleSystemPrompt()` per worker role. AGENTS.md files are appended as supplementary "Learned Heuristics" after a separator. This prevents the improver from accidentally weakening or removing safety-critical instructions.
