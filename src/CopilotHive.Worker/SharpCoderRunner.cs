@@ -94,6 +94,7 @@ public sealed class SharpCoderRunner : IAgentRunner
             - NEVER run `git push` — the infrastructure handles pushing automatically.
             - NEVER run `git checkout`, `git branch`, or `git switch` — the infrastructure handles branching.
             - When the goal description is ambiguous, files-to-change seem incomplete, or acceptance criteria conflict, call `request_clarification` instead of guessing.
+            - Call `report_progress` at each meaningful step (e.g. "Reading files", "Building", "Tests passing", "Committing") so the user can follow your progress in real time.
             """;
 
         var roleSpecific = role switch
