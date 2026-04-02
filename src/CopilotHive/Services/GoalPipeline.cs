@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using CopilotHive.Dashboard;
 using CopilotHive.Goals;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
@@ -165,6 +166,12 @@ public sealed class GoalPipeline
     public ConcurrentBag<ClarificationEntry> Clarifications { get; } = [];
 
     /// <summary>
+    /// Progress reports (<c>report_progress</c> tool calls) generated during this goal's execution.
+    /// Stored per-pipeline for Phase/Iteration-aware dashboard filtering.
+    /// </summary>
+    public ConcurrentBag<ProgressEntry> ProgressReports { get; } = [];
+
+    /// <summary>
     /// When <c>true</c>, the active phase is paused waiting for a clarification answer.
     /// The dashboard displays this phase with status "waiting".
     /// </summary>
@@ -326,6 +333,21 @@ public sealed class GoalPipeline
     public void RecordOutput(WorkerRole role, int iteration, string output)
     {
         PhaseOutputs[$"{role.ToRoleName()}-{iteration}"] = output;
+    }
+
+    /// <summary>Records a worker progress report into the pipeline's per-pipeline log.</summary>
+    public void AddProgressReport(string workerId, string status, string details)
+    {
+        ProgressReports.Add(new ProgressEntry
+        {
+            Timestamp = DateTime.UtcNow,
+            WorkerId = workerId,
+            GoalId = GoalId,
+            Phase = Phase.ToString(),
+            Iteration = Iteration,
+            Status = status,
+            Details = details,
+        });
     }
 
     /// <summary>
