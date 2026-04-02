@@ -96,6 +96,14 @@ public sealed class PhaseResult
     public double DurationSeconds { get; init; }
     /// <summary>Raw worker output captured for this phase, or <c>null</c> if not recorded.</summary>
     public string? WorkerOutput { get; set; }
+    /// <summary>Brain prompt (user message) sent when crafting the worker prompt for this phase.</summary>
+    public string? BrainPrompt { get; set; }
+    /// <summary>Crafted worker prompt (Brain assistant message) for this phase.</summary>
+    public string? WorkerPrompt { get; set; }
+    /// <summary>Planning prompt sent to the Brain during the Planning phase.</summary>
+    public string? PlanningPrompt { get; set; }
+    /// <summary>Brain response to the Planning prompt.</summary>
+    public string? PlanningResponse { get; set; }
 }
 
 /// <summary>Aggregate test counts from a tester run.</summary>

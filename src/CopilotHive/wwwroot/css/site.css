@@ -460,6 +460,52 @@ tr:last-child td { border-bottom: none; }
     color: var(--text-muted);
 }
 
+/* Iteration tabs */
+.iter-tabs {
+    display: flex;
+    gap: 0.25rem;
+    margin-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.5rem;
+}
+
+.iter-tab {
+    padding: 0.3rem 0.75rem;
+    border-radius: 6px 6px 0 0;
+    border: 1px solid var(--border);
+    border-bottom: none;
+    background: var(--bg);
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.iter-tab:hover { border-color: var(--accent); }
+.iter-tab.selected { background: var(--bg-card); color: var(--text); border-color: var(--accent); border-bottom: 2px solid var(--accent); }
+.iter-tab.done { color: var(--green); }
+.iter-tab.failed { color: var(--red); }
+.iter-tab.current { color: var(--accent); }
+
+.phase-box.selected {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+    animation: none;
+}
+
+.phase-detail-close {
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 1rem;
+    cursor: pointer;
+    padding: 0.25rem;
+    line-height: 1;
+}
+.phase-detail-close:hover { color: var(--text); }
+
 /* Goal detail: failure reason callout */
 .failure-callout {
     background: rgba(248, 81, 73, 0.1);
@@ -560,6 +606,8 @@ tr:last-child td { border-bottom: none; }
     border-radius: 6px;
     padding: 0.5rem 0.75rem;
     overflow-x: auto;
+    max-height: 400px;
+    overflow-y: auto;
     margin: 0.3em 0;
 }
 
