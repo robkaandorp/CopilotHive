@@ -1375,6 +1375,15 @@ tr:last-child td { border-bottom: none; }
     font-style: italic;
 }
 
+.timeline-awaiting {
+    animation: timeline-pulse 2s ease-in-out infinite;
+}
+
+@keyframes timeline-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
 .timeline-empty {
     text-align: center;
     color: var(--text-muted);
