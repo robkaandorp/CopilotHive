@@ -12,7 +12,6 @@
 @inject HttpClient HttpClient
 @inject PageHeaderState PageHeader
 
-<div class="goal-detail-page">
 <div class="goal-header" style="display:flex;align-items:center;gap:1rem;">
     @{ var repoNames = _storedGoal?.RepositoryNames ?? _detail?.RepositoryNames ?? []; }
     @foreach (var repo in repoNames)
@@ -637,7 +636,6 @@ else
 {
     <p style="color:var(--text-muted)">Goal not found.</p>
 }
-</div>
 
 @code {
     [Parameter] public string GoalId { get; set; } = "";
