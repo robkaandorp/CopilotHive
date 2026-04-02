@@ -5,12 +5,13 @@
 @inject IJSRuntime JS
 @inject HttpClient HttpClient
 @inject PageHeaderState PageHeader
+@inject GoalsFilterState FilterState
 
 <!-- Filter Bar -->
 <div class="filter-bar">
-    <input type="text" placeholder="Search goals…" @bind="_searchText" @bind:event="oninput" @bind:after="ApplyFilters" />
+    <input type="text" placeholder="Search goals…" @bind="FilterState.SearchText" @bind:event="oninput" @bind:after="ApplyFilters" />
 
-    <select @bind="_statusFilter" @bind:after="ApplyFilters">
+    <select @bind="FilterState.StatusFilter" @bind:after="ApplyFilters">
         <option value="">All statuses</option>
         @foreach (var s in Enum.GetValues<GoalStatus>())
         {
@@ -18,7 +19,7 @@
         }
     </select>
 
-    <select @bind="_priorityFilter" @bind:after="ApplyFilters">
+    <select @bind="FilterState.PriorityFilter" @bind:after="ApplyFilters">
         <option value="">All priorities</option>
         @foreach (var p in Enum.GetValues<GoalPriority>())
         {
@@ -26,7 +27,7 @@
         }
     </select>
 
-    <select @bind="_repoFilter" @bind:after="ApplyFilters">
+    <select @bind="FilterState.RepoFilter" @bind:after="ApplyFilters">
         <option value="">All repositories</option>
         @foreach (var r in _allRepoNames)
         {
@@ -34,18 +35,23 @@
         }
     </select>
 
-    <select @bind="_releaseFilter" @bind:after="ApplyFilters">
-        <option value="@ReleaseFilterUnreleased">Unreleased</option>
+    <select @bind="FilterState.ReleaseFilter" @bind:after="ApplyFilters">
+        <option value="@GoalsFilterState.ReleaseFilterUnreleased">Unreleased</option>
         @foreach (var rel in _planningReleases)
         {
             <option value="@rel.Id">📋 @rel.Tag</option>
         }
-        <option value="@ReleaseFilterAll">All releases</option>
+        <option value="@GoalsFilterState.ReleaseFilterAll">All releases</option>
         @foreach (var rel in _releasedReleases)
         {
             <option value="@rel.Id">@rel.Tag</option>
         }
     </select>
+
+    @if (!FilterState.IsDefault)
+    {
+        <button class="filter-reset-btn" @onclick="ResetFilters" title="Reset filters">✕ Reset</button>
+    }
 
     <span class="filter-count">@_filtered.Count goal(s)</span>
 </div>
@@ -151,17 +157,9 @@ else if (_loaded)
 }
 
 @code {
-    private const string ReleaseFilterUnreleased = "__unreleased__";
-    private const string ReleaseFilterAll = "";
-
     private List<Goal> _allGoals = [];
     private List<Goal> _filtered = [];
     private List<Release> _allReleases = [];
-    private string _searchText = "";
-    private string _statusFilter = "";
-    private string _priorityFilter = "";
-    private string _repoFilter = "";
-    private string _releaseFilter = ReleaseFilterUnreleased;
     private bool _loaded;
     private Dictionary<string, string> _approveErrors = new();
     private Dictionary<string, string> _revertErrors = new();
@@ -206,20 +204,20 @@ else if (_loaded)
     {
         var query = _allGoals.AsEnumerable();
 
-        if (!string.IsNullOrWhiteSpace(_statusFilter) && Enum.TryParse<GoalStatus>(_statusFilter, out var status))
+        if (!string.IsNullOrWhiteSpace(FilterState.StatusFilter) && Enum.TryParse<GoalStatus>(FilterState.StatusFilter, out var status))
             query = query.Where(g => g.Status == status);
 
-        if (!string.IsNullOrWhiteSpace(_priorityFilter) && Enum.TryParse<GoalPriority>(_priorityFilter, out var priority))
+        if (!string.IsNullOrWhiteSpace(FilterState.PriorityFilter) && Enum.TryParse<GoalPriority>(FilterState.PriorityFilter, out var priority))
             query = query.Where(g => g.Priority == priority);
 
-        if (!string.IsNullOrWhiteSpace(_repoFilter))
-            query = query.Where(g => g.RepositoryNames.Contains(_repoFilter, StringComparer.OrdinalIgnoreCase));
+        if (!string.IsNullOrWhiteSpace(FilterState.RepoFilter))
+            query = query.Where(g => g.RepositoryNames.Contains(FilterState.RepoFilter, StringComparer.OrdinalIgnoreCase));
 
         // Release filter:
         //   ReleaseFilterUnreleased → goals not assigned to any release (ReleaseId is null/empty)
         //   ReleaseFilterAll        → no release filter applied
         //   any other value         → specific release ID
-        if (_releaseFilter == ReleaseFilterUnreleased)
+        if (FilterState.ReleaseFilter == GoalsFilterState.ReleaseFilterUnreleased)
         {
             // Include goals with no release assignment OR goals assigned to a Planning release
             // (Planning releases are not yet shipped, so their goals are still "unreleased").
@@ -227,23 +225,23 @@ else if (_loaded)
                 string.IsNullOrEmpty(g.ReleaseId) ||
                 (_releaseStatusById.TryGetValue(g.ReleaseId, out var releaseStatus) && releaseStatus == ReleaseStatus.Planning));
         }
-        else if (_releaseFilter != ReleaseFilterAll)
+        else if (FilterState.ReleaseFilter != GoalsFilterState.ReleaseFilterAll)
         {
             // Find the selected release, then include goals from all releases sharing the same tag
             // AND the same status, so Released and Planning releases with identical tags don't bleed.
-            var selectedRelease = _allReleases.FirstOrDefault(r => r.Id == _releaseFilter);
+            var selectedRelease = _allReleases.FirstOrDefault(r => r.Id == FilterState.ReleaseFilter);
             var taggedReleaseIds = selectedRelease is not null
                 ? _allReleases
                     .Where(r => r.Tag == selectedRelease.Tag && r.Status == selectedRelease.Status)
                     .Select(r => r.Id)
                     .ToHashSet()
-                : new HashSet<string> { _releaseFilter };
+                : new HashSet<string> { FilterState.ReleaseFilter };
             query = query.Where(g => g.ReleaseId is not null && taggedReleaseIds.Contains(g.ReleaseId));
         }
 
-        if (!string.IsNullOrWhiteSpace(_searchText))
+        if (!string.IsNullOrWhiteSpace(FilterState.SearchText))
         {
-            var term = _searchText.Trim();
+            var term = FilterState.SearchText.Trim();
             query = query.Where(g =>
                 g.Id.Contains(term, StringComparison.OrdinalIgnoreCase) ||
                 g.Description.Contains(term, StringComparison.OrdinalIgnoreCase) ||
@@ -255,6 +253,12 @@ else if (_loaded)
             .ThenByDescending(g => g.Status == GoalStatus.Pending)
             .ThenByDescending(g => g.CreatedAt)
             .ToList();
+    }
+
+    private void ResetFilters()
+    {
+        FilterState.Reset();
+        ApplyFilters();
     }
 
     private static string StatusBadge(GoalStatus s) => s switch
