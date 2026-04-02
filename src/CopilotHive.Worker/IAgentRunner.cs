@@ -27,6 +27,9 @@ public interface IAgentRunner : IAsyncDisposable
     /// <summary>Sets the current task ID for tool call context.</summary>
     void SetCurrentTaskId(string? taskId);
 
+    /// <summary>Sets the current goal ID for the get_goal tool context.</summary>
+    void SetCurrentGoalId(string? goalId);
+
     /// <summary>Sets the custom agent configuration for the specified role.</summary>
     void SetCustomAgent(WorkerRole role, string agentsMdContent);
 

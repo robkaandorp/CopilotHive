@@ -98,6 +98,7 @@ public sealed class TaskExecutorSessionTests
         public void ClearWorkerReport() => LastWorkerReport = null;
         public void SetToolBridge(IToolCallBridge? bridge) { }
         public void SetCurrentTaskId(string? taskId) { }
+        public void SetCurrentGoalId(string? goalId) { }
         public void SetCustomAgent(WorkerRole role, string agentsMdContent) { }
 
         public void SetSession(object? session)

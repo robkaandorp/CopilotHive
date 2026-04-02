@@ -1,3 +1,9 @@
+## [Unreleased]
+
+### Changed
+
+**Worker `get_goal` tool now takes no argument.** The worker-side `get_goal` tool has been simplified to take no parameters. The goal ID is now injected by the worker runtime, ensuring workers can only fetch their own current goal's description — not arbitrary goals. This prevents workers from fetching the wrong goal after context compaction while still allowing them to recover their own goal description when needed. The `IAgentRunner` interface gained `SetCurrentGoalId()`, `TaskExecutor` calls it when wiring up tasks, and `SharpCoderRunner` stores the goal ID for use in the parameterless tool.
+
 ## [0.6.0]
 
 ### Added

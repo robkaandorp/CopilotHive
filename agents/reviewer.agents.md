@@ -52,3 +52,7 @@ responsible for the method's flaws.
 
 If the goal description contains an "## Out of scope" section, those items are
 explicitly excluded from review. Do not REQUEST_CHANGES for them regardless of severity.
+
+## Acceptance Criteria Completeness
+
+Always read the full goal description — if it has been compacted away, call `get_goal` (no argument — it always returns the current goal's description).

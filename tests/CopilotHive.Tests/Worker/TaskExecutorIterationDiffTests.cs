@@ -30,6 +30,7 @@ public sealed class TaskExecutorIterationDiffTests
         public void ClearWorkerReport() { }
         public void SetToolBridge(IToolCallBridge? bridge) { }
         public void SetCurrentTaskId(string? taskId) { }
+        public void SetCurrentGoalId(string? goalId) { }
         public void SetCustomAgent(WorkerRole role, string agentsMdContent) { }
         public void SetSession(object? session) => _session = session;
         public object? GetSession() => _session;
