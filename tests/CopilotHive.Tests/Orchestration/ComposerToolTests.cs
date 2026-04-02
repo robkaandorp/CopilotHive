@@ -1027,6 +1027,108 @@ public sealed class ComposerToolTests : IDisposable
         Assert.DoesNotContain(" — ", result);
     }
 
+    [Fact]
+    public async Task GetGoal_WithClarifications_DisplaysClarificationsInIteration()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("iter-clarif", "Goal with clarifications");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 30.0 }],
+            Clarifications =
+            [
+                new PersistedClarification
+                {
+                    Timestamp = new DateTime(2024, 6, 1, 12, 0, 0, DateTimeKind.Utc),
+                    Phase = "Coding",
+                    WorkerRole = "coder",
+                    Question = "Which pattern should I use?",
+                    Answer = "Use repository pattern.",
+                    AnsweredBy = "brain",
+                },
+            ],
+        };
+        await _store.AddIterationAsync("iter-clarif", summary, ct);
+
+        var result = await _composer.GetGoalAsync("iter-clarif");
+
+        // Clarifications section header
+        Assert.Contains("  Clarifications:", result);
+        // Clarification entry format: [AnsweredBy] WorkerRole (Phase): Q: Question
+        Assert.Contains("  - [brain] coder (Coding): Q: Which pattern should I use?", result);
+        // Answer line
+        Assert.Contains("    A: Use repository pattern.", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_WithMultipleClarifications_DisplaysAll()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("iter-multi-clarif", "Goal with multiple clarifications");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 30.0 },
+                new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 60.0 },
+            ],
+            Clarifications =
+            [
+                new PersistedClarification
+                {
+                    Timestamp = new DateTime(2024, 6, 1, 12, 0, 0, DateTimeKind.Utc),
+                    Phase = "Coding",
+                    WorkerRole = "coder",
+                    Question = "What pattern?",
+                    Answer = "Repository.",
+                    AnsweredBy = "brain",
+                },
+                new PersistedClarification
+                {
+                    Timestamp = new DateTime(2024, 6, 1, 12, 30, 0, DateTimeKind.Utc),
+                    Phase = "Testing",
+                    WorkerRole = "tester",
+                    Question = "Run integration tests?",
+                    Answer = "Yes, run them.",
+                    AnsweredBy = "composer",
+                },
+            ],
+        };
+        await _store.AddIterationAsync("iter-multi-clarif", summary, ct);
+
+        var result = await _composer.GetGoalAsync("iter-multi-clarif");
+
+        // Both clarifications should appear
+        Assert.Contains("  - [brain] coder (Coding): Q: What pattern?", result);
+        Assert.Contains("    A: Repository.", result);
+        Assert.Contains("  - [composer] tester (Testing): Q: Run integration tests?", result);
+        Assert.Contains("    A: Yes, run them.", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_NoClarifications_OmitsClarificationsSection()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("iter-no-clarif", "Goal without clarifications");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 10.0 }],
+            Clarifications = [],
+        };
+        await _store.AddIterationAsync("iter-no-clarif", summary, ct);
+
+        var result = await _composer.GetGoalAsync("iter-no-clarif");
+
+        // No clarifications section should appear
+        Assert.DoesNotContain("  Clarifications:", result);
+    }
+
     // ── get_phase_output ──
 
     [Fact]

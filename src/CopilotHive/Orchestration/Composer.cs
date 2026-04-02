@@ -1001,6 +1001,16 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
                         line += $" — {iter.TestCounts.Passed}/{iter.TestCounts.Total}";
                     sb.AppendLine(line);
                 }
+
+                if (iter.Clarifications is { Count: > 0 })
+                {
+                    sb.AppendLine("  Clarifications:");
+                    foreach (var c in iter.Clarifications)
+                    {
+                        sb.AppendLine($"  - [{c.AnsweredBy}] {c.WorkerRole} ({c.Phase}): Q: {c.Question}");
+                        sb.AppendLine($"    A: {c.Answer}");
+                    }
+                }
             }
         }
 
