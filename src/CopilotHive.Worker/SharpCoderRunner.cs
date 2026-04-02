@@ -166,7 +166,7 @@ public sealed class SharpCoderRunner : IAgentRunner
 
                 ## Acceptance Criteria Verification (MANDATORY)
 
-                You MUST read the full goal description (use `get_goal` if the task description is insufficient)
+                You MUST read the full goal description provided in the task details.
                 and verify that EVERY acceptance criterion is satisfied by the changes in the diff. If the diff
                 is technically correct but only implements a fraction of the goal's requirements, that is a
                 **[CRITICAL]** issue — you MUST REQUEST_CHANGES. Do not accept the brain's or coder's framing
