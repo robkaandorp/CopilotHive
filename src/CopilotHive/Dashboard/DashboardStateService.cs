@@ -181,7 +181,7 @@ public sealed class DashboardStateService : IDisposable
         var pipelines = _pipelineManager.GetAllPipelines();
         var all = pipelines
             .SelectMany(p => p.ProgressReports)
-            .OrderByDescending(e => e.Timestamp)
+            .OrderBy(e => e.Timestamp)
             .Take(count)
             .ToList();
 
@@ -204,17 +204,18 @@ public sealed class DashboardStateService : IDisposable
         var pipelineEntries = pipelines
             .SelectMany(p => p.ProgressReports)
             .Where(e => e.WorkerId == workerId)
-            .OrderByDescending(e => e.Timestamp)
+            .OrderBy(e => e.Timestamp)
             .Take(count)
             .ToList();
 
         // Supplement with global log for historical entries
         var globalEntries = _progressLog.GetRecent(500)
             .Where(e => e.WorkerId == workerId &&
-                !pipelineEntries.Any(p => p.Timestamp == e.Timestamp && p.GoalId == e.GoalId));
+                !pipelineEntries.Any(p => p.Timestamp == e.Timestamp && p.GoalId == e.GoalId))
+            .OrderBy(e => e.Timestamp);
 
         return pipelineEntries.Concat(globalEntries)
-            .OrderByDescending(e => e.Timestamp)
+            .OrderBy(e => e.Timestamp)
             .Take(count)
             .ToList();
     }
@@ -227,7 +228,7 @@ public sealed class DashboardStateService : IDisposable
         if (pipeline is not null)
         {
             return pipeline.ProgressReports
-                .OrderByDescending(e => e.Timestamp)
+                .OrderBy(e => e.Timestamp)
                 .Take(count)
                 .ToList();
         }
@@ -235,7 +236,8 @@ public sealed class DashboardStateService : IDisposable
         // Fall back to global log for completed goals
         return _progressLog.GetRecent(500)
             .Where(e => e.GoalId == goalId)
-            .TakeLast(count)
+            .OrderBy(e => e.Timestamp)
+            .Take(count)
             .ToList();
     }
 
@@ -286,6 +288,10 @@ public sealed class DashboardStateService : IDisposable
                     Name = "Planning",
                     RoleName = "",
                     Status = "completed",
+                    ProgressReports = pipeline?.ProgressReports
+                        .Where(p => p.Iteration == summary.Iteration && p.Phase == "Planning")
+                        .OrderBy(p => p.Timestamp)
+                        .ToList() ?? [],
                 },
             };
 
@@ -334,6 +340,10 @@ public sealed class DashboardStateService : IDisposable
                     BrainPrompt = summaryPhasePrompts.BrainPrompt,
                     WorkerPrompt = summaryPhasePrompts.WorkerPrompt,
                     Clarifications = summaryClarifications ?? [],
+                    ProgressReports = pipeline?.ProgressReports
+                        .Where(p => p.Iteration == summary.Iteration && p.Phase == pr.Name)
+                        .OrderBy(p => p.Timestamp)
+                        .ToList() ?? [],
                 });
             }
 
@@ -374,6 +384,7 @@ public sealed class DashboardStateService : IDisposable
                     Status = planningStatus,
                     ProgressReports = pipeline.ProgressReports
                         .Where(p => p.Iteration == currentIter && p.Phase == "Planning")
+                        .OrderBy(p => p.Timestamp)
                         .ToList(),
                 },
             };
@@ -430,6 +441,7 @@ public sealed class DashboardStateService : IDisposable
                         Verdict = hasMetrics && isTestPhase ? metrics.Verdict?.ToString() : null,
                         ProgressReports = pipeline.ProgressReports
                             .Where(p => p.Iteration == currentIter && p.Phase == phase.ToString())
+                            .OrderBy(p => p.Timestamp)
                             .ToList(),
                         BrainPrompt = phasePrompts.BrainPrompt,
                         WorkerPrompt = phasePrompts.WorkerPrompt,
