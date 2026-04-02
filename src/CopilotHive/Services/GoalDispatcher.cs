@@ -581,6 +581,16 @@ public sealed class GoalDispatcher : BackgroundService
 
     private async Task DriveNextPhaseAsync(GoalPipeline pipeline, TaskResult result, CancellationToken ct)
     {
+        // Early-exit guard: a crashed/failed worker should not continue through the pipeline.
+        // Recording the crash output as normal output would pollute iteration data.
+        if (result.Status == TaskOutcome.Failed)
+        {
+            var truncatedOutput = result.Output.Length > 300 ? result.Output[..300] + "..." : result.Output;
+            _logger.LogError("Worker for goal {GoalId} failed with output: {Output}", pipeline.GoalId, result.Output);
+            await MarkGoalFailed(pipeline, $"Worker failed: {truncatedOutput}", ct);
+            return;
+        }
+
         // Extract the iteration-start SHA from coder results so the reviewer can later compute
         // a scoped diff (git diff {sha}..HEAD) showing only this iteration's changes.
         // The SHA comes from the worker's feature-branch clone, which is correct — unlike the
