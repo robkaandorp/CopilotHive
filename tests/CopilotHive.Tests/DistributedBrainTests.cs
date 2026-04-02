@@ -820,11 +820,6 @@ public sealed class DistributedBrainTests
             const string ExpectedQuestion = "What is the retry limit?";
             const string ExpectedReason = "Requires domain knowledge outside the codebase";
 
-            var brain = new DistributedBrain(
-                "test-model",
-                NullLogger<DistributedBrain>.Instance,
-                stateDir: tmpDir);
-
             // Inject a fake IChatClient that drives the tool-call loop:
             // Call 1: returns escalate_to_composer tool call
             // Call 2: returns plain text (after tool result is processed by CodingAgent)
@@ -834,18 +829,13 @@ public sealed class DistributedBrainTests
                 toolArguments: new Dictionary<string, object?> { ["question"] = ExpectedQuestion, ["reason"] = ExpectedReason },
                 finalReply: "Escalation recorded.");
 
-            // Connect first (creates real client/agent state), then inject fake client
+            var brain = new DistributedBrain(
+                "test-model",
+                NullLogger<DistributedBrain>.Instance,
+                stateDir: tmpDir,
+                chatClient: stubClient);
+
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-            var chatClientField = typeof(DistributedBrain)
-                .GetField("_chatClient", BindingFlags.NonPublic | BindingFlags.Instance)
-                ?? throw new InvalidOperationException("_chatClient field not found");
-            chatClientField.SetValue(brain, stubClient);
-
-            var recreateMethod = typeof(DistributedBrain)
-                .GetMethod("RecreateAgent", BindingFlags.NonPublic | BindingFlags.Instance)
-                ?? throw new InvalidOperationException("RecreateAgent method not found");
-            recreateMethod.Invoke(brain, null);
 
             // Act
             var response = await brain.AskQuestionAsync(
@@ -1546,7 +1536,7 @@ public sealed class DistributedBrainTests
         try
         {
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir);
+                stateDir: tempDir, chatClient: new FakeChatClient());
 
             // Need to connect to initialize the agent
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
@@ -1578,7 +1568,7 @@ public sealed class DistributedBrainTests
         try
         {
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir);
+                stateDir: tempDir, chatClient: new FakeChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
             // Inject a message into the master session using reflection
@@ -1612,7 +1602,7 @@ public sealed class DistributedBrainTests
         try
         {
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir);
+                stateDir: tempDir, chatClient: new FakeChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
             // Create two different goal sessions with different message histories
@@ -1665,7 +1655,7 @@ public sealed class DistributedBrainTests
         try
         {
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir);
+                stateDir: tempDir, chatClient: new FakeChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
             // Fork a goal session
@@ -1698,7 +1688,7 @@ public sealed class DistributedBrainTests
         try
         {
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir);
+                stateDir: tempDir, chatClient: new FakeChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
             // Get fields via reflection
@@ -1774,7 +1764,7 @@ public sealed class DistributedBrainTests
 
             // Act: connect triggers migration
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir);
+                stateDir: tempDir, chatClient: new FakeChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
             // Assert: migration occurred
@@ -1803,7 +1793,7 @@ public sealed class DistributedBrainTests
         try
         {
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir);
+                stateDir: tempDir, chatClient: new FakeChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
             // Add a message to the master session
@@ -1849,26 +1839,15 @@ public sealed class DistributedBrainTests
         try
         {
             // Arrange: create brain with a stub client that returns a valid iteration plan
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir);
-
             var stubClient = new IterationPlanStubClient(
                 callId: "call-plan-1",
                 phases: ["coding", "testing", "review", "merging"],
                 reason: "Standard workflow");
 
-            // Connect first (creates real client/agent state), then inject fake client
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: stubClient);
+
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-            var chatClientField = typeof(DistributedBrain)
-                .GetField("_chatClient", BindingFlags.NonPublic | BindingFlags.Instance)
-                ?? throw new InvalidOperationException("_chatClient field not found");
-            chatClientField.SetValue(brain, stubClient);
-
-            var recreateMethod = typeof(DistributedBrain)
-                .GetMethod("RecreateAgent", BindingFlags.NonPublic | BindingFlags.Instance)
-                ?? throw new InvalidOperationException("RecreateAgent method not found");
-            recreateMethod.Invoke(brain, null);
 
             // Fork sessions for two goals with unique markers
             await brain.ForkSessionForGoalAsync("goal-A", TestContext.Current.CancellationToken);
@@ -1926,26 +1905,15 @@ public sealed class DistributedBrainTests
         try
         {
             // Arrange: create brain with a stub client
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir);
-
             var stubClient = new IterationPlanStubClient(
                 callId: "call-plan-concurrent",
                 phases: ["coding", "testing", "review"],
                 reason: "Concurrent test plan");
 
-            // Connect first (creates real client/agent state), then inject fake client
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: stubClient);
+
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-            var chatClientField = typeof(DistributedBrain)
-                .GetField("_chatClient", BindingFlags.NonPublic | BindingFlags.Instance)
-                ?? throw new InvalidOperationException("_chatClient field not found");
-            chatClientField.SetValue(brain, stubClient);
-
-            var recreateMethod = typeof(DistributedBrain)
-                .GetMethod("RecreateAgent", BindingFlags.NonPublic | BindingFlags.Instance)
-                ?? throw new InvalidOperationException("RecreateAgent method not found");
-            recreateMethod.Invoke(brain, null);
 
             // Fork sessions for two goals with unique markers
             await brain.ForkSessionForGoalAsync("goal-A", TestContext.Current.CancellationToken);
@@ -2028,27 +1996,16 @@ public sealed class DistributedBrainTests
         Directory.CreateDirectory(tempDir);
         try
         {
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir);
-
             // Use a stub that returns a predictable summary
             var stubClient = new IterationPlanStubClient(
                 callId: "call-summary-1",
                 phases: ["coding", "testing"],
                 reason: "Test summary");
 
-            // Connect first, then inject fake client
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: stubClient);
+
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-            var chatClientField = typeof(DistributedBrain)
-                .GetField("_chatClient", BindingFlags.NonPublic | BindingFlags.Instance)
-                ?? throw new InvalidOperationException("_chatClient field not found");
-            chatClientField.SetValue(brain, stubClient);
-
-            var recreateMethod = typeof(DistributedBrain)
-                .GetMethod("RecreateAgent", BindingFlags.NonPublic | BindingFlags.Instance)
-                ?? throw new InvalidOperationException("RecreateAgent method not found");
-            recreateMethod.Invoke(brain, null);
 
             // Get fields via reflection
             var masterSessionField = typeof(DistributedBrain)
@@ -2107,7 +2064,7 @@ public sealed class DistributedBrainTests
         try
         {
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir);
+                stateDir: tempDir, chatClient: new FakeChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
             // Get fields via reflection
@@ -2151,27 +2108,17 @@ public sealed class DistributedBrainTests
         Directory.CreateDirectory(tempDir);
         try
         {
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir);
-
             // Use a stub client for normal setup
             var stubClient = new IterationPlanStubClient(
                 callId: "call-summary-fail",
                 phases: ["coding"],
                 reason: "Test");
 
-            // Connect first, then inject fake client
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: stubClient);
+
+            // Connect
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-            var chatClientField = typeof(DistributedBrain)
-                .GetField("_chatClient", BindingFlags.NonPublic | BindingFlags.Instance)
-                ?? throw new InvalidOperationException("_chatClient field not found");
-            chatClientField.SetValue(brain, stubClient);
-
-            var recreateMethod = typeof(DistributedBrain)
-                .GetMethod("RecreateAgent", BindingFlags.NonPublic | BindingFlags.Instance)
-                ?? throw new InvalidOperationException("RecreateAgent method not found");
-            recreateMethod.Invoke(brain, null);
 
             // Create a goal session
             var goalId = "goal-cancel-test";

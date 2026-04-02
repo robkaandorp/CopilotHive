@@ -107,13 +107,16 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <param name="repoManager">Optional manager for persistent Brain repo clones (read-only file access).</param>
     /// <param name="stateDir">Directory for persistent state (session files). Defaults to <c>/app/state</c>.</param>
     /// <param name="goalStore">Optional goal store used by the <c>get_goal</c> tool to retrieve goal details on demand.</param>
+    /// <param name="chatClient">Optional pre-built <see cref="IChatClient"/>. When supplied, <see cref="ConnectAsync"/> skips
+    /// the <c>ChatClientFactory</c> and uses this instance instead — useful in tests that need to avoid real credentials.</param>
     public DistributedBrain(string modelOverride, ILogger<DistributedBrain> logger,
         MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null,
         int maxContextTokens = Constants.DefaultBrainContextWindow,
         int maxSteps = Constants.DefaultBrainMaxSteps,
         IBrainRepoManager? repoManager = null,
         string? stateDir = null,
-        IGoalStore? goalStore = null)
+        IGoalStore? goalStore = null,
+        IChatClient? chatClient = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -123,6 +126,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _repoManager = repoManager;
         _agentsManager = agentsManager;
         _goalStore = goalStore;
+        _chatClient = chatClient;
         _stateDir = stateDir ?? "/app/state";
         _masterSession = AgentSession.Create("brain");
         _session = _masterSession;
@@ -146,7 +150,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     {
         _logger.LogInformation("Brain connecting with model '{Model}'…", _modelOverride);
 
-        _chatClient = SDK.ChatClientFactory.Create(_modelOverride);
+        _chatClient ??= SDK.ChatClientFactory.Create(_modelOverride);
 
         // Try to load a persisted master session from a previous run.
         // Migrate legacy brain-session.json to brain-master.json if needed.
