@@ -2,6 +2,7 @@ using System.Reflection;
 using Grpc.Core;
 using Microsoft.Extensions.Logging;
 using CopilotHive.Agents;
+using CopilotHive.Goals;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
 
@@ -18,7 +19,8 @@ public sealed class HiveOrchestratorService(
     GoalDispatcher goalDispatcher,
     ILogger<HiveOrchestratorService> logger,
     AgentsManager? agentsManager = null,
-    Dashboard.ProgressLog? progressLog = null) : HiveOrchestrator.HiveOrchestratorBase
+    Dashboard.ProgressLog? progressLog = null,
+    IGoalStore? goalStore = null) : HiveOrchestrator.HiveOrchestratorBase
 {
 
 
@@ -347,6 +349,26 @@ public sealed class HiveOrchestratorService(
                     var progressPipeline = pipelineManager.GetByTaskId(request.TaskId);
                     progressLog?.Add(worker.Id, progressPipeline?.GoalId ?? "", status, details);
                     resultJson = System.Text.Json.JsonSerializer.Serialize(new { acknowledged = true });
+                    break;
+
+                case "get_goal":
+                    var getGoalArgs = System.Text.Json.JsonDocument.Parse(request.ArgumentsJson);
+                    var targetGoalId = getGoalArgs.RootElement.GetProperty("goal_id").GetString() ?? "";
+                    var targetGoal = goalStore != null ? await goalStore.GetGoalAsync(targetGoalId, ct) : null;
+                    if (targetGoal is null)
+                    {
+                        resultJson = System.Text.Json.JsonSerializer.Serialize(
+                            new { error = $"Goal '{targetGoalId}' not found." });
+                        break;
+                    }
+                    resultJson = System.Text.Json.JsonSerializer.Serialize(new
+                    {
+                        id = targetGoal.Id,
+                        status = targetGoal.Status.ToString(),
+                        description = targetGoal.Description,
+                        repositories = targetGoal.RepositoryNames,
+                        priority = targetGoal.Priority.ToString(),
+                    });
                     break;
 
                 default:

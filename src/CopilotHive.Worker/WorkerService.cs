@@ -240,6 +240,29 @@ public sealed class WorkerService(
             System.Text.Json.JsonSerializer.Serialize(new { status, details }), ct);
     }
 
+    /// <inheritdoc/>
+    public async Task<string> GetGoalAsync(string taskId, string goalId, CancellationToken ct)
+    {
+        var requestId = Guid.NewGuid().ToString("N");
+        var tcs = new TaskCompletionSource<ToolCallResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingToolCalls[requestId] = tcs;
+
+        using var reg = ct.Register(() => tcs.TrySetCanceled());
+
+        try
+        {
+            await SendToolCallRequest(requestId, taskId, "get_goal",
+                System.Text.Json.JsonSerializer.Serialize(new { goal_id = goalId }), ct);
+
+            var response = await tcs.Task;
+            return response.Success ? response.ResultJson : $"Error: {response.Error}";
+        }
+        finally
+        {
+            _pendingToolCalls.TryRemove(requestId, out _);
+        }
+    }
+
     private async Task SendToolCallRequest(string requestId, string taskId, string toolName, string argsJson, CancellationToken ct)
     {
         if (_stream is null || _assignedId is null)
