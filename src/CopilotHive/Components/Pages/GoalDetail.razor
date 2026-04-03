@@ -321,7 +321,7 @@
             @* RIGHT PANEL — iterations *@
             @if (hasAnyIterations)
             {
-                <div class="goal-detail-right" @ref="_rightPanelRef">
+                <div class="goal-detail-right">
                     @* _detail iterations *@
                     @if (_detail is not null && _detail.Iterations.Count > 0)
                     {
@@ -356,7 +356,7 @@
                                         </button>
                                     }
                                 </div>
-                                <div class="iter-content">
+                                <div class="iter-content" @ref="_iterContentRef">
 
                                 @if (!string.IsNullOrEmpty(iter.PlanReason))
                                 {
@@ -799,7 +799,8 @@ else
     private int _selectedIteration; // 0 = auto-select
     private string? _selectedPhase;
     private List<TimelineEntry> _timeline = [];
-    private ElementReference _rightPanelRef;
+    private ElementReference _iterContentRef;
+    private int _lastTimelineCount;
     private string? _approveError;
     private string? _revertError;
     private string? _cancelError;
@@ -820,6 +821,7 @@ else
     {
         _selectedIteration = 0;
         _selectedPhase = null;
+        _lastTimelineCount = 0;
         PageHeader.SetTitle($"🎯 Goal: {GoalId}");
         PageHeader.SetBack("/goals");
         Refresh();
@@ -940,6 +942,7 @@ else
     {
         _selectedIteration = number;
         _selectedPhase = null; // reset phase selection when switching tabs
+        _lastTimelineCount = 0;
         BuildActiveTimeline();
     }
 
@@ -1043,16 +1046,17 @@ else
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (_selectedPhase is null && _rightPanelRef.Context is not null)
+        if (_selectedPhase is null && _timeline.Count > _lastTimelineCount)
         {
             try
             {
-                await JS.InvokeVoidAsync("scrollToBottom", _rightPanelRef);
+                await JS.InvokeVoidAsync("scrollToBottom", _iterContentRef);
             }
             catch
             {
                 // Ignore JS interop errors (e.g., element not found)
             }
+            _lastTimelineCount = _timeline.Count;
         }
     }
 
