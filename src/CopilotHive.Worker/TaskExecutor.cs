@@ -42,6 +42,13 @@ public sealed class TaskExecutor(
         agentRunner.ClearTestReport();
         agentRunner.ClearWorkerReport();
 
+        // Inject the tester's structured report into the reviewer runner so get_test_report is available.
+        if (task.Role == WorkerRole.Reviewer
+            && task.Metadata.TryGetValue("tester_report", out var testerReport))
+        {
+            agentRunner.SetTesterReport(testerReport);
+        }
+
         // Load persisted session (if any) so the agent can resume prior context
         if (sessionClient != null && !string.IsNullOrEmpty(task.SessionId))
         {

@@ -92,6 +92,7 @@ public sealed class TaskExecutorTests
         public void SetToolBridge(IToolCallBridge? bridge) { }
         public void SetCurrentTaskId(string? taskId) { }
         public void SetCurrentGoalId(string? goalId) { }
+        public void SetTesterReport(string? report) { }
         public void SetCustomAgent(WorkerRole role, string agentsMdContent) { }
         public void SetSession(object? session) => _session = session;
         public object? GetSession() => _session;
