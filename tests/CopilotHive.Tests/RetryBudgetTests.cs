@@ -84,4 +84,29 @@ public sealed class RetryBudgetTests
         Assert.False(budget.TryConsume());
         Assert.Equal(0, budget.Used);
     }
+
+    [Fact]
+    public async Task TryConsume_ConcurrentCallers_ExactlyOneSucceeds()
+    {
+        var budget = new RetryBudget(1);
+        var barrier = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        async Task<bool> Consumer()
+        {
+            await barrier.Task;
+            return budget.TryConsume();
+        }
+
+        var t1 = Consumer();
+        var t2 = Consumer();
+        barrier.SetResult();
+
+        var results = await Task.WhenAll(t1, t2);
+
+        Assert.Equal(1, results.Count(r => r));
+        Assert.Equal(1, results.Count(r => !r));
+        Assert.True(budget.IsExhausted);
+        Assert.Equal(0, budget.Remaining);
+        Assert.Equal(1, budget.Used);
+    }
 }

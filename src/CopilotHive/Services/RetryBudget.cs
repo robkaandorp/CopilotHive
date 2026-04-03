@@ -1,3 +1,5 @@
+using System.Threading;
+
 namespace CopilotHive.Services;
 
 /// <summary>
@@ -23,10 +25,10 @@ public sealed class RetryBudget
     }
 
     /// <summary>Number of times <see cref="TryConsume"/> has succeeded.</summary>
-    public int Used => _initial - _remaining;
+    public int Used => _initial - Math.Max(0, _remaining);
 
     /// <summary>Number of consume operations still available.</summary>
-    public int Remaining => _remaining;
+    public int Remaining => Math.Max(0, _remaining);
 
     /// <summary>Total budget that was originally granted.</summary>
     public int Allowed => _initial;
@@ -38,11 +40,12 @@ public sealed class RetryBudget
     /// Attempts to consume one unit of the budget.
     /// Returns <c>true</c> and decrements <see cref="Remaining"/> on success;
     /// returns <c>false</c> when the budget is already exhausted.
+    /// Thread-safe: uses <see cref="Interlocked.Decrement(ref int)"/> to ensure
+    /// concurrent callers cannot both succeed when only one unit remains.
     /// </summary>
     public bool TryConsume()
     {
-        if (_remaining <= 0) return false;
-        _remaining--;
-        return true;
+        var prev = Interlocked.Decrement(ref _remaining);
+        return prev >= 0;
     }
 }
