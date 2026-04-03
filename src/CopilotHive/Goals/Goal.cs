@@ -68,6 +68,8 @@ public sealed class IterationSummary
     public Dictionary<string, string> PhaseOutputs { get; set; } = [];
     /// <summary>Clarification Q&amp;As that occurred during this iteration.</summary>
     public List<PersistedClarification> Clarifications { get; set; } = [];
+    /// <summary>Reason for the iteration plan, or <c>null</c> if not available.</summary>
+    public string? PlanReason { get; init; }
 }
 
 /// <summary>Serialisable clarification record stored in the database alongside an iteration summary.</summary>
