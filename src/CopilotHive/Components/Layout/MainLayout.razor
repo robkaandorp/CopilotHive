@@ -23,53 +23,44 @@
                 <span class="header-bell-badge">@_pendingClarificationCount</span>
             </button>
         }
-        else
-        {
-            <button class="header-bell-btn" @onclick="OpenDrawer" title="Clarifications" style="opacity: 0.5;">
-                🔔
-            </button>
-        }
     </header>
 
-    @if (_drawerOpen)
-    {
-        <div class="clarification-drawer-backdrop" @onclick="CloseDrawer"></div>
-        <div class="clarification-drawer clarification-drawer-open">
-            <div class="clarification-drawer-header">
-                <h3>📋 Clarifications (@_pendingClarifications.Count)</h3>
-                <button class="chat-action-btn" @onclick="CloseDrawer">✕</button>
-            </div>
-            <div class="clarification-drawer-body">
-                @foreach (var req in _pendingClarifications)
-                {
-                    <div class="clarification-item">
-                        <div class="clarification-meta">
-                            <span class="badge badge-muted">@req.GoalId</span>
-                            <span class="badge badge-yellow">@req.WorkerRole</span>
-                            <span class="text-muted">@req.RequestedAt.ToString("HH:mm:ss")</span>
-                        </div>
-                        <div class="clarification-question">@req.Question</div>
-                        <div class="clarification-answer-area">
-                            <textarea class="chat-input clarification-answer-input"
-                                      @bind="_clarificationAnswers[req.Id]"
-                                      placeholder="Type your answer…"
-                                      rows="2"></textarea>
-                            <button class="chat-send clarification-submit-btn"
-                                    disabled="@(string.IsNullOrWhiteSpace(GetClarificationAnswer(req.Id)))"
-                                    @onclick="() => SubmitClarificationAnswer(req.Id)">
-                                Submit
-                            </button>
-                        </div>
-                    </div>
-                }
-
-                @if (_pendingClarifications.Count == 0)
-                {
-                    <div class="text-muted" style="padding: 1rem;">No pending clarifications.</div>
-                }
-            </div>
+    <div class="clarification-drawer-backdrop" @onclick="CloseDrawer"></div>
+    <div class="clarification-drawer @(_drawerOpen ? "clarification-drawer-open" : "")" aria-hidden="@(!_drawerOpen)">
+        <div class="clarification-drawer-header">
+            <h3>📋 Clarifications (@_pendingClarifications.Count)</h3>
+            <button class="chat-action-btn" @onclick="CloseDrawer">✕ Close</button>
         </div>
-    }
+        <div class="clarification-drawer-body">
+            @foreach (var req in _pendingClarifications)
+            {
+                <div class="clarification-item">
+                    <div class="clarification-meta">
+                        <span class="badge badge-muted">@req.GoalId</span>
+                        <span class="badge badge-yellow">@req.WorkerRole</span>
+                        <span class="text-muted">@req.RequestedAt.ToString("HH:mm:ss")</span>
+                    </div>
+                    <div class="clarification-question">@req.Question</div>
+                    <div class="clarification-answer-area">
+                        <textarea class="chat-input clarification-answer-input"
+                                  @bind="_clarificationAnswers[req.Id]"
+                                  placeholder="Type your answer…"
+                                  rows="2"></textarea>
+                        <button class="chat-send clarification-submit-btn"
+                                disabled="@(string.IsNullOrWhiteSpace(GetClarificationAnswer(req.Id)))"
+                                @onclick="() => SubmitClarificationAnswer(req.Id)">
+                            Submit
+                        </button>
+                    </div>
+                </div>
+            }
+
+            @if (_pendingClarifications.Count == 0)
+            {
+                <div class="text-muted" style="padding: 1rem;">No pending clarifications.</div>
+            }
+        </div>
+    </div>
     <main class="hive-main">
         @Body
     </main>
@@ -114,6 +105,7 @@
     {
         _pendingClarifications = ClarificationQueue.GetPendingHumanRequests().ToList();
         _pendingClarificationCount = _pendingClarifications.Count;
+        if (_pendingClarificationCount == 0) _drawerOpen = false;
         // Ensure answer inputs exist for all pending requests
         foreach (var req in _pendingClarifications)
         {
