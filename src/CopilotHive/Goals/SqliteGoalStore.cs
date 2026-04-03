@@ -81,6 +81,9 @@ public sealed class SqliteGoalStore : IGoalStore
                 test_failed    INTEGER,
                 review_verdict TEXT,
                 notes_json     TEXT,
+                phase_outputs_json TEXT,
+                clarifications_json TEXT,
+                build_success  INTEGER NOT NULL DEFAULT 0,
                 created_at     TEXT NOT NULL,
                 UNIQUE(goal_id, iteration)
             );
@@ -160,6 +163,14 @@ public sealed class SqliteGoalStore : IGoalStore
             alter.CommandText = "ALTER TABLE goal_iterations ADD COLUMN clarifications_json TEXT";
             alter.ExecuteNonQuery();
             _logger.LogInformation("Migrated goal_iterations table: added 'clarifications_json' column");
+        }
+
+        if (!iterationColumns.Contains("build_success"))
+        {
+            using var alter = _db.CreateCommand();
+            alter.CommandText = "ALTER TABLE goal_iterations ADD COLUMN build_success INTEGER NOT NULL DEFAULT 0";
+            alter.ExecuteNonQuery();
+            _logger.LogInformation("Migrated goal_iterations table: added 'build_success' column");
         }
     }
 
@@ -881,8 +892,8 @@ public sealed class SqliteGoalStore : IGoalStore
         using var cmd = _db.CreateCommand();
         cmd.Transaction = transaction;
         cmd.CommandText = """
-            INSERT OR REPLACE INTO goal_iterations (goal_id, iteration, phases_json, test_total, test_passed, test_failed, review_verdict, notes_json, phase_outputs_json, clarifications_json, created_at)
-            VALUES (@goalId, @iteration, @phases, @testTotal, @testPassed, @testFailed, @reviewVerdict, @notes, @phaseOutputs, @clarifications, @createdAt)
+            INSERT OR REPLACE INTO goal_iterations (goal_id, iteration, phases_json, test_total, test_passed, test_failed, review_verdict, notes_json, phase_outputs_json, clarifications_json, build_success, created_at)
+            VALUES (@goalId, @iteration, @phases, @testTotal, @testPassed, @testFailed, @reviewVerdict, @notes, @phaseOutputs, @clarifications, @buildSuccess, @createdAt)
             """;
         cmd.Parameters.AddWithValue("@goalId", goalId);
         cmd.Parameters.AddWithValue("@iteration", summary.Iteration);
@@ -897,6 +908,7 @@ public sealed class SqliteGoalStore : IGoalStore
             ? JsonSerializer.Serialize(summary.PhaseOutputs, JsonOptions) : (object)DBNull.Value);
         cmd.Parameters.AddWithValue("@clarifications", summary.Clarifications.Count > 0
             ? JsonSerializer.Serialize(summary.Clarifications, JsonOptions) : (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("@buildSuccess", summary.BuildSuccess ? 1 : 0);
         cmd.Parameters.AddWithValue("@createdAt", DateTime.UtcNow.ToString("O"));
         cmd.ExecuteNonQuery();
     }
@@ -949,11 +961,17 @@ public sealed class SqliteGoalStore : IGoalStore
                     reader.GetString(clOrd), JsonOptions) ?? [];
             }
 
+            // build_success may be absent in databases created before migration
+            var buildSuccess = TryGetOrdinal(reader, "build_success", out var bsOrd) && !reader.IsDBNull(bsOrd)
+                ? reader.GetInt32(bsOrd) == 1
+                : false;
+
             summaries.Add(new IterationSummary
             {
                 Iteration = reader.GetInt32(reader.GetOrdinal("iteration")),
                 Phases = phases,
                 TestCounts = testCounts,
+                BuildSuccess = buildSuccess,
                 ReviewVerdict = reader.IsDBNull(rvOrd) ? null : reader.GetString(rvOrd),
                 Notes = notes,
                 PhaseOutputs = phaseOutputs,

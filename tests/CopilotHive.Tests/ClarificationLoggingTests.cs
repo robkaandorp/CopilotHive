@@ -602,6 +602,138 @@ public sealed class ClarificationLoggingTests
         Assert.Empty(iterations[0].Clarifications);
     }
 
+    // ── BuildSuccess persistence ─────────────────────────────────────────
+
+    /// <summary>
+    /// IterationSummary with BuildSuccess=true is persisted and loaded correctly.
+    /// </summary>
+    [Fact]
+    public async Task SqliteGoalStore_BuildSuccessTrue_RoundTrips()
+    {
+        var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
+
+        var goal = new Goal { Id = "g-build-t", Description = "Build success test", CreatedAt = DateTime.UtcNow };
+        await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 30 }],
+            TestCounts = new TestCounts { Total = 10, Passed = 10, Failed = 0 },
+            BuildSuccess = true,
+        };
+        await store.AddIterationAsync(goal.Id, summary, TestContext.Current.CancellationToken);
+
+        var iterations = await store.GetIterationsAsync(goal.Id, TestContext.Current.CancellationToken);
+        var loaded = Assert.Single(iterations);
+        Assert.True(loaded.BuildSuccess);
+    }
+
+    /// <summary>
+    /// IterationSummary with BuildSuccess=false is persisted and loaded correctly.
+    /// </summary>
+    [Fact]
+    public async Task SqliteGoalStore_BuildSuccessFalse_RoundTrips()
+    {
+        var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
+
+        var goal = new Goal { Id = "g-build-f", Description = "Build failure test", CreatedAt = DateTime.UtcNow };
+        await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Testing", Result = "fail", DurationSeconds = 30 }],
+            TestCounts = new TestCounts { Total = 10, Passed = 5, Failed = 5 },
+            BuildSuccess = false,
+        };
+        await store.AddIterationAsync(goal.Id, summary, TestContext.Current.CancellationToken);
+
+        var iterations = await store.GetIterationsAsync(goal.Id, TestContext.Current.CancellationToken);
+        var loaded = Assert.Single(iterations);
+        Assert.False(loaded.BuildSuccess);
+    }
+
+    /// <summary>
+    /// Simulates an old database without the build_success column.
+    /// A freshly opened store must still load iteration summaries,
+    /// defaulting BuildSuccess to false for pre-migration rows.
+    /// </summary>
+    [Fact]
+    public async Task SqliteGoalStore_BackwardCompat_NoBuildSuccessColumn_DefaultsToFalse()
+    {
+        var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+
+        // Manually create the old schema without build_success column
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = """
+                CREATE TABLE goals (
+                    id         TEXT PRIMARY KEY,
+                    description TEXT NOT NULL,
+                    status     TEXT NOT NULL DEFAULT 'pending',
+                    priority   TEXT NOT NULL DEFAULT 'normal',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE goal_iterations (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    goal_id         TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+                    iteration       INTEGER NOT NULL,
+                    phases_json     TEXT,
+                    test_total      INTEGER,
+                    test_passed     INTEGER,
+                    test_failed     INTEGER,
+                    review_verdict  TEXT,
+                    notes_json      TEXT,
+                    phase_outputs_json TEXT,
+                    clarifications_json TEXT,
+                    created_at      TEXT NOT NULL,
+                    UNIQUE(goal_id, iteration)
+                );
+                """;
+            cmd.ExecuteNonQuery();
+        }
+
+        // Insert a goal and an iteration directly (bypassing the store's INSERT)
+        using (var insertGoal = connection.CreateCommand())
+        {
+            insertGoal.CommandText = """
+                INSERT INTO goals (id, description, status, priority, created_at)
+                VALUES ('old-goal', 'Old schema goal', 'in_progress', 'normal', '2025-01-01T00:00:00Z')
+                """;
+            insertGoal.ExecuteNonQuery();
+        }
+
+        using (var insertIter = connection.CreateCommand())
+        {
+            insertIter.CommandText = """
+                INSERT INTO goal_iterations
+                    (goal_id, iteration, phases_json, test_total, test_passed, test_failed,
+                     review_verdict, notes_json, phase_outputs_json, clarifications_json, created_at)
+                VALUES
+                    ('old-goal', 1,
+                     '[{"name":"Coding","result":"pass","duration_seconds":45}]',
+                     5, 5, 0, NULL, NULL, NULL, NULL,
+                     '2025-01-01T00:00:00Z')
+                """;
+            insertIter.ExecuteNonQuery();
+        }
+
+        // Open with current store — migration adds build_success column
+        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
+
+        var iterations = await store.GetIterationsAsync("old-goal", TestContext.Current.CancellationToken);
+        var loaded = Assert.Single(iterations);
+        Assert.False(loaded.BuildSuccess,
+            "BuildSuccess must default to false when the column is absent (pre-migration).");
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────
 
     private static GoalPipeline CreatePipeline()

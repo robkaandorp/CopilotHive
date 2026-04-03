@@ -377,6 +377,44 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
         Assert.False(summary.PhaseOutputs.ContainsKey("coder-2"),
             "Outputs from a different iteration must not appear in the summary.");
     }
+
+    /// <summary>
+    /// BuildIterationSummary copies IterationMetrics.BuildSuccess=true into
+    /// the returned IterationSummary.BuildSuccess.
+    /// </summary>
+    [Fact]
+    public void BuildIterationSummary_CopiesBuildSuccess_True()
+    {
+        var goal = new Goal { Id = "build-true-goal", Description = "Test" };
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
+
+        pipeline.Metrics.PhaseDurations["Coding"]  = TimeSpan.FromSeconds(60);
+        pipeline.Metrics.PhaseDurations["Testing"]  = TimeSpan.FromSeconds(30);
+        pipeline.Metrics.BuildSuccess = true;
+
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+
+        Assert.True(summary.BuildSuccess);
+    }
+
+    /// <summary>
+    /// BuildIterationSummary copies IterationMetrics.BuildSuccess=false into
+    /// the returned IterationSummary.BuildSuccess.
+    /// </summary>
+    [Fact]
+    public void BuildIterationSummary_CopiesBuildSuccess_False()
+    {
+        var goal = new Goal { Id = "build-false-goal", Description = "Test" };
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
+
+        pipeline.Metrics.PhaseDurations["Coding"]  = TimeSpan.FromSeconds(60);
+        pipeline.Metrics.PhaseDurations["Testing"]  = TimeSpan.FromSeconds(30);
+        pipeline.Metrics.BuildSuccess = false;
+
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+
+        Assert.False(summary.BuildSuccess);
+    }
 }
 
 /// <summary>
