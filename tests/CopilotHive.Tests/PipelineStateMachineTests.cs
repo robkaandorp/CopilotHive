@@ -18,6 +18,109 @@ public class PipelineStateMachineTests
         return sm;
     }
 
+    // ---- GetCurrentPhaseOccurrence ----
+
+    [Fact]
+    public void GetCurrentPhaseOccurrence_FirstPhase_ReturnsOne()
+    {
+        var plan = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
+        var sm = CreateStarted(plan);
+        // Phase is Coding (first position in plan)
+        Assert.Equal(1, sm.GetCurrentPhaseOccurrence(plan));
+    }
+
+    [Fact]
+    public void GetCurrentPhaseOccurrence_MiddlePhase_ReturnsCorrectOccurrence()
+    {
+        var plan = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.DocWriting, GoalPhase.Review, GoalPhase.Merging };
+        var sm = CreateStarted(plan);
+
+        sm.Transition(PhaseInput.Succeeded); // → Testing
+        Assert.Equal(1, sm.GetCurrentPhaseOccurrence(plan)); // First Testing
+
+        sm.Transition(PhaseInput.Succeeded); // → DocWriting
+        Assert.Equal(1, sm.GetCurrentPhaseOccurrence(plan)); // First DocWriting
+
+        sm.Transition(PhaseInput.Succeeded); // → Review
+        Assert.Equal(1, sm.GetCurrentPhaseOccurrence(plan)); // First Review
+    }
+
+    [Fact]
+    public void GetCurrentPhaseOccurrence_RepeatingPhase_ReturnsCorrectOccurrence()
+    {
+        // Plan with multiple Coding phases
+        var plan = new List<GoalPhase>
+        {
+            GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review,
+            GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review,
+            GoalPhase.Merging
+        };
+        var sm = CreateStarted(plan);
+
+        // First Coding
+        Assert.Equal(1, sm.GetCurrentPhaseOccurrence(plan));
+
+        sm.Transition(PhaseInput.Succeeded); // → Testing
+        sm.Transition(PhaseInput.Succeeded); // → Review
+        sm.Transition(PhaseInput.Succeeded); // → Coding (second occurrence)
+
+        // Second Coding
+        Assert.Equal(2, sm.GetCurrentPhaseOccurrence(plan));
+    }
+
+    [Fact]
+    public void GetCurrentPhaseOccurrence_RepeatingTesting_ReturnsCorrectOccurrence()
+    {
+        // Plan with multiple Testing phases
+        var plan = new List<GoalPhase>
+        {
+            GoalPhase.Coding, GoalPhase.Testing,
+            GoalPhase.Coding, GoalPhase.Testing,
+            GoalPhase.Merging
+        };
+        var sm = CreateStarted(plan);
+
+        // First Coding → Testing
+        sm.Transition(PhaseInput.Succeeded); // → Testing
+        Assert.Equal(1, sm.GetCurrentPhaseOccurrence(plan)); // First Testing
+
+        sm.Transition(PhaseInput.Succeeded); // → Coding
+        sm.Transition(PhaseInput.Succeeded); // → Testing (second occurrence)
+
+        // Second Testing
+        Assert.Equal(2, sm.GetCurrentPhaseOccurrence(plan));
+    }
+
+    [Fact]
+    public void GetCurrentPhaseOccurrence_LastPhaseBeforeMerging_ReturnsCorrectOccurrence()
+    {
+        var plan = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
+        var sm = CreateStarted(plan);
+
+        sm.Transition(PhaseInput.Succeeded); // → Testing
+        sm.Transition(PhaseInput.Succeeded); // → DocWriting (skipped)
+        sm.Transition(PhaseInput.Succeeded); // → Review
+        sm.Transition(PhaseInput.Succeeded); // → Merging
+
+        // At Merging
+        Assert.Equal(1, sm.GetCurrentPhaseOccurrence(plan));
+    }
+
+    [Fact]
+    public void GetCurrentPhaseOccurrence_AfterNewIteration_ResetsOccurrence()
+    {
+        var plan = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Merging };
+        var sm = CreateStarted(plan);
+
+        sm.Transition(PhaseInput.Succeeded); // → Testing
+        sm.Transition(PhaseInput.Succeeded); // → Merging
+        sm.Transition(PhaseInput.Failed);    // → Coding (NewIteration)
+
+        // After NewIteration, phase resets to Coding
+        Assert.Equal(GoalPhase.Coding, sm.Phase);
+        Assert.Equal(1, sm.GetCurrentPhaseOccurrence(plan));
+    }
+
     // ---- Happy path flows ----
 
     [Fact]

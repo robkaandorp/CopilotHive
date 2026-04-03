@@ -738,7 +738,7 @@ public sealed class GoalDispatcher : BackgroundService
         {
             case TransitionEffect.Continue:
                 pipeline.AdvanceTo(transition.NextPhase);
-                var occurrenceIndex = CountPhaseOccurrences(pipeline, transition.NextPhase);
+                var occurrenceIndex = pipeline.StateMachine.GetCurrentPhaseOccurrence(pipeline.Plan!.Phases);
                 var nextPhaseInstructions = pipeline.Plan?.GetPhaseInstruction(transition.NextPhase, occurrenceIndex);
                 await DispatchPhaseAsync(pipeline, transition.NextPhase, nextPhaseInstructions, ct);
                 break;
@@ -1759,34 +1759,6 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         "Improve" => "improver",
         _ => "",
     };
-
-    /// <summary>
-    /// Counts how many times the given phase has appeared in the plan's phases list up to and
-    /// including the current pipeline phase position (1-based occurrence index).
-    /// This is used to determine the correct occurrence index for phase instruction lookup
-    /// when there are multi-round phases (e.g., multiple Coding phases).
-    /// Uses the state machine's remaining-phases count to compute the exact position,
-    /// avoiding enum-value matching which would always stop at the first occurrence.
-    /// </summary>
-    private static int CountPhaseOccurrences(GoalPipeline pipeline, GoalPhase targetPhase)
-    {
-        if (pipeline.Plan?.Phases is not { } phases || phases.Count == 0)
-            return 1;
-
-        // Determine the current position in the plan using the state machine's remaining phases.
-        // After a transition, RemainingPhases contains everything after the current phase, so:
-        // currentPosition = totalPhases - 1 - remainingCount
-        var remaining = pipeline.StateMachine.RemainingPhases;
-        var currentPosition = phases.Count - 1 - remaining.Count;
-
-        var count = 0;
-        for (var i = 0; i <= currentPosition && i < phases.Count; i++)
-        {
-            if (phases[i] == targetPhase)
-                count++;
-        }
-        return count > 0 ? count : 1;
-    }
 
     /// <summary>
     /// Commits and pushes the updated goals.yaml back to the config repo so external
