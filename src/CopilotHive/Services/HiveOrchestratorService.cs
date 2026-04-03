@@ -370,11 +370,16 @@ public sealed class HiveOrchestratorService(
                         var currentPhase = getGoalPipeline.Phase;
                         // Derive occurrence index by counting appearances up to CurrentPhaseIndex
                         var idx = getGoalPipeline.Plan.CurrentPhaseIndex;
-                        int occurrenceIndex = 1;
+                        int occurrenceIndex = 0;
                         for (int i = 0; i <= idx; i++)
+                        {
+                            if (i > 0 && getGoalPipeline.Plan.Phases[i] != getGoalPipeline.Plan.Phases[i - 1])
+                                occurrenceIndex = 0;
                             if (getGoalPipeline.Plan.Phases[i] == currentPhase)
-                                occurrenceIndex = i + 1;
-                        currentPhaseInstruction = getGoalPipeline.Plan.GetPhaseInstruction(currentPhase, occurrenceIndex);
+                                occurrenceIndex++;
+                        }
+                        int finalOccurrence = occurrenceIndex;
+                        currentPhaseInstruction = getGoalPipeline.Plan.GetPhaseInstruction(currentPhase, finalOccurrence);
                     }
 
                     resultJson = System.Text.Json.JsonSerializer.Serialize(new
