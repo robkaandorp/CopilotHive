@@ -1,3 +1,25 @@
+## [0.7.1]
+
+### Added
+
+**Reviewer `get_test_report` tool.** The reviewer worker now has a `get_test_report()` tool it can call to actively retrieve the tester's structured report (build success, test counts, verdict), preventing spurious rejections when reviewers cannot verify build/test results.
+
+### Changed
+
+**GoalDetail tab labels.** Tab labels now say "Iteration N" instead of "Iter N".
+**GoalDetail sticky tabs and phase bar.** Iteration tabs and phase bar are now sticky so only the content area scrolls.
+**GoalDetail timeline smart scroll.** Timeline only auto-scrolls to the bottom when new entries arrive; users can scroll up to read older content without being snapped back.
+**GoalDetail progress entry layout.** Progress entry layout cleaned up — role badge and status badge appear on the same line; phase label and worker ID removed for a cleaner look.
+**GoalDetail release label inline.** Release label moved inline into the metadata row, aligned with status badge, priority, and scope.
+**GoalDetail iteration tab spacing.** Iteration tabs now sit flush against the content below with no extra spacing.
+
+### Fixed
+
+**Build success state persists after goal completion.** Build success state now correctly persists after a goal completes — previously it always showed a red failure indicator after goal completion.
+**Failed phase auto-selected on tab click.** Clicking a failed iteration tab now automatically selects the failed phase, immediately showing the failure detail.
+**Phase detail no longer shows redundant progress reports table.** Phase detail panel no longer shows a redundant progress reports table — only clarifications remain.
+**GoalDetail metadata row spacing.** Metadata row now has proper spacing between items so labels don't crowd each other.
+
 ## [0.7.0]
 
 ### Added
