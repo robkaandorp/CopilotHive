@@ -232,7 +232,7 @@ public sealed class DistributedBrainTests
     {
         var pipeline = CreatePipeline("g-ctx-2", "Review rejected goal");
         pipeline.RecordOutput(WorkerRole.Reviewer, 1, "FAIL: Missing null check in UserService.GetById()");
-        pipeline.IncrementIteration(); // Now iteration 2
+        pipeline.IterationBudget.TryConsume(); // Now iteration 2
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
 
@@ -246,7 +246,7 @@ public sealed class DistributedBrainTests
     {
         var pipeline = CreatePipeline("g-ctx-3", "Test failed goal");
         pipeline.RecordOutput(WorkerRole.Tester, 1, "3 tests failed: TestAuth, TestLogin, TestLogout");
-        pipeline.IncrementIteration();
+        pipeline.IterationBudget.TryConsume();
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
 
@@ -259,7 +259,7 @@ public sealed class DistributedBrainTests
     {
         var pipeline = CreatePipeline("g-ctx-4", "Coder context goal");
         pipeline.RecordOutput(WorkerRole.Coder, 1, "Added UserService with CRUD operations");
-        pipeline.IncrementIteration();
+        pipeline.IterationBudget.TryConsume();
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
 
@@ -274,7 +274,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordOutput(WorkerRole.Coder, 1, "Implemented feature X");
         pipeline.RecordOutput(WorkerRole.Tester, 1, "All 50 tests pass");
         pipeline.RecordOutput(WorkerRole.Reviewer, 1, "FAIL: Variable naming inconsistent");
-        pipeline.IncrementIteration();
+        pipeline.IterationBudget.TryConsume();
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
 
@@ -287,7 +287,7 @@ public sealed class DistributedBrainTests
     public void BuildPreviousIterationContext_NoOutputsRecorded_ShowsFallbackMessage()
     {
         var pipeline = CreatePipeline("g-ctx-6", "No outputs goal");
-        pipeline.IncrementIteration();
+        pipeline.IterationBudget.TryConsume();
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
 
@@ -301,9 +301,9 @@ public sealed class DistributedBrainTests
     {
         var pipeline = CreatePipeline("g-ctx-7", "Multi-iteration goal");
         pipeline.RecordOutput(WorkerRole.Reviewer, 1, "FAIL: Iteration 1 issue");
-        pipeline.IncrementIteration(); // Now iteration 2
+        pipeline.IterationBudget.TryConsume(); // Now iteration 2
         pipeline.RecordOutput(WorkerRole.Reviewer, 2, "FAIL: Iteration 2 issue");
-        pipeline.IncrementIteration(); // Now iteration 3
+        pipeline.IterationBudget.TryConsume(); // Now iteration 3
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
 
@@ -318,7 +318,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("g-ctx-8", "Long output goal");
         var longOutput = new string('X', 5000);
         pipeline.RecordOutput(WorkerRole.Reviewer, 1, longOutput);
-        pipeline.IncrementIteration();
+        pipeline.IterationBudget.TryConsume();
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
 
@@ -617,7 +617,7 @@ public sealed class DistributedBrainTests
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-review-iter", "Multi-iteration review");
         pipeline.RecordOutput(WorkerRole.Tester, 1, "ITER1_OUTPUT_SHOULD_NOT_APPEAR");
-        pipeline.IncrementIteration();
+        pipeline.IterationBudget.TryConsume();
         pipeline.RecordOutput(WorkerRole.Tester, 2, "ITER2_OUTPUT_EXPECTED");
 
         // Act: at iteration 2, should use tester-2 key
@@ -761,7 +761,7 @@ public sealed class DistributedBrainTests
     {
         var pipeline = CreatePipeline("g-fb-7", "Multi-iteration fallback review");
         pipeline.RecordOutput(WorkerRole.Tester, 1, "ITER1_FALLBACK_SHOULD_NOT_APPEAR");
-        pipeline.IncrementIteration();
+        pipeline.IterationBudget.TryConsume();
         pipeline.RecordOutput(WorkerRole.Tester, 2, "ITER2_FALLBACK_EXPECTED");
 
         var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
@@ -1407,7 +1407,7 @@ public sealed class DistributedBrainTests
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-coder-iter", "Multi-iteration coder review");
         pipeline.RecordOutput(WorkerRole.Coder, 1, "CODER_ITER1_SHOULD_NOT_APPEAR");
-        pipeline.IncrementIteration();
+        pipeline.IterationBudget.TryConsume();
         pipeline.RecordOutput(WorkerRole.Coder, 2, "CODER_ITER2_EXPECTED");
 
         // Act: at iteration 2, should use coder-2 key

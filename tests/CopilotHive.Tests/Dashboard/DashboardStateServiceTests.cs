@@ -682,7 +682,7 @@ public sealed class DashboardStateServiceTests : IDisposable
         // (iteration 1 output comes from persisted summary)
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
         // Advance to iteration 2 so the pipeline's iteration-1 outputs don't conflict
-        pipeline.IncrementIteration(); // Now at iteration 2
+        pipeline.IterationBudget.TryConsume(); // Now at iteration 2
         pipeline.RecordOutput(WorkerRole.Coder, 2, "Live output from iteration 2 (should NOT be shown for iteration 1)");
         pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(30);
 

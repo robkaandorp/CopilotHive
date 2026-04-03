@@ -509,9 +509,9 @@ public sealed class PipelineSnapshot
     /// <summary>Number of test retries consumed so far.</summary>
     public int TestRetries { get; init; }
     /// <summary>Maximum retries allowed per task.</summary>
-    public int MaxRetries { get; init; }
+    public int MaxRetries { get; init; } = Constants.DefaultMaxRetriesPerTask;
     /// <summary>Maximum iterations allowed before the goal is failed.</summary>
-    public int MaxIterations { get; init; }
+    public int MaxIterations { get; init; } = Constants.DefaultMaxIterations;
     /// <summary>Task ID currently assigned to a worker, or <c>null</c> when idle.</summary>
     public string? ActiveTaskId { get; init; }
     /// <summary>Feature branch created by the coder, or <c>null</c> if coding has not started.</summary>
