@@ -1048,7 +1048,6 @@ else
     {
         if (_selectedPhase is null && _timeline.Count > _lastTimelineCount)
         {
-            _lastTimelineCount = _timeline.Count;
             try
             {
                 await JS.InvokeVoidAsync("scrollToBottom", _iterContentRef);
@@ -1057,6 +1056,7 @@ else
             {
                 // Ignore JS interop errors (e.g., element not found)
             }
+            _lastTimelineCount = _timeline.Count;
         }
     }
 
