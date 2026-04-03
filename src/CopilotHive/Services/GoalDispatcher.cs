@@ -1137,6 +1137,17 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         if (pipeline.IterationStartSha is not null)
             task.Metadata["iteration_start_sha"] = pipeline.IterationStartSha;
 
+        // Propagate the tester's structured report to the reviewer so it can be retrieved via get_test_report.
+        if (role == WorkerRole.Reviewer)
+        {
+            var testerKey = $"tester-{pipeline.Iteration}";
+            if (pipeline.PhaseOutputs.TryGetValue(testerKey, out var testerOutput)
+                && !string.IsNullOrWhiteSpace(testerOutput))
+            {
+                task.Metadata["tester_report"] = testerOutput;
+            }
+        }
+
         pipeline.SetActiveTask(task.TaskId, task.BranchInfo?.FeatureBranch);
         _pipelineManager.RegisterTask(task.TaskId, pipeline.GoalId);
 

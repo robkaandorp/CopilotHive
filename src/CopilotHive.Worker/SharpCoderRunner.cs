@@ -62,12 +62,14 @@ public sealed class SharpCoderRunner : IAgentRunner
 
     private TestResultReport? _lastTestReport;
     private WorkerReport? _lastWorkerReport;
+    private string? _testerReport;
 
     public TestResultReport? LastTestReport => _lastTestReport;
     public WorkerReport? LastWorkerReport => _lastWorkerReport;
 
     public void ClearTestReport() => _lastTestReport = null;
     public void ClearWorkerReport() => _lastWorkerReport = null;
+    public void SetTesterReport(string? report) => _testerReport = report;
 
     public void SetToolBridge(IToolCallBridge? bridge) => _toolBridge = bridge;
     public void SetCurrentTaskId(string? taskId) => _currentTaskId = taskId;
@@ -77,6 +79,7 @@ public sealed class SharpCoderRunner : IAgentRunner
     {
         _currentRole = role;
         _customAgentSystemPrompt = agentsMdContent;
+        _testerReport = null;
     }
 
     /// <summary>
@@ -529,7 +532,19 @@ public sealed class SharpCoderRunner : IAgentRunner
             tools.Add(BuildTestResultsTool());
 
         if (_currentRole == WorkerRole.Reviewer)
+        {
             tools.Add(BuildReviewVerdictTool());
+            tools.Add(AIFunctionFactory.Create(
+                () =>
+                {
+                    _log.Info("Tool call: get_test_report()");
+                    return string.IsNullOrWhiteSpace(_testerReport)
+                        ? "No test report available — the testing phase was not part of this iteration's plan, or no results were recorded."
+                        : _testerReport;
+                },
+                "get_test_report",
+                "Retrieve the tester's structured report for this iteration, including build success, test counts, and verdict. Call this to verify build/test acceptance criteria."));
+        }
 
         if (_currentRole == WorkerRole.Coder)
             tools.Add(BuildCodeChangesTool());

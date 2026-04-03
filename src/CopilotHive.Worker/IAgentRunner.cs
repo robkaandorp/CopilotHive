@@ -30,6 +30,9 @@ public interface IAgentRunner : IAsyncDisposable
     /// <summary>Sets the current goal ID for the get_goal tool context.</summary>
     void SetCurrentGoalId(string? goalId);
 
+    /// <summary>Sets the tester's structured report for this iteration. Only used by reviewer tasks.</summary>
+    void SetTesterReport(string? report);
+
     /// <summary>Sets the custom agent configuration for the specified role.</summary>
     void SetCustomAgent(WorkerRole role, string agentsMdContent);
 

@@ -42,6 +42,14 @@ public sealed class TaskExecutor(
         agentRunner.ClearTestReport();
         agentRunner.ClearWorkerReport();
 
+        // Always clear any stale tester report, then set it only when metadata is present.
+        agentRunner.SetTesterReport(null);
+        if (task.Role == WorkerRole.Reviewer
+            && task.Metadata.TryGetValue("tester_report", out var testerReport))
+        {
+            agentRunner.SetTesterReport(testerReport);
+        }
+
         // Load persisted session (if any) so the agent can resume prior context
         if (sessionClient != null && !string.IsNullOrEmpty(task.SessionId))
         {
