@@ -97,6 +97,8 @@ body {
     z-index: 10;
 }
 
+.hive-header h1 { margin-bottom: 0; }
+
 .hive-header-back {
     font-size: 1.25rem;
     color: var(--text-muted);
