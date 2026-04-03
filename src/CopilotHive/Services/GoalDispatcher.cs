@@ -978,7 +978,7 @@ public sealed class GoalDispatcher : BackgroundService
         {
             // Rule 2: Each Coding must be immediately followed by Testing.
             // Iterate backward so insertions don't shift indices we're about to process.
-            for (var i = phases.Count - 2; i >= 0; i--)
+            for (var i = phases.Count - 1; i >= 0; i--)
             {
                 if (phases[i] == GoalPhase.Coding && (i + 1 >= phases.Count || phases[i + 1] != GoalPhase.Testing))
                 {
@@ -1765,24 +1765,23 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
     /// including the current pipeline phase position (1-based occurrence index).
     /// This is used to determine the correct occurrence index for phase instruction lookup
     /// when there are multi-round phases (e.g., multiple Coding phases).
+    /// Walks phases in order from index 0, maintaining a running count per phase.
     /// </summary>
     private static int CountPhaseOccurrences(GoalPipeline pipeline, GoalPhase targetPhase)
     {
         if (pipeline.Plan?.Phases is not { } phases || phases.Count == 0)
             return 1;
 
-        // Count occurrences of targetPhase from index 0 up to and including
-        // the position of the current pipeline phase (pipeline.Phase).
-        // This gives the correct 1-based occurrence index for the phase being dispatched.
-        var currentIndex = phases.IndexOf(pipeline.Phase);
-        if (currentIndex < 0)
-            currentIndex = phases.Count - 1;
-
+        // Walk phases in order from index 0, maintaining a per-phase running count.
+        // When we reach the position where the current pipeline phase matches the target phase,
+        // return the count at that moment.
         var count = 0;
-        for (var i = 0; i <= currentIndex; i++)
+        for (var i = 0; i < phases.Count; i++)
         {
             if (phases[i] == targetPhase)
                 count++;
+            if (phases[i] == pipeline.Phase)
+                break;
         }
         return count > 0 ? count : 1;
     }

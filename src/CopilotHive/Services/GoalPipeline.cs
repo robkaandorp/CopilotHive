@@ -92,13 +92,10 @@ public sealed class IterationPlan
     public string? GetPhaseInstruction(GoalPhase phase, int occurrenceIndex)
     {
         var phaseName = phase.ToString().ToLowerInvariant();
-        // Try indexed key first (e.g. "coding-2")
-        if (occurrenceIndex > 1)
-        {
-            var indexedKey = $"{phaseName}-{occurrenceIndex}";
-            if (PhaseInstructions.TryGetValue(indexedKey, out var indexed))
-                return indexed;
-        }
+        // Try indexed key first (e.g. "coding-2" for occurrence 2, "coding-1" for occurrence 1)
+        var indexedKey = $"{phaseName}-{occurrenceIndex}";
+        if (PhaseInstructions.TryGetValue(indexedKey, out var indexed))
+            return indexed;
         // Fall back to bare key
         return PhaseInstructions.GetValueOrDefault(phaseName);
     }

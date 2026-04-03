@@ -1299,20 +1299,23 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
-    /// Counts how many times the given phase has appeared in the plan's phase list
-    /// up to and including the current phase being processed (1-based count).
+    /// Returns the 1-based occurrence index of the given phase within the plan's phases list,
+    /// counting up to and including the position of the current pipeline phase.
+    /// Walks phases in order from index 0, maintaining a running count per phase.
     /// </summary>
     private static int GetPhaseOccurrenceIndex(GoalPipeline pipeline, GoalPhase phase)
     {
         if (pipeline.Plan?.Phases is not { } phases)
             return 1;
 
+        // Walk phases in order from index 0, maintaining a per-phase running count.
+        // When we reach the position where the current pipeline phase matches,
+        // return the count at that moment.
         var count = 0;
         for (var i = 0; i < phases.Count; i++)
         {
             if (phases[i] == phase)
                 count++;
-            // Stop counting once we've passed the current phase in the pipeline
             if (phases[i] == pipeline.Phase)
                 break;
         }
