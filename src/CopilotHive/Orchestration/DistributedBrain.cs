@@ -1380,41 +1380,49 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             sb.AppendLine("=== End tester feedback ===");
         }
 
-        // Include coder output(s) for context on what was attempted.
-        // Collect ALL entries whose key starts with "coder-{prevIteration}" and is NOT followed
-        // by more digits (i.e. collect both "coder-3" and "coder-3-1", "coder-3-2" etc.)
-        var roundNumber = 1;
+        // Include coder output — collect ALL coding round outputs from the previous iteration.
+        // Bare key:  coder-{prevIteration}        (single-round plans)
+        // Round keys: coder-{prevIteration}-{R}   (multi-round plans, e.g. coder-2-1, coder-2-2)
+        // First loop: collect bare coder-{N} entries only.
+        var round = 0;
         foreach (var kvp in pipeline.PhaseOutputs)
         {
-            if (!kvp.Key.StartsWith($"coder-{prevIteration}", StringComparison.Ordinal))
+            if (!kvp.Key.StartsWith($"coder-{prevIteration}"))
                 continue;
-            var suffix = kvp.Key[$"coder-{prevIteration}".Length..];
-            if (suffix.Length > 0 && char.IsDigit(suffix[0]))
-                continue; // skip coder-{iter}-{round} keys here — handled below
-            if (!string.IsNullOrWhiteSpace(kvp.Value))
-            {
-                hasAnyFeedback = true;
-                sb.AppendLine($"=== Coder output round {roundNumber} (iteration {prevIteration}) ===");
-                sb.AppendLine(Truncate(kvp.Value, Constants.TruncationMedium));
-                sb.AppendLine("=== End coder output round " + roundNumber + " ===");
-            }
-            roundNumber++;
+
+            var remainder = kvp.Key[$"coder-{prevIteration}".Length..];
+            // Skip round-specific keys (e.g. coder-3-1, coder-3-2) — remainder starts with '-'
+            if (remainder.StartsWith("-"))
+                continue;
+
+            if (string.IsNullOrWhiteSpace(kvp.Value))
+                continue;
+
+            hasAnyFeedback = true;
+            round++;
+            sb.AppendLine($"=== Coder output round {round} (iteration {prevIteration}) ===");
+            sb.AppendLine(Truncate(kvp.Value, Constants.TruncationMedium));
+            sb.AppendLine($"=== End coder output round {round} ===");
         }
 
-        // Also collect round-specific coder outputs: coder-{prevIteration}-{round}
-        var round = 1;
+        // Second loop: collect round-specific coder-{N}-{R} entries.
+        var roundSpecificRound = 0;
         foreach (var kvp in pipeline.PhaseOutputs)
         {
-            if (!kvp.Key.StartsWith($"coder-{prevIteration}-", StringComparison.Ordinal))
+            if (!kvp.Key.StartsWith($"coder-{prevIteration}-"))
                 continue;
-            if (!string.IsNullOrWhiteSpace(kvp.Value))
-            {
-                hasAnyFeedback = true;
-                sb.AppendLine($"=== Coder output round {round} (iteration {prevIteration}) ===");
-                sb.AppendLine(Truncate(kvp.Value, Constants.TruncationMedium));
-                sb.AppendLine("=== End coder output round " + round + " ===");
-            }
-            round++;
+
+            if (!int.TryParse(kvp.Key[$"coder-{prevIteration}-".Length..], out _))
+                continue;
+
+            if (string.IsNullOrWhiteSpace(kvp.Value))
+                continue;
+
+            hasAnyFeedback = true;
+            roundSpecificRound++;
+            sb.AppendLine($"=== Coder output round {roundSpecificRound} (iteration {prevIteration}) ===");
+            sb.AppendLine(Truncate(kvp.Value, Constants.TruncationMedium));
+            sb.AppendLine($"=== End coder output round {roundSpecificRound} ===");
         }
 
         if (!hasAnyFeedback)
