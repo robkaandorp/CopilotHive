@@ -41,8 +41,12 @@ public sealed class IterationPlan
     /// <summary>Ordered list of phases the Brain wants to execute this iteration.</summary>
     public List<GoalPhase> Phases { get; init; } = [];
 
-    /// <summary>Per-phase instructions/context from the Brain.</summary>
-    public Dictionary<GoalPhase, string> PhaseInstructions { get; init; } = [];
+    /// <summary>
+    /// Per-phase instructions/context from the Brain.
+    /// Keys are lowercase phase names: "coding", "review", "testing", "merging", etc.
+    /// For multi-round plans, indexed keys like "coding-2" are used for the 2nd occurrence.
+    /// </summary>
+    public Dictionary<string, string> PhaseInstructions { get; init; } = [];
 
     /// <summary>Per-role model tier overrides from the Brain, keyed by phase (e.g. Coding → Premium).</summary>
     public Dictionary<GoalPhase, ModelTier> PhaseTiers { get; init; } = [];
@@ -74,6 +78,29 @@ public sealed class IterationPlan
     {
         var index = Phases.IndexOf(phase);
         return index >= 0 && index + 1 < Phases.Count ? Phases[index + 1] : null;
+    }
+
+    /// <summary>
+    /// Returns the instruction string for the given phase and occurrence index (1-based).
+    /// Tries the indexed key first (e.g. "coding-2" for occurrence 2), then falls back
+    /// to the bare key (e.g. "coding") for backward compatibility.
+    /// Returns null if neither key exists.
+    /// </summary>
+    /// <param name="phase">The phase to look up.</param>
+    /// <param name="occurrenceIndex">The 1-based occurrence index within the plan's phase sequence.</param>
+    /// <returns>The instruction string, or null if not found.</returns>
+    public string? GetPhaseInstruction(GoalPhase phase, int occurrenceIndex)
+    {
+        var phaseName = phase.ToString().ToLowerInvariant();
+        // Try indexed key first (e.g. "coding-2")
+        if (occurrenceIndex > 1)
+        {
+            var indexedKey = $"{phaseName}-{occurrenceIndex}";
+            if (PhaseInstructions.TryGetValue(indexedKey, out var indexed))
+                return indexed;
+        }
+        // Fall back to bare key
+        return PhaseInstructions.GetValueOrDefault(phaseName);
     }
 
     /// <summary>

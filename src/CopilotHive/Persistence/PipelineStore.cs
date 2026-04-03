@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using CopilotHive.Goals;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
@@ -8,6 +9,71 @@ using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 
 namespace CopilotHive.Persistence;
+
+/// <summary>
+/// JSON converter for legacy numeric keys in PhaseInstructions dictionaries.
+/// Old pipelines stored integer enum values ("0", "1", etc.) as keys.
+/// This converter converts them to lowercase phase names for backward compatibility.
+/// </summary>
+internal sealed class LegacyPhaseInstructionsConverter : JsonConverter<Dictionary<string, string>>
+{
+    // Map from GoalPhase enum ordinal to lowercase name
+    private static readonly string[] PhaseOrdinalToName =
+    [
+        "planning",  // 0
+        "coding",     // 1
+        "testing",    // 2
+        "review",     // 3
+        "docwriting", // 4
+        "improve",    // 5
+        "merging",    // 6
+    ];
+
+    public override Dictionary<string, string>? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType != JsonTokenType.StartObject)
+            return null;
+
+        var result = new Dictionary<string, string>();
+
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.EndObject)
+                break;
+
+            if (reader.TokenType != JsonTokenType.PropertyName)
+                continue;
+
+            var key = reader.GetString() ?? "";
+            var value = "";
+
+            if (reader.Read() && reader.TokenType == JsonTokenType.String)
+            {
+                value = reader.GetString() ?? "";
+            }
+
+            // Convert legacy numeric keys to lowercase phase names
+            if (int.TryParse(key, out var ordinal) && ordinal >= 0 && ordinal < PhaseOrdinalToName.Length)
+            {
+                key = PhaseOrdinalToName[ordinal];
+            }
+
+            result[key] = value;
+        }
+
+        return result;
+    }
+
+    public override void Write(Utf8JsonWriter writer, Dictionary<string, string> value, JsonSerializerOptions options)
+    {
+        writer.WriteStartObject();
+        foreach (var kvp in value)
+        {
+            writer.WriteString(kvp.Key, kvp.Value);
+        }
+        writer.WriteEndObject();
+    }
+}
 
 /// <summary>
 /// Persists GoalPipeline state to SQLite so the orchestrator can recover after restarts.
@@ -23,6 +89,7 @@ public sealed class PipelineStore : IAsyncDisposable
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         WriteIndented = false,
+        Converters = { new LegacyPhaseInstructionsConverter() },
     };
 
     /// <summary>

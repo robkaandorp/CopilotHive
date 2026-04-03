@@ -657,13 +657,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             }
         }
 
-        var instructions = new Dictionary<GoalPhase, string>();
+        var instructions = new Dictionary<string, string>();
         if (dto.PhaseInstructions is not null)
         {
             foreach (var (key, value) in dto.PhaseInstructions)
             {
-                if (Enum.TryParse<GoalPhase>(key, ignoreCase: true, out var phase) && value is not null)
-                    instructions[phase] = value;
+                if (value is not null)
+                    instructions[key] = value;
             }
         }
 
@@ -874,7 +874,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         var roleName = phase.ToWorkerRole().ToRoleName();
 
         var phaseInstructions = "";
-        if (pipeline.Plan?.PhaseInstructions.TryGetValue(phase, out var instructions) == true)
+        var occurrenceIndex = GetPhaseOccurrenceIndex(pipeline, phase);
+        var instructions = pipeline.Plan?.GetPhaseInstruction(phase, occurrenceIndex);
+        if (!string.IsNullOrEmpty(instructions))
             phaseInstructions = $"\nPhase instructions from the plan:\n{instructions}";
 
         // Check if docwriting preceded review in this iteration's plan, so the
@@ -1294,6 +1296,27 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     {
         if (_agent is null)
             throw new InvalidOperationException("Brain not connected. Call ConnectAsync first.");
+    }
+
+    /// <summary>
+    /// Counts how many times the given phase has appeared in the plan's phase list
+    /// up to and including the current phase being processed (1-based count).
+    /// </summary>
+    private static int GetPhaseOccurrenceIndex(GoalPipeline pipeline, GoalPhase phase)
+    {
+        if (pipeline.Plan?.Phases is not { } phases)
+            return 1;
+
+        var count = 0;
+        for (var i = 0; i < phases.Count; i++)
+        {
+            if (phases[i] == phase)
+                count++;
+            // Stop counting once we've passed the current phase in the pipeline
+            if (phases[i] == pipeline.Phase)
+                break;
+        }
+        return count > 0 ? count : 1;
     }
 
     internal static string Truncate(string text, int maxLength) =>

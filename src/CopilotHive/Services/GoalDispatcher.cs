@@ -738,9 +738,9 @@ public sealed class GoalDispatcher : BackgroundService
         {
             case TransitionEffect.Continue:
                 pipeline.AdvanceTo(transition.NextPhase);
-                string? instructions = null;
-                pipeline.Plan?.PhaseInstructions.TryGetValue(transition.NextPhase, out instructions);
-                await DispatchPhaseAsync(pipeline, transition.NextPhase, instructions, ct);
+                var occurrenceIndex = CountPhaseOccurrences(pipeline, transition.NextPhase);
+                var nextPhaseInstructions = pipeline.Plan?.GetPhaseInstruction(transition.NextPhase, occurrenceIndex);
+                await DispatchPhaseAsync(pipeline, transition.NextPhase, nextPhaseInstructions, ct);
                 break;
 
             case TransitionEffect.NewIteration:
@@ -954,16 +954,21 @@ public sealed class GoalDispatcher : BackgroundService
     }
 
     /// <summary>
-    /// Validates an IterationPlan to ensure safety invariants:
-    /// must contain Coding or DocWriting, at least one of Testing or Review, and end with Merging.
-    /// Missing phases are inserted in the correct position.
-    /// Docs-only plans (containing DocWriting but not Coding) are valid and Coding is not inserted.
+    /// Validates and normalises an IterationPlan to enforce multi-round coding safety invariants:
+    /// - Each Coding must be immediately followed by Testing (auto-insert if missing)
+    /// - Exactly one Review is required after all Coding+Testing pairs (auto-insert if missing)
+    /// - DocWriting and Improve rules unchanged (zero or one of each, same position rules)
+    /// - Must end with Merging (auto-append if missing)
+    ///
+    /// For example, the Brain proposes ["coding", "coding", "review"] → output ["coding", "testing", "coding", "testing", "review", "merging"].
     /// </summary>
+    /// <param name="plan">The plan to validate (phases list is modified in place).</param>
+    /// <returns>The same plan object with validated phases.</returns>
     internal static IterationPlan ValidatePlan(IterationPlan plan)
     {
         var phases = plan.Phases;
 
-        // Must contain Coding OR DocWriting (docs-only plans are valid)
+        // Rule 1: Must contain Coding OR DocWriting (docs-only plans are valid)
         if (!phases.Contains(GoalPhase.Coding) && !phases.Contains(GoalPhase.DocWriting))
         {
             phases.Insert(0, GoalPhase.Coding);
@@ -971,19 +976,29 @@ public sealed class GoalDispatcher : BackgroundService
 
         if (phases.Contains(GoalPhase.Coding))
         {
-            // Code-change plans: both Testing and Review are mandatory.
-            // Insert Testing after Coding if missing.
-            if (!phases.Contains(GoalPhase.Testing))
+            // Rule 2: Each Coding must be immediately followed by Testing.
+            // Iterate backward so insertions don't shift indices we're about to process.
+            for (var i = phases.Count - 2; i >= 0; i--)
             {
-                var codingIndex = phases.IndexOf(GoalPhase.Coding);
-                phases.Insert(codingIndex + 1, GoalPhase.Testing);
+                if (phases[i] == GoalPhase.Coding && (i + 1 >= phases.Count || phases[i + 1] != GoalPhase.Testing))
+                {
+                    phases.Insert(i + 1, GoalPhase.Testing);
+                }
             }
 
-            // Insert Review after Testing (or after Coding if Testing absent) if missing.
-            if (!phases.Contains(GoalPhase.Review))
+            // Rule 3: Exactly one Review, after all Coding+Testing pairs.
+            // Remove any existing Review entries, then insert one after the last Testing.
+            phases.RemoveAll(p => p == GoalPhase.Review);
+            var lastTestingIndex = phases.LastIndexOf(GoalPhase.Testing);
+            if (lastTestingIndex >= 0)
             {
-                var testingIndex = phases.IndexOf(GoalPhase.Testing);
-                phases.Insert(testingIndex + 1, GoalPhase.Review);
+                phases.Insert(lastTestingIndex + 1, GoalPhase.Review);
+            }
+            else
+            {
+                // No Testing found (shouldn't happen after Rule 2) — insert after last Coding
+                var lastCodingIndex = phases.LastIndexOf(GoalPhase.Coding);
+                phases.Insert(lastCodingIndex >= 0 ? lastCodingIndex + 1 : 0, GoalPhase.Review);
             }
         }
         else
@@ -997,7 +1012,7 @@ public sealed class GoalDispatcher : BackgroundService
             }
         }
 
-        // Must end with Merging — remove any misplaced Merging entries, then ensure it's last
+        // Rule 4: Must end with Merging — remove any misplaced entries, then append
         phases.RemoveAll(p => p == GoalPhase.Merging);
         phases.Add(GoalPhase.Merging);
 
@@ -1744,6 +1759,33 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         "Improve" => "improver",
         _ => "",
     };
+
+    /// <summary>
+    /// Counts how many times the given phase has appeared in the plan's phases list up to and
+    /// including the current pipeline phase position (1-based occurrence index).
+    /// This is used to determine the correct occurrence index for phase instruction lookup
+    /// when there are multi-round phases (e.g., multiple Coding phases).
+    /// </summary>
+    private static int CountPhaseOccurrences(GoalPipeline pipeline, GoalPhase targetPhase)
+    {
+        if (pipeline.Plan?.Phases is not { } phases || phases.Count == 0)
+            return 1;
+
+        // Count occurrences of targetPhase from index 0 up to and including
+        // the position of the current pipeline phase (pipeline.Phase).
+        // This gives the correct 1-based occurrence index for the phase being dispatched.
+        var currentIndex = phases.IndexOf(pipeline.Phase);
+        if (currentIndex < 0)
+            currentIndex = phases.Count - 1;
+
+        var count = 0;
+        for (var i = 0; i <= currentIndex; i++)
+        {
+            if (phases[i] == targetPhase)
+                count++;
+        }
+        return count > 0 ? count : 1;
+    }
 
     /// <summary>
     /// Commits and pushes the updated goals.yaml back to the config repo so external
