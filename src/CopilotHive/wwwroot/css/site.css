@@ -1109,7 +1109,7 @@ tr:last-child td { border-bottom: none; }
 .clarification-drawer {
     position: fixed;
     top: 0;
-    right: -400px;
+    right: 0;
     width: 380px;
     height: 100vh;
     background: var(--bg-card);
@@ -1117,11 +1117,12 @@ tr:last-child td { border-bottom: none; }
     z-index: 50;
     display: flex;
     flex-direction: column;
-    transition: right 0.3s ease;
+    transform: translateX(100%);
+    transition: transform 0.25s ease;
 }
 
 .clarification-drawer-open {
-    right: 0;
+    transform: translateX(0);
 }
 
 .clarification-drawer-header {

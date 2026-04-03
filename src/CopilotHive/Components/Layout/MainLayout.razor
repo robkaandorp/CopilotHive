@@ -25,7 +25,10 @@
         }
     </header>
 
-    <div class="clarification-drawer-backdrop" @onclick="CloseDrawer"></div>
+    @if (_drawerOpen)
+    {
+        <div class="clarification-drawer-backdrop" @onclick="CloseDrawer"></div>
+    }
     <div class="clarification-drawer @(_drawerOpen ? "clarification-drawer-open" : "")" aria-hidden="@(!_drawerOpen)">
         <div class="clarification-drawer-header">
             <h3>📋 Clarifications (@_pendingClarifications.Count)</h3>
