@@ -2,40 +2,30 @@
 @using CopilotHive.Orchestration
 @implements IDisposable
 
-<NavLink href="/" Match="NavLinkMatch.All">🏠 Dashboard</NavLink>
+<NavLink href="/" Match="NavLinkMatch.All">🏠 <span class="nav-label">Dashboard</span></NavLink>
 <NavLink href="/composer">
-    💬 Composer
+    💬 <span class="nav-label">Composer
     @if (_pendingClarifications > 0)
     {
         <span class="badge badge-clarification" title="@_pendingClarifications pending clarification(s)">🔔 @_pendingClarifications</span>
     }
+    </span>
 </NavLink>
-<NavLink href="/goals">🎯 Goals</NavLink>
-<NavLink href="/releases">📦 Releases</NavLink>
-<NavLink href="/orchestrator">🎵 Orchestrator</NavLink>
-<NavLink href="/workers">🐝 Workers</NavLink>
-<NavLink href="/configuration">⚙️ Configuration</NavLink>
-<NavLink href="/logs">🪵 Logs</NavLink>
-
-<div class="nav-version">
-    <span class="badge @(_isBeta ? "badge-yellow" : "badge-muted")">v@(_version)</span>
-</div>
+<NavLink href="/goals">💯 <span class="nav-label">Goals</span></NavLink>
+<NavLink href="/releases">📦 <span class="nav-label">Releases</span></NavLink>
+<NavLink href="/orchestrator">🎵 <span class="nav-label">Orchestrator</span></NavLink>
+<NavLink href="/workers">🐝 <span class="nav-label">Workers</span></NavLink>
+<NavLink href="/configuration">⚙️ <span class="nav-label">Configuration</span></NavLink>
+<NavLink href="/logs">🪵 <span class="nav-label">Logs</span></NavLink>
 
 @code {
     [Inject] private DashboardStateService State { get; set; } = default!;
     [Inject] private ClarificationQueueService ClarificationQueue { get; set; } = default!;
 
-    private string _version = "";
-    private bool _isBeta;
     private int _pendingClarifications;
 
     protected override void OnInitialized()
     {
-        _version = State.GetVersion();
-        _isBeta = _version.Contains("-beta", StringComparison.OrdinalIgnoreCase)
-                  || _version.Contains("-alpha", StringComparison.OrdinalIgnoreCase)
-                  || _version.Contains("-rc", StringComparison.OrdinalIgnoreCase)
-                  || _version.StartsWith("0.");
         _pendingClarifications = ClarificationQueue.PendingHumanCount;
         ClarificationQueue.OnChanged += HandleClarificationChanged;
     }
