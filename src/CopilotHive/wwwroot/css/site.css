@@ -464,9 +464,7 @@ tr:last-child td { border-bottom: none; }
 .iter-tabs {
     display: flex;
     gap: 0.25rem;
-    margin-bottom: 0.75rem;
     border-bottom: 1px solid var(--border);
-    padding-bottom: 0.5rem;
 }
 
 .iter-tab {
