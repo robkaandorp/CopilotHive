@@ -360,6 +360,23 @@ public sealed class HiveOrchestratorService(
                             new { error = $"Goal '{targetGoalId}' not found." });
                         break;
                     }
+
+                    // Look up the pipeline to get the current phase instruction
+                    string? currentPhaseInstruction = null;
+                    var getGoalPipeline = pipelineManager.GetByTaskId(request.TaskId);
+                    if (getGoalPipeline?.Plan is not null)
+                    {
+                        var phase = getGoalPipeline.Plan.CurrentPhase;
+                        if (phase.HasValue)
+                        {
+                            // Count how many times this phase has appeared up to and including the current one
+                            var occurrenceIndex = getGoalPipeline.Plan.Phases
+                                .Take(getGoalPipeline.Plan.CurrentPhaseIndex + 1)
+                                .Count(p => p == phase.Value);
+                            currentPhaseInstruction = getGoalPipeline.Plan.GetPhaseInstruction(phase.Value, occurrenceIndex);
+                        }
+                    }
+
                     resultJson = System.Text.Json.JsonSerializer.Serialize(new
                     {
                         id = targetGoal.Id,
@@ -367,6 +384,7 @@ public sealed class HiveOrchestratorService(
                         description = targetGoal.Description,
                         repositories = targetGoal.RepositoryNames,
                         priority = targetGoal.Priority.ToString(),
+                        current_phase_instruction = currentPhaseInstruction,
                     });
                     break;
 
