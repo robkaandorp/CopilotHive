@@ -1765,23 +1765,25 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
     /// including the current pipeline phase position (1-based occurrence index).
     /// This is used to determine the correct occurrence index for phase instruction lookup
     /// when there are multi-round phases (e.g., multiple Coding phases).
-    /// Walks phases in order from index 0, maintaining a running count per phase.
+    /// Uses the state machine's remaining-phases count to compute the exact position,
+    /// avoiding enum-value matching which would always stop at the first occurrence.
     /// </summary>
     private static int CountPhaseOccurrences(GoalPipeline pipeline, GoalPhase targetPhase)
     {
         if (pipeline.Plan?.Phases is not { } phases || phases.Count == 0)
             return 1;
 
-        // Walk phases in order from index 0, maintaining a per-phase running count.
-        // When we reach the position where the current pipeline phase matches the target phase,
-        // return the count at that moment.
+        // Determine the current position in the plan using the state machine's remaining phases.
+        // After a transition, RemainingPhases contains everything after the current phase, so:
+        // currentPosition = totalPhases - 1 - remainingCount
+        var remaining = pipeline.StateMachine.RemainingPhases;
+        var currentPosition = phases.Count - 1 - remaining.Count;
+
         var count = 0;
-        for (var i = 0; i < phases.Count; i++)
+        for (var i = 0; i <= currentPosition && i < phases.Count; i++)
         {
             if (phases[i] == targetPhase)
                 count++;
-            if (phases[i] == pipeline.Phase)
-                break;
         }
         return count > 0 ? count : 1;
     }

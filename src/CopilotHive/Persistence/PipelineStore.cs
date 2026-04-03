@@ -22,8 +22,8 @@ internal sealed class LegacyPhaseInstructionsConverter : JsonConverter<Dictionar
     [
         "planning",  // 0
         "coding",     // 1
-        "testing",    // 2
-        "review",     // 3
+        "review",     // 2
+        "testing",    // 3
         "docwriting", // 4
         "improve",    // 5
         "merging",    // 6

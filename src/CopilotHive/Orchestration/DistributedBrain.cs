@@ -1301,23 +1301,25 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <summary>
     /// Returns the 1-based occurrence index of the given phase within the plan's phases list,
     /// counting up to and including the position of the current pipeline phase.
-    /// Walks phases in order from index 0, maintaining a running count per phase.
+    /// Uses the state machine's remaining-phases count to compute the exact position,
+    /// avoiding enum-value matching which would always stop at the first occurrence.
     /// </summary>
     private static int GetPhaseOccurrenceIndex(GoalPipeline pipeline, GoalPhase phase)
     {
         if (pipeline.Plan?.Phases is not { } phases)
             return 1;
 
-        // Walk phases in order from index 0, maintaining a per-phase running count.
-        // When we reach the position where the current pipeline phase matches,
-        // return the count at that moment.
+        // Determine the current position in the plan using the state machine's remaining phases.
+        // After a transition, RemainingPhases contains everything after the current phase, so:
+        // currentPosition = totalPhases - 1 - remainingCount
+        var remaining = pipeline.StateMachine.RemainingPhases;
+        var currentPosition = phases.Count - 1 - remaining.Count;
+
         var count = 0;
-        for (var i = 0; i < phases.Count; i++)
+        for (var i = 0; i <= currentPosition && i < phases.Count; i++)
         {
             if (phases[i] == phase)
                 count++;
-            if (phases[i] == pipeline.Phase)
-                break;
         }
         return count > 0 ? count : 1;
     }
