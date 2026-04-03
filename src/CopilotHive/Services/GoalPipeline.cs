@@ -154,16 +154,30 @@ public sealed class GoalPipeline
 
     /// <summary>Current phase the pipeline is executing.</summary>
     public GoalPhase Phase { get; private set; } = GoalPhase.Planning;
+
+    /// <summary>Budget tracking review retry attempts.</summary>
+    public RetryBudget ReviewRetryBudget { get; }
+
+    /// <summary>Budget tracking test retry attempts.</summary>
+    public RetryBudget TestRetryBudget { get; }
+
+    /// <summary>Budget tracking iteration attempts (depleted each time a new iteration starts).</summary>
+    public RetryBudget IterationBudget { get; }
+
     /// <summary>One-based iteration counter; increments each time the pipeline loops.</summary>
-    public int Iteration { get; private set; } = 1;
+    public int Iteration => IterationBudget.Used + 1;
+
     /// <summary>Number of times the review phase has been retried in the current iteration.</summary>
-    public int ReviewRetries { get; private set; }
+    public int ReviewRetries => ReviewRetryBudget.Used;
+
     /// <summary>Number of times the test phase has been retried in the current iteration.</summary>
-    public int TestRetries { get; private set; }
+    public int TestRetries => TestRetryBudget.Used;
+
     /// <summary>Maximum number of task-level retries allowed.</summary>
-    public int MaxRetries { get; init; } = Constants.DefaultMaxRetriesPerTask;
+    public int MaxRetries => ReviewRetryBudget.Allowed;
+
     /// <summary>Maximum number of iterations allowed before the goal is failed.</summary>
-    public int MaxIterations { get; init; } = Constants.DefaultMaxIterations;
+    public int MaxIterations => IterationBudget.Allowed + 1;
 
     /// <summary>Brain-determined plan for the current iteration, or null if no plan set.</summary>
     public IterationPlan? Plan { get; private set; }
@@ -239,8 +253,9 @@ public sealed class GoalPipeline
         Goal = goal;
         GoalId = goal.Id;
         Description = goal.Description;
-        MaxRetries = maxRetries;
-        MaxIterations = maxIterations;
+        ReviewRetryBudget = new RetryBudget(maxRetries);
+        TestRetryBudget = new RetryBudget(maxRetries);
+        IterationBudget = new RetryBudget(maxIterations - 1);
     }
 
     /// <summary>Restore a pipeline from a persisted snapshot.</summary>
@@ -250,11 +265,21 @@ public sealed class GoalPipeline
         GoalId = snapshot.GoalId;
         Description = snapshot.Description;
         Phase = snapshot.Phase;
-        Iteration = snapshot.Iteration;
-        ReviewRetries = snapshot.ReviewRetries;
-        TestRetries = snapshot.TestRetries;
-        MaxRetries = snapshot.MaxRetries;
-        MaxIterations = snapshot.MaxIterations;
+
+        // Restore budgets from persisted scalar values.
+        // IterationBudget: allowed = maxIterations - 1, used = iteration - 1
+        IterationBudget = new RetryBudget(snapshot.MaxIterations - 1);
+        for (var i = 0; i < snapshot.Iteration - 1; i++)
+            IterationBudget.TryConsume();
+
+        ReviewRetryBudget = new RetryBudget(snapshot.MaxRetries);
+        for (var i = 0; i < snapshot.ReviewRetries; i++)
+            ReviewRetryBudget.TryConsume();
+
+        TestRetryBudget = new RetryBudget(snapshot.MaxRetries);
+        for (var i = 0; i < snapshot.TestRetries; i++)
+            TestRetryBudget.TryConsume();
+
         ActiveTaskId = snapshot.ActiveTaskId;
         CoderBranch = snapshot.CoderBranch;
         Plan = snapshot.Plan;
@@ -391,38 +416,6 @@ public sealed class GoalPipeline
     /// <param name="sessionJson">The serialised session JSON to persist.</param>
     public void SetRoleSession(string roleName, string sessionJson) =>
         RoleSessions[roleName] = sessionJson;
-
-    /// <summary>Increment the review retry counter. Returns true if retries remain.</summary>
-    public bool IncrementReviewRetry()
-    {
-        lock (_lock)
-        {
-            ReviewRetries++;
-            return ReviewRetries < MaxRetries;
-        }
-    }
-
-    /// <summary>Increment the test retry counter. Returns true if retries remain.</summary>
-    public bool IncrementTestRetry()
-    {
-        lock (_lock)
-        {
-            TestRetries++;
-            return TestRetries < MaxRetries;
-        }
-    }
-
-    /// <summary>
-    /// Increment the iteration counter. Returns <c>false</c> when the maximum has been reached.
-    /// </summary>
-    public bool IncrementIteration()
-    {
-        lock (_lock)
-        {
-            Iteration++;
-            return Iteration <= MaxIterations;
-        }
-    }
 
     /// <summary>Build a context summary for the Brain about this pipeline's current state.</summary>
     public string BuildContextSummary()

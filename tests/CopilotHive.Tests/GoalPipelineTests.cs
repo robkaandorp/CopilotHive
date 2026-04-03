@@ -169,49 +169,51 @@ public sealed class GoalPipelineTests
 
     #endregion
 
-    #region GoalPipeline — IncrementReviewRetry / IncrementTestRetry
+    #region GoalPipeline — ReviewRetryBudget / TestRetryBudget
 
     [Fact]
-    public void IncrementReviewRetry_UnderMax_ReturnsTrueAndIncrements()
+    public void ReviewRetryBudget_TryConsume_UnderMax_ReturnsTrueAndIncrements()
     {
         var pipeline = new GoalPipeline(CreateGoal(), maxRetries: 2);
 
-        var result = pipeline.IncrementReviewRetry();
+        var result = pipeline.ReviewRetryBudget.TryConsume();
 
         Assert.True(result);
         Assert.Equal(1, pipeline.ReviewRetries);
     }
 
     [Fact]
-    public void IncrementReviewRetry_AtMax_ReturnsFalse()
+    public void ReviewRetryBudget_TryConsume_AtMax_ReturnsFalse()
     {
         var pipeline = new GoalPipeline(CreateGoal(), maxRetries: 2);
 
-        pipeline.IncrementReviewRetry(); // 1 < 2 → true
-        var result = pipeline.IncrementReviewRetry(); // 2 < 2 → false
+        pipeline.ReviewRetryBudget.TryConsume(); // consume 1 of 2
+        pipeline.ReviewRetryBudget.TryConsume(); // consume 2 of 2
+        var result = pipeline.ReviewRetryBudget.TryConsume(); // exhausted
 
         Assert.False(result);
         Assert.Equal(2, pipeline.ReviewRetries);
     }
 
     [Fact]
-    public void IncrementTestRetry_UnderMax_ReturnsTrueAndIncrements()
+    public void TestRetryBudget_TryConsume_UnderMax_ReturnsTrueAndIncrements()
     {
         var pipeline = new GoalPipeline(CreateGoal(), maxRetries: 2);
 
-        var result = pipeline.IncrementTestRetry();
+        var result = pipeline.TestRetryBudget.TryConsume();
 
         Assert.True(result);
         Assert.Equal(1, pipeline.TestRetries);
     }
 
     [Fact]
-    public void IncrementTestRetry_AtMax_ReturnsFalse()
+    public void TestRetryBudget_TryConsume_AtMax_ReturnsFalse()
     {
         var pipeline = new GoalPipeline(CreateGoal(), maxRetries: 2);
 
-        pipeline.IncrementTestRetry();
-        var result = pipeline.IncrementTestRetry();
+        pipeline.TestRetryBudget.TryConsume(); // consume 1 of 2
+        pipeline.TestRetryBudget.TryConsume(); // consume 2 of 2
+        var result = pipeline.TestRetryBudget.TryConsume(); // exhausted
 
         Assert.False(result);
         Assert.Equal(2, pipeline.TestRetries);
@@ -219,26 +221,26 @@ public sealed class GoalPipelineTests
 
     #endregion
 
-    #region GoalPipeline — IncrementIteration
+    #region GoalPipeline — IterationBudget
 
     [Fact]
-    public void IncrementIteration_CalledOnce_IncrementsToTwo()
+    public void IterationBudget_TryConsume_CalledOnce_IncrementsToTwo()
     {
         var pipeline = new GoalPipeline(CreateGoal());
 
-        pipeline.IncrementIteration();
+        pipeline.IterationBudget.TryConsume();
 
         Assert.Equal(2, pipeline.Iteration);
     }
 
     [Fact]
-    public void IncrementIteration_CalledMultipleTimes_IncrementsCumulatively()
+    public void IterationBudget_TryConsume_CalledMultipleTimes_IncrementsCumulatively()
     {
         var pipeline = new GoalPipeline(CreateGoal());
 
-        pipeline.IncrementIteration();
-        pipeline.IncrementIteration();
-        pipeline.IncrementIteration();
+        pipeline.IterationBudget.TryConsume();
+        pipeline.IterationBudget.TryConsume();
+        pipeline.IterationBudget.TryConsume();
 
         Assert.Equal(4, pipeline.Iteration);
     }

@@ -620,7 +620,7 @@ public sealed class GoalDispatcher : BackgroundService
                 "No-op detected: Coder for {GoalId} returned with 0 files changed — retrying with stronger prompt",
                 pipeline.GoalId);
 
-            if (!pipeline.IncrementIteration())
+            if (!pipeline.IterationBudget.TryConsume())
             {
                 await MarkGoalFailed(pipeline, "Coder produced no file changes after max iterations (no-op)", ct);
                 return;
@@ -765,8 +765,8 @@ public sealed class GoalDispatcher : BackgroundService
         var isReviewRelated = verdict == "REQUEST_CHANGES"
             || pipeline.Metrics.ReviewVerdict == ReviewVerdict.RequestChanges;
         var canRetry = isReviewRelated
-            ? pipeline.IncrementReviewRetry()
-            : pipeline.IncrementTestRetry();
+            ? pipeline.ReviewRetryBudget.TryConsume()
+            : pipeline.TestRetryBudget.TryConsume();
 
         if (!canRetry)
         {
@@ -790,7 +790,7 @@ public sealed class GoalDispatcher : BackgroundService
         var updateMeta = new GoalUpdateMetadata { IterationSummary = iterationSummary };
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.InProgress, updateMeta, ct);
 
-        if (!pipeline.IncrementIteration())
+        if (!pipeline.IterationBudget.TryConsume())
         {
             pipeline.StateMachine.Fail();
             pipeline.AdvanceTo(GoalPhase.Failed);
@@ -1278,7 +1278,7 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
     {
         // State machine already transitioned to Coding (NewIteration) before this is called.
         // Check retry/iteration limits.
-        if (!pipeline.IncrementReviewRetry())
+        if (!pipeline.ReviewRetryBudget.TryConsume())
         {
             pipeline.StateMachine.Fail();
             pipeline.AdvanceTo(GoalPhase.Failed);
@@ -1288,9 +1288,9 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
 
         _logger.LogInformation(
             "Merge conflict for goal {GoalId} — sending back to Coder for rebase (retry {Retry}/{Max})",
-            pipeline.GoalId, pipeline.ReviewRetries, pipeline.MaxRetries);
+            pipeline.GoalId, pipeline.ReviewRetryBudget.Used, pipeline.ReviewRetryBudget.Allowed);
 
-        if (!pipeline.IncrementIteration())
+        if (!pipeline.IterationBudget.TryConsume())
         {
             pipeline.StateMachine.Fail();
             pipeline.AdvanceTo(GoalPhase.Failed);

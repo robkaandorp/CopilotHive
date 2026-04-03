@@ -190,7 +190,7 @@ public sealed class InjectSystemNoteAsyncTests
         var pipeline = new GoalPipeline(goal);
         // Advance iteration counter if needed
         for (var i = 1; i < iteration; i++)
-            pipeline.IncrementIteration();
+            pipeline.IterationBudget.TryConsume();
         return pipeline;
     }
 
@@ -463,7 +463,7 @@ public sealed class PlanAdjustmentInjectionTests
         var (dispatcher, pipeline) = CreateDispatcherWithPipeline(brain);
 
         // Set pipeline into a state where HandleNewIterationAsync can proceed:
-        // it needs both IncrementTestRetry() and IncrementIteration() to return true.
+        // it needs both TestRetryBudget.TryConsume() and IterationBudget.TryConsume() to return true.
         // With maxRetries=3 and maxIterations=10 (defaults), first calls return true.
         pipeline.StateMachine.StartIteration(
             [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging]);

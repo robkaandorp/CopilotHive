@@ -37,9 +37,9 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     {
         var pipeline = CreatePipeline("g1", "Implement feature");
         pipeline.AdvanceTo(GoalPhase.Coding);
-        pipeline.IncrementIteration();
-        pipeline.IncrementReviewRetry();
-        pipeline.IncrementTestRetry();
+        pipeline.IterationBudget.TryConsume();
+        pipeline.ReviewRetryBudget.TryConsume();
+        pipeline.TestRetryBudget.TryConsume();
         pipeline.SetActiveTask("task-42", "feature/g1");
 
         _store.SavePipeline(pipeline);
@@ -219,7 +219,7 @@ public sealed class PipelineStoreTests : IAsyncDisposable
 
         // Mutate state and save state-only
         pipeline.AdvanceTo(GoalPhase.Review);
-        pipeline.IncrementIteration();
+        pipeline.IterationBudget.TryConsume();
         _store.SavePipelineState(pipeline);
 
         var snap = Assert.Single(_store.LoadActivePipelines());
@@ -320,7 +320,7 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         _store.SavePipeline(pipeline);
 
         pipeline.AdvanceTo(GoalPhase.Testing);
-        pipeline.IncrementIteration();
+        pipeline.IterationBudget.TryConsume();
         _store.SavePipeline(pipeline);
 
         var snap = Assert.Single(_store.LoadActivePipelines());
@@ -525,7 +525,7 @@ public sealed class GoalPipelineSnapshotRestorationTests
         pipeline.AdvanceTo(GoalPhase.Review);
         Assert.Equal(GoalPhase.Review, pipeline.Phase);
 
-        pipeline.IncrementIteration();
+        pipeline.IterationBudget.TryConsume();
         Assert.Equal(2, pipeline.Iteration);
 
         pipeline.SetActiveTask("new-task", "feature/cont");
@@ -574,7 +574,7 @@ public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable{
     {
         var pipeline = _manager.CreatePipeline(CreateGoal("g1", "State persist"));
         pipeline.AdvanceTo(GoalPhase.Testing);
-        pipeline.IncrementIteration();
+        pipeline.IterationBudget.TryConsume();
 
         _manager.PersistState(pipeline);
 
@@ -874,8 +874,8 @@ public sealed class PipelineStoreSchemaMigrationTests
         {
             var pipeline = new GoalPipeline(CreateGoal("mg-1"));
             pipeline.AdvanceTo(GoalPhase.Coding);
-            pipeline.IncrementIteration();
-            pipeline.IncrementReviewRetry();
+            pipeline.IterationBudget.TryConsume();
+            pipeline.ReviewRetryBudget.TryConsume();
             pipeline.Metrics.TotalTests = 7;
             pipeline.Metrics.PassedTests = 7;
 

@@ -158,8 +158,8 @@ public sealed class PipelineFlowIntegrationTests : IAsyncDisposable
         Assert.Equal(TransitionEffect.NewIteration, failResult.Effect);
         Assert.Equal(GoalPhase.Coding, failResult.NextPhase);
 
-        pipeline.IncrementIteration();
-        pipeline.IncrementTestRetry();
+        pipeline.IterationBudget.TryConsume();
+        pipeline.TestRetryBudget.TryConsume();
 
         // ── Iteration 2 ─────────────────────────────────────────────────────
         pipeline.StateMachine.StartIteration(StandardPlan);
@@ -198,35 +198,42 @@ public sealed class PipelineFlowIntegrationTests : IAsyncDisposable
     [Fact]
     public void RetryLimitExhaustion_ExceedsMaxRetries_PipelineFailsAndNotRestored()
     {
-        // maxRetries = 3: IncrementTestRetry returns true for the first two calls
-        // (TestRetries 1 < 3, 2 < 3) and false on the third (TestRetries 3 < 3 = false).
+        // maxRetries = 3: TestRetryBudget.TryConsume() returns true for all three calls
+        // and false on the fourth (budget exhausted).
         var manager = new GoalPipelineManager(_store);
         var goal = CreateGoal("goal-exhaust");
         var pipeline = manager.CreatePipeline(goal, maxRetries: 3);
 
         pipeline.StateMachine.StartIteration(StandardPlan);
 
-        // Simulate driving Coding → Testing, then failing Testing three times
+        // Simulate driving Coding → Testing, then failing Testing four times
         pipeline.StateMachine.Transition(PhaseInput.Succeeded); // Coding → Testing
 
         // Retry 1
         pipeline.StateMachine.Transition(PhaseInput.Failed);    // Testing → Coding (NewIteration)
-        var r1 = pipeline.IncrementTestRetry();
+        var r1 = pipeline.TestRetryBudget.TryConsume();
         Assert.True(r1, "First retry should have remaining retries.");
         pipeline.StateMachine.StartIteration(StandardPlan);
         pipeline.StateMachine.Transition(PhaseInput.Succeeded); // Coding → Testing
 
         // Retry 2
         pipeline.StateMachine.Transition(PhaseInput.Failed);    // Testing → Coding (NewIteration)
-        var r2 = pipeline.IncrementTestRetry();
+        var r2 = pipeline.TestRetryBudget.TryConsume();
         Assert.True(r2, "Second retry should have remaining retries.");
         pipeline.StateMachine.StartIteration(StandardPlan);
         pipeline.StateMachine.Transition(PhaseInput.Succeeded); // Coding → Testing
 
-        // Retry 3 — limit exhausted
+        // Retry 3
         pipeline.StateMachine.Transition(PhaseInput.Failed);    // Testing → Coding (NewIteration)
-        var r3 = pipeline.IncrementTestRetry();
-        Assert.False(r3, "Third retry should indicate no remaining retries (limit reached).");
+        var r3 = pipeline.TestRetryBudget.TryConsume();
+        Assert.True(r3, "Third retry should have remaining retries.");
+        pipeline.StateMachine.StartIteration(StandardPlan);
+        pipeline.StateMachine.Transition(PhaseInput.Succeeded); // Coding → Testing
+
+        // Retry 4 — limit exhausted
+        pipeline.StateMachine.Transition(PhaseInput.Failed);    // Testing → Coding (NewIteration)
+        var r4 = pipeline.TestRetryBudget.TryConsume();
+        Assert.False(r4, "Fourth retry should indicate no remaining retries (limit reached).");
 
         // Caller calls Fail() when limit is exhausted
         pipeline.StateMachine.Fail();
