@@ -263,7 +263,7 @@ public sealed class DistributedBrainTests
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
 
-        Assert.Contains("=== Coder output (iteration 1) ===", result);
+        Assert.Contains("=== Coder output round 1 (iteration 1) ===", result);
         Assert.Contains("Added UserService", result);
     }
 
@@ -280,7 +280,7 @@ public sealed class DistributedBrainTests
 
         Assert.Contains("=== Reviewer feedback (iteration 1) ===", result);
         Assert.Contains("=== Tester feedback (iteration 1) ===", result);
-        Assert.Contains("=== Coder output (iteration 1) ===", result);
+        Assert.Contains("=== Coder output round 1 (iteration 1) ===", result);
     }
 
     [Fact]
