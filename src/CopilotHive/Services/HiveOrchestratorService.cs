@@ -366,15 +366,15 @@ public sealed class HiveOrchestratorService(
                     var getGoalPipeline = pipelineManager.GetByTaskId(request.TaskId);
                     if (getGoalPipeline?.Plan is not null)
                     {
-                        var phase = getGoalPipeline.Plan.CurrentPhase;
-                        if (phase.HasValue)
-                        {
-                            // Count how many times this phase has appeared up to and including the current one
-                            var occurrenceIndex = getGoalPipeline.Plan.Phases
-                                .Take(getGoalPipeline.Plan.CurrentPhaseIndex + 1)
-                                .Count(p => p == phase.Value);
-                            currentPhaseInstruction = getGoalPipeline.Plan.GetPhaseInstruction(phase.Value, occurrenceIndex);
-                        }
+                        // Use pipeline.Phase (updated by AdvanceTo) instead of Plan.CurrentPhase
+                        var currentPhase = getGoalPipeline.Phase;
+                        // Derive occurrence index by counting appearances up to CurrentPhaseIndex
+                        var idx = getGoalPipeline.Plan.CurrentPhaseIndex;
+                        int occurrenceIndex = 1;
+                        for (int i = 0; i <= idx; i++)
+                            if (getGoalPipeline.Plan.Phases[i] == currentPhase)
+                                occurrenceIndex = i + 1;
+                        currentPhaseInstruction = getGoalPipeline.Plan.GetPhaseInstruction(currentPhase, occurrenceIndex);
                     }
 
                     resultJson = System.Text.Json.JsonSerializer.Serialize(new
