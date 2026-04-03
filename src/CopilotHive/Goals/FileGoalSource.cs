@@ -222,6 +222,7 @@ public sealed class FileGoalSource : IGoalSource
             Passed = e.TestCounts.Passed,
             Failed = e.TestCounts.Failed,
         },
+        BuildSuccess = e.BuildSuccess,
         ReviewVerdict = e.ReviewVerdict,
         Notes = e.Notes ?? [],
         PhaseOutputs = e.PhaseOutputs ?? [],
@@ -249,6 +250,7 @@ public sealed class FileGoalSource : IGoalSource
             Passed = s.TestCounts.Passed,
             Failed = s.TestCounts.Failed,
         },
+        BuildSuccess = s.BuildSuccess,
         ReviewVerdict = s.ReviewVerdict,
         Notes = s.Notes.Count > 0 ? s.Notes : null,
         PhaseOutputs = s.PhaseOutputs.Count > 0 ? s.PhaseOutputs : null,
@@ -290,6 +292,7 @@ public sealed class FileGoalSource : IGoalSource
         public int Iteration { get; set; }
         public List<PhaseResultEntry>? Phases { get; set; }
         public TestCountEntry? TestCounts { get; set; }
+        public bool BuildSuccess { get; set; }
         public string? ReviewVerdict { get; set; }
         public List<string>? Notes { get; set; }
         /// <summary>Raw worker outputs keyed by <c>{role}-{iteration}</c>.</summary>

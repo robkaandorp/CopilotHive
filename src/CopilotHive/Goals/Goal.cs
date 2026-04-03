@@ -55,6 +55,8 @@ public sealed class IterationSummary
     public List<PhaseResult> Phases { get; init; } = [];
     /// <summary>Test counts, or <c>null</c> if no tests were run.</summary>
     public TestCounts? TestCounts { get; init; }
+    /// <summary>Whether the build succeeded during the testing phase.</summary>
+    public bool BuildSuccess { get; init; }
     /// <summary>"approve", "reject", or <c>null</c> if no review was run.</summary>
     public string? ReviewVerdict { get; init; }
     /// <summary>Notable events such as "improver skipped due to timeout".</summary>

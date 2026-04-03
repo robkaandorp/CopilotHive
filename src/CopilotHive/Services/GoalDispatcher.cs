@@ -1704,6 +1704,7 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
             Iteration = pipeline.Iteration,
             Phases = phases,
             TestCounts = testCounts,
+            BuildSuccess = metrics.BuildSuccess,
             ReviewVerdict = reviewVerdict,
             Notes = notes,
             PhaseOutputs = phaseOutputs,

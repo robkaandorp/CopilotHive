@@ -336,6 +336,7 @@ public sealed class DashboardStateService : IDisposable
                     TotalTests = isTestPhase ? (summary.TestCounts?.Total ?? 0) : 0,
                     PassedTests = isTestPhase ? (summary.TestCounts?.Passed ?? 0) : 0,
                     FailedTests = isTestPhase ? (summary.TestCounts?.Failed ?? 0) : 0,
+                    BuildSuccess = isTestPhase && summary.BuildSuccess,
                     ReviewVerdict = isReviewPhase ? summary.ReviewVerdict : null,
                     BrainPrompt = summaryPhasePrompts.BrainPrompt,
                     WorkerPrompt = summaryPhasePrompts.WorkerPrompt,
