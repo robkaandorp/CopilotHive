@@ -1,10 +1,11 @@
 @inherits LayoutComponentBase
 @inject CopilotHive.Dashboard.PageHeaderState PageHeader
+@inject CopilotHive.Dashboard.DashboardStateService DashboardState
 @implements IDisposable
 
 <div class="hive-layout">
     <nav class="hive-nav">
-        <div class="hive-brand">🐝 CopilotHive</div>
+        <div class="hive-brand">🐝 <span class="brand-text">CopilotHive</span></div>
         <NavMenu />
     </nav>
     <header class="hive-header">
@@ -18,13 +19,23 @@
         @Body
     </main>
     <footer class="hive-footer">
+        <span class="nav-version-footer">
+            <span class="badge @(_isBeta ? "badge-yellow" : "badge-muted")">v@(_version)</span>
+        </span>
         <a href="https://github.com/robkaandorp/CopilotHive" target="_blank" rel="noopener noreferrer">CopilotHive on GitHub</a>
     </footer>
 </div>
 
 @code {
+    private string _version = "";
+    private bool _isBeta;
     protected override void OnInitialized()
     {
+        _version = DashboardState.GetVersion();
+        _isBeta = _version.Contains("-beta", StringComparison.OrdinalIgnoreCase)
+                  || _version.Contains("-alpha", StringComparison.OrdinalIgnoreCase)
+                  || _version.Contains("-rc", StringComparison.OrdinalIgnoreCase)
+                  || _version.StartsWith("0.");
         PageHeader.OnChanged += HandleTitleChanged;
     }
 

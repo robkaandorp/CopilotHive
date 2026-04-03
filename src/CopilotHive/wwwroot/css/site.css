@@ -1403,3 +1403,54 @@ tr:last-child td { border-bottom: none; }
     font-size: 0.85rem;
     padding: 2rem 1rem;
 }
+
+/* ── Responsive nav collapse ── */
+
+.nav-version-footer {
+    font-size: 0.75rem;
+}
+
+.hive-footer {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+}
+
+@media (max-width: 768px) {
+    .hive-layout {
+        grid-template-columns: 52px 1fr;
+    }
+
+    .hive-nav {
+        padding: 0.5rem 0.25rem;
+        align-items: center;
+    }
+
+    .hive-brand {
+        font-size: 1.25rem;
+        padding: 0.5rem 0;
+        margin-bottom: 0.75rem;
+        overflow: hidden;
+        white-space: nowrap;
+    }
+
+    .hive-nav .hive-brand .brand-text {
+        display: none;
+    }
+
+    .hive-nav a {
+        padding: 0.5rem;
+        display: flex;
+        justify-content: center;
+        font-size: 1.1rem;
+    }
+
+    .hive-nav a .nav-label {
+        display: none;
+    }
+
+    .hive-footer {
+        grid-column: 1 / span 2;
+    }
+}
