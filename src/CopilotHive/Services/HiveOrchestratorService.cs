@@ -367,14 +367,7 @@ public sealed class HiveOrchestratorService(
                     if (getGoalPipeline?.Plan is not null)
                     {
                         var currentPhase = getGoalPipeline.Phase;
-                        var idx = getGoalPipeline.Plan.CurrentPhaseIndex;
-                        int occurrenceIndex = 0;
-                        for (int i = 0; i <= idx; i++)
-                        {
-                            if (getGoalPipeline.Plan.Phases[i] == currentPhase)
-                                occurrenceIndex++;
-                        }
-                        if (occurrenceIndex == 0) occurrenceIndex = 1;
+                        var occurrenceIndex = getGoalPipeline.StateMachine.GetCurrentPhaseOccurrence(getGoalPipeline.Plan.Phases);
                         currentPhaseInstruction = getGoalPipeline.Plan.GetPhaseInstruction(currentPhase, occurrenceIndex);
                     }
 

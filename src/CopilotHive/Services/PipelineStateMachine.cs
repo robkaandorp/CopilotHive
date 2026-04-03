@@ -212,4 +212,21 @@ public sealed class PipelineStateMachine
 
     private TransitionResult InvalidTransition(PhaseInput input) =>
         throw new InvalidOperationException($"Invalid transition: {Phase} + {input}.");
+
+    /// <summary>
+    /// Returns the 1-based occurrence count of the current phase within the executed portion of the plan.
+    /// The "executed portion" is: all completed phases + the current phase.
+    /// </summary>
+    public int GetCurrentPhaseOccurrence(IReadOnlyList<GoalPhase> planPhases)
+    {
+        // Position in plan = total phases - remaining - 1 (for current phase)
+        var currentPosition = planPhases.Count - _remainingPhases.Count - 1;
+        var count = 0;
+        for (var i = 0; i <= currentPosition && i < planPhases.Count; i++)
+        {
+            if (planPhases[i] == Phase)
+                count++;
+        }
+        return count > 0 ? count : 1;
+    }
 }

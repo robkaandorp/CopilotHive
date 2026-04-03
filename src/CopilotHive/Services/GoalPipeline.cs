@@ -54,32 +54,6 @@ public sealed class IterationPlan
     /// <summary>Brain's reasoning for this plan.</summary>
     public string? Reason { get; init; }
 
-    /// <summary>Index of the current phase being executed.</summary>
-    public int CurrentPhaseIndex { get; set; }
-
-    /// <summary>The current phase in the plan, or null if plan is complete.</summary>
-    public GoalPhase? CurrentPhase => CurrentPhaseIndex < Phases.Count ? Phases[CurrentPhaseIndex] : null;
-
-    /// <summary>The next phase in the plan after the current one, or null if none.</summary>
-    public GoalPhase? NextPhase => CurrentPhaseIndex + 1 < Phases.Count ? Phases[CurrentPhaseIndex + 1] : null;
-
-    /// <summary>Whether all planned phases have been executed.</summary>
-    public bool IsComplete => CurrentPhaseIndex >= Phases.Count;
-
-    /// <summary>Advance to the next phase. Returns the new current phase or null if complete.</summary>
-    public GoalPhase? Advance()
-    {
-        if (!IsComplete) CurrentPhaseIndex++;
-        return CurrentPhase;
-    }
-
-    /// <summary>Returns the phase that comes after the specified phase, or null if none.</summary>
-    public GoalPhase? NextPhaseAfter(GoalPhase phase)
-    {
-        var index = Phases.IndexOf(phase);
-        return index >= 0 && index + 1 < Phases.Count ? Phases[index + 1] : null;
-    }
-
     /// <summary>
     /// Returns the instruction string for the given phase and occurrence index (1-based).
     /// Tries the indexed key first (e.g. "coding-2" for occurrence 2), then falls back
@@ -359,12 +333,11 @@ public sealed class GoalPipeline
         }
     }
 
-    /// <summary>Set the iteration plan from the Brain, resetting to the first phase.</summary>
+    /// <summary>Set the iteration plan from the Brain.</summary>
     public void SetPlan(IterationPlan plan)
     {
         lock (_lock)
         {
-            plan.CurrentPhaseIndex = 0;
             Plan = plan;
         }
     }
