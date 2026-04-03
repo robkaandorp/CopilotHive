@@ -941,6 +941,30 @@ else
         _selectedPhase = null; // reset phase selection when switching tabs
         _lastTimelineCount = 0;
         BuildActiveTimeline();
+        AutoSelectFailedPhase(number);
+    }
+
+    private void AutoSelectFailedPhase(int number)
+    {
+        // Live path: look through _detail.Iterations for a failed phase
+        if (_detail is not null)
+        {
+            var iter = _detail.Iterations.FirstOrDefault(i => i.Number == number);
+            var failedPhase = iter?.Phases.FirstOrDefault(p => p.Status == "failed");
+            if (failedPhase is not null)
+            {
+                _selectedPhase = $"{number}-{failedPhase.Name}";
+                return;
+            }
+        }
+
+        // Stored path: look through _storedIterations for a failed phase
+        var storedIter = _storedIterations.FirstOrDefault(i => i.Iteration == number);
+        var storedFailedPhase = storedIter?.Phases.FirstOrDefault(p => p.Result == "fail");
+        if (storedFailedPhase is not null)
+        {
+            _selectedPhase = $"s{number}-{storedFailedPhase.Name}";
+        }
     }
 
     private void ClearSelectedPhase()
