@@ -42,7 +42,8 @@ public sealed class TaskExecutor(
         agentRunner.ClearTestReport();
         agentRunner.ClearWorkerReport();
 
-        // Inject the tester's structured report into the reviewer runner so get_test_report is available.
+        // Always clear any stale tester report, then set it only when metadata is present.
+        agentRunner.SetTesterReport(null);
         if (task.Role == WorkerRole.Reviewer
             && task.Metadata.TryGetValue("tester_report", out var testerReport))
         {
