@@ -1209,6 +1209,13 @@ tr:last-child td { border-bottom: none; }
     font-size: 0.85rem;
 }
 
+.goal-detail-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem 0.75rem;
+}
+
 .goal-detail-body {
     flex: 1;
     display: flex;
