@@ -354,14 +354,13 @@
                                         </button>
                                     }
                                 </div>
-                                <div class="iter-content" @ref="_iterContentRef">
-
                                 @if (!string.IsNullOrEmpty(iter.PlanReason))
                                 {
-                                    <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.5rem;font-style:italic">
+                                    <div class="plan-reason">
                                         📋 @iter.PlanReason
                                     </div>
                                 }
+                                <div class="iter-content" @ref="_iterContentRef">
 
                                 @foreach (var phase in iter.Phases)
                                 {
@@ -581,6 +580,12 @@
                                         </button>
                                     }
                                 </div>
+                                @if (!string.IsNullOrEmpty(iter.PlanReason))
+                                {
+                                    <div class="plan-reason">
+                                        📋 @iter.PlanReason
+                                    </div>
+                                }
                                 <div class="iter-content">
 
                                 @if (iter.TestCounts is { } tc)

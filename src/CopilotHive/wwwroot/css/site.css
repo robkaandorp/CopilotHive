@@ -1252,6 +1252,14 @@ tr:last-child td { border-bottom: none; }
     min-height: 0;
 }
 
+.plan-reason {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-style: italic;
+    padding: 0.25rem 0.5rem;
+    flex-shrink: 0;
+}
+
 .goal-detail-bottom {
     flex-shrink: 0;
     display: flex;
