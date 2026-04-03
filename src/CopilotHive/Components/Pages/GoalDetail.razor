@@ -519,17 +519,14 @@
                                                 <div class="timeline-entry timeline-progress">
                                                     <div class="timeline-ts">@entry.Timestamp.ToString("HH:mm:ss")</div>
                                                     <div class="timeline-body">
-                                                        <span class="role-badge @RoleBadgeColor(entry.RoleName)">@entry.RoleName</span>
-                                                        @if (!string.IsNullOrEmpty(entry.Status))
-                                                        {
-                                                            <span class="badge badge-blue">@entry.Status</span>
-                                                        }
-                                                        <span class="timeline-phase">[@entry.PhaseName]</span>
+                                                        <div style="display:flex;align-items:center;gap:0.35rem;">
+                                                            <span class="role-badge @RoleBadgeColor(entry.RoleName)">@entry.RoleName</span>
+                                                            @if (!string.IsNullOrEmpty(entry.Status))
+                                                            {
+                                                                <span class="badge badge-blue">@entry.Status</span>
+                                                            }
+                                                        </div>
                                                         <div class="timeline-details">@entry.Details</div>
-                                                        @if (!string.IsNullOrEmpty(entry.WorkerId))
-                                                        {
-                                                            <div class="timeline-worker">worker: @entry.WorkerId</div>
-                                                        }
                                                     </div>
                                                 </div>
                                             }
