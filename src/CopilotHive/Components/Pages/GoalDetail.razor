@@ -427,27 +427,6 @@
                                                 </div>
                                             }
 
-                                            @if (phase.ProgressReports.Count > 0)
-                                            {
-                                                <div style="margin-bottom:0.75rem">
-                                                    <div class="label" style="margin-bottom:0.25rem">Progress Reports</div>
-                                                    <table style="font-size:0.85rem">
-                                                        <thead><tr><th>Time</th><th>Worker</th><th>Status</th><th>Details</th></tr></thead>
-                                                        <tbody>
-                                                            @foreach (var rpt in phase.ProgressReports)
-                                                            {
-                                                                <tr>
-                                                                    <td style="white-space:nowrap;color:var(--text-muted)">@rpt.Timestamp.ToString("HH:mm:ss")</td>
-                                                                    <td style="font-family:monospace;font-size:0.85rem">@Truncate(rpt.WorkerId, 12)</td>
-                                                                    <td><span class="badge badge-blue">@rpt.Status</span></td>
-                                                                    <td>@Truncate(rpt.Details, 200)</td>
-                                                                </tr>
-                                                            }
-                                                        </tbody>
-                                                    </table>
-                                                </div>
-                                            }
-
                                             @if (phase.Clarifications.Count > 0)
                                             {
                                                 <div style="margin-bottom:0.75rem">
