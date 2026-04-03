@@ -272,7 +272,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 "Retrieve goal details (description, status, repositories, iteration info) by goal ID."),
             AIFunctionFactory.Create(
                 ([Description("Ordered phase names, e.g. [\"coding\",\"testing\",\"docwriting\",\"review\",\"merging\"]")] string[] phases,
-                 [Description("JSON-encoded dict of phase name to instruction, e.g. {\"coding\":\"focus on...\",\"review\":\"check...\"}")] string phase_instructions,
+                 [Description("JSON object with per-phase instructions.\n  Single-round: {\"coding\": \"...\", \"review\": \"...\"}\n  Multi-round:  {\"coding-1\": \"step 1: revert...\", \"coding-2\": \"step 2: restructure...\", \"review\": \"...\"}")] string phase_instructions,
                  [Description("Why you chose this iteration plan")] string reason,
                  [Description("Optional JSON-encoded dict of phase name to model tier, e.g. {\"coding\":\"premium\"}. Valid phases: coding, testing, docwriting, review, improve. Valid tiers: standard, premium. Omitted phases use the default tier.")] string? model_tiers = null) =>
                 {
@@ -553,9 +553,23 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             Available phases: coding, testing, docwriting, review, improve, merging
 
+            For large or complex coding tasks, you may plan multiple coding+testing rounds before review:
+              ["coding", "testing", "coding", "testing", "review", "improve", "merging"]
+
+            Use multiple coding rounds when:
+            - The change involves a large file (>500 lines) that risks LLM response timeouts
+            - The work naturally splits into sequential steps (e.g. "revert X, then implement Y")
+            - A previous iteration timed out during coding
+
+            Each coding round must be immediately followed by testing. Provide separate phase_instructions
+            for each round using keys "coding-1", "coding-2", etc. and "testing-1", "testing-2", etc.
+            Single-round plans may use bare keys "coding", "testing" as before.
+
             Call the `report_iteration_plan` tool with:
             - phases: ordered list of phase names
-            - phase_instructions: JSON object with per-phase instructions (e.g. {"coding": "focus on...", "review": "check..."})
+            - phase_instructions: JSON object with per-phase instructions.
+              Single-round: {"coding": "...", "review": "..."}
+              Multi-round:  {"coding-1": "step 1: revert...", "coding-2": "step 2: restructure...", "review": "..."}
             - reason: why this plan
             - model_tiers: (optional) JSON object to escalate specific phases to premium tier
               (e.g. {"coding": "premium"}). Valid phases: coding, testing, docwriting, review, improve.
@@ -874,6 +888,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         var roleName = phase.ToWorkerRole().ToRoleName();
 
         var phaseInstructions = "";
+        // Use occurrence-indexed key lookup for multi-round plans (e.g. "coding-2" for second coding round)
         var occurrenceIndex = GetPhaseOccurrenceIndex(pipeline, phase);
         var instructions = pipeline.Plan?.GetPhaseInstruction(phase, occurrenceIndex);
         if (!string.IsNullOrEmpty(instructions))
@@ -1365,15 +1380,49 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             sb.AppendLine("=== End tester feedback ===");
         }
 
-        // Include coder output for context on what was attempted
-        var coderKey = $"coder-{prevIteration}";
-        if (pipeline.PhaseOutputs.TryGetValue(coderKey, out var coderOutput)
-            && !string.IsNullOrWhiteSpace(coderOutput))
+        // Include coder output — collect ALL coding round outputs from the previous iteration.
+        // Bare key:  coder-{prevIteration}        (single-round plans)
+        // Round keys: coder-{prevIteration}-{R}   (multi-round plans, e.g. coder-2-1, coder-2-2)
+        // First loop: collect bare coder-{N} entries only.
+        var round = 0;
+        foreach (var kvp in pipeline.PhaseOutputs)
         {
+            if (!kvp.Key.StartsWith($"coder-{prevIteration}"))
+                continue;
+
+            var remainder = kvp.Key[$"coder-{prevIteration}".Length..];
+            // Skip round-specific keys (e.g. coder-3-1, coder-3-2) — remainder starts with '-'
+            if (remainder.StartsWith("-"))
+                continue;
+
+            if (string.IsNullOrWhiteSpace(kvp.Value))
+                continue;
+
             hasAnyFeedback = true;
-            sb.AppendLine($"=== Coder output (iteration {prevIteration}) ===");
-            sb.AppendLine(Truncate(coderOutput, Constants.TruncationMedium));
-            sb.AppendLine("=== End coder output ===");
+            round++;
+            sb.AppendLine($"=== Coder output round {round} (iteration {prevIteration}) ===");
+            sb.AppendLine(Truncate(kvp.Value, Constants.TruncationMedium));
+            sb.AppendLine($"=== End coder output round {round} ===");
+        }
+
+        // Second loop: collect round-specific coder-{N}-{R} entries.
+        var roundSpecificRound = 0;
+        foreach (var kvp in pipeline.PhaseOutputs)
+        {
+            if (!kvp.Key.StartsWith($"coder-{prevIteration}-"))
+                continue;
+
+            if (!int.TryParse(kvp.Key[$"coder-{prevIteration}-".Length..], out _))
+                continue;
+
+            if (string.IsNullOrWhiteSpace(kvp.Value))
+                continue;
+
+            hasAnyFeedback = true;
+            roundSpecificRound++;
+            sb.AppendLine($"=== Coder output round {roundSpecificRound} (iteration {prevIteration}) ===");
+            sb.AppendLine(Truncate(kvp.Value, Constants.TruncationMedium));
+            sb.AppendLine($"=== End coder output round {roundSpecificRound} ===");
         }
 
         if (!hasAnyFeedback)
