@@ -81,6 +81,9 @@ public sealed class SqliteGoalStore : IGoalStore
                 test_failed    INTEGER,
                 review_verdict TEXT,
                 notes_json     TEXT,
+                phase_outputs_json TEXT,
+                clarifications_json TEXT,
+                build_success  INTEGER NOT NULL DEFAULT 0,
                 created_at     TEXT NOT NULL,
                 UNIQUE(goal_id, iteration)
             );

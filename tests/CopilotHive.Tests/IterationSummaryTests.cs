@@ -494,4 +494,68 @@ public sealed class IterationSummaryTests : IDisposable
         Assert.Single(roundTripped.Phases);
         Assert.Equal("Implemented the feature.", roundTripped.Phases[0].WorkerOutput);
     }
+
+    // ── BuildSuccess persistence ─────────────────────────────────────────
+
+    /// <summary>
+    /// IterationSummary with BuildSuccess=true round-trips through
+    /// FileGoalSource UpdateGoalStatusAsync → ReadGoalsAsync.
+    /// </summary>
+    [Fact]
+    public async Task FileGoalSource_BuildSuccessTrue_RoundTrips()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: build-ok-goal
+                description: "Goal with build success"
+            """);
+
+        var source = new FileGoalSource(path);
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 20.0 }],
+            TestCounts = new TestCounts { Total = 8, Passed = 8, Failed = 0 },
+            BuildSuccess = true,
+        };
+        await source.UpdateGoalStatusAsync("build-ok-goal", GoalStatus.Completed,
+            new GoalUpdateMetadata { Iterations = 1, IterationSummary = summary },
+            TestContext.Current.CancellationToken);
+
+        var goals = await source.ReadGoalsAsync(TestContext.Current.CancellationToken);
+        Assert.Single(goals);
+        var s = Assert.Single(goals[0].IterationSummaries);
+        Assert.True(s.BuildSuccess);
+    }
+
+    /// <summary>
+    /// IterationSummary with BuildSuccess=false round-trips through
+    /// FileGoalSource UpdateGoalStatusAsync → ReadGoalsAsync.
+    /// </summary>
+    [Fact]
+    public async Task FileGoalSource_BuildSuccessFalse_RoundTrips()
+    {
+        var path = WriteTempYaml("""
+            goals:
+              - id: build-fail-goal
+                description: "Goal with build failure"
+            """);
+
+        var source = new FileGoalSource(path);
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = "Testing", Result = "fail", DurationSeconds = 20.0 }],
+            TestCounts = new TestCounts { Total = 8, Passed = 3, Failed = 5 },
+            BuildSuccess = false,
+        };
+        await source.UpdateGoalStatusAsync("build-fail-goal", GoalStatus.Completed,
+            new GoalUpdateMetadata { Iterations = 1, IterationSummary = summary },
+            TestContext.Current.CancellationToken);
+
+        var goals = await source.ReadGoalsAsync(TestContext.Current.CancellationToken);
+        Assert.Single(goals);
+        var s = Assert.Single(goals[0].IterationSummaries);
+        Assert.False(s.BuildSuccess);
+    }
 }
