@@ -657,13 +657,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             }
         }
 
-        var instructions = new Dictionary<GoalPhase, string>();
+        var instructions = new Dictionary<string, string>();
         if (dto.PhaseInstructions is not null)
         {
             foreach (var (key, value) in dto.PhaseInstructions)
             {
-                if (Enum.TryParse<GoalPhase>(key, ignoreCase: true, out var phase) && value is not null)
-                    instructions[phase] = value;
+                if (value is not null)
+                    instructions[key] = value;
             }
         }
 
@@ -874,7 +874,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         var roleName = phase.ToWorkerRole().ToRoleName();
 
         var phaseInstructions = "";
-        if (pipeline.Plan?.PhaseInstructions.TryGetValue(phase, out var instructions) == true)
+        var occurrenceIndex = GetPhaseOccurrenceIndex(pipeline, phase);
+        var instructions = pipeline.Plan?.GetPhaseInstruction(phase, occurrenceIndex);
+        if (!string.IsNullOrEmpty(instructions))
             phaseInstructions = $"\nPhase instructions from the plan:\n{instructions}";
 
         // Check if docwriting preceded review in this iteration's plan, so the
@@ -1294,6 +1296,32 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     {
         if (_agent is null)
             throw new InvalidOperationException("Brain not connected. Call ConnectAsync first.");
+    }
+
+    /// <summary>
+    /// Returns the 1-based occurrence index of the given phase within the plan's phases list,
+    /// counting up to and including the position of the current pipeline phase.
+    /// Uses the state machine's remaining-phases count to compute the exact position,
+    /// avoiding enum-value matching which would always stop at the first occurrence.
+    /// </summary>
+    private static int GetPhaseOccurrenceIndex(GoalPipeline pipeline, GoalPhase phase)
+    {
+        if (pipeline.Plan?.Phases is not { } phases)
+            return 1;
+
+        // Determine the current position in the plan using the state machine's remaining phases.
+        // After a transition, RemainingPhases contains everything after the current phase, so:
+        // currentPosition = totalPhases - 1 - remainingCount
+        var remaining = pipeline.StateMachine.RemainingPhases;
+        var currentPosition = phases.Count - 1 - remaining.Count;
+
+        var count = 0;
+        for (var i = 0; i <= currentPosition && i < phases.Count; i++)
+        {
+            if (phases[i] == phase)
+                count++;
+        }
+        return count > 0 ? count : 1;
     }
 
     internal static string Truncate(string text, int maxLength) =>

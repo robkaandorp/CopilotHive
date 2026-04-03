@@ -148,7 +148,7 @@ public sealed class DistributedBrainTests
         Assert.Equal(GoalPhase.Review, plan.Phases[2]);
         Assert.Equal(GoalPhase.Merging, plan.Phases[3]);
         Assert.Equal("Standard workflow", plan.Reason);
-        Assert.Equal("focus on tests", plan.PhaseInstructions[GoalPhase.Coding]);
+        Assert.Equal("focus on tests", plan.PhaseInstructions["coding"]);
     }
 
     [Fact]
