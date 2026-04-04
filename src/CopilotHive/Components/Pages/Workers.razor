@@ -27,6 +27,7 @@
                 <th>Worker ID</th>
                 <th>Role</th>
                 <th>Model</th>
+                <th>Ctx</th>
                 <th>Status</th>
                 <th>Current Task</th>
                 <th>Last Heartbeat</th>
@@ -60,6 +61,22 @@
                         else
                         {
                             <text>—</text>
+                        }
+                    </td>
+                    <td style="font-family:monospace;font-size:0.85rem">
+                        @if (w.IsBusy && w.ContextUsagePercent > 0)
+                        {
+                            var color = w.ContextUsagePercent switch
+                            {
+                                < 50 => "var(--green)",
+                                < 80 => "var(--amber)",
+                                _ => "var(--red)"
+                            };
+                            <span style="color:@color">@w.ContextUsagePercent%</span>
+                        }
+                        else
+                        {
+                            <span style="color:var(--text-muted)">—</span>
                         }
                     </td>
                     <td>

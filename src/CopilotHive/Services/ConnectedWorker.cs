@@ -26,6 +26,8 @@ public sealed class ConnectedWorker
     public DateTime ConnectedAt { get; init; } = DateTime.UtcNow;
     /// <summary>Model used for the current task, or <c>null</c> when idle.</summary>
     public string? CurrentModel { get; set; }
+    /// <summary>Estimated context window usage as a percentage (0–100), or 0 when idle.</summary>
+    public int ContextUsagePercent { get; set; }
 
     /// <summary>
     /// The orchestrator writes messages here; the worker's stream reads from it.

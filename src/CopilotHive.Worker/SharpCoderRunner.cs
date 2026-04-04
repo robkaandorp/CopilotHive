@@ -258,6 +258,18 @@ public sealed class SharpCoderRunner : IAgentRunner
     /// <inheritdoc/>
     public object? GetSession() => _session;
 
+    /// <inheritdoc/>
+    public int GetContextUsagePercent()
+    {
+        if (_session == null) return 0;
+
+        const double ContextDenominator = 100_000.0;
+        var tokens = _session.LastKnownContextTokens > 0
+            ? _session.LastKnownContextTokens
+            : _session.EstimatedContextTokens;
+        return (int)Math.Min(100, (tokens * 100.0) / ContextDenominator);
+    }
+
     public Task ConnectAsync(CancellationToken ct = default)
     {
         _log.Info("Initializing SharpCoderRunner IChatClient...");

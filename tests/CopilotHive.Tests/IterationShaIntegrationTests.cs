@@ -382,6 +382,7 @@ public sealed class IterationShaIntegrationTests : IAsyncDisposable
         public void SetCustomAgent(WorkerRole role, string agentsMdContent) { }
         public void SetSession(object? session) => _session = session;
         public object? GetSession() => _session;
+        public int GetContextUsagePercent() => 0;
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ResetSessionAsync(string? model = null, CancellationToken ct = default) => Task.CompletedTask;

@@ -55,6 +55,12 @@ public interface IAgentRunner : IAsyncDisposable
     /// </returns>
     object? GetSession();
 
+    /// <summary>
+    /// Returns the estimated context window usage as a percentage (0–100) relative to
+    /// a 100,000-token denominator. Returns 0 if no session is active.
+    /// </summary>
+    int GetContextUsagePercent();
+
     /// <summary>Connects to the underlying AI agent engine.</summary>
     Task ConnectAsync(CancellationToken ct = default);
 

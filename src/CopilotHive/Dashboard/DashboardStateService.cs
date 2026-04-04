@@ -127,6 +127,7 @@ public sealed class DashboardStateService : IDisposable
                 LastHeartbeat = w.LastHeartbeat,
                 ConnectedAt = w.ConnectedAt,
                 CurrentModel = w.CurrentModel,
+                ContextUsagePercent = w.ContextUsagePercent,
             }).ToList(),
             Pipelines = pipelines.Select(p => new PipelineInfo
             {
@@ -749,6 +750,8 @@ public sealed class WorkerInfo
     public DateTime ConnectedAt { get; init; }
     /// <summary>Model used for the current task, or <c>null</c> when idle.</summary>
     public string? CurrentModel { get; init; }
+    /// <summary>Estimated context window usage as a percentage (0–100), or 0 when idle.</summary>
+    public int ContextUsagePercent { get; init; }
 
     /// <summary>
     /// Returns the model string to display for this worker: the task-specific
