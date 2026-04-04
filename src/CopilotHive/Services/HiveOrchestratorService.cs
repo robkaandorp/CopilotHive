@@ -164,9 +164,9 @@ public sealed class HiveOrchestratorService(
     /// <returns>An acknowledged <see cref="HeartbeatResponse"/>.</returns>
     public override Task<HeartbeatResponse> Heartbeat(HeartbeatRequest request, ServerCallContext context)
     {
-        workerPool.UpdateHeartbeat(request.WorkerId);
-        logger.LogDebug("Heartbeat from {WorkerId} (busy={Busy}, role={Role}, task={TaskId})",
-            request.WorkerId, request.Busy, request.CurrentRole, request.CurrentTaskId);
+        workerPool.UpdateHeartbeat(request.WorkerId, request.ContextUsagePercent);
+        logger.LogDebug("Heartbeat from {WorkerId} (busy={Busy}, role={Role}, task={TaskId}, ctx={Ctx}%)",
+            request.WorkerId, request.Busy, request.CurrentRole, request.CurrentTaskId, request.ContextUsagePercent);
 
         return Task.FromResult(new HeartbeatResponse { Acknowledged = true });
     }

@@ -355,6 +355,9 @@ public sealed class WorkerService(
                     Busy = taskId is not null,
                     CurrentTaskId = taskId ?? "",
                     CurrentRole = _currentRole ?? "",
+                    ContextUsagePercent = taskId is not null
+                        ? _agentRunner.GetContextUsagePercent()
+                        : 0,
                 }, cancellationToken: ct);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)

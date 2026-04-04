@@ -98,10 +98,14 @@ public sealed class WorkerPool : IWorkerPool
     /// Updates the last heartbeat timestamp for the specified worker.
     /// </summary>
     /// <param name="id">Identifier of the worker.</param>
-    public void UpdateHeartbeat(string id)
+    /// <param name="contextUsagePercent">Estimated context window usage as a percentage (0–100).</param>
+    public void UpdateHeartbeat(string id, int contextUsagePercent = 0)
     {
         if (_workers.TryGetValue(id, out var worker))
+        {
             worker.LastHeartbeat = DateTime.UtcNow;
+            worker.ContextUsagePercent = contextUsagePercent;
+        }
     }
 
     /// <summary>
