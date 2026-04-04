@@ -69,7 +69,7 @@
                             var color = w.ContextUsagePercent switch
                             {
                                 < 50 => "var(--green)",
-                                < 80 => "var(--amber)",
+                                < 80 => "var(--accent)",
                                 _ => "var(--red)"
                             };
                             <span style="color:@color">@w.ContextUsagePercent%</span>
