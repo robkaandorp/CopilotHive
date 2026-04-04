@@ -2,6 +2,7 @@ extern alias WorkerAssembly;
 
 using System;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -326,7 +327,35 @@ file sealed class StubChatClient(string replyText) : IChatClient
         IEnumerable<ChatMessage> messages,
         ChatOptions? options = null,
         CancellationToken cancellationToken = default)
-        => throw new NotSupportedException("Streaming is not used in these tests.");
+    {
+        return GetStreamingUpdatesAsync(replyText, cancellationToken);
+    }
+
+    private static async IAsyncEnumerable<ChatResponseUpdate> GetStreamingUpdatesAsync(
+        string replyText, [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await Task.Yield();
+
+        // Yield text delta in chunks
+        var remaining = replyText.AsMemory();
+        const int chunkSize = 10;
+
+        while (!remaining.IsEmpty && !cancellationToken.IsCancellationRequested)
+        {
+            var chunk = remaining.Length <= chunkSize
+                ? remaining
+                : remaining[..chunkSize];
+            yield return new ChatResponseUpdate(ChatRole.Assistant, [new TextContent(chunk.ToString())]);
+            remaining = remaining.Slice(chunk.Length);
+        }
+
+        // Yield final update with finish reason
+        yield return new ChatResponseUpdate
+        {
+            FinishReason = ChatFinishReason.Stop,
+            Role = ChatRole.Assistant,
+        };
+    }
 
     /// <inheritdoc />
     public object? GetService(Type serviceType, object? serviceKey = null) => null;

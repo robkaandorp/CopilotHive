@@ -302,22 +302,19 @@ public sealed class SharpCoderRunner : IAgentRunner
             EnableBash = _currentRole != WorkerRole.Improver,
             EnableFileWrites = _currentRole != WorkerRole.Reviewer,
             ReasoningEffort = _currentReasoning,
+            ShowToolCallsInStream = true,
         };
 
         // Write pre-execution diagnostics so we can inspect inputs even if the LLM call hangs or is killed
         WriteDiagnosticsFile(null, prompt, TimeSpan.Zero, options, "pre");
 
         var agent = new CodingAgent(_chatClient, options);
-        AgentResult result;
-        if (_session != null)
-        {
-            result = await agent.ExecuteAsync(_session, prompt, ct);
-        }
-        else
-        {
-            _session = AgentSession.Create(Guid.NewGuid().ToString("N"));
-            result = await agent.ExecuteAsync(_session, prompt, ct);
-        }
+
+        // Ensure session exists before streaming
+        _session ??= AgentSession.Create(Guid.NewGuid().ToString("N"));
+
+        // Drain the streaming response to update LastKnownContextTokens after each LLM turn
+        var result = await DrainStreamingAsync(agent, _session, prompt, ct);
 
         stopwatch.Stop();
         var elapsedSecs = stopwatch.Elapsed.TotalSeconds.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
@@ -355,6 +352,29 @@ public sealed class SharpCoderRunner : IAgentRunner
         }
 
         return result.Message;
+    }
+
+    /// <summary>
+    /// Drains the streaming response from the agent, extracting the final AgentResult.
+    /// This method ensures LastKnownContextTokens is updated after every LLM turn.
+    /// </summary>
+    private static async Task<AgentResult> DrainStreamingAsync(
+        CodingAgent agent, AgentSession session, string prompt, CancellationToken ct)
+    {
+        AgentResult? result = null;
+        await foreach (var update in agent.ExecuteStreamingAsync(session, prompt, ct))
+        {
+            if (update.Kind == StreamingUpdateKind.Completed)
+            {
+                result = update.Result;
+            }
+            // Discard TextDelta — no output is streamed in worker context
+        }
+
+        if (result == null)
+            throw new InvalidOperationException("Streaming execution completed without a final AgentResult.");
+
+        return result;
     }
 
     public ValueTask DisposeAsync()
