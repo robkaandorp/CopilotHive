@@ -32,6 +32,8 @@
 
 **Collapsed nav alignment.** In collapsed nav mode (≤ 768px), nav icons were appearing right-aligned within the 52px column. Fixed by adding `width: 100%` to collapsed nav links and explicit `grid-column: 1` to `.hive-nav`.
 
+**Worker Ctx% always showed 0% during task execution.** `SendPromptAsync` was using the non-streaming `ExecuteAsync` path, which only updates `LastKnownContextTokens` when the entire prompt completes (potentially 5–15 minutes). Heartbeats fired every 30 seconds during that window always read a zero value. Fixed by switching to `ExecuteStreamingAsync` with `ShowToolCallsInStream = true`, which runs the tool-call loop manually and updates `LastKnownContextTokens` after every LLM turn — so heartbeat Ctx% values now reflect live context usage throughout execution.
+
 ## [0.7.1]
 
 ### Added
