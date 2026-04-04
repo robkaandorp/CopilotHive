@@ -60,7 +60,7 @@
     <div class="cards">
         <div class="card">
             <div class="label">Context</div>
-            <div class="value" style="color:@ContextColor">@FormatTokens(_stats.EstimatedContextTokens)</div>
+            <div class="value" style="color:@ContextColor">@FormatTokens(_stats.ContextTokens)</div>
             <div style="font-size:0.75rem;color:var(--text-muted)">
                 @_stats.ContextUsagePercent% of @FormatTokens(_stats.MaxContextTokens)
             </div>
@@ -110,7 +110,7 @@ else
     <div class="cards">
         <div class="card">
             <div class="label">Context</div>
-            <div class="value" style="color:@ComposerContextColor">@FormatTokens(_composerStats.EstimatedContextTokens)</div>
+            <div class="value" style="color:@ComposerContextColor">@FormatTokens(_composerStats.ContextTokens)</div>
             <div style="font-size:0.75rem;color:var(--text-muted)">
                 @_composerStats.ContextUsagePercent% of @FormatTokens(_composerStats.MaxContextTokens)
             </div>

@@ -1260,14 +1260,16 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     {
         if (_agent is null) return null;
 
-        var estimatedTokens = _masterSession.EstimatedContextTokens;
-        var usagePct = _maxContextTokens > 0 ? (int)(estimatedTokens * 100.0 / _maxContextTokens) : 0;
+        var contextTokens = _masterSession.LastKnownContextTokens > 0
+            ? _masterSession.LastKnownContextTokens
+            : _masterSession.EstimatedContextTokens;
+        var usagePct = _maxContextTokens > 0 ? (int)(contextTokens * 100.0 / _maxContextTokens) : 0;
 
         return new BrainStats
         {
             Model = _modelOverride,
             MessageCount = _masterSession.MessageHistory.Count,
-            EstimatedContextTokens = estimatedTokens,
+            ContextTokens = contextTokens,
             MaxContextTokens = _maxContextTokens,
             ContextUsagePercent = usagePct,
             CumulativeInputTokens = _masterSession.InputTokensUsed,

@@ -240,14 +240,16 @@ public sealed class Composer : IClarificationRouter, IAsyncDisposable
     {
         if (_agent is null) return null;
 
-        var estimatedTokens = _session.EstimatedContextTokens;
-        var usagePct = _maxContextTokens > 0 ? (int)(estimatedTokens * 100.0 / _maxContextTokens) : 0;
+        var contextTokens = _session.LastKnownContextTokens > 0
+            ? _session.LastKnownContextTokens
+            : _session.EstimatedContextTokens;
+        var usagePct = _maxContextTokens > 0 ? (int)(contextTokens * 100.0 / _maxContextTokens) : 0;
 
         return new BrainStats
         {
             Model = _model,
             MessageCount = _session.MessageHistory.Count,
-            EstimatedContextTokens = estimatedTokens,
+            ContextTokens = contextTokens,
             MaxContextTokens = _maxContextTokens,
             ContextUsagePercent = usagePct,
             CumulativeInputTokens = _session.InputTokensUsed,
