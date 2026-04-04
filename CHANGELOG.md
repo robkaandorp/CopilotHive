@@ -1,3 +1,37 @@
+## [0.8.0]
+
+### Added
+
+**Multi-round coding iterations.** The Brain can now plan multiple sequential Coding+Testing rounds within a single iteration before reaching Review (e.g. `[coding, testing, coding, testing, review, improve, merging]`). This is useful for large file changes that risk LLM response timeouts, or work that naturally splits into sequential steps with dependencies. Each coding round gets its own phase instruction keyed as `coding-1`, `coding-2`, etc. in the iteration plan. `ValidatePlan` enforces that each Coding round is immediately followed by Testing.
+
+**Worker phase instruction in `get_goal` response.** When a worker calls the `get_goal` tool, the response now includes `current_phase_instruction` — the Brain's specific instruction for the current coding round (e.g. the `coding-2` instruction for the second round). Workers no longer need a separate tool call to retrieve round-specific instructions.
+
+**Worker context usage in Workers dashboard.** Each worker now reports its current session context usage percentage with every 30-second heartbeat. The Workers page displays a colour-coded "Ctx" column (green below 50%, amber 50–79%, red 80%+) for busy workers. Uses the exact token count from the most recent API response (`LastKnownContextTokens`) with fallback to a heuristic estimate before the first API call.
+
+**Clarification bell icon and slide-out drawer.** The always-visible clarification side panel on the Composer page has been replaced by an on-demand slide-out drawer. A 🔔 bell icon with a red count badge appears in the global header whenever a worker requests human clarification — visible from any page. Clicking the bell opens a drawer that slides in from the right with a semi-transparent backdrop. The drawer auto-closes when all pending clarifications are answered. The bell disappears when there are no pending requests.
+
+**Responsive navigation.** The sidebar nav collapses to icon-only mode (52px wide) on viewports ≤ 768px, showing only emoji icons for each nav item. The brand name collapses to the 🐝 emoji. The version badge moved from the nav bottom to the footer, visible at all viewport widths. The footer spans both columns in collapsed mode.
+
+### Changed
+
+**Brain context metrics use master session.** The Brain statistics on the Orchestrator page now always reflect the master session (the long-lived session that accumulates goal summaries), rather than whichever goal fork session happened to be active at poll time. This eliminates wild fluctuations (10% → 70%+) that occurred as the Brain swapped between concurrent goal sessions.
+
+**Brain and Composer context token count is now exact.** Both Brain and Composer `GetStats()` now use `LastKnownContextTokens` (the exact `InputTokenCount` from the most recent API response, including system prompt and tool definition overhead) when available, falling back to the character-based heuristic estimate only before the first API call. `BrainStats.EstimatedContextTokens` renamed to `ContextTokens` to reflect this.
+
+**RetryBudget replaces mutable retry counters.** Mutable `ReviewRetries`/`MaxReviewRetries` and `TestRetries`/`MaxTestRetries` integer pairs on `GoalPipeline` replaced by a thread-safe `RetryBudget` type. Encapsulates remaining/maximum budget with `TryConsume()` and `IsExhausted` properties for cleaner retry tracking.
+
+**Iteration plan phase tracking removed.** Redundant `IterationPlan.CurrentPhaseIndex` tracking system removed. Phase progression is now driven exclusively by the pipeline state machine without a parallel index counter.
+
+### Fixed
+
+**Plan reason pinned above scrollable timeline.** The Brain's plan reason text (📋) was previously inside the scrollable `.iter-content` div, causing it to scroll out of view when the progress timeline filled with entries. It is now rendered above the scroll area as a sibling element, always visible.
+
+**Page header `h1` bottom margin removed.** The `h1` inside `.hive-header` no longer has a bottom margin, eliminating unwanted spacing in the header bar.
+
+**Goals nav icon restored.** The Goals nav link icon was incorrectly changed to 💯 by the responsive nav goal. Restored to the correct 🎯 icon.
+
+**Collapsed nav alignment.** In collapsed nav mode (≤ 768px), nav icons were appearing right-aligned within the 52px column. Fixed by adding `width: 100%` to collapsed nav links and explicit `grid-column: 1` to `.hive-nav`.
+
 ## [0.7.1]
 
 ### Added
