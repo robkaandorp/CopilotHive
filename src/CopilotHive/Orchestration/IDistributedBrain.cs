@@ -207,8 +207,12 @@ public sealed class BrainStats
     public string Model { get; init; } = "";
     /// <summary>Number of messages in the conversation history.</summary>
     public int MessageCount { get; init; }
-    /// <summary>Estimated current context size in tokens.</summary>
-    public long EstimatedContextTokens { get; init; }
+    /// <summary>
+    /// Current context size in tokens.
+    /// Uses the exact input token count from the most recent API response when available,
+    /// falling back to the character-based heuristic before the first API call.
+    /// </summary>
+    public long ContextTokens { get; init; }
     /// <summary>Maximum context window size.</summary>
     public long MaxContextTokens { get; init; }
     /// <summary>Context usage percentage (0–100).</summary>
