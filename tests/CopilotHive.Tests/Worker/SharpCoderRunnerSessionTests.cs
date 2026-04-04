@@ -1,5 +1,6 @@
 extern alias WorkerAssembly;
 
+using System.Runtime.CompilerServices;
 using Microsoft.Extensions.AI;
 using SharpCoder;
 using WorkerAssembly::CopilotHive.Worker;
@@ -185,7 +186,35 @@ file sealed class StubChatClientForSession : IChatClient
         IEnumerable<ChatMessage> messages,
         ChatOptions? options = null,
         CancellationToken cancellationToken = default)
-        => throw new NotSupportedException();
+    {
+        return GetStreamingUpdatesAsync("Done.", cancellationToken);
+    }
+
+    private static async IAsyncEnumerable<ChatResponseUpdate> GetStreamingUpdatesAsync(
+        string replyText, [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await Task.Yield();
+
+        // Yield text delta in chunks
+        var remaining = replyText.AsMemory();
+        const int chunkSize = 10;
+
+        while (!remaining.IsEmpty && !cancellationToken.IsCancellationRequested)
+        {
+            var chunk = remaining.Length <= chunkSize
+                ? remaining
+                : remaining[..chunkSize];
+            yield return new ChatResponseUpdate(ChatRole.Assistant, [new TextContent(chunk.ToString())]);
+            remaining = remaining.Slice(chunk.Length);
+        }
+
+        // Yield final update with finish reason
+        yield return new ChatResponseUpdate
+        {
+            FinishReason = ChatFinishReason.Stop,
+            Role = ChatRole.Assistant,
+        };
+    }
 
     /// <inheritdoc />
     public object? GetService(Type serviceType, object? serviceKey = null) => null;
