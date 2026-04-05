@@ -632,6 +632,7 @@ public sealed class DashboardStateService : IDisposable
         "Review" => "reviewer",
         "Doc Writing" => "docwriter",
         "Improvement" => "improver",
+        "Improve" => "improver",
         _ => "",
     };
 

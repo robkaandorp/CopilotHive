@@ -2370,6 +2370,141 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Contains(testing2.ProgressReports, p => p.Details == "Second testing report");
     }
 
+    // ── PhaseNameToRoleName regression tests ────────────────────────────────────
+
+    /// <summary>
+    /// Regression: <c>"Improve"</c> phase name (from persisted <see cref="IterationSummary"/>)
+    /// must map to <c>"improver"</c> role so the dashboard shows the correct worker role
+    /// for goals completed with the <c>GoalPhase.Improve</c> enum value.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_ImprovePhaseInPersistedSummary_MapsToImprover()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "improve-phase-goal",
+            Description = "Goal with Improve phase in persisted summary",
+            Status = GoalStatus.Completed,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 45.0 },
+                new PhaseResult { Name = "Improve", Result = "pass", DurationSeconds = 20.0 },
+            ],
+        };
+        await _store.UpdateGoalStatusAsync("improve-phase-goal", GoalStatus.Completed,
+            new GoalUpdateMetadata { Iterations = 1, IterationSummary = summary }, ct);
+
+        using var service = CreateService();
+
+        var detail = service.GetGoalDetail("improve-phase-goal");
+
+        Assert.NotNull(detail);
+        var iteration = Assert.Single(detail.Iterations);
+        // Planning + Coding + Improve = 3 phases
+        Assert.Equal(3, iteration.Phases.Count);
+
+        var improvePhase = iteration.Phases.FirstOrDefault(p => p.Name == "Improve");
+        Assert.NotNull(improvePhase);
+        Assert.Equal("improver", improvePhase.RoleName);
+    }
+
+    /// <summary>
+    /// Regression: <c>"Improvement"</c> phase name must still map to <c>"improver"</c>
+    /// role to preserve backwards compatibility with any existing persisted data.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_ImprovementPhaseInPersistedSummary_MapsToImprover()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "improvement-phase-goal",
+            Description = "Goal with Improvement phase in persisted summary",
+            Status = GoalStatus.Completed,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult { Name = "Improvement", Result = "pass", DurationSeconds = 25.0 },
+            ],
+        };
+        await _store.UpdateGoalStatusAsync("improvement-phase-goal", GoalStatus.Completed,
+            new GoalUpdateMetadata { Iterations = 1, IterationSummary = summary }, ct);
+
+        using var service = CreateService();
+
+        var detail = service.GetGoalDetail("improvement-phase-goal");
+
+        Assert.NotNull(detail);
+        var iteration = Assert.Single(detail.Iterations);
+        // Planning + Improvement = 2 phases
+        Assert.Equal(2, iteration.Phases.Count);
+
+        var improvementPhase = iteration.Phases.FirstOrDefault(p => p.Name == "Improvement");
+        Assert.NotNull(improvementPhase);
+        Assert.Equal("improver", improvementPhase.RoleName);
+    }
+
+    /// <summary>
+    /// Regression: verifies that all known phase-role mappings in <see cref="DashboardStateService"/>
+    /// are correct so that no other phase-role mapping regresses when <c>"Improve"</c>
+    /// is added alongside <c>"Improvement"</c>.
+    /// </summary>
+    [Theory]
+    [InlineData("Coding", "coder")]
+    [InlineData("Testing", "tester")]
+    [InlineData("Review", "reviewer")]
+    [InlineData("Doc Writing", "docwriter")]
+    [InlineData("Improvement", "improver")]
+    [InlineData("Improve", "improver")]
+    [InlineData("UnknownPhase", "")]
+    public async Task GetGoalDetail_PhaseRoleMappings_AreCorrect(string phaseName, string expectedRole)
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = $"mapping-test-{phaseName.ToLowerInvariant().Replace(" ", "-")}",
+            Description = $"Goal with {phaseName} phase",
+            Status = GoalStatus.Completed,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult { Name = phaseName, Result = "pass", DurationSeconds = 10.0 },
+            ],
+        };
+        await _store.UpdateGoalStatusAsync(goal.Id, GoalStatus.Completed,
+            new GoalUpdateMetadata { Iterations = 1, IterationSummary = summary }, ct);
+
+        using var service = CreateService();
+
+        var detail = service.GetGoalDetail(goal.Id);
+
+        Assert.NotNull(detail);
+        var iteration = Assert.Single(detail.Iterations);
+        var phase = iteration.Phases.FirstOrDefault(p => p.Name == phaseName);
+        Assert.NotNull(phase);
+        Assert.Equal(expectedRole, phase.RoleName);
+    }
+
     private DashboardStateService CreateService()
     {
         var workerPool = new WorkerPool();
