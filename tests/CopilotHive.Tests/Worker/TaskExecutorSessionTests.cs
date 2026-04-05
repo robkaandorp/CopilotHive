@@ -392,4 +392,82 @@ public sealed class TaskExecutorSessionTests
         // Assert — task must complete successfully; session save failure is non-fatal
         Assert.Equal(TaskOutcome.Completed, result.Status);
     }
+
+    /// <summary>
+    /// An <see cref="IAgentRunner"/> that throws an exception when sending prompts,
+    /// used to test error handling paths in <see cref="TaskExecutor"/>.
+    /// </summary>
+    private sealed class ThrowingAgentRunner : IAgentRunner
+    {
+        private readonly Exception _exceptionToThrow;
+
+        public ThrowingAgentRunner(Exception exceptionToThrow)
+        {
+            _exceptionToThrow = exceptionToThrow;
+        }
+
+        public TestResultReport? LastTestReport { get; set; }
+        public WorkerReport? LastWorkerReport { get; set; }
+
+        public void ClearTestReport() => LastTestReport = null;
+        public void ClearWorkerReport() => LastWorkerReport = null;
+        public void SetToolBridge(IToolCallBridge? bridge) { }
+        public void SetCurrentTaskId(string? taskId) { }
+        public void SetCurrentGoalId(string? goalId) { }
+        public void SetTesterReport(string? report) { }
+        public void SetCustomAgent(WorkerRole role, string agentsMdContent) { }
+        public void SetMaxContextTokens(int maxTokens) { }
+        public void SetSession(object? session) { }
+        public object? GetSession() => null;
+        public int GetContextUsagePercent() => 0;
+        public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+        public Task ResetSessionAsync(string? model = null, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
+        {
+            throw _exceptionToThrow;
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// Regression test: When <see cref="Console.Error"/> is disposed (e.g., by xUnit test framework
+    /// redirecting output), <see cref="TaskExecutor.ExecuteAsync"/> must not throw
+    /// <see cref="ObjectDisposedException"/> when the catch blocks try to log errors.
+    /// The TryWriteError helper should swallow the exception.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_WithDisposedConsoleError_ReturnsNormalResult()
+    {
+        // Arrange — save original Console.Error
+        var originalError = Console.Error;
+        StringWriter? disposedWriter = null;
+
+        try
+        {
+            // Redirect Console.Error to a StringWriter and dispose it
+            disposedWriter = new StringWriter();
+            Console.SetError(disposedWriter);
+            disposedWriter.Dispose();
+
+            // Create executor with a throwing agent runner to trigger the catch block
+            var agentRunner = new ThrowingAgentRunner(new InvalidOperationException("Simulated failure"));
+            var executor = new TaskExecutor(agentRunner, gitOperations: new NoOpGitOperations(), sessionClient: null);
+            var task = BuildTask("goal-10:Coder");
+
+            // Act — must NOT throw ObjectDisposedException when catch block tries to log
+            var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+            // Assert — should return a Failed TaskResult instead of throwing
+            Assert.NotNull(result);
+            Assert.Equal(TaskOutcome.Failed, result.Status);
+            Assert.Contains("Simulated failure", result.Output);
+        }
+        finally
+        {
+            // Restore original Console.Error
+            Console.SetError(originalError);
+        }
+    }
 }

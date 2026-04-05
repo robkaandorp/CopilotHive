@@ -25,6 +25,25 @@ public sealed class TaskExecutor(
     private readonly IGitOperations _git = gitOperations ?? new DefaultGitOperations();
 
     /// <summary>
+    /// Writes to <see cref="Console.Error"/> safely, swallowing <see cref="ObjectDisposedException"/>
+    /// and <see cref="IOException"/> so logging never propagates an exception. Uses a lock to avoid
+    /// interleaved output when multiple tasks log concurrently.
+    /// </summary>
+    private static readonly object _errorLock = new();
+    private static void TryWriteError(string message)
+    {
+        try
+        {
+            lock (_errorLock)
+            {
+                Console.Error.WriteLine(message);
+            }
+        }
+        catch (ObjectDisposedException) { }
+        catch (IOException) { }
+    }
+
+    /// <summary>
     /// Executes the full lifecycle of a task: cloning repos, branching,
     /// running Copilot, collecting results, and pushing changes.
     /// </summary>
@@ -360,7 +379,7 @@ public sealed class TaskExecutor(
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             // Real cancellation (e.g., shutdown signal) — propagate as Cancelled
-            Console.Error.WriteLine($"[Task] Cancelled by token: {task.TaskId}");
+            TryWriteError($"[Task] Cancelled by token: {task.TaskId}");
             return new TaskResult
             {
                 TaskId = task.TaskId,
@@ -373,7 +392,7 @@ public sealed class TaskExecutor(
         {
             // Not a real cancellation — likely an API timeout or HTTP failure.
             // Treat as a failure so the orchestrator can retry or fail the phase.
-            Console.Error.WriteLine($"[Task] Failed (API timeout/error): {ex}");
+            TryWriteError($"[Task] Failed (API timeout/error): {ex}");
             return new TaskResult
             {
                 TaskId = task.TaskId,
@@ -388,7 +407,7 @@ public sealed class TaskExecutor(
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[Task] Failed: {ex}");
+            TryWriteError($"[Task] Failed: {ex}");
 
             return new TaskResult
             {
