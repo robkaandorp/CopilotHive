@@ -1,3 +1,31 @@
+## [0.8.1]
+
+### Added
+
+- **Configurable worker context window** — workers no longer use a hardcoded 100,000-token context window. A three-tier fallback is available via `hive-config.yaml`:
+  1. `workers.<role>.context_window` (per-role override)
+  2. `orchestrator.worker_context_window` (global default for all workers)
+  3. Built-in default of 150,000 tokens
+
+  The resolved value flows through task assignment to workers and drives both context usage percentage and compaction threshold.
+
+  ```yaml
+  workers:
+    coder:
+      context_window: 200000   # per-role override
+  orchestrator:
+    worker_context_window: 150000  # global default for all workers
+  ```
+
+### Fixed
+
+- **GPT-5.x streaming crash** — `CopilotResponsesHandler` was intercepting SSE streaming responses and parsing them as JSON; fixed by passing through `text/event-stream` responses unchanged.
+- **Multi-round phase display in Goal Detail** — repeated phases now use occurrence-aware keys and assignment so phase buttons, output, and timeline entries are not duplicated or cross-highlighted.
+- **Planning escalation display** — clarifications created when the Brain escalates during the Planning phase are now shown in Goal Detail.
+- **Clarification timeline cleanup** — clarification requests now render only once as structured clarification cards, instead of first appearing as an unstructured raw progress entry and then again as a formatted card.
+- **Role badge fixes in Goal Detail** — Planning/Brain and Improve/Improver role labels now display correctly in the timeline and summarised iteration views.
+- **TaskExecutor logging robustness in tests/CI** — `TaskExecutor` no longer crashes when logging to a closed/disposed console writer during test execution.
+
 ## [0.8.0]
 
 ### Added
