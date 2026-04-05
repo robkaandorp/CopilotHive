@@ -342,11 +342,15 @@
                                 <div class="phase-bar" style="margin-bottom:0.5rem">
                                     @foreach (var phase in iter.Phases)
                                     {
-                                        var phaseKey = $"{iter.Number}-{phase.Name}";
+                                        var phaseKey = $"{iter.Number}-{phase.Name}-{phase.Occurrence}";
                                         <button class="phase-box @phase.Status @(_selectedPhase == phaseKey ? "selected" : "")"
                                                 @onclick="() => TogglePhase(phaseKey)">
                                             <span class="phase-box-icon">@PhaseIcon(phase.Status)</span>
                                             @phase.Name
+                                            @if (iter.Phases.Count(p => p.Name == phase.Name) > 1)
+                                            {
+                                                <span class="phase-occurrence"> (@phase.Occurrence)</span>
+                                            }
                                             @if (phase.DurationSeconds.HasValue)
                                             {
                                                 <span class="phase-box-duration">@FormatDuration(phase.DurationSeconds.Value)</span>
@@ -364,7 +368,7 @@
 
                                 @foreach (var phase in iter.Phases)
                                 {
-                                    var phaseKey = $"{iter.Number}-{phase.Name}";
+                                    var phaseKey = $"{iter.Number}-{phase.Name}-{phase.Occurrence}";
                                     @if (_selectedPhase == phaseKey)
                                     {
                                         <div class="phase-detail">

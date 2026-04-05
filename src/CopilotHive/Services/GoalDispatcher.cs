@@ -1443,6 +1443,9 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
             ? pipeline.CompletedAt.Value - goalStartedAt
             : TimeSpan.Zero;
 
+        var iterationSummary = BuildIterationSummary(pipeline, failedPhase: null);
+        pipeline.CompletedIterationSummaries.Add(iterationSummary);
+
         var completedMeta = new GoalUpdateMetadata
         {
             CompletedAt = pipeline.CompletedAt ?? DateTime.UtcNow,
@@ -1450,7 +1453,7 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
             PhaseDurations = pipeline.Metrics.PhaseDurations is { Count: > 0 }
                 ? pipeline.Metrics.PhaseDurations.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.TotalSeconds)
                 : null,
-            IterationSummary = BuildIterationSummary(pipeline, failedPhase: null),
+            IterationSummary = iterationSummary,
             TotalDurationSeconds = duration.TotalSeconds,
             MergeCommitHash = pipeline.MergeCommitHash,
         };
@@ -1569,6 +1572,9 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         var failedPhase = pipeline.Phase; // capture before AdvanceTo overwrites it
         pipeline.AdvanceTo(GoalPhase.Failed);
 
+        var iterationSummary = BuildIterationSummary(pipeline, failedPhase);
+        pipeline.CompletedIterationSummaries.Add(iterationSummary);
+
         var failedMeta = new GoalUpdateMetadata
         {
             CompletedAt = pipeline.CompletedAt ?? DateTime.UtcNow,
@@ -1577,7 +1583,7 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
             PhaseDurations = pipeline.Metrics.PhaseDurations is { Count: > 0 }
                 ? pipeline.Metrics.PhaseDurations.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.TotalSeconds)
                 : null,
-            IterationSummary = BuildIterationSummary(pipeline, failedPhase),
+            IterationSummary = iterationSummary,
         };
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Failed, failedMeta, ct);
         await CommitGoalsToConfigRepoAsync($"Goal '{pipeline.GoalId}' failed: {reason}", ct);
