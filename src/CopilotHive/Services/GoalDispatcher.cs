@@ -298,17 +298,6 @@ public sealed class GoalDispatcher : BackgroundService
             AnsweredBy: answeredBy);
 
         pipeline.Clarifications.Add(entry);
-        _progressLog?.AddClarification(entry);
-        pipeline.ProgressReports.Add(new ProgressEntry
-        {
-            Timestamp = entry.Timestamp,
-            WorkerId = entry.WorkerRole,
-            GoalId = entry.GoalId,
-            Phase = entry.Phase,
-            Iteration = entry.Iteration,
-            Status = "clarification",
-            Details = $"Q: {entry.Question} | A: {entry.Answer} (answered by: {entry.AnsweredBy})",
-        });
 
         _logger.LogInformation(
             "Clarification recorded for goal {GoalId} iteration {Iteration} phase {Phase}: Q={Question} | AnsweredBy={AnsweredBy}",

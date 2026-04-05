@@ -32,22 +32,15 @@ public sealed class ProgressLog
     }
 
     /// <summary>
-    /// Records a clarification event as a distinct progress entry with status <c>"clarification"</c>.
+    /// Records a clarification event.  Kept for backwards compatibility but no longer
+    /// enqueues a flat progress entry — clarifications are rendered via
+    /// <c>pipeline.Clarifications</c> as structured cards in the timeline.
     /// </summary>
     /// <param name="clarification">The clarification entry to record.</param>
     public void AddClarification(ClarificationEntry clarification)
     {
-        _entries.Enqueue(new ProgressEntry
-        {
-            Timestamp = clarification.Timestamp,
-            WorkerId = clarification.WorkerRole,
-            GoalId = clarification.GoalId,
-            Status = "clarification",
-            Details = $"Q: {clarification.Question} | A: {clarification.Answer} (answered by: {clarification.AnsweredBy})",
-        });
-
-        while (_entries.Count > _maxEntries)
-            _entries.TryDequeue(out _);
+        // No-op: clarifications are displayed via the structured ClarificationEntry
+        // in pipeline.Clarifications, not as flat progress-log entries.
     }
 
     /// <summary>Returns the most recent progress entries.</summary>

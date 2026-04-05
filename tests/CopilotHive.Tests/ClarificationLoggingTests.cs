@@ -78,8 +78,13 @@ public sealed class ClarificationLoggingTests
         Assert.Equal(pipeline.Phase.ToString(), entry.Phase);
     }
 
+    /// <summary>
+    /// Clarifications are only recorded in pipeline.Clarifications (rendered as structured
+    /// cards).  They no longer appear as flat entries in the progress log — that caused
+    /// duplicate display in the Goal Detail timeline.
+    /// </summary>
     [Fact]
-    public async Task AskBrainAsync_BrainAnswers_ClarificationAddedToProgressLog()
+    public async Task AskBrainAsync_BrainAnswers_NoFlatProgressLogEntry()
     {
         var brain = new FakeBrain(BrainResponse.Answer("My direct answer."));
         var progressLog = new ProgressLog();
@@ -87,13 +92,15 @@ public sealed class ClarificationLoggingTests
 
         await dispatcher.AskBrainAsync(pipeline, "What to do?", TestContext.Current.CancellationToken);
 
+        // Clarification must be in pipeline.Clarifications (structured card)
+        var entry = Assert.Single(pipeline.Clarifications);
+        Assert.Equal("What to do?", entry.Question);
+        Assert.Equal("My direct answer.", entry.Answer);
+        Assert.Equal("brain", entry.AnsweredBy);
+
+        // But NOT in the flat progress log (no Status == "clarification")
         var recent = progressLog.GetRecent(10);
-        var clarEntry = recent.FirstOrDefault(e => e.Status == "clarification");
-        Assert.NotNull(clarEntry);
-        Assert.Contains("What to do?", clarEntry.Details);
-        Assert.Contains("My direct answer.", clarEntry.Details);
-        Assert.Contains("answered by: brain", clarEntry.Details);
-        Assert.Equal(pipeline.GoalId, clarEntry.GoalId);
+        Assert.DoesNotContain(recent, e => e.Status == "clarification");
     }
 
     // ── AskBrainAsync — brain not available ────────────────────────────────
@@ -322,10 +329,14 @@ public sealed class ClarificationLoggingTests
         Assert.Contains(pipeline.Clarifications, e => e.Question == "Q2?" && e.Answer == "Answer two.");
     }
 
-    // ── ProgressLog.AddClarification ──────────────────────────────────────
+    // ── ProgressLog.AddClarification (now a no-op) ─────────────────────────
 
+    /// <summary>
+    /// AddClarification is kept for backwards compatibility but is a no-op.
+    /// Clarifications are surfaced via pipeline.Clarifications, not as flat entries.
+    /// </summary>
     [Fact]
-    public void ProgressLog_AddClarification_AppearsInRecent()
+    public void ProgressLog_AddClarification_IsANoOp()
     {
         var log = new ProgressLog();
         var entry = new ClarificationEntry(
@@ -333,39 +344,40 @@ public sealed class ClarificationLoggingTests
 
         log.AddClarification(entry);
 
-        var recent = log.GetRecent(10);
-        var found = Assert.Single(recent);
-        Assert.Equal("clarification", found.Status);
-        Assert.Equal("goal-1", found.GoalId);
-        Assert.Contains("My question?", found.Details);
-        Assert.Contains("My answer.", found.Details);
-        Assert.Contains("answered by: brain", found.Details);
+        // No flat entry should appear — clarifications render via pipeline.Clarifications
+        Assert.Empty(log.GetRecent(10));
     }
 
+    /// <summary>
+    /// AddClarification must not throw even with a null entry.
+    /// </summary>
     [Fact]
-    public void ProgressLog_AddClarification_UsesWorkerRoleAsWorkerId()
+    public void ProgressLog_AddClarification_DoesNotThrow()
     {
         var log = new ProgressLog();
         var entry = new ClarificationEntry(
             DateTime.UtcNow, "goal-1", 1, "Testing", "tester", "Q?", "A.", "composer");
 
-        log.AddClarification(entry);
-
-        var found = Assert.Single(log.GetRecent(10));
-        Assert.Equal("tester", found.WorkerId);
+        var ex = Record.Exception(() => log.AddClarification(entry));
+        Assert.Null(ex);
     }
 
+    /// <summary>
+    /// AddClarification does not pollute the progress log — other entries remain visible.
+    /// </summary>
     [Fact]
-    public void ProgressLog_AddClarification_TimestampMatchesClarificationEntry()
+    public void ProgressLog_AddClarification_DoesNotPolluteRecent()
     {
         var log = new ProgressLog();
-        var ts = new DateTime(2024, 6, 15, 10, 30, 0, DateTimeKind.Utc);
-        var entry = new ClarificationEntry(ts, "goal-1", 1, "Coding", "coder", "Q?", "A.", "human");
+        log.Add("worker-1", "goal-1", "active", "Doing stuff");
 
+        var entry = new ClarificationEntry(
+            DateTime.UtcNow, "goal-1", 1, "Coding", "coder", "Q?", "A.", "brain");
         log.AddClarification(entry);
 
-        var found = Assert.Single(log.GetRecent(10));
-        Assert.Equal(ts, found.Timestamp);
+        var recent = log.GetRecent(10);
+        Assert.Single(recent);
+        Assert.NotEqual("clarification", recent[0].Status);
     }
 
     // ── IterationSummary.Clarifications persistence ────────────────────────
