@@ -282,20 +282,6 @@ public sealed class DashboardStateService : IDisposable
             var summaryCraftPrompts = ExtractCraftPrompts(summaryConversation, summary.Iteration);
             var (summaryPlanningPrompt, summaryPlanningResponse) = ExtractPlanningPrompts(summaryConversation, summary.Iteration);
 
-            var phases = new List<PhaseViewInfo>
-            {
-                new PhaseViewInfo
-                {
-                    Name = "Planning",
-                    RoleName = "",
-                    Status = "completed",
-                    ProgressReports = pipeline?.ProgressReports
-                        .Where(p => p.Iteration == summary.Iteration && p.Phase == "Planning")
-                        .OrderBy(p => p.Timestamp)
-                        .ToList() ?? [],
-                },
-            };
-
             // Group persisted clarifications by phase name for this iteration
             var summaryClarificationsByPhase = summary.Clarifications
                 .GroupBy(c => c.Phase, StringComparer.OrdinalIgnoreCase)
@@ -311,6 +297,23 @@ public sealed class DashboardStateService : IDisposable
                         Answer: c.Answer,
                         AnsweredBy: c.AnsweredBy)).ToList(),
                     StringComparer.OrdinalIgnoreCase);
+
+            summaryClarificationsByPhase.TryGetValue("Planning", out var planningClarifications);
+
+            var phases = new List<PhaseViewInfo>
+            {
+                new PhaseViewInfo
+                {
+                    Name = "Planning",
+                    RoleName = "brain",
+                    Status = "completed",
+                    Clarifications = planningClarifications ?? [],
+                    ProgressReports = pipeline?.ProgressReports
+                        .Where(p => p.Iteration == summary.Iteration && p.Phase == "Planning")
+                        .OrderBy(p => p.Timestamp)
+                        .ToList() ?? [],
+                },
+            };
 
             foreach (var pr in summary.Phases)
             {
@@ -377,13 +380,16 @@ public sealed class DashboardStateService : IDisposable
                 .GroupBy(c => c.Phase, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.OrdinalIgnoreCase);
 
+            clarificationsByPhase.TryGetValue("Planning", out var planningClarifications);
+
             var currentPhases = new List<PhaseViewInfo>
             {
                 new PhaseViewInfo
                 {
                     Name = "Planning",
-                    RoleName = "",
+                    RoleName = "brain",
                     Status = planningStatus,
+                    Clarifications = planningClarifications ?? [],
                     ProgressReports = pipeline.ProgressReports
                         .Where(p => p.Iteration == currentIter && p.Phase == "Planning")
                         .OrderBy(p => p.Timestamp)

@@ -1982,6 +1982,54 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Equal("composer", testingClarif.AnsweredBy);
     }
 
+    // ── Clarification display for live/in-progress pipelines ─────────────────
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetGoalDetail"/> populates
+    /// <see cref="PhaseViewInfo.Clarifications"/> on the Planning phase view
+    /// from a live <see cref="GoalPipeline"/> when the pipeline is in the Planning phase.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_LivePipeline_PlanningPhaseClarificationSurfacesOnPlanningPhaseView()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal { Id = "planning-clarif-live", Description = "Test" };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+
+        pipeline.Clarifications.Add(new ClarificationEntry(
+            DateTime.UtcNow,
+            goal.Id,
+            1,
+            "Planning",
+            "brain",
+            "Should I use Strategy or Factory here?",
+            "Use Strategy.",
+            "composer"));
+
+        var workerPool = new WorkerPool();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store);
+
+        var detail = service.GetGoalDetail("planning-clarif-live");
+
+        Assert.NotNull(detail);
+        var planningPhase = detail.Iterations.First().Phases.First(p => p.Name == "Planning");
+        var clarif = Assert.Single(planningPhase.Clarifications);
+        Assert.Equal("Should I use Strategy or Factory here?", clarif.Question);
+        Assert.Equal("Use Strategy.", clarif.Answer);
+        Assert.Equal("composer", clarif.AnsweredBy);
+    }
+
     // ── Multi-Round Phase Tests ──────────────────────────────────────────────
 
     /// <summary>
