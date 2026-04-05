@@ -473,9 +473,17 @@ public static class ChatClientFactory
 
             var response = await base.SendAsync(request, ct);
 
+            // Skip response interception for streaming responses — the SSE stream
+            // must be consumed directly by the OpenAI SDK's streaming parser.
+            var contentType = response.Content?.Headers?.ContentType?.MediaType;
+            if (contentType == "text/event-stream")
+            {
+                return response;
+            }
+
             if (response.IsSuccessStatusCode)
             {
-                var respBody = await response.Content.ReadAsStringAsync();
+                var respBody = await response.Content!.ReadAsStringAsync();
                 var respJson = JsonNode.Parse(respBody);
 
                 // Accumulate response output into turn history
@@ -489,7 +497,7 @@ public static class ChatClientFactory
             }
             else
             {
-                var errBody = await response.Content.ReadAsStringAsync();
+                var errBody = await response.Content!.ReadAsStringAsync();
                 LogResponsesExchange(seq, "error", $"HTTP {(int)response.StatusCode}: {errBody}");
             }
 

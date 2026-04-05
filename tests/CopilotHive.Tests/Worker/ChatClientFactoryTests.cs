@@ -1,5 +1,6 @@
 extern alias WorkerAssembly;
 
+using System.Net;
 using WorkerAssembly::CopilotHive.SDK;
 
 namespace CopilotHive.Tests.Worker;
@@ -292,5 +293,106 @@ public sealed class ChatClientFactoryReasoningTests
 
         Assert.Equal("gpt-5.4", model);
         Assert.Equal(Microsoft.Extensions.AI.ReasoningEffort.Medium, reasoning);
+    }
+}
+
+/// <summary>
+/// Tests for <see cref="ChatClientFactory.CopilotResponsesHandler"/> streaming behaviour:
+/// verifies that SSE (text/event-stream) responses pass through intact without being
+/// read or modified, while non-streaming JSON responses are still processed for turn
+/// history tracking.
+/// </summary>
+public sealed class CopilotResponsesHandlerTests
+{
+    /// <summary>
+    /// Verifies that when the Copilot API returns a streaming response (content-type
+    /// text/event-stream), <see cref="ChatClientFactory.CopilotResponsesHandler"/>
+    /// returns it immediately without reading or modifying the body, so the SSE stream
+    /// can be consumed directly by the OpenAI SDK's streaming parser.
+/// </summary>
+    [Fact]
+    public async Task StreamingResponse_PassesThrough_Intact()
+    {
+        const string sseBody = "event: done\ndata: {}\n\n";
+        var handler = new ChatClientFactory.CopilotResponsesHandler(
+            new StreamingFakeResponseHandler(sseBody));
+        using var client = new HttpClient(handler);
+
+        var request = new HttpRequestMessage(HttpMethod.Post, "https://api.githubcopilot.com/responses")
+        {
+            Content = new StringContent("{}", System.Text.Encoding.UTF8, "application/json")
+        };
+
+        var response = await client.SendAsync(request, TestContext.Current.CancellationToken);
+
+        // The content-type must remain text/event-stream (not overwritten to JSON)
+        Assert.Equal("text/event-stream", response.Content.Headers.ContentType?.MediaType);
+
+        // The body must NOT have been read or replaced with JSON
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.Contains("event: done", body);
+    }
+
+    /// <summary>
+    /// Verifies that non-streaming (application/json) responses are still fully processed:
+    /// the handler reads the body, parses it for turn history accumulation, and
+    /// re-wraps it as StringContent.
+/// </summary>
+    [Fact]
+    public async Task NonStreamingResponse_StillProcessed()
+    {
+        const string jsonBody = """{"output":[{"type":"message","content":[{"type":"output_text","text":"Hello"}]}]}""";
+        var handler = new ChatClientFactory.CopilotResponsesHandler(
+            new JsonFakeResponseHandler(jsonBody));
+        using var client = new HttpClient(handler);
+
+        var request = new HttpRequestMessage(HttpMethod.Post, "https://api.githubcopilot.com/responses")
+        {
+            Content = new StringContent("{}", System.Text.Encoding.UTF8, "application/json")
+        };
+
+        var response = await client.SendAsync(request, TestContext.Current.CancellationToken);
+
+        // Non-streaming response should be returned as JSON StringContent
+        Assert.Equal("application/json", response.Content.Headers.ContentType?.MediaType);
+
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.NotEmpty(body);
+    }
+
+    /// <summary>Fake inner handler that returns a streaming SSE response.</summary>
+    private sealed class StreamingFakeResponseHandler : HttpMessageHandler
+    {
+        private readonly string _body;
+
+        public StreamingFakeResponseHandler(string body) => _body = body;
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken ct)
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(_body, System.Text.Encoding.UTF8, "text/event-stream"),
+            };
+            return Task.FromResult(response);
+        }
+    }
+
+    /// <summary>Fake inner handler that returns a JSON response.</summary>
+    private sealed class JsonFakeResponseHandler : HttpMessageHandler
+    {
+        private readonly string _body;
+
+        public JsonFakeResponseHandler(string body) => _body = body;
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken ct)
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(_body, System.Text.Encoding.UTF8, "application/json"),
+            };
+            return Task.FromResult(response);
+        }
     }
 }
