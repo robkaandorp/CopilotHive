@@ -39,6 +39,7 @@ public sealed class TaskExecutor(
         agentRunner.SetToolBridge(toolBridge);
         agentRunner.SetCurrentTaskId(task.TaskId);
         agentRunner.SetCurrentGoalId(task.GoalId);
+        agentRunner.SetMaxContextTokens(task.MaxContextTokens);
         agentRunner.ClearTestReport();
         agentRunner.ClearWorkerReport();
 

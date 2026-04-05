@@ -56,6 +56,7 @@ public sealed class SharpCoderRunner : IAgentRunner
     private string? _currentGoalId;
     private WorkerRole _currentRole;
     private string? _customAgentSystemPrompt;
+    private int _maxContextTokens = 150_000;
 
     /// <summary>Current agent session; set via <see cref="SetSession"/> before <see cref="SendPromptAsync"/>.</summary>
     private AgentSession? _session;
@@ -81,6 +82,10 @@ public sealed class SharpCoderRunner : IAgentRunner
         _customAgentSystemPrompt = agentsMdContent;
         _testerReport = null;
     }
+
+    /// <inheritdoc/>
+    public void SetMaxContextTokens(int maxTokens) =>
+        _maxContextTokens = maxTokens > 0 ? maxTokens : 150_000;
 
     /// <summary>
     /// Builds the full system prompt for the given <paramref name="role"/> by combining the
@@ -263,11 +268,11 @@ public sealed class SharpCoderRunner : IAgentRunner
     {
         if (_session == null) return 0;
 
-        const double ContextDenominator = 100_000.0;
+        var contextDenominator = (double)_maxContextTokens;
         var tokens = _session.LastKnownContextTokens > 0
             ? _session.LastKnownContextTokens
             : _session.EstimatedContextTokens;
-        return (int)Math.Min(100, (tokens * 100.0) / ContextDenominator);
+        return (int)Math.Min(100, (tokens * 100.0) / contextDenominator);
     }
 
     public Task ConnectAsync(CancellationToken ct = default)
@@ -297,6 +302,7 @@ public sealed class SharpCoderRunner : IAgentRunner
         {
             WorkDirectory = workDir,
             MaxSteps = 500,
+            MaxContextTokens = _maxContextTokens,
             SystemPrompt = BuildRoleSystemPrompt(_currentRole, _customAgentSystemPrompt),
             CustomTools = BuildCustomTools(),
             EnableBash = _currentRole != WorkerRole.Improver,

@@ -14,6 +14,7 @@ repositories:
 workers:
   coder:
     model: claude-opus-4.6
+    context_window: 150000
   reviewer:
     model: gpt-5.4
   tester:
@@ -28,5 +29,6 @@ orchestrator:
   max_retries_per_task: 3
   always_improve: true
   verbose_logging: false
+  worker_context_window: 150000
   brain_context_window: 150000  # Max tokens for the Brain model's context
   brain_max_steps: 50           # Max tool-call steps per Brain request

@@ -20,6 +20,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
     /// <param name="prompt">The prompt to send to the worker.</param>
     /// <param name="branchAction">Git branch action to perform (create, checkout, etc.).</param>
     /// <param name="model">Optional model ID for this task (e.g., "claude-sonnet-4.6").</param>
+    /// <param name="maxContextTokens">Context window size in tokens for the worker's agent.</param>
     /// <returns>A fully constructed <see cref="WorkTask"/>.</returns>
     public WorkTask Build(
         string goalId,
@@ -29,7 +30,8 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
         IEnumerable<TargetRepository> repositories,
         string prompt,
         BranchAction branchAction,
-        string? model = null)
+        string? model = null,
+        int maxContextTokens = Constants.DefaultBrainContextWindow)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(goalId);
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
@@ -54,6 +56,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
             Model = model ?? "",
             SessionId = $"{goalId}:{roleName}",
             Repositories = repoList,
+            MaxContextTokens = maxContextTokens,
         };
     }
 }

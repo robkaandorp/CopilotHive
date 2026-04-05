@@ -56,8 +56,15 @@ public interface IAgentRunner : IAsyncDisposable
     object? GetSession();
 
     /// <summary>
+    /// Sets the context window size used for heartbeat Ctx% calculation and
+    /// agent compaction threshold. Must be called before <see cref="SendPromptAsync"/>.
+    /// </summary>
+    /// <param name="maxTokens">Maximum context window in tokens.</param>
+    void SetMaxContextTokens(int maxTokens);
+
+    /// <summary>
     /// Returns the estimated context window usage as a percentage (0–100) relative to
-    /// a 100,000-token denominator. Returns 0 if no session is active.
+    /// the configured context window. Returns 0 if no session is active.
     /// </summary>
     int GetContextUsagePercent();
 

@@ -1130,6 +1130,9 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         _logger.LogDebug("Model for {Role}: {Model} (tier={Tier}, configLoaded={ConfigLoaded})",
             roleName, model ?? "(null)", phaseTier, _config is not null);
 
+        // Resolve context window: per-role override > global worker default > constant fallback
+        var maxContextTokens = _config?.GetContextWindowForRole(roleName) ?? Constants.DefaultBrainContextWindow;
+
         var task = _taskBuilder.Build(
             goalId: pipeline.GoalId,
             goalDescription: pipeline.Description,
@@ -1138,7 +1141,8 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
             repositories: repositories,
             prompt: prompt,
             branchAction: branchAction,
-            model: model);
+            model: model,
+            maxContextTokens: maxContextTokens);
 
         // Improver operates read-only: it can see the feature branch but must not push.
         // Downgrade the action to Unspecified so the worker runtime skips push operations.

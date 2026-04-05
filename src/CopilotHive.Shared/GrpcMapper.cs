@@ -24,6 +24,7 @@ public static class GrpcMapper
             Role = ToGrpcRole(task.Role),
             Model = task.Model,
             SessionId = task.SessionId,
+            MaxContextTokens = task.MaxContextTokens,
         };
         foreach (var repo in task.Repositories)
         {
@@ -149,6 +150,7 @@ public static class GrpcMapper
                 DefaultBranch = r.DefaultBranch,
             })],
             Metadata = new Dictionary<string, string>(assignment.Metadata),
+            MaxContextTokens = assignment.MaxContextTokens > 0 ? assignment.MaxContextTokens : SharedConstants.DefaultBrainContextWindow,
         };
     }
 

@@ -83,6 +83,7 @@ message TaskAssignment {
   map<string, string> metadata = 8;  // Additional context
   string model = 9;               // Model ID for this task (e.g., "claude-sonnet-4.6")
   string session_id = 10;         // Session identifier: "goalId:roleName"
+  int32 max_context_tokens = 11;  // Context window size for worker (tokens)
 }
 
 // === Session Management ===

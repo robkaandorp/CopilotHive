@@ -4,6 +4,15 @@ using CopilotHive.Workers;
 namespace CopilotHive.Services;
 
 /// <summary>
+/// Shared constants that need to be accessible across projects.
+/// </summary>
+internal static class SharedConstants
+{
+    /// <summary>The default context window size in tokens for the Brain model.</summary>
+    public const int DefaultBrainContextWindow = 150_000;
+}
+
+/// <summary>
 /// Domain representation of a task assignment. Replaces gRPC TaskAssignment in business logic.
 /// </summary>
 public sealed record WorkTask
@@ -30,6 +39,8 @@ public sealed record WorkTask
     public int Iteration { get; init; }
     /// <summary>Additional key-value metadata for the task.</summary>
     public Dictionary<string, string> Metadata { get; init; } = new();
+    /// <summary>Context window size in tokens for the worker's agent. Used for heartbeat Ctx% calculation and compaction threshold.</summary>
+    public int MaxContextTokens { get; init; } = SharedConstants.DefaultBrainContextWindow;
 }
 
 /// <summary>

@@ -34,6 +34,23 @@ public sealed class HiveConfigFile
         Workers.TryGetValue(roleName.ToLowerInvariant(), out var wc) && !string.IsNullOrEmpty(wc.PremiumModel)
             ? wc.PremiumModel
             : null;
+
+    /// <summary>
+    /// Resolves the context window size for a given role.
+    /// Returns the per-role <c>context_window</c> if set and greater than 0,
+    /// otherwise the orchestrator's <c>worker_context_window</c>,
+    /// or finally <see cref="Constants.DefaultBrainContextWindow"/>.
+    /// </summary>
+    /// <param name="roleName">Role name (e.g. "coder", "reviewer").</param>
+    /// <returns>The resolved context window in tokens.</returns>
+    public int GetContextWindowForRole(string roleName)
+    {
+        if (Workers.TryGetValue(roleName.ToLowerInvariant(), out var wc) && wc.ContextWindow > 0)
+            return wc.ContextWindow;
+        if (Orchestrator.WorkerContextWindow > 0)
+            return Orchestrator.WorkerContextWindow;
+        return Constants.DefaultBrainContextWindow;
+    }
 }
 
 /// <summary>
@@ -59,6 +76,13 @@ public sealed class WorkerConfig
 
     /// <summary>Premium model override for this worker role, selected when the Brain requests the 'premium' tier.</summary>
     public string? PremiumModel { get; set; }
+
+    /// <summary>
+    /// Context window size in tokens for this worker role. When set and greater than 0,
+    /// overrides the orchestrator's <c>worker_context_window</c>.
+    /// Used for heartbeat Ctx% calculation and agent compaction threshold.
+    /// </summary>
+    public int ContextWindow { get; set; }
 }
 
 /// <summary>
@@ -86,6 +110,12 @@ public sealed class OrchestratorConfig
     public int BrainContextWindow { get; set; } = Constants.DefaultBrainContextWindow;
     /// <summary>Maximum tool-call steps the Brain agent may take per request.</summary>
     public int BrainMaxSteps { get; set; } = Constants.DefaultBrainMaxSteps;
+    /// <summary>
+    /// Default context window size in tokens for all workers. Individual roles can override
+    /// this via <c>workers.&lt;role&gt;.context_window</c>. Used for heartbeat Ctx% calculation
+    /// and agent compaction threshold.
+    /// </summary>
+    public int WorkerContextWindow { get; set; } = Constants.DefaultBrainContextWindow;
 }
 
 /// <summary>
