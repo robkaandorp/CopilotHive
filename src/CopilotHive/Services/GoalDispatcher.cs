@@ -44,6 +44,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly IClarificationRouter? _clarificationRouter;
     private readonly ClarificationQueueService? _clarificationQueue;
     private readonly ProgressLog? _progressLog;
+    private readonly ClarificationHandler _clarificationHandler;
 
     /// <summary>
     /// Initialises a new <see cref="GoalDispatcher"/> with required and optional dependencies.
@@ -100,6 +101,7 @@ public sealed class GoalDispatcher : BackgroundService
         _clarificationQueue = clarificationQueue;
         _startupDelay = startupDelay ?? TimeSpan.FromSeconds(10);
         _progressLog = progressLog;
+        _clarificationHandler = new ClarificationHandler(brain, clarificationRouter, clarificationQueue, logger);
 
         completionNotifier.OnTaskCompleted+= result => HandleTaskCompletionAsync(result);
     }
@@ -189,209 +191,24 @@ public sealed class GoalDispatcher : BackgroundService
     /// Composer cannot answer, the question is queued for human resolution with a 5-minute
     /// timeout. Returns the resolved answer as a string.
     /// </summary>
-    public async Task<string> AskBrainAsync(GoalPipeline pipeline, string question, CancellationToken ct)
-    {
-        if (_brain is null)
-            return "Brain is not available. Please proceed with your best judgment.";
-
-        _logger.LogInformation("Worker asks Brain: {Question}", question);
-        var brainResponse = await _brain.AskQuestionAsync(
-            pipeline.GoalId,
-            pipeline.Iteration,
-            pipeline.Phase.ToString(),
-            pipeline.Phase.ToWorkerRole().ToRoleName(),
-            question,
-            ct);
-
-        if (!brainResponse.IsEscalation)
-        {
-            var answer = brainResponse.Text ?? string.Empty;
-            _logger.LogInformation("Brain answers: {Answer}", answer[..Math.Min(answer.Length, 200)]);
-            RecordClarification(pipeline, question, answer, "brain");
-            return answer;
-        }
-
-        _logger.LogInformation("Brain escalated question for goal {GoalId} — routing to Composer", pipeline.GoalId);
-
-        // Create a clarification request
-        var request = new ClarificationRequest
-        {
-            GoalId = pipeline.GoalId,
-            WorkerRole = pipeline.Phase.ToWorkerRole().ToRoleName(),
-            Question = question,
-        };
-
-        // If no clarification router or clarification queue, return fallback
-        if (_clarificationRouter is null || _clarificationQueue is null)
-        {
-            _logger.LogWarning("No clarification router or clarification queue available — returning fallback for goal {GoalId}",
-                pipeline.GoalId);
-            return ClarificationQueueService.TimeoutFallbackMessage;
-        }
-
-        // Enqueue the request so the human queue is ready if needed
-        var tcs = _clarificationQueue.Enqueue(request);
-
-        // Mark current phase as waiting for clarification
-        pipeline.IsWaitingForClarification = true;
-
-        // Step 1: Try Composer auto-answer (30s timeout)
-        var composerAnswer = await _clarificationRouter.TryAutoAnswerAsync(
-            pipeline.GoalId,
-            question,
-            $"Goal description: {pipeline.Description}. Current phase: {pipeline.Phase}.",
-            _clarificationQueue,
-            request,
-            ct);
-
-        if (composerAnswer is not null)
-        {
-            // Composer answered successfully — resolve the request
-            _clarificationQueue.SubmitAnswer(request.Id, composerAnswer, "composer");
-            pipeline.IsWaitingForClarification = false;
-            RecordClarification(pipeline, question, composerAnswer, "composer");
-            return composerAnswer;
-        }
-
-        // Step 2: Composer escalated to human — wait for human answer (5min timeout)
-        _logger.LogInformation(
-            "Clarification for goal {GoalId} escalated to human. Waiting up to {Timeout} for answer.",
-            pipeline.GoalId, ClarificationQueueService.HumanTimeout);
-
-        try
-        {
-            var humanAnswer = await tcs.Task.WaitAsync(ClarificationQueueService.HumanTimeout, ct);
-            _logger.LogInformation("Human answered clarification for goal {GoalId}", pipeline.GoalId);
-            pipeline.IsWaitingForClarification = false;
-            RecordClarification(pipeline, question, humanAnswer, "human");
-            return humanAnswer;
-        }
-        catch (TimeoutException)
-        {
-            _logger.LogWarning(
-                "Human clarification timed out for goal {GoalId} — returning fallback", pipeline.GoalId);
-            _clarificationQueue.MarkTimedOut(request.Id);
-            pipeline.IsWaitingForClarification = false;
-            RecordClarification(pipeline, question, ClarificationQueueService.TimeoutFallbackMessage, "timeout");
-            return ClarificationQueueService.TimeoutFallbackMessage;
-        }
-    }
+    public Task<string> AskBrainAsync(GoalPipeline pipeline, string question, CancellationToken ct)
+        => _clarificationHandler.AskBrainAsync(pipeline, question, ct);
 
     /// <summary>
     /// Records a clarification Q&amp;A into the pipeline and emits a structured log entry.
+    /// Delegated to <see cref="ClarificationHandler"/>.
     /// </summary>
     private void RecordClarification(GoalPipeline pipeline, string question, string answer, string answeredBy)
-    {
-        // Planning, Merging, Done, Failed phases have no worker role — use "brain" as the role
-        var workerRole = pipeline.Phase is GoalPhase.Planning or GoalPhase.Merging or GoalPhase.Done or GoalPhase.Failed
-            ? "brain"
-            : pipeline.Phase.ToWorkerRole().ToRoleName();
-
-        var entry = new ClarificationEntry(
-            Timestamp: DateTime.UtcNow,
-            GoalId: pipeline.GoalId,
-            Iteration: pipeline.Iteration,
-            Phase: pipeline.Phase.ToString(),
-            WorkerRole: workerRole,
-            Question: question,
-            Answer: answer,
-            AnsweredBy: answeredBy)
-        {
-            Occurrence = pipeline.PhaseOccurrence,
-        };
-
-        pipeline.Clarifications.Add(entry);
-
-        _logger.LogInformation(
-            "Clarification recorded for goal {GoalId} iteration {Iteration} phase {Phase}: Q={Question} | AnsweredBy={AnsweredBy}",
-            entry.GoalId, entry.Iteration, entry.Phase,
-            question.Length > 100 ? question[..100] + "..." : question,
-            answeredBy);
-    }
+        => _clarificationHandler.RecordClarification(pipeline, question, answer, answeredBy);
 
     /// <summary>
     /// Routes a Brain escalation through the clarification pipeline and returns
     /// the resolved answer (from Composer, human, or timeout fallback).
+    /// Delegated to <see cref="ClarificationHandler"/>.
     /// </summary>
-    private async Task<string> RouteEscalationAsync(
+    private Task<string> RouteEscalationAsync(
         GoalPipeline pipeline, string question, string reason, CancellationToken ct)
-    {
-        _logger.LogInformation(
-            "Brain escalated for goal {GoalId} — routing clarification to Composer. Reason: {Reason}",
-            pipeline.GoalId, reason);
-
-        if (_clarificationRouter is null || _clarificationQueue is null)
-        {
-            _logger.LogWarning(
-                "No clarification router or clarification queue available — returning fallback for goal {GoalId}",
-                pipeline.GoalId);
-            RecordClarification(pipeline, question, ClarificationQueueService.TimeoutFallbackMessage, "timeout");
-            return ClarificationQueueService.TimeoutFallbackMessage;
-        }
-
-        // Planning, Merging, Done, Failed phases have no worker role — use "brain" as the role
-        var workerRole = pipeline.Phase is GoalPhase.Planning or GoalPhase.Merging or GoalPhase.Done or GoalPhase.Failed
-            ? "brain"
-            : pipeline.Phase.ToWorkerRole().ToRoleName();
-
-        var request = new ClarificationRequest
-        {
-            GoalId = pipeline.GoalId,
-            WorkerRole = workerRole,
-            Question = question,
-        };
-
-        var tcs = _clarificationQueue.Enqueue(request);
-        pipeline.IsWaitingForClarification = true;
-
-        // Step 1: Try Composer auto-answer (30s timeout)
-        var composerAnswer = await _clarificationRouter.TryAutoAnswerAsync(
-            pipeline.GoalId,
-            question,
-            $"Goal description: {pipeline.Description}. Current phase: {pipeline.Phase}. Reason for escalation: {reason}",
-            _clarificationQueue,
-            request,
-            ct);
-
-        if (composerAnswer is not null)
-        {
-            _clarificationQueue.SubmitAnswer(request.Id, composerAnswer, "composer");
-            pipeline.IsWaitingForClarification = false;
-            RecordClarification(pipeline, question, composerAnswer, "composer");
-            return composerAnswer;
-        }
-
-        // Step 2: Composer escalated to human — wait for human answer (5min timeout)
-        // Use a dedicated timeout token linked with the caller's token so we can
-        // distinguish "clarification timed out" from "caller requested cancellation".
-        _logger.LogInformation(
-            "Brain escalation for goal {GoalId} escalated to human. Waiting up to {Timeout} for answer.",
-            pipeline.GoalId, ClarificationQueueService.HumanTimeout);
-
-        using var timeoutCts = new CancellationTokenSource(ClarificationQueueService.HumanTimeout);
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, ct);
-
-        try
-        {
-            var humanAnswer = await tcs.Task.WaitAsync(linkedCts.Token);
-            _logger.LogInformation("Human answered Brain escalation for goal {GoalId}", pipeline.GoalId);
-            pipeline.IsWaitingForClarification = false;
-            RecordClarification(pipeline, question, humanAnswer, "human");
-            return humanAnswer;
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            // The clarification timeout token fired (not the caller's token) — treat as timeout fallback
-            _logger.LogWarning(
-                "Brain escalation timed out for goal {GoalId} — returning fallback", pipeline.GoalId);
-            _clarificationQueue.MarkTimedOut(request.Id);
-            pipeline.IsWaitingForClarification = false;
-            RecordClarification(pipeline, question, ClarificationQueueService.TimeoutFallbackMessage, "timeout");
-            return ClarificationQueueService.TimeoutFallbackMessage;
-        }
-        // OperationCanceledException where ct.IsCancellationRequested propagates naturally
-        // (caller requested cancellation — do NOT fall back, re-throw)
-    }
+        => _clarificationHandler.RouteEscalationAsync(pipeline, question, reason, ct);
 
     /// <summary>
     /// Calls <see cref="IDistributedBrain.PlanIterationAsync"/> and handles any escalation
@@ -399,41 +216,9 @@ public sealed class GoalDispatcher : BackgroundService
     /// with the answer as additional context. On timeout, returns the default plan.
     /// Exposed as <c>internal</c> for unit testing via <c>InternalsVisibleTo</c>.
     /// </summary>
-    internal async Task<IterationPlan> ResolvePlanAsync(
+    internal Task<IterationPlan> ResolvePlanAsync(
         GoalPipeline pipeline, string? additionalContext, CancellationToken ct)
-    {
-        if (_brain is null)
-            return IterationPlan.Default();
-
-        var result = await _brain.PlanIterationAsync(pipeline, additionalContext, ct);
-
-        if (!result.IsEscalation)
-            return result.Plan ?? IterationPlan.Default();
-
-        // Brain needs clarification before planning
-        var answer = await RouteEscalationAsync(
-            pipeline,
-            result.EscalationQuestion ?? "Brain requested clarification during planning",
-            result.EscalationReason ?? string.Empty,
-            ct);
-
-        if (answer == ClarificationQueueService.TimeoutFallbackMessage)
-        {
-            _logger.LogWarning(
-                "Brain planning escalation timed out for goal {GoalId} — using default plan", pipeline.GoalId);
-            return IterationPlan.Default();
-        }
-
-        // Retry planning with the answer as additional context
-        _logger.LogInformation(
-            "Retrying Brain planning for goal {GoalId} with clarification answer", pipeline.GoalId);
-        var retryContext = additionalContext is not null
-            ? $"{additionalContext}\n\n=== Clarification answer ===\n{answer}\n=== End clarification answer ==="
-            : $"=== Clarification answer ===\n{answer}\n=== End clarification answer ===";
-
-        var retryResult = await _brain.PlanIterationAsync(pipeline, retryContext, ct);
-        return retryResult.Plan ?? IterationPlan.Default();
-    }
+        => _clarificationHandler.ResolvePlanAsync(pipeline, additionalContext, ct);
 
     /// <summary>
     /// Calls <see cref="IDistributedBrain.CraftPromptAsync"/> and handles any escalation
@@ -441,46 +226,9 @@ public sealed class GoalDispatcher : BackgroundService
     /// crafting with the answer as additional context. On timeout, returns a fallback prompt.
     /// Exposed as <c>internal</c> for unit testing via <c>InternalsVisibleTo</c>.
     /// </summary>
-    internal async Task<string> ResolvePromptAsync(
+    internal Task<string> ResolvePromptAsync(
         GoalPipeline pipeline, GoalPhase phase, string? additionalContext, CancellationToken ct)
-    {
-        if (_brain is null)
-            return $"Work on: {pipeline.Description} (phase: {phase})";
-
-        var result = await _brain.CraftPromptAsync(pipeline, phase, additionalContext, ct);
-
-        if (!result.IsEscalation)
-            return result.Prompt ?? $"Work on: {pipeline.Description}";
-
-        // Brain needs clarification before crafting the prompt
-        var answer = await RouteEscalationAsync(
-            pipeline,
-            result.EscalationQuestion ?? "Brain requested clarification during prompt crafting",
-            result.EscalationReason ?? string.Empty,
-            ct);
-
-        if (answer == ClarificationQueueService.TimeoutFallbackMessage)
-        {
-            _logger.LogWarning(
-                "Brain prompt escalation timed out for goal {GoalId} phase {Phase} — using fallback prompt",
-                pipeline.GoalId, phase);
-            return phase == GoalPhase.Review
-                ? DistributedBrain.BuildReviewFallbackPrompt(pipeline, additionalContext)
-                : $"Work on: {pipeline.Description}";
-        }
-
-        // Retry prompt crafting with the answer as additional context
-        _logger.LogInformation(
-            "Retrying Brain prompt crafting for goal {GoalId} phase {Phase} with clarification answer",
-            pipeline.GoalId, phase);
-        var retryContext = additionalContext is not null
-            ? $"{additionalContext}\n\n=== Clarification answer ===\n{answer}\n=== End clarification answer ==="
-            : $"=== Clarification answer ===\n{answer}\n=== End clarification answer ===";
-
-        var retryResult = await _brain.CraftPromptAsync(pipeline, phase, retryContext, ct);
-        return retryResult.Prompt ?? $"Work on: {pipeline.Description}";
-    }
-
+        => _clarificationHandler.ResolvePromptAsync(pipeline, phase, additionalContext, ct);
 
     /// <inheritdoc/>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
