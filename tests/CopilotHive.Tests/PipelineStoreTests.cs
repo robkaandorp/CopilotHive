@@ -133,9 +133,12 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         _store.SavePipeline(pipeline);
         var snap = Assert.Single(_store.LoadActivePipelines());
 
-        Assert.Equal(2, snap.PhaseOutputs.Count);
+        // Each RecordOutput stores both per-occurrence and backward-compatible keys
+        Assert.Equal(4, snap.PhaseOutputs.Count);
         Assert.Equal("code output", snap.PhaseOutputs["coder-1"]);
+        Assert.Equal("code output", snap.PhaseOutputs["coder-1-1"]);
         Assert.Equal("test output", snap.PhaseOutputs["tester-1"]);
+        Assert.Equal("test output", snap.PhaseOutputs["tester-1-1"]);
     }
 
     [Fact]

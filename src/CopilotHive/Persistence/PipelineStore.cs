@@ -192,6 +192,7 @@ public sealed class PipelineStore : IAsyncDisposable
         ("conversation_entries",  "iteration",         "INTEGER"),
         ("conversation_entries",  "purpose",           "TEXT"),
         ("pipelines",             "iteration_start_sha", "TEXT"),
+        ("pipelines",             "phase_occurrence",    "INTEGER NOT NULL DEFAULT 1"),
     ];
 
     /// <summary>
@@ -324,7 +325,8 @@ public sealed class PipelineStore : IAsyncDisposable
                        active_task_id, coder_branch, phase_outputs, metrics_json,
                        created_at, completed_at, goal_started_at, plan_json, merge_commit_hash,
                        COALESCE(role_sessions_json, '{}'),
-                       iteration_start_sha
+                       iteration_start_sha,
+                       COALESCE(phase_occurrence, 1)
                 FROM pipelines
                 WHERE phase NOT IN ('Done', 'Failed')
                 """;
@@ -356,6 +358,7 @@ public sealed class PipelineStore : IAsyncDisposable
                     RoleSessions = JsonSerializer.Deserialize<Dictionary<string, string>>(reader.GetString(18), JsonOptions) ?? [],
                     Conversation = LoadConversationCore(goalId),
                     IterationStartSha = reader.IsDBNull(19) ? null : reader.GetString(19),
+                    PhaseOccurrence = reader.GetInt32(20),
                 });
             }
 
@@ -377,13 +380,13 @@ public sealed class PipelineStore : IAsyncDisposable
                  review_retries, test_retries, max_retries, max_iterations,
                  active_task_id, coder_branch, plan_json, phase_outputs, metrics_json,
                  created_at, completed_at, goal_started_at, merge_commit_hash,
-                 role_sessions_json, iteration_start_sha)
+                 role_sessions_json, iteration_start_sha, phase_occurrence)
             VALUES
                 (@goalId, @desc, @goalJson, @phase, @iteration,
                  @reviewRetries, @testRetries, @maxRetries, @maxIterations,
                  @activeTaskId, @coderBranch, @planJson, @phaseOutputs, @metricsJson,
                  @createdAt, @completedAt, @goalStartedAt, @mergeCommitHash,
-                 @roleSessionsJson, @iterationStartSha)
+                 @roleSessionsJson, @iterationStartSha, @phaseOccurrence)
             """;
         cmd.Parameters.AddWithValue("@goalId", pipeline.GoalId);
         cmd.Parameters.AddWithValue("@desc", pipeline.Description);
@@ -408,6 +411,7 @@ public sealed class PipelineStore : IAsyncDisposable
         cmd.Parameters.AddWithValue("@mergeCommitHash", (object?)pipeline.MergeCommitHash ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@roleSessionsJson", JsonSerializer.Serialize(new Dictionary<string, string>(pipeline.RoleSessions), JsonOptions));
         cmd.Parameters.AddWithValue("@iterationStartSha", (object?)pipeline.IterationStartSha ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@phaseOccurrence", pipeline.PhaseOccurrence);
         cmd.ExecuteNonQuery();
     }
 
@@ -542,4 +546,9 @@ public sealed class PipelineSnapshot
     /// diff (<c>git diff {sha}..HEAD</c>) for reviewers. <c>null</c> when not yet captured or not applicable.
     /// </summary>
     public string? IterationStartSha { get; init; }
+    /// <summary>
+    /// 1-based occurrence index of the current phase within the iteration plan.
+    /// Defaults to 1 for pipelines predating per-occurrence tracking.
+    /// </summary>
+    public int PhaseOccurrence { get; init; } = 1;
 }

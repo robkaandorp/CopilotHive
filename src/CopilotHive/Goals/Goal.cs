@@ -87,6 +87,11 @@ public sealed class PersistedClarification
     public string Answer { get; init; } = "";
     /// <summary>Who answered: "brain", "composer", "human", or "timeout".</summary>
     public string AnsweredBy { get; init; } = "";
+    /// <summary>
+    /// 1-based occurrence index of the phase within the iteration plan.
+    /// Defaults to 0 for entries persisted before per-occurrence tracking (backward compat).
+    /// </summary>
+    public int Occurrence { get; init; }
 }
 
 /// <summary>Result of a single pipeline phase within one iteration.</summary>
@@ -108,6 +113,11 @@ public sealed class PhaseResult
     public string? PlanningPrompt { get; set; }
     /// <summary>Brain response to the Planning prompt.</summary>
     public string? PlanningResponse { get; set; }
+    /// <summary>
+    /// 1-based occurrence index of this phase within the iteration plan (e.g. 1 for first Coding, 2 for second Coding).
+    /// Null for legacy persisted summaries that predate per-occurrence tracking.
+    /// </summary>
+    public int? Occurrence { get; init; }
 }
 
 /// <summary>Aggregate test counts from a tester run.</summary>

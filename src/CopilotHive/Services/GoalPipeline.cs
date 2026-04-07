@@ -106,7 +106,14 @@ public sealed record ClarificationEntry(
     string WorkerRole,
     string Question,
     string Answer,
-    string AnsweredBy);
+    string AnsweredBy)
+{
+    /// <summary>
+    /// 1-based occurrence index of the phase within the iteration plan.
+    /// Defaults to 0 for entries created before per-occurrence tracking (backward compat).
+    /// </summary>
+    public int Occurrence { get; init; }
+}
 
 /// <summary>
 /// Tracks a single goal's progress through the multi-phase pipeline.
@@ -198,6 +205,13 @@ public sealed class GoalPipeline
     /// <summary>UTC timestamp when the current phase started (for phase duration tracking).</summary>
     public DateTime? PhaseStartedAt { get; private set; }
 
+    /// <summary>
+    /// The 1-based occurrence index of the current phase within the iteration plan.
+    /// Set by the dispatcher when advancing phases in a multi-round plan.
+    /// Defaults to 1 for single-occurrence phases and the first phase of each iteration.
+    /// </summary>
+    public int PhaseOccurrence { get; set; } = 1;
+
     /// <summary>UTC timestamp when the goal was started (captured at dispatch time, before the pipeline is created).</summary>
     public DateTime? GoalStartedAt { get; internal set; }
 
@@ -262,6 +276,7 @@ public sealed class GoalPipeline
         GoalStartedAt = snapshot.GoalStartedAt;
         MergeCommitHash = snapshot.MergeCommitHash;
         IterationStartSha = snapshot.IterationStartSha;
+        PhaseOccurrence = snapshot.PhaseOccurrence;
 
         foreach (var (key, value) in snapshot.PhaseOutputs)
             PhaseOutputs[key] = value;
@@ -297,7 +312,10 @@ public sealed class GoalPipeline
             {
                 var phaseName = Phase.ToString();
                 var elapsed = DateTime.UtcNow - PhaseStartedAt.Value;
-                // Accumulate: the same phase can repeat across retries
+                // Per-occurrence key: e.g. "Coding-1", "Coding-2"
+                var occurrenceKey = $"{phaseName}-{PhaseOccurrence}";
+                Metrics.PhaseDurations[occurrenceKey] = elapsed;
+                // Accumulated total key: backward-compatible, accumulates across occurrences
                 if (Metrics.PhaseDurations.TryGetValue(phaseName, out var existing))
                     Metrics.PhaseDurations[phaseName] = existing + elapsed;
                 else
@@ -354,7 +372,11 @@ public sealed class GoalPipeline
     /// <summary>Record output from a completed phase.</summary>
     public void RecordOutput(WorkerRole role, int iteration, string output)
     {
-        PhaseOutputs[$"{role.ToRoleName()}-{iteration}"] = output;
+        var roleName = role.ToRoleName();
+        // Per-occurrence key: e.g. "coder-1-1", "coder-1-2"
+        PhaseOutputs[$"{roleName}-{iteration}-{PhaseOccurrence}"] = output;
+        // Backward-compatible latest key: e.g. "coder-1" (overwrites previous occurrence)
+        PhaseOutputs[$"{roleName}-{iteration}"] = output;
     }
 
     /// <summary>Records a worker progress report into the pipeline's per-pipeline log.</summary>
@@ -369,6 +391,7 @@ public sealed class GoalPipeline
             Iteration = Iteration,
             Status = status,
             Details = details,
+            Occurrence = PhaseOccurrence,
         });
     }
 

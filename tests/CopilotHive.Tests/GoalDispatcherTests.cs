@@ -415,6 +415,167 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
 
         Assert.False(summary.BuildSuccess);
     }
+
+    /// <summary>
+    /// BuildIterationSummary emits separate PhaseResult entries for each occurrence
+    /// of a repeated phase (e.g., two Coding phases in a multi-round plan).
+    /// </summary>
+    [Fact]
+    public void BuildIterationSummary_MultiRoundPlan_EmitsPerOccurrencePhaseResults()
+    {
+        var goal = new Goal { Id = "multi-round-goal", Description = "Test" };
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
+
+        // Set up a multi-round plan: Coding, Testing, Coding, Testing, Review
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review],
+        };
+        pipeline.SetPlan(plan);
+
+        // Record per-occurrence durations
+        pipeline.Metrics.PhaseDurations["Coding-1"] = TimeSpan.FromSeconds(30);
+        pipeline.Metrics.PhaseDurations["Coding-2"] = TimeSpan.FromSeconds(45);
+        pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(75); // accumulated
+        pipeline.Metrics.PhaseDurations["Testing-1"] = TimeSpan.FromSeconds(15);
+        pipeline.Metrics.PhaseDurations["Testing-2"] = TimeSpan.FromSeconds(20);
+        pipeline.Metrics.PhaseDurations["Testing"] = TimeSpan.FromSeconds(35); // accumulated
+        pipeline.Metrics.PhaseDurations["Review"] = TimeSpan.FromSeconds(10);
+
+        // Record per-occurrence outputs
+        pipeline.PhaseOutputs["coder-1-1"] = "First coding output";
+        pipeline.PhaseOutputs["coder-1-2"] = "Second coding output";
+        pipeline.PhaseOutputs["coder-1"] = "Second coding output"; // latest (backward-compat)
+        pipeline.PhaseOutputs["tester-1-1"] = "First testing output";
+        pipeline.PhaseOutputs["tester-1-2"] = "Second testing output";
+        pipeline.PhaseOutputs["tester-1"] = "Second testing output"; // latest
+        pipeline.PhaseOutputs["reviewer-1-1"] = "Review output";
+        pipeline.PhaseOutputs["reviewer-1"] = "Review output";
+
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+
+        // Should have 5 PhaseResults: Coding(1), Testing(1), Coding(2), Testing(2), Review
+        // Note: Order depends on dictionary iteration order, so check by occurrence
+        var codingPhases = summary.Phases.Where(p => p.Name == "Coding").ToList();
+        var testingPhases = summary.Phases.Where(p => p.Name == "Testing").ToList();
+        var reviewPhases = summary.Phases.Where(p => p.Name == "Review").ToList();
+
+        Assert.Equal(2, codingPhases.Count);
+        Assert.Equal(2, testingPhases.Count);
+        Assert.Single(reviewPhases);
+
+        // First Coding occurrence
+        var coding1 = codingPhases.FirstOrDefault(p => p.DurationSeconds == 30);
+        Assert.NotNull(coding1);
+        Assert.Equal("First coding output", coding1.WorkerOutput);
+
+        // Second Coding occurrence
+        var coding2 = codingPhases.FirstOrDefault(p => p.DurationSeconds == 45);
+        Assert.NotNull(coding2);
+        Assert.Equal("Second coding output", coding2.WorkerOutput);
+
+        // First Testing occurrence
+        var testing1 = testingPhases.FirstOrDefault(p => p.DurationSeconds == 15);
+        Assert.NotNull(testing1);
+        Assert.Equal("First testing output", testing1.WorkerOutput);
+
+        // Second Testing occurrence
+        var testing2 = testingPhases.FirstOrDefault(p => p.DurationSeconds == 20);
+        Assert.NotNull(testing2);
+        Assert.Equal("Second testing output", testing2.WorkerOutput);
+
+        // Review (single occurrence)
+        var review = reviewPhases.Single();
+        Assert.Equal(10, review.DurationSeconds);
+        Assert.Equal("Review output", review.WorkerOutput);
+    }
+
+    /// <summary>
+    /// BuildIterationSummary includes both per-occurrence and backward-compatible keys
+    /// in the PhaseOutputs dictionary.
+    /// </summary>
+    [Fact]
+    public void BuildIterationSummary_MultiRoundPlan_IncludesBothOccurrenceAndLatestKeys()
+    {
+        var goal = new Goal { Id = "output-keys-goal", Description = "Test" };
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
+
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Coding, GoalPhase.Testing],
+        };
+        pipeline.SetPlan(plan);
+
+        pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(60);
+        pipeline.Metrics.PhaseDurations["Testing"] = TimeSpan.FromSeconds(30);
+
+        // Record outputs with occurrence tracking
+        pipeline.PhaseOutputs["coder-1-1"] = "Round 1 code";
+        pipeline.PhaseOutputs["coder-1-2"] = "Round 2 code";
+        pipeline.PhaseOutputs["coder-1"] = "Round 2 code";
+        pipeline.PhaseOutputs["tester-1-1"] = "Round 1 tests";
+        pipeline.PhaseOutputs["tester-1-2"] = "Round 2 tests";
+        pipeline.PhaseOutputs["tester-1"] = "Round 2 tests";
+
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+
+        // PhaseOutputs should include both occurrence-specific and backward-compatible keys
+        Assert.True(summary.PhaseOutputs.ContainsKey("coder-1-1"));
+        Assert.True(summary.PhaseOutputs.ContainsKey("coder-1-2"));
+        Assert.True(summary.PhaseOutputs.ContainsKey("coder-1"));
+        Assert.True(summary.PhaseOutputs.ContainsKey("tester-1-1"));
+        Assert.True(summary.PhaseOutputs.ContainsKey("tester-1-2"));
+        Assert.True(summary.PhaseOutputs.ContainsKey("tester-1"));
+
+        Assert.Equal("Round 1 code", summary.PhaseOutputs["coder-1-1"]);
+        Assert.Equal("Round 2 code", summary.PhaseOutputs["coder-1-2"]);
+        Assert.Equal("Round 2 code", summary.PhaseOutputs["coder-1"]);
+    }
+
+    /// <summary>
+    /// BuildIterationSummary with a failed phase in a multi-round plan marks only
+    /// the specific occurrence that failed, not all occurrences of that phase type.
+    /// </summary>
+    [Fact]
+    public void BuildIterationSummary_MultiRoundPlan_FailedPhaseMarksOnlySpecificOccurrence()
+    {
+        var goal = new Goal { Id = "fail-occ-goal", Description = "Test" };
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
+
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review],
+        };
+        pipeline.SetPlan(plan);
+
+        // Record durations for all phases
+        pipeline.Metrics.PhaseDurations["Coding-1"] = TimeSpan.FromSeconds(30);
+        pipeline.Metrics.PhaseDurations["Coding-2"] = TimeSpan.FromSeconds(45);
+        pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(75);
+        pipeline.Metrics.PhaseDurations["Testing-1"] = TimeSpan.FromSeconds(15);
+        pipeline.Metrics.PhaseDurations["Testing-2"] = TimeSpan.FromSeconds(20);
+        pipeline.Metrics.PhaseDurations["Testing"] = TimeSpan.FromSeconds(35);
+
+        // Simulate Testing round 2 failing — PhaseOccurrence is 2 at the time of failure
+        pipeline.PhaseOccurrence = 2;
+
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: GoalPhase.Testing);
+
+        var testingPhases = summary.Phases.Where(p => p.Name == "Testing").ToList();
+        Assert.Equal(2, testingPhases.Count);
+
+        // First Testing occurrence should be "pass" (it completed successfully)
+        var testing1 = testingPhases.First(p => p.DurationSeconds == 15);
+        Assert.Equal("pass", testing1.Result);
+
+        // Second Testing occurrence should be "fail" (the one that actually failed)
+        var testing2 = testingPhases.First(p => p.DurationSeconds == 20);
+        Assert.Equal("fail", testing2.Result);
+
+        // Coding phases should all be "pass"
+        var codingPhases = summary.Phases.Where(p => p.Name == "Coding").ToList();
+        Assert.All(codingPhases, c => Assert.Equal("pass", c.Result));
+    }
 }
 
 /// <summary>

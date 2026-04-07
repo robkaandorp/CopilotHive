@@ -2198,10 +2198,11 @@ public sealed class DashboardStateServiceTests : IDisposable
     }
 
     /// <summary>
-    /// Verifies that only the last occurrence of each phase has non-null WorkerOutput.
+    /// Verifies that each occurrence of a repeated phase shows its own worker output
+    /// (per-occurrence key lookup), and non-repeated phases show their output normally.
     /// </summary>
     [Fact]
-    public void GetGoalDetail_MultiRoundPlan_OnlyLastOccurrenceHasWorkerOutput()
+    public void GetGoalDetail_MultiRoundPlan_EachOccurrenceHasItsOwnWorkerOutput()
     {
         var goal = new Goal
         {
@@ -2225,11 +2226,17 @@ public sealed class DashboardStateServiceTests : IDisposable
         // Set pipeline.Phase to Review so GetGoalDetail sees all phases
         var phaseProperty = typeof(GoalPipeline).GetProperty("Phase");
         phaseProperty?.SetValue(pipeline, GoalPhase.Review);
-        // Record outputs for all worker phases
+
+        // Record outputs with per-occurrence tracking
+        pipeline.PhaseOccurrence = 1;
         pipeline.RecordOutput(WorkerRole.Coder, 1, "First coding output");
+        pipeline.PhaseOccurrence = 1;
         pipeline.RecordOutput(WorkerRole.Tester, 1, "First testing output");
+        pipeline.PhaseOccurrence = 2;
         pipeline.RecordOutput(WorkerRole.Coder, 1, "Second coding output");
+        pipeline.PhaseOccurrence = 2;
         pipeline.RecordOutput(WorkerRole.Tester, 1, "Second testing output");
+        pipeline.PhaseOccurrence = 1;
         pipeline.RecordOutput(WorkerRole.Reviewer, 1, "Review output");
 
         var goalManager = new GoalManager();
@@ -2248,19 +2255,19 @@ public sealed class DashboardStateServiceTests : IDisposable
         var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
         Assert.NotNull(currentIteration);
 
-        // First occurrence of Coding should have null WorkerOutput
+        // First occurrence of Coding should show first coding output
         var coding1 = currentIteration.Phases.First(p => p.Name == "Coding" && p.Occurrence == 1);
-        Assert.Null(coding1.WorkerOutput);
+        Assert.Equal("First coding output", coding1.WorkerOutput);
 
-        // Second occurrence of Coding should have the output
+        // Second occurrence of Coding should show second coding output
         var coding2 = currentIteration.Phases.First(p => p.Name == "Coding" && p.Occurrence == 2);
         Assert.Equal("Second coding output", coding2.WorkerOutput);
 
-        // First occurrence of Testing should have null WorkerOutput
+        // First occurrence of Testing should show first testing output
         var testing1 = currentIteration.Phases.First(p => p.Name == "Testing" && p.Occurrence == 1);
-        Assert.Null(testing1.WorkerOutput);
+        Assert.Equal("First testing output", testing1.WorkerOutput);
 
-        // Second occurrence of Testing should have the output
+        // Second occurrence of Testing should show second testing output
         var testing2 = currentIteration.Phases.First(p => p.Name == "Testing" && p.Occurrence == 2);
         Assert.Equal("Second testing output", testing2.WorkerOutput);
 
@@ -2274,10 +2281,11 @@ public sealed class DashboardStateServiceTests : IDisposable
     }
 
     /// <summary>
-    /// Verifies that only the last occurrence of each phase has non-empty ProgressReports.
+    /// Verifies that all ProgressReports for a phase are shown on every occurrence of that phase,
+    /// since ProgressReports are keyed by phase name only (not occurrence).
     /// </summary>
     [Fact]
-    public void GetGoalDetail_MultiRoundPlan_OnlyLastOccurrenceHasProgressReports()
+    public void GetGoalDetail_MultiRoundPlan_AllOccurrencesShowProgressReports()
     {
         var goal = new Goal
         {
@@ -2302,14 +2310,15 @@ public sealed class DashboardStateServiceTests : IDisposable
         var phaseProperty = typeof(GoalPipeline).GetProperty("Phase");
         phaseProperty?.SetValue(pipeline, GoalPhase.Testing);
 
-        // Add progress reports directly to the pipeline's ProgressReports collection
-        // These simulate reports from all Coding and Testing occurrences
+        // Add progress reports with per-occurrence tracking.
+        // Occurrence 1 reports for Coding and Testing
         pipeline.ProgressReports.Add(new ProgressEntry
         {
             Iteration = 1,
             Phase = "Coding",
             Details = "First coding report",
             Timestamp = DateTime.UtcNow,
+            Occurrence = 1,
         });
         pipeline.ProgressReports.Add(new ProgressEntry
         {
@@ -2317,6 +2326,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             Phase = "Coding",
             Details = "Second coding report",
             Timestamp = DateTime.UtcNow.AddSeconds(10),
+            Occurrence = 2,
         });
         pipeline.ProgressReports.Add(new ProgressEntry
         {
@@ -2324,6 +2334,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             Phase = "Testing",
             Details = "First testing report",
             Timestamp = DateTime.UtcNow,
+            Occurrence = 1,
         });
         pipeline.ProgressReports.Add(new ProgressEntry
         {
@@ -2331,6 +2342,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             Phase = "Testing",
             Details = "Second testing report",
             Timestamp = DateTime.UtcNow.AddSeconds(10),
+            Occurrence = 2,
         });
 
         var goalManager = new GoalManager();
@@ -2349,24 +2361,24 @@ public sealed class DashboardStateServiceTests : IDisposable
         var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
         Assert.NotNull(currentIteration);
 
-        // First occurrence of Coding should have empty ProgressReports
+        // Coding occurrence 1 gets only the report with Occurrence == 1
         var coding1 = currentIteration.Phases.First(p => p.Name == "Coding" && p.Occurrence == 1);
-        Assert.Empty(coding1.ProgressReports);
+        Assert.Single(coding1.ProgressReports);
+        Assert.Contains(coding1.ProgressReports, p => p.Details == "First coding report");
 
-        // Second occurrence of Coding should have both reports
+        // Coding occurrence 2 gets only the report with Occurrence == 2
         var coding2 = currentIteration.Phases.First(p => p.Name == "Coding" && p.Occurrence == 2);
-        Assert.Equal(2, coding2.ProgressReports.Count);
-        Assert.Contains(coding2.ProgressReports, p => p.Details == "First coding report");
+        Assert.Single(coding2.ProgressReports);
         Assert.Contains(coding2.ProgressReports, p => p.Details == "Second coding report");
 
-        // First occurrence of Testing should have empty ProgressReports
+        // Testing occurrence 1 gets only the report with Occurrence == 1
         var testing1 = currentIteration.Phases.First(p => p.Name == "Testing" && p.Occurrence == 1);
-        Assert.Empty(testing1.ProgressReports);
+        Assert.Single(testing1.ProgressReports);
+        Assert.Contains(testing1.ProgressReports, p => p.Details == "First testing report");
 
-        // Second occurrence of Testing should have both reports
+        // Testing occurrence 2 gets only the report with Occurrence == 2
         var testing2 = currentIteration.Phases.First(p => p.Name == "Testing" && p.Occurrence == 2);
-        Assert.Equal(2, testing2.ProgressReports.Count);
-        Assert.Contains(testing2.ProgressReports, p => p.Details == "First testing report");
+        Assert.Single(testing2.ProgressReports);
         Assert.Contains(testing2.ProgressReports, p => p.Details == "Second testing report");
     }
 
@@ -2503,6 +2515,79 @@ public sealed class DashboardStateServiceTests : IDisposable
         var phase = iteration.Phases.FirstOrDefault(p => p.Name == phaseName);
         Assert.NotNull(phase);
         Assert.Equal(expectedRole, phase.RoleName);
+    }
+
+    /// <summary>
+    /// Verifies that a completed goal with a multi-round plan shows each occurrence with its
+    /// own worker output and occurrence index, and that test metrics only appear on the last
+    /// Testing occurrence.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_CompletedMultiRoundPlan_PerOccurrenceOutputAndLastOccurrenceMetrics()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "completed-multi-round-goal",
+            Description = "Completed multi-round goal",
+            Status = GoalStatus.Completed,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        // Build summary as BuildIterationSummary would: PhaseResult.Occurrence is set,
+        // WorkerOutput is the per-occurrence output.
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult { Name = "Coding",  Result = "pass", DurationSeconds = 30.0, WorkerOutput = "First coding output",   Occurrence = 1 },
+                new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 15.0, WorkerOutput = "First testing output",  Occurrence = 1 },
+                new PhaseResult { Name = "Coding",  Result = "pass", DurationSeconds = 45.0, WorkerOutput = "Second coding output",  Occurrence = 2 },
+                new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 20.0, WorkerOutput = "Second testing output", Occurrence = 2 },
+                new PhaseResult { Name = "Review",  Result = "pass", DurationSeconds = 10.0, WorkerOutput = "Review output",        Occurrence = 1 },
+            ],
+            TestCounts = new TestCounts { Total = 42, Passed = 40, Failed = 2 },
+            ReviewVerdict = "approve",
+        };
+        await _store.UpdateGoalStatusAsync("completed-multi-round-goal", GoalStatus.Completed,
+            new GoalUpdateMetadata { Iterations = 1, IterationSummary = summary }, ct);
+
+        using var service = CreateService();
+
+        var detail = service.GetGoalDetail("completed-multi-round-goal");
+
+        Assert.NotNull(detail);
+        var iteration = Assert.Single(detail.Iterations);
+
+        // Planning + 5 phases = 6 total
+        Assert.Equal(6, iteration.Phases.Count);
+
+        // Each Coding occurrence has its own output and occurrence index
+        var coding1 = iteration.Phases.First(p => p.Name == "Coding" && p.Occurrence == 1);
+        Assert.Equal("First coding output", coding1.WorkerOutput);
+
+        var coding2 = iteration.Phases.First(p => p.Name == "Coding" && p.Occurrence == 2);
+        Assert.Equal("Second coding output", coding2.WorkerOutput);
+
+        // Each Testing occurrence has its own output
+        var testing1 = iteration.Phases.First(p => p.Name == "Testing" && p.Occurrence == 1);
+        Assert.Equal("First testing output", testing1.WorkerOutput);
+
+        var testing2 = iteration.Phases.First(p => p.Name == "Testing" && p.Occurrence == 2);
+        Assert.Equal("Second testing output", testing2.WorkerOutput);
+
+        // Test metrics only on last Testing occurrence
+        Assert.Equal(0, testing1.TotalTests);
+        Assert.Equal(42, testing2.TotalTests);
+        Assert.Equal(40, testing2.PassedTests);
+        Assert.Equal(2, testing2.FailedTests);
+
+        // Review output and verdict only on (single) Review occurrence
+        var review = iteration.Phases.First(p => p.Name == "Review");
+        Assert.Equal("Review output", review.WorkerOutput);
+        Assert.Equal("approve", review.ReviewVerdict);
     }
 
     private DashboardStateService CreateService()

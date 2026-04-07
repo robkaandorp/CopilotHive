@@ -65,4 +65,9 @@ public sealed class ProgressEntry
     public string Status { get; init; } = "";
     /// <summary>Details message.</summary>
     public string Details { get; init; } = "";
+    /// <summary>
+    /// 1-based occurrence index of the phase within the iteration plan.
+    /// Defaults to 0 for entries created before per-occurrence tracking (backward compat).
+    /// </summary>
+    public int Occurrence { get; init; }
 }

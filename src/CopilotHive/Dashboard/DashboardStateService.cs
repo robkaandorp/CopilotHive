@@ -383,7 +383,10 @@ public sealed class DashboardStateService : IDisposable
                     WorkerRole: c.WorkerRole,
                     Question: c.Question,
                     Answer: c.Answer,
-                    AnsweredBy: c.AnsweredBy)).ToList(),
+                    AnsweredBy: c.AnsweredBy)
+                {
+                    Occurrence = c.Occurrence,
+                }).ToList(),
                 StringComparer.OrdinalIgnoreCase);
 
         clarificationsByPhase.TryGetValue("Planning", out var planningClarifications);
@@ -407,32 +410,73 @@ public sealed class DashboardStateService : IDisposable
         {
             var roleName = PhaseNameToRoleName(pr.Name);
 
+            // Count total occurrences per phase in this summary for last-occurrence detection.
+            var totalOccurrencesForPhase = summary.Phases.Count(p => p.Name == pr.Name);
+            // Current occurrence: use PhaseResult.Occurrence if set, else default to 1.
+            var occurrence = pr.Occurrence ?? 1;
+            var isLastOccurrence = occurrence >= totalOccurrencesForPhase;
+
             // Prefer PhaseResult.WorkerOutput (persisted) over live pipeline PhaseOutputs.
             // This ensures completed goals (no pipeline) still display output correctly.
             string? workerOutput = pr.WorkerOutput;
             if (string.IsNullOrEmpty(workerOutput) && !string.IsNullOrEmpty(roleName))
-                pipeline?.PhaseOutputs.TryGetValue($"{roleName}-{summary.Iteration}", out workerOutput);
+            {
+                // Use occurrence-specific key if Occurrence is set; otherwise fall back to latest.
+                if (pr.Occurrence.HasValue)
+                    pipeline?.PhaseOutputs.TryGetValue($"{roleName}-{summary.Iteration}-{pr.Occurrence.Value}", out workerOutput);
+                // Only fall back to latest key for single-occurrence or last-occurrence phases
+                if (string.IsNullOrEmpty(workerOutput) && isLastOccurrence)
+                    pipeline?.PhaseOutputs.TryGetValue($"{roleName}-{summary.Iteration}", out workerOutput);
+            }
 
             var isTestPhase = pr.Name == "Testing";
             var isReviewPhase = pr.Name == "Review";
 
-            clarificationsByPhase.TryGetValue(pr.Name, out var phaseClarifications);
+            // Filter clarifications by occurrence. Fall back to all phase clarifications
+            // if no occurrence-specific entries exist (backward compat for old persisted goals).
+            List<ClarificationEntry>? phaseClarifications = null;
+            if (clarificationsByPhase.TryGetValue(pr.Name, out var allPhaseClarifications))
+            {
+                var occSpecific = allPhaseClarifications.Where(c => c.Occurrence == occurrence).ToList();
+                phaseClarifications = occSpecific.Count > 0
+                    ? occSpecific
+                    : (allPhaseClarifications.Any(c => c.Occurrence > 0) ? [] : allPhaseClarifications);
+            }
+
             craftPrompts.TryGetValue(roleName, out var phasePrompts);
+
+            // Filter progress reports by occurrence. Fall back to all phase reports
+            // if no occurrence-specific entries exist (backward compat for old data).
+            var allPhaseProgress = pipeline?.ProgressReports
+                .Where(p => p.Iteration == summary.Iteration && p.Phase == pr.Name)
+                .OrderBy(p => p.Timestamp)
+                .ToList() ?? [];
+            List<ProgressEntry> phaseProgress;
+            if (allPhaseProgress.Count > 0)
+            {
+                var occProgress = allPhaseProgress.Where(p => p.Occurrence == occurrence).ToList();
+                phaseProgress = occProgress.Count > 0
+                    ? occProgress
+                    : (allPhaseProgress.Any(p => p.Occurrence > 0) ? [] : allPhaseProgress);
+            }
+            else
+            {
+                phaseProgress = [];
+            }
 
             phases.Add(BuildPhaseViewInfo(
                 phaseIndex: phases.Count,
                 phase: pr,
                 workerOutput: workerOutput,
                 clarifications: phaseClarifications,
-                progress: pipeline?.ProgressReports
-                    .Where(p => p.Iteration == summary.Iteration && p.Phase == pr.Name)
-                    .OrderBy(p => p.Timestamp)
-                    .ToList() ?? [],
+                progress: phaseProgress,
                 summary: summary,
                 isTestPhase: isTestPhase,
                 isReviewPhase: isReviewPhase,
                 craftPrompts: phasePrompts,
-                pipeline: pipeline));
+                pipeline: pipeline,
+                occurrence: occurrence,
+                isLastOccurrence: isLastOccurrence));
         }
 
         return phases;
@@ -492,6 +536,18 @@ public sealed class DashboardStateService : IDisposable
                 occurrenceCounters[phase] = occurrenceCounters.GetValueOrDefault(phase) + 1;
                 var occurrence = occurrenceCounters[phase];
 
+                // Compute isLastOccurrence early — needed for fallback logic below.
+                var lastPlanIndex = -1;
+                for (var j = planPhases.Count - 1; j >= 0; j--)
+                {
+                    if (planPhases[j] == phase)
+                    {
+                        lastPlanIndex = j;
+                        break;
+                    }
+                }
+                var isLastOccurrence = (i == lastPlanIndex);
+
                 string status;
                 if (i < completedCount)
                     status = "completed";
@@ -507,40 +563,54 @@ public sealed class DashboardStateService : IDisposable
                 var roleName = GetRoleNameSafe(phase);
                 string? workerOutput = null;
                 if (!string.IsNullOrEmpty(roleName))
-                    pipeline.PhaseOutputs.TryGetValue($"{roleName}-{currentIter}", out workerOutput);
+                {
+                    // Try per-occurrence key first
+                    if (!pipeline.PhaseOutputs.TryGetValue($"{roleName}-{currentIter}-{occurrence}", out workerOutput))
+                    {
+                        // Only fall back to the backward-compatible latest key for the last
+                        // occurrence of each phase type (or for single-occurrence phases).
+                        // Non-last occurrences with missing per-occurrence keys get null
+                        // instead of stale data from a later occurrence.
+                        if (isLastOccurrence)
+                            pipeline.PhaseOutputs.TryGetValue($"{roleName}-{currentIter}", out workerOutput);
+                    }
+                }
 
                 var isTestPhase = phase == GoalPhase.Testing;
                 var isReviewPhase = phase == GoalPhase.Review;
 
-                clarificationsByPhase.TryGetValue(phase.ToString(), out var phaseClarifications);
+                // Filter clarifications by occurrence. Fall back to all phase clarifications
+                // if no occurrence-specific entries exist (backward compat for old data).
+                var phaseName = phase.ToString();
+                List<ClarificationEntry>? phaseClarifications = null;
+                if (clarificationsByPhase.TryGetValue(phaseName, out var allPhaseClarifications))
+                {
+                    var occSpecific = allPhaseClarifications.Where(c => c.Occurrence == occurrence).ToList();
+                    phaseClarifications = occSpecific.Count > 0
+                        ? occSpecific
+                        : (allPhaseClarifications.Any(c => c.Occurrence > 0) ? [] : allPhaseClarifications);
+                }
+
                 craftPrompts.TryGetValue(roleName, out var phasePrompts);
 
-                // Find the index of the last occurrence of this phase name in the rendered list.
-                // Since Planning is at index 0 and worker phases start at index 1, we scan
-                // planPhases from the end to find the absolute index in the rendered list.
-                var lastPlanIndex = -1;
-                for (var j = planPhases.Count - 1; j >= 0; j--)
-                {
-                    if (planPhases[j] == phase)
-                    {
-                        lastPlanIndex = j;
-                        break;
-                    }
-                }
-                // phaseIndex is rendered list index = plan index + 1 (Planning is at 0)
-                var isLastOccurrence = (i == lastPlanIndex);
+                // Filter progress reports by occurrence. Fall back to all phase reports
+                // if no occurrence-specific entries exist (backward compat for old data).
+                var allPhaseProgress = pipeline.ProgressReports
+                    .Where(p => p.Iteration == currentIter && p.Phase == phaseName)
+                    .OrderBy(p => p.Timestamp)
+                    .ToList();
+                List<ProgressEntry> phaseProgress;
+                var occProgress = allPhaseProgress.Where(p => p.Occurrence == occurrence).ToList();
+                phaseProgress = occProgress.Count > 0
+                    ? occProgress
+                    : (allPhaseProgress.Any(p => p.Occurrence > 0) ? [] : allPhaseProgress);
 
                 phases.Add(BuildPhaseViewInfo(
                     phaseIndex: phases.Count,
                     phase: phase,
-                    workerOutput: isLastOccurrence ? workerOutput : null,
-                    clarifications: isLastOccurrence ? (phaseClarifications ?? []) : [],
-                    progress: isLastOccurrence
-                        ? pipeline.ProgressReports
-                            .Where(p => p.Iteration == currentIter && p.Phase == phase.ToString())
-                            .OrderBy(p => p.Timestamp)
-                            .ToList()
-                        : [],
+                    workerOutput: workerOutput,
+                    clarifications: phaseClarifications ?? [],
+                    progress: phaseProgress,
                     pipeline: pipeline,
                     isLastOccurrence: isLastOccurrence,
                     occurrence: occurrence,
@@ -571,7 +641,9 @@ public sealed class DashboardStateService : IDisposable
         bool isTestPhase,
         bool isReviewPhase,
         (string? BrainPrompt, string? WorkerPrompt)? craftPrompts,
-        GoalPipeline? pipeline)
+        GoalPipeline? pipeline,
+        int occurrence = 1,
+        bool isLastOccurrence = true)
     {
         return new PhaseViewInfo
         {
@@ -579,12 +651,13 @@ public sealed class DashboardStateService : IDisposable
             RoleName = PhaseNameToRoleName(phase.Name),
             Status = phase.Result switch { "pass" => "completed", "fail" => "failed", "skip" => "skipped", _ => "completed" },
             DurationSeconds = phase.DurationSeconds > 0 ? phase.DurationSeconds : null,
+            Occurrence = occurrence,
             WorkerOutput = workerOutput,
-            TotalTests = isTestPhase ? (summary?.TestCounts?.Total ?? 0) : 0,
-            PassedTests = isTestPhase ? (summary?.TestCounts?.Passed ?? 0) : 0,
-            FailedTests = isTestPhase ? (summary?.TestCounts?.Failed ?? 0) : 0,
-            BuildSuccess = isTestPhase && (summary?.BuildSuccess ?? false),
-            ReviewVerdict = isReviewPhase ? summary?.ReviewVerdict : null,
+            TotalTests = isTestPhase && isLastOccurrence ? (summary?.TestCounts?.Total ?? 0) : 0,
+            PassedTests = isTestPhase && isLastOccurrence ? (summary?.TestCounts?.Passed ?? 0) : 0,
+            FailedTests = isTestPhase && isLastOccurrence ? (summary?.TestCounts?.Failed ?? 0) : 0,
+            BuildSuccess = isTestPhase && isLastOccurrence && (summary?.BuildSuccess ?? false),
+            ReviewVerdict = isReviewPhase && isLastOccurrence ? summary?.ReviewVerdict : null,
             BrainPrompt = craftPrompts?.BrainPrompt,
             WorkerPrompt = craftPrompts?.WorkerPrompt,
             Clarifications = clarifications ?? [],
@@ -621,9 +694,9 @@ public sealed class DashboardStateService : IDisposable
             Status = status,
             Occurrence = occurrence,
             WorkerOutput = workerOutput,
-            DurationSeconds = isLastOccurrence
-                ? (metrics.PhaseDurations.TryGetValue(phase.ToString(), out var dur) ? dur.TotalSeconds : null)
-                : null,
+            DurationSeconds = metrics.PhaseDurations.TryGetValue($"{phase}-{occurrence}", out var occDur)
+                ? occDur.TotalSeconds
+                : (metrics.PhaseDurations.TryGetValue(phase.ToString(), out var dur) ? dur.TotalSeconds : null),
             TotalTests = hasMetrics && isTestPhase && isLastOccurrence ? metrics.TotalTests : 0,
             PassedTests = hasMetrics && isTestPhase && isLastOccurrence ? metrics.PassedTests : 0,
             FailedTests = hasMetrics && isTestPhase && isLastOccurrence ? metrics.FailedTests : 0,

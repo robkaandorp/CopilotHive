@@ -295,7 +295,10 @@ public sealed class GoalDispatcher : BackgroundService
             WorkerRole: workerRole,
             Question: question,
             Answer: answer,
-            AnsweredBy: answeredBy);
+            AnsweredBy: answeredBy)
+        {
+            Occurrence = pipeline.PhaseOccurrence,
+        };
 
         pipeline.Clarifications.Add(entry);
 
@@ -728,6 +731,7 @@ public sealed class GoalDispatcher : BackgroundService
             case TransitionEffect.Continue:
                 pipeline.AdvanceTo(transition.NextPhase);
                 var occurrenceIndex = pipeline.StateMachine.GetCurrentPhaseOccurrence(pipeline.Plan!.Phases);
+                pipeline.PhaseOccurrence = occurrenceIndex;
                 var nextPhaseInstructions = pipeline.Plan?.GetPhaseInstruction(transition.NextPhase, occurrenceIndex);
                 await DispatchPhaseAsync(pipeline, transition.NextPhase, nextPhaseInstructions, ct);
                 break;
@@ -844,6 +848,7 @@ public sealed class GoalDispatcher : BackgroundService
             ? await ResolvePromptAsync(pipeline, GoalPhase.Coding, context, ct)
             : $"Fix issues for: {pipeline.Description}. {context}";
 
+        pipeline.PhaseOccurrence = 1;
         await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
     }
 
@@ -1342,6 +1347,7 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         var fixPrompt = _brain is not null
             ? await ResolvePromptAsync(pipeline, GoalPhase.Coding, rebaseContext, ct)
             : rebaseContext;
+        pipeline.PhaseOccurrence = 1;
         await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
     }
 
@@ -1662,29 +1668,108 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         var craftPrompts = DashboardStateService.ExtractCraftPrompts(pipeline.Conversation, pipeline.Iteration);
         var (planningPrompt, planningResponse) = DashboardStateService.ExtractPlanningPrompts(pipeline.Conversation, pipeline.Iteration);
 
-        var phases = metrics.PhaseDurations
-            .Select((kvp, index) =>
+        // Track occurrence indices per phase as we walk the plan in order.
+        var occurrenceCounters = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        // Determine total occurrences per phase from the plan (for last-occurrence detection).
+        var planPhaseTotals = new Dictionary<string, int>(StringComparer.Ordinal);
+        if (pipeline.Plan is not null)
+        {
+            foreach (var p in pipeline.Plan.Phases)
             {
-                // Determine role key from phase name to look up output
-                var roleName = PhaseNameToRoleName(kvp.Key);
-                pipeline.PhaseOutputs.TryGetValue($"{roleName}-{pipeline.Iteration}", out var output);
+                var name = p.ToString();
+                planPhaseTotals[name] = planPhaseTotals.GetValueOrDefault(name, 0) + 1;
+            }
+        }
 
-                craftPrompts.TryGetValue(roleName, out var prompts);
+        // Determine the occurrence index of the failed phase (if any) so that only
+        // the specific occurrence that actually failed is marked "fail".
+        // PhaseOccurrence on the pipeline reflects the last occurrence being executed.
+        var failedPhaseOccurrence = failedPhase.HasValue ? pipeline.PhaseOccurrence : 0;
 
-                return new PhaseResult
-                {
-                    Name = kvp.Key,
-                    Result = failedPhase.HasValue && kvp.Key == failedPhase.Value.ToString() ? "fail" : "pass",
-                    DurationSeconds = kvp.Value.TotalSeconds,
-                    WorkerOutput = string.IsNullOrEmpty(output) ? null : output,
-                    BrainPrompt = prompts.BrainPrompt,
-                    WorkerPrompt = prompts.WorkerPrompt,
-                    // Attach planning prompts to the first phase (planning is per-iteration)
-                    PlanningPrompt = index == 0 ? planningPrompt : null,
-                    PlanningResponse = index == 0 ? planningResponse : null,
-                };
-            })
-            .ToList();
+        var phases = new List<PhaseResult>();
+        var isFirstPhase = true;
+        var iteration = pipeline.Iteration;
+
+        // Walk the plan in order to emit PhaseResults in the correct sequence.
+        // If no plan exists, fall back to iterating PhaseDurations (base keys only).
+        IEnumerable<string> orderedPhaseNames;
+        if (pipeline.Plan is not null && pipeline.Plan.Phases.Count > 0)
+        {
+            orderedPhaseNames = pipeline.Plan.Phases.Select(p => p.ToString());
+        }
+        else
+        {
+            // Fallback: deduplicated base keys from PhaseDurations (no plan available)
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var fallback = new List<string>();
+            foreach (var key in metrics.PhaseDurations.Keys)
+            {
+                // Skip per-occurrence keys (e.g. "Coding-1")
+                var lastDash = key.LastIndexOf('-');
+                if (lastDash > 0 && int.TryParse(key.AsSpan(lastDash + 1), out _))
+                    continue;
+                if (seen.Add(key))
+                    fallback.Add(key);
+            }
+            orderedPhaseNames = fallback;
+        }
+
+        foreach (var phaseName in orderedPhaseNames)
+        {
+            // Skip phases that never executed (no duration recorded for either the base key or occ key).
+            // This handles partially-executed plans (e.g. goal failed before reaching later phases).
+            occurrenceCounters[phaseName] = occurrenceCounters.GetValueOrDefault(phaseName, 0) + 1;
+            var occ = occurrenceCounters[phaseName];
+            var totalOccurrences = planPhaseTotals.GetValueOrDefault(phaseName, 1);
+
+            var occDurationKey = $"{phaseName}-{occ}";
+            bool hasDuration;
+            TimeSpan duration;
+
+            if (metrics.PhaseDurations.TryGetValue(occDurationKey, out var occDur))
+            {
+                // Per-occurrence key exists — phase actually ran this occurrence.
+                hasDuration = true;
+                duration = occDur;
+            }
+            else if (totalOccurrences == 1 && metrics.PhaseDurations.TryGetValue(phaseName, out var baseDur))
+            {
+                // Single-occurrence phase with only the base (accumulated) key — also valid.
+                hasDuration = true;
+                duration = baseDur;
+            }
+            else
+            {
+                // Phase did not execute this occurrence (e.g. partially-executed plan).
+                hasDuration = false;
+                duration = TimeSpan.Zero;
+            }
+
+            if (!hasDuration)
+                continue;
+
+            var roleName = PhaseNameToRoleName(phaseName);
+            pipeline.PhaseOutputs.TryGetValue($"{roleName}-{iteration}-{occ}", out var output);
+            if (string.IsNullOrEmpty(output))
+                pipeline.PhaseOutputs.TryGetValue($"{roleName}-{iteration}", out output);
+
+            craftPrompts.TryGetValue(roleName, out var prompts);
+
+            phases.Add(new PhaseResult
+            {
+                Name = phaseName,
+                Result = failedPhase.HasValue && phaseName == failedPhase.Value.ToString() && occ == failedPhaseOccurrence ? "fail" : "pass",
+                DurationSeconds = duration.TotalSeconds,
+                WorkerOutput = string.IsNullOrEmpty(output) ? null : output,
+                BrainPrompt = prompts.BrainPrompt,
+                WorkerPrompt = prompts.WorkerPrompt,
+                PlanningPrompt = isFirstPhase ? planningPrompt : null,
+                PlanningResponse = isFirstPhase ? planningResponse : null,
+                Occurrence = occ,
+            });
+            isFirstPhase = false;
+        }
 
         // Phases that were skipped are not in PhaseDurations — add them separately.
         // If PhaseDurations already recorded an "Improve" entry (e.g. the phase started then failed),
@@ -1715,12 +1800,20 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         if (metrics.ImproverSkipped && !string.IsNullOrWhiteSpace(metrics.ImproverSkipReason))
             notes.Add($"improver skipped: {metrics.ImproverSkipReason}");
 
-        // Build PhaseOutputs dictionary for the iteration summary (keyed by "{role}-{iteration}")
+        // Build PhaseOutputs dictionary for the iteration summary (keyed by "{role}-{iteration}" and "{role}-{iteration}-{occ}")
         var phaseOutputs = new Dictionary<string, string>();
+        var iterStr = pipeline.Iteration.ToString();
         foreach (var (key, output) in pipeline.PhaseOutputs)
         {
-            // Only include outputs for the current iteration (key format: "{role}-{iteration}")
-            if (key.EndsWith($"-{pipeline.Iteration}"))
+            // Key formats:
+            // "{role}-{iteration}"         — backward-compatible latest key
+            // "{role}-{iteration}-{occ}"   — per-occurrence key
+            // Role names are single words (no hyphens), so the structure is predictable.
+            var parts = key.Split('-');
+            // parts[0] = role, parts[1] = iteration, parts[2] (optional) = occurrence
+            if (parts.Length == 2 && parts[1] == iterStr)
+                phaseOutputs[key] = output;
+            else if (parts.Length == 3 && parts[1] == iterStr && int.TryParse(parts[2], out _))
                 phaseOutputs[key] = output;
         }
 
@@ -1743,6 +1836,7 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
                     Question = c.Question,
                     Answer = c.Answer,
                     AnsweredBy = c.AnsweredBy,
+                    Occurrence = c.Occurrence,
                 })
                 .ToList(),
         };
@@ -2093,6 +2187,7 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         pipeline.SetPlan(iterationPlan);
         pipeline.StateMachine.StartIteration(iterationPlan.Phases);
         var firstPhase = iterationPlan.Phases[0];
+        pipeline.PhaseOccurrence = 1;
         pipeline.AdvanceTo(firstPhase);
 
         // Craft prompt for first phase and dispatch
