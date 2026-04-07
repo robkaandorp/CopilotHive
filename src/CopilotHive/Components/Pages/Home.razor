@@ -114,16 +114,16 @@
 @code {
     private DashboardSnapshot _snap = new();
 
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
         PageHeader.SetTitle("🏠 Dashboard");
-        _snap = State.GetSnapshot();
+        _snap = await State.GetSnapshot();
         State.OnStateChanged += RefreshState;
     }
 
-    private void RefreshState() => InvokeAsync(() =>
+    private void RefreshState() => InvokeAsync(async () =>
     {
-        _snap = State.GetSnapshot();
+        _snap = await State.GetSnapshot();
         StateHasChanged();
     });
 

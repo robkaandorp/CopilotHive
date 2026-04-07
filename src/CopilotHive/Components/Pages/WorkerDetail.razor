@@ -98,9 +98,9 @@ else
     private IReadOnlyList<ProgressEntry> _progress = [];
     private OrchestratorInfo _info = new();
 
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
-        Refresh();
+        await RefreshAsync();
         PageHeader.SetTitle(_worker is not null
             ? $"🐝 Worker {_worker.Id[..Math.Min(12, _worker.Id.Length)]}"
             : $"🐝 Worker {WorkerId}");
@@ -108,15 +108,15 @@ else
         State.OnStateChanged += RefreshState;
     }
 
-    private void Refresh()
+    private async Task RefreshAsync()
     {
-        var snap = State.GetSnapshot();
+        var snap = await State.GetSnapshot();
         _worker = snap.Workers.FirstOrDefault(w => w.Id == WorkerId);
         _progress = State.GetProgressForWorker(WorkerId);
         _info = State.GetOrchestratorInfo();
     }
 
-    private void RefreshState() => InvokeAsync(() => { Refresh(); StateHasChanged(); });
+    private void RefreshState() => InvokeAsync(async () => { await RefreshAsync(); StateHasChanged(); });
 
     private static string FormatAgo(DateTime utc)
     {

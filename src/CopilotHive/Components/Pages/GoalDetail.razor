@@ -794,33 +794,33 @@ else
     private string? _releaseAssignError;
     private string? _goalReleaseId;
 
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
-        Refresh();
+        await RefreshAsync();
         State.OnStateChanged += RefreshState;
     }
 
-    protected override void OnParametersSet()
+    protected override async Task OnParametersSetAsync()
     {
         _selectedIteration = 0;
         _selectedPhase = null;
         _lastTimelineCount = 0;
         PageHeader.SetTitle($"🎯 Goal: {GoalId}");
         PageHeader.SetBack("/goals");
-        Refresh();
+        await RefreshAsync();
     }
 
-    private void Refresh()
+    private async Task RefreshAsync()
     {
-        _detail = State.GetGoalDetail(GoalId);
+        _detail = await State.GetGoalDetail(GoalId);
         _progress = State.GetProgressForGoal(GoalId);
 
         // Fallback: load from SQLite for completed/failed goals not in active pipelines
         if (_detail is null)
         {
-            _storedGoal = GoalStore.GetGoalAsync(GoalId).GetAwaiter().GetResult();
+            _storedGoal = await GoalStore.GetGoalAsync(GoalId);
             _storedIterations = _storedGoal is not null
-                ? GoalStore.GetIterationsAsync(GoalId).GetAwaiter().GetResult()
+                ? await GoalStore.GetIterationsAsync(GoalId)
                 : [];
         }
         else
@@ -835,7 +835,7 @@ else
         // Resolve release ID — load from store for _detail branch (pipeline goals don't carry ReleaseId)
         if (_detail is not null)
         {
-            var liveGoal = GoalStore.GetGoalAsync(GoalId).GetAwaiter().GetResult();
+            var liveGoal = await GoalStore.GetGoalAsync(GoalId);
             _goalReleaseId = liveGoal?.ReleaseId;
         }
         else
@@ -850,14 +850,14 @@ else
             var statuses = new Dictionary<string, GoalStatus>();
             foreach (var depId in depIds)
             {
-                var depDetail = State.GetGoalDetail(depId);
+                var depDetail = await State.GetGoalDetail(depId);
                 if (depDetail is not null)
                 {
                     statuses[depId] = depDetail.Status;
                 }
                 else
                 {
-                    var stored = GoalStore.GetGoalAsync(depId).GetAwaiter().GetResult();
+                    var stored = await GoalStore.GetGoalAsync(depId);
                     if (stored is not null)
                         statuses[depId] = stored.Status;
                 }
@@ -873,7 +873,7 @@ else
         var goalStatus = _detail?.Status ?? _storedGoal?.Status;
         if (goalStatus == GoalStatus.Completed && string.IsNullOrEmpty(_goalReleaseId))
         {
-            var allReleases = GoalStore.GetReleasesAsync().GetAwaiter().GetResult();
+            var allReleases = await GoalStore.GetReleasesAsync();
             var goalRepos = _detail?.RepositoryNames ?? _storedGoal?.RepositoryNames ?? [];
             _planningReleases = allReleases
                 .Where(r => r.Status == ReleaseStatus.Planning)
@@ -888,7 +888,7 @@ else
         }
     }
 
-    private void RefreshState() => InvokeAsync(() => { Refresh(); StateHasChanged(); });
+    private void RefreshState() => InvokeAsync(async () => { await RefreshAsync(); StateHasChanged(); });
 
     private void BuildActiveTimeline()
     {
@@ -1077,7 +1077,7 @@ else
         var response = await HttpClient.PatchAsync($"/api/goals/{GoalId}/status", body);
         if (response.IsSuccessStatusCode)
         {
-            Refresh();
+            await RefreshAsync();
             // Update local state if loaded from SQLite (no active pipeline)
             if (_storedGoal is not null)
                 _storedGoal.Status = GoalStatus.Pending;
@@ -1100,7 +1100,7 @@ else
         var response = await HttpClient.PatchAsync($"/api/goals/{GoalId}/status", body);
         if (response.IsSuccessStatusCode)
         {
-            Refresh();
+            await RefreshAsync();
             // Update local state if loaded from SQLite (no active pipeline)
             if (_storedGoal is not null)
                 _storedGoal.Status = GoalStatus.Draft;
@@ -1122,7 +1122,7 @@ else
         var response = await HttpClient.PostAsync($"/api/goals/{GoalId}/cancel", null);
         if (response.IsSuccessStatusCode)
         {
-            Refresh();
+            await RefreshAsync();
             StateHasChanged();
         }
         else

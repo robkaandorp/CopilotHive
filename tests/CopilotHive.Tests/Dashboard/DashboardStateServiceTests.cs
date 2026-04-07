@@ -92,7 +92,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             logSink, progressLog, goalStore: _store);
 
         // Act
-        var detail = service.GetGoalDetail("parent-goal-beta");
+        var detail = await service.GetGoalDetail("parent-goal-beta");
 
         // Assert
         Assert.NotNull(detail);
@@ -157,7 +157,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             logSink, progressLog, goalStore: _store);
 
         // Exercise the service method under test
-        var detail = service.GetGoalDetail("service-dep-goal");
+        var detail = await service.GetGoalDetail("service-dep-goal");
 
         Assert.NotNull(detail);
         Assert.Equal(2, detail.DependsOn.Count);
@@ -193,7 +193,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: _store);
 
-        var detail = service.GetGoalDetail("no-dep-service-goal");
+        var detail = await service.GetGoalDetail("no-dep-service-goal");
 
         Assert.NotNull(detail);
         Assert.Empty(detail.DependsOn);
@@ -228,7 +228,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: _store);
 
-        var detail = service.GetGoalDetail("merged-goal");
+        var detail = await service.GetGoalDetail("merged-goal");
 
         Assert.NotNull(detail);
         Assert.Equal("cafebabe0123", detail.MergeCommitHash);
@@ -261,7 +261,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: _store);
 
-        var detail = service.GetGoalDetail("unmerged-goal");
+        var detail = await service.GetGoalDetail("unmerged-goal");
 
         Assert.NotNull(detail);
         Assert.Null(detail.MergeCommitHash);
@@ -405,7 +405,7 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         using var service = BuildService(config: config);
 
-        var detail = service.GetGoalDetail("repo-url-goal");
+        var detail = await service.GetGoalDetail("repo-url-goal");
 
         Assert.NotNull(detail);
         Assert.Equal("https://github.com/org/target-repo", detail.RepositoryUrl);
@@ -430,7 +430,7 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         using var service = BuildService(config: null);
 
-        var detail = service.GetGoalDetail("no-config-goal");
+        var detail = await service.GetGoalDetail("no-config-goal");
 
         Assert.NotNull(detail);
         Assert.Null(detail.RepositoryUrl);
@@ -458,7 +458,7 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         using var service = BuildService(config: null);
 
-        var detail = service.GetGoalDetail("repo-names-goal");
+        var detail = await service.GetGoalDetail("repo-names-goal");
 
         Assert.NotNull(detail);
         Assert.Equal(2, detail.RepositoryNames.Count);
@@ -485,7 +485,7 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         using var service = BuildService(config: null);
 
-        var detail = service.GetGoalDetail("no-repos-goal");
+        var detail = await service.GetGoalDetail("no-repos-goal");
 
         Assert.NotNull(detail);
         Assert.NotNull(detail.RepositoryNames);
@@ -500,7 +500,7 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// to <c>WorkerInfo.CurrentModel</c> on the snapshot.
     /// </summary>
     [Fact]
-    public void GetSnapshot_MapsCurrentModelFromWorkerToInfo()
+    public async Task GetSnapshot_MapsCurrentModelFromWorkerToInfo()
     {
         // Arrange: register a busy worker and set its CurrentModel
         var workerPool = new WorkerPool();
@@ -519,7 +519,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             logSink, progressLog, goalStore: null);
 
         // Act
-        var snapshot = service.GetSnapshot();
+        var snapshot = await service.GetSnapshot();
 
         // Assert: the WorkerInfo in the snapshot carries the model
         var info = snapshot.Workers.Single(w => w.Id == "w-model-test");
@@ -532,7 +532,7 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// has not been set (i.e., the worker is idle).
     /// </summary>
     [Fact]
-    public void GetSnapshot_CurrentModel_IsNullWhenWorkerIsIdle()
+    public async Task GetSnapshot_CurrentModel_IsNullWhenWorkerIsIdle()
     {
         // Arrange: register a worker but do NOT set CurrentModel (idle state)
         var workerPool = new WorkerPool();
@@ -549,7 +549,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             logSink, progressLog, goalStore: null);
 
         // Act
-        var snapshot = service.GetSnapshot();
+        var snapshot = await service.GetSnapshot();
 
         // Assert: idle worker has no model
         var info = snapshot.Workers.Single(w => w.Id == "w-idle-test");
@@ -620,7 +620,7 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Equal("Persisted coder output from database.", storedGoal.IterationSummaries[0].Phases[0].WorkerOutput);
 
         // GetGoalDetail must load IterationSummaries from the store for completed goals
-        var detail = service.GetGoalDetail("completed-goal");
+        var detail = await service.GetGoalDetail("completed-goal");
 
         Assert.NotNull(detail);
         Assert.Single(detail.Iterations);
@@ -701,7 +701,7 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Single(storedGoal.IterationSummaries);
         Assert.Equal("Persisted output (authoritative).", storedGoal.IterationSummaries[0].Phases[0].WorkerOutput);
 
-        var detail = service.GetGoalDetail("prefers-persisted-goal");
+        var detail = await service.GetGoalDetail("prefers-persisted-goal");
 
         Assert.NotNull(detail);
 
@@ -722,7 +722,7 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// live pipeline <c>PhaseOutputs</c> when <c>PhaseResult.WorkerOutput</c> is null or empty.
     /// </summary>
     [Fact]
-    public void GetGoalDetail_FallsBackToPipelinePhaseOutputs_WhenWorkerOutputIsNull()
+    public async Task GetGoalDetail_FallsBackToPipelinePhaseOutputs_WhenWorkerOutputIsNull()
     {
         var goal = new Goal
         {
@@ -755,7 +755,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: null);
 
-        var detail = service.GetGoalDetail("fallback-goal");
+        var detail = await service.GetGoalDetail("fallback-goal");
 
         Assert.NotNull(detail);
         // Current iteration is built from pipeline when no summary exists
@@ -776,7 +776,7 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// Planning phase should be shown with <c>"active"</c> status.
     /// </summary>
     [Fact]
-    public void GetGoalDetail_DuringPlanning_OnlyShowsPlanningPhaseActive()
+    public async Task GetGoalDetail_DuringPlanning_OnlyShowsPlanningPhaseActive()
     {
         var goal = new Goal
         {
@@ -800,7 +800,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: null);
 
-        var detail = service.GetGoalDetail("planning-only-goal");
+        var detail = await service.GetGoalDetail("planning-only-goal");
 
         Assert.NotNull(detail);
         var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
@@ -819,7 +819,7 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// <see cref="IterationViewInfo.PlanReason"/> should carry the plan's reason.
     /// </summary>
     [Fact]
-    public void GetGoalDetail_AfterPlanningComplete_ShowsCompletedPlanningPlusWorkerPhases()
+    public async Task GetGoalDetail_AfterPlanningComplete_ShowsCompletedPlanningPlusWorkerPhases()
     {
         var goal = new Goal
         {
@@ -852,7 +852,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: null);
 
-        var detail = service.GetGoalDetail("post-planning-goal");
+        var detail = await service.GetGoalDetail("post-planning-goal");
 
         Assert.NotNull(detail);
         var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
@@ -873,7 +873,7 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// must still be shown alongside the completed Planning phase.
     /// </summary>
     [Fact]
-    public void GetGoalDetail_PastPlanningWithNullPlan_ShowsFallbackWorkerPhases()
+    public async Task GetGoalDetail_PastPlanningWithNullPlan_ShowsFallbackWorkerPhases()
     {
         var goal = new Goal
         {
@@ -899,7 +899,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: null);
 
-        var detail = service.GetGoalDetail("null-plan-goal");
+        var detail = await service.GetGoalDetail("null-plan-goal");
 
         Assert.NotNull(detail);
         var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
@@ -1370,7 +1370,7 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// for worker phases from the pipeline conversation.
     /// </summary>
     [Fact]
-    public void GetGoalDetail_PopulatesPhasePrompts_FromPipelineConversation()
+    public async Task GetGoalDetail_PopulatesPhasePrompts_FromPipelineConversation()
     {
         var goal = new Goal
         {
@@ -1403,7 +1403,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: null);
 
-        var detail = service.GetGoalDetail("prompt-goal");
+        var detail = await service.GetGoalDetail("prompt-goal");
 
         Assert.NotNull(detail);
         var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
@@ -1421,7 +1421,7 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// from planning entries in the pipeline conversation.
     /// </summary>
     [Fact]
-    public void GetGoalDetail_PopulatesPlanningPrompts_FromPipelineConversation()
+    public async Task GetGoalDetail_PopulatesPlanningPrompts_FromPipelineConversation()
     {
         var goal = new Goal
         {
@@ -1448,7 +1448,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: null);
 
-        var detail = service.GetGoalDetail("planning-prompt-goal");
+        var detail = await service.GetGoalDetail("planning-prompt-goal");
 
         Assert.NotNull(detail);
         var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
@@ -1464,7 +1464,7 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// when no planning entries exist in the pipeline conversation.
     /// </summary>
     [Fact]
-    public void GetGoalDetail_NullPlanningPrompts_WhenNoPlanningEntriesExist()
+    public async Task GetGoalDetail_NullPlanningPrompts_WhenNoPlanningEntriesExist()
     {
         var goal = new Goal
         {
@@ -1487,7 +1487,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: null);
 
-        var detail = service.GetGoalDetail("no-planning-prompt-goal");
+        var detail = await service.GetGoalDetail("no-planning-prompt-goal");
 
         Assert.NotNull(detail);
         var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
@@ -1501,7 +1501,7 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// Verifies that phase prompts are null when no conversation entries exist.
     /// </summary>
     [Fact]
-    public void GetGoalDetail_NullPhasePrompts_WhenNoConversationEntries()
+    public async Task GetGoalDetail_NullPhasePrompts_WhenNoConversationEntries()
     {
         var goal = new Goal
         {
@@ -1530,7 +1530,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: null);
 
-        var detail = service.GetGoalDetail("no-conv-prompt-goal");
+        var detail = await service.GetGoalDetail("no-conv-prompt-goal");
 
         Assert.NotNull(detail);
         var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
@@ -1589,7 +1589,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: _store);
 
-        var detail = service.GetGoalDetail("completed-iteration-goal");
+        var detail = await service.GetGoalDetail("completed-iteration-goal");
 
         Assert.NotNull(detail);
         Assert.Single(detail.Iterations);
@@ -1656,7 +1656,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: _store);
 
-        var detail = service.GetGoalDetail("breaking-goal");
+        var detail = await service.GetGoalDetail("breaking-goal");
 
         Assert.NotNull(detail);
         Assert.Equal(GoalScope.Breaking, detail!.Scope);
@@ -1861,7 +1861,7 @@ public sealed class DashboardStateServiceTests : IDisposable
         await _store.AddIterationAsync(goal.Id, summary, ct);
 
         using var service = CreateService();
-        var detail = service.GetGoalDetail("clarif-completed-goal");
+        var detail = await service.GetGoalDetail("clarif-completed-goal");
 
         Assert.NotNull(detail);
         var iter = Assert.Single(detail.Iterations);
@@ -1905,7 +1905,7 @@ public sealed class DashboardStateServiceTests : IDisposable
         await _store.AddIterationAsync(goal.Id, summary, ct);
 
         using var service = CreateService();
-        var detail = service.GetGoalDetail("no-clarif-completed-goal");
+        var detail = await service.GetGoalDetail("no-clarif-completed-goal");
 
         Assert.NotNull(detail);
         var iter = Assert.Single(detail.Iterations);
@@ -1964,7 +1964,7 @@ public sealed class DashboardStateServiceTests : IDisposable
         await _store.AddIterationAsync(goal.Id, summary, ct);
 
         using var service = CreateService();
-        var detail = service.GetGoalDetail("multi-phase-clarif-goal");
+        var detail = await service.GetGoalDetail("multi-phase-clarif-goal");
 
         Assert.NotNull(detail);
         var iter = Assert.Single(detail.Iterations);
@@ -2020,7 +2020,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: _store);
 
-        var detail = service.GetGoalDetail("planning-clarif-live");
+        var detail = await service.GetGoalDetail("planning-clarif-live");
 
         Assert.NotNull(detail);
         var planningPhase = detail.Iterations.First().Phases.First(p => p.Name == "Planning");
@@ -2037,7 +2037,7 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// produces 6 PhaseViewInfo entries with unique (Name, Occurrence) pairs.
     /// </summary>
     [Fact]
-    public void GetGoalDetail_MultiRoundPlan_ProducesUniqueNameOccurrencePairs()
+    public async Task GetGoalDetail_MultiRoundPlan_ProducesUniqueNameOccurrencePairs()
     {
         var goal = new Goal
         {
@@ -2082,7 +2082,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: null);
 
-        var detail = service.GetGoalDetail("multi-round-goal");
+        var detail = await service.GetGoalDetail("multi-round-goal");
 
         Assert.NotNull(detail);
         var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
@@ -2124,7 +2124,7 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// "completed", current is "active", and after are "pending".
     /// </summary>
     [Fact]
-    public void GetGoalDetail_MultiRoundPlan_StatusIsPositional()
+    public async Task GetGoalDetail_MultiRoundPlan_StatusIsPositional()
     {
         var goal = new Goal
         {
@@ -2159,7 +2159,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: null);
 
-        var detail = service.GetGoalDetail("positional-status-goal");
+        var detail = await service.GetGoalDetail("positional-status-goal");
 
         Assert.NotNull(detail);
         var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
@@ -2202,7 +2202,7 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// (per-occurrence key lookup), and non-repeated phases show their output normally.
     /// </summary>
     [Fact]
-    public void GetGoalDetail_MultiRoundPlan_EachOccurrenceHasItsOwnWorkerOutput()
+    public async Task GetGoalDetail_MultiRoundPlan_EachOccurrenceHasItsOwnWorkerOutput()
     {
         var goal = new Goal
         {
@@ -2249,7 +2249,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: null);
 
-        var detail = service.GetGoalDetail("worker-output-goal");
+        var detail = await service.GetGoalDetail("worker-output-goal");
 
         Assert.NotNull(detail);
         var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
@@ -2285,7 +2285,7 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// since ProgressReports are keyed by phase name only (not occurrence).
     /// </summary>
     [Fact]
-    public void GetGoalDetail_MultiRoundPlan_AllOccurrencesShowProgressReports()
+    public async Task GetGoalDetail_MultiRoundPlan_AllOccurrencesShowProgressReports()
     {
         var goal = new Goal
         {
@@ -2355,7 +2355,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: null);
 
-        var detail = service.GetGoalDetail("progress-reports-goal");
+        var detail = await service.GetGoalDetail("progress-reports-goal");
 
         Assert.NotNull(detail);
         var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
@@ -2416,7 +2416,7 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         using var service = CreateService();
 
-        var detail = service.GetGoalDetail("improve-phase-goal");
+        var detail = await service.GetGoalDetail("improve-phase-goal");
 
         Assert.NotNull(detail);
         var iteration = Assert.Single(detail.Iterations);
@@ -2458,7 +2458,7 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         using var service = CreateService();
 
-        var detail = service.GetGoalDetail("improvement-phase-goal");
+        var detail = await service.GetGoalDetail("improvement-phase-goal");
 
         Assert.NotNull(detail);
         var iteration = Assert.Single(detail.Iterations);
@@ -2508,7 +2508,7 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         using var service = CreateService();
 
-        var detail = service.GetGoalDetail(goal.Id);
+        var detail = await service.GetGoalDetail(goal.Id);
 
         Assert.NotNull(detail);
         var iteration = Assert.Single(detail.Iterations);
@@ -2556,7 +2556,7 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         using var service = CreateService();
 
-        var detail = service.GetGoalDetail("completed-multi-round-goal");
+        var detail = await service.GetGoalDetail("completed-multi-round-goal");
 
         Assert.NotNull(detail);
         var iteration = Assert.Single(detail.Iterations);

@@ -101,17 +101,17 @@ else
     private DashboardSnapshot _snap = new();
     private OrchestratorInfo _info = new();
 
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
         PageHeader.SetTitle("🐝 Workers");
-        _snap = State.GetSnapshot();
+        _snap = await State.GetSnapshot();
         _info = State.GetOrchestratorInfo();
         State.OnStateChanged += RefreshState;
     }
 
-    private void RefreshState() => InvokeAsync(() =>
+    private void RefreshState() => InvokeAsync(async () =>
     {
-        _snap = State.GetSnapshot();
+        _snap = await State.GetSnapshot();
         _info = State.GetOrchestratorInfo();
         StateHasChanged();
     });
