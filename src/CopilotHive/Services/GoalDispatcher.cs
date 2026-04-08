@@ -1417,16 +1417,15 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         var (planningPrompt, planningResponse) = DashboardStateService.ExtractPlanningPrompts(pipeline.Conversation, pipeline.Iteration);
 
         // Track occurrence indices per phase as we walk the plan in order.
-        var occurrenceCounters = new Dictionary<string, int>(StringComparer.Ordinal);
+        var occurrenceCounters = new Dictionary<GoalPhase, int>();
 
         // Determine total occurrences per phase from the plan (for last-occurrence detection).
-        var planPhaseTotals = new Dictionary<string, int>(StringComparer.Ordinal);
+        var planPhaseTotals = new Dictionary<GoalPhase, int>();
         if (pipeline.Plan is not null)
         {
             foreach (var p in pipeline.Plan.Phases)
             {
-                var name = p.ToString();
-                planPhaseTotals[name] = planPhaseTotals.GetValueOrDefault(name, 0) + 1;
+                planPhaseTotals[p] = planPhaseTotals.GetValueOrDefault(p, 0) + 1;
             }
         }
 
@@ -1441,35 +1440,36 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
 
         // Walk the plan in order to emit PhaseResults in the correct sequence.
         // If no plan exists, fall back to iterating PhaseDurations (base keys only).
-        IEnumerable<string> orderedPhaseNames;
+        IEnumerable<GoalPhase> orderedPhases;
         if (pipeline.Plan is not null && pipeline.Plan.Phases.Count > 0)
         {
-            orderedPhaseNames = pipeline.Plan.Phases.Select(p => p.ToString());
+            orderedPhases = pipeline.Plan.Phases;
         }
         else
         {
             // Fallback: deduplicated base keys from PhaseDurations (no plan available)
             var seen = new HashSet<string>(StringComparer.Ordinal);
-            var fallback = new List<string>();
+            var fallback = new List<GoalPhase>();
             foreach (var key in metrics.PhaseDurations.Keys)
             {
                 // Skip per-occurrence keys (e.g. "Coding-1")
                 var lastDash = key.LastIndexOf('-');
                 if (lastDash > 0 && int.TryParse(key.AsSpan(lastDash + 1), out _))
                     continue;
-                if (seen.Add(key))
-                    fallback.Add(key);
+                if (seen.Add(key) && Enum.TryParse<GoalPhase>(key, out var parsed))
+                    fallback.Add(parsed);
             }
-            orderedPhaseNames = fallback;
+            orderedPhases = fallback;
         }
 
-        foreach (var phaseName in orderedPhaseNames)
+        foreach (var goalPhase in orderedPhases)
         {
             // Skip phases that never executed (no duration recorded for either the base key or occ key).
             // This handles partially-executed plans (e.g. goal failed before reaching later phases).
-            occurrenceCounters[phaseName] = occurrenceCounters.GetValueOrDefault(phaseName, 0) + 1;
-            var occ = occurrenceCounters[phaseName];
-            var totalOccurrences = planPhaseTotals.GetValueOrDefault(phaseName, 1);
+            var phaseName = goalPhase.ToString();
+            occurrenceCounters[goalPhase] = occurrenceCounters.GetValueOrDefault(goalPhase, 0) + 1;
+            var occ = occurrenceCounters[goalPhase];
+            var totalOccurrences = planPhaseTotals.GetValueOrDefault(goalPhase, 1);
 
             var occDurationKey = $"{phaseName}-{occ}";
             bool hasDuration;
@@ -1506,8 +1506,8 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
 
             phases.Add(new PhaseResult
             {
-                Name = phaseName,
-                Result = failedPhase.HasValue && phaseName == failedPhase.Value.ToString() && occ == failedPhaseOccurrence ? "fail" : "pass",
+                Name = goalPhase,
+                Result = failedPhase.HasValue && goalPhase == failedPhase.Value && occ == failedPhaseOccurrence ? PhaseOutcome.Fail : PhaseOutcome.Pass,
                 DurationSeconds = duration.TotalSeconds,
                 WorkerOutput = string.IsNullOrEmpty(output) ? null : output,
                 BrainPrompt = prompts.BrainPrompt,
@@ -1524,8 +1524,8 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         // remove it so the summary never contains duplicate phase names.
         if (metrics.ImproverSkipped)
         {
-            phases.RemoveAll(p => p.Name == "Improve");
-            phases.Add(new PhaseResult { Name = "Improve", Result = "skip", DurationSeconds = 0 });
+            phases.RemoveAll(p => p.Name == GoalPhase.Improve);
+            phases.Add(new PhaseResult { Name = GoalPhase.Improve, Result = PhaseOutcome.Skip, DurationSeconds = 0 });
         }
 
         TestCounts? testCounts = metrics.TotalTests > 0

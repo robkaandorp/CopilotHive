@@ -188,7 +188,7 @@ internal static class GoalDetailViewBuilder
 
         foreach (var pr in summary.Phases)
         {
-            var roleName = PhaseNameToRoleName(pr.Name);
+            var roleName = GetRoleNameSafe(pr.Name);
 
             // Count total occurrences per phase in this summary for last-occurrence detection.
             var totalOccurrencesForPhase = summary.Phases.Count(p => p.Name == pr.Name);
@@ -209,12 +209,12 @@ internal static class GoalDetailViewBuilder
                     pipeline?.PhaseOutputs.TryGetValue($"{roleName}-{summary.Iteration}", out workerOutput);
             }
 
-            var isTestPhase = pr.Name == "Testing";
-            var isReviewPhase = pr.Name == "Review";
+            var isTestPhase = pr.Name == GoalPhase.Testing;
+            var isReviewPhase = pr.Name == GoalPhase.Review;
 
             // Filter clarifications by occurrence using the OccurrenceFilter helper.
             List<ClarificationEntry>? phaseClarifications = null;
-            if (clarificationsByPhase.TryGetValue(pr.Name, out var allPhaseClarifications))
+            if (clarificationsByPhase.TryGetValue(pr.Name.ToString(), out var allPhaseClarifications))
             {
                 phaseClarifications = OccurrenceFilter.FilterByOccurrence(allPhaseClarifications, occurrence);
             }
@@ -223,7 +223,7 @@ internal static class GoalDetailViewBuilder
 
             // Filter progress reports by occurrence using the OccurrenceFilter helper.
             var allPhaseProgress = pipeline?.ProgressReports
-                .Where(p => p.Iteration == summary.Iteration && p.Phase == pr.Name)
+                .Where(p => p.Iteration == summary.Iteration && p.Phase == pr.Name.ToString())
                 .OrderBy(p => p.Timestamp)
                 .ToList() ?? [];
             var phaseProgress = OccurrenceFilter.FilterByOccurrence(allPhaseProgress, occurrence);
@@ -402,9 +402,9 @@ internal static class GoalDetailViewBuilder
     {
         return new PhaseViewInfo
         {
-            Name = phase.Name,
-            RoleName = PhaseNameToRoleName(phase.Name),
-            Status = phase.Result switch { "pass" => "completed", "fail" => "failed", "skip" => "skipped", _ => "completed" },
+            Name = phase.Name.ToDisplayName(),
+            RoleName = GetRoleNameSafe(phase.Name),
+            Status = phase.Result switch { PhaseOutcome.Pass => "completed", PhaseOutcome.Fail => "failed", PhaseOutcome.Skip => "skipped", _ => "completed" },
             DurationSeconds = phase.DurationSeconds > 0 ? phase.DurationSeconds : null,
             Occurrence = occurrence,
             WorkerOutput = workerOutput,

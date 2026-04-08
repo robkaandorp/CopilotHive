@@ -967,9 +967,9 @@ public sealed class ComposerToolTests : IDisposable
             TestCounts = new TestCounts { Passed = 840, Total = 840, Failed = 0 },
             Phases =
             [
-                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 45.2 },
-                new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 120.1 },
-                new PhaseResult { Name = "Review", Result = "fail", DurationSeconds = 30.5 },
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 45.2 },
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 120.1 },
+                new PhaseResult { Name = GoalPhase.Review, Result = PhaseOutcome.Fail, DurationSeconds = 30.5 },
             ],
         };
         await _store.AddIterationAsync("iter-detail", summary, ct);
@@ -996,7 +996,7 @@ public sealed class ComposerToolTests : IDisposable
         {
             Iteration = 1,
             ReviewVerdict = null,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 10.0 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 10.0 }],
         };
         await _store.AddIterationAsync("iter-no-review", summary, ct);
 
@@ -1016,7 +1016,7 @@ public sealed class ComposerToolTests : IDisposable
         {
             Iteration = 1,
             TestCounts = null,
-            Phases = [new PhaseResult { Name = "Testing", Result = "fail", DurationSeconds = 5.0 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Fail, DurationSeconds = 5.0 }],
         };
         await _store.AddIterationAsync("iter-no-counts", summary, ct);
 
@@ -1036,7 +1036,7 @@ public sealed class ComposerToolTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 30.0 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 30.0 }],
             Clarifications =
             [
                 new PersistedClarification
@@ -1073,8 +1073,8 @@ public sealed class ComposerToolTests : IDisposable
             Iteration = 1,
             Phases =
             [
-                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 30.0 },
-                new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 60.0 },
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 30.0 },
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 60.0 },
             ],
             Clarifications =
             [
@@ -1118,7 +1118,7 @@ public sealed class ComposerToolTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 10.0 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 10.0 }],
             Clarifications = [],
         };
         await _store.AddIterationAsync("iter-no-clarif", summary, ct);
@@ -1142,7 +1142,7 @@ public sealed class ComposerToolTests : IDisposable
             Iteration = 1,
             Phases =
             [
-                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 10.0, WorkerOutput = "coder log line 1\ncoder log line 2" },
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 10.0, WorkerOutput = "coder log line 1\ncoder log line 2" },
             ],
         };
         await _store.AddIterationAsync("phase-out", summary, ct);
@@ -1162,7 +1162,7 @@ public sealed class ComposerToolTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 5.0, WorkerOutput = "test output" }],
+            Phases = [new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 5.0, WorkerOutput = "test output" }],
         };
         await _store.AddIterationAsync("phase-case", summary, ct);
 
@@ -1180,7 +1180,7 @@ public sealed class ComposerToolTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 10.0, WorkerOutput = null }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 10.0, WorkerOutput = null }],
             PhaseOutputs = new Dictionary<string, string> { ["coder-1"] = "fallback coder output" },
         };
         await _store.AddIterationAsync("phase-fallback", summary, ct);
@@ -1205,7 +1205,7 @@ public sealed class ComposerToolTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 2,
-            Phases = [new PhaseResult { Name = phaseName, Result = "pass", DurationSeconds = 1.0, WorkerOutput = null }],
+            Phases = [new PhaseResult { Name = Enum.Parse<GoalPhase>(phaseName), Result = PhaseOutcome.Pass, DurationSeconds = 1.0, WorkerOutput = null }],
             PhaseOutputs = new Dictionary<string, string> { [$"{rolePrefix}-2"] = $"output for {phaseName}" },
         };
         await _store.AddIterationAsync(goalId, summary, ct);
@@ -1225,7 +1225,7 @@ public sealed class ComposerToolTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 1.0, WorkerOutput = longOutput }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, WorkerOutput = longOutput }],
         };
         await _store.AddIterationAsync("phase-trunc", summary, ct);
 
@@ -1266,7 +1266,7 @@ public sealed class ComposerToolTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 1.0 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0 }],
         };
         await _store.AddIterationAsync("phase-no-phase", summary, ct);
 
@@ -1284,7 +1284,7 @@ public sealed class ComposerToolTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Planning", Result = "pass", DurationSeconds = 1.0, WorkerOutput = null }],
+            Phases = [new PhaseResult { Name = GoalPhase.Planning, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, WorkerOutput = null }],
         };
         await _store.AddIterationAsync("phase-unknown", summary, ct);
 
@@ -1303,7 +1303,7 @@ public sealed class ComposerToolTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 1.0, WorkerOutput = null }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, WorkerOutput = null }],
             // PhaseOutputs is empty — no fallback
         };
         await _store.AddIterationAsync("phase-no-output", summary, ct);
@@ -1350,7 +1350,7 @@ public sealed class ComposerToolTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 10.0, WorkerOutput = "coder output here" }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 10.0, WorkerOutput = "coder output here" }],
         };
         await _store.AddIterationAsync("content-output", summary, ct);
 
@@ -1563,7 +1563,7 @@ public sealed class ComposerToolTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 5.0, WorkerOutput = "should not see this" }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 5.0, WorkerOutput = "should not see this" }],
         };
         var ct = TestContext.Current.CancellationToken;
         await _store.AddIterationAsync("invalid-content", summary, ct);

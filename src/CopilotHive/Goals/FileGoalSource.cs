@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Services;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -207,8 +208,8 @@ public sealed class FileGoalSource : IGoalSource
         Iteration = e.Iteration,
         Phases = e.Phases?.Select(p => new PhaseResult
         {
-            Name = p.Name ?? string.Empty,
-            Result = p.Result ?? throw new InvalidOperationException("PhaseResultEntry.Result must not be null"),
+            Name = Enum.Parse<GoalPhase>(p.Name ?? string.Empty),
+            Result = Enum.Parse<PhaseOutcome>(p.Result ?? throw new InvalidOperationException("PhaseResultEntry.Result must not be null"), ignoreCase: true),
             DurationSeconds = p.DurationSeconds,
             WorkerOutput = p.WorkerOutput,
             BrainPrompt = p.BrainPrompt,
@@ -234,8 +235,8 @@ public sealed class FileGoalSource : IGoalSource
         Phases = s.Phases.Count > 0
             ? s.Phases.Select(p => new PhaseResultEntry
             {
-                Name = p.Name,
-                Result = p.Result,
+                Name = p.Name.ToString(),
+                Result = p.Result.ToString().ToLowerInvariant(),
                 DurationSeconds = p.DurationSeconds,
                 WorkerOutput = p.WorkerOutput,
                 BrainPrompt = p.BrainPrompt,

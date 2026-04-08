@@ -1,4 +1,5 @@
 using CopilotHive.Goals;
+using CopilotHive.Services;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -37,8 +38,8 @@ public sealed class IterationSummaryTests : IDisposable
             Iteration = 2,
             Phases =
             [
-                new PhaseResult { Name = "Coding",  Result = "pass", DurationSeconds = 90.0 },
-                new PhaseResult { Name = "Testing", Result = "fail", DurationSeconds = 12.5 },
+                new PhaseResult { Name = GoalPhase.Coding,  Result = PhaseOutcome.Pass, DurationSeconds = 90.0 },
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Fail, DurationSeconds = 12.5 },
             ],
             TestCounts = new TestCounts { Total = 20, Passed = 18, Failed = 2 },
             ReviewVerdict = "approve",
@@ -47,10 +48,10 @@ public sealed class IterationSummaryTests : IDisposable
 
         Assert.Equal(2, summary.Iteration);
         Assert.Equal(2, summary.Phases.Count);
-        Assert.Equal("Coding",  summary.Phases[0].Name);
-        Assert.Equal("pass",    summary.Phases[0].Result);
+        Assert.Equal(GoalPhase.Coding,  summary.Phases[0].Name);
+        Assert.Equal(PhaseOutcome.Pass,    summary.Phases[0].Result);
         Assert.Equal(90.0,      summary.Phases[0].DurationSeconds);
-        Assert.Equal("fail",    summary.Phases[1].Result);
+        Assert.Equal(PhaseOutcome.Fail,    summary.Phases[1].Result);
         Assert.NotNull(summary.TestCounts);
         Assert.Equal(20, summary.TestCounts.Total);
         Assert.Equal(18, summary.TestCounts.Passed);
@@ -130,8 +131,8 @@ public sealed class IterationSummaryTests : IDisposable
             Iteration = 1,
             Phases =
             [
-                new PhaseResult { Name = "Coding",  Result = "pass", DurationSeconds = 100.0 },
-                new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 25.0  },
+                new PhaseResult { Name = GoalPhase.Coding,  Result = PhaseOutcome.Pass, DurationSeconds = 100.0 },
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 25.0  },
             ],
             TestCounts = new TestCounts { Total = 5, Passed = 5, Failed = 0 },
             ReviewVerdict = "approve",
@@ -178,8 +179,8 @@ public sealed class IterationSummaryTests : IDisposable
                 Iteration = 1,
                 Phases =
                 [
-                    new PhaseResult { Name = "Coding",  Result = "pass", DurationSeconds = 45.0 },
-                    new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 10.0 },
+                    new PhaseResult { Name = GoalPhase.Coding,  Result = PhaseOutcome.Pass, DurationSeconds = 45.0 },
+                    new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 10.0 },
                 ],
                 TestCounts = new TestCounts { Total = 8, Passed = 7, Failed = 1 },
                 ReviewVerdict = "reject",
@@ -198,8 +199,8 @@ public sealed class IterationSummaryTests : IDisposable
         var s = goal.IterationSummaries[0];
         Assert.Equal(1, s.Iteration);
         Assert.Equal(2, s.Phases.Count);
-        Assert.Equal("Coding", s.Phases[0].Name);
-        Assert.Equal("pass",   s.Phases[0].Result);
+        Assert.Equal(GoalPhase.Coding, s.Phases[0].Name);
+        Assert.Equal(PhaseOutcome.Pass,   s.Phases[0].Result);
         Assert.Equal(45.0,     s.Phases[0].DurationSeconds);
         Assert.NotNull(s.TestCounts);
         Assert.Equal(8, s.TestCounts.Total);
@@ -234,7 +235,7 @@ public sealed class IterationSummaryTests : IDisposable
             IterationSummary = new IterationSummary
             {
                 Iteration = 2,
-                Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 55.0 }],
+                Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 55.0 }],
             },
         };
 
@@ -271,7 +272,7 @@ public sealed class IterationSummaryTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 80.0 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 80.0 }],
             TestCounts = null,
             ReviewVerdict = null,
         };
@@ -297,7 +298,7 @@ public sealed class IterationSummaryTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 80.0 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 80.0 }],
             TestCounts = null,
         };
 
@@ -360,15 +361,15 @@ public sealed class IterationSummaryTests : IDisposable
             [
                 new PhaseResult
                 {
-                    Name = "Coding",
-                    Result = "pass",
+                    Name = GoalPhase.Coding,
+                    Result = PhaseOutcome.Pass,
                     DurationSeconds = 60.0,
                     WorkerOutput = "Coder completed task successfully.",
                 },
                 new PhaseResult
                 {
-                    Name = "Testing",
-                    Result = "pass",
+                    Name = GoalPhase.Testing,
+                    Result = PhaseOutcome.Pass,
                     DurationSeconds = 20.0,
                     WorkerOutput = null, // no output for this phase
                 },
@@ -407,7 +408,7 @@ public sealed class IterationSummaryTests : IDisposable
             Iteration = 2,
             Phases =
             [
-                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 30.0 },
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 30.0 },
             ],
             PhaseOutputs = new Dictionary<string, string>
             {
@@ -444,7 +445,7 @@ public sealed class IterationSummaryTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 10.0 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 10.0 }],
             PhaseOutputs = [],
         };
 
@@ -514,7 +515,7 @@ public sealed class IterationSummaryTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 20.0 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 20.0 }],
             TestCounts = new TestCounts { Total = 8, Passed = 8, Failed = 0 },
             BuildSuccess = true,
         };
@@ -545,7 +546,7 @@ public sealed class IterationSummaryTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Testing", Result = "fail", DurationSeconds = 20.0 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Fail, DurationSeconds = 20.0 }],
             TestCounts = new TestCounts { Total = 8, Passed = 3, Failed = 5 },
             BuildSuccess = false,
         };

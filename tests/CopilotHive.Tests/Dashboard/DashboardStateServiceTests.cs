@@ -584,15 +584,15 @@ public sealed class DashboardStateServiceTests : IDisposable
             [
                 new PhaseResult
                 {
-                    Name = "Coding",
-                    Result = "pass",
+                    Name = GoalPhase.Coding,
+                    Result = PhaseOutcome.Pass,
                     DurationSeconds = 60.0,
                     WorkerOutput = "Persisted coder output from database.",
                 },
                 new PhaseResult
                 {
-                    Name = "Testing",
-                    Result = "pass",
+                    Name = GoalPhase.Testing,
+                    Result = PhaseOutcome.Pass,
                     DurationSeconds = 30.0,
                     WorkerOutput = "All tests passed.",
                 },
@@ -661,8 +661,8 @@ public sealed class DashboardStateServiceTests : IDisposable
             [
                 new PhaseResult
                 {
-                    Name = "Coding",
-                    Result = "pass",
+                    Name = GoalPhase.Coding,
+                    Result = PhaseOutcome.Pass,
                     DurationSeconds = 45.0,
                     WorkerOutput = "Persisted output (authoritative).",
                 },
@@ -1567,8 +1567,8 @@ public sealed class DashboardStateServiceTests : IDisposable
             [
                 new PhaseResult
                 {
-                    Name = "Coding",
-                    Result = "pass",
+                    Name = GoalPhase.Coding,
+                    Result = PhaseOutcome.Pass,
                     DurationSeconds = 60.0,
                     WorkerOutput = "Coder completed work.",
                 },
@@ -1843,7 +1843,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             Iteration = 1,
             Phases =
             [
-                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 45.0 },
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 45.0 },
             ],
             Clarifications =
             [
@@ -1898,7 +1898,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             Iteration = 1,
             Phases =
             [
-                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 30.0 },
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 30.0 },
             ],
             Clarifications = [],
         };
@@ -1936,8 +1936,8 @@ public sealed class DashboardStateServiceTests : IDisposable
             Iteration = 1,
             Phases =
             [
-                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 50.0 },
-                new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 20.0 },
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 50.0 },
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 20.0 },
             ],
             Clarifications =
             [
@@ -2407,8 +2407,8 @@ public sealed class DashboardStateServiceTests : IDisposable
             Iteration = 1,
             Phases =
             [
-                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 45.0 },
-                new PhaseResult { Name = "Improve", Result = "pass", DurationSeconds = 20.0 },
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 45.0 },
+                new PhaseResult { Name = GoalPhase.Improve, Result = PhaseOutcome.Pass, DurationSeconds = 20.0 },
             ],
         };
         await _store.UpdateGoalStatusAsync("improve-phase-goal", GoalStatus.Completed,
@@ -2423,7 +2423,7 @@ public sealed class DashboardStateServiceTests : IDisposable
         // Planning + Coding + Improve = 3 phases
         Assert.Equal(3, iteration.Phases.Count);
 
-        var improvePhase = iteration.Phases.FirstOrDefault(p => p.Name == "Improve");
+        var improvePhase = iteration.Phases.FirstOrDefault(p => p.Name == "Improvement");
         Assert.NotNull(improvePhase);
         Assert.Equal("improver", improvePhase.RoleName);
     }
@@ -2450,7 +2450,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             Iteration = 1,
             Phases =
             [
-                new PhaseResult { Name = "Improvement", Result = "pass", DurationSeconds = 25.0 },
+                new PhaseResult { Name = GoalPhase.Improve, Result = PhaseOutcome.Pass, DurationSeconds = 25.0 },
             ],
         };
         await _store.UpdateGoalStatusAsync("improvement-phase-goal", GoalStatus.Completed,
@@ -2476,21 +2476,19 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// is added alongside <c>"Improvement"</c>.
     /// </summary>
     [Theory]
-    [InlineData("Coding", "coder")]
-    [InlineData("Testing", "tester")]
-    [InlineData("Review", "reviewer")]
-    [InlineData("Doc Writing", "docwriter")]
-    [InlineData("Improvement", "improver")]
-    [InlineData("Improve", "improver")]
-    [InlineData("UnknownPhase", "")]
-    public async Task GetGoalDetail_PhaseRoleMappings_AreCorrect(string phaseName, string expectedRole)
+    [InlineData(GoalPhase.Coding, "coder")]
+    [InlineData(GoalPhase.Testing, "tester")]
+    [InlineData(GoalPhase.Review, "reviewer")]
+    [InlineData(GoalPhase.DocWriting, "docwriter")]
+    [InlineData(GoalPhase.Improve, "improver")]
+    public async Task GetGoalDetail_PhaseRoleMappings_AreCorrect(GoalPhase goalPhase, string expectedRole)
     {
         var ct = TestContext.Current.CancellationToken;
 
         var goal = new Goal
         {
-            Id = $"mapping-test-{phaseName.ToLowerInvariant().Replace(" ", "-")}",
-            Description = $"Goal with {phaseName} phase",
+            Id = $"mapping-test-{goalPhase.ToString().ToLowerInvariant()}",
+            Description = $"Goal with {goalPhase} phase",
             Status = GoalStatus.Completed,
         };
         await _store.CreateGoalAsync(goal, ct);
@@ -2500,7 +2498,7 @@ public sealed class DashboardStateServiceTests : IDisposable
             Iteration = 1,
             Phases =
             [
-                new PhaseResult { Name = phaseName, Result = "pass", DurationSeconds = 10.0 },
+                new PhaseResult { Name = goalPhase, Result = PhaseOutcome.Pass, DurationSeconds = 10.0 },
             ],
         };
         await _store.UpdateGoalStatusAsync(goal.Id, GoalStatus.Completed,
@@ -2512,7 +2510,7 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         Assert.NotNull(detail);
         var iteration = Assert.Single(detail.Iterations);
-        var phase = iteration.Phases.FirstOrDefault(p => p.Name == phaseName);
+        var phase = iteration.Phases.FirstOrDefault(p => p.Name == goalPhase.ToDisplayName());
         Assert.NotNull(phase);
         Assert.Equal(expectedRole, phase.RoleName);
     }
@@ -2542,11 +2540,11 @@ public sealed class DashboardStateServiceTests : IDisposable
             Iteration = 1,
             Phases =
             [
-                new PhaseResult { Name = "Coding",  Result = "pass", DurationSeconds = 30.0, WorkerOutput = "First coding output",   Occurrence = 1 },
-                new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 15.0, WorkerOutput = "First testing output",  Occurrence = 1 },
-                new PhaseResult { Name = "Coding",  Result = "pass", DurationSeconds = 45.0, WorkerOutput = "Second coding output",  Occurrence = 2 },
-                new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 20.0, WorkerOutput = "Second testing output", Occurrence = 2 },
-                new PhaseResult { Name = "Review",  Result = "pass", DurationSeconds = 10.0, WorkerOutput = "Review output",        Occurrence = 1 },
+                new PhaseResult { Name = GoalPhase.Coding,  Result = PhaseOutcome.Pass, DurationSeconds = 30.0, WorkerOutput = "First coding output",   Occurrence = 1 },
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 15.0, WorkerOutput = "First testing output",  Occurrence = 1 },
+                new PhaseResult { Name = GoalPhase.Coding,  Result = PhaseOutcome.Pass, DurationSeconds = 45.0, WorkerOutput = "Second coding output",  Occurrence = 2 },
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 20.0, WorkerOutput = "Second testing output", Occurrence = 2 },
+                new PhaseResult { Name = GoalPhase.Review,  Result = PhaseOutcome.Pass, DurationSeconds = 10.0, WorkerOutput = "Review output",        Occurrence = 1 },
             ],
             TestCounts = new TestCounts { Total = 42, Passed = 40, Failed = 2 },
             ReviewVerdict = "approve",

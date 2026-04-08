@@ -327,8 +327,9 @@ public sealed partial class Composer
                 foreach (var phase in iter.Phases)
                 {
                     var durationStr = phase.DurationSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s";
-                    var line = $"- {phase.Name}: {phase.Result} ({durationStr})";
-                    if (phase.Name.Equals("Testing", StringComparison.OrdinalIgnoreCase) && iter.TestCounts is not null)
+                    var resultStr = phase.Result.ToString().ToLowerInvariant();
+                    var line = $"- {phase.Name}: {resultStr} ({durationStr})";
+                    if (phase.Name == GoalPhase.Testing && iter.TestCounts is not null)
                         line += $" — {iter.TestCounts.Passed}/{iter.TestCounts.Total}";
                     sb.AppendLine(line);
                 }
@@ -420,7 +421,7 @@ public sealed partial class Composer
 
         // 7. Find the phase in the iteration
         var phaseResult = iterSummary.Phases
-            .FirstOrDefault(p => p.Name.Equals(phase, StringComparison.OrdinalIgnoreCase));
+            .FirstOrDefault(p => p.Name.ToString().Equals(phase, StringComparison.OrdinalIgnoreCase));
         if (phaseResult is null)
             return $"Phase '{phase}' not found in iteration {iteration}";
 

@@ -1,3 +1,5 @@
+using CopilotHive.Services;
+
 namespace CopilotHive.Goals;
 
 /// <summary>
@@ -97,10 +99,10 @@ public sealed class PersistedClarification
 /// <summary>Result of a single pipeline phase within one iteration.</summary>
 public sealed class PhaseResult
 {
-    /// <summary>Phase name (e.g. "Coding", "Testing").</summary>
-    public required string Name { get; init; }
-    /// <summary>"pass", "fail", or "skip".</summary>
-    public required string Result { get; init; }
+    /// <summary>Phase that was executed.</summary>
+    public required GoalPhase Name { get; init; }
+    /// <summary>Outcome of the phase execution.</summary>
+    public required PhaseOutcome Result { get; init; }
     /// <summary>Wall-clock duration of the phase in seconds.</summary>
     public double DurationSeconds { get; init; }
     /// <summary>Raw worker output captured for this phase, or <c>null</c> if not recorded.</summary>

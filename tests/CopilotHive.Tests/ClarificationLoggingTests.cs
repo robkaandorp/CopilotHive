@@ -561,7 +561,7 @@ public sealed class ClarificationLoggingTests
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 10 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 10 }],
             Clarifications =
             [
                 new PersistedClarification
@@ -604,7 +604,7 @@ public sealed class ClarificationLoggingTests
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 5 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 5 }],
             Clarifications = [],
         };
         await store.AddIterationAsync(goal.Id, summary, TestContext.Current.CancellationToken);
@@ -632,7 +632,7 @@ public sealed class ClarificationLoggingTests
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 30 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 30 }],
             TestCounts = new TestCounts { Total = 10, Passed = 10, Failed = 0 },
             BuildSuccess = true,
         };
@@ -659,7 +659,7 @@ public sealed class ClarificationLoggingTests
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Testing", Result = "fail", DurationSeconds = 30 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Fail, DurationSeconds = 30 }],
             TestCounts = new TestCounts { Total = 10, Passed = 5, Failed = 5 },
             BuildSuccess = false,
         };

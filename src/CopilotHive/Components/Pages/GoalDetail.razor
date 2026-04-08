@@ -573,9 +573,9 @@
                                     @foreach (var phase in iter.Phases)
                                     {
                                         var phaseKey = $"s{iter.Iteration}-{phase.Name}";
-                                        <button class="phase-box @(phase.Result == "pass" ? "completed" : phase.Result == "fail" ? "failed" : "skipped") @(_selectedPhase == phaseKey ? "selected" : "")"
+                                        <button class="phase-box @(phase.Result == PhaseOutcome.Pass ? "completed" : phase.Result == PhaseOutcome.Fail ? "failed" : "skipped") @(_selectedPhase == phaseKey ? "selected" : "")"
                                                 @onclick="() => TogglePhase(phaseKey)">
-                                            <span class="phase-box-icon">@(phase.Result == "pass" ? "✓" : phase.Result == "fail" ? "✗" : "~")</span>
+                                            <span class="phase-box-icon">@(phase.Result == PhaseOutcome.Pass ? "✓" : phase.Result == PhaseOutcome.Fail ? "✗" : "~")</span>
                                             @phase.Name
                                             @if (phase.DurationSeconds > 0)
                                             {
@@ -638,7 +638,7 @@
                                         <div class="phase-detail">
                                             <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem">
                                                 <strong>@phase.Name</strong>
-                                                <span class="badge @PhaseBadge(phase.Result == "pass" ? "completed" : phase.Result == "fail" ? "failed" : "pending")">@phase.Result</span>
+                                                <span class="badge @PhaseBadge(phase.Result == PhaseOutcome.Pass ? "completed" : phase.Result == PhaseOutcome.Fail ? "failed" : "pending")">@phase.Result</span>
                                                 @if (phase.DurationSeconds > 0)
                                                 {
                                                     <span style="color:var(--text-muted)">Duration: @FormatDuration(phase.DurationSeconds)</span>
@@ -657,7 +657,7 @@
                                             @* Show clarifications for this iteration, optionally filtered by phase *@
                                             @{
                                                 var iterClars = iter.Clarifications
-                                                    .Where(c => string.Equals(c.Phase, phase.Name, StringComparison.OrdinalIgnoreCase))
+                                                    .Where(c => string.Equals(c.Phase, phase.Name.ToString(), StringComparison.OrdinalIgnoreCase))
                                                     .ToList();
                                             }
                                             @if (iterClars.Count > 0)
@@ -946,7 +946,7 @@ else
 
         // Stored path: look through _storedIterations for a failed phase
         var storedIter = _storedIterations.FirstOrDefault(i => i.Iteration == number);
-        var storedFailedPhase = storedIter?.Phases.FirstOrDefault(p => p.Result == "fail");
+        var storedFailedPhase = storedIter?.Phases.FirstOrDefault(p => p.Result == PhaseOutcome.Fail);
         if (storedFailedPhase is not null)
         {
             _selectedPhase = $"s{number}-{storedFailedPhase.Name}";

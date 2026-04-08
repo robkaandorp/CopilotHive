@@ -282,9 +282,9 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
 
         var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
 
-        var improvePhases = summary.Phases.Where(p => p.Name == "Improve").ToList();
+        var improvePhases = summary.Phases.Where(p => p.Name == GoalPhase.Improve).ToList();
         Assert.Single(improvePhases);
-        Assert.Equal("skip", improvePhases[0].Result);
+        Assert.Equal(PhaseOutcome.Skip, improvePhases[0].Result);
     }
 
     /// <summary>
@@ -302,9 +302,9 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
 
         var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
 
-        var improvePhases = summary.Phases.Where(p => p.Name == "Improve").ToList();
+        var improvePhases = summary.Phases.Where(p => p.Name == GoalPhase.Improve).ToList();
         Assert.Single(improvePhases);
-        Assert.Equal("skip", improvePhases[0].Result);
+        Assert.Equal(PhaseOutcome.Skip, improvePhases[0].Result);
     }
 
     /// <summary>
@@ -326,8 +326,8 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
 
         var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
 
-        var codingPhase = summary.Phases.FirstOrDefault(p => p.Name == "Coding");
-        var testingPhase = summary.Phases.FirstOrDefault(p => p.Name == "Testing");
+        var codingPhase = summary.Phases.FirstOrDefault(p => p.Name == GoalPhase.Coding);
+        var testingPhase = summary.Phases.FirstOrDefault(p => p.Name == GoalPhase.Testing);
 
         Assert.NotNull(codingPhase);
         Assert.Equal("Coder finished the task.", codingPhase.WorkerOutput);
@@ -456,9 +456,9 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
 
         // Should have 5 PhaseResults: Coding(1), Testing(1), Coding(2), Testing(2), Review
         // Note: Order depends on dictionary iteration order, so check by occurrence
-        var codingPhases = summary.Phases.Where(p => p.Name == "Coding").ToList();
-        var testingPhases = summary.Phases.Where(p => p.Name == "Testing").ToList();
-        var reviewPhases = summary.Phases.Where(p => p.Name == "Review").ToList();
+        var codingPhases = summary.Phases.Where(p => p.Name == GoalPhase.Coding).ToList();
+        var testingPhases = summary.Phases.Where(p => p.Name == GoalPhase.Testing).ToList();
+        var reviewPhases = summary.Phases.Where(p => p.Name == GoalPhase.Review).ToList();
 
         Assert.Equal(2, codingPhases.Count);
         Assert.Equal(2, testingPhases.Count);
@@ -561,20 +561,20 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
 
         var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: GoalPhase.Testing);
 
-        var testingPhases = summary.Phases.Where(p => p.Name == "Testing").ToList();
+        var testingPhases = summary.Phases.Where(p => p.Name == GoalPhase.Testing).ToList();
         Assert.Equal(2, testingPhases.Count);
 
         // First Testing occurrence should be "pass" (it completed successfully)
         var testing1 = testingPhases.First(p => p.DurationSeconds == 15);
-        Assert.Equal("pass", testing1.Result);
+        Assert.Equal(PhaseOutcome.Pass, testing1.Result);
 
         // Second Testing occurrence should be "fail" (the one that actually failed)
         var testing2 = testingPhases.First(p => p.DurationSeconds == 20);
-        Assert.Equal("fail", testing2.Result);
+        Assert.Equal(PhaseOutcome.Fail, testing2.Result);
 
         // Coding phases should all be "pass"
-        var codingPhases = summary.Phases.Where(p => p.Name == "Coding").ToList();
-        Assert.All(codingPhases, c => Assert.Equal("pass", c.Result));
+        var codingPhases = summary.Phases.Where(p => p.Name == GoalPhase.Coding).ToList();
+        Assert.All(codingPhases, c => Assert.Equal(PhaseOutcome.Pass, c.Result));
     }
 }
 

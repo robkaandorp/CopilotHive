@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using CopilotHive.Dashboard;
 using CopilotHive.Goals;
 using CopilotHive.Metrics;
@@ -11,6 +13,7 @@ namespace CopilotHive.Services;
 /// <summary>
 /// Phases a goal progresses through in the pipeline.
 /// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter<GoalPhase>))]
 public enum GoalPhase
 {
     /// <summary>Initial phase: the brain is planning the iteration.</summary>
@@ -31,6 +34,31 @@ public enum GoalPhase
     Done,
     /// <summary>The goal has failed and will not be retried.</summary>
     Failed,
+}
+
+/// <summary>
+/// Outcome of a single pipeline phase within one iteration.
+/// Uses <see cref="JsonNamingPolicy.CamelCase"/> so values serialize as "pass", "fail", "skip"
+/// matching existing stored data.
+/// </summary>
+[JsonConverter(typeof(CamelCasePhaseOutcomeConverter))]
+public enum PhaseOutcome
+{
+    /// <summary>The phase completed successfully.</summary>
+    Pass,
+    /// <summary>The phase failed.</summary>
+    Fail,
+    /// <summary>The phase was skipped.</summary>
+    Skip,
+}
+
+/// <summary>
+/// JSON converter for <see cref="PhaseOutcome"/> that serializes values as camelCase strings
+/// ("pass", "fail", "skip") for backward compatibility with existing stored data.
+/// </summary>
+internal sealed class CamelCasePhaseOutcomeConverter : JsonStringEnumConverter<PhaseOutcome>
+{
+    public CamelCasePhaseOutcomeConverter() : base(JsonNamingPolicy.CamelCase) { }
 }
 
 /// <summary>

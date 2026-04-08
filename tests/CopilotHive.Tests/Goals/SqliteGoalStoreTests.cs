@@ -224,7 +224,7 @@ public sealed class SqliteGoalStoreTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 45.2 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 45.2 }],
             TestCounts = new TestCounts { Total = 10, Passed = 10, Failed = 0 },
             ReviewVerdict = "approve",
         };
@@ -257,7 +257,7 @@ public sealed class SqliteGoalStoreTests : IDisposable
         var s1 = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 30 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 30 }],
             ReviewVerdict = "reject",
             Notes = ["reviewer said: missing tests"],
         };
@@ -266,8 +266,8 @@ public sealed class SqliteGoalStoreTests : IDisposable
             Iteration = 2,
             Phases =
             [
-                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 25 },
-                new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 60 },
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 25 },
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 60 },
             ],
             TestCounts = new TestCounts { Total = 50, Passed = 50, Failed = 0 },
             ReviewVerdict = "approve",
@@ -696,15 +696,15 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
             [
                 new PhaseResult
                 {
-                    Name = "Coding",
-                    Result = "pass",
+                    Name = GoalPhase.Coding,
+                    Result = PhaseOutcome.Pass,
                     DurationSeconds = 75.0,
                     WorkerOutput = "Coder: Implemented feature X.",
                 },
                 new PhaseResult
                 {
-                    Name = "Testing",
-                    Result = "pass",
+                    Name = GoalPhase.Testing,
+                    Result = PhaseOutcome.Pass,
                     DurationSeconds = 30.0,
                     WorkerOutput = null,
                 },
@@ -737,7 +737,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
             Iteration = 3,
             Phases =
             [
-                new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 50.0 },
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 50.0 },
             ],
             PhaseOutputs = new Dictionary<string, string>
             {
@@ -770,7 +770,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 10.0 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 10.0 }],
             PhaseOutputs = [],
         };
 
@@ -800,8 +800,8 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
             [
                 new PhaseResult
                 {
-                    Name = "Review",
-                    Result = "fail",
+                    Name = GoalPhase.Review,
+                    Result = PhaseOutcome.Fail,
                     DurationSeconds = 15.0,
                     WorkerOutput = "Reviewer: Missing null checks.",
                 },
@@ -964,7 +964,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
         var summary = new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 45.2 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 45.2 }],
             TestCounts = new TestCounts { Total = 10, Passed = 10, Failed = 0 },
             ReviewVerdict = "approve",
         };
@@ -1274,7 +1274,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
         await _store.AddIterationAsync(goal1.Id, new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 5 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 5 }],
             Clarifications =
             [
                 new PersistedClarification
@@ -1292,7 +1292,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
         await _store.AddIterationAsync(goal2.Id, new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Testing", Result = "pass", DurationSeconds = 3 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 3 }],
             Clarifications =
             [
                 new PersistedClarification
@@ -1342,7 +1342,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
         await _store.AddIterationAsync(goal.Id, new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 1 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1 }],
             Clarifications = clarifications,
         }, ct);
 
@@ -1368,7 +1368,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
         await _store.AddIterationAsync(goal.Id, new IterationSummary
         {
             Iteration = 1,
-            Phases = [new PhaseResult { Name = "Coding", Result = "pass", DurationSeconds = 2 }],
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 2 }],
             Clarifications = [],
         }, ct);
 
