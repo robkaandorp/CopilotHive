@@ -1,6 +1,8 @@
 using CopilotHive.Metrics;
 using CopilotHive.Workers;
 
+#pragma warning disable CS0618 // Obsolete members tested for backward compatibility
+
 namespace CopilotHive.Tests.Metrics;
 
 /// <summary>

@@ -198,17 +198,27 @@ public sealed class PipelineLifecycleIntegrationTests : IAsyncDisposable
         var pipeline = manager.CreatePipeline(CreateGoal("goal-conv", "Conversation accumulation goal"));
         pipeline.StateMachine.StartIteration(plan);
 
-        // ── Initial conversation entries and phase outputs ───────────────────
+        // ── Initial conversation entries and phase log entries ────────────────
         pipeline.Conversation.Add(new ConversationEntry("user", "Start coding."));
         pipeline.Conversation.Add(new ConversationEntry("assistant", "Understood."));
-        pipeline.PhaseOutputs["coder-1"] = "Initial coder output.";
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "Initial coder output.",
+        });
 
         manager.PersistFull(pipeline);
 
         // ── Additional entries added after PersistFull ───────────────────────
         pipeline.Conversation.Add(new ConversationEntry("user", "How are the tests?"));
         pipeline.Conversation.Add(new ConversationEntry("assistant", "Tests passed."));
-        pipeline.PhaseOutputs["tester-1"] = "All tests green.";
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "All tests green.",
+        });
 
         manager.PersistState(pipeline);
 
@@ -227,14 +237,11 @@ public sealed class PipelineLifecycleIntegrationTests : IAsyncDisposable
         Assert.Equal("assistant", restoredPipeline.Conversation[1].Role);
         Assert.Equal("Understood.", restoredPipeline.Conversation[1].Content);
 
-        // Phase outputs written before PersistFull are present
-        Assert.True(restoredPipeline.PhaseOutputs.ContainsKey("coder-1"));
-        Assert.Equal("Initial coder output.", restoredPipeline.PhaseOutputs["coder-1"]);
-
-        // Phase outputs set after PersistFull but saved via PersistState ARE included
-        // because PersistState calls SavePipelineState which upserts phase_outputs.
-        Assert.True(restoredPipeline.PhaseOutputs.ContainsKey("tester-1"));
-        Assert.Equal("All tests green.", restoredPipeline.PhaseOutputs["tester-1"]);
+        // PhaseLog entries written before PersistFull AND via PersistState are present
+        // because PersistState calls SavePipelineState which upserts phase_log_json.
+        Assert.Equal(2, restoredPipeline.PhaseLog.Count);
+        Assert.Equal("Initial coder output.", restoredPipeline.PhaseLog[0].WorkerOutput);
+        Assert.Equal("All tests green.", restoredPipeline.PhaseLog[1].WorkerOutput);
     }
 
     // ──────────────────────────────────────────────────────────────────────────

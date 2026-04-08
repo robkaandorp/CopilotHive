@@ -124,21 +124,28 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     }
 
     [Fact]
-    public void SavePipeline_ThenLoad_RestoresPhaseOutputs()
+    public void SavePipeline_ThenLoad_RestoresPhaseLog()
     {
         var pipeline = CreatePipeline();
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "code output");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "test output");
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "code output",
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "test output",
+        });
 
         _store.SavePipeline(pipeline);
         var snap = Assert.Single(_store.LoadActivePipelines());
 
-        // Each RecordOutput stores both per-occurrence and backward-compatible keys
-        Assert.Equal(4, snap.PhaseOutputs.Count);
-        Assert.Equal("code output", snap.PhaseOutputs["coder-1"]);
-        Assert.Equal("code output", snap.PhaseOutputs["coder-1-1"]);
-        Assert.Equal("test output", snap.PhaseOutputs["tester-1"]);
-        Assert.Equal("test output", snap.PhaseOutputs["tester-1-1"]);
+        Assert.Equal(2, snap.PhaseLog.Count);
+        Assert.Equal("code output", snap.PhaseLog[0].WorkerOutput);
+        Assert.Equal("test output", snap.PhaseLog[1].WorkerOutput);
     }
 
     [Fact]
@@ -480,7 +487,11 @@ public sealed class GoalPipelineSnapshotRestorationTests
             MaxRetries = 5,
             ActiveTaskId = "task-99",
             CoderBranch = "feature/restore",
-            PhaseOutputs = new() { ["coder-1"] = "output1", ["tester-2"] = "output2" },
+            PhaseLog =
+            [
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, Iteration = 1, Occurrence = 1, WorkerOutput = "output1" },
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, Iteration = 2, Occurrence = 1, WorkerOutput = "output2" },
+            ],
             Metrics = new() { Iteration = 3, BuildSuccess = true, TotalTests = 42, PassedTests = 40, FailedTests = 2 },
             CreatedAt = new DateTime(2025, 1, 15, 10, 30, 0, DateTimeKind.Utc),
             CompletedAt = null,
@@ -499,8 +510,8 @@ public sealed class GoalPipelineSnapshotRestorationTests
         Assert.Equal(5, pipeline.MaxRetries);
         Assert.Equal("task-99", pipeline.ActiveTaskId);
         Assert.Equal("feature/restore", pipeline.CoderBranch);
-        Assert.Equal(2, pipeline.PhaseOutputs.Count);
-        Assert.Equal("output1", pipeline.PhaseOutputs["coder-1"]);
+        Assert.Equal(2, pipeline.PhaseLog.Count);
+        Assert.Equal("output1", pipeline.PhaseLog[0].WorkerOutput);
         Assert.True(pipeline.Metrics.BuildSuccess);
         Assert.Equal(42, pipeline.Metrics.TotalTests);
         Assert.Equal(2, pipeline.Conversation.Count);

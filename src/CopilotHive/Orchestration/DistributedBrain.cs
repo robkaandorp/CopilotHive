@@ -917,8 +917,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         // For review phase, extract the tester output from the current iteration so the reviewer
         // can verify test results without needing to run tests themselves.
         string currentTestResults;
+        var testerEntry = pipeline.PhaseLog
+            .LastOrDefault(e => e.Iteration == pipeline.Iteration && e.Name == GoalPhase.Testing);
         if (phase == GoalPhase.Review
-            && pipeline.PhaseOutputs.TryGetValue($"tester-{pipeline.Iteration}", out var testerOut)
+            && testerEntry?.WorkerOutput is { } testerOut
             && !string.IsNullOrWhiteSpace(testerOut))
         {
             const int maxTesterOutputChars = 2000;
@@ -934,8 +936,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         // For review phase, also include coder output so the reviewer understands the rationale
         // behind code decisions. Cap at 2000 chars with ellipsis if truncated.
         string currentCoderOutput;
+        var coderEntry = pipeline.PhaseLog
+            .LastOrDefault(e => e.Iteration == pipeline.Iteration && e.Name == GoalPhase.Coding);
         if (phase == GoalPhase.Review
-            && pipeline.PhaseOutputs.TryGetValue($"coder-{pipeline.Iteration}", out var coderOut)
+            && coderEntry?.WorkerOutput is { } coderOut
             && !string.IsNullOrWhiteSpace(coderOut))
         {
             const int maxCoderOutputChars = 2000;
@@ -984,17 +988,20 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <returns>A reviewer-ready fallback prompt containing test results and guidance.</returns>
     internal static string BuildReviewFallbackPrompt(GoalPipeline pipeline, string? additionalContext = null)
     {
-        var currentTestResults = (pipeline.PhaseOutputs.TryGetValue($"tester-{pipeline.Iteration}", out var testerOut)
-            && !string.IsNullOrWhiteSpace(testerOut))
-            ? testerOut
+        var testerLogEntry = pipeline.PhaseLog
+            .LastOrDefault(e => e.Iteration == pipeline.Iteration && e.Name == GoalPhase.Testing);
+        var currentTestResults = (!string.IsNullOrWhiteSpace(testerLogEntry?.WorkerOutput))
+            ? testerLogEntry.WorkerOutput
             : "";
 
         // Include coder output so the reviewer understands the rationale behind code decisions.
         // Cap at 2000 chars with ellipsis if truncated.
         string currentCoderOutput = "";
-        if (pipeline.PhaseOutputs.TryGetValue($"coder-{pipeline.Iteration}", out var coderOut)
-            && !string.IsNullOrWhiteSpace(coderOut))
+        var coderLogEntry = pipeline.PhaseLog
+            .LastOrDefault(e => e.Iteration == pipeline.Iteration && e.Name == GoalPhase.Coding);
+        if (!string.IsNullOrWhiteSpace(coderLogEntry?.WorkerOutput))
         {
+            var coderOut = coderLogEntry.WorkerOutput;
             const int maxCoderOutputChars = 2000;
             currentCoderOutput = coderOut.Length > maxCoderOutputChars
                 ? coderOut[..maxCoderOutputChars] + "..."
@@ -1353,7 +1360,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     /// <summary>
     /// Builds a summary of the previous iteration's reviewer/tester feedback
-    /// from <see cref="GoalPipeline.PhaseOutputs"/>. Returns an empty string
+    /// from <see cref="GoalPipeline.PhaseLog"/>. Returns an empty string
     /// for the first iteration.
     /// </summary>
     internal static string BuildPreviousIterationContext(GoalPipeline pipeline)
@@ -1362,76 +1369,47 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             return "";
 
         var prevIteration = pipeline.Iteration - 1;
+        var prevEntries = pipeline.PhaseLog
+            .Where(e => e.Iteration == prevIteration)
+            .ToList();
+
         var sb = new StringBuilder();
         sb.AppendLine($"=== Previous iteration ({prevIteration}) feedback ===");
 
         var hasAnyFeedback = false;
 
         // Include reviewer feedback — the most critical signal for replanning
-        var reviewerKey = $"reviewer-{prevIteration}";
-        if (pipeline.PhaseOutputs.TryGetValue(reviewerKey, out var reviewerOutput)
-            && !string.IsNullOrWhiteSpace(reviewerOutput))
+        var reviewerEntry = prevEntries
+            .LastOrDefault(e => e.Name == GoalPhase.Review);
+        if (!string.IsNullOrWhiteSpace(reviewerEntry?.WorkerOutput))
         {
             hasAnyFeedback = true;
             sb.AppendLine($"=== Reviewer feedback (iteration {prevIteration}) ===");
-            sb.AppendLine(Truncate(reviewerOutput, Constants.TruncationConversationSummary));
+            sb.AppendLine(Truncate(reviewerEntry.WorkerOutput, Constants.TruncationConversationSummary));
             sb.AppendLine("=== End reviewer feedback ===");
         }
 
         // Include tester feedback if tests failed
-        var testerKey = $"tester-{prevIteration}";
-        if (pipeline.PhaseOutputs.TryGetValue(testerKey, out var testerOutput)
-            && !string.IsNullOrWhiteSpace(testerOutput))
+        var testerEntry = prevEntries
+            .LastOrDefault(e => e.Name == GoalPhase.Testing);
+        if (!string.IsNullOrWhiteSpace(testerEntry?.WorkerOutput))
         {
             hasAnyFeedback = true;
             sb.AppendLine($"=== Tester feedback (iteration {prevIteration}) ===");
-            sb.AppendLine(Truncate(testerOutput, Constants.TruncationConversationSummary));
+            sb.AppendLine(Truncate(testerEntry.WorkerOutput, Constants.TruncationConversationSummary));
             sb.AppendLine("=== End tester feedback ===");
         }
 
-        // Include coder output — collect ALL coding round outputs from the previous iteration.
-        // Bare key:  coder-{prevIteration}        (single-round plans)
-        // Round keys: coder-{prevIteration}-{R}   (multi-round plans, e.g. coder-2-1, coder-2-2)
-        // First loop: collect bare coder-{N} entries only.
-        var round = 0;
-        foreach (var kvp in pipeline.PhaseOutputs)
+        // Include coder output — all coding round outputs from the previous iteration
+        var coderEntries = prevEntries
+            .Where(e => e.Name == GoalPhase.Coding && !string.IsNullOrWhiteSpace(e.WorkerOutput))
+            .ToList();
+        for (var i = 0; i < coderEntries.Count; i++)
         {
-            if (!kvp.Key.StartsWith($"coder-{prevIteration}"))
-                continue;
-
-            var remainder = kvp.Key[$"coder-{prevIteration}".Length..];
-            // Skip round-specific keys (e.g. coder-3-1, coder-3-2) — remainder starts with '-'
-            if (remainder.StartsWith("-"))
-                continue;
-
-            if (string.IsNullOrWhiteSpace(kvp.Value))
-                continue;
-
             hasAnyFeedback = true;
-            round++;
-            sb.AppendLine($"=== Coder output round {round} (iteration {prevIteration}) ===");
-            sb.AppendLine(Truncate(kvp.Value, Constants.TruncationMedium));
-            sb.AppendLine($"=== End coder output round {round} ===");
-        }
-
-        // Second loop: collect round-specific coder-{N}-{R} entries.
-        var roundSpecificRound = 0;
-        foreach (var kvp in pipeline.PhaseOutputs)
-        {
-            if (!kvp.Key.StartsWith($"coder-{prevIteration}-"))
-                continue;
-
-            if (!int.TryParse(kvp.Key[$"coder-{prevIteration}-".Length..], out _))
-                continue;
-
-            if (string.IsNullOrWhiteSpace(kvp.Value))
-                continue;
-
-            hasAnyFeedback = true;
-            roundSpecificRound++;
-            sb.AppendLine($"=== Coder output round {roundSpecificRound} (iteration {prevIteration}) ===");
-            sb.AppendLine(Truncate(kvp.Value, Constants.TruncationMedium));
-            sb.AppendLine($"=== End coder output round {roundSpecificRound} ===");
+            sb.AppendLine($"=== Coder output round {i + 1} (iteration {prevIteration}) ===");
+            sb.AppendLine(Truncate(coderEntries[i].WorkerOutput!, Constants.TruncationMedium));
+            sb.AppendLine($"=== End coder output round {i + 1} ===");
         }
 
         if (!hasAnyFeedback)

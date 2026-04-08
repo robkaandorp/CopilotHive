@@ -9,6 +9,8 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 using WorkerRole = CopilotHive.Workers.WorkerRole;
 
+#pragma warning disable CS0618 // Obsolete members tested for backward compatibility
+
 namespace CopilotHive.Tests;
 
 public sealed class GoalDispatcherReviewVerdictTests
@@ -264,43 +266,31 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
 public sealed class GoalDispatcherBuildIterationSummaryTests
 {
     /// <summary>
-    /// When <see cref="CopilotHive.Metrics.IterationMetrics.ImproverSkipped"/> is true AND PhaseDurations already
-    /// contains an "Improve" entry, the output must contain exactly one "Improve" phase result
-    /// with result "skip" (no duplicate entries).
+    /// BuildIterationSummary reads PhaseLog entries with Result=Skip for improver.
     /// </summary>
     [Fact]
-    public void BuildIterationSummary_ImproverSkipped_WithImproveInPhaseDurations_ExactlyOneSkipEntry()
+    public void BuildIterationSummary_ImproverSkipped_SingleSkipEntry()
     {
         var goal = new Goal { Id = "test-goal", Description = "Test" };
         var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
 
-        pipeline.Metrics.PhaseDurations["Coding"]  = TimeSpan.FromSeconds(60);
-        pipeline.Metrics.PhaseDurations["Improve"]  = TimeSpan.FromSeconds(5);
-        pipeline.Metrics.PhaseDurations["Testing"]  = TimeSpan.FromSeconds(30);
-        pipeline.Metrics.ImproverSkipped            = true;
-        pipeline.Metrics.ImproverSkipReason         = "Brain timeout";
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddMinutes(-2),
+            CompletedAt = DateTime.UtcNow.AddMinutes(-1),
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Improve, Result = PhaseOutcome.Skip,
+            Iteration = 1, Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddSeconds(-5),
+            CompletedAt = DateTime.UtcNow,
+            Verdict = "Brain timeout",
+        });
 
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
-
-        var improvePhases = summary.Phases.Where(p => p.Name == GoalPhase.Improve).ToList();
-        Assert.Single(improvePhases);
-        Assert.Equal(PhaseOutcome.Skip, improvePhases[0].Result);
-    }
-
-    /// <summary>
-    /// When <see cref="CopilotHive.Metrics.IterationMetrics.ImproverSkipped"/> is true and PhaseDurations does NOT
-    /// contain an "Improve" entry, a single "skip" entry is still produced.
-    /// </summary>
-    [Fact]
-    public void BuildIterationSummary_ImproverSkipped_WithoutImproveInPhaseDurations_SingleSkipEntry()
-    {
-        var goal = new Goal { Id = "test-goal-2", Description = "Test" };
-        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
-
-        pipeline.Metrics.PhaseDurations["Coding"]  = TimeSpan.FromSeconds(60);
-        pipeline.Metrics.ImproverSkipped            = true;
-
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
 
         var improvePhases = summary.Phases.Where(p => p.Name == GoalPhase.Improve).ToList();
         Assert.Single(improvePhases);
@@ -308,8 +298,7 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
     }
 
     /// <summary>
-    /// BuildIterationSummary populates PhaseResult.WorkerOutput from pipeline.PhaseOutputs
-    /// using the {role}-{iteration} key format.
+    /// BuildIterationSummary reads WorkerOutput from PhaseLog entries.
     /// </summary>
     [Fact]
     public void BuildIterationSummary_PopulatesPhaseResultWorkerOutput()
@@ -317,14 +306,20 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
         var goal = new Goal { Id = "output-goal", Description = "Test" };
         var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
 
-        pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(60);
-        pipeline.Metrics.PhaseDurations["Testing"] = TimeSpan.FromSeconds(30);
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "Coder finished the task.",
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "All 5 tests pass.",
+        });
 
-        // RecordOutput uses "{role}-{iteration}" format (iteration = 1 by default)
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "Coder finished the task.");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "All 5 tests pass.");
-
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
 
         var codingPhase = summary.Phases.FirstOrDefault(p => p.Name == GoalPhase.Coding);
         var testingPhase = summary.Phases.FirstOrDefault(p => p.Name == GoalPhase.Testing);
@@ -338,7 +333,7 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
 
     /// <summary>
     /// BuildIterationSummary populates IterationSummary.PhaseOutputs with entries
-    /// keyed by {role}-{iteration} matching the current iteration.
+    /// derived from PhaseLog for backward compatibility.
     /// </summary>
     [Fact]
     public void BuildIterationSummary_PopulatesPhaseOutputsDictionary()
@@ -346,18 +341,21 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
         var goal = new Goal { Id = "dict-goal", Description = "Test" };
         var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
 
-        pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(45);
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "Coder output.");
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "Coder output.",
+        });
 
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
 
         Assert.True(summary.PhaseOutputs.ContainsKey("coder-1"));
         Assert.Equal("Coder output.", summary.PhaseOutputs["coder-1"]);
     }
 
     /// <summary>
-    /// BuildIterationSummary does not include outputs from other iterations
-    /// (e.g., outputs from iteration 2 are excluded when summarizing iteration 1).
+    /// BuildIterationSummary only includes PhaseLog entries for the current iteration.
     /// </summary>
     [Fact]
     public void BuildIterationSummary_ExcludesOutputsFromOtherIterations()
@@ -365,13 +363,21 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
         var goal = new Goal { Id = "multi-iter-goal", Description = "Test" };
         var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
 
-        pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(30);
-        // Simulate outputs from multiple iterations coexisting in PhaseOutputs
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "Iteration 1 output.");
-        pipeline.RecordOutput(WorkerRole.Coder, 2, "Iteration 2 output.");
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "Iteration 1 output.",
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 2, Occurrence = 1,
+            WorkerOutput = "Iteration 2 output.",
+        });
 
         // Summary is built for iteration 1 (pipeline.Iteration = 1)
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
 
         Assert.True(summary.PhaseOutputs.ContainsKey("coder-1"));
         Assert.False(summary.PhaseOutputs.ContainsKey("coder-2"),
@@ -388,11 +394,11 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
         var goal = new Goal { Id = "build-true-goal", Description = "Test" };
         var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
 
-        pipeline.Metrics.PhaseDurations["Coding"]  = TimeSpan.FromSeconds(60);
-        pipeline.Metrics.PhaseDurations["Testing"]  = TimeSpan.FromSeconds(30);
+        pipeline.PhaseLog.Add(new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, Iteration = 1, Occurrence = 1 });
+        pipeline.PhaseLog.Add(new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, Iteration = 1, Occurrence = 1 });
         pipeline.Metrics.BuildSuccess = true;
 
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
 
         Assert.True(summary.BuildSuccess);
     }
@@ -407,11 +413,11 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
         var goal = new Goal { Id = "build-false-goal", Description = "Test" };
         var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
 
-        pipeline.Metrics.PhaseDurations["Coding"]  = TimeSpan.FromSeconds(60);
-        pipeline.Metrics.PhaseDurations["Testing"]  = TimeSpan.FromSeconds(30);
+        pipeline.PhaseLog.Add(new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, Iteration = 1, Occurrence = 1 });
+        pipeline.PhaseLog.Add(new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, Iteration = 1, Occurrence = 1 });
         pipeline.Metrics.BuildSuccess = false;
 
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
 
         Assert.False(summary.BuildSuccess);
     }
@@ -426,36 +432,45 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
         var goal = new Goal { Id = "multi-round-goal", Description = "Test" };
         var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
 
-        // Set up a multi-round plan: Coding, Testing, Coding, Testing, Review
-        var plan = new IterationPlan
+        var start = DateTime.UtcNow;
+        pipeline.PhaseLog.Add(new PhaseResult
         {
-            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review],
-        };
-        pipeline.SetPlan(plan);
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "First coding output",
+            StartedAt = start, CompletedAt = start.AddSeconds(30),
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "First testing output",
+            StartedAt = start.AddSeconds(30), CompletedAt = start.AddSeconds(45),
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 2,
+            WorkerOutput = "Second coding output",
+            StartedAt = start.AddSeconds(45), CompletedAt = start.AddSeconds(90),
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 2,
+            WorkerOutput = "Second testing output",
+            StartedAt = start.AddSeconds(90), CompletedAt = start.AddSeconds(110),
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Review, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "Review output",
+            StartedAt = start.AddSeconds(110), CompletedAt = start.AddSeconds(120),
+        });
 
-        // Record per-occurrence durations
-        pipeline.Metrics.PhaseDurations["Coding-1"] = TimeSpan.FromSeconds(30);
-        pipeline.Metrics.PhaseDurations["Coding-2"] = TimeSpan.FromSeconds(45);
-        pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(75); // accumulated
-        pipeline.Metrics.PhaseDurations["Testing-1"] = TimeSpan.FromSeconds(15);
-        pipeline.Metrics.PhaseDurations["Testing-2"] = TimeSpan.FromSeconds(20);
-        pipeline.Metrics.PhaseDurations["Testing"] = TimeSpan.FromSeconds(35); // accumulated
-        pipeline.Metrics.PhaseDurations["Review"] = TimeSpan.FromSeconds(10);
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
 
-        // Record per-occurrence outputs
-        pipeline.PhaseOutputs["coder-1-1"] = "First coding output";
-        pipeline.PhaseOutputs["coder-1-2"] = "Second coding output";
-        pipeline.PhaseOutputs["coder-1"] = "Second coding output"; // latest (backward-compat)
-        pipeline.PhaseOutputs["tester-1-1"] = "First testing output";
-        pipeline.PhaseOutputs["tester-1-2"] = "Second testing output";
-        pipeline.PhaseOutputs["tester-1"] = "Second testing output"; // latest
-        pipeline.PhaseOutputs["reviewer-1-1"] = "Review output";
-        pipeline.PhaseOutputs["reviewer-1"] = "Review output";
-
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
-
-        // Should have 5 PhaseResults: Coding(1), Testing(1), Coding(2), Testing(2), Review
-        // Note: Order depends on dictionary iteration order, so check by occurrence
         var codingPhases = summary.Phases.Where(p => p.Name == GoalPhase.Coding).ToList();
         var testingPhases = summary.Phases.Where(p => p.Name == GoalPhase.Testing).ToList();
         var reviewPhases = summary.Phases.Where(p => p.Name == GoalPhase.Review).ToList();
@@ -464,30 +479,11 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
         Assert.Equal(2, testingPhases.Count);
         Assert.Single(reviewPhases);
 
-        // First Coding occurrence
-        var coding1 = codingPhases.FirstOrDefault(p => p.DurationSeconds == 30);
-        Assert.NotNull(coding1);
-        Assert.Equal("First coding output", coding1.WorkerOutput);
-
-        // Second Coding occurrence
-        var coding2 = codingPhases.FirstOrDefault(p => p.DurationSeconds == 45);
-        Assert.NotNull(coding2);
-        Assert.Equal("Second coding output", coding2.WorkerOutput);
-
-        // First Testing occurrence
-        var testing1 = testingPhases.FirstOrDefault(p => p.DurationSeconds == 15);
-        Assert.NotNull(testing1);
-        Assert.Equal("First testing output", testing1.WorkerOutput);
-
-        // Second Testing occurrence
-        var testing2 = testingPhases.FirstOrDefault(p => p.DurationSeconds == 20);
-        Assert.NotNull(testing2);
-        Assert.Equal("Second testing output", testing2.WorkerOutput);
-
-        // Review (single occurrence)
-        var review = reviewPhases.Single();
-        Assert.Equal(10, review.DurationSeconds);
-        Assert.Equal("Review output", review.WorkerOutput);
+        Assert.Equal("First coding output", codingPhases[0].WorkerOutput);
+        Assert.Equal("Second coding output", codingPhases[1].WorkerOutput);
+        Assert.Equal("First testing output", testingPhases[0].WorkerOutput);
+        Assert.Equal("Second testing output", testingPhases[1].WorkerOutput);
+        Assert.Equal("Review output", reviewPhases[0].WorkerOutput);
     }
 
     /// <summary>
@@ -500,24 +496,32 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
         var goal = new Goal { Id = "output-keys-goal", Description = "Test" };
         var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
 
-        var plan = new IterationPlan
+        pipeline.PhaseLog.Add(new PhaseResult
         {
-            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Coding, GoalPhase.Testing],
-        };
-        pipeline.SetPlan(plan);
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "Round 1 code",
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 2,
+            WorkerOutput = "Round 2 code",
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "Round 1 tests",
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 2,
+            WorkerOutput = "Round 2 tests",
+        });
 
-        pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(60);
-        pipeline.Metrics.PhaseDurations["Testing"] = TimeSpan.FromSeconds(30);
-
-        // Record outputs with occurrence tracking
-        pipeline.PhaseOutputs["coder-1-1"] = "Round 1 code";
-        pipeline.PhaseOutputs["coder-1-2"] = "Round 2 code";
-        pipeline.PhaseOutputs["coder-1"] = "Round 2 code";
-        pipeline.PhaseOutputs["tester-1-1"] = "Round 1 tests";
-        pipeline.PhaseOutputs["tester-1-2"] = "Round 2 tests";
-        pipeline.PhaseOutputs["tester-1"] = "Round 2 tests";
-
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: null);
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
 
         // PhaseOutputs should include both occurrence-specific and backward-compatible keys
         Assert.True(summary.PhaseOutputs.ContainsKey("coder-1-1"));
@@ -534,7 +538,7 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
 
     /// <summary>
     /// BuildIterationSummary with a failed phase in a multi-round plan marks only
-    /// the specific occurrence that failed, not all occurrences of that phase type.
+    /// the specific occurrence that failed via its PhaseLog entry Result.
     /// </summary>
     [Fact]
     public void BuildIterationSummary_MultiRoundPlan_FailedPhaseMarksOnlySpecificOccurrence()
@@ -542,39 +546,140 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
         var goal = new Goal { Id = "fail-occ-goal", Description = "Test" };
         var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
 
-        var plan = new IterationPlan
+        var start = DateTime.UtcNow;
+        pipeline.PhaseLog.Add(new PhaseResult
         {
-            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review],
-        };
-        pipeline.SetPlan(plan);
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            StartedAt = start, CompletedAt = start.AddSeconds(30),
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            StartedAt = start.AddSeconds(30), CompletedAt = start.AddSeconds(45),
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 2,
+            StartedAt = start.AddSeconds(45), CompletedAt = start.AddSeconds(90),
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing, Result = PhaseOutcome.Fail,
+            Iteration = 1, Occurrence = 2,
+            StartedAt = start.AddSeconds(90), CompletedAt = start.AddSeconds(110),
+            Verdict = "FAIL",
+        });
 
-        // Record durations for all phases
-        pipeline.Metrics.PhaseDurations["Coding-1"] = TimeSpan.FromSeconds(30);
-        pipeline.Metrics.PhaseDurations["Coding-2"] = TimeSpan.FromSeconds(45);
-        pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(75);
-        pipeline.Metrics.PhaseDurations["Testing-1"] = TimeSpan.FromSeconds(15);
-        pipeline.Metrics.PhaseDurations["Testing-2"] = TimeSpan.FromSeconds(20);
-        pipeline.Metrics.PhaseDurations["Testing"] = TimeSpan.FromSeconds(35);
-
-        // Simulate Testing round 2 failing — PhaseOccurrence is 2 at the time of failure
-        pipeline.PhaseOccurrence = 2;
-
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline, failedPhase: GoalPhase.Testing);
+        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
 
         var testingPhases = summary.Phases.Where(p => p.Name == GoalPhase.Testing).ToList();
         Assert.Equal(2, testingPhases.Count);
 
-        // First Testing occurrence should be "pass" (it completed successfully)
-        var testing1 = testingPhases.First(p => p.DurationSeconds == 15);
-        Assert.Equal(PhaseOutcome.Pass, testing1.Result);
+        // First Testing occurrence should be "pass"
+        Assert.Equal(PhaseOutcome.Pass, testingPhases[0].Result);
 
-        // Second Testing occurrence should be "fail" (the one that actually failed)
-        var testing2 = testingPhases.First(p => p.DurationSeconds == 20);
-        Assert.Equal(PhaseOutcome.Fail, testing2.Result);
+        // Second Testing occurrence should be "fail"
+        Assert.Equal(PhaseOutcome.Fail, testingPhases[1].Result);
 
         // Coding phases should all be "pass"
         var codingPhases = summary.Phases.Where(p => p.Name == GoalPhase.Coding).ToList();
         Assert.All(codingPhases, c => Assert.Equal(PhaseOutcome.Pass, c.Result));
+    }
+}
+
+/// <summary>
+/// Tests for <see cref="GoalDispatcher.GetLastCraftPromptFromConversation"/>
+/// and <see cref="GoalDispatcher.GetPlanningPromptsFromConversation"/>.
+/// </summary>
+public sealed class GoalDispatcherConversationExtractionTests
+{
+    private static GoalPipeline CreatePipeline(int iteration = 1)
+    {
+        var goal = new Goal { Id = "test-goal", Description = "Test" };
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3);
+        // Set the iteration to match
+        for (int i = 1; i < iteration; i++)
+            pipeline.AdvanceTo(GoalPhase.Coding);
+        return pipeline;
+    }
+
+    [Fact]
+    public void GetLastCraftPromptFromConversation_ReturnsLastUserCraftPrompt()
+    {
+        var pipeline = CreatePipeline();
+        pipeline.Conversation.Add(new ConversationEntry("user", "Brain prompt for coding", 1, "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "Worker prompt", 1, "craft-prompt"));
+
+        var result = GoalDispatcher.GetLastCraftPromptFromConversation(pipeline);
+
+        Assert.Equal("Brain prompt for coding", result);
+    }
+
+    [Fact]
+    public void GetLastCraftPromptFromConversation_ReturnsNull_WhenNoCraftPromptExists()
+    {
+        var pipeline = CreatePipeline();
+        pipeline.Conversation.Add(new ConversationEntry("user", "Plan please", 1, "planning"));
+
+        var result = GoalDispatcher.GetLastCraftPromptFromConversation(pipeline);
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void GetLastCraftPromptFromConversation_FiltersOnCurrentIteration()
+    {
+        var pipeline = CreatePipeline();
+        pipeline.Conversation.Add(new ConversationEntry("user", "Old prompt", 1, "craft-prompt"));
+        pipeline.Conversation.Add(new ConversationEntry("user", "New prompt", 2, "craft-prompt"));
+
+        // Pipeline is at iteration 1 — should return the iteration-1 entry
+        var result = GoalDispatcher.GetLastCraftPromptFromConversation(pipeline);
+
+        Assert.Equal("Old prompt", result);
+    }
+
+    [Fact]
+    public void GetPlanningPromptsFromConversation_ReturnsBothPromptAndResponse()
+    {
+        var pipeline = CreatePipeline();
+        pipeline.Conversation.Add(new ConversationEntry("user", "Plan iteration 1", 1, "planning"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "I will code and test.", 1, "planning"));
+
+        var (prompt, response) = GoalDispatcher.GetPlanningPromptsFromConversation(pipeline);
+
+        Assert.Equal("Plan iteration 1", prompt);
+        Assert.Equal("I will code and test.", response);
+    }
+
+    [Fact]
+    public void GetPlanningPromptsFromConversation_ReturnsNulls_WhenNoPlanningEntries()
+    {
+        var pipeline = CreatePipeline();
+        pipeline.Conversation.Add(new ConversationEntry("user", "Some craft prompt", 1, "craft-prompt"));
+
+        var (prompt, response) = GoalDispatcher.GetPlanningPromptsFromConversation(pipeline);
+
+        Assert.Null(prompt);
+        Assert.Null(response);
+    }
+
+    [Fact]
+    public void GetPlanningPromptsFromConversation_ReturnsLastPair_WhenMultipleExist()
+    {
+        var pipeline = CreatePipeline();
+        pipeline.Conversation.Add(new ConversationEntry("user", "First plan attempt", 1, "planning"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "First response", 1, "planning"));
+        pipeline.Conversation.Add(new ConversationEntry("user", "Retry plan attempt", 1, "planning"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "Retry response", 1, "planning"));
+
+        var (prompt, response) = GoalDispatcher.GetPlanningPromptsFromConversation(pipeline);
+
+        Assert.Equal("Retry plan attempt", prompt);
+        Assert.Equal("Retry response", response);
     }
 }
 

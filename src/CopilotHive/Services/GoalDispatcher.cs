@@ -460,8 +460,8 @@ public sealed class GoalDispatcher : BackgroundService
                 _ => PhaseInput.Succeeded, // PASS, APPROVE, or no verdict
             };
 
-        var phaseDurationSeconds = pipeline.PhaseStartedAt.HasValue
-            ? (DateTime.UtcNow - pipeline.PhaseStartedAt.Value).TotalSeconds
+        var phaseDurationSeconds = pipeline.CurrentPhaseEntry?.StartedAt.HasValue == true
+            ? (DateTime.UtcNow - pipeline.CurrentPhaseEntry.StartedAt.Value).TotalSeconds
             : 0;
         _logger.LogInformation(
             "Phase {Phase} for goal {GoalId} completed in {DurationSeconds:F1}s (model={Model})",
@@ -471,6 +471,17 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogInformation("Verdict for {GoalId} phase {Phase}: {Verdict} → {PhaseInput}",
             pipeline.GoalId, pipeline.Phase, verdict, phaseInput);
 
+        // PhaseLog: update the current entry with completion data
+        if (pipeline.CurrentPhaseEntry is { } logEntry)
+        {
+            logEntry.CompletedAt = DateTime.UtcNow;
+            logEntry.Verdict = verdict;
+            logEntry.WorkerOutput = result.Output.Length > 4000
+                ? result.Output[..4000] + $"... ({result.Output.Length} chars total)"
+                : result.Output;
+            logEntry.Result = phaseInput == PhaseInput.Failed ? PhaseOutcome.Fail : PhaseOutcome.Pass;
+        }
+
         // State machine transition
         var transition = pipeline.StateMachine.Transition(phaseInput);
 
@@ -479,9 +490,8 @@ public sealed class GoalDispatcher : BackgroundService
             case TransitionEffect.Continue:
                 pipeline.AdvanceTo(transition.NextPhase);
                 var occurrenceIndex = pipeline.StateMachine.GetCurrentPhaseOccurrence(pipeline.Plan!.Phases);
-                pipeline.PhaseOccurrence = occurrenceIndex;
                 var nextPhaseInstructions = pipeline.Plan?.GetPhaseInstruction(transition.NextPhase, occurrenceIndex);
-                await DispatchPhaseAsync(pipeline, transition.NextPhase, nextPhaseInstructions, ct);
+                await DispatchPhaseAsync(pipeline, transition.NextPhase, nextPhaseInstructions, ct, occurrenceIndex);
                 break;
 
             case TransitionEffect.NewIteration:
@@ -518,13 +528,10 @@ public sealed class GoalDispatcher : BackgroundService
             return;
         }
 
-        // Advance to Coding — this records the duration of the just-ended phase
-        // (Review or Testing) into Metrics.PhaseDurations via AdvanceTo.
-        var failedPhase = isReviewRelated ? GoalPhase.Review : GoalPhase.Testing;
         pipeline.AdvanceTo(GoalPhase.Coding);
 
-        // Snapshot the ending iteration (PhaseDurations now includes the failed phase)
-        var iterationSummary = BuildIterationSummary(pipeline, failedPhase);
+        // Snapshot the ending iteration from PhaseLog
+        var iterationSummary = BuildIterationSummary(pipeline);
         pipeline.CompletedIterationSummaries.Add(iterationSummary);
 
         // Persist the iteration summary to the goal source so the dashboard can read it
@@ -596,14 +603,42 @@ public sealed class GoalDispatcher : BackgroundService
             ? await ResolvePromptAsync(pipeline, GoalPhase.Coding, context, ct)
             : $"Fix issues for: {pipeline.Description}. {context}";
 
-        pipeline.PhaseOccurrence = 1;
+        // PhaseLog: append a new entry for the coder phase in the new iteration
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Occurrence = 1,
+            Iteration = pipeline.Iteration,
+            StartedAt = DateTime.UtcNow,
+        });
+        if (pipeline.CurrentPhaseEntry is { } newIterEntry)
+        {
+            newIterEntry.WorkerPrompt = fixPrompt;
+            newIterEntry.BrainPrompt = GetLastCraftPromptFromConversation(pipeline);
+            // Capture planning prompt/response from conversation onto the first entry of the new iteration
+            var (planningPrompt, planningResponse) = GetPlanningPromptsFromConversation(pipeline);
+            newIterEntry.PlanningPrompt = planningPrompt;
+            newIterEntry.PlanningResponse = planningResponse;
+        }
+
         await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
     }
 
     /// <summary>Dispatch a specific pipeline phase to the appropriate worker.</summary>
     private async Task DispatchPhaseAsync(
-        GoalPipeline pipeline, GoalPhase phase, string? phaseInstructions, CancellationToken ct)
+        GoalPipeline pipeline, GoalPhase phase, string? phaseInstructions, CancellationToken ct, int occurrence = 1)
     {
+        // PhaseLog: append a new entry when the phase starts
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = phase,
+            Result = PhaseOutcome.Pass,
+            Occurrence = occurrence,
+            Iteration = pipeline.Iteration,
+            StartedAt = DateTime.UtcNow,
+        });
+
         switch (phase)
         {
             case GoalPhase.Coding:
@@ -613,6 +648,11 @@ public sealed class GoalDispatcher : BackgroundService
                 var prompt = _brain is not null
                     ? await ResolvePromptAsync(pipeline, phase, null, ct)
                     : $"Work on: {pipeline.Description} (phase: {phase})";
+                if (pipeline.CurrentPhaseEntry is { } promptEntry)
+                {
+                    promptEntry.WorkerPrompt = prompt;
+                    promptEntry.BrainPrompt = GetLastCraftPromptFromConversation(pipeline);
+                }
                 await DispatchToRole(pipeline, phase.ToWorkerRole(), prompt, ct);
                 break;
 
@@ -630,8 +670,13 @@ public sealed class GoalDispatcher : BackgroundService
                     _logger.LogWarning(ex, "Improver failed for goal {GoalId} — skipping to next phase. Reason: {Reason}",
                         pipeline.GoalId, skipReason);
 
-                    pipeline.Metrics.ImproverSkipped = true;
-                    pipeline.Metrics.ImproverSkipReason = skipReason;
+                    // PhaseLog: mark the improver entry as skipped
+                    if (pipeline.CurrentPhaseEntry is { } skipEntry && skipEntry.Name == GoalPhase.Improve)
+                    {
+                        skipEntry.CompletedAt = DateTime.UtcNow;
+                        skipEntry.Result = PhaseOutcome.Skip;
+                        skipEntry.Verdict = skipReason;
+                    }
 
                     var notesMeta = new GoalUpdateMetadata
                     {
@@ -692,6 +737,11 @@ public sealed class GoalDispatcher : BackgroundService
         var improvePrompt = _brain is not null
             ? await ResolvePromptAsync(pipeline, GoalPhase.Improve, improveContext, ct)
             : "Update the *.agents.md files based on iteration results.\n\n" + analysis;
+        if (pipeline.CurrentPhaseEntry is { } improveEntry)
+        {
+            improveEntry.WorkerPrompt = improvePrompt;
+            improveEntry.BrainPrompt = GetLastCraftPromptFromConversation(pipeline);
+        }
         await DispatchToRole(pipeline, WorkerRole.Improver, improvePrompt, ct);
     }
 
@@ -901,11 +951,11 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         // Propagate the tester's structured report to the reviewer so it can be retrieved via get_test_report.
         if (role == WorkerRole.Reviewer)
         {
-            var testerKey = $"tester-{pipeline.Iteration}";
-            if (pipeline.PhaseOutputs.TryGetValue(testerKey, out var testerOutput)
-                && !string.IsNullOrWhiteSpace(testerOutput))
+            var testerEntry = pipeline.PhaseLog
+                .LastOrDefault(e => e.Name == GoalPhase.Testing && e.Iteration == pipeline.Iteration && e.WorkerOutput is not null);
+            if (testerEntry?.WorkerOutput is not null)
             {
-                task.Metadata["tester_report"] = testerOutput;
+                task.Metadata["tester_report"] = testerEntry.WorkerOutput;
             }
         }
 
@@ -1100,7 +1150,6 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         var fixPrompt = _brain is not null
             ? await ResolvePromptAsync(pipeline, GoalPhase.Coding, rebaseContext, ct)
             : rebaseContext;
-        pipeline.PhaseOccurrence = 1;
         await DispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
     }
 
@@ -1191,16 +1240,13 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
             ? pipeline.CompletedAt.Value - goalStartedAt
             : TimeSpan.Zero;
 
-        var iterationSummary = BuildIterationSummary(pipeline, failedPhase: null);
+        var iterationSummary = BuildIterationSummary(pipeline);
         pipeline.CompletedIterationSummaries.Add(iterationSummary);
 
         var completedMeta = new GoalUpdateMetadata
         {
             CompletedAt = pipeline.CompletedAt ?? DateTime.UtcNow,
             Iterations = pipeline.Iteration,
-            PhaseDurations = pipeline.Metrics.PhaseDurations is { Count: > 0 }
-                ? pipeline.Metrics.PhaseDurations.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.TotalSeconds)
-                : null,
             IterationSummary = iterationSummary,
             TotalDurationSeconds = duration.TotalSeconds,
             MergeCommitHash = pipeline.MergeCommitHash,
@@ -1317,10 +1363,9 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
 
     private async Task MarkGoalFailed(GoalPipeline pipeline, string reason, CancellationToken ct)
     {
-        var failedPhase = pipeline.Phase; // capture before AdvanceTo overwrites it
         pipeline.AdvanceTo(GoalPhase.Failed);
 
-        var iterationSummary = BuildIterationSummary(pipeline, failedPhase);
+        var iterationSummary = BuildIterationSummary(pipeline);
         pipeline.CompletedIterationSummaries.Add(iterationSummary);
 
         var failedMeta = new GoalUpdateMetadata
@@ -1328,9 +1373,6 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
             CompletedAt = pipeline.CompletedAt ?? DateTime.UtcNow,
             Iterations = pipeline.Iteration,
             FailureReason = reason,
-            PhaseDurations = pipeline.Metrics.PhaseDurations is { Count: > 0 }
-                ? pipeline.Metrics.PhaseDurations.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.TotalSeconds)
-                : null,
             IterationSummary = iterationSummary,
         };
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Failed, failedMeta, ct);
@@ -1405,133 +1447,23 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
     }
 
     /// <summary>
-    /// Builds an <see cref="IterationSummary"/> from the pipeline's current metrics.
-    /// All phases tracked in <see cref="IterationMetrics.PhaseDurations"/> are included;
-    /// the <paramref name="failedPhase"/> (if provided) is marked as "fail", all others as "pass".
+    /// Builds an <see cref="IterationSummary"/> from the pipeline's <see cref="GoalPipeline.PhaseLog"/>.
+    /// Entries for the current iteration are extracted directly — no plan-walking or PhaseDurations needed.
     /// </summary>
-    /// <param name="pipeline">Pipeline whose metrics to summarise.</param>
-    /// <param name="failedPhase">The phase that caused failure, or <c>null</c> for a completed goal.</param>
+    /// <param name="pipeline">Pipeline whose PhaseLog to summarise.</param>
     /// <returns>A populated <see cref="IterationSummary"/>.</returns>
-    internal static IterationSummary BuildIterationSummary(GoalPipeline pipeline, GoalPhase? failedPhase)
+    internal static IterationSummary BuildIterationSummary(GoalPipeline pipeline)
     {
         var metrics = pipeline.Metrics;
-
-        // Extract craft-prompt pairs and planning prompts from the conversation
-        // so they are persisted on the PhaseResult and survive goal completion.
-        var craftPrompts = DashboardStateService.ExtractCraftPrompts(pipeline.Conversation, pipeline.Iteration);
-        var (planningPrompt, planningResponse) = DashboardStateService.ExtractPlanningPrompts(pipeline.Conversation, pipeline.Iteration);
-
-        // Track occurrence indices per phase as we walk the plan in order.
-        var occurrenceCounters = new Dictionary<GoalPhase, int>();
-
-        // Determine total occurrences per phase from the plan (for last-occurrence detection).
-        var planPhaseTotals = new Dictionary<GoalPhase, int>();
-        if (pipeline.Plan is not null)
-        {
-            foreach (var p in pipeline.Plan.Phases)
-            {
-                planPhaseTotals[p] = planPhaseTotals.GetValueOrDefault(p, 0) + 1;
-            }
-        }
-
-        // Determine the occurrence index of the failed phase (if any) so that only
-        // the specific occurrence that actually failed is marked "fail".
-        // PhaseOccurrence on the pipeline reflects the last occurrence being executed.
-        var failedPhaseOccurrence = failedPhase.HasValue ? pipeline.PhaseOccurrence : 0;
-
-        var phases = new List<PhaseResult>();
-        var isFirstPhase = true;
         var iteration = pipeline.Iteration;
 
-        // Walk the plan in order to emit PhaseResults in the correct sequence.
-        // If no plan exists, fall back to iterating PhaseDurations (base keys only).
-        IEnumerable<GoalPhase> orderedPhases;
-        if (pipeline.Plan is not null && pipeline.Plan.Phases.Count > 0)
-        {
-            orderedPhases = pipeline.Plan.Phases;
-        }
-        else
-        {
-            // Fallback: deduplicated base keys from PhaseDurations (no plan available)
-            var seen = new HashSet<string>(StringComparer.Ordinal);
-            var fallback = new List<GoalPhase>();
-            foreach (var key in metrics.PhaseDurations.Keys)
-            {
-                // Skip per-occurrence keys (e.g. "Coding-1")
-                var lastDash = key.LastIndexOf('-');
-                if (lastDash > 0 && int.TryParse(key.AsSpan(lastDash + 1), out _))
-                    continue;
-                if (seen.Add(key) && Enum.TryParse<GoalPhase>(key, out var parsed))
-                    fallback.Add(parsed);
-            }
-            orderedPhases = fallback;
-        }
+        // Filter PhaseLog entries for this iteration
+        var entries = pipeline.PhaseLog
+            .Where(e => e.Iteration == iteration)
+            .ToList();
 
-        foreach (var goalPhase in orderedPhases)
-        {
-            // Skip phases that never executed (no duration recorded for either the base key or occ key).
-            // This handles partially-executed plans (e.g. goal failed before reaching later phases).
-            var phaseName = goalPhase.ToString();
-            occurrenceCounters[goalPhase] = occurrenceCounters.GetValueOrDefault(goalPhase, 0) + 1;
-            var occ = occurrenceCounters[goalPhase];
-            var totalOccurrences = planPhaseTotals.GetValueOrDefault(goalPhase, 1);
-
-            var occDurationKey = $"{phaseName}-{occ}";
-            bool hasDuration;
-            TimeSpan duration;
-
-            if (metrics.PhaseDurations.TryGetValue(occDurationKey, out var occDur))
-            {
-                // Per-occurrence key exists — phase actually ran this occurrence.
-                hasDuration = true;
-                duration = occDur;
-            }
-            else if (totalOccurrences == 1 && metrics.PhaseDurations.TryGetValue(phaseName, out var baseDur))
-            {
-                // Single-occurrence phase with only the base (accumulated) key — also valid.
-                hasDuration = true;
-                duration = baseDur;
-            }
-            else
-            {
-                // Phase did not execute this occurrence (e.g. partially-executed plan).
-                hasDuration = false;
-                duration = TimeSpan.Zero;
-            }
-
-            if (!hasDuration)
-                continue;
-
-            var roleName = goalPhase.ToRoleName();
-            pipeline.PhaseOutputs.TryGetValue($"{roleName}-{iteration}-{occ}", out var output);
-            if (string.IsNullOrEmpty(output))
-                pipeline.PhaseOutputs.TryGetValue($"{roleName}-{iteration}", out output);
-
-            craftPrompts.TryGetValue(roleName, out var prompts);
-
-            phases.Add(new PhaseResult
-            {
-                Name = goalPhase,
-                Result = failedPhase.HasValue && goalPhase == failedPhase.Value && occ == failedPhaseOccurrence ? PhaseOutcome.Fail : PhaseOutcome.Pass,
-                DurationSeconds = duration.TotalSeconds,
-                WorkerOutput = string.IsNullOrEmpty(output) ? null : output,
-                BrainPrompt = prompts.BrainPrompt,
-                WorkerPrompt = prompts.WorkerPrompt,
-                PlanningPrompt = isFirstPhase ? planningPrompt : null,
-                PlanningResponse = isFirstPhase ? planningResponse : null,
-                Occurrence = occ,
-            });
-            isFirstPhase = false;
-        }
-
-        // Phases that were skipped are not in PhaseDurations — add them separately.
-        // If PhaseDurations already recorded an "Improve" entry (e.g. the phase started then failed),
-        // remove it so the summary never contains duplicate phase names.
-        if (metrics.ImproverSkipped)
-        {
-            phases.RemoveAll(p => p.Name == GoalPhase.Improve);
-            phases.Add(new PhaseResult { Name = GoalPhase.Improve, Result = PhaseOutcome.Skip, DurationSeconds = 0 });
-        }
+        // The PhaseLog entries ARE the phases — same type, no mapping needed.
+        var phases = entries.ToList();
 
         TestCounts? testCounts = metrics.TotalTests > 0
             ? new TestCounts
@@ -1549,38 +1481,37 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
             _ => null,
         };
 
+        // Check for improver skip in the PhaseLog
+        var improverSkipEntry = entries.FirstOrDefault(e => e.Name == GoalPhase.Improve && e.Result == PhaseOutcome.Skip);
         var notes = new List<string>();
-        if (metrics.ImproverSkipped && !string.IsNullOrWhiteSpace(metrics.ImproverSkipReason))
-            notes.Add($"improver skipped: {metrics.ImproverSkipReason}");
+        if (improverSkipEntry is not null)
+            notes.Add($"improver skipped: {improverSkipEntry.Verdict ?? "unknown"}");
 
-        // Build PhaseOutputs dictionary for the iteration summary (keyed by "{role}-{iteration}" and "{role}-{iteration}-{occ}")
+        // Build PhaseOutputs dictionary from log entries for backward compat
         var phaseOutputs = new Dictionary<string, string>();
-        var iterStr = pipeline.Iteration.ToString();
-        foreach (var (key, output) in pipeline.PhaseOutputs)
+        foreach (var entry in entries.Where(e => e.WorkerOutput is not null))
         {
-            // Key formats:
-            // "{role}-{iteration}"         — backward-compatible latest key
-            // "{role}-{iteration}-{occ}"   — per-occurrence key
-            // Role names are single words (no hyphens), so the structure is predictable.
-            var parts = key.Split('-');
-            // parts[0] = role, parts[1] = iteration, parts[2] (optional) = occurrence
-            if (parts.Length == 2 && parts[1] == iterStr)
-                phaseOutputs[key] = output;
-            else if (parts.Length == 3 && parts[1] == iterStr && int.TryParse(parts[2], out _))
-                phaseOutputs[key] = output;
+            var roleName = entry.Name.ToRoleName();
+            if (!string.IsNullOrEmpty(roleName))
+            {
+                phaseOutputs[$"{roleName}-{entry.Iteration}"] = entry.WorkerOutput!;
+                if (entry.Occurrence is > 0)
+                    phaseOutputs[$"{roleName}-{entry.Iteration}-{entry.Occurrence}"] = entry.WorkerOutput!;
+            }
         }
 
         return new IterationSummary
         {
-            Iteration = pipeline.Iteration,
+            Iteration = iteration,
             Phases = phases,
             TestCounts = testCounts,
             BuildSuccess = metrics.BuildSuccess,
             ReviewVerdict = reviewVerdict,
             Notes = notes,
             PhaseOutputs = phaseOutputs,
+            PlanReason = pipeline.Plan?.Reason,
             Clarifications = pipeline.Clarifications
-                .Where(c => c.Iteration == pipeline.Iteration)
+                .Where(c => c.Iteration == iteration)
                 .Select(c => new PersistedClarification
                 {
                     Timestamp = c.Timestamp,
@@ -1929,13 +1860,31 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         pipeline.SetPlan(iterationPlan);
         pipeline.StateMachine.StartIteration(iterationPlan.Phases);
         var firstPhase = iterationPlan.Phases[0];
-        pipeline.PhaseOccurrence = 1;
         pipeline.AdvanceTo(firstPhase);
 
         // Craft prompt for first phase and dispatch
         var firstPhasePrompt = _brain is not null
             ? await ResolvePromptAsync(pipeline, firstPhase, null, ct)
             : (firstPhase == GoalPhase.Coding ? BuildCoderPrompt(goal) : $"Work on: {pipeline.Description}");
+
+        // PhaseLog: append entry for the first phase of the pipeline
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = firstPhase,
+            Result = PhaseOutcome.Pass,
+            Occurrence = 1,
+            Iteration = pipeline.Iteration,
+            StartedAt = DateTime.UtcNow,
+        });
+        if (pipeline.CurrentPhaseEntry is { } firstPhaseEntry)
+        {
+            firstPhaseEntry.WorkerPrompt = firstPhasePrompt;
+            firstPhaseEntry.BrainPrompt = GetLastCraftPromptFromConversation(pipeline);
+            // Capture planning prompt/response from conversation onto the first entry
+            var (planningPrompt, planningResponse) = GetPlanningPromptsFromConversation(pipeline);
+            firstPhaseEntry.PlanningPrompt = planningPrompt;
+            firstPhaseEntry.PlanningResponse = planningResponse;
+        }
 
         var firstRole = firstPhase.ToWorkerRole();
         await DispatchToRole(pipeline, firstRole, firstPhasePrompt, ct);
@@ -2068,5 +2017,33 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
 
         // Append the full description as the commit body
         return $"{subject}\n\n{description.Trim()}";
+    }
+
+    /// <summary>
+    /// Extracts the last "craft-prompt" user entry from the pipeline conversation
+    /// for the current iteration. This is the prompt that was sent TO the Brain
+    /// when asking it to craft a worker prompt.
+    /// </summary>
+    internal static string? GetLastCraftPromptFromConversation(GoalPipeline pipeline)
+    {
+        return pipeline.Conversation
+            .LastOrDefault(e => e.Iteration == pipeline.Iteration
+                             && e.Purpose == "craft-prompt"
+                             && e.Role == "user")
+            ?.Content;
+    }
+
+    /// <summary>
+    /// Extracts the planning prompt and response from the pipeline conversation
+    /// for the current iteration. Returns the last "planning" user/assistant pair.
+    /// </summary>
+    internal static (string? Prompt, string? Response) GetPlanningPromptsFromConversation(GoalPipeline pipeline)
+    {
+        var planningEntries = pipeline.Conversation
+            .Where(e => e.Iteration == pipeline.Iteration && e.Purpose == "planning")
+            .ToList();
+        var prompt = planningEntries.LastOrDefault(e => e.Role == "user")?.Content;
+        var response = planningEntries.LastOrDefault(e => e.Role == "assistant")?.Content;
+        return (prompt, response);
     }
 }

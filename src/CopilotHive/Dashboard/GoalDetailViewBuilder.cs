@@ -99,8 +99,8 @@ internal static class GoalDetailViewBuilder
 
         foreach (var summary in allSummaries)
         {
-            var summaryConversation = pipeline?.Conversation ?? Enumerable.Empty<ConversationEntry>();
-            var (summaryPlanningPrompt, summaryPlanningResponse) = ExtractPlanningPrompts(summaryConversation, summary.Iteration);
+            // Read planning prompt/response from the first PhaseResult in the summary
+            var firstSummaryPhase = summary.Phases.FirstOrDefault();
 
             var phases = BuildPhasesFromSummary(goalId, summary, pipeline);
 
@@ -109,8 +109,8 @@ internal static class GoalDetailViewBuilder
                 Number = summary.Iteration,
                 Phases = phases,
                 IsCurrent = false,
-                PlanningBrainPrompt = summaryPlanningPrompt,
-                PlanningBrainResponse = summaryPlanningResponse,
+                PlanningBrainPrompt = firstSummaryPhase?.PlanningPrompt,
+                PlanningBrainResponse = firstSummaryPhase?.PlanningResponse,
             });
         }
 
@@ -119,7 +119,10 @@ internal static class GoalDetailViewBuilder
         {
             var currentIter = pipeline.Iteration;
             var isCurrent = pipeline.Phase is not GoalPhase.Done and not GoalPhase.Failed;
-            var (planningBrainPrompt, planningBrainResponse) = ExtractPlanningPrompts(pipeline.Conversation, currentIter);
+
+            // Read planning prompt/response from the first PhaseLog entry for this iteration
+            var firstLogEntry = pipeline.PhaseLog
+                .FirstOrDefault(e => e.Iteration == currentIter);
 
             var currentPhases = BuildPhasesFromPipeline(goalId, pipeline, currentIter);
 
@@ -129,8 +132,8 @@ internal static class GoalDetailViewBuilder
                 Phases = currentPhases,
                 IsCurrent = isCurrent,
                 PlanReason = pipeline.Plan?.Reason,
-                PlanningBrainPrompt = planningBrainPrompt,
-                PlanningBrainResponse = planningBrainResponse,
+                PlanningBrainPrompt = firstLogEntry?.PlanningPrompt,
+                PlanningBrainResponse = firstLogEntry?.PlanningResponse,
             });
         }
 
@@ -147,9 +150,6 @@ internal static class GoalDetailViewBuilder
     public static List<PhaseViewInfo> BuildPhasesFromSummary(
         string goalId, IterationSummary summary, GoalPipeline? pipeline)
     {
-        var conversation = pipeline?.Conversation ?? Enumerable.Empty<ConversationEntry>();
-        var craftPrompts = ExtractCraftPrompts(conversation, summary.Iteration);
-
         // Group persisted clarifications by phase name for this iteration.
         var clarificationsByPhase = summary.Clarifications
             .GroupBy(c => c.Phase, StringComparer.OrdinalIgnoreCase)
@@ -196,18 +196,8 @@ internal static class GoalDetailViewBuilder
             var occurrence = pr.Occurrence ?? 1;
             var isLastOccurrence = occurrence >= totalOccurrencesForPhase;
 
-            // Prefer PhaseResult.WorkerOutput (persisted) over live pipeline PhaseOutputs.
-            // This ensures completed goals (no pipeline) still display output correctly.
+            // Use PhaseResult.WorkerOutput directly (persisted on the log entry).
             string? workerOutput = pr.WorkerOutput;
-            if (string.IsNullOrEmpty(workerOutput) && !string.IsNullOrEmpty(roleName))
-            {
-                // Use occurrence-specific key if Occurrence is set; otherwise fall back to latest.
-                if (pr.Occurrence.HasValue)
-                    pipeline?.PhaseOutputs.TryGetValue($"{roleName}-{summary.Iteration}-{pr.Occurrence.Value}", out workerOutput);
-                // Only fall back to latest key for single-occurrence or last-occurrence phases
-                if (string.IsNullOrEmpty(workerOutput) && isLastOccurrence)
-                    pipeline?.PhaseOutputs.TryGetValue($"{roleName}-{summary.Iteration}", out workerOutput);
-            }
 
             var isTestPhase = pr.Name == GoalPhase.Testing;
             var isReviewPhase = pr.Name == GoalPhase.Review;
@@ -218,8 +208,6 @@ internal static class GoalDetailViewBuilder
             {
                 phaseClarifications = OccurrenceFilter.FilterByOccurrence(allPhaseClarifications, occurrence);
             }
-
-            craftPrompts.TryGetValue(roleName, out var phasePrompts);
 
             // Filter progress reports by occurrence using the OccurrenceFilter helper.
             var allPhaseProgress = pipeline?.ProgressReports
@@ -237,7 +225,6 @@ internal static class GoalDetailViewBuilder
                 summary: summary,
                 isTestPhase: isTestPhase,
                 isReviewPhase: isReviewPhase,
-                craftPrompts: phasePrompts,
                 pipeline: pipeline,
                 occurrence: occurrence,
                 isLastOccurrence: isLastOccurrence));
@@ -250,14 +237,12 @@ internal static class GoalDetailViewBuilder
 
     /// <summary>
     /// Builds the list of <see cref="PhaseViewInfo"/> entries for the live pipeline's
-    /// current iteration, including positional status computation for multi-round plans.
+    /// current iteration, using PhaseLog for completed/active phases and the plan for pending ones.
     /// </summary>
     public static List<PhaseViewInfo> BuildPhasesFromPipeline(string goalId, GoalPipeline pipeline, int currentIter)
     {
         // Determine the planning phase status.
         var planningStatus = pipeline.Phase == GoalPhase.Planning ? "active" : "completed";
-
-        var craftPrompts = ExtractCraftPrompts(pipeline.Conversation, currentIter);
 
         // Collect all clarifications from this pipeline, grouped by phase name.
         var clarificationsByPhase = pipeline.Clarifications
@@ -267,6 +252,10 @@ internal static class GoalDetailViewBuilder
 
         clarificationsByPhase.TryGetValue("Planning", out var planningClarifications);
 
+        // Get the planning prompt from the first PhaseLog entry's PlanningPrompt/PlanningResponse
+        var firstLogEntry = pipeline.PhaseLog
+            .FirstOrDefault(e => e.Iteration == currentIter);
+
         var phases = new List<PhaseViewInfo>
         {
             new PhaseViewInfo
@@ -274,6 +263,8 @@ internal static class GoalDetailViewBuilder
                 Name = "Planning",
                 RoleName = "brain",
                 Status = planningStatus,
+                BrainPrompt = firstLogEntry?.PlanningPrompt,
+                WorkerPrompt = firstLogEntry?.PlanningResponse,
                 Clarifications = planningClarifications ?? [],
                 ProgressReports = pipeline.ProgressReports
                     .Where(p => p.Iteration == currentIter && p.Phase == "Planning")
@@ -286,105 +277,105 @@ internal static class GoalDetailViewBuilder
         // Once past Planning, ALWAYS show worker phases (even if Plan is null).
         if (pipeline.Phase != GoalPhase.Planning)
         {
-            var planPhases = pipeline.Plan?.Phases ?? [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging];
-            var failedFound = false;
-            var isCurrent = pipeline.Phase is not GoalPhase.Done and not GoalPhase.Failed;
-            var completedCount = planPhases.Count - pipeline.StateMachine.RemainingPhases.Count - 1;
-            if (pipeline.Phase == GoalPhase.Done)
-                completedCount = planPhases.Count;
+            // Get PhaseLog entries for the current iteration
+            var logEntries = pipeline.PhaseLog
+                .Where(e => e.Iteration == currentIter)
+                .ToList();
 
-            var occurrenceCounters = new Dictionary<GoalPhase, int>();
-            for (var i = 0; i < planPhases.Count; i++)
+            // Build a set of phases already in the log (with occurrence tracking)
+            var loggedPhases = new HashSet<(GoalPhase, int)>();
+            foreach (var entry in logEntries)
+                loggedPhases.Add((entry.Name, entry.Occurrence ?? 1));
+
+            // Show PhaseLog entries (completed and active)
+            foreach (var entry in logEntries)
             {
-                var phase = planPhases[i];
-                occurrenceCounters[phase] = occurrenceCounters.GetValueOrDefault(phase) + 1;
-                var occurrence = occurrenceCounters[phase];
-
-                // Compute isLastOccurrence early — needed for fallback logic below.
-                var lastPlanIndex = -1;
-                for (var j = planPhases.Count - 1; j >= 0; j--)
-                {
-                    if (planPhases[j] == phase)
-                    {
-                        lastPlanIndex = j;
-                        break;
-                    }
-                }
-                var isLastOccurrence = (i == lastPlanIndex);
+                var occurrence = entry.Occurrence ?? 1;
+                var phaseName = entry.Name.ToString();
 
                 string status;
-                if (i < completedCount)
-                    status = "completed";
-                else if (i == completedCount && isCurrent)
-                    status = pipeline.IsWaitingForClarification ? "waiting" : "active";
-                else if (i == completedCount && pipeline.Phase == GoalPhase.Failed && !failedFound)
-                    { status = "failed"; failedFound = true; }
-                else if (pipeline.Phase == GoalPhase.Done)
-                    status = "completed";
+                if (entry.CompletedAt.HasValue)
+                    status = entry.Result == PhaseOutcome.Fail ? "failed"
+                           : entry.Result == PhaseOutcome.Skip ? "skipped"
+                           : "completed";
+                else if (pipeline.IsWaitingForClarification)
+                    status = "waiting";
                 else
-                    status = "pending";
+                    status = "active";
 
-                var roleName = phase.ToRoleName();
-                string? workerOutput = null;
-                if (!string.IsNullOrEmpty(roleName))
-                {
-                    // Try per-occurrence key first
-                    if (!pipeline.PhaseOutputs.TryGetValue($"{roleName}-{currentIter}-{occurrence}", out workerOutput))
-                    {
-                        // Only fall back to the backward-compatible latest key for the last
-                        // occurrence of each phase type (or for single-occurrence phases).
-                        // Non-last occurrences with missing per-occurrence keys get null
-                        // instead of stale data from a later occurrence.
-                        if (isLastOccurrence)
-                            pipeline.PhaseOutputs.TryGetValue($"{roleName}-{currentIter}", out workerOutput);
-                    }
-                }
+                var isTestPhase = entry.Name == GoalPhase.Testing;
+                var isReviewPhase = entry.Name == GoalPhase.Review;
 
-                var isTestPhase = phase == GoalPhase.Testing;
-                var isReviewPhase = phase == GoalPhase.Review;
+                // Determine last occurrence
+                var totalOccurrencesForPhase = logEntries.Count(e => e.Name == entry.Name);
+                var isLastOccurrence = occurrence >= totalOccurrencesForPhase;
 
-                // Filter clarifications by occurrence using the OccurrenceFilter helper.
-                var phaseName = phase.ToString();
                 List<ClarificationEntry>? phaseClarifications = null;
                 if (clarificationsByPhase.TryGetValue(phaseName, out var allPhaseClarifications))
-                {
                     phaseClarifications = OccurrenceFilter.FilterByOccurrence(allPhaseClarifications, occurrence);
-                }
 
-                craftPrompts.TryGetValue(roleName, out var phasePrompts);
-
-                // Filter progress reports by occurrence using the OccurrenceFilter helper.
                 var allPhaseProgress = pipeline.ProgressReports
                     .Where(p => p.Iteration == currentIter && p.Phase == phaseName)
                     .OrderBy(p => p.Timestamp)
                     .ToList();
                 var phaseProgress = OccurrenceFilter.FilterByOccurrence(allPhaseProgress, occurrence);
 
-                phases.Add(BuildPhaseViewInfo(
-                    phaseIndex: phases.Count,
-                    phase: phase,
-                    workerOutput: workerOutput,
-                    clarifications: phaseClarifications ?? [],
-                    progress: phaseProgress,
-                    pipeline: pipeline,
-                    isLastOccurrence: isLastOccurrence,
-                    occurrence: occurrence,
-                    status: status,
-                    isTestPhase: isTestPhase,
-                    isReviewPhase: isReviewPhase,
-                    craftPrompts: phasePrompts,
-                    currentIter: currentIter));
+                var metrics = pipeline.Metrics;
+                var hasMetrics = status is "completed" or "active" or "failed" or "waiting";
+
+                phases.Add(new PhaseViewInfo
+                {
+                    Name = entry.Name.ToDisplayName(),
+                    RoleName = entry.Name.ToRoleName(),
+                    Status = status,
+                    Occurrence = occurrence,
+                    WorkerOutput = entry.WorkerOutput,
+                    DurationSeconds = entry.DurationSeconds > 0 ? entry.DurationSeconds : null,
+                    TotalTests = hasMetrics && isTestPhase && isLastOccurrence ? metrics.TotalTests : 0,
+                    PassedTests = hasMetrics && isTestPhase && isLastOccurrence ? metrics.PassedTests : 0,
+                    FailedTests = hasMetrics && isTestPhase && isLastOccurrence ? metrics.FailedTests : 0,
+                    CoveragePercent = hasMetrics && isTestPhase && isLastOccurrence ? metrics.CoveragePercent : 0,
+                    BuildSuccess = hasMetrics && isTestPhase && isLastOccurrence && metrics.BuildSuccess,
+                    ReviewVerdict = hasMetrics && isReviewPhase ? metrics.ReviewVerdict?.ToString() : null,
+                    ReviewIssuesFound = hasMetrics && isReviewPhase ? metrics.ReviewIssuesFound : 0,
+                    Issues = hasMetrics && isReviewPhase ? metrics.ReviewIssues.ToList() :
+                             hasMetrics && isTestPhase && isLastOccurrence ? metrics.Issues.ToList() : [],
+                    Verdict = hasMetrics && isTestPhase && isLastOccurrence ? metrics.Verdict?.ToString() : null,
+                    ProgressReports = phaseProgress,
+                    BrainPrompt = entry.BrainPrompt,
+                    WorkerPrompt = entry.WorkerPrompt,
+                    Clarifications = phaseClarifications ?? [],
+                });
+            }
+
+            // Show pending plan phases not yet in the log
+            var planPhases = pipeline.Plan?.Phases ?? [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging];
+            var pendingOccurrenceCounters = new Dictionary<GoalPhase, int>();
+            foreach (var planPhase in planPhases)
+            {
+                pendingOccurrenceCounters[planPhase] = pendingOccurrenceCounters.GetValueOrDefault(planPhase) + 1;
+                var occ = pendingOccurrenceCounters[planPhase];
+                if (loggedPhases.Contains((planPhase, occ)))
+                    continue;
+
+                phases.Add(new PhaseViewInfo
+                {
+                    Name = planPhase.ToDisplayName(),
+                    RoleName = planPhase.ToRoleName(),
+                    Status = "pending",
+                    Occurrence = occ,
+                });
             }
         }
 
         return phases;
     }
 
-    // ── BuildPhaseViewInfo overloads ──────────────────────────────────────────
+    // ── BuildPhaseViewInfo ──────────────────────────────────────────────────────
 
     /// <summary>
-    /// Overload for building a <see cref="PhaseViewInfo"/> from a persisted
-    /// <see cref="PhaseResult"/> (summarised-iteration path).
+    /// Builds a <see cref="PhaseViewInfo"/> from a persisted <see cref="PhaseResult"/>
+    /// (summarised-iteration path).
     /// </summary>
     public static PhaseViewInfo BuildPhaseViewInfo(
         int phaseIndex,
@@ -395,7 +386,6 @@ internal static class GoalDetailViewBuilder
         IterationSummary? summary,
         bool isTestPhase,
         bool isReviewPhase,
-        (string? BrainPrompt, string? WorkerPrompt)? craftPrompts,
         GoalPipeline? pipeline,
         int occurrence = 1,
         bool isLastOccurrence = true)
@@ -408,141 +398,16 @@ internal static class GoalDetailViewBuilder
             DurationSeconds = phase.DurationSeconds > 0 ? phase.DurationSeconds : null,
             Occurrence = occurrence,
             WorkerOutput = workerOutput,
+            BrainPrompt = phase.BrainPrompt,
+            WorkerPrompt = phase.WorkerPrompt,
             TotalTests = isTestPhase && isLastOccurrence ? (summary?.TestCounts?.Total ?? 0) : 0,
             PassedTests = isTestPhase && isLastOccurrence ? (summary?.TestCounts?.Passed ?? 0) : 0,
             FailedTests = isTestPhase && isLastOccurrence ? (summary?.TestCounts?.Failed ?? 0) : 0,
             BuildSuccess = isTestPhase && isLastOccurrence && (summary?.BuildSuccess ?? false),
             ReviewVerdict = isReviewPhase && isLastOccurrence ? summary?.ReviewVerdict : null,
-            BrainPrompt = craftPrompts?.BrainPrompt,
-            WorkerPrompt = craftPrompts?.WorkerPrompt,
             Clarifications = clarifications ?? [],
             ProgressReports = progress,
         };
-    }
-
-    /// <summary>
-    /// Overload for building a <see cref="PhaseViewInfo"/> from a live <see cref="GoalPhase"/>
-    /// (live-pipeline path). Computes metrics and positional status for multi-round plans.
-    /// </summary>
-    public static PhaseViewInfo BuildPhaseViewInfo(
-        int phaseIndex,
-        GoalPhase phase,
-        string? workerOutput,
-        List<ClarificationEntry>? clarifications,
-        List<ProgressEntry> progress,
-        GoalPipeline pipeline,
-        bool isLastOccurrence,
-        int occurrence = 1,
-        string status = "pending",
-        bool isTestPhase = false,
-        bool isReviewPhase = false,
-        (string? BrainPrompt, string? WorkerPrompt)? craftPrompts = null,
-        int currentIter = 1)
-    {
-        var metrics = pipeline.Metrics;
-        var hasMetrics = status is "completed" or "active" or "failed" or "waiting";
-
-        return new PhaseViewInfo
-        {
-            Name = phase.ToDisplayName(),
-            RoleName = phase.ToRoleName(),
-            Status = status,
-            Occurrence = occurrence,
-            WorkerOutput = workerOutput,
-            DurationSeconds = metrics.PhaseDurations.TryGetValue($"{phase}-{occurrence}", out var occDur)
-                ? occDur.TotalSeconds
-                : (metrics.PhaseDurations.TryGetValue(phase.ToString(), out var dur) ? dur.TotalSeconds : null),
-            TotalTests = hasMetrics && isTestPhase && isLastOccurrence ? metrics.TotalTests : 0,
-            PassedTests = hasMetrics && isTestPhase && isLastOccurrence ? metrics.PassedTests : 0,
-            FailedTests = hasMetrics && isTestPhase && isLastOccurrence ? metrics.FailedTests : 0,
-            CoveragePercent = hasMetrics && isTestPhase && isLastOccurrence ? metrics.CoveragePercent : 0,
-            BuildSuccess = hasMetrics && isTestPhase && isLastOccurrence && metrics.BuildSuccess,
-            ReviewVerdict = hasMetrics && isReviewPhase ? metrics.ReviewVerdict?.ToString() : null,
-            ReviewIssuesFound = hasMetrics && isReviewPhase ? metrics.ReviewIssuesFound : 0,
-            Issues = hasMetrics && isReviewPhase ? metrics.ReviewIssues.ToList() :
-                     hasMetrics && isTestPhase && isLastOccurrence ? metrics.Issues.ToList() : [],
-            Verdict = hasMetrics && isTestPhase && isLastOccurrence ? metrics.Verdict?.ToString() : null,
-            ProgressReports = progress,
-            BrainPrompt = craftPrompts?.BrainPrompt,
-            WorkerPrompt = craftPrompts?.WorkerPrompt,
-            Clarifications = clarifications ?? [],
-        };
-    }
-
-    // ── Extract helpers (already static) ─────────────────────────────────────
-
-    /// <summary>
-    /// Extracts the planning Brain prompt and response for a given iteration from the conversation log.
-    /// </summary>
-    /// <param name="conversation">The pipeline conversation entries to search.</param>
-    /// <param name="iteration">The iteration number to filter by.</param>
-    /// <returns>A tuple of (userPrompt, assistantResponse), each of which may be null if not found.</returns>
-    public static (string? UserPrompt, string? AssistantResponse) ExtractPlanningPrompts(
-        IEnumerable<ConversationEntry> conversation, int iteration)
-    {
-        var planningEntries = conversation
-            .Where(e => e.Iteration == iteration && e.Purpose == "planning")
-            .ToList();
-        var userPrompt = planningEntries.LastOrDefault(e => e.Role == "user")?.Content;
-        var assistantResponse = planningEntries.LastOrDefault(e => e.Role == "assistant")?.Content;
-        return (userPrompt, assistantResponse);
-    }
-
-    /// <summary>
-    /// Walks the conversation log and associates craft-prompt pairs with the worker role
-    /// that follows them. Returns a dictionary keyed by role name (e.g. "coder", "tester").
-    /// </summary>
-    /// <param name="conversation">The pipeline conversation entries to search.</param>
-    /// <param name="iteration">The iteration number to filter by.</param>
-    /// <returns>A dictionary from role name to its associated (BrainPrompt, WorkerPrompt) pair.</returns>
-    public static Dictionary<string, (string? BrainPrompt, string? WorkerPrompt)> ExtractCraftPrompts(
-        IEnumerable<ConversationEntry> conversation, int iteration)
-    {
-        var result = new Dictionary<string, (string? BrainPrompt, string? WorkerPrompt)>(StringComparer.OrdinalIgnoreCase);
-
-        // Filter to entries for this iteration, excluding planning entries
-        var entries = conversation
-            .Where(e => e.Iteration == iteration && e.Purpose != "planning")
-            .ToList();
-
-        // Walk entries; collect pending craft-prompt pair and associate with the next worker-output role
-        string? pendingBrainPrompt = null;
-        string? pendingWorkerPrompt = null;
-
-        foreach (var entry in entries)
-        {
-            if (entry.Purpose == "craft-prompt")
-            {
-                if (entry.Role == "user")
-                {
-                    // Only capture the first craft-prompt request in each phase block.
-                    // Mid-task AskBrainAsync follow-ups also use Purpose=="craft-prompt",
-                    // so we must not overwrite the initial dispatch prompt.
-                    if (pendingBrainPrompt is null)
-                    {
-                        pendingBrainPrompt = entry.Content;
-                        pendingWorkerPrompt = null;
-                    }
-                }
-                else if (entry.Role == "assistant")
-                {
-                    // Only record the response for the first pair; ignore follow-up assistant turns.
-                    if (pendingBrainPrompt is not null && pendingWorkerPrompt is null)
-                        pendingWorkerPrompt = entry.Content;
-                }
-            }
-            else if (entry.Purpose == "worker-output")
-            {
-                // Associate the accumulated craft-prompt pair with this worker role
-                if (!string.IsNullOrEmpty(entry.Role))
-                    result[entry.Role] = (pendingBrainPrompt, pendingWorkerPrompt);
-                // Reset pending state for the next worker
-                pendingBrainPrompt = null;
-                pendingWorkerPrompt = null;
-            }
-        }
-
-        return result;
     }
 
     // ── Repository URL resolution ─────────────────────────────────────────────

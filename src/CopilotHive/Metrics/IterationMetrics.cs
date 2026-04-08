@@ -62,6 +62,7 @@ public sealed class IterationMetrics
     public int TestRetryCount { get; set; }
 
     /// <summary>Wall-clock duration of each pipeline phase, keyed by phase name (e.g. "Coding", "Review").</summary>
+    [Obsolete("Phase durations are now tracked via PhaseResult.StartedAt/CompletedAt in PhaseLog. Kept for JSON backward compatibility.")]
     public Dictionary<string, TimeSpan> PhaseDurations { get; set; } = [];
 
     /// <summary>Prompt tokens consumed during this iteration (0 until SDK exposes token metrics).</summary>
@@ -75,8 +76,10 @@ public sealed class IterationMetrics
     public Dictionary<string, object> Custom { get; set; } = [];
 
     /// <summary>Whether the improve phase was skipped due to a non-critical failure (e.g. Brain timeout).</summary>
+    [Obsolete("Improver skip is now tracked via PhaseResult with Result=Skip in PhaseLog. Kept for JSON backward compatibility.")]
     public bool ImproverSkipped { get; set; }
     /// <summary>Reason the improver was skipped, if applicable.</summary>
+    [Obsolete("Improver skip reason is now tracked via PhaseResult.Verdict in PhaseLog. Kept for JSON backward compatibility.")]
     public string? ImproverSkipReason { get; set; }
 
     /// <summary>Ratio of passed unit tests to total unit tests (0 when no tests exist).</summary>
@@ -109,10 +112,11 @@ public sealed class IterationMetrics
         ReviewIssuesFound = 0;
         ReviewIssues = [];
         ReviewVerdict = null;
+#pragma warning disable CS0618 // Obsolete members kept for backward compat
         PhaseDurations = [];
-        PromptTokens = 0;
-        CompletionTokens = 0;
         ImproverSkipped = false;
         ImproverSkipReason = null;
+#pragma warning restore CS0618
+        PromptTokens = 0;
     }
 }

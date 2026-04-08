@@ -100,11 +100,24 @@ public sealed class PersistedClarification
 public sealed class PhaseResult
 {
     /// <summary>Phase that was executed.</summary>
-    public required GoalPhase Name { get; init; }
+    public required GoalPhase Name { get; set; }
     /// <summary>Outcome of the phase execution.</summary>
-    public required PhaseOutcome Result { get; init; }
-    /// <summary>Wall-clock duration of the phase in seconds.</summary>
-    public double DurationSeconds { get; init; }
+    public required PhaseOutcome Result { get; set; }
+    /// <summary>Wall-clock duration of the phase in seconds. Computed from timestamps when available.</summary>
+    private double _durationSeconds;
+
+    /// <summary>
+    /// Wall-clock duration of the phase in seconds. When both <see cref="StartedAt"/> and
+    /// <see cref="CompletedAt"/> are set, the value is computed from the timestamps. Otherwise
+    /// returns the explicitly set value (for JSON backward compatibility).
+    /// </summary>
+    public double DurationSeconds
+    {
+        get => (CompletedAt.HasValue && StartedAt.HasValue)
+            ? (CompletedAt.Value - StartedAt.Value).TotalSeconds
+            : _durationSeconds;
+        set => _durationSeconds = value;
+    }
     /// <summary>Raw worker output captured for this phase, or <c>null</c> if not recorded.</summary>
     public string? WorkerOutput { get; set; }
     /// <summary>Brain prompt (user message) sent when crafting the worker prompt for this phase.</summary>
@@ -119,7 +132,15 @@ public sealed class PhaseResult
     /// 1-based occurrence index of this phase within the iteration plan (e.g. 1 for first Coding, 2 for second Coding).
     /// Null for legacy persisted summaries that predate per-occurrence tracking.
     /// </summary>
-    public int? Occurrence { get; init; }
+    public int? Occurrence { get; set; }
+    /// <summary>1-based iteration number this phase entry belongs to. Null for legacy data.</summary>
+    public int? Iteration { get; set; }
+    /// <summary>UTC timestamp when the phase was dispatched to the worker.</summary>
+    public DateTime? StartedAt { get; set; }
+    /// <summary>UTC timestamp when the worker result was received.</summary>
+    public DateTime? CompletedAt { get; set; }
+    /// <summary>The raw verdict string from the worker (e.g. "PASS", "FAIL", "APPROVE", "REQUEST_CHANGES").</summary>
+    public string? Verdict { get; set; }
 }
 
 /// <summary>Aggregate test counts from a tester run.</summary>

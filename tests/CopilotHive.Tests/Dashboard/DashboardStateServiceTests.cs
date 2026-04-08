@@ -7,6 +7,8 @@ using CopilotHive.Workers;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 
+using WorkerRole = CopilotHive.Workers.WorkerRole;
+
 namespace CopilotHive.Tests.Dashboard;
 
 /// <summary>
@@ -683,8 +685,10 @@ public sealed class DashboardStateServiceTests : IDisposable
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
         // Advance to iteration 2 so the pipeline's iteration-1 outputs don't conflict
         pipeline.IterationBudget.TryConsume(); // Now at iteration 2
-        pipeline.RecordOutput(WorkerRole.Coder, 2, "Live output from iteration 2 (should NOT be shown for iteration 1)");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 2, "Live output from iteration 2 (should NOT be shown for iteration 1)");
+#pragma warning disable CS0618
         pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(30);
+#pragma warning restore CS0618
 
         var goalManager = new GoalManager();
         goalManager.AddSource(_store);
@@ -742,8 +746,10 @@ public sealed class DashboardStateServiceTests : IDisposable
         pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
         pipeline.AdvanceTo(GoalPhase.Coding);
         // Iteration defaults to 1
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "Live pipeline output should be used.");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "Live pipeline output should be used.");
+#pragma warning disable CS0618
         pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(30);
+#pragma warning restore CS0618
 
         var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
@@ -842,6 +848,16 @@ public sealed class DashboardStateServiceTests : IDisposable
         pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
         pipeline.AdvanceTo(GoalPhase.Coding);
 
+        // Add an active (not completed) PhaseLog entry for Coding
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Iteration = 1,
+            Occurrence = 1,
+            Result = PhaseOutcome.Pass,
+            StartedAt = DateTime.UtcNow,
+        });
+
         var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
         goalManager.AddSource(goalSource);
@@ -857,7 +873,7 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.NotNull(detail);
         var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
         Assert.NotNull(currentIteration);
-        // Planning (completed) + 3 worker phases = 4 total
+        // Planning (completed) + Coding (active) + 2 pending worker phases = 4 total
         Assert.Equal(4, currentIteration.Phases.Count);
         Assert.Equal("Planning", currentIteration.Phases[0].Name);
         Assert.Equal("completed", currentIteration.Phases[0].Status);
@@ -1133,235 +1149,6 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Equal(version, orchestratorInfo.Version);
     }
 
-    // ── ExtractPlanningPrompts ──────────────────────────────────────────────
-
-    /// <summary>
-    /// Verifies that <see cref="DashboardStateService.ExtractPlanningPrompts"/> returns null for
-    /// both values when there are no planning entries for the given iteration.
-    /// </summary>
-    [Fact]
-    public void ExtractPlanningPrompts_NoEntries_ReturnsNulls()
-    {
-        var entries = new List<ConversationEntry>
-        {
-            new ConversationEntry("user", "Some other message", 1, "craft-prompt"),
-        };
-
-        var (userPrompt, assistantResponse) = DashboardStateService.ExtractPlanningPrompts(entries, 1);
-
-        Assert.Null(userPrompt);
-        Assert.Null(assistantResponse);
-    }
-
-    /// <summary>
-    /// Verifies that <see cref="DashboardStateService.ExtractPlanningPrompts"/> correctly extracts
-    /// the user prompt and assistant response for a given iteration.
-    /// </summary>
-    [Fact]
-    public void ExtractPlanningPrompts_WithPlanningEntries_ExtractsBothPrompts()
-    {
-        var entries = new List<ConversationEntry>
-        {
-            new ConversationEntry("user", "Plan this goal now", 1, "planning"),
-            new ConversationEntry("assistant", "Here is my plan: ...", 1, "planning"),
-        };
-
-        var (userPrompt, assistantResponse) = DashboardStateService.ExtractPlanningPrompts(entries, 1);
-
-        Assert.Equal("Plan this goal now", userPrompt);
-        Assert.Equal("Here is my plan: ...", assistantResponse);
-    }
-
-    /// <summary>
-    /// Verifies that <see cref="DashboardStateService.ExtractPlanningPrompts"/> only returns entries
-    /// matching the requested iteration, ignoring entries from other iterations.
-    /// </summary>
-    [Fact]
-    public void ExtractPlanningPrompts_FiltersToRequestedIteration()
-    {
-        var entries = new List<ConversationEntry>
-        {
-            new ConversationEntry("user", "Iter 1 prompt", 1, "planning"),
-            new ConversationEntry("assistant", "Iter 1 response", 1, "planning"),
-            new ConversationEntry("user", "Iter 2 prompt", 2, "planning"),
-            new ConversationEntry("assistant", "Iter 2 response", 2, "planning"),
-        };
-
-        var (userPrompt, assistantResponse) = DashboardStateService.ExtractPlanningPrompts(entries, 2);
-
-        Assert.Equal("Iter 2 prompt", userPrompt);
-        Assert.Equal("Iter 2 response", assistantResponse);
-    }
-
-    // ── ExtractCraftPrompts ────────────────────────────────────────────────
-
-    /// <summary>
-    /// Verifies that <see cref="DashboardStateService.ExtractCraftPrompts"/> returns an empty
-    /// dictionary when there are no craft-prompt or worker-output entries.
-    /// </summary>
-    [Fact]
-    public void ExtractCraftPrompts_NoEntries_ReturnsEmpty()
-    {
-        var entries = new List<ConversationEntry>
-        {
-            new ConversationEntry("user", "Planning prompt", 1, "planning"),
-        };
-
-        var result = DashboardStateService.ExtractCraftPrompts(entries, 1);
-
-        Assert.Empty(result);
-    }
-
-    /// <summary>
-    /// Verifies that <see cref="DashboardStateService.ExtractCraftPrompts"/> associates
-    /// a craft-prompt pair with the subsequent worker-output role.
-    /// </summary>
-    [Fact]
-    public void ExtractCraftPrompts_SingleWorker_AssociatesCorrectly()
-    {
-        var entries = new List<ConversationEntry>
-        {
-            new ConversationEntry("user", "Write code for this", 1, "craft-prompt"),
-            new ConversationEntry("assistant", "Your task: implement feature X", 1, "craft-prompt"),
-            new ConversationEntry("coder", "I implemented feature X.", 1, "worker-output"),
-        };
-
-        var result = DashboardStateService.ExtractCraftPrompts(entries, 1);
-
-        Assert.True(result.ContainsKey("coder"));
-        Assert.Equal("Write code for this", result["coder"].BrainPrompt);
-        Assert.Equal("Your task: implement feature X", result["coder"].WorkerPrompt);
-    }
-
-    /// <summary>
-    /// Verifies that <see cref="DashboardStateService.ExtractCraftPrompts"/> correctly associates
-    /// separate craft-prompt pairs with each worker role in order.
-    /// </summary>
-    [Fact]
-    public void ExtractCraftPrompts_MultipleWorkers_AssociatesEachCorrectly()
-    {
-        var entries = new List<ConversationEntry>
-        {
-            new ConversationEntry("user", "Brain asks coder", 1, "craft-prompt"),
-            new ConversationEntry("assistant", "Crafted coder prompt", 1, "craft-prompt"),
-            new ConversationEntry("coder", "Coder done.", 1, "worker-output"),
-            new ConversationEntry("user", "Brain asks tester", 1, "craft-prompt"),
-            new ConversationEntry("assistant", "Crafted tester prompt", 1, "craft-prompt"),
-            new ConversationEntry("tester", "Tester done.", 1, "worker-output"),
-        };
-
-        var result = DashboardStateService.ExtractCraftPrompts(entries, 1);
-
-        Assert.True(result.ContainsKey("coder"));
-        Assert.Equal("Brain asks coder", result["coder"].BrainPrompt);
-        Assert.Equal("Crafted coder prompt", result["coder"].WorkerPrompt);
-
-        Assert.True(result.ContainsKey("tester"));
-        Assert.Equal("Brain asks tester", result["tester"].BrainPrompt);
-        Assert.Equal("Crafted tester prompt", result["tester"].WorkerPrompt);
-    }
-
-    /// <summary>
-    /// Verifies that <see cref="DashboardStateService.ExtractCraftPrompts"/> filters to the
-    /// requested iteration and ignores entries from other iterations.
-    /// </summary>
-    [Fact]
-    public void ExtractCraftPrompts_FiltersToRequestedIteration()
-    {
-        var entries = new List<ConversationEntry>
-        {
-            new ConversationEntry("user", "Iter 1 brain prompt", 1, "craft-prompt"),
-            new ConversationEntry("assistant", "Iter 1 worker prompt", 1, "craft-prompt"),
-            new ConversationEntry("coder", "Iter 1 output", 1, "worker-output"),
-            new ConversationEntry("user", "Iter 2 brain prompt", 2, "craft-prompt"),
-            new ConversationEntry("assistant", "Iter 2 worker prompt", 2, "craft-prompt"),
-            new ConversationEntry("coder", "Iter 2 output", 2, "worker-output"),
-        };
-
-        var result = DashboardStateService.ExtractCraftPrompts(entries, 2);
-
-        Assert.True(result.ContainsKey("coder"));
-        Assert.Equal("Iter 2 brain prompt", result["coder"].BrainPrompt);
-        Assert.Equal("Iter 2 worker prompt", result["coder"].WorkerPrompt);
-        // Should not contain iter 1 overwriting iter 2
-        Assert.Single(result);
-    }
-
-    /// <summary>
-    /// Verifies that <see cref="DashboardStateService.ExtractCraftPrompts"/> handles the case where
-    /// a worker-output appears without a preceding craft-prompt (legacy or missing entries).
-    /// </summary>
-    [Fact]
-    public void ExtractCraftPrompts_WorkerOutputWithoutCraftPrompt_HasNullPrompts()
-    {
-        var entries = new List<ConversationEntry>
-        {
-            new ConversationEntry("coder", "Coder just did it.", 1, "worker-output"),
-        };
-
-        var result = DashboardStateService.ExtractCraftPrompts(entries, 1);
-
-        Assert.True(result.ContainsKey("coder"));
-        Assert.Null(result["coder"].BrainPrompt);
-        Assert.Null(result["coder"].WorkerPrompt);
-    }
-
-    // ── Regression: ExtractPlanningPrompts — multiple entries ──────────────
-
-    /// <summary>
-    /// Regression: when <c>PlanIterationAsync</c> is called more than once (nudge/retry),
-    /// multiple planning entries are appended. <see cref="DashboardStateService.ExtractPlanningPrompts"/>
-    /// must return the LAST pair, not the first.
-    /// </summary>
-    [Fact]
-    public void ExtractPlanningPrompts_MultiplePlanningEntries_ReturnsLastPair()
-    {
-        var entries = new List<ConversationEntry>
-        {
-            // First attempt (should be ignored)
-            new ConversationEntry("user",      "Plan attempt 1",      1, "planning"),
-            new ConversationEntry("assistant", "Response attempt 1",  1, "planning"),
-            // Second (nudge) attempt — this is the authoritative one
-            new ConversationEntry("user",      "Plan attempt 2 nudge", 1, "planning"),
-            new ConversationEntry("assistant", "Response attempt 2",   1, "planning"),
-        };
-
-        var (userPrompt, assistantResponse) = DashboardStateService.ExtractPlanningPrompts(entries, 1);
-
-        Assert.Equal("Plan attempt 2 nudge", userPrompt);
-        Assert.Equal("Response attempt 2",   assistantResponse);
-    }
-
-    // ── Regression: ExtractCraftPrompts — AskBrainAsync mid-task follow-ups ──
-
-    /// <summary>
-    /// Regression: <c>AskBrainAsync</c> adds more craft-prompt entries after the initial
-    /// dispatch pair. <see cref="DashboardStateService.ExtractCraftPrompts"/> must keep
-    /// only the FIRST pair (the dispatch prompt), not the follow-up Q&amp;A.
-    /// </summary>
-    [Fact]
-    public void ExtractCraftPrompts_MidTaskFollowUp_ShowsDispatchPromptNotFollowUp()
-    {
-        var entries = new List<ConversationEntry>
-        {
-            // Initial dispatch pair (first — should be retained)
-            new ConversationEntry("user",      "Dispatch: write the feature",  1, "craft-prompt"),
-            new ConversationEntry("assistant", "Task: implement feature X",    1, "craft-prompt"),
-            // Mid-task follow-up via AskBrainAsync (should NOT overwrite the dispatch prompt)
-            new ConversationEntry("user",      "Follow-up question",           1, "craft-prompt"),
-            new ConversationEntry("assistant", "Follow-up answer",             1, "craft-prompt"),
-            // Worker reports output after the follow-up
-            new ConversationEntry("coder",     "Coder finished with help.",    1, "worker-output"),
-        };
-
-        var result = DashboardStateService.ExtractCraftPrompts(entries, 1);
-
-        Assert.True(result.ContainsKey("coder"));
-        // Must show the FIRST (dispatch) prompt, not the follow-up
-        Assert.Equal("Dispatch: write the feature", result["coder"].BrainPrompt);
-        Assert.Equal("Task: implement feature X",   result["coder"].WorkerPrompt);
-    }
-
     // ── GetGoalDetail: inline prompts in phases ──────────────────────────
 
     /// <summary>
@@ -1370,7 +1157,7 @@ public sealed class DashboardStateServiceTests : IDisposable
     /// for worker phases from the pipeline conversation.
     /// </summary>
     [Fact]
-    public async Task GetGoalDetail_PopulatesPhasePrompts_FromPipelineConversation()
+    public async Task GetGoalDetail_PopulatesPhasePrompts_FromPhaseLog()
     {
         var goal = new Goal
         {
@@ -1388,10 +1175,18 @@ public sealed class DashboardStateServiceTests : IDisposable
         pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
         pipeline.AdvanceTo(GoalPhase.Coding);
 
-        // Add craft-prompt + worker-output conversation entries
-        pipeline.Conversation.Add(new ConversationEntry("user", "Brain prompt for coder", 1, "craft-prompt"));
-        pipeline.Conversation.Add(new ConversationEntry("assistant", "Crafted coder task", 1, "craft-prompt"));
-        pipeline.Conversation.Add(new ConversationEntry("coder", "Coder finished.", 1, "worker-output"));
+        // Add PhaseLog entry with BrainPrompt and WorkerPrompt (this is now the primary source)
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Iteration = 1,
+            Occurrence = 1,
+            Result = PhaseOutcome.Pass,
+            BrainPrompt = "Brain prompt for coder",
+            WorkerPrompt = "Crafted coder task",
+            WorkerOutput = "Coder finished.",
+            CompletedAt = DateTime.UtcNow,
+        });
 
         var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
@@ -1434,9 +1229,18 @@ public sealed class DashboardStateServiceTests : IDisposable
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
 
-        // Add planning conversation entries
-        pipeline.Conversation.Add(new ConversationEntry("user", "Please plan iteration 1", 1, "planning"));
-        pipeline.Conversation.Add(new ConversationEntry("assistant", "I will code and test.", 1, "planning"));
+        // Add a PhaseLog entry with PlanningPrompt/PlanningResponse set
+        // (in production, GoalDispatcher sets these after ResolvePlanAsync completes)
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Occurrence = 1,
+            Iteration = 1,
+            StartedAt = DateTime.UtcNow,
+            PlanningPrompt = "Please plan iteration 1",
+            PlanningResponse = "I will code and test.",
+        });
 
         var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
@@ -2056,21 +1860,30 @@ public sealed class DashboardStateServiceTests : IDisposable
             Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
         };
         pipeline.SetPlan(plan);
-        // Use RestoreFromPlan to set the state machine to Testing with remaining phases
         pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Testing);
-        
-        // Set pipeline.Phase to Testing using AdvanceTo
         pipeline.AdvanceTo(GoalPhase.Testing);
-        // After RestoreFromPlan + AdvanceTo: remainingCount = 3 (Coding, Testing, Review, Merging)
-        // completedCount = 6 - 3 - 1 = 2 (indices 0, 1 are completed)
-        // But the actual result shows 3 completed (Planning always counts)
 
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "First coding output");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "First testing output");
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "Second coding output");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "Second testing output");
-        pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(30);
-        pipeline.Metrics.PhaseDurations["Testing"] = TimeSpan.FromSeconds(20);
+        // Add PhaseLog entries for completed and active phases
+        var start = DateTime.UtcNow.AddMinutes(-5);
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Iteration = 1, Occurrence = 1,
+            Result = PhaseOutcome.Pass, WorkerOutput = "First coding output",
+            StartedAt = start, CompletedAt = start.AddSeconds(15),
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing, Iteration = 1, Occurrence = 1,
+            Result = PhaseOutcome.Pass, WorkerOutput = "First testing output",
+            StartedAt = start.AddSeconds(15), CompletedAt = start.AddSeconds(25),
+        });
+        // Active phase (no CompletedAt)
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Iteration = 1, Occurrence = 2,
+            Result = PhaseOutcome.Pass,
+            StartedAt = start.AddSeconds(25),
+        });
 
         var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
@@ -2088,11 +1901,7 @@ public sealed class DashboardStateServiceTests : IDisposable
         var currentIteration = detail.Iterations.FirstOrDefault(i => i.IsCurrent);
         Assert.NotNull(currentIteration);
 
-        // After RestoreFromPlan at Testing + AdvanceTo:
-        // Phase order: Planning, Coding/1, Testing/1, Coding/2, Testing/2, Review, Merging
-        // Status: completed, completed, completed, active, pending, pending, pending
-        // (3 completed because Planning is always completed + 2 from completedCount)
-        
+        // Phase order: Planning, Coding/1, Testing/1, Coding/2 (active), Testing/2 (pending), Review (pending), Merging (pending)
         Assert.Equal(7, currentIteration.Phases.Count);
         
         // Verify Planning is completed
@@ -2147,7 +1956,28 @@ public sealed class DashboardStateServiceTests : IDisposable
         pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Testing);
         // Set pipeline.Phase to Testing using AdvanceTo
         pipeline.AdvanceTo(GoalPhase.Testing);
-        // Now: SM at Testing, Remaining=[Coding, Testing, Review, Merging], Phase=Testing
+
+        // Add PhaseLog entries for completed and active phases
+        var start = DateTime.UtcNow.AddMinutes(-5);
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Iteration = 1, Occurrence = 1,
+            Result = PhaseOutcome.Pass,
+            StartedAt = start, CompletedAt = start.AddSeconds(15),
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing, Iteration = 1, Occurrence = 1,
+            Result = PhaseOutcome.Pass,
+            StartedAt = start.AddSeconds(15), CompletedAt = start.AddSeconds(25),
+        });
+        // Active phase (no CompletedAt)
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Iteration = 1, Occurrence = 2,
+            Result = PhaseOutcome.Pass,
+            StartedAt = start.AddSeconds(25),
+        });
 
         var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
@@ -2228,16 +2058,11 @@ public sealed class DashboardStateServiceTests : IDisposable
         phaseProperty?.SetValue(pipeline, GoalPhase.Review);
 
         // Record outputs with per-occurrence tracking
-        pipeline.PhaseOccurrence = 1;
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "First coding output");
-        pipeline.PhaseOccurrence = 1;
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "First testing output");
-        pipeline.PhaseOccurrence = 2;
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "Second coding output");
-        pipeline.PhaseOccurrence = 2;
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "Second testing output");
-        pipeline.PhaseOccurrence = 1;
-        pipeline.RecordOutput(WorkerRole.Reviewer, 1, "Review output");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "First coding output", occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "First testing output", occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "Second coding output", occurrence: 2);
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "Second testing output", occurrence: 2);
+        pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, "Review output", occurrence: 1);
 
         var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
@@ -2305,10 +2130,44 @@ public sealed class DashboardStateServiceTests : IDisposable
         };
         pipeline.SetPlan(plan);
         // Use RestoreFromPlan to set RemainingPhases correctly
-        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Testing);
-        // Set pipeline.Phase to Testing so GetGoalDetail sees worker phases
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Review);
+        // Set pipeline.Phase to Review so GetGoalDetail sees all worker phases
         var phaseProperty = typeof(GoalPipeline).GetProperty("Phase");
-        phaseProperty?.SetValue(pipeline, GoalPhase.Testing);
+        phaseProperty?.SetValue(pipeline, GoalPhase.Review);
+
+        // Add PhaseLog entries for all completed and active phases
+        var start = DateTime.UtcNow.AddMinutes(-5);
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Iteration = 1, Occurrence = 1,
+            Result = PhaseOutcome.Pass,
+            StartedAt = start, CompletedAt = start.AddSeconds(15),
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing, Iteration = 1, Occurrence = 1,
+            Result = PhaseOutcome.Pass,
+            StartedAt = start.AddSeconds(15), CompletedAt = start.AddSeconds(25),
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Iteration = 1, Occurrence = 2,
+            Result = PhaseOutcome.Pass,
+            StartedAt = start.AddSeconds(25), CompletedAt = start.AddSeconds(40),
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing, Iteration = 1, Occurrence = 2,
+            Result = PhaseOutcome.Pass,
+            StartedAt = start.AddSeconds(40), CompletedAt = start.AddSeconds(50),
+        });
+        // Active phase (no CompletedAt)
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Review, Iteration = 1, Occurrence = 1,
+            Result = PhaseOutcome.Pass,
+            StartedAt = start.AddSeconds(50),
+        });
 
         // Add progress reports with per-occurrence tracking.
         // Occurrence 1 reports for Coding and Testing

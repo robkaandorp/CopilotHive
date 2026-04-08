@@ -285,20 +285,6 @@ public sealed class DashboardStateService : IDisposable
 
     // ── Static prompt-extraction helpers (kept on DashboardStateService for callers) ──
 
-    /// <summary>
-    /// Extracts the planning Brain prompt and response for a given iteration from the conversation log.
-    /// </summary>
-    public static (string? UserPrompt, string? AssistantResponse) ExtractPlanningPrompts(
-        IEnumerable<ConversationEntry> conversation, int iteration) =>
-        GoalDetailViewBuilder.ExtractPlanningPrompts(conversation, iteration);
-
-    /// <summary>
-    /// Walks the conversation log and associates craft-prompt pairs with the worker role.
-    /// </summary>
-    public static Dictionary<string, (string? BrainPrompt, string? WorkerPrompt)> ExtractCraftPrompts(
-        IEnumerable<ConversationEntry> conversation, int iteration) =>
-        GoalDetailViewBuilder.ExtractCraftPrompts(conversation, iteration);
-
     // ── Release CRUD ───────────────────────────────────────────────────────────
 
     /// <summary>Returns all releases, optionally filtered by repository name.</summary>

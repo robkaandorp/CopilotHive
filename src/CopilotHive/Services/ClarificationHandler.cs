@@ -149,7 +149,7 @@ internal sealed class ClarificationHandler
             Answer: answer,
             AnsweredBy: answeredBy)
         {
-            Occurrence = pipeline.PhaseOccurrence,
+            Occurrence = pipeline.CurrentPhaseEntry?.Occurrence ?? 1,
         };
 
         pipeline.Clarifications.Add(entry);

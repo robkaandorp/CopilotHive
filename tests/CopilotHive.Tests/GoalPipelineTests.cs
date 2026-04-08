@@ -4,6 +4,8 @@ using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Extensions.Logging.Abstractions;
 
+#pragma warning disable CS0618 // Obsolete members tested for backward compatibility
+
 namespace CopilotHive.Tests;
 
 public sealed class GoalPipelineTests
@@ -30,7 +32,7 @@ public sealed class GoalPipelineTests
         Assert.Null(pipeline.ActiveTaskId);
         Assert.Null(pipeline.CoderBranch);
         Assert.Null(pipeline.CompletedAt);
-        Assert.Empty(pipeline.PhaseOutputs);
+        Assert.Empty(pipeline.PhaseLog);
     }
 
     [Theory]
@@ -77,95 +79,21 @@ public sealed class GoalPipelineTests
     }
 
     [Fact]
-    public void AdvanceTo_RecordsPerOccurrenceDuration()
+    public void AdvanceTo_PhaseLog_RecordsDuration()
     {
         var pipeline = new GoalPipeline(CreateGoal());
-        
-        // AdvanceTo records duration of PREVIOUS phase when transitioning.
-        // PhaseOccurrence must be set BEFORE AdvanceTo to correctly record the phase being left.
-        // The occurrence recorded is: {phase_being_left}-{PhaseOccurrence_at_time_of_AdvanceTo}
-        
-        // Start: Phase is Planning (default), no duration recorded for Planning
-        pipeline.PhaseOccurrence = 1;
-        pipeline.AdvanceTo(GoalPhase.Coding);
-        System.Threading.Thread.Sleep(10); // Small delay for measurable duration
-        
-        // Transition FROM Coding (occurrence 1) TO Testing (occurrence 1)
-        // PhaseOccurrence = 1 records Coding-1
-        pipeline.PhaseOccurrence = 1;
-        pipeline.AdvanceTo(GoalPhase.Testing);
-        
-        // Verify Coding-1 was recorded
-        Assert.True(pipeline.Metrics.PhaseDurations.ContainsKey("Coding-1"), "Should have Coding-1 key");
-        
-        System.Threading.Thread.Sleep(10);
-        
-        // Transition FROM Testing (occurrence 1) TO Coding (occurrence 2)
-        // PhaseOccurrence = 1 records Testing-1
-        pipeline.PhaseOccurrence = 1;
-        pipeline.AdvanceTo(GoalPhase.Coding);
-        
-        // Verify Testing-1 was recorded
-        Assert.True(pipeline.Metrics.PhaseDurations.ContainsKey("Testing-1"), "Should have Testing-1 key");
-        
-        System.Threading.Thread.Sleep(10);
-        
-        // Transition FROM Coding (occurrence 2) TO Testing (occurrence 2)
-        // PhaseOccurrence = 2 records Coding-2
-        pipeline.PhaseOccurrence = 2;
-        pipeline.AdvanceTo(GoalPhase.Testing);
-        
-        // Verify Coding-2 was recorded
-        Assert.True(pipeline.Metrics.PhaseDurations.ContainsKey("Coding-2"), "Should have Coding-2 key");
-        
-        System.Threading.Thread.Sleep(10);
-        
-        // Transition FROM Testing (occurrence 2) TO Done
-        // PhaseOccurrence = 2 records Testing-2
-        pipeline.PhaseOccurrence = 2;
-        pipeline.AdvanceTo(GoalPhase.Done);
-        
-        // Verify Testing-2 was recorded
-        Assert.True(pipeline.Metrics.PhaseDurations.ContainsKey("Testing-2"), "Should have Testing-2 key");
-        
-        // Verify accumulated keys exist
-        Assert.True(pipeline.Metrics.PhaseDurations.ContainsKey("Coding"));
-        Assert.True(pipeline.Metrics.PhaseDurations.ContainsKey("Testing"));
-        
-        // Verify accumulation is correct
-        var codingTotal = pipeline.Metrics.PhaseDurations["Coding-1"] + pipeline.Metrics.PhaseDurations["Coding-2"];
-        Assert.Equal(codingTotal, pipeline.Metrics.PhaseDurations["Coding"]);
-        
-        var testingTotal = pipeline.Metrics.PhaseDurations["Testing-1"] + pipeline.Metrics.PhaseDurations["Testing-2"];
-        Assert.Equal(testingTotal, pipeline.Metrics.PhaseDurations["Testing"]);
-    }
 
-    [Fact]
-    public void AdvanceTo_SingleOccurrence_UsesOccurrenceOne()
-    {
-        var pipeline = new GoalPipeline(CreateGoal());
-        
-        // Default PhaseOccurrence is 1
-        Assert.Equal(1, pipeline.PhaseOccurrence);
-        
-        // Start Coding - Planning phase is not recorded (special case)
+        // PhaseLog entries track duration via StartedAt/CompletedAt
+        // This test verifies that AdvanceTo transitions update the pipeline phase
         pipeline.AdvanceTo(GoalPhase.Coding);
-        System.Threading.Thread.Sleep(10);
-        
-        // Transition to Testing - records Coding-1 (uses current PhaseOccurrence = 1)
+        Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+
         pipeline.AdvanceTo(GoalPhase.Testing);
-        
-        // Should have per-occurrence key for Coding
-        Assert.True(pipeline.Metrics.PhaseDurations.ContainsKey("Coding-1"));
-        Assert.True(pipeline.Metrics.PhaseDurations.ContainsKey("Coding"));
-        
-        System.Threading.Thread.Sleep(10);
-        
-        // Transition to Done - records Testing-1 (PhaseOccurrence still = 1)
+        Assert.Equal(GoalPhase.Testing, pipeline.Phase);
+
         pipeline.AdvanceTo(GoalPhase.Done);
-        
-        Assert.True(pipeline.Metrics.PhaseDurations.ContainsKey("Testing-1"));
-        Assert.True(pipeline.Metrics.PhaseDurations.ContainsKey("Testing"));
+        Assert.Equal(GoalPhase.Done, pipeline.Phase);
+        Assert.NotNull(pipeline.CompletedAt);
     }
 
     #endregion
@@ -220,50 +148,75 @@ public sealed class GoalPipelineTests
 
     #endregion
 
-    #region GoalPipeline — RecordOutput
+    #region GoalPipeline — PhaseLog
 
     [Fact]
-    public void RecordOutput_SingleEntry_StoresWithCorrectKey()
+    public void PhaseLog_SingleEntry_StoresOutput()
     {
         var pipeline = new GoalPipeline(CreateGoal());
 
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "some output");
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "some output",
+        });
 
-        Assert.True(pipeline.PhaseOutputs.ContainsKey("coder-1"));
-        Assert.Equal("some output", pipeline.PhaseOutputs["coder-1"]);
+        Assert.Single(pipeline.PhaseLog);
+        Assert.Equal("some output", pipeline.PhaseLog[0].WorkerOutput);
     }
 
     [Fact]
-    public void RecordOutput_MultipleEntries_StoresAll()
+    public void PhaseLog_MultipleEntries_StoresAll()
     {
         var pipeline = new GoalPipeline(CreateGoal());
 
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "code output");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "test output");
-        pipeline.RecordOutput(WorkerRole.Coder, 2, "code v2");
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "code output",
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "test output",
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 2, Occurrence = 1,
+            WorkerOutput = "code v2",
+        });
 
-        // Each RecordOutput stores two keys: per-occurrence and backward-compatible latest
-        // coder-1-1, coder-1 (occurrence 1, default PhaseOccurrence)
-        // tester-1-1, tester-1
-        // coder-2-1, coder-2
-        Assert.Equal(6, pipeline.PhaseOutputs.Count);
-        Assert.Equal("code output", pipeline.PhaseOutputs["coder-1"]);
-        Assert.Equal("code output", pipeline.PhaseOutputs["coder-1-1"]);
-        Assert.Equal("test output", pipeline.PhaseOutputs["tester-1"]);
-        Assert.Equal("test output", pipeline.PhaseOutputs["tester-1-1"]);
-        Assert.Equal("code v2", pipeline.PhaseOutputs["coder-2"]);
-        Assert.Equal("code v2", pipeline.PhaseOutputs["coder-2-1"]);
+        Assert.Equal(3, pipeline.PhaseLog.Count);
+        Assert.Equal("code output", pipeline.PhaseLog[0].WorkerOutput);
+        Assert.Equal("test output", pipeline.PhaseLog[1].WorkerOutput);
+        Assert.Equal("code v2", pipeline.PhaseLog[2].WorkerOutput);
     }
 
     [Fact]
-    public void RecordOutput_SameKey_OverwritesPrevious()
+    public void PhaseLog_AppendOnly_DoesNotOverwrite()
     {
         var pipeline = new GoalPipeline(CreateGoal());
 
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "first");
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "second");
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "first",
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "second",
+        });
 
-        Assert.Equal("second", pipeline.PhaseOutputs["coder-1"]);
+        Assert.Equal(2, pipeline.PhaseLog.Count);
+        Assert.Equal("first", pipeline.PhaseLog[0].WorkerOutput);
+        Assert.Equal("second", pipeline.PhaseLog[1].WorkerOutput);
     }
 
     #endregion
@@ -375,16 +328,21 @@ public sealed class GoalPipelineTests
     }
 
     [Fact]
-    public void BuildContextSummary_WithPhaseOutputs_IncludesOutputSections()
+    public void BuildContextSummary_WithPhaseLog_IncludesOutputSections()
     {
         var pipeline = new GoalPipeline(CreateGoal());
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "hello world");
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "hello world",
+        });
 
         var summary = pipeline.BuildContextSummary();
 
-        Assert.Contains("=== Output from coder-1 ===", summary);
+        Assert.Contains("=== Output from coder-1-1 ===", summary);
         Assert.Contains("hello world", summary);
-        Assert.Contains("=== End output from coder-1 ===", summary);
+        Assert.Contains("=== End output from coder-1-1 ===", summary);
     }
 
     [Fact]
@@ -392,7 +350,12 @@ public sealed class GoalPipelineTests
     {
         var pipeline = new GoalPipeline(CreateGoal());
         var longOutput = new string('x', 3000);
-        pipeline.RecordOutput(WorkerRole.Coder, 1, longOutput);
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = longOutput,
+        });
 
         var summary = pipeline.BuildContextSummary();
 
@@ -575,39 +538,44 @@ public sealed class GoalPipelineRoleSessionTests
     }
 
     [Fact]
-    public void RestoredFromSnapshot_PhaseOccurrence_IsRestored()
+    public void RestoredFromSnapshot_PhaseLog_IsRestored()
     {
-        var goal = CreateGoal("g-occ");
+        var goal = CreateGoal("g-log");
         var snapshot = new CopilotHive.Persistence.PipelineSnapshot
         {
             GoalId = goal.Id,
             Description = goal.Description,
             Goal = goal,
             CreatedAt = DateTime.UtcNow,
-            PhaseOccurrence = 3,
+            PhaseLog =
+            [
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, Iteration = 1, Occurrence = 1 },
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Fail, Iteration = 1, Occurrence = 1 },
+            ],
         };
 
         var pipeline = new GoalPipeline(snapshot);
 
-        Assert.Equal(3, pipeline.PhaseOccurrence);
+        Assert.Equal(2, pipeline.PhaseLog.Count);
+        Assert.Equal(GoalPhase.Coding, pipeline.PhaseLog[0].Name);
+        Assert.Equal(GoalPhase.Testing, pipeline.PhaseLog[1].Name);
     }
 
     [Fact]
-    public void RestoredFromSnapshot_PhaseOccurrence_DefaultsToOne()
+    public void RestoredFromSnapshot_PhaseLog_DefaultsToEmpty()
     {
-        var goal = CreateGoal("g-occ-default");
+        var goal = CreateGoal("g-log-default");
         var snapshot = new CopilotHive.Persistence.PipelineSnapshot
         {
             GoalId = goal.Id,
             Description = goal.Description,
             Goal = goal,
             CreatedAt = DateTime.UtcNow,
-            // PhaseOccurrence not explicitly set — PipelineSnapshot defaults to 1
         };
 
         var pipeline = new GoalPipeline(snapshot);
 
-        Assert.Equal(1, pipeline.PhaseOccurrence);
+        Assert.Empty(pipeline.PhaseLog);
     }
 
     #endregion

@@ -119,14 +119,6 @@ public sealed class ImprovementAnalyzer
         if (current.ReviewVerdict is not null)
             sb.AppendLine($"- Review verdict: {current.ReviewVerdict} ({current.ReviewIssuesFound} issues found)");
 
-        if (current.PhaseDurations.Count > 0)
-        {
-            sb.AppendLine();
-            sb.AppendLine("## Phase Durations");
-            foreach (var (phase, duration) in current.PhaseDurations)
-                sb.AppendLine($"- {phase}: {duration.TotalMinutes:F1} min");
-        }
-
         if (!string.IsNullOrEmpty(current.TestReportSummary))
             sb.AppendLine($"- Summary: {current.TestReportSummary}");
 

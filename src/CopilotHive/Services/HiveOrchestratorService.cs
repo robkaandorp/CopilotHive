@@ -435,7 +435,8 @@ public sealed class HiveOrchestratorService(
                 var outputText = !string.IsNullOrWhiteSpace(complete.Metrics?.Summary)
                     ? complete.Metrics.Summary
                     : complete.Output;
-                pipeline.RecordOutput(workerRole, pipeline.Iteration, outputText);
+                if (pipeline.CurrentPhaseEntry is { } entry)
+                    entry.WorkerOutput = outputText;
             }
         }
 

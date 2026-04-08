@@ -12,6 +12,55 @@ using WorkerRole = CopilotHive.Workers.WorkerRole;
 
 namespace CopilotHive.Tests;
 
+/// <summary>
+/// Test helper to simulate the old RecordOutput/PhaseOutputs behavior using PhaseLog.
+/// </summary>
+internal static class PipelineTestHelpers
+{
+    private static readonly Dictionary<WorkerRole, GoalPhase> RoleToPhase = new()
+    {
+        [WorkerRole.Coder] = GoalPhase.Coding,
+        [WorkerRole.Tester] = GoalPhase.Testing,
+        [WorkerRole.Reviewer] = GoalPhase.Review,
+        [WorkerRole.DocWriter] = GoalPhase.DocWriting,
+        [WorkerRole.Improver] = GoalPhase.Improve,
+    };
+
+    /// <summary>
+    /// Adds a PhaseResult to the pipeline's PhaseLog, simulating the old RecordOutput behavior.
+    /// </summary>
+    public static void RecordTestOutput(this GoalPipeline pipeline, WorkerRole role, int iteration, string output, int occurrence = 1)
+    {
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = RoleToPhase[role],
+            Iteration = iteration,
+            Occurrence = occurrence,
+            WorkerOutput = output,
+            Result = PhaseOutcome.Pass,
+            StartedAt = DateTime.UtcNow,
+            CompletedAt = DateTime.UtcNow,
+        });
+    }
+
+    /// <summary>
+    /// Sets a PhaseOutputs-like entry in PhaseLog by adding a PhaseResult for the given role+iteration.
+    /// </summary>
+    public static void SetTestPhaseOutput(this GoalPipeline pipeline, WorkerRole role, int iteration, string output, int occurrence = 1)
+    {
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = RoleToPhase[role],
+            Iteration = iteration,
+            Occurrence = occurrence,
+            WorkerOutput = output,
+            Result = PhaseOutcome.Pass,
+            StartedAt = DateTime.UtcNow,
+            CompletedAt = DateTime.UtcNow,
+        });
+    }
+}
+
 public sealed class DistributedBrainTests
 {
     // -- TaskCompletionNotifier Tests --
@@ -231,7 +280,7 @@ public sealed class DistributedBrainTests
     public void BuildPreviousIterationContext_SecondIteration_IncludesReviewerFeedback()
     {
         var pipeline = CreatePipeline("g-ctx-2", "Review rejected goal");
-        pipeline.RecordOutput(WorkerRole.Reviewer, 1, "FAIL: Missing null check in UserService.GetById()");
+        pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, "FAIL: Missing null check in UserService.GetById()");
         pipeline.IterationBudget.TryConsume(); // Now iteration 2
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
@@ -245,7 +294,7 @@ public sealed class DistributedBrainTests
     public void BuildPreviousIterationContext_SecondIteration_IncludesTesterFeedback()
     {
         var pipeline = CreatePipeline("g-ctx-3", "Test failed goal");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "3 tests failed: TestAuth, TestLogin, TestLogout");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "3 tests failed: TestAuth, TestLogin, TestLogout");
         pipeline.IterationBudget.TryConsume();
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
@@ -258,7 +307,7 @@ public sealed class DistributedBrainTests
     public void BuildPreviousIterationContext_SecondIteration_IncludesCoderOutput()
     {
         var pipeline = CreatePipeline("g-ctx-4", "Coder context goal");
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "Added UserService with CRUD operations");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "Added UserService with CRUD operations");
         pipeline.IterationBudget.TryConsume();
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
@@ -271,9 +320,9 @@ public sealed class DistributedBrainTests
     public void BuildPreviousIterationContext_AllPhaseOutputs_IncludesAll()
     {
         var pipeline = CreatePipeline("g-ctx-5", "Full feedback goal");
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "Implemented feature X");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "All 50 tests pass");
-        pipeline.RecordOutput(WorkerRole.Reviewer, 1, "FAIL: Variable naming inconsistent");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "Implemented feature X");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "All 50 tests pass");
+        pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, "FAIL: Variable naming inconsistent");
         pipeline.IterationBudget.TryConsume();
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
@@ -300,9 +349,9 @@ public sealed class DistributedBrainTests
     public void BuildPreviousIterationContext_ThirdIteration_UsesIterationTwoOutputs()
     {
         var pipeline = CreatePipeline("g-ctx-7", "Multi-iteration goal");
-        pipeline.RecordOutput(WorkerRole.Reviewer, 1, "FAIL: Iteration 1 issue");
+        pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, "FAIL: Iteration 1 issue");
         pipeline.IterationBudget.TryConsume(); // Now iteration 2
-        pipeline.RecordOutput(WorkerRole.Reviewer, 2, "FAIL: Iteration 2 issue");
+        pipeline.RecordTestOutput(WorkerRole.Reviewer, 2, "FAIL: Iteration 2 issue");
         pipeline.IterationBudget.TryConsume(); // Now iteration 3
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
@@ -317,7 +366,7 @@ public sealed class DistributedBrainTests
     {
         var pipeline = CreatePipeline("g-ctx-8", "Long output goal");
         var longOutput = new string('X', 5000);
-        pipeline.RecordOutput(WorkerRole.Reviewer, 1, longOutput);
+        pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, longOutput);
         pipeline.IterationBudget.TryConsume();
 
         var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
@@ -513,7 +562,7 @@ public sealed class DistributedBrainTests
         // Arrange: pipeline with tester output recorded for iteration 1
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-rev-1", "Add null checks to UserService");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "All 42 tests pass. No failures.");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "All 42 tests pass. No failures.");
 
         // Act: call the internal method directly to get the raw prompt text
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
@@ -530,7 +579,7 @@ public sealed class DistributedBrainTests
         // Arrange: even if tester output is present, a Coding phase prompt must not include it
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-coding-1", "Implement feature Y");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "Some test output that should not appear");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "Some test output that should not appear");
 
         // Act
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Coding);
@@ -546,7 +595,7 @@ public sealed class DistributedBrainTests
         // Arrange: tester output present but Testing phase should not include it
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-test-1", "Run integration tests");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "Previous test output should not appear");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "Previous test output should not appear");
 
         // Act
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Testing);
@@ -562,7 +611,7 @@ public sealed class DistributedBrainTests
         // Arrange: pipeline with tester output and additional context
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-rev-order", "Review ordering test");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "UNIQUE_TESTER_MARKER_XYZ");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "UNIQUE_TESTER_MARKER_XYZ");
 
         // Act
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review, "UNIQUE_CONTEXT_MARKER_ABC");
@@ -601,7 +650,7 @@ public sealed class DistributedBrainTests
         // Arrange: tester output is only whitespace
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-review-ws", "Review with whitespace tester output");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "   \n  \t  ");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "   \n  \t  ");
 
         // Act
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
@@ -616,9 +665,9 @@ public sealed class DistributedBrainTests
         // Arrange: record tester output for two iterations, advance to iteration 2
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-review-iter", "Multi-iteration review");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "ITER1_OUTPUT_SHOULD_NOT_APPEAR");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "ITER1_OUTPUT_SHOULD_NOT_APPEAR");
         pipeline.IterationBudget.TryConsume();
-        pipeline.RecordOutput(WorkerRole.Tester, 2, "ITER2_OUTPUT_EXPECTED");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 2, "ITER2_OUTPUT_EXPECTED");
 
         // Act: at iteration 2, should use tester-2 key
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
@@ -637,7 +686,7 @@ public sealed class DistributedBrainTests
         // 2. The craft prompt still includes the tester output section as expected.
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-rev-instr", "Review instruction test");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "All tests pass.");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "All tests pass.");
 
         // Verify the craft prompt includes tester output (key observable behavior)
         var craftPrompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
@@ -688,7 +737,7 @@ public sealed class DistributedBrainTests
     public void BuildReviewFallbackPrompt_WithTesterOutput_ContainsTestResults()
     {
         var pipeline = CreatePipeline("g-fb-1", "Fix null reference in OrderService");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "Passed: 87, Failed: 0");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "Passed: 87, Failed: 0");
 
         var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
 
@@ -701,7 +750,7 @@ public sealed class DistributedBrainTests
     public void BuildReviewFallbackPrompt_ContainsReviewerGuidance()
     {
         var pipeline = CreatePipeline("g-fb-2", "Update API controller");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "All tests pass");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "All tests pass");
 
         var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
 
@@ -749,7 +798,7 @@ public sealed class DistributedBrainTests
     public void BuildReviewFallbackPrompt_WhitespaceOnlyTesterOutput_OmitsTestResultsSection()
     {
         var pipeline = CreatePipeline("g-fb-6", "Clean up imports");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "  \n\t  ");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "  \n\t  ");
 
         var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
 
@@ -760,9 +809,9 @@ public sealed class DistributedBrainTests
     public void BuildReviewFallbackPrompt_UsesCurrentIterationTesterOutput()
     {
         var pipeline = CreatePipeline("g-fb-7", "Multi-iteration fallback review");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "ITER1_FALLBACK_SHOULD_NOT_APPEAR");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "ITER1_FALLBACK_SHOULD_NOT_APPEAR");
         pipeline.IterationBudget.TryConsume();
-        pipeline.RecordOutput(WorkerRole.Tester, 2, "ITER2_FALLBACK_EXPECTED");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 2, "ITER2_FALLBACK_EXPECTED");
 
         var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
 
@@ -776,7 +825,7 @@ public sealed class DistributedBrainTests
         // When agent is null, Review phase must still get tester output and guidance
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-fb-craft-1", "Fix authentication bug");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "FALLBACK_TESTER_RESULTS_42");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "FALLBACK_TESTER_RESULTS_42");
 
         var promptResult = await brain.CraftPromptAsync(pipeline, GoalPhase.Review, null, TestContext.Current.CancellationToken);
 
@@ -1263,7 +1312,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("goal-truncate", "Test tester output truncation");
         const int largeTesterOutputLength = 5000;
         var largeTesterOutput = new string('X', largeTesterOutputLength);
-        pipeline.PhaseOutputs[$"tester-{pipeline.Iteration}"] = largeTesterOutput;
+        pipeline.SetTestPhaseOutput(WorkerRole.Tester, pipeline.Iteration, largeTesterOutput);
 
         // Act: craft a Review-phase prompt
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
@@ -1286,7 +1335,7 @@ public sealed class DistributedBrainTests
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("goal-short-output", "Test short tester output");
         var shortOutput = "All 42 tests passed. Build succeeded.";
-        pipeline.PhaseOutputs[$"tester-{pipeline.Iteration}"] = shortOutput;
+        pipeline.SetTestPhaseOutput(WorkerRole.Tester, pipeline.Iteration, shortOutput);
 
         // Act
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
@@ -1302,7 +1351,7 @@ public sealed class DistributedBrainTests
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("goal-exact-2000", "Test exact 2000 char boundary");
         var exactly2000 = new string('Y', 2000);
-        pipeline.PhaseOutputs[$"tester-{pipeline.Iteration}"] = exactly2000;
+        pipeline.SetTestPhaseOutput(WorkerRole.Tester, pipeline.Iteration, exactly2000);
 
         // Act
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
@@ -1319,7 +1368,7 @@ public sealed class DistributedBrainTests
         // Arrange: pipeline with coder output recorded for iteration 1
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-coder-1", "Implement user service");
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "Added UserService.cs with GetById, Create, Update methods.");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "Added UserService.cs with GetById, Create, Update methods.");
 
         // Act
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
@@ -1351,7 +1400,7 @@ public sealed class DistributedBrainTests
         // Arrange: coder output is only whitespace
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-ws-coder", "Review with whitespace coder output");
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "   \n  \t  ");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "   \n  \t  ");
 
         // Act
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
@@ -1368,7 +1417,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("g-coder-truncate", "Test coder output truncation");
         const int largeCoderOutputLength = 5000;
         var largeCoderOutput = new string('Z', largeCoderOutputLength);
-        pipeline.PhaseOutputs[$"coder-{pipeline.Iteration}"] = largeCoderOutput;
+        pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, largeCoderOutput);
 
         // Act
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
@@ -1391,7 +1440,7 @@ public sealed class DistributedBrainTests
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-short-coder", "Test short coder output");
         var shortOutput = "Implemented feature X as requested.";
-        pipeline.PhaseOutputs[$"coder-{pipeline.Iteration}"] = shortOutput;
+        pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, shortOutput);
 
         // Act
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
@@ -1406,9 +1455,9 @@ public sealed class DistributedBrainTests
         // Arrange: record coder output for two iterations, advance to iteration 2
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-coder-iter", "Multi-iteration coder review");
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "CODER_ITER1_SHOULD_NOT_APPEAR");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "CODER_ITER1_SHOULD_NOT_APPEAR");
         pipeline.IterationBudget.TryConsume();
-        pipeline.RecordOutput(WorkerRole.Coder, 2, "CODER_ITER2_EXPECTED");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 2, "CODER_ITER2_EXPECTED");
 
         // Act: at iteration 2, should use coder-2 key
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
@@ -1424,8 +1473,8 @@ public sealed class DistributedBrainTests
         // Arrange: pipeline with both tester and coder output
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-both-outputs", "Test both outputs ordering");
-        pipeline.RecordOutput(WorkerRole.Tester, 1, "TESTER_MARKER_UNIQUE");
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "CODER_MARKER_UNIQUE");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "TESTER_MARKER_UNIQUE");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "CODER_MARKER_UNIQUE");
 
         // Act
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
@@ -1449,7 +1498,7 @@ public sealed class DistributedBrainTests
         // Arrange: coder output present but Coding phase should not include it
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-coding-coder", "Coding phase with coder output");
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "CODER_OUTPUT_SHOULD_NOT_APPEAR");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "CODER_OUTPUT_SHOULD_NOT_APPEAR");
 
         // Act
         var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Coding);
@@ -1464,7 +1513,7 @@ public sealed class DistributedBrainTests
     {
         // Arrange
         var pipeline = CreatePipeline("g-fb-coder-1", "Fallback review with coder output");
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "Added feature with async support.");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "Added feature with async support.");
 
         // Act
         var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
@@ -1495,7 +1544,7 @@ public sealed class DistributedBrainTests
         // Arrange: coder output is only whitespace
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-fb-ws-coder", "Fallback review with whitespace coder output");
-        pipeline.RecordOutput(WorkerRole.Coder, 1, "   \n  \t  ");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "   \n  \t  ");
 
         // Act
         var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
@@ -1511,7 +1560,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("g-fb-coder-trunc", "Fallback coder truncation test");
         const int largeCoderOutputLength = 5000;
         var largeCoderOutput = new string('W', largeCoderOutputLength);
-        pipeline.PhaseOutputs[$"coder-{pipeline.Iteration}"] = largeCoderOutput;
+        pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, largeCoderOutput);
 
         // Act
         var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);

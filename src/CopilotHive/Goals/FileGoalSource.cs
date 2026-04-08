@@ -216,6 +216,9 @@ public sealed class FileGoalSource : IGoalSource
             WorkerPrompt = p.WorkerPrompt,
             PlanningPrompt = p.PlanningPrompt,
             PlanningResponse = p.PlanningResponse,
+            StartedAt = ParseTimestamp(p.StartedAt),
+            CompletedAt = ParseTimestamp(p.CompletedAt),
+            Verdict = p.Verdict,
         }).ToList() ?? [],
         TestCounts = e.TestCounts is null ? null : new TestCounts
         {
@@ -243,6 +246,9 @@ public sealed class FileGoalSource : IGoalSource
                 WorkerPrompt = p.WorkerPrompt,
                 PlanningPrompt = p.PlanningPrompt,
                 PlanningResponse = p.PlanningResponse,
+                StartedAt = p.StartedAt?.ToString("O"),
+                CompletedAt = p.CompletedAt?.ToString("O"),
+                Verdict = p.Verdict,
             }).ToList()
             : null,
         TestCounts = s.TestCounts is null ? null : new TestCountEntry
@@ -316,6 +322,12 @@ public sealed class FileGoalSource : IGoalSource
         public string? PlanningPrompt { get; set; }
         /// <summary>Brain response to the Planning prompt.</summary>
         public string? PlanningResponse { get; set; }
+        /// <summary>UTC timestamp when the phase was dispatched (ISO 8601).</summary>
+        public string? StartedAt { get; set; }
+        /// <summary>UTC timestamp when the worker result was received (ISO 8601).</summary>
+        public string? CompletedAt { get; set; }
+        /// <summary>Raw verdict string from the worker.</summary>
+        public string? Verdict { get; set; }
     }
 
     /// <summary>YAML-serializable representation of <see cref="TestCounts"/>.</summary>

@@ -378,7 +378,7 @@ public sealed partial class Composer
         if (content is not "output" and not "brain_prompt" and not "worker_prompt")
             return $"Invalid content '{content}'. Valid values: output, brain_prompt, worker_prompt.";
 
-        // 4. Handle brain_prompt / worker_prompt via pipeline conversation
+        // 4. Handle brain_prompt / worker_prompt via PhaseResult entries
         if (content is "brain_prompt" or "worker_prompt")
         {
             // Verify the goal still exists before retrieving prompt data
@@ -386,15 +386,20 @@ public sealed partial class Composer
             if (promptGoal is null)
                 return $"No {content.Replace('_', ' ')} is available for phase '{phase}' in iteration {iteration} of goal '{id}'.";
 
-            var conversation = await _goalStore.GetPipelineConversationAsync(id);
-            if (conversation.Count == 0)
-                return $"No pipeline conversation is available for goal '{id}' (requested: {content} for phase '{phase}', iteration {iteration}).";
+            // Look for the prompt in persisted iteration summaries
+            var iterationsForPrompt = await _goalStore.GetIterationsAsync(id);
+            var iterSummaryForPrompt = iterationsForPrompt.FirstOrDefault(i => i.Iteration == iteration);
+            PhaseResult? phaseEntry = null;
+            if (iterSummaryForPrompt is not null)
+            {
+                phaseEntry = iterSummaryForPrompt.Phases
+                    .LastOrDefault(p => p.Name.ToString().Equals(phase, StringComparison.OrdinalIgnoreCase));
+            }
 
-            var craftPrompts = DashboardStateService.ExtractCraftPrompts(conversation, iteration);
-            if (!craftPrompts.TryGetValue(rolePrefix, out var prompts))
+            if (phaseEntry is null)
                 return $"No {content.Replace('_', ' ')} is available for phase '{phase}' in iteration {iteration} of goal '{id}'.";
 
-            var promptText = content == "brain_prompt" ? prompts.BrainPrompt : prompts.WorkerPrompt;
+            var promptText = content == "brain_prompt" ? phaseEntry.BrainPrompt : phaseEntry.WorkerPrompt;
             if (string.IsNullOrEmpty(promptText))
                 return $"No {content.Replace('_', ' ')} is available for phase '{phase}' in iteration {iteration} of goal '{id}'.";
 

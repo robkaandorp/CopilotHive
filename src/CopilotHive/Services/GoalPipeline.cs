@@ -197,9 +197,6 @@ public sealed class GoalPipeline
     /// <summary>The feature branch created by the coder for this goal.</summary>
     public string? CoderBranch { get; private set; }
 
-    /// <summary>Accumulated output from each completed phase, keyed by "{role}-{iteration}".</summary>
-    public ConcurrentDictionary<string, string> PhaseOutputs { get; } = new();
-
     /// <summary>
     /// Persisted agent session JSON blobs, keyed by role name (case-insensitive).
     /// Allows workers to resume mid-session after an orchestrator restart.
@@ -208,6 +205,12 @@ public sealed class GoalPipeline
 
     /// <summary>In-memory iteration summaries for completed iterations (available to dashboard before goal finishes).</summary>
     public List<IterationSummary> CompletedIterationSummaries { get; } = [];
+
+    /// <summary>Append-only log of phase entries, one per phase dispatch, in chronological order.</summary>
+    public List<PhaseResult> PhaseLog { get; } = [];
+
+    /// <summary>The most recently appended log entry, or <c>null</c> if no phase has started yet.</summary>
+    public PhaseResult? CurrentPhaseEntry => PhaseLog.Count > 0 ? PhaseLog[^1] : null;
 
     /// <summary>All clarifications Q&amp;As that occurred during this goal's execution.</summary>
     public ConcurrentBag<ClarificationEntry> Clarifications { get; } = [];
@@ -229,16 +232,6 @@ public sealed class GoalPipeline
 
     /// <summary>Per-goal conversation history for the Brain.</summary>
     public List<ConversationEntry> Conversation { get; } = [];
-
-    /// <summary>UTC timestamp when the current phase started (for phase duration tracking).</summary>
-    public DateTime? PhaseStartedAt { get; private set; }
-
-    /// <summary>
-    /// The 1-based occurrence index of the current phase within the iteration plan.
-    /// Set by the dispatcher when advancing phases in a multi-round plan.
-    /// Defaults to 1 for single-occurrence phases and the first phase of each iteration.
-    /// </summary>
-    public int PhaseOccurrence { get; set; } = 1;
 
     /// <summary>UTC timestamp when the goal was started (captured at dispatch time, before the pipeline is created).</summary>
     public DateTime? GoalStartedAt { get; internal set; }
@@ -304,10 +297,6 @@ public sealed class GoalPipeline
         GoalStartedAt = snapshot.GoalStartedAt;
         MergeCommitHash = snapshot.MergeCommitHash;
         IterationStartSha = snapshot.IterationStartSha;
-        PhaseOccurrence = snapshot.PhaseOccurrence;
-
-        foreach (var (key, value) in snapshot.PhaseOutputs)
-            PhaseOutputs[key] = value;
 
         foreach (var (key, value) in snapshot.RoleSessions)
             RoleSessions[key] = value;
@@ -324,34 +313,21 @@ public sealed class GoalPipeline
         foreach (var entry in snapshot.Conversation)
             Conversation.Add(entry);
 
+        foreach (var entry in snapshot.PhaseLog)
+            PhaseLog.Add(entry);
+
         // Rebuild the state machine from the persisted plan so the dashboard
         // can correctly show completed / active / pending phases.
         if (Plan is not null)
             StateMachine.RestoreFromPlan(Plan.Phases, Phase);
     }
 
-    /// <summary>Advance to the next phase, recording timing for the previous phase.</summary>
+    /// <summary>Advance to the next phase.</summary>
     public void AdvanceTo(GoalPhase phase)
     {
         lock (_lock)
         {
-            // Record duration of the phase that just ended
-            if (PhaseStartedAt.HasValue && Phase != GoalPhase.Planning)
-            {
-                var phaseName = Phase.ToString();
-                var elapsed = DateTime.UtcNow - PhaseStartedAt.Value;
-                // Per-occurrence key: e.g. "Coding-1", "Coding-2"
-                var occurrenceKey = $"{phaseName}-{PhaseOccurrence}";
-                Metrics.PhaseDurations[occurrenceKey] = elapsed;
-                // Accumulated total key: backward-compatible, accumulates across occurrences
-                if (Metrics.PhaseDurations.TryGetValue(phaseName, out var existing))
-                    Metrics.PhaseDurations[phaseName] = existing + elapsed;
-                else
-                    Metrics.PhaseDurations[phaseName] = elapsed;
-            }
-
             Phase = phase;
-            PhaseStartedAt = DateTime.UtcNow;
             if (phase is GoalPhase.Done or GoalPhase.Failed)
                 CompletedAt = DateTime.UtcNow;
         }
@@ -397,16 +373,6 @@ public sealed class GoalPipeline
         }
     }
 
-    /// <summary>Record output from a completed phase.</summary>
-    public void RecordOutput(WorkerRole role, int iteration, string output)
-    {
-        var roleName = role.ToRoleName();
-        // Per-occurrence key: e.g. "coder-1-1", "coder-1-2"
-        PhaseOutputs[$"{roleName}-{iteration}-{PhaseOccurrence}"] = output;
-        // Backward-compatible latest key: e.g. "coder-1" (overwrites previous occurrence)
-        PhaseOutputs[$"{roleName}-{iteration}"] = output;
-    }
-
     /// <summary>Records a worker progress report into the pipeline's per-pipeline log.</summary>
     public void AddProgressReport(string workerId, string status, string details)
     {
@@ -419,7 +385,7 @@ public sealed class GoalPipeline
             Iteration = Iteration,
             Status = status,
             Details = details,
-            Occurrence = PhaseOccurrence,
+            Occurrence = CurrentPhaseEntry?.Occurrence ?? 1,
         });
     }
 
@@ -456,8 +422,10 @@ public sealed class GoalPipeline
         if (CoderBranch is not null)
             parts.Add($"Branch: {CoderBranch}");
 
-        foreach (var (key, output) in PhaseOutputs)
+        foreach (var entry in PhaseLog.Where(e => e.WorkerOutput is not null))
         {
+            var key = $"{entry.Name.ToRoleName()}-{entry.Iteration}-{entry.Occurrence}";
+            var output = entry.WorkerOutput!;
             var truncated = output.Length > 2000 ? output[..2000] + "..." : output;
             parts.Add($"\n=== Output from {key} ===\n{truncated}\n=== End output from {key} ===");
         }

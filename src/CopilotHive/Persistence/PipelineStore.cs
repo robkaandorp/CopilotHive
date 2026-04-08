@@ -193,6 +193,7 @@ public sealed class PipelineStore : IAsyncDisposable
         ("conversation_entries",  "purpose",           "TEXT"),
         ("pipelines",             "iteration_start_sha", "TEXT"),
         ("pipelines",             "phase_occurrence",    "INTEGER NOT NULL DEFAULT 1"),
+        ("pipelines",             "phase_log_json",      "TEXT"),
     ];
 
     /// <summary>
@@ -322,11 +323,11 @@ public sealed class PipelineStore : IAsyncDisposable
             cmd.CommandText = """
                 SELECT goal_id, description, goal_json, phase, iteration,
                        review_retries, test_retries, max_retries, max_iterations,
-                       active_task_id, coder_branch, phase_outputs, metrics_json,
+                       active_task_id, coder_branch, metrics_json,
                        created_at, completed_at, goal_started_at, plan_json, merge_commit_hash,
                        COALESCE(role_sessions_json, '{}'),
                        iteration_start_sha,
-                       COALESCE(phase_occurrence, 1)
+                       phase_log_json
                 FROM pipelines
                 WHERE phase NOT IN ('Done', 'Failed')
                 """;
@@ -348,17 +349,17 @@ public sealed class PipelineStore : IAsyncDisposable
                     MaxIterations = reader.GetInt32(8),
                     ActiveTaskId = reader.IsDBNull(9) ? null : reader.GetString(9),
                     CoderBranch = reader.IsDBNull(10) ? null : reader.GetString(10),
-                    PhaseOutputs = JsonSerializer.Deserialize<Dictionary<string, string>>(reader.GetString(11), JsonOptions) ?? [],
-                    Metrics = JsonSerializer.Deserialize<IterationMetrics>(reader.GetString(12), JsonOptions) ?? new() { Iteration = 1 },
-                    CreatedAt = DateTime.Parse(reader.GetString(13), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
-                    CompletedAt = reader.IsDBNull(14) ? null : DateTime.Parse(reader.GetString(14), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
-                    GoalStartedAt = reader.IsDBNull(15) ? null : DateTime.Parse(reader.GetString(15), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
-                    Plan = reader.IsDBNull(16) ? null : JsonSerializer.Deserialize<IterationPlan>(reader.GetString(16), JsonOptions),
-                    MergeCommitHash = reader.IsDBNull(17) ? null : reader.GetString(17),
-                    RoleSessions = JsonSerializer.Deserialize<Dictionary<string, string>>(reader.GetString(18), JsonOptions) ?? [],
+                    Metrics = JsonSerializer.Deserialize<IterationMetrics>(reader.GetString(11), JsonOptions) ?? new() { Iteration = 1 },
+                    CreatedAt = DateTime.Parse(reader.GetString(12), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+                    CompletedAt = reader.IsDBNull(13) ? null : DateTime.Parse(reader.GetString(13), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+                    GoalStartedAt = reader.IsDBNull(14) ? null : DateTime.Parse(reader.GetString(14), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+                    Plan = reader.IsDBNull(15) ? null : JsonSerializer.Deserialize<IterationPlan>(reader.GetString(15), JsonOptions),
+                    MergeCommitHash = reader.IsDBNull(16) ? null : reader.GetString(16),
+                    RoleSessions = JsonSerializer.Deserialize<Dictionary<string, string>>(reader.GetString(17), JsonOptions) ?? [],
                     Conversation = LoadConversationCore(goalId),
-                    IterationStartSha = reader.IsDBNull(19) ? null : reader.GetString(19),
-                    PhaseOccurrence = reader.GetInt32(20),
+                    IterationStartSha = reader.IsDBNull(18) ? null : reader.GetString(18),
+                    PhaseLog = reader.IsDBNull(19) ? []
+                        : JsonSerializer.Deserialize<List<PhaseResult>>(reader.GetString(19), JsonOptions) ?? [],
                 });
             }
 
@@ -378,15 +379,15 @@ public sealed class PipelineStore : IAsyncDisposable
             INSERT OR REPLACE INTO pipelines
                 (goal_id, description, goal_json, phase, iteration,
                  review_retries, test_retries, max_retries, max_iterations,
-                 active_task_id, coder_branch, plan_json, phase_outputs, metrics_json,
+                 active_task_id, coder_branch, plan_json, metrics_json,
                  created_at, completed_at, goal_started_at, merge_commit_hash,
-                 role_sessions_json, iteration_start_sha, phase_occurrence)
+                 role_sessions_json, iteration_start_sha, phase_log_json)
             VALUES
                 (@goalId, @desc, @goalJson, @phase, @iteration,
                  @reviewRetries, @testRetries, @maxRetries, @maxIterations,
-                 @activeTaskId, @coderBranch, @planJson, @phaseOutputs, @metricsJson,
+                 @activeTaskId, @coderBranch, @planJson, @metricsJson,
                  @createdAt, @completedAt, @goalStartedAt, @mergeCommitHash,
-                 @roleSessionsJson, @iterationStartSha, @phaseOccurrence)
+                 @roleSessionsJson, @iterationStartSha, @phaseLogJson)
             """;
         cmd.Parameters.AddWithValue("@goalId", pipeline.GoalId);
         cmd.Parameters.AddWithValue("@desc", pipeline.Description);
@@ -401,7 +402,6 @@ public sealed class PipelineStore : IAsyncDisposable
         cmd.Parameters.AddWithValue("@coderBranch", (object?)pipeline.CoderBranch ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@planJson",
             pipeline.Plan is not null ? JsonSerializer.Serialize(pipeline.Plan, JsonOptions) : DBNull.Value);
-        cmd.Parameters.AddWithValue("@phaseOutputs", JsonSerializer.Serialize(pipeline.PhaseOutputs, JsonOptions));
         cmd.Parameters.AddWithValue("@metricsJson", JsonSerializer.Serialize(pipeline.Metrics, JsonOptions));
         cmd.Parameters.AddWithValue("@createdAt", pipeline.CreatedAt.ToString("O"));
         cmd.Parameters.AddWithValue("@completedAt",
@@ -411,7 +411,10 @@ public sealed class PipelineStore : IAsyncDisposable
         cmd.Parameters.AddWithValue("@mergeCommitHash", (object?)pipeline.MergeCommitHash ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@roleSessionsJson", JsonSerializer.Serialize(new Dictionary<string, string>(pipeline.RoleSessions), JsonOptions));
         cmd.Parameters.AddWithValue("@iterationStartSha", (object?)pipeline.IterationStartSha ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@phaseOccurrence", pipeline.PhaseOccurrence);
+        cmd.Parameters.AddWithValue("@phaseLogJson",
+            pipeline.PhaseLog.Count > 0
+                ? JsonSerializer.Serialize(pipeline.PhaseLog, JsonOptions)
+                : DBNull.Value);
         cmd.ExecuteNonQuery();
     }
 
@@ -522,8 +525,6 @@ public sealed class PipelineSnapshot
     public string? CoderBranch { get; init; }
     /// <summary>Brain-determined iteration plan, or <c>null</c> if not yet planned.</summary>
     public IterationPlan? Plan { get; init; }
-    /// <summary>Accumulated output from each completed phase.</summary>
-    public Dictionary<string, string> PhaseOutputs { get; init; } = [];
     /// <summary>Metrics captured during this iteration.</summary>
     public IterationMetrics Metrics { get; init; } = new() { Iteration = 1 };
     /// <summary>UTC timestamp when the pipeline was created.</summary>
@@ -546,9 +547,6 @@ public sealed class PipelineSnapshot
     /// diff (<c>git diff {sha}..HEAD</c>) for reviewers. <c>null</c> when not yet captured or not applicable.
     /// </summary>
     public string? IterationStartSha { get; init; }
-    /// <summary>
-    /// 1-based occurrence index of the current phase within the iteration plan.
-    /// Defaults to 1 for pipelines predating per-occurrence tracking.
-    /// </summary>
-    public int PhaseOccurrence { get; init; } = 1;
+    /// <summary>Append-only log of phase entries recorded during this pipeline's execution.</summary>
+    public List<PhaseResult> PhaseLog { get; init; } = [];
 }

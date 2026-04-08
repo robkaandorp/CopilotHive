@@ -1412,10 +1412,10 @@ public sealed class ComposerToolTests : IDisposable
 
         await _composer.CreateGoalAsync("no-pipeline", "Goal without pipeline conversation");
 
-        // Without PipelineStore wired, there's no conversation to retrieve
+        // Without persisted iteration data, there's no brain prompt to retrieve
         var result = await _composer.GetPhaseOutputAsync("no-pipeline", 1, "Coding", content: "brain_prompt");
 
-        Assert.Contains("No pipeline conversation is available for goal 'no-pipeline'", result);
+        Assert.Contains("No brain prompt is available for phase 'Coding' in iteration 1 of goal 'no-pipeline'", result);
     }
 
     [Fact]
@@ -1427,7 +1427,7 @@ public sealed class ComposerToolTests : IDisposable
 
         var result = await _composer.GetPhaseOutputAsync("no-pipeline-wp", 1, "Coding", content: "worker_prompt");
 
-        Assert.Contains("No pipeline conversation is available for goal 'no-pipeline-wp'", result);
+        Assert.Contains("No worker prompt is available for phase 'Coding' in iteration 1 of goal 'no-pipeline-wp'", result);
     }
 
     // ── GetPhaseOutputAsync with PipelineStore for brain_prompt/worker_prompt ──
@@ -1446,17 +1446,27 @@ public sealed class ComposerToolTests : IDisposable
             storeWithPipeline,
             stateDir: Path.GetTempPath());
 
-        // Create a goal and pipeline with conversation
+        // Create a goal with persisted iteration summary containing brain prompt
         await composerWithPipeline.CreateGoalAsync("brain-prompt-goal", "Goal with brain prompt");
         var goal = await storeWithPipeline.GetGoalAsync("brain-prompt-goal", ct);
         Assert.NotNull(goal);
 
-        var pipeline = new GoalPipeline(goal, maxRetries: 3);
-        pipeline.Conversation.Add(new ConversationEntry("user", "Brain asks coder to implement X", Iteration: 1, Purpose: "craft-prompt"));
-        pipeline.Conversation.Add(new ConversationEntry("assistant", "Your task: implement X", Iteration: 1, Purpose: "craft-prompt"));
-        pipeline.Conversation.Add(new ConversationEntry("coder", "Coder completed.", Iteration: 1, Purpose: "worker-output"));
-
-        pipelineStore.SavePipeline(pipeline);
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = GoalPhase.Coding,
+                    Result = PhaseOutcome.Pass,
+                    BrainPrompt = "Brain asks coder to implement X",
+                    WorkerPrompt = "Your task: implement X",
+                    WorkerOutput = "Coder completed.",
+                },
+            ],
+        };
+        await storeWithPipeline.AddIterationAsync("brain-prompt-goal", summary, ct);
 
         // Now test GetPhaseOutputAsync with content: "brain_prompt"
         var result = await composerWithPipeline.GetPhaseOutputAsync("brain-prompt-goal", 1, "Coding", content: "brain_prompt");
@@ -1478,17 +1488,27 @@ public sealed class ComposerToolTests : IDisposable
             storeWithPipeline,
             stateDir: Path.GetTempPath());
 
-        // Create a goal and pipeline with conversation
+        // Create a goal with persisted iteration summary containing worker prompt
         await composerWithPipeline.CreateGoalAsync("worker-prompt-goal", "Goal with worker prompt");
         var goal = await storeWithPipeline.GetGoalAsync("worker-prompt-goal", ct);
         Assert.NotNull(goal);
 
-        var pipeline = new GoalPipeline(goal, maxRetries: 3);
-        pipeline.Conversation.Add(new ConversationEntry("user", "Brain prompt for tester", Iteration: 1, Purpose: "craft-prompt"));
-        pipeline.Conversation.Add(new ConversationEntry("assistant", "Your task: test the code", Iteration: 1, Purpose: "craft-prompt"));
-        pipeline.Conversation.Add(new ConversationEntry("tester", "Tests passed!", Iteration: 1, Purpose: "worker-output"));
-
-        pipelineStore.SavePipeline(pipeline);
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = GoalPhase.Testing,
+                    Result = PhaseOutcome.Pass,
+                    BrainPrompt = "Brain prompt for tester",
+                    WorkerPrompt = "Your task: test the code",
+                    WorkerOutput = "Tests passed!",
+                },
+            ],
+        };
+        await storeWithPipeline.AddIterationAsync("worker-prompt-goal", summary, ct);
 
         // Now test GetPhaseOutputAsync with content: "worker_prompt"
         var result = await composerWithPipeline.GetPhaseOutputAsync("worker-prompt-goal", 1, "Testing", content: "worker_prompt");
@@ -1548,11 +1568,22 @@ public sealed class ComposerToolTests : IDisposable
         // Build a brain prompt with 300 lines
         var longBrainPrompt = string.Join('\n', Enumerable.Range(1, 300).Select(i => $"Brain line {i}"));
 
-        var pipeline = new GoalPipeline(goal, maxRetries: 3);
-        pipeline.Conversation.Add(new ConversationEntry("user", longBrainPrompt, Iteration: 1, Purpose: "craft-prompt"));
-        pipeline.Conversation.Add(new ConversationEntry("assistant", "Your task: implement X", Iteration: 1, Purpose: "craft-prompt"));
-        pipeline.Conversation.Add(new ConversationEntry("coder", "Coder completed.", Iteration: 1, Purpose: "worker-output"));
-        pipelineStore.SavePipeline(pipeline);
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = GoalPhase.Coding,
+                    Result = PhaseOutcome.Pass,
+                    BrainPrompt = longBrainPrompt,
+                    WorkerPrompt = "Your task: implement X",
+                    WorkerOutput = "Coder completed.",
+                },
+            ],
+        };
+        await storeWithPipeline.AddIterationAsync("brain-prompt-trunc", summary, ct);
 
         var result = await composerWithPipeline.GetPhaseOutputAsync("brain-prompt-trunc", 1, "Coding", content: "brain_prompt", max_lines: 10);
 
@@ -1582,11 +1613,22 @@ public sealed class ComposerToolTests : IDisposable
         // Build a worker prompt with 300 lines
         var longWorkerPrompt = string.Join('\n', Enumerable.Range(1, 300).Select(i => $"Worker line {i}"));
 
-        var pipeline = new GoalPipeline(goal, maxRetries: 3);
-        pipeline.Conversation.Add(new ConversationEntry("user", "Brain prompt for tester", Iteration: 1, Purpose: "craft-prompt"));
-        pipeline.Conversation.Add(new ConversationEntry("assistant", longWorkerPrompt, Iteration: 1, Purpose: "craft-prompt"));
-        pipeline.Conversation.Add(new ConversationEntry("tester", "Tests passed!", Iteration: 1, Purpose: "worker-output"));
-        pipelineStore.SavePipeline(pipeline);
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = GoalPhase.Testing,
+                    Result = PhaseOutcome.Pass,
+                    BrainPrompt = "Brain prompt for tester",
+                    WorkerPrompt = longWorkerPrompt,
+                    WorkerOutput = "Tests passed!",
+                },
+            ],
+        };
+        await storeWithPipeline.AddIterationAsync("worker-prompt-trunc", summary, ct);
 
         var result = await composerWithPipeline.GetPhaseOutputAsync("worker-prompt-trunc", 1, "Testing", content: "worker_prompt", max_lines: 10);
 
