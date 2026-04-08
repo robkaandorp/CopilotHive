@@ -188,7 +188,7 @@ internal static class GoalDetailViewBuilder
 
         foreach (var pr in summary.Phases)
         {
-            var roleName = GetRoleNameSafe(pr.Name);
+            var roleName = pr.Name.ToRoleName();
 
             // Count total occurrences per phase in this summary for last-occurrence detection.
             var totalOccurrencesForPhase = summary.Phases.Count(p => p.Name == pr.Name);
@@ -324,7 +324,7 @@ internal static class GoalDetailViewBuilder
                 else
                     status = "pending";
 
-                var roleName = GetRoleNameSafe(phase);
+                var roleName = phase.ToRoleName();
                 string? workerOutput = null;
                 if (!string.IsNullOrEmpty(roleName))
                 {
@@ -403,7 +403,7 @@ internal static class GoalDetailViewBuilder
         return new PhaseViewInfo
         {
             Name = phase.Name.ToDisplayName(),
-            RoleName = GetRoleNameSafe(phase.Name),
+            RoleName = phase.Name.ToRoleName(),
             Status = phase.Result switch { PhaseOutcome.Pass => "completed", PhaseOutcome.Fail => "failed", PhaseOutcome.Skip => "skipped", _ => "completed" },
             DurationSeconds = phase.DurationSeconds > 0 ? phase.DurationSeconds : null,
             Occurrence = occurrence,
@@ -445,7 +445,7 @@ internal static class GoalDetailViewBuilder
         return new PhaseViewInfo
         {
             Name = phase.ToDisplayName(),
-            RoleName = GetRoleNameSafe(phase),
+            RoleName = phase.ToRoleName(),
             Status = status,
             Occurrence = occurrence,
             WorkerOutput = workerOutput,
@@ -576,24 +576,4 @@ internal static class GoalDetailViewBuilder
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    private static string PhaseNameToRoleName(string phaseName) => phaseName switch
-    {
-        "Coding" => "coder",
-        "Testing" => "tester",
-        "Review" => "reviewer",
-        "Doc Writing" => "docwriter",
-        "Improvement" => "improver",
-        "Improve" => "improver",
-        _ => "",
-    };
-
-    private static string GetRoleNameSafe(GoalPhase phase) => phase switch
-    {
-        GoalPhase.Coding => "coder",
-        GoalPhase.Testing => "tester",
-        GoalPhase.Review => "reviewer",
-        GoalPhase.DocWriting => "docwriter",
-        GoalPhase.Improve => "improver",
-        _ => "",
-    };
 }

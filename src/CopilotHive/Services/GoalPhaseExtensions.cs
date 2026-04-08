@@ -28,6 +28,20 @@ public static class GoalPhaseExtensions
     };
 
     /// <summary>
+    /// Returns the lowercase role name for a worker-dispatching phase (e.g. "coder", "tester").
+    /// Returns empty string for non-worker phases (Planning, Merging, Done, Failed).
+    /// </summary>
+    public static string ToRoleName(this GoalPhase phase) => phase switch
+    {
+        GoalPhase.Coding     => "coder",
+        GoalPhase.Testing    => "tester",
+        GoalPhase.Review     => "reviewer",
+        GoalPhase.DocWriting => "docwriter",
+        GoalPhase.Improve    => "improver",
+        _                    => "",
+    };
+
+    /// <summary>
     /// Maps a <see cref="GoalPhase"/> to the corresponding <see cref="WorkerRole"/>.
     /// Only valid for phases that dispatch to a worker.
     /// </summary>

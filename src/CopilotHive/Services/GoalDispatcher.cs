@@ -1497,7 +1497,7 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
             if (!hasDuration)
                 continue;
 
-            var roleName = PhaseNameToRoleName(phaseName);
+            var roleName = goalPhase.ToRoleName();
             pipeline.PhaseOutputs.TryGetValue($"{roleName}-{iteration}-{occ}", out var output);
             if (string.IsNullOrEmpty(output))
                 pipeline.PhaseOutputs.TryGetValue($"{roleName}-{iteration}", out output);
@@ -1589,17 +1589,6 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
                 .ToList(),
         };
     }
-
-    /// <summary>Maps a phase name string to its worker role name for output lookup.</summary>
-    private static string PhaseNameToRoleName(string phaseName) => phaseName switch
-    {
-        "Coding" => "coder",
-        "Testing" => "tester",
-        "Review" => "reviewer",
-        "DocWriting" => "docwriter",
-        "Improve" => "improver",
-        _ => "",
-    };
 
     /// <summary>
     /// Commits and pushes the updated goals.yaml back to the config repo so external

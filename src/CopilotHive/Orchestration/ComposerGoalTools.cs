@@ -12,15 +12,6 @@ namespace CopilotHive.Orchestration;
 
 public sealed partial class Composer
 {
-    private static readonly Dictionary<string, string> PhaseOutputKeys = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ["Coding"] = "coder",
-        ["Testing"] = "tester",
-        ["Review"] = "reviewer",
-        ["DocWriting"] = "docwriter",
-        ["Improve"] = "improver",
-    };
-
     private static bool IsValidGoalId(string? id)
     {
         if (string.IsNullOrEmpty(id)) return false;
@@ -373,8 +364,11 @@ public sealed partial class Composer
             return "ERROR: Invalid parameters: phase is required";
 
         // 2. Whitelist check SECOND
-        if (!PhaseOutputKeys.TryGetValue(phase, out var rolePrefix))
+        if (!Enum.TryParse<GoalPhase>(phase, ignoreCase: true, out var goalPhase))
             return $"Unknown phase '{phase}'. Supported phases: Coding, Testing, Review, DocWriting, Improve.";
+        var rolePrefix = goalPhase.ToRoleName();
+        if (string.IsNullOrEmpty(rolePrefix))
+            return $"Phase '{phase}' does not have a worker output key.";
 
         // 3. Validate content parameter
         if (content is not "output" and not "brain_prompt" and not "worker_prompt")

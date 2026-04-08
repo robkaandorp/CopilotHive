@@ -82,3 +82,30 @@ public class GoalPhaseToWorkerRoleTests
         Assert.Contains("999", ex.Message);
     }
 }
+
+/// <summary>
+/// Tests for the <see cref="GoalPhaseExtensions.ToRoleName"/> extension method.
+/// </summary>
+public class GoalPhaseToRoleNameTests
+{
+    [Theory]
+    [InlineData(GoalPhase.Coding,     "coder")]
+    [InlineData(GoalPhase.Testing,    "tester")]
+    [InlineData(GoalPhase.Review,     "reviewer")]
+    [InlineData(GoalPhase.DocWriting, "docwriter")]
+    [InlineData(GoalPhase.Improve,    "improver")]
+    public void ToRoleName_WorkerPhases_ReturnsCorrectRoleName(GoalPhase phase, string expected) =>
+        Assert.Equal(expected, phase.ToRoleName());
+
+    [Theory]
+    [InlineData(GoalPhase.Planning)]
+    [InlineData(GoalPhase.Merging)]
+    [InlineData(GoalPhase.Done)]
+    [InlineData(GoalPhase.Failed)]
+    public void ToRoleName_NonWorkerPhases_ReturnsEmptyString(GoalPhase phase) =>
+        Assert.Equal("", phase.ToRoleName());
+
+    [Fact]
+    public void ToRoleName_InvalidEnumValue_ReturnsEmptyString() =>
+        Assert.Equal("", ((GoalPhase)999).ToRoleName());
+}

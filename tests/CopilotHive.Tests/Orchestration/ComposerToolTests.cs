@@ -1288,10 +1288,28 @@ public sealed class ComposerToolTests : IDisposable
         };
         await _store.AddIterationAsync("phase-unknown", summary, ct);
 
-        var result = await _composer.GetPhaseOutputAsync("phase-unknown", 1, "Planning");
+        var result = await _composer.GetPhaseOutputAsync("phase-unknown", 1, "Blah");
 
-        Assert.Contains("Unknown phase 'Planning'", result);
+        Assert.Contains("Unknown phase 'Blah'", result);
         Assert.Contains("Coding, Testing, Review, DocWriting, Improve", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_NonWorkerPhase_ReturnsNoOutputKeyMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("phase-nonworker", "Non-worker phase test");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = GoalPhase.Planning, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, WorkerOutput = null }],
+        };
+        await _store.AddIterationAsync("phase-nonworker", summary, ct);
+
+        var result = await _composer.GetPhaseOutputAsync("phase-nonworker", 1, "Planning");
+
+        Assert.Contains("does not have a worker output key", result);
     }
 
     [Fact]
