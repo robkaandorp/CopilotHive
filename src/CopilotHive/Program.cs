@@ -103,7 +103,8 @@ static async Task<int> RunServerAsync(string[] args)
                 maxSteps,
                 sp.GetService<IBrainRepoManager>(),
                 stateDir,
-                sp.GetRequiredService<IGoalStore>());
+                sp.GetRequiredService<IGoalStore>(),
+                compactionModel: config?.Models?.CompactionModel);
         });
     }
 
@@ -138,7 +139,8 @@ static async Task<int> RunServerAsync(string[] args)
             ollamaApiKey,
             sp.GetService<HiveConfigFile>(),
             sp.GetService<ConfigRepoManager>(),
-            availableModels);
+            availableModels,
+            compactionModel: config?.Models?.CompactionModel);
     });
     builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 

@@ -2155,6 +2155,26 @@ public sealed class DistributedBrainTests
         }
     }
 
+    // ── Compaction Model Tests ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// <see cref="DistributedBrain"/> must store the <c>compactionModel</c> constructor
+    /// parameter in its private <c>_compactionModel</c> field so that
+    /// <c>RecreateAgent()</c> can use it to create a separate compaction client.
+    /// </summary>
+    [Fact]
+    public void Constructor_CompactionModel_StoresValue()
+    {
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            compactionModel: "copilot/gpt-5.4-mini");
+
+        var field = typeof(DistributedBrain)
+            .GetField("_compactionModel", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException("_compactionModel field not found on DistributedBrain");
+
+        Assert.Equal("copilot/gpt-5.4-mini", field.GetValue(brain));
+    }
+
 }
 
 /// <summary>

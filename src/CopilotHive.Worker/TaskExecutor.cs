@@ -59,6 +59,8 @@ public sealed class TaskExecutor(
         agentRunner.SetCurrentTaskId(task.TaskId);
         agentRunner.SetCurrentGoalId(task.GoalId);
         agentRunner.SetMaxContextTokens(task.MaxContextTokens);
+        agentRunner.SetCompactionModel(
+            task.Metadata.TryGetValue("compaction_model", out var compModel) ? compModel : null);
         agentRunner.ClearTestReport();
         agentRunner.ClearWorkerReport();
 

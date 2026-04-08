@@ -32,3 +32,7 @@ orchestrator:
   worker_context_window: 150000
   brain_context_window: 150000  # Max tokens for the Brain model's context
   brain_max_steps: 50           # Max tool-call steps per Brain request
+
+# Model-level configuration
+models:
+  compaction_model: null  # Model for context compaction summaries (e.g. "copilot/gpt-5.4-mini"). Uses main model when null.

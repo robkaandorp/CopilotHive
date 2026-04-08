@@ -909,6 +909,11 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
             }
         }
 
+        // Propagate compaction model to the worker so it creates a separate IChatClient for context compaction.
+        var compactionModel = _config?.Models?.CompactionModel;
+        if (!string.IsNullOrEmpty(compactionModel))
+            task.Metadata["compaction_model"] = compactionModel;
+
         pipeline.SetActiveTask(task.TaskId, task.BranchInfo?.FeatureBranch);
         _pipelineManager.RegisterTask(task.TaskId, pipeline.GoalId);
 

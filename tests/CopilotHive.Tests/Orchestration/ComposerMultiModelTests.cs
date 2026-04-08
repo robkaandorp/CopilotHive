@@ -1,3 +1,4 @@
+using System.Reflection;
 using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
@@ -395,5 +396,51 @@ public sealed class ComposerHubNullTests : IAsyncLifetime
         // Endpoints should not be mapped when composer is null
         var response = await _client.GetAsync("/api/composer/models", TestContext.Current.CancellationToken);
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+}
+
+/// <summary>
+/// Tests for Composer's compaction model storage — verifies that the
+/// <c>compactionModel</c> constructor parameter is correctly stored in the
+/// private <c>_compactionModel</c> field.
+/// </summary>
+public sealed class ComposerCompactionTests : IDisposable
+{
+    private readonly SqliteConnection _connection;
+    private readonly SqliteGoalStore _store;
+
+    public ComposerCompactionTests()
+    {
+        _connection = new SqliteConnection("Data Source=:memory:");
+        _connection.Open();
+        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+    }
+
+    public void Dispose()
+    {
+        _connection.Dispose();
+    }
+
+    /// <summary>
+    /// <see cref="Composer"/> must store the <c>compactionModel</c> constructor
+    /// parameter in its private <c>_compactionModel</c> field so that
+    /// <c>RecreateAgent()</c> can use it to create a separate compaction client.
+    /// </summary>
+    [Fact]
+    public void Constructor_CompactionModel_StoresValue()
+    {
+        var composer = new Composer(
+            "claude-sonnet-4",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            chatClientFactory: _ => new Mock<IChatClient>().Object,
+            compactionModel: "copilot/gpt-5.4-mini");
+
+        var field = typeof(Composer)
+            .GetField("_compactionModel", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException("_compactionModel field not found on Composer");
+
+        Assert.Equal("copilot/gpt-5.4-mini", field.GetValue(composer));
     }
 }

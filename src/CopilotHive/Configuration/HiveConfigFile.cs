@@ -13,6 +13,8 @@ public sealed class HiveConfigFile
     public Dictionary<string, WorkerConfig> Workers { get; set; } = [];
     /// <summary>Orchestrator-level configuration.</summary>
     public OrchestratorConfig Orchestrator { get; set; } = new();
+    /// <summary>Model-level configuration (compaction model, etc.).</summary>
+    public ModelsConfig? Models { get; set; }
     /// <summary>Composer agent configuration. When set, the Composer is enabled.</summary>
     public ComposerConfig? Composer { get; set; }
 
@@ -116,6 +118,19 @@ public sealed class OrchestratorConfig
     /// and agent compaction threshold.
     /// </summary>
     public int WorkerContextWindow { get; set; } = Constants.DefaultBrainContextWindow;
+}
+
+/// <summary>
+/// Top-level models configuration. Supports compaction_model
+/// and can grow with additional model-level settings.
+/// </summary>
+public sealed class ModelsConfig
+{
+    /// <summary>
+    /// Model to use for context compaction summaries (e.g. "gpt-5.4-mini").
+    /// When null or empty, the main model is used for compaction (default behavior).
+    /// </summary>
+    public string? CompactionModel { get; set; }
 }
 
 /// <summary>

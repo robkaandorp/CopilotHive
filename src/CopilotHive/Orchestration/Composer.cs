@@ -30,6 +30,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly string _stateDir;
     private readonly IHttpClientFactory? _httpClientFactory;
     private readonly string? _ollamaApiKey;
+    private readonly string? _compactionModel;
     private IChatClient? _chatClient;
     private CodingAgent? _agent;
     private AgentSession _session;
@@ -186,7 +187,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         HiveConfigFile? hiveConfig = null,
         ConfigRepoManager? configRepo = null,
         IEnumerable<string>? availableModels = null,
-        Func<string, IChatClient>? chatClientFactory = null)
+        Func<string, IChatClient>? chatClientFactory = null,
+        string? compactionModel = null)
     {
         _model = model;
         _maxContextTokens = maxContextTokens;
@@ -201,6 +203,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _hiveConfig = hiveConfig;
         _configRepo = configRepo;
         _chatClientFactory = chatClientFactory;
+        _compactionModel = compactionModel;
         _session = AgentSession.Create("composer");
 
         AvailableModels = (availableModels?.ToList() ?? [model]).AsReadOnly();
@@ -476,6 +479,9 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             ReasoningEffort = _reasoningEffort,
             ShowToolCallsInStream = true,
             Logger = _logger,
+            CompactionClient = !string.IsNullOrEmpty(_compactionModel)
+                ? CopilotHive.SDK.ChatClientFactory.Create(_compactionModel)
+                : null,
             OnCompacting = () =>
             {
                 IsCompacting = true;

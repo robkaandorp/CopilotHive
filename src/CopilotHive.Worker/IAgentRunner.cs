@@ -68,6 +68,12 @@ public interface IAgentRunner : IAsyncDisposable
     /// </summary>
     int GetContextUsagePercent();
 
+    /// <summary>
+    /// Sets the model to use for context compaction. Pass null to use the main model.
+    /// Must be called before <see cref="SendPromptAsync"/>.
+    /// </summary>
+    void SetCompactionModel(string? model);
+
     /// <summary>Connects to the underlying AI agent engine.</summary>
     Task ConnectAsync(CancellationToken ct = default);
 

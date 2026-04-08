@@ -32,6 +32,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly IBrainRepoManager? _repoManager;
     private readonly IGoalStore? _goalStore;
     private readonly string _stateDir;
+    private readonly string? _compactionModel;
 
     /// <summary>
     /// Directory used for persistent Brain state (session files).
@@ -109,6 +110,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <param name="goalStore">Optional goal store used by the <c>get_goal</c> tool to retrieve goal details on demand.</param>
     /// <param name="chatClient">Optional pre-built <see cref="IChatClient"/>. When supplied, <see cref="ConnectAsync"/> skips
     /// the <c>ChatClientFactory</c> and uses this instance instead — useful in tests that need to avoid real credentials.</param>
+    /// <param name="compactionModel">Optional model string for a separate compaction <see cref="IChatClient"/>.</param>
     public DistributedBrain(string modelOverride, ILogger<DistributedBrain> logger,
         MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null,
         int maxContextTokens = Constants.DefaultBrainContextWindow,
@@ -116,7 +118,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         IBrainRepoManager? repoManager = null,
         string? stateDir = null,
         IGoalStore? goalStore = null,
-        IChatClient? chatClient = null)
+        IChatClient? chatClient = null,
+        string? compactionModel = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -128,6 +131,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _goalStore = goalStore;
         _chatClient = chatClient;
         _stateDir = stateDir ?? "/app/state";
+        _compactionModel = compactionModel;
         _masterSession = AgentSession.Create("brain");
         _session = _masterSession;
 
@@ -353,6 +357,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             AutoLoadWorkspaceInstructions = false,
             ReasoningEffort = _reasoningEffort,
             Logger = _logger,
+            CompactionClient = !string.IsNullOrEmpty(_compactionModel)
+                ? CopilotHive.SDK.ChatClientFactory.Create(_compactionModel)
+                : null,
             OnCompacted = r =>
             {
                 _logger.LogInformation(

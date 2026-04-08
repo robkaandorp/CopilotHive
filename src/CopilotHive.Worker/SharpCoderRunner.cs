@@ -57,6 +57,7 @@ public sealed class SharpCoderRunner : IAgentRunner
     private WorkerRole _currentRole;
     private string? _customAgentSystemPrompt;
     private int _maxContextTokens = 150_000;
+    private string? _compactionModel;
 
     /// <summary>Current agent session; set via <see cref="SetSession"/> before <see cref="SendPromptAsync"/>.</summary>
     private AgentSession? _session;
@@ -86,6 +87,9 @@ public sealed class SharpCoderRunner : IAgentRunner
     /// <inheritdoc/>
     public void SetMaxContextTokens(int maxTokens) =>
         _maxContextTokens = maxTokens > 0 ? maxTokens : 150_000;
+
+    /// <inheritdoc/>
+    public void SetCompactionModel(string? model) => _compactionModel = model;
 
     /// <summary>
     /// Builds the full system prompt for the given <paramref name="role"/> by combining the
@@ -310,6 +314,9 @@ public sealed class SharpCoderRunner : IAgentRunner
             ReasoningEffort = _currentReasoning,
             ShowToolCallsInStream = true,
         };
+
+        if (!string.IsNullOrEmpty(_compactionModel))
+            options.CompactionClient = CopilotHive.SDK.ChatClientFactory.Create(_compactionModel);
 
         // Write pre-execution diagnostics so we can inspect inputs even if the LLM call hangs or is killed
         WriteDiagnosticsFile(null, prompt, TimeSpan.Zero, options, "pre");
