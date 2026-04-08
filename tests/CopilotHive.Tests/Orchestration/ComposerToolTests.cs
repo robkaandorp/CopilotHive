@@ -1295,6 +1295,34 @@ public sealed class ComposerToolTests : IDisposable
     }
 
     [Fact]
+    public async Task GetPhaseOutput_NumericPhaseString_ReturnsUnknownPhaseMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("phase-numeric", "Numeric phase string test");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, WorkerOutput = "output" }],
+        };
+        await _store.AddIterationAsync("phase-numeric", summary, ct);
+
+        foreach (var numericPhase in new[] { "1", "2", "999" })
+        {
+            var result = await _composer.GetPhaseOutputAsync("phase-numeric", 1, numericPhase);
+            Assert.Contains($"Unknown phase '{numericPhase}'", result);
+            Assert.Contains("Coding, Testing, Review, DocWriting, Improve", result);
+        }
+
+        // Valid phase names must still work (case-insensitive)
+        var codingResult = await _composer.GetPhaseOutputAsync("phase-numeric", 1, "Coding");
+        Assert.DoesNotContain("Unknown phase", codingResult);
+
+        var testingResult = await _composer.GetPhaseOutputAsync("phase-numeric", 1, "testing");
+        Assert.DoesNotContain("Unknown phase", testingResult);
+    }
+
+    [Fact]
     public async Task GetPhaseOutput_NonWorkerPhase_ReturnsNoOutputKeyMessage()
     {
         var ct = TestContext.Current.CancellationToken;

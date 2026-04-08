@@ -364,6 +364,10 @@ public sealed partial class Composer
             return "ERROR: Invalid parameters: phase is required";
 
         // 2. Whitelist check SECOND
+        // Reject numeric strings that Enum.TryParse would accept (e.g. "1" → GoalPhase.Coding)
+        if (int.TryParse(phase, out _))
+            return $"Unknown phase '{phase}'. Supported phases: Coding, Testing, Review, DocWriting, Improve.";
+
         if (!Enum.TryParse<GoalPhase>(phase, ignoreCase: true, out var goalPhase))
             return $"Unknown phase '{phase}'. Supported phases: Coding, Testing, Review, DocWriting, Improve.";
         var rolePrefix = goalPhase.ToRoleName();
