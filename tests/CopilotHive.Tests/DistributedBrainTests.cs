@@ -189,7 +189,7 @@ public sealed class DistributedBrainTests
             PhaseInstructions: """{"coding":"focus on tests","review":"check edge cases"}""",
             Reason: "Standard workflow",
             ModelTiers: null);
-        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+        var plan = BrainPlanParser.BuildIterationPlanFromToolCall(toolCall);
         Assert.Equal(4, plan.Phases.Count);
         Assert.Equal(GoalPhase.Coding, plan.Phases[0]);
         Assert.Equal(GoalPhase.Testing, plan.Phases[1]);
@@ -207,7 +207,7 @@ public sealed class DistributedBrainTests
             PhaseInstructions: "{}",
             Reason: "nothing to do",
             ModelTiers: null);
-        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+        var plan = BrainPlanParser.BuildIterationPlanFromToolCall(toolCall);
         Assert.Empty(plan.Phases);
     }
 
@@ -219,7 +219,7 @@ public sealed class DistributedBrainTests
             PhaseInstructions: "{}",
             Reason: "test",
             ModelTiers: null);
-        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+        var plan = BrainPlanParser.BuildIterationPlanFromToolCall(toolCall);
         Assert.Equal(2, plan.Phases.Count);
         Assert.Equal(GoalPhase.Coding, plan.Phases[0]);
         Assert.Equal(GoalPhase.Testing, plan.Phases[1]);
@@ -269,7 +269,7 @@ public sealed class DistributedBrainTests
     {
         var pipeline = CreatePipeline("g-ctx-1", "First iteration goal");
         // Iteration defaults to 1
-        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
         Assert.Equal("", result);
     }
 
@@ -280,7 +280,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, "FAIL: Missing null check in UserService.GetById()");
         pipeline.IterationBudget.TryConsume(); // Now iteration 2
 
-        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
 
         Assert.Contains($"=== Previous iteration (1) feedback ===", result);
         Assert.Contains("=== Reviewer feedback (iteration 1) ===", result);
@@ -294,7 +294,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Tester, 1, "3 tests failed: TestAuth, TestLogin, TestLogout");
         pipeline.IterationBudget.TryConsume();
 
-        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
 
         Assert.Contains("=== Tester feedback (iteration 1) ===", result);
         Assert.Contains("3 tests failed", result);
@@ -307,7 +307,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Coder, 1, "Added UserService with CRUD operations");
         pipeline.IterationBudget.TryConsume();
 
-        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
 
         Assert.Contains("=== Coder output round 1 (iteration 1) ===", result);
         Assert.Contains("Added UserService", result);
@@ -322,7 +322,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, "FAIL: Variable naming inconsistent");
         pipeline.IterationBudget.TryConsume();
 
-        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
 
         Assert.Contains("=== Reviewer feedback (iteration 1) ===", result);
         Assert.Contains("=== Tester feedback (iteration 1) ===", result);
@@ -335,7 +335,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("g-ctx-6", "No outputs goal");
         pipeline.IterationBudget.TryConsume();
 
-        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
 
         Assert.Contains($"=== Previous iteration (1) feedback ===", result);
         Assert.Contains("No phase outputs recorded", result);
@@ -351,7 +351,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Reviewer, 2, "FAIL: Iteration 2 issue");
         pipeline.IterationBudget.TryConsume(); // Now iteration 3
 
-        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
 
         Assert.Contains($"=== Previous iteration (2) feedback ===", result);
         Assert.Contains("Iteration 2 issue", result);
@@ -366,7 +366,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, longOutput);
         pipeline.IterationBudget.TryConsume();
 
-        var result = DistributedBrain.BuildPreviousIterationContext(pipeline);
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
 
         // Reviewer uses TruncationConversationSummary (2000) so output should be truncated
         Assert.True(result.Length < 5000 + 200); // Some overhead for labels
@@ -527,10 +527,14 @@ public sealed class DistributedBrainTests
         }
         Assert.NotNull(repoRoot);
         
-        var sourcePath = Path.Combine(repoRoot, "src", "CopilotHive", "Orchestration", "DistributedBrain.cs");
-        Assert.True(File.Exists(sourcePath), $"Source file not found at {sourcePath}");
+        // Read both DistributedBrain.cs (DefaultSystemPrompt) and BrainPromptBuilder.cs (BuildReviewFallbackPrompt, BuildCraftPromptText)
+        var brainSourcePath = Path.Combine(repoRoot, "src", "CopilotHive", "Orchestration", "DistributedBrain.cs");
+        Assert.True(File.Exists(brainSourcePath), $"Source file not found at {brainSourcePath}");
+
+        var promptBuilderSourcePath = Path.Combine(repoRoot, "src", "CopilotHive", "Orchestration", "BrainPromptBuilder.cs");
+        Assert.True(File.Exists(promptBuilderSourcePath), $"Source file not found at {promptBuilderSourcePath}");
         
-        var source = File.ReadAllText(sourcePath);
+        var source = File.ReadAllText(brainSourcePath) + File.ReadAllText(promptBuilderSourcePath);
         
         // Verify the guidance strings for "Files to change" are present
         Assert.Contains("\"Files to change\" in the goal is GUIDANCE", source);
@@ -562,7 +566,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Tester, 1, "All 42 tests pass. No failures.");
 
         // Act: call the internal method directly to get the raw prompt text
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: the tester output string appears verbatim in the prompt
         Assert.Contains("All 42 tests pass. No failures.", prompt);
@@ -579,7 +583,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Tester, 1, "Some test output that should not appear");
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Coding);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Coding);
 
         // Assert: tester output is NOT in the prompt for Coding phase
         Assert.DoesNotContain("Some test output that should not appear", prompt);
@@ -595,7 +599,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Tester, 1, "Previous test output should not appear");
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Testing);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Testing);
 
         // Assert: tester output is NOT in the prompt for Testing phase
         Assert.DoesNotContain("Previous test output should not appear", prompt);
@@ -611,7 +615,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Tester, 1, "UNIQUE_TESTER_MARKER_XYZ");
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review, "UNIQUE_CONTEXT_MARKER_ABC");
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review, "UNIQUE_CONTEXT_MARKER_ABC");
 
         // Assert: both markers are present
         Assert.Contains("UNIQUE_CONTEXT_MARKER_ABC", prompt);
@@ -635,7 +639,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("g-review-notest", "Review the implementation");
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: the tester output section header should NOT be present
         Assert.DoesNotContain("=== Tester output (iteration", prompt);
@@ -650,7 +654,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Tester, 1, "   \n  \t  ");
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: whitespace-only output should be treated as absent
         Assert.DoesNotContain("=== Tester output (iteration", prompt);
@@ -667,7 +671,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Tester, 2, "ITER2_OUTPUT_EXPECTED");
 
         // Act: at iteration 2, should use tester-2 key
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: only iteration 2's output appears
         Assert.Contains("ITER2_OUTPUT_EXPECTED", prompt);
@@ -686,7 +690,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Tester, 1, "All tests pass.");
 
         // Verify the craft prompt includes tester output (key observable behavior)
-        var craftPrompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var craftPrompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
         Assert.Contains("=== Tester output (iteration 1) ===", craftPrompt);
         Assert.Contains("All tests pass.", craftPrompt);
 
@@ -714,15 +718,18 @@ public sealed class DistributedBrainTests
             repoRoot = Directory.GetParent(repoRoot)?.FullName;
         Assert.NotNull(repoRoot);
 
-        var sourcePath = Path.Combine(repoRoot, "src", "CopilotHive", "Orchestration", "DistributedBrain.cs");
-        Assert.True(File.Exists(sourcePath), $"Source file not found at {sourcePath}");
+        var brainSourcePath = Path.Combine(repoRoot, "src", "CopilotHive", "Orchestration", "DistributedBrain.cs");
+        Assert.True(File.Exists(brainSourcePath), $"Source file not found at {brainSourcePath}");
 
-        var source = File.ReadAllText(sourcePath);
+        var promptBuilderSourcePath = Path.Combine(repoRoot, "src", "CopilotHive", "Orchestration", "BrainPromptBuilder.cs");
+        Assert.True(File.Exists(promptBuilderSourcePath), $"Source file not found at {promptBuilderSourcePath}");
+
+        var source = File.ReadAllText(brainSourcePath) + File.ReadAllText(promptBuilderSourcePath);
 
         const string expectedInstruction =
             "Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.";
 
-        // Now the instruction appears in DefaultSystemPrompt + BuildReviewFallbackPrompt (at least 2 locations)
+        // Now the instruction appears in DefaultSystemPrompt (DistributedBrain.cs) + BuildReviewFallbackPrompt (BrainPromptBuilder.cs) (at least 2 locations)
         var occurrences = source.Split(expectedInstruction).Length - 1;
         Assert.True(occurrences >= 2,
             $"Expected the test-results instruction to appear in at least 2 locations (DefaultSystemPrompt + fallback), but found {occurrences}.");
@@ -736,7 +743,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("g-fb-1", "Fix null reference in OrderService");
         pipeline.RecordTestOutput(WorkerRole.Tester, 1, "Passed: 87, Failed: 0");
 
-        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
 
         Assert.Contains("Passed: 87, Failed: 0", prompt);
         Assert.Contains("=== Tester output (iteration 1) ===", prompt);
@@ -749,7 +756,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("g-fb-2", "Update API controller");
         pipeline.RecordTestOutput(WorkerRole.Tester, 1, "All tests pass");
 
-        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
 
         Assert.Contains(
             "Use the testing phase results to verify that all tests pass",
@@ -764,7 +771,7 @@ public sealed class DistributedBrainTests
     {
         var pipeline = CreatePipeline("g-fb-3", "Refactor PaymentGateway module");
 
-        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
 
         Assert.Contains("Refactor PaymentGateway module", prompt);
     }
@@ -774,7 +781,7 @@ public sealed class DistributedBrainTests
     {
         var pipeline = CreatePipeline("g-fb-4", "Add logging");
 
-        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline, "EXTRA_CONTEXT_MARKER");
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline, "EXTRA_CONTEXT_MARKER");
 
         Assert.Contains("=== Additional context ===", prompt);
         Assert.Contains("EXTRA_CONTEXT_MARKER", prompt);
@@ -786,7 +793,7 @@ public sealed class DistributedBrainTests
     {
         var pipeline = CreatePipeline("g-fb-5", "Remove deprecated endpoints");
 
-        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
 
         Assert.DoesNotContain("=== Tester output (iteration", prompt);
     }
@@ -797,7 +804,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("g-fb-6", "Clean up imports");
         pipeline.RecordTestOutput(WorkerRole.Tester, 1, "  \n\t  ");
 
-        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
 
         Assert.DoesNotContain("=== Tester output (iteration", prompt);
     }
@@ -810,7 +817,7 @@ public sealed class DistributedBrainTests
         pipeline.IterationBudget.TryConsume();
         pipeline.RecordTestOutput(WorkerRole.Tester, 2, "ITER2_FALLBACK_EXPECTED");
 
-        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
 
         Assert.Contains("ITER2_FALLBACK_EXPECTED", prompt);
         Assert.DoesNotContain("ITER1_FALLBACK_SHOULD_NOT_APPEAR", prompt);
@@ -1163,7 +1170,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("goal-12345", "This is a very long goal description that should not appear in the craft prompt header");
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Coding);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Coding);
 
         // Assert: Goal ID appears in the header
         Assert.Contains("Goal: goal-12345", prompt);
@@ -1182,7 +1189,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("goal-token-optimization", longDescription);
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Coding);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Coding);
 
         // Assert: The full description should NOT appear in the prompt header
         // Only the goal ID should be present
@@ -1198,7 +1205,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("goal-iter-phase", "Test iteration/phase display");
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Testing);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Testing);
 
         // Assert: Goal header format is "Goal: {id} (iteration {n}, phase {phase})"
         Assert.Contains("Goal: goal-iter-phase", prompt);
@@ -1214,7 +1221,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("goal-getgoal", "Test get_goal tool reference");
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Coding);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Coding);
 
         // Assert: prompt instructs to use get_goal tool
         Assert.Contains("get_goal", prompt);
@@ -1230,7 +1237,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("goal-no-dupe", "Test for duplicate instructions");
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Coding);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Coding);
 
         // Assert: the craft prompt should NOT contain the full role instructions
         // (those are now in DefaultSystemPrompt, not in BuildCraftPromptText)
@@ -1249,7 +1256,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("goal-review-note", "Test review note");
 
         // Test without docwriting phase (no note should appear)
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
         Assert.DoesNotContain("The docwriting phase already ran before this review", prompt);
     }
 
@@ -1291,7 +1298,7 @@ public sealed class DistributedBrainTests
         var pipeline = new GoalPipeline(goal);
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Coding);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Coding);
 
         // Assert
         Assert.Contains("Target repositories:", prompt);
@@ -1312,7 +1319,7 @@ public sealed class DistributedBrainTests
         pipeline.SetTestPhaseOutput(WorkerRole.Tester, pipeline.Iteration, largeTesterOutput);
 
         // Act: craft a Review-phase prompt
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: the full tester output does NOT appear in the prompt
         Assert.DoesNotContain(largeTesterOutput, prompt);
@@ -1335,7 +1342,7 @@ public sealed class DistributedBrainTests
         pipeline.SetTestPhaseOutput(WorkerRole.Tester, pipeline.Iteration, shortOutput);
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: full short output appears verbatim in the prompt (no truncation)
         Assert.Contains(shortOutput, prompt);
@@ -1351,7 +1358,7 @@ public sealed class DistributedBrainTests
         pipeline.SetTestPhaseOutput(WorkerRole.Tester, pipeline.Iteration, exactly2000);
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: exactly 2000 chars should appear as-is (no truncation)
         Assert.Contains(exactly2000, prompt);
@@ -1368,7 +1375,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Coder, 1, "Added UserService.cs with GetById, Create, Update methods.");
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: coder output appears with fenced block format
         Assert.Contains("Added UserService.cs with GetById, Create, Update methods.", prompt);
@@ -1384,7 +1391,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("g-no-coder", "Review without coder output");
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: coder block should NOT be present
         Assert.DoesNotContain("=== Coder output (iteration", prompt);
@@ -1400,7 +1407,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Coder, 1, "   \n  \t  ");
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: whitespace-only output should be treated as absent
         Assert.DoesNotContain("=== Coder output (iteration", prompt);
@@ -1417,7 +1424,7 @@ public sealed class DistributedBrainTests
         pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, largeCoderOutput);
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: the full coder output does NOT appear in the prompt
         Assert.DoesNotContain(largeCoderOutput, prompt);
@@ -1440,7 +1447,7 @@ public sealed class DistributedBrainTests
         pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, shortOutput);
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: full short output appears verbatim in the prompt (no truncation)
         Assert.Contains(shortOutput, prompt);
@@ -1457,7 +1464,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Coder, 2, "CODER_ITER2_EXPECTED");
 
         // Act: at iteration 2, should use coder-2 key
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: only iteration 2's output appears
         Assert.Contains("CODER_ITER2_EXPECTED", prompt);
@@ -1474,7 +1481,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Coder, 1, "CODER_MARKER_UNIQUE");
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Review);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: both outputs appear
         Assert.Contains("TESTER_MARKER_UNIQUE", prompt);
@@ -1498,7 +1505,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Coder, 1, "CODER_OUTPUT_SHOULD_NOT_APPEAR");
 
         // Act
-        var prompt = brain.BuildCraftPromptText(pipeline, GoalPhase.Coding);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Coding);
 
         // Assert: coder output is NOT in the prompt for Coding phase
         Assert.DoesNotContain("CODER_OUTPUT_SHOULD_NOT_APPEAR", prompt);
@@ -1513,7 +1520,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Coder, 1, "Added feature with async support.");
 
         // Act
-        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
 
         // Assert
         Assert.Contains("Added feature with async support.", prompt);
@@ -1528,7 +1535,7 @@ public sealed class DistributedBrainTests
         var pipeline = CreatePipeline("g-fb-no-coder", "Fallback review without coder output");
 
         // Act
-        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
 
         // Assert
         Assert.DoesNotContain("=== Coder output (iteration", prompt);
@@ -1544,7 +1551,7 @@ public sealed class DistributedBrainTests
         pipeline.RecordTestOutput(WorkerRole.Coder, 1, "   \n  \t  ");
 
         // Act
-        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
 
         // Assert: whitespace-only output should be treated as absent
         Assert.DoesNotContain("=== Coder output (iteration", prompt);
@@ -1560,7 +1567,7 @@ public sealed class DistributedBrainTests
         pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, largeCoderOutput);
 
         // Act
-        var prompt = DistributedBrain.BuildReviewFallbackPrompt(pipeline);
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
 
         // Assert: the full coder output does NOT appear
         Assert.DoesNotContain(largeCoderOutput, prompt);
