@@ -409,7 +409,7 @@ public sealed class PipelineStore : IAsyncDisposable
         cmd.Parameters.AddWithValue("@goalStartedAt",
             pipeline.GoalStartedAt.HasValue ? pipeline.GoalStartedAt.Value.ToString("O") : DBNull.Value);
         cmd.Parameters.AddWithValue("@mergeCommitHash", (object?)pipeline.MergeCommitHash ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@roleSessionsJson", JsonSerializer.Serialize(new Dictionary<string, string>(pipeline.RoleSessions), JsonOptions));
+        cmd.Parameters.AddWithValue("@roleSessionsJson", JsonSerializer.Serialize(pipeline.RoleSessions.GetAll().ToDictionary(kv => kv.Key, kv => kv.Value), JsonOptions));
         cmd.Parameters.AddWithValue("@iterationStartSha", (object?)pipeline.IterationStartSha ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@phaseLogJson",
             pipeline.PhaseLog.Count > 0
