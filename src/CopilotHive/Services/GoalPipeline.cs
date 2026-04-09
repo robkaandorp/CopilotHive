@@ -1,147 +1,11 @@
 using System.Collections.Concurrent;
-using System.Text.Json;
-using System.Text.Json.Serialization;
 using CopilotHive.Dashboard;
 using CopilotHive.Goals;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
-using CopilotHive.Workers;
 
 namespace CopilotHive.Services;
-
-/// <summary>
-/// Phases a goal progresses through in the pipeline.
-/// </summary>
-[JsonConverter(typeof(JsonStringEnumConverter<GoalPhase>))]
-public enum GoalPhase
-{
-    /// <summary>Initial phase: the brain is planning the iteration.</summary>
-    Planning,
-    /// <summary>The coder worker is implementing the goal.</summary>
-    Coding,
-    /// <summary>The reviewer worker is reviewing the coder's changes.</summary>
-    Review,
-    /// <summary>The tester worker is running and writing tests.</summary>
-    Testing,
-    /// <summary>The doc-writer worker is updating documentation.</summary>
-    DocWriting,
-    /// <summary>The improver worker is improving AGENTS.md files.</summary>
-    Improve,
-    /// <summary>The feature branch is being merged to main.</summary>
-    Merging,
-    /// <summary>The goal has been completed successfully.</summary>
-    Done,
-    /// <summary>The goal has failed and will not be retried.</summary>
-    Failed,
-}
-
-/// <summary>
-/// Outcome of a single pipeline phase within one iteration.
-/// Uses <see cref="JsonNamingPolicy.CamelCase"/> so values serialize as "pass", "fail", "skip"
-/// matching existing stored data.
-/// </summary>
-[JsonConverter(typeof(CamelCasePhaseOutcomeConverter))]
-public enum PhaseOutcome
-{
-    /// <summary>The phase completed successfully.</summary>
-    Pass,
-    /// <summary>The phase failed.</summary>
-    Fail,
-    /// <summary>The phase was skipped.</summary>
-    Skip,
-}
-
-/// <summary>
-/// JSON converter for <see cref="PhaseOutcome"/> that serializes values as camelCase strings
-/// ("pass", "fail", "skip") for backward compatibility with existing stored data.
-/// </summary>
-internal sealed class CamelCasePhaseOutcomeConverter : JsonStringEnumConverter<PhaseOutcome>
-{
-    public CamelCasePhaseOutcomeConverter() : base(JsonNamingPolicy.CamelCase) { }
-}
-
-/// <summary>
-/// Brain-determined workflow plan for a single iteration.
-/// </summary>
-public sealed class IterationPlan
-{
-    /// <summary>Ordered list of phases the Brain wants to execute this iteration.</summary>
-    public List<GoalPhase> Phases { get; init; } = [];
-
-    /// <summary>
-    /// Per-phase instructions/context from the Brain.
-    /// Keys are lowercase phase names: "coding", "review", "testing", "merging", etc.
-    /// For multi-round plans, indexed keys like "coding-2" are used for the 2nd occurrence.
-    /// </summary>
-    public Dictionary<string, string> PhaseInstructions { get; init; } = [];
-
-    /// <summary>Per-role model tier overrides from the Brain, keyed by phase (e.g. Coding → Premium).</summary>
-    public Dictionary<GoalPhase, ModelTier> PhaseTiers { get; init; } = [];
-
-    /// <summary>Brain's reasoning for this plan.</summary>
-    public string? Reason { get; init; }
-
-    /// <summary>
-    /// Returns the instruction string for the given phase and occurrence index (1-based).
-    /// Tries the indexed key first (e.g. "coding-2" for occurrence 2), then falls back
-    /// to the bare key (e.g. "coding") for backward compatibility.
-    /// Returns null if neither key exists.
-    /// </summary>
-    /// <param name="phase">The phase to look up.</param>
-    /// <param name="occurrenceIndex">The 1-based occurrence index within the plan's phase sequence.</param>
-    /// <returns>The instruction string, or null if not found.</returns>
-    public string? GetPhaseInstruction(GoalPhase phase, int occurrenceIndex)
-    {
-        var phaseName = phase.ToString().ToLowerInvariant();
-        // Try indexed key first (e.g. "coding-2" for occurrence 2, "coding-1" for occurrence 1)
-        var indexedKey = $"{phaseName}-{occurrenceIndex}";
-        if (PhaseInstructions.TryGetValue(indexedKey, out var indexed))
-            return indexed;
-        // Fall back to bare key
-        return PhaseInstructions.GetValueOrDefault(phaseName);
-    }
-
-    /// <summary>
-    /// Creates a default plan with the standard phase order.
-    /// Used as fallback when the Brain doesn't provide a plan.
-    /// </summary>
-    public static IterationPlan Default(bool includeImprove = false)
-    {
-        var phases = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.DocWriting, GoalPhase.Review };
-        if (includeImprove) phases.Add(GoalPhase.Improve);
-        phases.Add(GoalPhase.Merging);
-        return new IterationPlan { Phases = phases, Reason = "Default plan" };
-    }
-}
-
-/// <summary>
-/// Records a single clarification Q&amp;A that occurred during goal execution.
-/// </summary>
-/// <param name="Timestamp">UTC time the clarification was created.</param>
-/// <param name="GoalId">The goal this clarification belongs to.</param>
-/// <param name="Iteration">Iteration number when the clarification was asked.</param>
-/// <param name="Phase">Pipeline phase when the clarification was asked.</param>
-/// <param name="WorkerRole">Worker role that triggered the question.</param>
-/// <param name="Question">The question that was asked.</param>
-/// <param name="Answer">The answer that was provided.</param>
-/// <param name="AnsweredBy">Who answered: \"brain\", \"composer\", or \"human\".</param>
-public sealed record ClarificationEntry(
-    DateTime Timestamp,
-    string GoalId,
-    int Iteration,
-    string Phase,
-    string WorkerRole,
-    string Question,
-    string Answer,
-    string AnsweredBy)
-{
-    /// <summary>
-    /// 1-based occurrence index of the phase within the iteration plan.
-    /// Defaults to 0 for entries created before per-occurrence tracking (backward compat).
-    /// </summary>
-    public int Occurrence { get; init; }
-}
 
 /// <summary>
 /// Tracks a single goal's progress through the multi-phase pipeline.
@@ -194,14 +58,21 @@ public sealed class GoalPipeline
     /// <summary>The active task ID currently assigned to a worker (null when idle).</summary>
     public string? ActiveTaskId { get; private set; }
 
+    /// <summary>Grouped branch-related state (feature branch, iteration SHA, merge hash).</summary>
+    public BranchContext Branch { get; } = new();
+
     /// <summary>The feature branch created by the coder for this goal.</summary>
-    public string? CoderBranch { get; private set; }
+    public string? CoderBranch
+    {
+        get => Branch.CoderBranch;
+        set => Branch.CoderBranch = value;
+    }
 
     /// <summary>
     /// Persisted agent session JSON blobs, keyed by role name (case-insensitive).
     /// Allows workers to resume mid-session after an orchestrator restart.
     /// </summary>
-    public ConcurrentDictionary<string, string> RoleSessions { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public RoleSessionStore RoleSessions { get; } = new();
 
     /// <summary>In-memory iteration summaries for completed iterations (available to dashboard before goal finishes).</summary>
     public List<IterationSummary> CompletedIterationSummaries { get; } = [];
@@ -230,8 +101,11 @@ public sealed class GoalPipeline
     /// <summary>Metrics extracted by the Brain from worker output.</summary>
     public IterationMetrics Metrics { get; } = new() { Iteration = 1 };
 
+    /// <summary>Owns the per-goal conversation history and context-summary logic.</summary>
+    public ConversationTracker ConversationTracker { get; } = new();
+
     /// <summary>Per-goal conversation history for the Brain.</summary>
-    public List<ConversationEntry> Conversation { get; } = [];
+    public List<ConversationEntry> Conversation => ConversationTracker.Entries;
 
     /// <summary>UTC timestamp when the goal was started (captured at dispatch time, before the pipeline is created).</summary>
     public DateTime? GoalStartedAt { get; internal set; }
@@ -240,16 +114,19 @@ public sealed class GoalPipeline
     public DateTime CreatedAt { get; private init; } = DateTime.UtcNow;
     /// <summary>UTC timestamp when this pipeline completed (Done or Failed), or <c>null</c> if still active.</summary>
     public DateTime? CompletedAt { get; private set; }
-    /// <summary>SHA-1 hash of the merge commit produced when the feature branch was merged, or <c>null</c> if not yet merged.</summary>
-    public string? MergeCommitHash { get; set; }
+    /// <summary>SHA-1 hash of the merge commit, or <c>null</c> if not yet merged.</summary>
+    public string? MergeCommitHash
+    {
+        get => Branch.MergeCommitHash;
+        set => Branch.MergeCommitHash = value;
+    }
 
-    /// <summary>
-    /// HEAD SHA of the target repository at the moment the coder was dispatched for this iteration.
-    /// Used to compute an iteration-scoped diff (<c>git diff {sha}..HEAD</c>) for reviewers so they
-    /// can distinguish this iteration's changes from earlier iterations on the same branch.
-    /// <c>null</c> when the SHA could not be captured (e.g. empty repository).
-    /// </summary>
-    public string? IterationStartSha { get; set; }
+    /// <summary>HEAD SHA captured before the coder ran this iteration, or <c>null</c>.</summary>
+    public string? IterationStartSha
+    {
+        get => Branch.IterationStartSha;
+        set => Branch.IterationStartSha = value;
+    }
 
     /// <summary>
     /// Creates a new pipeline for the specified goal.
@@ -290,16 +167,15 @@ public sealed class GoalPipeline
             TestRetryBudget.TryConsume();
 
         ActiveTaskId = snapshot.ActiveTaskId;
-        CoderBranch = snapshot.CoderBranch;
+        Branch.CoderBranch = snapshot.CoderBranch;
         Plan = snapshot.Plan;
         CreatedAt = snapshot.CreatedAt;
         CompletedAt = snapshot.CompletedAt;
         GoalStartedAt = snapshot.GoalStartedAt;
-        MergeCommitHash = snapshot.MergeCommitHash;
-        IterationStartSha = snapshot.IterationStartSha;
+        Branch.MergeCommitHash = snapshot.MergeCommitHash;
+        Branch.IterationStartSha = snapshot.IterationStartSha;
 
-        foreach (var (key, value) in snapshot.RoleSessions)
-            RoleSessions[key] = value;
+        RoleSessions.Load(snapshot.RoleSessions);
 
         Metrics.BuildSuccess = snapshot.Metrics.BuildSuccess;
         Metrics.TotalTests = snapshot.Metrics.TotalTests;
@@ -389,49 +265,16 @@ public sealed class GoalPipeline
         });
     }
 
-    /// <summary>
-    /// Returns the persisted session JSON for the given role, or <c>null</c> if no session has been stored.
-    /// The lookup is case-insensitive.
-    /// </summary>
-    /// <param name="roleName">The name of the role whose session to retrieve.</param>
-    /// <returns>The session JSON string, or <c>null</c> if not found.</returns>
+    /// <summary>Returns the persisted session JSON for the given role, or <c>null</c> if not found.</summary>
     public string? GetRoleSession(string roleName) =>
-        RoleSessions.TryGetValue(roleName, out var session) ? session : null;
+        RoleSessions.Get(roleName);
 
-    /// <summary>
-    /// Stores the session JSON for the given role, overwriting any previously stored value.
-    /// The key is treated case-insensitively.
-    /// </summary>
-    /// <param name="roleName">The name of the role whose session to store.</param>
-    /// <param name="sessionJson">The serialised session JSON to persist.</param>
+    /// <summary>Stores the session JSON for the given role (case-insensitive key).</summary>
     public void SetRoleSession(string roleName, string sessionJson) =>
-        RoleSessions[roleName] = sessionJson;
+        RoleSessions.Set(roleName, sessionJson);
 
     /// <summary>Build a context summary for the Brain about this pipeline's current state.</summary>
-    public string BuildContextSummary()
-    {
-        var parts = new List<string>
-        {
-            $"Goal: {Description}",
-            $"Phase: {Phase}",
-            $"Iteration: {Iteration}",
-            $"Review retries: {ReviewRetries}/{MaxRetries}",
-            $"Test retries: {TestRetries}/{MaxRetries}",
-        };
-
-        if (CoderBranch is not null)
-            parts.Add($"Branch: {CoderBranch}");
-
-        foreach (var entry in PhaseLog.Where(e => e.WorkerOutput is not null))
-        {
-            var key = $"{entry.Name.ToRoleName()}-{entry.Iteration}-{entry.Occurrence}";
-            var output = entry.WorkerOutput!;
-            var truncated = output.Length > 2000 ? output[..2000] + "..." : output;
-            parts.Add($"\n=== Output from {key} ===\n{truncated}\n=== End output from {key} ===");
-        }
-
-        return string.Join("\n", parts);
-    }
+    public string BuildContextSummary() => ConversationTracker.BuildContextSummary(this);
 
     /// <summary>Returns a human-friendly display name for the given <see cref="GoalPhase"/>.</summary>
     /// <param name="phase">The pipeline phase to get a display name for.</param>
