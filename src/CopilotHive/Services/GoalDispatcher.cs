@@ -396,7 +396,7 @@ public sealed class GoalDispatcher : BackgroundService
                 result.TaskId, result.GitStatus.FilesChanged);
 
         // Extract structured verdict from worker tool call metrics
-        var verdict = "PASS"; // Default: worker completed successfully
+        var verdict = Verdict.Pass; // Default: worker completed successfully
         if (result.Metrics is { } metrics)
         {
             if (!string.IsNullOrEmpty(metrics.Verdict))
@@ -417,7 +417,7 @@ public sealed class GoalDispatcher : BackgroundService
                     pipeline.GoalId, metrics.PassedTests, metrics.TotalTests, metrics.FailedTests, metrics.Verdict);
             }
 
-            if (pipeline.Phase == GoalPhase.Review && verdict is "APPROVE" or "REQUEST_CHANGES")
+            if (pipeline.Phase == GoalPhase.Review && (Verdict.Matches(verdict, Verdict.Approve) || Verdict.Matches(verdict, Verdict.RequestChanges)))
             {
                 pipeline.Metrics.ReviewVerdict = ReviewVerdictExtensions.ParseReviewVerdict(verdict);
                 if (metrics.Issues is { Count: > 0 })
@@ -455,8 +455,8 @@ public sealed class GoalDispatcher : BackgroundService
             ? PhaseInput.Succeeded // Improve phase is non-blocking
             : verdict switch
             {
-                "FAIL" or "CANCELLED" => PhaseInput.Failed,
-                "REQUEST_CHANGES" => PhaseInput.RequestChanges,
+                var v when Verdict.Matches(v, Verdict.Fail) || Verdict.Matches(v, Verdict.Cancelled) => PhaseInput.Failed,
+                var v when Verdict.Matches(v, Verdict.RequestChanges) => PhaseInput.RequestChanges,
                 _ => PhaseInput.Succeeded, // PASS, APPROVE, or no verdict
             };
 
@@ -513,7 +513,7 @@ public sealed class GoalDispatcher : BackgroundService
         GoalPipeline pipeline, string verdict, CancellationToken ct)
     {
         // Determine which retry counter to increment based on the verdict
-        var isReviewRelated = verdict == "REQUEST_CHANGES"
+        var isReviewRelated = Verdict.Matches(verdict, Verdict.RequestChanges)
             || pipeline.Metrics.ReviewVerdict == ReviewVerdict.RequestChanges;
         var canRetry = isReviewRelated
             ? pipeline.ReviewRetryBudget.TryConsume()
