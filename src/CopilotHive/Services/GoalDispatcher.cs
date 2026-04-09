@@ -674,14 +674,7 @@ public sealed class GoalDispatcher : BackgroundService
             : (firstPhase == GoalPhase.Coding ? BuildCoderPrompt(goal) : $"Work on: {pipeline.Description}");
 
         // PhaseLog: append entry for the first phase of the pipeline
-        pipeline.PhaseLog.Add(new PhaseResult
-        {
-            Name = firstPhase,
-            Result = PhaseOutcome.Pass,
-            Occurrence = 1,
-            Iteration = pipeline.Iteration,
-            StartedAt = DateTime.UtcNow,
-        });
+        pipeline.PhaseLog.Add(PhaseResult.Create(firstPhase, pipeline.Iteration, 1));
         if (pipeline.CurrentPhaseEntry is { } firstPhaseEntry)
         {
             firstPhaseEntry.WorkerPrompt = firstPhasePrompt;

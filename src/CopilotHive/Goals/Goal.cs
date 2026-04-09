@@ -141,6 +141,25 @@ public sealed class PhaseResult
     public DateTime? CompletedAt { get; set; }
     /// <summary>The raw verdict string from the worker (e.g. "PASS", "FAIL", "APPROVE", "REQUEST_CHANGES").</summary>
     public string? Verdict { get; set; }
+
+    /// <summary>
+    /// Creates a new <see cref="PhaseResult"/> entry for a phase that is about to start.
+    /// Sets sensible defaults: <see cref="Result"/> = <see cref="PhaseOutcome.Pass"/>,
+    /// <see cref="StartedAt"/> = <see cref="DateTime.UtcNow"/>, and populates
+    /// <see cref="Occurrence"/> and <see cref="Iteration"/> from the pipeline state.
+    /// </summary>
+    /// <param name="phase">The phase being dispatched.</param>
+    /// <param name="iteration">The 1-based iteration number.</param>
+    /// <param name="occurrence">The 1-based occurrence index within the iteration plan.</param>
+    /// <returns>A new <see cref="PhaseResult"/> ready to be appended to <see cref="GoalPipeline.PhaseLog"/>.</returns>
+    public static PhaseResult Create(GoalPhase phase, int iteration, int occurrence) => new()
+    {
+        Name = phase,
+        Result = PhaseOutcome.Pass,
+        Iteration = iteration,
+        Occurrence = occurrence,
+        StartedAt = DateTime.UtcNow,
+    };
 }
 
 /// <summary>Aggregate test counts from a tester run.</summary>

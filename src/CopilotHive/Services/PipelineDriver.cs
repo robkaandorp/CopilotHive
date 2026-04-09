@@ -337,14 +337,7 @@ internal sealed class PipelineDriver
             : $"Fix issues for: {pipeline.Description}. {context}";
 
         // PhaseLog: append a new entry for the coder phase in the new iteration
-        pipeline.PhaseLog.Add(new PhaseResult
-        {
-            Name = GoalPhase.Coding,
-            Result = PhaseOutcome.Pass,
-            Occurrence = 1,
-            Iteration = pipeline.Iteration,
-            StartedAt = DateTime.UtcNow,
-        });
+        pipeline.PhaseLog.Add(PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1));
         if (pipeline.CurrentPhaseEntry is { } newIterEntry)
         {
             newIterEntry.WorkerPrompt = fixPrompt;
@@ -441,14 +434,7 @@ internal sealed class PipelineDriver
         GoalPipeline pipeline, GoalPhase phase, string? phaseInstructions, CancellationToken ct, int occurrence = 1)
     {
         // PhaseLog: append a new entry when the phase starts
-        pipeline.PhaseLog.Add(new PhaseResult
-        {
-            Name = phase,
-            Result = PhaseOutcome.Pass,
-            Occurrence = occurrence,
-            Iteration = pipeline.Iteration,
-            StartedAt = DateTime.UtcNow,
-        });
+        pipeline.PhaseLog.Add(PhaseResult.Create(phase, pipeline.Iteration, occurrence));
 
         switch (phase)
         {
