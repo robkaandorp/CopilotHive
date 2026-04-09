@@ -355,6 +355,7 @@ public sealed class DashboardStateService : IDisposable
             RoleModels = roles.ToDictionary(r => r, r => _config?.GetModelForRole(r) ?? Constants.DefaultModel),
             BrainModel = _brain?.GetStats()?.Model ?? "(not configured)",
             ComposerModel = _composer?.GetStats()?.Model ?? "(not configured)",
+            CompactionModel = _config?.Models?.CompactionModel,
         };
     }
 

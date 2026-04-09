@@ -51,6 +51,11 @@
                 <td>@ReasoningBadge(model)</td>
             </tr>
         }
+        <tr>
+            <td><span class="badge badge-green">compaction</span></td>
+            <td style="font-family:monospace;font-size:0.85rem">@(string.IsNullOrEmpty(_info.CompactionModel) ? "(use main model)" : StripReasoning(_info.CompactionModel))</td>
+            <td>@(string.IsNullOrEmpty(_info.CompactionModel) ? "—" : ReasoningBadge(_info.CompactionModel))</td>
+        </tr>
     </tbody>
 </table>
 

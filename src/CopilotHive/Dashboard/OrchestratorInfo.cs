@@ -17,4 +17,6 @@ public sealed class OrchestratorInfo
     public string ComposerModel { get; init; } = "";
     /// <summary>Model configured per worker role.</summary>
     public Dictionary<string, string> RoleModels { get; init; } = [];
+    /// <summary>Model configured for context compaction summaries, or null if using the main model.</summary>
+    public string? CompactionModel { get; init; }
 }

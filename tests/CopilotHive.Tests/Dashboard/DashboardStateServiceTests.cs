@@ -1091,6 +1091,87 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.True(info.RoleModels.ContainsKey("improver"),  "RoleModels missing 'improver'");
     }
 
+    // ── OrchestratorInfo.CompactionModel ────────────────────────────────────
+
+    /// <summary>
+    /// Verifies that <see cref="OrchestratorInfo.CompactionModel"/> returns the value
+    /// it was constructed with.
+    /// </summary>
+    [Fact]
+    public void OrchestratorInfo_CompactionModel_Set_ReturnsValue()
+    {
+        var info = new OrchestratorInfo
+        {
+            CompactionModel = "some-model",
+        };
+
+        Assert.Equal("some-model", info.CompactionModel);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="OrchestratorInfo.CompactionModel"/> defaults to null
+    /// when not explicitly set.
+    /// </summary>
+    [Fact]
+    public void OrchestratorInfo_CompactionModel_DefaultIsNull()
+    {
+        var info = new OrchestratorInfo();
+
+        Assert.Null(info.CompactionModel);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetOrchestratorInfo"/> populates
+    /// <see cref="OrchestratorInfo.CompactionModel"/> from the config's
+    /// <see cref="ModelsConfig.CompactionModel"/> when configured.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_CompactionModel_PopulatedFromConfig()
+    {
+        var config = new HiveConfigFile
+        {
+            Repositories = [],
+            Models = new ModelsConfig { CompactionModel = "copilot/gpt-5.4-mini" },
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Equal("copilot/gpt-5.4-mini", info.CompactionModel);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="OrchestratorInfo.CompactionModel"/> is null when
+    /// the config's <see cref="HiveConfigFile.Models"/> section is absent.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_CompactionModel_NullWhenModelsSectionAbsent()
+    {
+        var config = new HiveConfigFile
+        {
+            Repositories = [],
+            // Models is null by default
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Null(info.CompactionModel);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="OrchestratorInfo.CompactionModel"/> is null when
+    /// the config itself is null.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_CompactionModel_NullWhenConfigIsNull()
+    {
+        using var service = BuildService(config: null);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Null(info.CompactionModel);
+    }
+
     /// <summary>
     /// Helper that constructs a <see cref="DashboardStateService"/> with the given
     /// optional config and an in-memory SQLite goal store.
