@@ -1,12 +1,10 @@
 using System.ComponentModel;
-using System.Text;
 using System.Text.Json;
 using CopilotHive.Agents;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Metrics;
 using CopilotHive.Services;
-using CopilotHive.Telemetry;
 using CopilotHive.Workers;
 using Microsoft.Extensions.AI;
 using SharpCoder;
@@ -49,68 +47,18 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly List<AITool> _brainTools;
     private readonly AgentsManager? _agentsManager;
 
-    /// <summary>
-    /// Active pipeline snapshots keyed by goal ID. Used by the <c>get_goal</c> tool to return
-    /// iteration and phase information for a goal without requiring a full <see cref="IGoalStore"/> query.
-    /// Updated by <see cref="RegisterActivePipeline"/> when goal dispatch begins.
-    /// </summary>
+    /// <summary>Active pipeline snapshots keyed by goal ID, used by the <c>get_goal</c> tool.</summary>
     private Dictionary<string, GoalPipeline>? _activePipelines;
 
-    /// <summary>
-    /// Serialises all Brain LLM calls so that <see cref="_lastToolCallResult"/> is
-    /// never overwritten by a concurrent goal's tool lambda.
-    /// </summary>
+    /// <summary>Serialises all Brain LLM calls so <see cref="_lastToolCallResult"/> is never overwritten concurrently.</summary>
     private readonly SemaphoreSlim _brainCallGate = new(1, 1);
 
-    /// <summary>
-    /// Stores the last tool call result captured by the Brain tool lambdas.
-    /// Written by tool lambdas (from FunctionInvokingChatClient thread),
-    /// read after ExecuteAsync completes.
-    /// Access is serialised by <see cref="_brainCallGate"/>.
-    /// </summary>
+    /// <summary>Last tool call result captured by Brain tool lambdas. Serialised by <see cref="_brainCallGate"/>.</summary>
     private volatile BrainToolCallResult? _lastToolCallResult;
 
-    private const string DefaultSystemPrompt = """
-        You are the CopilotHive Orchestrator Brain — a product owner and project manager.
-        You have two jobs:
-        1. Plan iteration phases using the report_iteration_plan tool
-        2. Craft clear, specific prompts for workers when asked
+    private const string DefaultSystemPrompt = BrainPromptBuilder.DefaultSystemPrompt;
 
-        You have read-only access to the target repositories via file tools (read_file, glob, grep).
-        Use these to examine project structure, configuration, and code when it helps you plan
-        better iterations or craft more targeted worker prompts.
-
-        RULES:
-        - When planning iterations, always call report_iteration_plan
-        - When crafting prompts, respond with ONLY the prompt text — no JSON, no markdown formatting
-        - If you need clarification during planning or prompt crafting that cannot be determined from the codebase, call the escalate_to_composer tool with a question and reason
-        - Never include git checkout/branch/switch/push commands in prompts — infrastructure handles branching
-        - Never include framework-specific build/test commands — workers use build and test skills
-
-        WORKER PROMPT RULES:
-        When crafting worker prompts, follow these rules per role:
-        - Coders: Tell them to implement immediately, read files, use build/test skills, commit with git add -A && git commit. Never include git branch or push commands.
-        - Testers: Tell them to build, run test skill, write integration tests, call report_test_results. Never tell them to create report files.
-        - Reviewers: Do NOT include git diff commands — the worker's workspace context provides the correct diff. Tell them to review using their workspace diff commands, focus on +/- lines, call report_review_verdict. Files to change is guidance, Files NOT to change is strict. Test changes are always acceptable. Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
-        - DocWriters: Do NOT include git diff commands. Tell them to use workspace context diff, update only requested docs, build to verify, call report_doc_changes.
-        - Improvers: Tell them to analyze results and update *.agents.md files using file tools. No git commands.
-        """;
-
-    /// <summary>
-    /// Initialises a new <see cref="DistributedBrain"/> that connects directly to an LLM provider.
-    /// </summary>
-    /// <param name="modelOverride">Model string, optionally with provider prefix (e.g. "copilot/claude-sonnet-4.6").</param>
-    /// <param name="logger">Logger instance.</param>
-    /// <param name="metricsTracker">Optional tracker used to include historical metrics in prompts.</param>
-    /// <param name="agentsManager">Optional manager used to load the orchestrator's AGENTS.md.</param>
-    /// <param name="maxContextTokens">Maximum context window size in tokens. Defaults to <see cref="Constants.DefaultBrainContextWindow"/>.</param>
-    /// <param name="maxSteps">Maximum tool-call steps per Brain request. Defaults to <see cref="Constants.DefaultBrainMaxSteps"/>.</param>
-    /// <param name="repoManager">Optional manager for persistent Brain repo clones (read-only file access).</param>
-    /// <param name="stateDir">Directory for persistent state (session files). Defaults to <c>/app/state</c>.</param>
-    /// <param name="goalStore">Optional goal store used by the <c>get_goal</c> tool to retrieve goal details on demand.</param>
-    /// <param name="chatClient">Optional pre-built <see cref="IChatClient"/>. When supplied, <see cref="ConnectAsync"/> skips
-    /// the <c>ChatClientFactory</c> and uses this instance instead — useful in tests that need to avoid real credentials.</param>
-    /// <param name="compactionModel">Optional model string for a separate compaction <see cref="IChatClient"/>.</param>
+    /// <summary>Initialises a new <see cref="DistributedBrain"/> that connects directly to an LLM provider.</summary>
     public DistributedBrain(string modelOverride, ILogger<DistributedBrain> logger,
         MetricsTracker? metricsTracker = null, Agents.AgentsManager? agentsManager = null,
         int maxContextTokens = Constants.DefaultBrainContextWindow,
@@ -146,10 +94,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             : $"{DefaultSystemPrompt}\n\n{orchestratorInstructions}";
     }
 
-    /// <summary>
-    /// Creates the IChatClient and CodingAgent for the configured model/provider.
-    /// Also loads a previously saved session if one exists.
-    /// </summary>
+    /// <summary>Creates the IChatClient and CodingAgent. Also loads a previously saved session.</summary>
     public async Task ConnectAsync(CancellationToken ct = default)
     {
         _logger.LogInformation("Brain connecting with model '{Model}'…", _modelOverride);
@@ -201,10 +146,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             repoName, _repoManager.GetClonePath(repoName));
     }
 
-    /// <summary>
-    /// Registers a pipeline as active so the <c>get_goal</c> tool can include iteration
-    /// and phase context in its response.
-    /// </summary>
+    /// <summary>Registers a pipeline as active so the <c>get_goal</c> tool can include iteration and phase context.</summary>
     /// <param name="pipeline">The active goal pipeline.</param>
     public void RegisterActivePipeline(GoalPipeline pipeline)
     {
@@ -212,19 +154,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _activePipelines[pipeline.GoalId] = pipeline;
     }
 
-    /// <summary>
-    /// Removes a pipeline from the active-pipeline registry once a goal completes or fails.
-    /// </summary>
-    /// <param name="goalId">The goal ID whose pipeline to deregister.</param>
+    /// <summary>Removes a pipeline from the active-pipeline registry once a goal completes or fails.</summary>
     public void DeregisterActivePipeline(string goalId)
     {
         _activePipelines?.Remove(goalId);
     }
 
-    /// <summary>
-    /// Builds the AIFunction tools that the Brain LLM can call.
-    /// Only <c>report_iteration_plan</c> — prompt crafting uses plain text responses.
-    /// </summary>
+    /// <summary>Builds the AIFunction tools that the Brain LLM can call.</summary>
     private List<AITool> BuildBrainTools()
     {
         var validPhases = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -335,10 +271,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         string? ModelTiers)
         : BrainToolCallResult("report_iteration_plan");
 
-    /// <summary>
-    /// Creates a CodingAgent with current configuration. Called on connect
-    /// and when the underlying configuration changes.
-    /// </summary>
+    /// <summary>Creates a CodingAgent with current configuration.</summary>
     private void RecreateAgent()
     {
         if (_chatClient is null)
@@ -388,18 +321,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>Returns the file path for a goal-specific forked session.</summary>
-    /// <param name="goalId">The goal identifier.</param>
     private string GetGoalSessionFilePath(string goalId)
         => Path.Combine(_stateDir, $"brain-goal-{goalId}.json");
 
     /// <summary>Returns the file path for the master Brain session.</summary>
     private string GetMasterSessionFilePath() => Path.Combine(_stateDir, "brain-master.json");
 
-    /// <summary>
-    /// Forks the master session to create an isolated goal session and persists it to disk.
-    /// </summary>
-    /// <param name="goalId">The goal identifier to fork for.</param>
-    /// <param name="ct">Cancellation token.</param>
+    /// <summary>Forks the master session for a goal and persists it to disk.</summary>
     /// <inheritdoc />
     public async Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default)
     {
@@ -410,12 +338,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             goalId, goalSession.MessageHistory.Count);
     }
 
-    /// <summary>
-    /// Loads the goal-specific session into <c>_session</c>, saving the current session first
-    /// if switching goals. Falls back to forking from master if no persisted goal session exists.
-    /// </summary>
-    /// <param name="goalId">The goal identifier whose session to load.</param>
-    /// <param name="ct">Cancellation token.</param>
+    /// <summary>Loads the goal-specific session, saving the current session first if switching goals.</summary>
     private async Task LoadGoalSessionAsync(string goalId, CancellationToken ct)
     {
         // Idempotent: already loaded for this goal
@@ -435,11 +358,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         RecreateAgent();
     }
 
-    /// <summary>
-    /// Persists the currently active goal session to disk.
-    /// No-op if no goal is active.
-    /// </summary>
-    /// <param name="ct">Cancellation token.</param>
+    /// <summary>Persists the currently active goal session to disk. No-op if no goal is active.</summary>
     private async Task SaveCurrentSessionAsync(CancellationToken ct)
     {
         if (_activeGoalId == null) return;
@@ -447,10 +366,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         await _session.SaveAsync(goalSessionFile, ct);
     }
 
-    /// <summary>
-    /// Deletes the persisted goal session file after goal completion or failure.
-    /// </summary>
-    /// <param name="goalId">The goal identifier whose session to delete.</param>
+    /// <summary>Deletes the persisted goal session file after goal completion or failure.</summary>
     /// <inheritdoc />
     public void DeleteGoalSession(string goalId)
     {
@@ -516,80 +432,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         await SaveSessionAsync(ct);
     }
 
-    /// <summary>
-    /// Asks the Brain to plan which phases should run during the current iteration.
-    /// Returns a <see cref="PlanResult"/> that either contains the plan or an escalation request.
-    /// </summary>
-    /// <param name="pipeline">The goal pipeline containing iteration state and context.</param>
-    /// <param name="additionalContext">Optional extra context prepended to the planning prompt (e.g. retry context for a previously failed goal).</param>
-    /// <param name="ct">Cancellation token.</param>
+    /// <summary>Asks the Brain to plan which phases should run during the current iteration.</summary>
     public async Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
     {
-        var previousIterationContext = BuildPreviousIterationContext(pipeline);
-
-        var retryContext = pipeline.Iteration > 1
-            ? $"""
-              Retry context:
-              - This is iteration {pipeline.Iteration} (previous attempts: {pipeline.Iteration - 1})
-              - Review retries: {pipeline.ReviewRetries}
-              - Test retries: {pipeline.TestRetries}
-              This is a retry — use the feedback above to plan which phases need re-running.
-              """
-            : "This is the first iteration — no previous feedback.";
-
-        var conversationSummary = pipeline.Conversation.Count > 0
-            ? $"Conversation history ({pipeline.Conversation.Count} messages): " +
-              Truncate(string.Join(" | ", pipeline.Conversation.Select(e => $"[{e.Role}] {e.Content}")), Constants.TruncationConversationSummary)
-            : "";
-
-        var prompt = $$"""
-            {{(additionalContext is not null ? $"=== Additional context ===\n{additionalContext}\n=== End additional context ===\n\n" : "")}}Plan the workflow for iteration {{pipeline.Iteration}} of goal: {{pipeline.Description}}
-
-            Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
-            (You can browse the code under these folder names in your working directory)
-
-            {{retryContext}}
-            {{previousIterationContext}}
-            {{conversationSummary}}
-
-            Decide the ordered phases for this iteration. Consider:
-            - Is this a documentation-only change? (coder edits, then docwriter — may skip testing)
-            - Is this a retry after failure? (what phases need re-running)
-            IMPORTANT: Only include the docwriting phase when the goal explicitly requests
-            documentation updates (e.g. "update README", "add changelog entry", "update docs").
-            Skip docwriting for purely internal changes (refactors, bug fixes, test additions)
-            unless the goal description specifically calls for it.
-            Include the improve phase to let the improver refine agents.md guidance based on
-            how the iteration went — especially when steps needed retries or produced issues.
-
-            Available phases: coding, testing, docwriting, review, improve, merging
-
-            For large or complex coding tasks, you may plan multiple coding+testing rounds before review:
-              ["coding", "testing", "coding", "testing", "review", "improve", "merging"]
-
-            Use multiple coding rounds when:
-            - The change involves a large file (>500 lines) that risks LLM response timeouts
-            - The work naturally splits into sequential steps (e.g. "revert X, then implement Y")
-            - A previous iteration timed out during coding
-
-            Each coding round must be immediately followed by testing. Provide separate phase_instructions
-            for each round using keys "coding-1", "coding-2", etc. and "testing-1", "testing-2", etc.
-            Single-round plans may use bare keys "coding", "testing" as before.
-
-            Call the `report_iteration_plan` tool with:
-            - phases: ordered list of phase names
-            - phase_instructions: JSON object with per-phase instructions.
-              Single-round: {"coding": "...", "review": "..."}
-              Multi-round:  {"coding-1": "step 1: revert...", "coding-2": "step 2: restructure...", "review": "..."}
-            - reason: why this plan
-            - model_tiers: (optional) JSON object to escalate specific phases to premium tier
-              (e.g. {"coding": "premium"}). Valid phases: coding, testing, docwriting, review, improve.
-              Only use premium when previous iterations failed and you believe the task requires
-              stronger reasoning. Omitted phases use the default tier.
-
-            If the goal description is ambiguous or you need domain knowledge to plan properly,
-            call the `escalate_to_composer` tool instead with a question and reason.
-            """;
+        var prompt = BrainPromptBuilder.BuildPlanningPrompt(pipeline, additionalContext);
 
         if (_agent is null)
         {
@@ -629,7 +475,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
                 if (toolCall is IterationPlanResult iterationPlanResult)
                 {
-                    var plan = BuildIterationPlanFromToolCall(iterationPlanResult);
+                    var plan = BrainPlanParser.BuildIterationPlanFromToolCall(iterationPlanResult);
 
                     if (plan is { Phases.Count: > 0 })
                     {
@@ -641,7 +487,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     }
 
                     _logger.LogWarning("Failed to parse iteration plan from Brain response: {Response}",
-                        Truncate(response, Constants.TruncationShort));
+                        BrainPromptBuilder.Truncate(response, Constants.TruncationShort));
                     break;
                 }
 
@@ -670,91 +516,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         return PlanResult.Success(IterationPlan.Default());
     }
 
-    internal static IterationPlan MapIterationPlan(IterationPlanDto dto)
-    {
-        var phases = new List<GoalPhase>();
-        foreach (var name in dto.Phases)
-        {
-            if (Enum.TryParse<GoalPhase>(name, ignoreCase: true, out var phase)
-                && phase is not (GoalPhase.Planning or GoalPhase.Done or GoalPhase.Failed))
-            {
-                phases.Add(phase);
-            }
-        }
-
-        var instructions = new Dictionary<string, string>();
-        if (dto.PhaseInstructions is not null)
-        {
-            foreach (var (key, value) in dto.PhaseInstructions)
-            {
-                if (value is not null)
-                    instructions[key] = value;
-            }
-        }
-
-        var phaseTiers = new Dictionary<GoalPhase, ModelTier>();
-        if (dto.ModelTiers is not null)
-        {
-            foreach (var (key, value) in dto.ModelTiers)
-            {
-                if (Enum.TryParse<GoalPhase>(key, ignoreCase: true, out var phase) && value is not null)
-                    phaseTiers[phase] = ModelTierExtensions.ParseModelTier(value);
-            }
-        }
-
-        return new IterationPlan
-        {
-            Phases = phases,
-            PhaseInstructions = instructions,
-            PhaseTiers = phaseTiers,
-            Reason = dto.Reason,
-        };
-    }
-
-    /// <summary>
-    /// Builds an <see cref="IterationPlan"/> from a <c>report_iteration_plan</c> tool call result.
-    /// </summary>
-    internal static IterationPlan BuildIterationPlanFromToolCall(IterationPlanResult toolCall)
-    {
-        var phaseNames = toolCall.Phases?.ToList() ?? [];
-
-        Dictionary<string, string>? phaseInstructions = null;
-        if (!string.IsNullOrEmpty(toolCall.PhaseInstructions))
-        {
-            try { phaseInstructions = JsonSerializer.Deserialize<Dictionary<string, string>>(toolCall.PhaseInstructions, ProtocolJson.Options); }
-            catch (JsonException) { /* best-effort */ }
-        }
-
-        Dictionary<string, string>? modelTiers = null;
-        if (!string.IsNullOrEmpty(toolCall.ModelTiers))
-        {
-            try { modelTiers = JsonSerializer.Deserialize<Dictionary<string, string>>(toolCall.ModelTiers, ProtocolJson.Options); }
-            catch (JsonException) { /* best-effort */ }
-        }
-
-        var dto = new IterationPlanDto
-        {
-            Phases = phaseNames,
-            PhaseInstructions = phaseInstructions,
-            ModelTiers = modelTiers,
-            Reason = toolCall.Reason,
-        };
-        return MapIterationPlan(dto);
-    }
-
-    /// <summary>DTO for deserializing the Brain's iteration plan JSON response.</summary>
-    internal sealed record IterationPlanDto
-    {
-        public List<string> Phases { get; init; } = [];
-        public Dictionary<string, string>? PhaseInstructions { get; init; }
-        public Dictionary<string, string>? ModelTiers { get; init; }
-        public string? Reason { get; init; }
-    }
-
-    /// <summary>
-    /// Generates a summary of the completed goal's work and appends it to the master session.
-    /// Should be called after a goal completes successfully, before deleting the goal session.
-    /// </summary>
+    /// <summary>Generates a summary of the completed goal's work and appends it to the master session.</summary>
     public async Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default)
     {
         await _brainCallGate.WaitAsync(ct);
@@ -762,20 +524,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             await LoadGoalSessionAsync(pipeline.GoalId, ct);
 
-            var prompt = $"""
-                This goal has been completed successfully and merged.
-                
-                Goal: {pipeline.GoalId}
-                Description: {Truncate(pipeline.Description, 500)}
-                Iterations: {pipeline.Iteration}
-                
-                Summarize what was accomplished in 2-4 sentences. Focus on:
-                - What was changed (files, components, patterns)
-                - Key decisions or trade-offs made
-                - Any important context for future goals
-                
-                Respond with ONLY the summary text.
-                """;
+            var prompt = BrainPromptBuilder.BuildSummarizePrompt(pipeline);
 
             string summary;
             if (_agent is not null)
@@ -801,7 +550,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _activeGoalId = null;
 
             _logger.LogInformation("Merged summary for goal '{GoalId}' into master session: {Summary}",
-                pipeline.GoalId, Truncate(summary, 200));
+                pipeline.GoalId, BrainPromptBuilder.Truncate(summary, 200));
 
             return summary;
         }
@@ -820,19 +569,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             return null;
         }
 
-        var prompt = $$"""
-            Generate a concise git commit message for a squash merge of goal: {{pipeline.Description}}
-
-            Goal ID: {{pipeline.GoalId}}
-            Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
-
-            Format:
-            - First line: a short imperative subject (~72 characters, no "Goal:" prefix)
-            - Blank line
-            - 2–4 bullet points summarizing what was implemented
-
-            Respond with ONLY the commit message text — no tool calls, no JSON, no markdown wrapping.
-            """;
+        var prompt = BrainPromptBuilder.BuildCommitMessagePrompt(pipeline);
 
         try
         {
@@ -874,164 +611,18 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Builds the raw prompt text that will be sent to the Brain to craft a worker prompt.
-    /// Extracted for testability — allows verifying prompt content without a connected agent.
-    /// </summary>
-    /// <param name="pipeline">The goal pipeline with phase outputs and iteration state.</param>
-    /// <param name="phase">The current goal phase.</param>
-    /// <param name="additionalContext">Optional additional context to include.</param>
-    /// <returns>The assembled prompt text.</returns>
-    internal string BuildCraftPromptText(GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null)
-    {
-        var roleName = phase.ToWorkerRole().ToRoleName();
-
-        var phaseInstructions = "";
-        // Use occurrence-indexed key lookup for multi-round plans (e.g. "coding-2" for second coding round)
-        var occurrenceIndex = GetPhaseOccurrenceIndex(pipeline, phase);
-        var instructions = pipeline.Plan?.GetPhaseInstruction(phase, occurrenceIndex);
-        if (!string.IsNullOrEmpty(instructions))
-            phaseInstructions = $"\nPhase instructions from the plan:\n{instructions}";
-
-        // Check if docwriting preceded review in this iteration's plan, so the
-        // reviewer knows that CHANGELOG/README changes are expected and in-scope.
-        var docWritingPrecededReview = pipeline.Plan?.Phases is { } phases
-            && phases.IndexOf(GoalPhase.DocWriting) is >= 0 and var dwIdx
-            && phases.IndexOf(GoalPhase.Review) is >= 0 and var rvIdx
-            && dwIdx < rvIdx;
-
-        // When retrying after review/test rejection, include the specific feedback
-        // so the coder/tester knows exactly what to fix.
-        var previousFeedback = (phase is GoalPhase.Coding or GoalPhase.Testing && pipeline.Iteration > 1)
-            ? BuildPreviousIterationContext(pipeline)
-            : "";
-
-        // For review phase, extract the tester output from the current iteration so the reviewer
-        // can verify test results without needing to run tests themselves.
-        string currentTestResults;
-        var testerEntry = pipeline.PhaseLog
-            .LastOrDefault(e => e.Iteration == pipeline.Iteration && e.Name == GoalPhase.Testing);
-        if (phase == GoalPhase.Review
-            && testerEntry?.WorkerOutput is { } testerOut
-            && !string.IsNullOrWhiteSpace(testerOut))
-        {
-            const int maxTesterOutputChars = 2000;
-            currentTestResults = testerOut.Length > maxTesterOutputChars
-                ? testerOut[..maxTesterOutputChars] + "..."
-                : testerOut;
-        }
-        else
-        {
-            currentTestResults = "";
-        }
-
-        // For review phase, also include coder output so the reviewer understands the rationale
-        // behind code decisions. Cap at 2000 chars with ellipsis if truncated.
-        string currentCoderOutput;
-        var coderEntry = pipeline.PhaseLog
-            .LastOrDefault(e => e.Iteration == pipeline.Iteration && e.Name == GoalPhase.Coding);
-        if (phase == GoalPhase.Review
-            && coderEntry?.WorkerOutput is { } coderOut
-            && !string.IsNullOrWhiteSpace(coderOut))
-        {
-            const int maxCoderOutputChars = 2000;
-            currentCoderOutput = coderOut.Length > maxCoderOutputChars
-                ? coderOut[..maxCoderOutputChars] + "..."
-                : coderOut;
-        }
-        else
-        {
-            currentCoderOutput = "";
-        }
-
-        // Include docwriting-preceded-review guidance inline when relevant
-        var docWritingNote = (phase == GoalPhase.Review && docWritingPrecededReview)
-            ? "\nNote: The docwriting phase already ran before this review. Changes to CHANGELOG.md, README.md, and XML doc comments are EXPECTED and should NOT be flagged as scope violations."
-            : "";
-
-        return $$"""
-            Craft a prompt for the {{roleName}} worker.
-
-            Goal: {{pipeline.GoalId}} (iteration {{pipeline.Iteration}}, phase {{phase}})
-            Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
-            {{phaseInstructions}}
-            {{(previousFeedback.Length > 0 ? $"\n{previousFeedback}" : "")}}
-            {{(additionalContext is not null ? $"\n=== Additional context ===\n{additionalContext}\n=== End additional context ===" : "")}}
-            {{(currentTestResults.Length > 0 ? $"\n=== Tester output (iteration {pipeline.Iteration}) ===\n{currentTestResults}\n=== End tester output ===" : "")}}
-            {{(currentCoderOutput.Length > 0 ? $"\n=== Coder output (iteration {pipeline.Iteration}) ===\n{currentCoderOutput}\n=== End coder output ===" : "")}}
-            {{docWritingNote}}
-
-            The worker has access to project skills (e.g. build, test) that describe how to build and test this project.
-            Tell the worker to use those skills instead of hardcoding framework-specific commands.
-
-            Respond with ONLY the prompt text — no JSON, no markdown wrapping.
-            If you need clarification that cannot be determined from the codebase, call escalate_to_composer instead.
-            Use the get_goal tool if you need the full goal description.
-            """;
-    }
-
-    /// <summary>
-    /// Builds a direct worker prompt for the Review phase when the Brain agent is not connected.
-    /// Includes tester output and reviewer guidance so reviewers always get test results
-    /// and the "verify that all tests pass" instruction, regardless of agent availability.
-    /// </summary>
-    /// <param name="pipeline">The goal pipeline with phase outputs and iteration state.</param>
-    /// <param name="additionalContext">Optional additional context to include.</param>
-    /// <returns>A reviewer-ready fallback prompt containing test results and guidance.</returns>
-    internal static string BuildReviewFallbackPrompt(GoalPipeline pipeline, string? additionalContext = null)
-    {
-        var testerLogEntry = pipeline.PhaseLog
-            .LastOrDefault(e => e.Iteration == pipeline.Iteration && e.Name == GoalPhase.Testing);
-        var currentTestResults = (!string.IsNullOrWhiteSpace(testerLogEntry?.WorkerOutput))
-            ? testerLogEntry.WorkerOutput
-            : "";
-
-        // Include coder output so the reviewer understands the rationale behind code decisions.
-        // Cap at 2000 chars with ellipsis if truncated.
-        string currentCoderOutput = "";
-        var coderLogEntry = pipeline.PhaseLog
-            .LastOrDefault(e => e.Iteration == pipeline.Iteration && e.Name == GoalPhase.Coding);
-        if (!string.IsNullOrWhiteSpace(coderLogEntry?.WorkerOutput))
-        {
-            var coderOut = coderLogEntry.WorkerOutput;
-            const int maxCoderOutputChars = 2000;
-            currentCoderOutput = coderOut.Length > maxCoderOutputChars
-                ? coderOut[..maxCoderOutputChars] + "..."
-                : coderOut;
-        }
-
-        return $$"""
-            Review the changes for: {{pipeline.Description}}
-
-            Use the diff commands from your workspace context to review the branch changes.
-            Focus only on the diff lines (+ and -), then call the report_review_verdict tool when done.
-
-            - "Files to change" in the goal is GUIDANCE, not an exhaustive whitelist. Test files and test changes that cover the modified code are ALWAYS acceptable and expected.
-            - "Files NOT to change" in the goal IS a strict prohibition — flag any changes to those files as MAJOR.
-            - The goal description defines WHAT to do. New behavior described in the goal is IN SCOPE — do not reject changes just because the base branch doesn't have them yet.
-            - Only flag issues that are clearly bugs, security problems, or genuine scope violations (touching unrelated code/features).
-            - Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
-            {{(additionalContext is not null ? $"\n=== Additional context ===\n{additionalContext}\n=== End additional context ===" : "")}}
-            {{(currentTestResults.Length > 0 ? $"\n=== Tester output (iteration {pipeline.Iteration}) ===\n{currentTestResults}\n=== End tester output ===" : "")}}
-            {{(currentCoderOutput.Length > 0 ? $"\n=== Coder output (iteration {pipeline.Iteration}) ===\n{currentCoderOutput}\n=== End coder output ===" : "")}}
-            """;
-    }
-
-    /// <summary>
-    /// Asks the Brain to craft a prompt for the specified phase's worker.
-    /// Returns a <see cref="PromptResult"/> that either contains the crafted prompt or an escalation request.
-    /// </summary>
+    /// <summary>Asks the Brain to craft a prompt for the specified phase's worker.</summary>
     public async Task<PromptResult> CraftPromptAsync(
         GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
     {
-        var prompt = BuildCraftPromptText(pipeline, phase, additionalContext);
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, phase, additionalContext);
 
         if (_agent is null)
         {
             _logger.LogWarning("Brain not connected — using fallback prompt for {GoalId} phase {Phase}",
                 pipeline.GoalId, phase);
             return phase == GoalPhase.Review
-                ? PromptResult.Success(BuildReviewFallbackPrompt(pipeline, additionalContext))
+                ? PromptResult.Success(BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline, additionalContext))
                 : PromptResult.Success($"Work on: {pipeline.Description}");
         }
 
@@ -1041,12 +632,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 async () =>
                 {
                     _logger.LogDebug("Brain craft-prompt request for {GoalId} (phase={Phase}):\n{Prompt}",
-                        pipeline.GoalId, phase, Truncate(prompt, Constants.TruncationVerbose));
+                        pipeline.GoalId, phase, BrainPromptBuilder.Truncate(prompt, Constants.TruncationVerbose));
 
                     var (response, toolCall) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct);
 
                     _logger.LogDebug("Brain craft-prompt response for {GoalId}:\n{Response}",
-                        pipeline.GoalId, Truncate(response, Constants.TruncationVerbose));
+                        pipeline.GoalId, BrainPromptBuilder.Truncate(response, Constants.TruncationVerbose));
 
                     pipeline.Conversation.Add(new ConversationEntry("user", prompt, pipeline.Iteration, "craft-prompt"));
                     pipeline.Conversation.Add(new ConversationEntry("assistant", response, pipeline.Iteration, "craft-prompt"));
@@ -1114,15 +705,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             return BrainResponse.Answer("Brain is not available. Please proceed with your best judgment.");
         }
 
-        var prompt = $"""
-            A worker ({workerRole}) in goal {goalId} (iteration {iteration}, phase {phase}) has a question:
-
-            {question}
-
-            If you can answer this from the codebase and project context, respond with ONLY the answer text.
-            If the question requires domain knowledge, business context, or a decision that cannot be
-            determined from the codebase alone, call the escalate_to_composer tool with the question and reason.
-            """;
+        var prompt = BrainPromptBuilder.BuildAskQuestionPrompt(goalId, iteration, phase, workerRole, question);
 
         try
         {
@@ -1159,15 +742,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>Formats a context-usage log message for the Brain LLM call.</summary>
-    /// <param name="inputTokens">Cumulative input tokens used so far.</param>
-    /// <param name="contextWindow">Maximum context window size in tokens.</param>
-    /// <param name="callerName">Name of the calling method (populated by <see cref="System.Runtime.CompilerServices.CallerMemberNameAttribute"/>).</param>
-    /// <returns>A human-readable context-usage message.</returns>
-    internal static string FormatContextUsageMessage(long inputTokens, int contextWindow, string callerName)
-    {
-        var pct = contextWindow > 0 ? inputTokens * 100.0 / contextWindow : 0.0;
-        return $"Brain context usage: {pct.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)}% ({inputTokens}/{contextWindow} tokens) after {callerName}";
-    }
+    internal static string FormatContextUsageMessage(long inputTokens, int contextWindow, string callerName) =>
+        BrainPromptBuilder.FormatContextUsageMessage(inputTokens, contextWindow, callerName);
 
     private async Task<(string Text, BrainToolCallResult? ToolCall)> ExecuteBrainAsync(
         string prompt, string? goalId, CancellationToken ct,
@@ -1282,98 +858,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     {
         if (_agent is null)
             throw new InvalidOperationException("Brain not connected. Call ConnectAsync first.");
-    }
-
-    /// <summary>
-    /// Returns the 1-based occurrence index of the given phase within the plan's phases list,
-    /// counting up to and including the position of the current pipeline phase.
-    /// Uses the state machine's remaining-phases count to compute the exact position,
-    /// avoiding enum-value matching which would always stop at the first occurrence.
-    /// </summary>
-    private static int GetPhaseOccurrenceIndex(GoalPipeline pipeline, GoalPhase phase)
-    {
-        if (pipeline.Plan?.Phases is not { } phases)
-            return 1;
-
-        // Determine the current position in the plan using the state machine's remaining phases.
-        // After a transition, RemainingPhases contains everything after the current phase, so:
-        // currentPosition = totalPhases - 1 - remainingCount
-        var remaining = pipeline.StateMachine.RemainingPhases;
-        var currentPosition = phases.Count - 1 - remaining.Count;
-
-        var count = 0;
-        for (var i = 0; i <= currentPosition && i < phases.Count; i++)
-        {
-            if (phases[i] == phase)
-                count++;
-        }
-        return count > 0 ? count : 1;
-    }
-
-    internal static string Truncate(string text, int maxLength) =>
-        text.Length <= maxLength ? text : text[..maxLength] + "...";
-
-    /// <summary>
-    /// Builds a summary of the previous iteration's reviewer/tester feedback
-    /// from <see cref="GoalPipeline.PhaseLog"/>. Returns an empty string
-    /// for the first iteration.
-    /// </summary>
-    internal static string BuildPreviousIterationContext(GoalPipeline pipeline)
-    {
-        if (pipeline.Iteration <= 1)
-            return "";
-
-        var prevIteration = pipeline.Iteration - 1;
-        var prevEntries = pipeline.PhaseLog
-            .Where(e => e.Iteration == prevIteration)
-            .ToList();
-
-        var sb = new StringBuilder();
-        sb.AppendLine($"=== Previous iteration ({prevIteration}) feedback ===");
-
-        var hasAnyFeedback = false;
-
-        // Include reviewer feedback — the most critical signal for replanning
-        var reviewerEntry = prevEntries
-            .LastOrDefault(e => e.Name == GoalPhase.Review);
-        if (!string.IsNullOrWhiteSpace(reviewerEntry?.WorkerOutput))
-        {
-            hasAnyFeedback = true;
-            sb.AppendLine($"=== Reviewer feedback (iteration {prevIteration}) ===");
-            sb.AppendLine(Truncate(reviewerEntry.WorkerOutput, Constants.TruncationConversationSummary));
-            sb.AppendLine("=== End reviewer feedback ===");
-        }
-
-        // Include tester feedback if tests failed
-        var testerEntry = prevEntries
-            .LastOrDefault(e => e.Name == GoalPhase.Testing);
-        if (!string.IsNullOrWhiteSpace(testerEntry?.WorkerOutput))
-        {
-            hasAnyFeedback = true;
-            sb.AppendLine($"=== Tester feedback (iteration {prevIteration}) ===");
-            sb.AppendLine(Truncate(testerEntry.WorkerOutput, Constants.TruncationConversationSummary));
-            sb.AppendLine("=== End tester feedback ===");
-        }
-
-        // Include coder output — all coding round outputs from the previous iteration
-        var coderEntries = prevEntries
-            .Where(e => e.Name == GoalPhase.Coding && !string.IsNullOrWhiteSpace(e.WorkerOutput))
-            .ToList();
-        for (var i = 0; i < coderEntries.Count; i++)
-        {
-            hasAnyFeedback = true;
-            sb.AppendLine($"=== Coder output round {i + 1} (iteration {prevIteration}) ===");
-            sb.AppendLine(Truncate(coderEntries[i].WorkerOutput!, Constants.TruncationMedium));
-            sb.AppendLine($"=== End coder output round {i + 1} ===");
-        }
-
-        if (!hasAnyFeedback)
-        {
-            sb.AppendLine("  (No phase outputs recorded for the previous iteration)");
-        }
-
-        sb.AppendLine("=== End previous iteration feedback ===");
-        return sb.ToString();
     }
 
     /// <summary>Saves the session and disposes the underlying chat client.</summary>

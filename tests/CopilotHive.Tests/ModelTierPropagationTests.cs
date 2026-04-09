@@ -15,7 +15,7 @@ public sealed class ModelTierPropagationTests
     public void BuildIterationPlan_WithModelTiers_ParsesPerPhaseTiers()
     {
         var toolCall = MakeToolCall(modelTiers: """{"coding":"premium","review":"premium"}""");
-        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+        var plan = BrainPlanParser.BuildIterationPlanFromToolCall(toolCall);
 
         Assert.Equal(ModelTier.Premium, plan.PhaseTiers[GoalPhase.Coding]);
         Assert.Equal(ModelTier.Premium, plan.PhaseTiers[GoalPhase.Review]);
@@ -26,7 +26,7 @@ public sealed class ModelTierPropagationTests
     public void BuildIterationPlan_WithoutModelTiers_PhaseTiersEmpty()
     {
         var toolCall = MakeToolCall(modelTiers: null);
-        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+        var plan = BrainPlanParser.BuildIterationPlanFromToolCall(toolCall);
 
         Assert.Empty(plan.PhaseTiers);
     }
@@ -35,7 +35,7 @@ public sealed class ModelTierPropagationTests
     public void BuildIterationPlan_StandardTier_ParsesCorrectly()
     {
         var toolCall = MakeToolCall(modelTiers: """{"coding":"standard"}""");
-        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+        var plan = BrainPlanParser.BuildIterationPlanFromToolCall(toolCall);
 
         Assert.Equal(ModelTier.Standard, plan.PhaseTiers[GoalPhase.Coding]);
     }
@@ -44,7 +44,7 @@ public sealed class ModelTierPropagationTests
     public void BuildIterationPlan_InvalidModelTiersJson_ReturnsEmptyTiers()
     {
         var toolCall = MakeToolCall(modelTiers: "not-valid-json");
-        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+        var plan = BrainPlanParser.BuildIterationPlanFromToolCall(toolCall);
 
         Assert.Empty(plan.PhaseTiers);
     }
@@ -58,7 +58,7 @@ public sealed class ModelTierPropagationTests
     public void BuildIterationPlan_NormalisesModelTierCasing(string tierValue, ModelTier expected)
     {
         var toolCall = MakeToolCall(modelTiers: $$"""{"coding":"{{tierValue}}"}""");
-        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+        var plan = BrainPlanParser.BuildIterationPlanFromToolCall(toolCall);
 
         Assert.Equal(expected, plan.PhaseTiers[GoalPhase.Coding]);
     }
@@ -67,7 +67,7 @@ public sealed class ModelTierPropagationTests
     public void PhaseTiers_GetValueOrDefault_ReturnsDefaultForUnsetPhases()
     {
         var toolCall = MakeToolCall(modelTiers: """{"coding":"premium"}""");
-        var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
+        var plan = BrainPlanParser.BuildIterationPlanFromToolCall(toolCall);
 
         Assert.Equal(ModelTier.Premium, plan.PhaseTiers.GetValueOrDefault(GoalPhase.Coding, ModelTier.Default));
         Assert.Equal(ModelTier.Default, plan.PhaseTiers.GetValueOrDefault(GoalPhase.Testing, ModelTier.Default));

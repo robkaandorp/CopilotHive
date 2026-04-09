@@ -266,7 +266,7 @@ internal sealed class ClarificationHandler
                 "Brain prompt escalation timed out for goal {GoalId} phase {Phase} — using fallback prompt",
                 pipeline.GoalId, phase);
             return phase == GoalPhase.Review
-                ? DistributedBrain.BuildReviewFallbackPrompt(pipeline, additionalContext)
+                ? BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline, additionalContext)
                 : $"Work on: {pipeline.Description}";
         }
 
