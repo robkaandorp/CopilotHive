@@ -673,34 +673,25 @@ public sealed class ClarificationIntegrationTests
     }
 
     [Fact]
-    public async Task AskBrainAsync_WaitAsyncThrowsTimeoutException_ReturnsFallbackMessage()
+    public async Task AskBrainAsync_RouterEscalatesToHuman_MarkTimedOut_ReturnsFallbackMessage()
     {
-        // This test exercises the catch (TimeoutException) block in AskBrainAsync (lines 247-252).
-        // We use a custom router that faults the TCS with TimeoutException after enqueue.
-        // When WaitAsync is called on a faulted task, it throws the fault exception immediately,
-        // triggering the dispatcher's catch block.
-
-        // Arrange: Router escalates to human and then faults the TCS with TimeoutException
+        // Arrange: Brain escalates, Router escalates to human, queue times out via MarkTimedOut
         var brain = new FakeClarificationBrain(BrainResponse.Escalated("Need human input", "Need human input"));
         var queue = new ClarificationQueueService();
-        var router = new TimeoutFaultingClarificationRouter();
+        var router = new FakeClarificationRouter(null); // null = escalate to human
         var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
 
-        // Act - AskBrainAsync will:
-        // 1. Enqueue request (creates TCS)
-        // 2. Call router.TryAutoAnswerAsync which faults the TCS with TimeoutException
-        // 3. Router returns null (escalate to human)
-        // 4. Dispatcher calls tcs.Task.WaitAsync() which throws TimeoutException
-        // 5. Dispatcher catches TimeoutException and returns fallback
-        var answer = await dispatcher.AskBrainAsync(pipeline, "What should I do?", TestContext.Current.CancellationToken);
+        var askTask = dispatcher.AskBrainAsync(pipeline, "What should I do?", TestContext.Current.CancellationToken);
 
-        // Assert - Dispatcher caught TimeoutException and returned fallback
+        await Task.Delay(50, TestContext.Current.CancellationToken);
+        var pending = queue.GetPendingHumanRequests();
+        Assert.Single(pending);
+
+        queue.MarkTimedOut(pending[0].Id);
+
+        var answer = await askTask;
         Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, answer);
-
-        // Verify the request was marked as timed out
-        var allRequests = queue.GetAllRequests();
-        Assert.Single(allRequests);
-        Assert.Equal(ClarificationStatus.TimedOut, allRequests[0].Status);
+        Assert.Equal(ClarificationStatus.TimedOut, pending[0].Status);
     }
 
     [Fact]
@@ -839,7 +830,112 @@ public sealed class ClarificationIntegrationTests
         Assert.Equal("g1", all[1].GoalId);
     }
 
+    // ── LinkedCts cancellation pattern ────────────────────────────────────
+
+    [Fact]
+    public async Task AskBrainAsync_CallerCancelled_ThrowsOperationCanceledException()
+    {
+        // Arrange: Brain escalates, Router escalates to human, caller cancels
+        var brain = new FakeClarificationBrain(BrainResponse.Escalated("Need human input", "Need human input"));
+        var queue = new ClarificationQueueService();
+        var router = new FakeClarificationRouter(null);
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
+
+        using var cts = new CancellationTokenSource();
+        var askTask = dispatcher.AskBrainAsync(pipeline, "What architecture?", cts.Token);
+
+        // Wait for the request to be enqueued before cancelling
+        await Task.Delay(50, TestContext.Current.CancellationToken);
+        Assert.Single(queue.GetPendingHumanRequests());
+
+        // Cancel the caller's token
+        cts.Cancel();
+
+        // Assert: OperationCanceledException (as TaskCanceledException) propagates — NOT swallowed as fallback
+        await Assert.ThrowsAsync<TaskCanceledException>(() => askTask);
+    }
+
+    [Fact]
+    public async Task RouteEscalationAsync_CallerCancelled_ThrowsOperationCanceledException()
+    {
+        // Arrange: Router escalates to human, caller cancels
+        var brain = new FakeClarificationBrain(BrainResponse.Answer("irrelevant"));
+        var queue = new ClarificationQueueService();
+        var router = new FakeClarificationRouter(null);
+        var handler = CreateClarificationHandler(brain, queue, router);
+        var pipeline = CreateTestPipeline();
+
+        using var cts = new CancellationTokenSource();
+        var escalateTask = handler.RouteEscalationAsync(pipeline, "What should I do?", "reason", cts.Token);
+
+        await Task.Delay(50, TestContext.Current.CancellationToken);
+        Assert.Single(queue.GetPendingHumanRequests());
+
+        cts.Cancel();
+
+        await Assert.ThrowsAsync<TaskCanceledException>(() => escalateTask);
+    }
+
+    [Fact]
+    public async Task AskBrainAsync_ComposerAnswers_IsWaitingForClarificationResetToFalse()
+    {
+        var brain = new FakeClarificationBrain(BrainResponse.Escalated("Escalating", "reason"));
+        var queue = new ClarificationQueueService();
+        var router = new FakeClarificationRouter("Composer answer");
+        var (dispatcher, pipeline) = CreateDispatcherWithClarification(brain, queue, router: router);
+
+        var answer = await dispatcher.AskBrainAsync(pipeline, "Question?", TestContext.Current.CancellationToken);
+
+        Assert.Equal("Composer answer", answer);
+        Assert.False(pipeline.IsWaitingForClarification);
+    }
+
+    [Fact]
+    public async Task RouteEscalationAsync_ComposerAnswers_IsWaitingForClarificationResetToFalse()
+    {
+        var brain = new FakeClarificationBrain(BrainResponse.Answer("irrelevant"));
+        var queue = new ClarificationQueueService();
+        var router = new FakeClarificationRouter("Composer answer");
+        var handler = CreateClarificationHandler(brain, queue, router);
+        var pipeline = CreateTestPipeline();
+
+        var answer = await handler.RouteEscalationAsync(pipeline, "Question?", "reason", TestContext.Current.CancellationToken);
+
+        Assert.Equal("Composer answer", answer);
+        Assert.False(pipeline.IsWaitingForClarification);
+    }
+
+    [Fact]
+    public async Task RouteEscalationAsync_NoRouterOrQueue_ReturnsFallbackImmediately()
+    {
+        var brain = new FakeClarificationBrain(BrainResponse.Answer("irrelevant"));
+        // No queue or router
+        var handler = CreateClarificationHandler(brain, queue: null, router: null);
+        var pipeline = CreateTestPipeline();
+
+        var answer = await handler.RouteEscalationAsync(pipeline, "What to do?", "no infra", TestContext.Current.CancellationToken);
+
+        Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, answer);
+        Assert.False(pipeline.IsWaitingForClarification);
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────
+
+    private static ClarificationHandler CreateClarificationHandler(
+        IDistributedBrain brain,
+        ClarificationQueueService? queue,
+        IClarificationRouter? router)
+    {
+        return new ClarificationHandler(brain, router, queue, NullLogger<ClarificationHandler>.Instance);
+    }
+
+    private static GoalPipeline CreateTestPipeline()
+    {
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
+        var pipeline = new GoalPipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        return pipeline;
+    }
 
     private static (GoalDispatcher dispatcher, GoalPipeline pipeline) CreateDispatcherWithClarification(
         IDistributedBrain brain,
@@ -1011,44 +1107,7 @@ public sealed class ClarificationIntegrationTests
         }
     }
 
-    /// <summary>
-    /// Router that escalates to human and faults the TCS with TimeoutException.
-    /// When the dispatcher calls WaitAsync on the faulted task, it throws TimeoutException,
-    /// exercising the catch block in AskBrainAsync.
-    /// </summary>
-    private sealed class TimeoutFaultingClarificationRouter : IClarificationRouter
-    {
-        public Task<string?> TryAutoAnswerAsync(
-            string goalId,
-            string question,
-            string context,
-            ClarificationQueueService clarificationQueue,
-            ClarificationRequest request,
-            CancellationToken ct = default)
-        {
-            // First, escalate to human (this is required for the flow)
-            clarificationQueue.EscalateToHuman(request.Id);
 
-            // Now use reflection to get the TCS and fault it with TimeoutException.
-            // The TCS is stored in ClarificationQueueService._waiters ConcurrentDictionary.
-            var waitersField = typeof(ClarificationQueueService)
-                .GetField("_waiters", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-                ?? throw new InvalidOperationException("Could not find _waiters field");
-
-            var waiters = waitersField.GetValue(clarificationQueue)
-                as System.Collections.Concurrent.ConcurrentDictionary<string, TaskCompletionSource<string>>
-                ?? throw new InvalidOperationException("_waiters is not a ConcurrentDictionary<string, TaskCompletionSource<string>>");
-
-            if (waiters.TryGetValue(request.Id, out var tcs))
-            {
-                // Fault the TCS with TimeoutException - when WaitAsync is called on this,
-                // it will throw TimeoutException immediately
-                tcs.SetException(new TimeoutException("Simulated human timeout"));
-            }
-
-            return Task.FromResult<string?>(null);
-        }
-    }
 
     private sealed class FakeGoalSource : IGoalSource
     {

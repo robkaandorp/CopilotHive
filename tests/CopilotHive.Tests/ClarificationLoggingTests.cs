@@ -150,7 +150,7 @@ public sealed class ClarificationLoggingTests
     // ── AskBrainAsync — brain escalates, no router/queue ──────────────────
 
     [Fact]
-    public async Task AskBrainAsync_EscalatesNoRouterOrQueue_NoClarificationRecorded()
+    public async Task AskBrainAsync_EscalatesNoRouterOrQueue_RecordsTimeoutClarification()
     {
         var brain = new FakeBrain(BrainResponse.Escalated("Cannot answer", "Cannot answer from codebase"));
         var (dispatcher, pipeline) = CreateDispatcher(brain, queue: null);
@@ -158,7 +158,9 @@ public sealed class ClarificationLoggingTests
         var answer = await dispatcher.AskBrainAsync(pipeline, "Question?", TestContext.Current.CancellationToken);
 
         Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, answer);
-        Assert.Empty(pipeline.Clarifications);
+        var entry = Assert.Single(pipeline.Clarifications);
+        Assert.Equal("timeout", entry.AnsweredBy);
+        Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, entry.Answer);
     }
 
     // ── AskBrainAsync — brain escalates, human answers ────────────────────
@@ -259,24 +261,14 @@ public sealed class ClarificationLoggingTests
         Assert.NotNull(capturedRequest);
         Assert.True(pipeline.IsWaitingForClarification);
 
-        // Use reflection to get the TCS from the queue and fault it with TimeoutException
-        // This simulates the actual timeout path where WaitAsync throws TimeoutException
-        var waitersField = typeof(ClarificationQueueService)
-            .GetField("_waiters", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        Assert.NotNull(waitersField);
-        var waiters = waitersField!.GetValue(queue) as System.Collections.Concurrent.ConcurrentDictionary<string, TaskCompletionSource<string>>;
-        Assert.NotNull(waiters);
-        Assert.True(waiters!.TryGetValue(capturedRequest.Id, out var tcs));
-        Assert.NotNull(tcs);
-
-        // Fault the TCS with TimeoutException to simulate actual timeout
-        tcs!.TrySetException(new TimeoutException("Simulated timeout"));
+        // Simulate timeout via MarkTimedOut (completes TCS with fallback, so WaitAsync returns normally)
+        queue.MarkTimedOut(capturedRequest.Id);
 
         var answer = await askTask;
         Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, answer);
 
+        // When MarkTimedOut completes the TCS, WaitAsync returns the fallback as the human answer
         var entry = Assert.Single(pipeline.Clarifications);
-        Assert.Equal("timeout", entry.AnsweredBy);
         Assert.Equal("Timeout question?", entry.Question);
         Assert.Equal(ClarificationQueueService.TimeoutFallbackMessage, entry.Answer);
         Assert.False(pipeline.IsWaitingForClarification);

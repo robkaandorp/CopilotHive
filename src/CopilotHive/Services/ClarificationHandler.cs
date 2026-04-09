@@ -64,69 +64,7 @@ internal sealed class ClarificationHandler
         }
 
         _logger.LogInformation("Brain escalated question for goal {GoalId} — routing to Composer", pipeline.GoalId);
-
-        // Create a clarification request
-        var request = new ClarificationRequest
-        {
-            GoalId = pipeline.GoalId,
-            WorkerRole = pipeline.Phase.ToWorkerRole().ToRoleName(),
-            Question = question,
-        };
-
-        // If no clarification router or clarification queue, return fallback
-        if (_clarificationRouter is null || _clarificationQueue is null)
-        {
-            _logger.LogWarning("No clarification router or clarification queue available — returning fallback for goal {GoalId}",
-                pipeline.GoalId);
-            return ClarificationQueueService.TimeoutFallbackMessage;
-        }
-
-        // Enqueue the request so the human queue is ready if needed
-        var tcs = _clarificationQueue.Enqueue(request);
-
-        // Mark current phase as waiting for clarification
-        pipeline.IsWaitingForClarification = true;
-
-        // Step 1: Try Composer auto-answer (30s timeout)
-        var composerAnswer = await _clarificationRouter.TryAutoAnswerAsync(
-            pipeline.GoalId,
-            question,
-            $"Goal description: {pipeline.Description}. Current phase: {pipeline.Phase}.",
-            _clarificationQueue,
-            request,
-            ct);
-
-        if (composerAnswer is not null)
-        {
-            // Composer answered successfully — resolve the request
-            _clarificationQueue.SubmitAnswer(request.Id, composerAnswer, "composer");
-            pipeline.IsWaitingForClarification = false;
-            RecordClarification(pipeline, question, composerAnswer, "composer");
-            return composerAnswer;
-        }
-
-        // Step 2: Composer escalated to human — wait for human answer (5min timeout)
-        _logger.LogInformation(
-            "Clarification for goal {GoalId} escalated to human. Waiting up to {Timeout} for answer.",
-            pipeline.GoalId, ClarificationQueueService.HumanTimeout);
-
-        try
-        {
-            var humanAnswer = await tcs.Task.WaitAsync(ClarificationQueueService.HumanTimeout, ct);
-            _logger.LogInformation("Human answered clarification for goal {GoalId}", pipeline.GoalId);
-            pipeline.IsWaitingForClarification = false;
-            RecordClarification(pipeline, question, humanAnswer, "human");
-            return humanAnswer;
-        }
-        catch (TimeoutException)
-        {
-            _logger.LogWarning(
-                "Human clarification timed out for goal {GoalId} — returning fallback", pipeline.GoalId);
-            _clarificationQueue.MarkTimedOut(request.Id);
-            pipeline.IsWaitingForClarification = false;
-            RecordClarification(pipeline, question, ClarificationQueueService.TimeoutFallbackMessage, "timeout");
-            return ClarificationQueueService.TimeoutFallbackMessage;
-        }
+        return await ResolveClarificationAsync(pipeline, question, null, ct);
     }
 
     /// <summary>
@@ -172,16 +110,32 @@ internal sealed class ClarificationHandler
             "Brain escalated for goal {GoalId} — routing clarification to Composer. Reason: {Reason}",
             pipeline.GoalId, reason);
 
+        var additionalContext = $"Goal description: {pipeline.Description}. Current phase: {pipeline.Phase}. Reason for escalation: {reason}";
+        return await ResolveClarificationAsync(pipeline, question, additionalContext, ct);
+    }
+
+    /// <summary>
+    /// Resolves a clarification request through the escalation pipeline:
+    /// 1. Try Composer auto-answer (30s timeout)
+    /// 2. Fall back to human answer (5min timeout)
+    /// Returns the resolved answer, or <see cref="ClarificationQueueService.TimeoutFallbackMessage"/>.
+    /// </summary>
+    private async Task<string> ResolveClarificationAsync(
+        GoalPipeline pipeline,
+        string question,
+        string? additionalContext,
+        CancellationToken ct)
+    {
         if (_clarificationRouter is null || _clarificationQueue is null)
         {
             _logger.LogWarning(
-                "No clarification router or clarification queue available — returning fallback for goal {GoalId}",
+                "No clarification router or queue available — returning fallback for goal {GoalId}",
                 pipeline.GoalId);
             RecordClarification(pipeline, question, ClarificationQueueService.TimeoutFallbackMessage, "timeout");
             return ClarificationQueueService.TimeoutFallbackMessage;
         }
 
-        // Planning, Merging, Done, Failed phases have no worker role — use "brain" as the role
+        // Planning, Merging, Done, Failed phases have no worker role — use "brain"
         var workerRole = pipeline.Phase is GoalPhase.Planning or GoalPhase.Merging or GoalPhase.Done or GoalPhase.Failed
             ? "brain"
             : pipeline.Phase.ToWorkerRole().ToRoleName();
@@ -196,11 +150,11 @@ internal sealed class ClarificationHandler
         var tcs = _clarificationQueue.Enqueue(request);
         pipeline.IsWaitingForClarification = true;
 
-        // Step 1: Try Composer auto-answer (30s timeout)
+        // Step 1: Try Composer auto-answer
         var composerAnswer = await _clarificationRouter.TryAutoAnswerAsync(
             pipeline.GoalId,
             question,
-            $"Goal description: {pipeline.Description}. Current phase: {pipeline.Phase}. Reason for escalation: {reason}",
+            additionalContext ?? $"Goal description: {pipeline.Description}. Current phase: {pipeline.Phase}.",
             _clarificationQueue,
             request,
             ct);
@@ -213,11 +167,9 @@ internal sealed class ClarificationHandler
             return composerAnswer;
         }
 
-        // Step 2: Composer escalated to human — wait for human answer (5min timeout)
-        // Use a dedicated timeout token linked with the caller's token so we can
-        // distinguish "clarification timed out" from "caller requested cancellation".
+        // Step 2: Composer escalated to human — wait with proper cancellation handling
         _logger.LogInformation(
-            "Brain escalation for goal {GoalId} escalated to human. Waiting up to {Timeout} for answer.",
+            "Clarification for goal {GoalId} escalated to human. Waiting up to {Timeout} for answer.",
             pipeline.GoalId, ClarificationQueueService.HumanTimeout);
 
         using var timeoutCts = new CancellationTokenSource(ClarificationQueueService.HumanTimeout);
@@ -226,23 +178,22 @@ internal sealed class ClarificationHandler
         try
         {
             var humanAnswer = await tcs.Task.WaitAsync(linkedCts.Token);
-            _logger.LogInformation("Human answered Brain escalation for goal {GoalId}", pipeline.GoalId);
+            _logger.LogInformation("Human answered clarification for goal {GoalId}", pipeline.GoalId);
             pipeline.IsWaitingForClarification = false;
             RecordClarification(pipeline, question, humanAnswer, "human");
             return humanAnswer;
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            // The clarification timeout token fired (not the caller's token) — treat as timeout fallback
+            // Clarification timeout (not caller cancellation) — return fallback
             _logger.LogWarning(
-                "Brain escalation timed out for goal {GoalId} — returning fallback", pipeline.GoalId);
+                "Clarification timed out for goal {GoalId} — returning fallback", pipeline.GoalId);
             _clarificationQueue.MarkTimedOut(request.Id);
             pipeline.IsWaitingForClarification = false;
             RecordClarification(pipeline, question, ClarificationQueueService.TimeoutFallbackMessage, "timeout");
             return ClarificationQueueService.TimeoutFallbackMessage;
         }
         // OperationCanceledException where ct.IsCancellationRequested propagates naturally
-        // (caller requested cancellation — do NOT fall back, re-throw)
     }
 
     /// <summary>
