@@ -75,12 +75,10 @@ public sealed class ModelTierPropagationTests
 
     // -- Helpers --
 
-    private static DistributedBrain.BrainToolCallResult MakeToolCall(string? modelTiers) =>
-        new("report_iteration_plan", new Dictionary<string, object?>
-        {
-            ["phases"] = new[] { "coding", "testing", "review", "merging" },
-            ["phase_instructions"] = """{"coding":"do the work"}""",
-            ["reason"] = "test plan",
-            ["model_tiers"] = modelTiers,
-        });
+    private static DistributedBrain.IterationPlanResult MakeToolCall(string? modelTiers) =>
+        new(
+            Phases: ["coding", "testing", "review", "merging"],
+            PhaseInstructions: """{"coding":"do the work"}""",
+            Reason: "test plan",
+            ModelTiers: modelTiers);
 }

@@ -184,12 +184,11 @@ public sealed class DistributedBrainTests
     [Fact]
     public void BuildIterationPlanFromToolCall_ValidPhases_BuildsCorrectPlan()
     {
-        var toolCall = new DistributedBrain.BrainToolCallResult("report_iteration_plan", new Dictionary<string, object?>
-        {
-            ["phases"] = new string[] { "coding", "testing", "review", "merging" },
-            ["phase_instructions"] = """{"coding":"focus on tests","review":"check edge cases"}""",
-            ["reason"] = "Standard workflow",
-        });
+        var toolCall = new DistributedBrain.IterationPlanResult(
+            Phases: ["coding", "testing", "review", "merging"],
+            PhaseInstructions: """{"coding":"focus on tests","review":"check edge cases"}""",
+            Reason: "Standard workflow",
+            ModelTiers: null);
         var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
         Assert.Equal(4, plan.Phases.Count);
         Assert.Equal(GoalPhase.Coding, plan.Phases[0]);
@@ -203,12 +202,11 @@ public sealed class DistributedBrainTests
     [Fact]
     public void BuildIterationPlanFromToolCall_EmptyPhases_ReturnsEmptyPlan()
     {
-        var toolCall = new DistributedBrain.BrainToolCallResult("report_iteration_plan", new Dictionary<string, object?>
-        {
-            ["phases"] = Array.Empty<string>(),
-            ["phase_instructions"] = "{}",
-            ["reason"] = "nothing to do",
-        });
+        var toolCall = new DistributedBrain.IterationPlanResult(
+            Phases: [],
+            PhaseInstructions: "{}",
+            Reason: "nothing to do",
+            ModelTiers: null);
         var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
         Assert.Empty(plan.Phases);
     }
@@ -216,12 +214,11 @@ public sealed class DistributedBrainTests
     [Fact]
     public void BuildIterationPlanFromToolCall_InvalidPhaseNames_Skipped()
     {
-        var toolCall = new DistributedBrain.BrainToolCallResult("report_iteration_plan", new Dictionary<string, object?>
-        {
-            ["phases"] = new string[] { "coding", "invalid_phase", "testing" },
-            ["phase_instructions"] = "{}",
-            ["reason"] = "test",
-        });
+        var toolCall = new DistributedBrain.IterationPlanResult(
+            Phases: ["coding", "invalid_phase", "testing"],
+            PhaseInstructions: "{}",
+            Reason: "test",
+            ModelTiers: null);
         var plan = DistributedBrain.BuildIterationPlanFromToolCall(toolCall);
         Assert.Equal(2, plan.Phases.Count);
         Assert.Equal(GoalPhase.Coding, plan.Phases[0]);

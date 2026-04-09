@@ -240,11 +240,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 ([Description("The question to forward to the Composer for resolution.")] string question,
                  [Description("The reason why the Brain cannot answer this question from the codebase.")] string reason) =>
                 {
-                    _lastToolCallResult = new BrainToolCallResult("escalate_to_composer", new Dictionary<string, object?>
-                    {
-                        ["question"] = question,
-                        ["reason"] = reason,
-                    });
+                    _lastToolCallResult = new EscalateResult(question, reason);
                     return "Escalation recorded.";
                 },
                 "escalate_to_composer",
@@ -316,11 +312,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                         (tierErrors.Count == 0, string.Join("; ", tierErrors)));
                     if (error is not null) return error;
 
-                    _lastToolCallResult = new BrainToolCallResult("report_iteration_plan", new Dictionary<string, object?>
-                    {
-                        ["phases"] = phases, ["phase_instructions"] = phase_instructions, ["reason"] = reason,
-                        ["model_tiers"] = model_tiers,
-                    });
+                    _lastToolCallResult = new IterationPlanResult(phases ?? [], phase_instructions, reason, model_tiers);
                     return "Iteration plan recorded.";
                 },
                 "report_iteration_plan",
@@ -328,8 +320,20 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         ];
     }
 
-    /// <summary>Result captured from a Brain tool call.</summary>
-    internal sealed record BrainToolCallResult(string ToolName, Dictionary<string, object?> Arguments);
+    /// <summary>Base type for results captured from Brain tool calls.</summary>
+    internal abstract record BrainToolCallResult(string ToolName);
+
+    /// <summary>Result of an <c>escalate_to_composer</c> tool call.</summary>
+    internal sealed record EscalateResult(string Question, string Reason)
+        : BrainToolCallResult("escalate_to_composer");
+
+    /// <summary>Result of a <c>report_iteration_plan</c> tool call.</summary>
+    internal sealed record IterationPlanResult(
+        string[] Phases,
+        string PhaseInstructions,
+        string Reason,
+        string? ModelTiers)
+        : BrainToolCallResult("report_iteration_plan");
 
     /// <summary>
     /// Creates a CodingAgent with current configuration. Called on connect
@@ -614,18 +618,18 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 pipeline.Conversation.Add(new ConversationEntry("assistant", response, pipeline.Iteration, "planning"));
 
                 // Check for escalate_to_composer BEFORE report_iteration_plan
-                if (toolCall is { ToolName: "escalate_to_composer" })
+                if (toolCall is EscalateResult escalation)
                 {
-                    var escalationQuestion = GetStringArg(toolCall.Arguments, "question") ?? "Brain requested clarification during planning";
-                    var escalationReason = GetStringArg(toolCall.Arguments, "reason") ?? "Brain requested escalation";
+                    var escalationQuestion = string.IsNullOrEmpty(escalation.Question) ? "Brain requested clarification during planning" : escalation.Question;
+                    var escalationReason = string.IsNullOrEmpty(escalation.Reason) ? "Brain requested escalation" : escalation.Reason;
                     _logger.LogInformation(
                         "Brain escalated planning for goal {GoalId}: {Reason}", pipeline.GoalId, escalationReason);
                     return PlanResult.Escalated(escalationQuestion, escalationReason);
                 }
 
-                if (toolCall is { ToolName: "report_iteration_plan" })
+                if (toolCall is IterationPlanResult iterationPlanResult)
                 {
-                    var plan = BuildIterationPlanFromToolCall(toolCall);
+                    var plan = BuildIterationPlanFromToolCall(iterationPlanResult);
 
                     if (plan is { Phases.Count: > 0 })
                     {
@@ -710,43 +714,31 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <summary>
     /// Builds an <see cref="IterationPlan"/> from a <c>report_iteration_plan</c> tool call result.
     /// </summary>
-    internal static IterationPlan BuildIterationPlanFromToolCall(BrainToolCallResult toolCall)
+    internal static IterationPlan BuildIterationPlanFromToolCall(IterationPlanResult toolCall)
     {
-        var args = toolCall.Arguments;
-
-        var phaseNames = new List<string>();
-        if (args.TryGetValue("phases", out var phasesVal) && phasesVal is not null)
-        {
-            if (phasesVal is string[] arr)
-                phaseNames = arr.ToList();
-            else if (phasesVal is JsonElement je && je.ValueKind == JsonValueKind.Array)
-                phaseNames = je.EnumerateArray().Select(e => e.GetString() ?? "").ToList();
-            else if (phasesVal is IEnumerable<object> list)
-                phaseNames = list.Select(x => x?.ToString() ?? "").ToList();
-        }
+        var phaseNames = toolCall.Phases?.ToList() ?? [];
 
         Dictionary<string, string>? phaseInstructions = null;
-        var piStr = GetStringArg(args, "phase_instructions");
-        if (!string.IsNullOrEmpty(piStr))
+        if (!string.IsNullOrEmpty(toolCall.PhaseInstructions))
         {
-            try
-            {
-                phaseInstructions = JsonSerializer.Deserialize<Dictionary<string, string>>(piStr, ProtocolJson.Options);
-            }
-            catch (JsonException)
-            {
-                // Best-effort: ignore unparsable phase instructions
-            }
+            try { phaseInstructions = JsonSerializer.Deserialize<Dictionary<string, string>>(toolCall.PhaseInstructions, ProtocolJson.Options); }
+            catch (JsonException) { /* best-effort */ }
+        }
+
+        Dictionary<string, string>? modelTiers = null;
+        if (!string.IsNullOrEmpty(toolCall.ModelTiers))
+        {
+            try { modelTiers = JsonSerializer.Deserialize<Dictionary<string, string>>(toolCall.ModelTiers, ProtocolJson.Options); }
+            catch (JsonException) { /* best-effort */ }
         }
 
         var dto = new IterationPlanDto
         {
             Phases = phaseNames,
             PhaseInstructions = phaseInstructions,
-            ModelTiers = ParseJsonDictArg(args, "model_tiers"),
-            Reason = GetStringArg(args, "reason"),
+            ModelTiers = modelTiers,
+            Reason = toolCall.Reason,
         };
-
         return MapIterationPlan(dto);
     }
 
@@ -1060,10 +1052,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     pipeline.Conversation.Add(new ConversationEntry("assistant", response, pipeline.Iteration, "craft-prompt"));
 
                     // Check for escalate_to_composer tool call
-                    if (toolCall is { ToolName: "escalate_to_composer" })
+                    if (toolCall is EscalateResult escalation)
                     {
-                        var escalationQuestion = GetStringArg(toolCall.Arguments, "question") ?? "Brain requested clarification during prompt crafting";
-                        var escalationReason = GetStringArg(toolCall.Arguments, "reason") ?? "Brain requested escalation";
+                        var escalationQuestion = string.IsNullOrEmpty(escalation.Question) ? "Brain requested clarification during prompt crafting" : escalation.Question;
+                        var escalationReason = string.IsNullOrEmpty(escalation.Reason) ? "Brain requested escalation" : escalation.Reason;
                         _logger.LogInformation(
                             "Brain escalated prompt crafting for {GoalId} phase {Phase}: {Reason}",
                             pipeline.GoalId, phase, escalationReason);
@@ -1144,10 +1136,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 },
                 ct);
 
-            if (toolCall is { ToolName: "escalate_to_composer" })
+            if (toolCall is EscalateResult escalation)
             {
-                var escalationQuestion = GetStringArg(toolCall.Arguments, "question") ?? question;
-                var escalationReason = GetStringArg(toolCall.Arguments, "reason") ?? "Brain requested escalation";
+                var escalationQuestion = string.IsNullOrEmpty(escalation.Question) ? question : escalation.Question;
+                var escalationReason = string.IsNullOrEmpty(escalation.Reason) ? "Brain requested escalation" : escalation.Reason;
                 _logger.LogInformation(
                     "Brain escalated question for goal {GoalId} via tool call: {Reason}", goalId, escalationReason);
                 return BrainResponse.Escalated(escalationQuestion, escalationReason);
@@ -1163,43 +1155,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             _logger.LogError(ex, "Brain AskQuestionAsync failed for goal {GoalId} — returning fallback", goalId);
             return BrainResponse.Answer("Brain encountered an error. Please proceed with your best judgment.");
-        }
-    }
-
-    internal static string? GetStringArg(Dictionary<string, object?> args, string key) =>
-        args.TryGetValue(key, out var val) ? val?.ToString() : null;
-
-    internal static List<string>? GetStringArrayArg(Dictionary<string, object?> args, string key)
-    {
-        if (!args.TryGetValue(key, out var val) || val is null)
-            return null;
-
-        if (val is string[] arr)
-            return arr.ToList();
-
-        if (val is JsonElement je && je.ValueKind == JsonValueKind.Array)
-            return je.EnumerateArray().Select(e => e.GetString() ?? "").ToList();
-
-        if (val is IEnumerable<object> list)
-            return list.Select(x => x?.ToString() ?? "").ToList();
-
-        return null;
-    }
-
-    /// <summary>Extracts a JSON-encoded string→string dictionary from tool call arguments.</summary>
-    internal static Dictionary<string, string>? ParseJsonDictArg(Dictionary<string, object?> args, string key)
-    {
-        var str = GetStringArg(args, key);
-        if (string.IsNullOrEmpty(str))
-            return null;
-
-        try
-        {
-            return JsonSerializer.Deserialize<Dictionary<string, string>>(str, ProtocolJson.Options);
-        }
-        catch (JsonException)
-        {
-            return null;
         }
     }
 
