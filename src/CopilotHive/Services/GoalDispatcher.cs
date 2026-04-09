@@ -1234,38 +1234,8 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         }
 
         pipeline.AdvanceTo(GoalPhase.Done);
-
-        var goalStartedAt = pipeline.GoalStartedAt ?? pipeline.Goal.StartedAt ?? pipeline.CreatedAt;
-        var duration = pipeline.CompletedAt.HasValue
-            ? pipeline.CompletedAt.Value - goalStartedAt
-            : TimeSpan.Zero;
-
-        var iterationSummary = BuildIterationSummary(pipeline);
-        pipeline.CompletedIterationSummaries.Add(iterationSummary);
-
-        var completedMeta = new GoalUpdateMetadata
-        {
-            CompletedAt = pipeline.CompletedAt ?? DateTime.UtcNow,
-            Iterations = pipeline.Iteration,
-            IterationSummary = iterationSummary,
-            TotalDurationSeconds = duration.TotalSeconds,
-            MergeCommitHash = pipeline.MergeCommitHash,
-        };
-        await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Completed, completedMeta, ct);
-        await CommitGoalsToConfigRepoAsync($"Goal '{pipeline.GoalId}' completed", ct);
-
-        // Auto-tag: assign the goal to a Planning release if exactly one exists
-        await TryAutoTagReleaseAsync(pipeline, ct);
-
-        pipeline.Metrics.Iteration = pipeline.Iteration;
-        pipeline.Metrics.Duration = duration;
-        pipeline.Metrics.Verdict = TaskVerdict.Pass;
-        pipeline.Metrics.RetryCount = pipeline.ReviewRetries + pipeline.TestRetries;
-        pipeline.Metrics.ReviewRetryCount = pipeline.ReviewRetries;
-        pipeline.Metrics.TestRetryCount = pipeline.TestRetries;
-        PopulateAgentsMdVersions(pipeline);
-        _metricsTracker?.RecordIteration(pipeline.Metrics);
-        await CommitMetricsToConfigRepoAsync(pipeline, ct);
+        await FinalizeGoalAsync(pipeline, GoalStatus.Completed, failureReason: null,
+            mergeCommitHash: pipeline.MergeCommitHash, ct);
 
         // Check for regression after recording metrics
         if (_metricsTracker is not null && _agentsManager is not null)
@@ -1309,16 +1279,7 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
             }
         }
 
-        _logger.LogInformation("Goal {GoalId} completed in {Elapsed}", pipeline.GoalId, DurationFormatter.FormatDuration(duration));
-        _logger.LogInformation(
-            "🎉 Goal {GoalId} completed! Iterations={Iterations}, Duration={Duration:F1}min, " +
-            "Tests={Passed}/{Total}, Coverage={Coverage:F1}%",
-            pipeline.GoalId, pipeline.Iteration, duration.TotalMinutes,
-            pipeline.Metrics.PassedTests, pipeline.Metrics.TotalTests,
-            pipeline.Metrics.CoveragePercent);
-
-        // Deregister from Brain — goal is no longer active
-        (_brain as DistributedBrain)?.DeregisterActivePipeline(pipeline.GoalId);
+        await TryAutoTagReleaseAsync(pipeline, ct);
     }
 
     /// <summary>
@@ -1364,27 +1325,45 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
     private async Task MarkGoalFailed(GoalPipeline pipeline, string reason, CancellationToken ct)
     {
         pipeline.AdvanceTo(GoalPhase.Failed);
+        await FinalizeGoalAsync(pipeline, GoalStatus.Failed, failureReason: reason,
+            mergeCommitHash: null, ct);
+    }
 
+    private async Task FinalizeGoalAsync(
+        GoalPipeline pipeline,
+        GoalStatus status,
+        string? failureReason,
+        string? mergeCommitHash,
+        CancellationToken ct)
+    {
         var iterationSummary = BuildIterationSummary(pipeline);
         pipeline.CompletedIterationSummaries.Add(iterationSummary);
 
-        var failedMeta = new GoalUpdateMetadata
+        var goalStartedAt = pipeline.GoalStartedAt ?? pipeline.Goal.StartedAt ?? pipeline.CreatedAt;
+        var duration = pipeline.CompletedAt.HasValue
+            ? pipeline.CompletedAt.Value - goalStartedAt
+            : TimeSpan.Zero;
+
+        var meta = new GoalUpdateMetadata
         {
             CompletedAt = pipeline.CompletedAt ?? DateTime.UtcNow,
             Iterations = pipeline.Iteration,
-            FailureReason = reason,
             IterationSummary = iterationSummary,
+            TotalDurationSeconds = duration.TotalSeconds,
+            FailureReason = failureReason,
+            MergeCommitHash = mergeCommitHash,
         };
-        await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Failed, failedMeta, ct);
-        await CommitGoalsToConfigRepoAsync($"Goal '{pipeline.GoalId}' failed: {reason}", ct);
 
-        var duration = pipeline.CompletedAt.HasValue
-            ? pipeline.CompletedAt.Value - pipeline.CreatedAt
-            : TimeSpan.Zero;
+        await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, status, meta, ct);
+        await CommitGoalsToConfigRepoAsync(
+            failureReason is not null
+                ? $"Goal '{pipeline.GoalId}' failed: {failureReason}"
+                : $"Goal '{pipeline.GoalId}' completed",
+            ct);
 
         pipeline.Metrics.Iteration = pipeline.Iteration;
         pipeline.Metrics.Duration = duration;
-        pipeline.Metrics.Verdict = TaskVerdict.Fail;
+        pipeline.Metrics.Verdict = status == GoalStatus.Completed ? TaskVerdict.Pass : TaskVerdict.Fail;
         pipeline.Metrics.RetryCount = pipeline.ReviewRetries + pipeline.TestRetries;
         pipeline.Metrics.ReviewRetryCount = pipeline.ReviewRetries;
         pipeline.Metrics.TestRetryCount = pipeline.TestRetries;
@@ -1392,15 +1371,27 @@ You will be asked to craft prompts for ALL phases in the final plan, including a
         _metricsTracker?.RecordIteration(pipeline.Metrics);
         await CommitMetricsToConfigRepoAsync(pipeline, ct);
 
-        _logger.LogWarning("Goal {GoalId} failed: {Reason}", pipeline.GoalId, reason);
-
         // Deregister from Brain — goal is no longer active
         (_brain as DistributedBrain)?.DeregisterActivePipeline(pipeline.GoalId);
 
         // Delete goal session on failure (no summary to merge)
-        if (_brain is not null)
+        if (status == GoalStatus.Failed && _brain is not null)
             _brain.DeleteGoalSession(pipeline.GoalId);
+
+        if (status == GoalStatus.Completed)
+        {
+            _logger.LogInformation("Goal {GoalId} completed in {Elapsed}", pipeline.GoalId, DurationFormatter.FormatDuration(duration));
+            _logger.LogInformation(
+                "🎉 Goal {GoalId} completed! Iterations={Iterations}, Duration={Duration:F1}min, " +
+                "Tests={Passed}/{Total}, Coverage={Coverage:F1}%",
+                pipeline.GoalId, pipeline.Iteration, duration.TotalMinutes,
+                pipeline.Metrics.PassedTests, pipeline.Metrics.TotalTests,
+                pipeline.Metrics.CoveragePercent);
+        }
+        else
+            _logger.LogWarning("Goal {GoalId} failed: {Reason}", pipeline.GoalId, failureReason);
     }
+
 
     /// <summary>
     /// Builds a concise summary of worker output for the pipeline conversation.
