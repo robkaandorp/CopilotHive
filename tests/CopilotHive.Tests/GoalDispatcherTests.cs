@@ -261,7 +261,7 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
 }
 
 /// <summary>
-/// Tests for <see cref="GoalDispatcher.BuildIterationSummary"/> logic.
+/// Tests for <see cref="PipelineHelpers.BuildIterationSummary"/> logic.
 /// </summary>
 public sealed class GoalDispatcherBuildIterationSummaryTests
 {
@@ -290,7 +290,7 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
             Verdict = "Brain timeout",
         });
 
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
+        var summary = PipelineHelpers.BuildIterationSummary(pipeline);
 
         var improvePhases = summary.Phases.Where(p => p.Name == GoalPhase.Improve).ToList();
         Assert.Single(improvePhases);
@@ -319,7 +319,7 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
             WorkerOutput = "All 5 tests pass.",
         });
 
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
+        var summary = PipelineHelpers.BuildIterationSummary(pipeline);
 
         var codingPhase = summary.Phases.FirstOrDefault(p => p.Name == GoalPhase.Coding);
         var testingPhase = summary.Phases.FirstOrDefault(p => p.Name == GoalPhase.Testing);
@@ -348,7 +348,7 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
             WorkerOutput = "Coder output.",
         });
 
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
+        var summary = PipelineHelpers.BuildIterationSummary(pipeline);
 
         Assert.True(summary.PhaseOutputs.ContainsKey("coder-1"));
         Assert.Equal("Coder output.", summary.PhaseOutputs["coder-1"]);
@@ -377,7 +377,7 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
         });
 
         // Summary is built for iteration 1 (pipeline.Iteration = 1)
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
+        var summary = PipelineHelpers.BuildIterationSummary(pipeline);
 
         Assert.True(summary.PhaseOutputs.ContainsKey("coder-1"));
         Assert.False(summary.PhaseOutputs.ContainsKey("coder-2"),
@@ -398,7 +398,7 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
         pipeline.PhaseLog.Add(new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, Iteration = 1, Occurrence = 1 });
         pipeline.Metrics.BuildSuccess = true;
 
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
+        var summary = PipelineHelpers.BuildIterationSummary(pipeline);
 
         Assert.True(summary.BuildSuccess);
     }
@@ -417,7 +417,7 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
         pipeline.PhaseLog.Add(new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, Iteration = 1, Occurrence = 1 });
         pipeline.Metrics.BuildSuccess = false;
 
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
+        var summary = PipelineHelpers.BuildIterationSummary(pipeline);
 
         Assert.False(summary.BuildSuccess);
     }
@@ -469,7 +469,7 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
             StartedAt = start.AddSeconds(110), CompletedAt = start.AddSeconds(120),
         });
 
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
+        var summary = PipelineHelpers.BuildIterationSummary(pipeline);
 
         var codingPhases = summary.Phases.Where(p => p.Name == GoalPhase.Coding).ToList();
         var testingPhases = summary.Phases.Where(p => p.Name == GoalPhase.Testing).ToList();
@@ -521,7 +521,7 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
             WorkerOutput = "Round 2 tests",
         });
 
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
+        var summary = PipelineHelpers.BuildIterationSummary(pipeline);
 
         // PhaseOutputs should include both occurrence-specific and backward-compatible keys
         Assert.True(summary.PhaseOutputs.ContainsKey("coder-1-1"));
@@ -573,7 +573,7 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
             Verdict = "FAIL",
         });
 
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
+        var summary = PipelineHelpers.BuildIterationSummary(pipeline);
 
         var testingPhases = summary.Phases.Where(p => p.Name == GoalPhase.Testing).ToList();
         Assert.Equal(2, testingPhases.Count);
@@ -591,8 +591,8 @@ public sealed class GoalDispatcherBuildIterationSummaryTests
 }
 
 /// <summary>
-/// Tests for <see cref="GoalDispatcher.GetLastCraftPromptFromConversation"/>
-/// and <see cref="GoalDispatcher.GetPlanningPromptsFromConversation"/>.
+/// Tests for <see cref="PipelineHelpers.GetLastCraftPromptFromConversation"/>
+/// and <see cref="PipelineHelpers.GetPlanningPromptsFromConversation"/>.
 /// </summary>
 public sealed class GoalDispatcherConversationExtractionTests
 {
@@ -613,7 +613,7 @@ public sealed class GoalDispatcherConversationExtractionTests
         pipeline.Conversation.Add(new ConversationEntry("user", "Brain prompt for coding", 1, "craft-prompt"));
         pipeline.Conversation.Add(new ConversationEntry("assistant", "Worker prompt", 1, "craft-prompt"));
 
-        var result = GoalDispatcher.GetLastCraftPromptFromConversation(pipeline);
+        var result = PipelineHelpers.GetLastCraftPromptFromConversation(pipeline);
 
         Assert.Equal("Brain prompt for coding", result);
     }
@@ -624,7 +624,7 @@ public sealed class GoalDispatcherConversationExtractionTests
         var pipeline = CreatePipeline();
         pipeline.Conversation.Add(new ConversationEntry("user", "Plan please", 1, "planning"));
 
-        var result = GoalDispatcher.GetLastCraftPromptFromConversation(pipeline);
+        var result = PipelineHelpers.GetLastCraftPromptFromConversation(pipeline);
 
         Assert.Null(result);
     }
@@ -637,7 +637,7 @@ public sealed class GoalDispatcherConversationExtractionTests
         pipeline.Conversation.Add(new ConversationEntry("user", "New prompt", 2, "craft-prompt"));
 
         // Pipeline is at iteration 1 — should return the iteration-1 entry
-        var result = GoalDispatcher.GetLastCraftPromptFromConversation(pipeline);
+        var result = PipelineHelpers.GetLastCraftPromptFromConversation(pipeline);
 
         Assert.Equal("Old prompt", result);
     }
@@ -649,7 +649,7 @@ public sealed class GoalDispatcherConversationExtractionTests
         pipeline.Conversation.Add(new ConversationEntry("user", "Plan iteration 1", 1, "planning"));
         pipeline.Conversation.Add(new ConversationEntry("assistant", "I will code and test.", 1, "planning"));
 
-        var (prompt, response) = GoalDispatcher.GetPlanningPromptsFromConversation(pipeline);
+        var (prompt, response) = PipelineHelpers.GetPlanningPromptsFromConversation(pipeline);
 
         Assert.Equal("Plan iteration 1", prompt);
         Assert.Equal("I will code and test.", response);
@@ -661,7 +661,7 @@ public sealed class GoalDispatcherConversationExtractionTests
         var pipeline = CreatePipeline();
         pipeline.Conversation.Add(new ConversationEntry("user", "Some craft prompt", 1, "craft-prompt"));
 
-        var (prompt, response) = GoalDispatcher.GetPlanningPromptsFromConversation(pipeline);
+        var (prompt, response) = PipelineHelpers.GetPlanningPromptsFromConversation(pipeline);
 
         Assert.Null(prompt);
         Assert.Null(response);
@@ -676,7 +676,7 @@ public sealed class GoalDispatcherConversationExtractionTests
         pipeline.Conversation.Add(new ConversationEntry("user", "Retry plan attempt", 1, "planning"));
         pipeline.Conversation.Add(new ConversationEntry("assistant", "Retry response", 1, "planning"));
 
-        var (prompt, response) = GoalDispatcher.GetPlanningPromptsFromConversation(pipeline);
+        var (prompt, response) = PipelineHelpers.GetPlanningPromptsFromConversation(pipeline);
 
         Assert.Equal("Retry plan attempt", prompt);
         Assert.Equal("Retry response", response);
@@ -684,7 +684,7 @@ public sealed class GoalDispatcherConversationExtractionTests
 }
 
 /// <summary>
-/// Tests for <see cref="GoalDispatcher.ValidatePlan"/> logic.
+/// Tests for <see cref="IterationPlanValidator.ValidatePlan"/> logic.
 /// </summary>
 public sealed class GoalDispatcherValidatePlanTests
 {
@@ -698,7 +698,7 @@ public sealed class GoalDispatcherValidatePlanTests
         };
 
         // Act
-        var result = GoalDispatcher.ValidatePlan(plan);
+        var result = IterationPlanValidator.ValidatePlan(plan);
 
         // Assert: Coding absent, DocWriting retained
         Assert.DoesNotContain(GoalPhase.Coding, result.Phases);
@@ -716,7 +716,7 @@ public sealed class GoalDispatcherValidatePlanTests
         };
 
         // Act
-        var result = GoalDispatcher.ValidatePlan(plan);
+        var result = IterationPlanValidator.ValidatePlan(plan);
 
         // Assert: Coding absent, DocWriting retained, ends with Merging
         Assert.DoesNotContain(GoalPhase.Coding, result.Phases);
@@ -734,7 +734,7 @@ public sealed class GoalDispatcherValidatePlanTests
         };
 
         // Act
-        var result = GoalDispatcher.ValidatePlan(plan);
+        var result = IterationPlanValidator.ValidatePlan(plan);
 
         // Assert: Coding inserted as fallback
         Assert.Contains(GoalPhase.Coding, result.Phases);
@@ -751,7 +751,7 @@ public sealed class GoalDispatcherValidatePlanTests
         };
 
         // Act
-        var result = GoalDispatcher.ValidatePlan(plan);
+        var result = IterationPlanValidator.ValidatePlan(plan);
 
         // Assert: plan is unchanged — Coding appears exactly once
         Assert.Equal(1, result.Phases.Count(p => p == GoalPhase.Coding));
@@ -769,7 +769,7 @@ public sealed class GoalDispatcherValidatePlanTests
         };
 
         // Act
-        var result = GoalDispatcher.ValidatePlan(plan);
+        var result = IterationPlanValidator.ValidatePlan(plan);
 
         // Assert: Coding still present exactly once, Merging at end
         Assert.Equal(1, result.Phases.Count(p => p == GoalPhase.Coding));
@@ -788,7 +788,7 @@ public sealed class GoalDispatcherValidatePlanTests
         };
 
         // Act
-        var result = GoalDispatcher.ValidatePlan(plan);
+        var result = IterationPlanValidator.ValidatePlan(plan);
 
         // Assert: Review inserted
         Assert.Contains(GoalPhase.Review, result.Phases);
@@ -806,7 +806,7 @@ public sealed class GoalDispatcherValidatePlanTests
         };
 
         // Act
-        var result = GoalDispatcher.ValidatePlan(plan);
+        var result = IterationPlanValidator.ValidatePlan(plan);
 
         // Assert: Testing inserted
         Assert.Contains(GoalPhase.Testing, result.Phases);
@@ -824,7 +824,7 @@ public sealed class GoalDispatcherValidatePlanTests
         };
 
         // Act
-        var result = GoalDispatcher.ValidatePlan(plan);
+        var result = IterationPlanValidator.ValidatePlan(plan);
 
         // Assert: both Testing and Review inserted
         Assert.Contains(GoalPhase.Testing, result.Phases);
@@ -842,7 +842,7 @@ public sealed class GoalDispatcherValidatePlanTests
         };
 
         // Act
-        var result = GoalDispatcher.ValidatePlan(plan);
+        var result = IterationPlanValidator.ValidatePlan(plan);
 
         // Assert: no duplicates, order preserved, Merging at end
         Assert.Equal(1, result.Phases.Count(p => p == GoalPhase.Testing));
@@ -868,7 +868,7 @@ public sealed class GoalDispatcherValidatePlanTests
         };
 
         // Act
-        var result = GoalDispatcher.ValidatePlan(plan);
+        var result = IterationPlanValidator.ValidatePlan(plan);
 
         // Assert: Review absent, Coding absent
         Assert.DoesNotContain(GoalPhase.Review, result.Phases);
@@ -887,7 +887,7 @@ public sealed class GoalDispatcherValidatePlanTests
         };
 
         // Act
-        var result = GoalDispatcher.ValidatePlan(plan);
+        var result = IterationPlanValidator.ValidatePlan(plan);
 
         // Assert: Testing inserted; Review NOT inserted; Coding absent
         Assert.Contains(GoalPhase.Testing, result.Phases);
@@ -906,7 +906,7 @@ public sealed class GoalDispatcherValidatePlanTests
         };
 
         // Act
-        var result = GoalDispatcher.ValidatePlan(plan);
+        var result = IterationPlanValidator.ValidatePlan(plan);
 
         // Assert: Review retained, Testing NOT inserted, Coding absent
         Assert.Contains(GoalPhase.Review, result.Phases);
@@ -917,7 +917,7 @@ public sealed class GoalDispatcherValidatePlanTests
 }
 
 /// <summary>
-/// Tests for <see cref="GoalDispatcher.BuildWorkerOutputSummary"/> logic.
+/// Tests for <see cref="PipelineHelpers.BuildWorkerOutputSummary"/> logic.
 /// </summary>
 public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
 {
@@ -925,7 +925,7 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
     public void IncludesVerdictAndPhase()
     {
         var result = new TaskResult { TaskId = "t1", Status = TaskOutcome.Completed };
-        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Review, "REQUEST_CHANGES", result);
+        var summary = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Review, "REQUEST_CHANGES", result);
 
         Assert.Contains("Phase Review completed", summary);
         Assert.Contains("verdict: REQUEST_CHANGES", summary);
@@ -945,7 +945,7 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
             },
         };
 
-        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Review, "REQUEST_CHANGES", result);
+        var summary = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Review, "REQUEST_CHANGES", result);
 
         Assert.Contains("GetActiveTask called after MarkComplete", summary);
         Assert.Contains("Missing null check on branch name", summary);
@@ -968,7 +968,7 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
             },
         };
 
-        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Testing, "FAIL", result);
+        var summary = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Testing, "FAIL", result);
 
         Assert.Contains("Tests: 47/50 passed, 3 failed", summary);
     }
@@ -983,7 +983,7 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
             GitStatus = new GitChangeSummary { FilesChanged = 3, Insertions = 42, Deletions = 10 },
         };
 
-        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+        var summary = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
 
         Assert.Contains("Files changed: 3 (+42 -10)", summary);
     }
@@ -999,7 +999,7 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
             Output = longOutput,
         };
 
-        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+        var summary = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
 
         Assert.Contains("Worker output (no summary):", summary);
         Assert.Contains("...", summary);
@@ -1012,7 +1012,7 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
     {
         var result = new TaskResult { TaskId = "t1", Status = TaskOutcome.Completed, Output = "" };
 
-        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+        var summary = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
 
         Assert.DoesNotContain("Worker output:", summary);
     }
@@ -1037,7 +1037,7 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
             },
         };
 
-        var output = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+        var output = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
 
         Assert.Contains("Worker summary:", output);
         Assert.Contains("Implemented feature X. All tests pass.", output);
@@ -1060,7 +1060,7 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
             Metrics = new TaskMetrics { Verdict = "PASS" },
         };
 
-        var output = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+        var output = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
 
         Assert.Contains("Worker output (no summary):", output);
         Assert.Contains("Raw agent output text.", output);
@@ -1081,7 +1081,7 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
             Metrics = new TaskMetrics { Verdict = "PASS" },
         };
 
-        var output = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+        var output = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
 
         Assert.DoesNotContain("Worker summary:", output);
         Assert.DoesNotContain("Worker output", output);
@@ -1102,7 +1102,7 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
             Metrics = new TaskMetrics { Verdict = "PASS" },
         };
 
-        var output = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+        var output = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
 
         Assert.Contains("Worker output (no summary):", output);
         Assert.Contains("...", output);
@@ -1119,7 +1119,7 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
             GitStatus = new GitChangeSummary { FilesChanged = 5, Insertions = 20, Deletions = 3, Pushed = false },
         };
 
-        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+        var summary = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
 
         Assert.Contains("⚠️ Git push FAILED", summary);
         Assert.Contains("changes were not pushed to the remote", summary);
@@ -1135,7 +1135,7 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
             GitStatus = new GitChangeSummary { FilesChanged = 5, Insertions = 20, Deletions = 3, Pushed = true },
         };
 
-        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+        var summary = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
 
         Assert.DoesNotContain("Git push FAILED", summary);
     }
@@ -1150,7 +1150,7 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
             GitStatus = new GitChangeSummary { FilesChanged = 0, Pushed = false },
         };
 
-        var summary = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+        var summary = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
 
         Assert.DoesNotContain("Git push FAILED", summary);
     }
@@ -1568,14 +1568,14 @@ public sealed class GoalDispatcherPushFailureLoggingTests
 }
 
 /// <summary>
-/// Tests for <see cref="GoalDispatcher.BuildSquashCommitMessage"/> logic.
+/// Tests for <see cref="PipelineHelpers.BuildSquashCommitMessage"/> logic.
 /// </summary>
 public sealed class GoalDispatcherBuildSquashCommitMessageTests
 {
     [Fact]
     public void BuildSquashCommitMessage_ShortDescription_ReturnsSingleLineMessage()
     {
-        var result = GoalDispatcher.BuildSquashCommitMessage("goal-123", "Add logging support");
+        var result = PipelineHelpers.BuildSquashCommitMessage("goal-123", "Add logging support");
 
         Assert.Equal("Goal: goal-123 \u2014 Add logging support", result);
     }
@@ -1583,7 +1583,7 @@ public sealed class GoalDispatcherBuildSquashCommitMessageTests
     [Fact]
     public void BuildSquashCommitMessage_SubjectStartsWithGoalIdAndEmdash()
     {
-        var result = GoalDispatcher.BuildSquashCommitMessage("abc-42", "Fix the bug");
+        var result = PipelineHelpers.BuildSquashCommitMessage("abc-42", "Fix the bug");
 
         Assert.StartsWith("Goal: abc-42 \u2014", result);
     }
@@ -1593,7 +1593,7 @@ public sealed class GoalDispatcherBuildSquashCommitMessageTests
     {
         var longDescription = new string('x', 200);
 
-        var result = GoalDispatcher.BuildSquashCommitMessage("goal-1", longDescription);
+        var result = PipelineHelpers.BuildSquashCommitMessage("goal-1", longDescription);
 
         var subjectLine = result.Split('\n')[0];
         Assert.True(subjectLine.Length <= 120,
@@ -1605,7 +1605,7 @@ public sealed class GoalDispatcherBuildSquashCommitMessageTests
     {
         var longDescription = new string('x', 200);
 
-        var result = GoalDispatcher.BuildSquashCommitMessage("goal-1", longDescription);
+        var result = PipelineHelpers.BuildSquashCommitMessage("goal-1", longDescription);
 
         Assert.Contains(longDescription.Trim(), result);
     }
@@ -1615,7 +1615,7 @@ public sealed class GoalDispatcherBuildSquashCommitMessageTests
     {
         var description = "First line summary\nSecond line details\nThird line more details";
 
-        var result = GoalDispatcher.BuildSquashCommitMessage("goal-99", description);
+        var result = PipelineHelpers.BuildSquashCommitMessage("goal-99", description);
 
         var subjectLine = result.Split('\n')[0];
         Assert.Contains("First line summary", subjectLine);
@@ -1627,7 +1627,7 @@ public sealed class GoalDispatcherBuildSquashCommitMessageTests
     {
         var description = "First line\nSecond line";
 
-        var result = GoalDispatcher.BuildSquashCommitMessage("goal-5", description);
+        var result = PipelineHelpers.BuildSquashCommitMessage("goal-5", description);
 
         // Subject + blank line + body
         Assert.Contains("\n\n", result);
@@ -1642,7 +1642,7 @@ public sealed class GoalDispatcherBuildSquashCommitMessageTests
         var descLength = 120 - prefix.Length;
         var description = new string('a', descLength);
 
-        var result = GoalDispatcher.BuildSquashCommitMessage("id", description);
+        var result = PipelineHelpers.BuildSquashCommitMessage("id", description);
 
         // Should be a single line (no body needed)
         Assert.Equal($"Goal: id \u2014 {description}", result);
@@ -1652,7 +1652,7 @@ public sealed class GoalDispatcherBuildSquashCommitMessageTests
     [Fact]
     public void BuildSquashCommitMessage_EmptyDescription_HandledGracefully()
     {
-        var result = GoalDispatcher.BuildSquashCommitMessage("goal-0", "");
+        var result = PipelineHelpers.BuildSquashCommitMessage("goal-0", "");
 
         Assert.StartsWith("Goal: goal-0 \u2014", result);
     }
@@ -1689,7 +1689,7 @@ public sealed class GoalDispatcherGenerateMergeCommitMessageTests
     }
 
     /// <summary>
-    /// When the Brain returns null, the result must equal <see cref="GoalDispatcher.BuildSquashCommitMessage"/>.
+    /// When the Brain returns null, the result must equal <see cref="PipelineHelpers.BuildSquashCommitMessage"/>.
     /// </summary>
     [Fact]
     public async Task GenerateMergeCommitMessageAsync_BrainReturnsNull_UsesFallback()
@@ -1705,12 +1705,12 @@ public sealed class GoalDispatcherGenerateMergeCommitMessageTests
         var result = await dispatcher.GenerateMergeCommitMessageAsync(pipeline, TestContext.Current.CancellationToken);
 
         // Assert — output equals the static fallback
-        var expected = GoalDispatcher.BuildSquashCommitMessage(goalId, description);
+        var expected = PipelineHelpers.BuildSquashCommitMessage(goalId, description);
         Assert.Equal(expected, result);
     }
 
     /// <summary>
-    /// When the Brain throws (non-cancellation), the result must equal <see cref="GoalDispatcher.BuildSquashCommitMessage"/>.
+    /// When the Brain throws (non-cancellation), the result must equal <see cref="PipelineHelpers.BuildSquashCommitMessage"/>.
     /// </summary>
     [Fact]
     public async Task GenerateMergeCommitMessageAsync_BrainThrows_UsesFallback()
@@ -1726,7 +1726,7 @@ public sealed class GoalDispatcherGenerateMergeCommitMessageTests
         var result = await dispatcher.GenerateMergeCommitMessageAsync(pipeline, TestContext.Current.CancellationToken);
 
         // Assert — output equals the static fallback
-        var expected = GoalDispatcher.BuildSquashCommitMessage(goalId, description);
+        var expected = PipelineHelpers.BuildSquashCommitMessage(goalId, description);
         Assert.Equal(expected, result);
     }
 

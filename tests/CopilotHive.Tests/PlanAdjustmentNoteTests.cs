@@ -10,7 +10,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace CopilotHive.Tests;
 
 /// <summary>
-/// Tests for <see cref="GoalDispatcher.BuildPlanAdjustmentNote"/> and
+/// Tests for <see cref="IterationPlanValidator.BuildPlanAdjustmentNote"/> and
 /// the plan-adjustment injection behaviour at all three dispatch sites.
 /// </summary>
 public sealed class BuildPlanAdjustmentNoteTests
@@ -23,7 +23,7 @@ public sealed class BuildPlanAdjustmentNoteTests
         var original = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Merging };
         var final    = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
 
-        var note = GoalDispatcher.BuildPlanAdjustmentNote(original, final);
+        var note = IterationPlanValidator.BuildPlanAdjustmentNote(original, final);
 
         Assert.Contains("Coding, Merging", note);
     }
@@ -34,7 +34,7 @@ public sealed class BuildPlanAdjustmentNoteTests
         var original = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Merging };
         var final    = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
 
-        var note = GoalDispatcher.BuildPlanAdjustmentNote(original, final);
+        var note = IterationPlanValidator.BuildPlanAdjustmentNote(original, final);
 
         Assert.Contains("Coding, Testing, Review, Merging", note);
     }
@@ -45,7 +45,7 @@ public sealed class BuildPlanAdjustmentNoteTests
         var original = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Merging };
         var final    = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
 
-        var note = GoalDispatcher.BuildPlanAdjustmentNote(original, final);
+        var note = IterationPlanValidator.BuildPlanAdjustmentNote(original, final);
 
         // Both Testing and Review were added
         Assert.Contains("Testing", note);
@@ -58,7 +58,7 @@ public sealed class BuildPlanAdjustmentNoteTests
         var original = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Merging };
         var final    = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
 
-        var note = GoalDispatcher.BuildPlanAdjustmentNote(original, final);
+        var note = IterationPlanValidator.BuildPlanAdjustmentNote(original, final);
 
         // The new per-change note describes Review insertion with the reason
         Assert.Contains("Review was inserted", note);
@@ -72,7 +72,7 @@ public sealed class BuildPlanAdjustmentNoteTests
         var original = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Merging };
         var final    = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
 
-        var note = GoalDispatcher.BuildPlanAdjustmentNote(original, final);
+        var note = IterationPlanValidator.BuildPlanAdjustmentNote(original, final);
 
         // Adjustments section should mention Review but NOT describe Coding or Testing being added
         var adjustmentsStart = note.IndexOf("Adjustments:", StringComparison.Ordinal);
@@ -96,7 +96,7 @@ public sealed class BuildPlanAdjustmentNoteTests
         var original = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Merging };
         var final    = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
 
-        var note = GoalDispatcher.BuildPlanAdjustmentNote(original, final);
+        var note = IterationPlanValidator.BuildPlanAdjustmentNote(original, final);
 
         Assert.Contains("ALL phases", note);
     }
@@ -108,7 +108,7 @@ public sealed class BuildPlanAdjustmentNoteTests
         var original = new List<GoalPhase> { GoalPhase.Merging };
         var final    = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
 
-        var note = GoalDispatcher.BuildPlanAdjustmentNote(original, final);
+        var note = IterationPlanValidator.BuildPlanAdjustmentNote(original, final);
 
         Assert.Contains("Coding was inserted", note);
     }
@@ -120,7 +120,7 @@ public sealed class BuildPlanAdjustmentNoteTests
         var original = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Review, GoalPhase.Merging };
         var final    = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
 
-        var note = GoalDispatcher.BuildPlanAdjustmentNote(original, final);
+        var note = IterationPlanValidator.BuildPlanAdjustmentNote(original, final);
 
         Assert.Contains("Testing was inserted", note);
         Assert.Contains("code-change plans", note);
@@ -133,7 +133,7 @@ public sealed class BuildPlanAdjustmentNoteTests
         var original = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Merging, GoalPhase.Testing, GoalPhase.Review };
         var final    = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
 
-        var note = GoalDispatcher.BuildPlanAdjustmentNote(original, final);
+        var note = IterationPlanValidator.BuildPlanAdjustmentNote(original, final);
 
         Assert.Contains("Merging was moved", note);
     }
@@ -144,7 +144,7 @@ public sealed class BuildPlanAdjustmentNoteTests
         var original = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Merging };
         var final    = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
 
-        var note = GoalDispatcher.BuildPlanAdjustmentNote(original, final);
+        var note = IterationPlanValidator.BuildPlanAdjustmentNote(original, final);
 
         Assert.Contains("Adjustments:", note);
     }
@@ -156,7 +156,7 @@ public sealed class BuildPlanAdjustmentNoteTests
         var original = new List<GoalPhase> { GoalPhase.DocWriting, GoalPhase.Merging };
         var final    = new List<GoalPhase> { GoalPhase.DocWriting, GoalPhase.Testing, GoalPhase.Merging };
 
-        var note = GoalDispatcher.BuildPlanAdjustmentNote(original, final);
+        var note = IterationPlanValidator.BuildPlanAdjustmentNote(original, final);
 
         Assert.Contains("Testing was inserted after DocWriting", note);
         // Must NOT say "after Coding" for a docs-only plan
@@ -170,7 +170,7 @@ public sealed class BuildPlanAdjustmentNoteTests
         var original = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review };
         var final    = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
 
-        var note = GoalDispatcher.BuildPlanAdjustmentNote(original, final);
+        var note = IterationPlanValidator.BuildPlanAdjustmentNote(original, final);
 
         Assert.Contains("Merging was appended", note);
         Assert.Contains("always required", note);

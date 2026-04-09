@@ -346,14 +346,6 @@ public sealed class GoalDispatcher : BackgroundService
         _pipelineManager.PersistFull(pipeline);
     }
 
-    // ── Forwarding wrappers for static methods (tests call GoalDispatcher.X directly) ──
-
-    internal static IterationPlan ValidatePlan(IterationPlan plan)
-        => IterationPlanValidator.ValidatePlan(plan);
-
-    internal static string BuildPlanAdjustmentNote(List<GoalPhase> original, List<GoalPhase> final)
-        => IterationPlanValidator.BuildPlanAdjustmentNote(original, final);
-
     // ── Forwarding wrappers for instance methods (tests call via reflection) ──
 
     private Task MarkGoalCompleted(GoalPipeline pipeline, CancellationToken ct)
@@ -367,36 +359,6 @@ public sealed class GoalDispatcher : BackgroundService
 
     private Task HandleMergeFailureAsync(GoalPipeline pipeline, string errorMessage, CancellationToken ct)
         => _pipelineDriver.HandleMergeFailureAsync(pipeline, errorMessage, ct);
-
-    /// <summary>
-    /// Builds a concise summary of worker output for the pipeline conversation.
-    /// The Brain uses this to understand what each phase produced — especially
-    /// WHY a reviewer rejected or what tests failed.
-    /// </summary>
-    internal static string BuildWorkerOutputSummary(GoalPhase phase, string verdict, TaskResult result)
-        => PipelineHelpers.BuildWorkerOutputSummary(phase, verdict, result);
-
-    /// <summary>
-    /// Builds an <see cref="IterationSummary"/> from the pipeline's <see cref="GoalPipeline.PhaseLog"/>.
-    /// Entries for the current iteration are extracted directly — no plan-walking or PhaseDurations needed.
-    /// </summary>
-    internal static IterationSummary BuildIterationSummary(GoalPipeline pipeline)
-        => PipelineHelpers.BuildIterationSummary(pipeline);
-
-    /// <summary>
-    /// Builds a squash-merge commit message from a goal ID and description.
-    /// </summary>
-    internal static string BuildSquashCommitMessage(string goalId, string description)
-        => PipelineHelpers.BuildSquashCommitMessage(goalId, description);
-
-    internal static string InjectTokenIntoUrl(string url)
-        => PipelineHelpers.InjectTokenIntoUrl(url);
-
-    internal static string? GetLastCraftPromptFromConversation(GoalPipeline pipeline)
-        => PipelineHelpers.GetLastCraftPromptFromConversation(pipeline);
-
-    internal static (string? Prompt, string? Response) GetPlanningPromptsFromConversation(GoalPipeline pipeline)
-        => PipelineHelpers.GetPlanningPromptsFromConversation(pipeline);
 
     private async Task DispatchToRole(GoalPipeline pipeline, WorkerRole role, string? prompt, CancellationToken ct)
     {
@@ -644,11 +606,11 @@ public sealed class GoalDispatcher : BackgroundService
             {
                 var rawPlan = await ResolvePlanAsync(pipeline, null, ct);
                 var originalPhases = rawPlan.Phases.ToList();
-                iterationPlan = ValidatePlan(rawPlan);
+                iterationPlan = IterationPlanValidator.ValidatePlan(rawPlan);
 
                 if (!originalPhases.SequenceEqual(iterationPlan.Phases))
                 {
-                    var note = BuildPlanAdjustmentNote(originalPhases, iterationPlan.Phases);
+                    var note = IterationPlanValidator.BuildPlanAdjustmentNote(originalPhases, iterationPlan.Phases);
                     await _brain.InjectSystemNoteAsync(pipeline, note, ct);
                 }
             }
@@ -678,9 +640,9 @@ public sealed class GoalDispatcher : BackgroundService
         if (pipeline.CurrentPhaseEntry is { } firstPhaseEntry)
         {
             firstPhaseEntry.WorkerPrompt = firstPhasePrompt;
-            firstPhaseEntry.BrainPrompt = GetLastCraftPromptFromConversation(pipeline);
+            firstPhaseEntry.BrainPrompt = PipelineHelpers.GetLastCraftPromptFromConversation(pipeline);
             // Capture planning prompt/response from conversation onto the first entry
-            var (planningPrompt, planningResponse) = GetPlanningPromptsFromConversation(pipeline);
+            var (planningPrompt, planningResponse) = PipelineHelpers.GetPlanningPromptsFromConversation(pipeline);
             firstPhaseEntry.PlanningPrompt = planningPrompt;
             firstPhaseEntry.PlanningResponse = planningResponse;
         }
@@ -711,7 +673,7 @@ public sealed class GoalDispatcher : BackgroundService
 
             if (repoConfig is not null)
             {
-                var url = InjectTokenIntoUrl(repoConfig.Url);
+                var url = PipelineHelpers.InjectTokenIntoUrl(repoConfig.Url);
                 repos.Add(new TargetRepository
                 {
                     Name = repoConfig.Name,
@@ -749,13 +711,13 @@ public sealed class GoalDispatcher : BackgroundService
 
     /// <summary>
     /// Generates a commit message by asking the Brain for a concise summary first,
-    /// falling back to <see cref="BuildSquashCommitMessage"/> when the Brain is unavailable
+    /// falling back to <see cref="PipelineHelpers.BuildSquashCommitMessage"/> when the Brain is unavailable
     /// or returns null. The "Goal:" prefix is always preserved.
     /// </summary>
     internal async Task<string> GenerateMergeCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct)
     {
         if (_brain is null)
-            return BuildSquashCommitMessage(pipeline.GoalId, pipeline.Description);
+            return PipelineHelpers.BuildSquashCommitMessage(pipeline.GoalId, pipeline.Description);
 
         try
         {
@@ -776,7 +738,7 @@ public sealed class GoalDispatcher : BackgroundService
                 pipeline.GoalId);
         }
 
-        return BuildSquashCommitMessage(pipeline.GoalId, pipeline.Description);
+        return PipelineHelpers.BuildSquashCommitMessage(pipeline.GoalId, pipeline.Description);
     }
 
 }

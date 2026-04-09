@@ -291,7 +291,7 @@ static async Task<int> RunServerAsync(string[] args)
         {
             try
             {
-                var url = GoalDispatcher.InjectTokenIntoUrl(repo.Url);
+                var url = PipelineHelpers.InjectTokenIntoUrl(repo.Url);
                 await repoManager.EnsureCloneAsync(repo.Name, url, repo.DefaultBranch);
                 logger.LogInformation("Cloned/updated repo '{RepoName}' at startup", repo.Name);
             }
