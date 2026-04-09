@@ -110,7 +110,7 @@ internal sealed class GoalLifecycleService
         string? mergeCommitHash,
         CancellationToken ct)
     {
-        var iterationSummary = GoalDispatcher.BuildIterationSummary(pipeline);
+        var iterationSummary = PipelineHelpers.BuildIterationSummary(pipeline);
         pipeline.CompletedIterationSummaries.Add(iterationSummary);
 
         var goalStartedAt = pipeline.GoalStartedAt ?? pipeline.Goal.StartedAt ?? pipeline.CreatedAt;

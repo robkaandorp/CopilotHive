@@ -12,8 +12,7 @@ namespace CopilotHive.Tests;
 
 /// <summary>
 /// Direct tests for <see cref="IterationPlanValidator"/> — the extracted plan validation logic.
-/// These verify that the extracted class behaves identically to the original
-/// GoalDispatcher.ValidatePlan and GoalDispatcher.BuildPlanAdjustmentNote forwarding wrappers.
+/// These verify the correctness of the extracted class.
 /// </summary>
 public sealed class IterationPlanValidatorTests
 {
@@ -80,16 +79,13 @@ public sealed class IterationPlanValidatorTests
     }
 
     [Fact]
-    public void ValidatePlan_ForwardingWrapper_ProducesSameResult()
+    public void ValidatePlan_InsertsTestingAndReview_WhenMissing()
     {
-        // Verify GoalDispatcher.ValidatePlan forwarding wrapper produces same result as direct call
-        var plan1 = new IterationPlan { Phases = [GoalPhase.Coding, GoalPhase.Merging] };
-        var plan2 = new IterationPlan { Phases = [GoalPhase.Coding, GoalPhase.Merging] };
+        var plan = new IterationPlan { Phases = [GoalPhase.Coding, GoalPhase.Merging] };
 
-        var directResult = IterationPlanValidator.ValidatePlan(plan1);
-        var wrapperResult = GoalDispatcher.ValidatePlan(plan2);
+        var result = IterationPlanValidator.ValidatePlan(plan);
 
-        Assert.Equal(directResult.Phases, wrapperResult.Phases);
+        Assert.Equal([GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging], result.Phases);
     }
 
     // ── BuildPlanAdjustmentNote ─────────────────────────────────────────────
@@ -142,22 +138,21 @@ public sealed class IterationPlanValidatorTests
     }
 
     [Fact]
-    public void BuildPlanAdjustmentNote_ForwardingWrapper_ProducesSameResult()
+    public void BuildPlanAdjustmentNote_DescribesInsertedPhases()
     {
         var original = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Merging };
         var final = new List<GoalPhase> { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging };
 
-        var directNote = IterationPlanValidator.BuildPlanAdjustmentNote(original, final);
-        var wrapperNote = GoalDispatcher.BuildPlanAdjustmentNote(original, final);
+        var note = IterationPlanValidator.BuildPlanAdjustmentNote(original, final);
 
-        Assert.Equal(directNote, wrapperNote);
+        Assert.Contains("Testing was inserted", note);
+        Assert.Contains("Review was inserted", note);
     }
 }
 
 /// <summary>
 /// Direct tests for <see cref="PipelineHelpers"/> — the extracted static helper methods.
-/// These verify that the extracted class behaves identically to the original
-/// GoalDispatcher forwarding wrappers.
+/// These verify that the extracted class is correct.
 /// </summary>
 public sealed class PipelineHelpersTests
 {
@@ -321,7 +316,7 @@ public sealed class PipelineHelpersTests
     }
 
     [Fact]
-    public void BuildWorkerOutputSummary_ForwardingWrapper_ProducesSameResult()
+    public void BuildWorkerOutputSummary_IncludesTestMetrics()
     {
         var result = new TaskResult
         {
@@ -330,10 +325,9 @@ public sealed class PipelineHelpersTests
             Output = "Test output",
             Metrics = new TaskMetrics { TotalTests = 10, PassedTests = 8, FailedTests = 2 },
         };
-        var direct = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Testing, "PASS", result);
-        var wrapper = GoalDispatcher.BuildWorkerOutputSummary(GoalPhase.Testing, "PASS", result);
+        var summary = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Testing, "PASS", result);
 
-        Assert.Equal(direct, wrapper);
+        Assert.Contains("8/10", summary);
     }
 
     // ── BuildIterationSummary ───────────────────────────────────────────────
@@ -367,7 +361,7 @@ public sealed class PipelineHelpersTests
     }
 
     [Fact]
-    public void BuildIterationSummary_ForwardingWrapper_ProducesSameResult()
+    public void BuildIterationSummary_CapturesIterationNumber()
     {
         var goal = new Goal { Id = "g-1", Description = "Test" };
         var pipeline = new GoalPipeline(goal);
@@ -381,12 +375,10 @@ public sealed class PipelineHelpersTests
             Result = PhaseOutcome.Pass,
         });
 
-        var direct = PipelineHelpers.BuildIterationSummary(pipeline);
-        var wrapper = GoalDispatcher.BuildIterationSummary(pipeline);
+        var summary = PipelineHelpers.BuildIterationSummary(pipeline);
 
-        // Both should produce the same iteration number and test counts
-        Assert.Equal(direct.Iteration, wrapper.Iteration);
-        Assert.Equal(direct.TestCounts?.Total, wrapper.TestCounts?.Total);
+        // Iteration number should be captured in summary
+        Assert.Equal(pipeline.Iteration, summary.Iteration);
     }
 }
 

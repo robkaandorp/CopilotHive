@@ -394,7 +394,7 @@ public sealed class ClarificationLoggingTests
         pipeline.Clarifications.Add(new ClarificationEntry(
             DateTime.UtcNow, "g-1", 2, "Testing", "tester", "Q2?", "A2.", "composer"));
 
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
+        var summary = PipelineHelpers.BuildIterationSummary(pipeline);
 
         // Only clarifications for iteration 1 should be included
         Assert.Single(summary.Clarifications);
@@ -410,7 +410,7 @@ public sealed class ClarificationLoggingTests
         var pipeline = new GoalPipeline(goal);
         pipeline.AdvanceTo(GoalPhase.Coding);
 
-        var summary = GoalDispatcher.BuildIterationSummary(pipeline);
+        var summary = PipelineHelpers.BuildIterationSummary(pipeline);
 
         Assert.Empty(summary.Clarifications);
     }
