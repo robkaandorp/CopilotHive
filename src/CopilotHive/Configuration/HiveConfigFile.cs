@@ -1,3 +1,5 @@
+using CopilotHive.Workers;
+
 namespace CopilotHive.Configuration;
 
 /// <summary>
@@ -53,6 +55,24 @@ public sealed class HiveConfigFile
             return Orchestrator.WorkerContextWindow;
         return Constants.DefaultBrainContextWindow;
     }
+
+    /// <summary>
+    /// Resolves the model to use for a given role (typed overload).
+    /// Delegates to <see cref="GetModelForRole(string)"/> using the role's name.
+    /// </summary>
+    public string GetModelForRole(WorkerRole role) => GetModelForRole(role.ToRoleName());
+
+    /// <summary>
+    /// Resolves the premium model configured for a given role, or <c>null</c> if none is set (typed overload).
+    /// Delegates to <see cref="GetPremiumModelForRole(string)"/> using the role's name.
+    /// </summary>
+    public string? GetPremiumModelForRole(WorkerRole role) => GetPremiumModelForRole(role.ToRoleName());
+
+    /// <summary>
+    /// Resolves the context window size for a given role (typed overload).
+    /// Delegates to <see cref="GetContextWindowForRole(string)"/> using the role's name.
+    /// </summary>
+    public int GetContextWindowForRole(WorkerRole role) => GetContextWindowForRole(role.ToRoleName());
 }
 
 /// <summary>
@@ -118,6 +138,10 @@ public sealed class OrchestratorConfig
     /// and agent compaction threshold.
     /// </summary>
     public int WorkerContextWindow { get; set; } = Constants.DefaultBrainContextWindow;
+    /// <summary>Docker image used to spawn worker containers.</summary>
+    public string DockerImage { get; set; } = "robkaandorp/copilot-acp-server:dev";
+    /// <summary>Starting TCP port for worker containers; each additional worker increments by one.</summary>
+    public int BasePort { get; set; } = Constants.DefaultBasePort;
 }
 
 /// <summary>

@@ -11,7 +11,8 @@ namespace CopilotHive.Workers;
 public sealed class DockerWorkerManager : IWorkerManager
 {
     private readonly DockerClient _docker;
-    private readonly HiveConfiguration _config;
+    private readonly HiveConfigFile _config;
+    private readonly string _gitHubToken;
     private readonly Dictionary<string, WorkerInfo> _workers = [];
     private readonly string _sessionId = Guid.NewGuid().ToString("N")[..8];
     private readonly ILogger<DockerWorkerManager>? _logger;
@@ -20,12 +21,14 @@ public sealed class DockerWorkerManager : IWorkerManager
     /// <summary>
     /// Initialises a new <see cref="DockerWorkerManager"/> using the default local Docker daemon.
     /// </summary>
-    /// <param name="config">Configuration providing the Docker image, base port, and credentials.</param>
+    /// <param name="config">Configuration providing the Docker image, base port, and other settings.</param>
+    /// <param name="gitHubToken">GitHub personal access token passed to worker containers.</param>
     /// <param name="logger">Optional logger; when omitted, log output is suppressed.</param>
-    public DockerWorkerManager(HiveConfiguration config, ILogger<DockerWorkerManager>? logger = null)
+    public DockerWorkerManager(HiveConfigFile config, string gitHubToken, ILogger<DockerWorkerManager>? logger = null)
     {
         _config = config;
-        _nextPort = config.BasePort;
+        _gitHubToken = gitHubToken;
+        _nextPort = config.Orchestrator.BasePort;
         _logger = logger;
         _docker = new DockerClientConfiguration().CreateClient();
     }
@@ -84,11 +87,11 @@ public sealed class DockerWorkerManager : IWorkerManager
         var response = await _docker.Containers.CreateContainerAsync(
             new CreateContainerParameters
             {
-                Image = _config.DockerImage,
+                Image = _config.Orchestrator.DockerImage,
                 Name = id,
                 Env =
                 [
-                    $"GH_TOKEN={_config.GitHubToken}",
+                    $"GH_TOKEN={_gitHubToken}",
                     $"LLM_PROVIDER=copilot",
                 ],
                 HostConfig = new HostConfig

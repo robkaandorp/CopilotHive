@@ -6,31 +6,17 @@ namespace CopilotHive.Tests;
 public class HiveConfigurationTests
 {
     [Fact]
-    public void GetModelForRole_Defaults_ReturnsExpectedModels()
+    public void GetModelForRole_PerRoleOverride_ReturnsConfiguredModel()
     {
-        var config = new HiveConfiguration
+        var config = new HiveConfigFile
         {
-            Goal = "test",
-            GitHubToken = "fake",
-        };
-
-        Assert.Equal("claude-opus-4.6", config.GetModelForRole(WorkerRole.Coder));
-        Assert.Equal("gpt-5.3-codex", config.GetModelForRole(WorkerRole.Reviewer));
-        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole(WorkerRole.Tester));
-        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole(WorkerRole.Improver));
-    }
-
-    [Fact]
-    public void GetModelForRole_WithOverrides_ReturnsOverriddenModels()
-    {
-        var config = new HiveConfiguration
-        {
-            Goal = "test",
-            GitHubToken = "fake",
-            CoderModel = "gpt-5.4",
-            ReviewerModel = "claude-opus-4.6",
-            TesterModel = "gpt-5-mini",
-            ImproverModel = "gpt-5.2",
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { Model = "gpt-5.4" },
+                ["reviewer"] = new WorkerConfig { Model = "claude-opus-4.6" },
+                ["tester"] = new WorkerConfig { Model = "gpt-5-mini" },
+                ["improver"] = new WorkerConfig { Model = "gpt-5.2" },
+            },
         };
 
         Assert.Equal("gpt-5.4", config.GetModelForRole(WorkerRole.Coder));
@@ -40,57 +26,86 @@ public class HiveConfigurationTests
     }
 
     [Fact]
-    public void GetModelForRole_FallbackModel_UsedForCoderAndUnmatchedRoles()
+    public void GetModelForRole_NoPerRoleConfig_FallsBackToOrchestratorModel()
     {
-        var config = new HiveConfiguration
+        var config = new HiveConfigFile
         {
-            Goal = "test",
-            GitHubToken = "fake",
-            Model = "claude-sonnet-4.6",
+            Orchestrator = { Model = "custom-fallback-model" },
         };
 
-        // Coder falls back to Model (no CoderModel set)
-        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole(WorkerRole.Coder));
-        // MergeWorker falls to default _ => Model
-        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole(WorkerRole.MergeWorker));
+        Assert.Equal("custom-fallback-model", config.GetModelForRole(WorkerRole.Coder));
+        Assert.Equal("custom-fallback-model", config.GetModelForRole(WorkerRole.Reviewer));
+        Assert.Equal("custom-fallback-model", config.GetModelForRole(WorkerRole.Tester));
+        Assert.Equal("custom-fallback-model", config.GetModelForRole(WorkerRole.Improver));
+        Assert.Equal("custom-fallback-model", config.GetModelForRole(WorkerRole.MergeWorker));
     }
 
     [Fact]
-    public void GetModelForRole_EnumValues_ReturnExpectedDefaults()
+    public void GetModelForRole_NothingConfigured_ReturnsDefaultWorkerModel()
     {
-        var config = new HiveConfiguration
-        {
-            Goal = "test",
-            GitHubToken = "fake",
-        };
+        var config = new HiveConfigFile();
 
-        Assert.Equal("claude-opus-4.6", config.GetModelForRole(WorkerRole.Coder));
-        Assert.Equal("gpt-5.3-codex", config.GetModelForRole(WorkerRole.Reviewer));
-        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole(WorkerRole.Tester));
+        // Orchestrator.Model defaults to Constants.DefaultWorkerModel
+        Assert.Equal(Constants.DefaultWorkerModel, config.GetModelForRole(WorkerRole.Coder));
+        Assert.Equal(Constants.DefaultWorkerModel, config.GetModelForRole(WorkerRole.Reviewer));
+        Assert.Equal(Constants.DefaultWorkerModel, config.GetModelForRole(WorkerRole.Tester));
+        Assert.Equal(Constants.DefaultWorkerModel, config.GetModelForRole(WorkerRole.DocWriter));
     }
 
     [Fact]
-    public void GetModelForRole_Orchestrator_DefaultsSonnet()
+    public void GetModelForRole_MultipleRolesConfigured_EachReturnsItsOwnModel()
     {
-        var config = new HiveConfiguration
+        var config = new HiveConfigFile
         {
-            Goal = "test",
-            GitHubToken = "fake",
+            Orchestrator = { Model = "fallback-model" },
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { Model = "coder-specific-model" },
+                ["docwriter"] = new WorkerConfig { Model = "docwriter-specific-model" },
+            },
         };
 
-        Assert.Equal("claude-sonnet-4.6", config.GetModelForRole(WorkerRole.Orchestrator));
+        Assert.Equal("coder-specific-model", config.GetModelForRole(WorkerRole.Coder));
+        Assert.Equal("docwriter-specific-model", config.GetModelForRole(WorkerRole.DocWriter));
+        // Unconfigured roles fall back to Orchestrator.Model
+        Assert.Equal("fallback-model", config.GetModelForRole(WorkerRole.Tester));
+        Assert.Equal("fallback-model", config.GetModelForRole(WorkerRole.Reviewer));
+        Assert.Equal("fallback-model", config.GetModelForRole(WorkerRole.Improver));
     }
 
     [Fact]
-    public void GetModelForRole_Orchestrator_WithOverride()
+    public void GetContextWindowForRole_PerRoleSet_ReturnsPerRoleValue()
     {
-        var config = new HiveConfiguration
+        const int coderWindow = 200_000;
+        var config = new HiveConfigFile
         {
-            Goal = "test",
-            GitHubToken = "fake",
-            OrchestratorModel = "gpt-5-mini",
+            Orchestrator = { WorkerContextWindow = 100_000 },
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { ContextWindow = coderWindow },
+            },
         };
 
-        Assert.Equal("gpt-5-mini", config.GetModelForRole(WorkerRole.Orchestrator));
+        Assert.Equal(coderWindow, config.GetContextWindowForRole(WorkerRole.Coder));
+    }
+
+    [Fact]
+    public void GetContextWindowForRole_NoPerRole_FallsBackToOrchestratorWorkerContextWindow()
+    {
+        const int orchestratorWindow = 120_000;
+        var config = new HiveConfigFile
+        {
+            Orchestrator = { WorkerContextWindow = orchestratorWindow },
+        };
+
+        Assert.Equal(orchestratorWindow, config.GetContextWindowForRole(WorkerRole.Tester));
+    }
+
+    [Fact]
+    public void GetContextWindowForRole_NothingConfigured_ReturnsDefaultBrainContextWindow()
+    {
+        var config = new HiveConfigFile();
+
+        Assert.Equal(Constants.DefaultBrainContextWindow, config.GetContextWindowForRole(WorkerRole.Coder));
     }
 }

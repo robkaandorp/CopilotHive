@@ -10,7 +10,7 @@ namespace CopilotHive.Tests;
 
 public class PremiumModelSelectionTests
 {
-    // -- HiveConfiguration.GetPremiumModelForRole --
+    // -- HiveConfigFile.GetPremiumModelForRole --
 
     [Theory]
     [InlineData(WorkerRole.Coder, "gpt-5.4-premium")]
@@ -19,14 +19,15 @@ public class PremiumModelSelectionTests
     [InlineData(WorkerRole.Improver, "claude-opus-premium")]
     public void GetPremiumModelForRole_WhenConfigured_ReturnsConfiguredModel(WorkerRole role, string expectedModel)
     {
-        var config = new HiveConfiguration
+        var config = new HiveConfigFile
         {
-            Goal = "test",
-            GitHubToken = "fake",
-            PremiumCoderModel = "gpt-5.4-premium",
-            PremiumReviewerModel = "claude-opus-4.6-premium",
-            PremiumTesterModel = "gpt-5-premium",
-            PremiumImproverModel = "claude-opus-premium",
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { PremiumModel = "gpt-5.4-premium" },
+                ["reviewer"] = new WorkerConfig { PremiumModel = "claude-opus-4.6-premium" },
+                ["tester"] = new WorkerConfig { PremiumModel = "gpt-5-premium" },
+                ["improver"] = new WorkerConfig { PremiumModel = "claude-opus-premium" },
+            },
         };
 
         Assert.Equal(expectedModel, config.GetPremiumModelForRole(role));
@@ -41,11 +42,7 @@ public class PremiumModelSelectionTests
     [InlineData(WorkerRole.DocWriter)]
     public void GetPremiumModelForRole_WhenNotConfigured_ReturnsNull(WorkerRole role)
     {
-        var config = new HiveConfiguration
-        {
-            Goal = "test",
-            GitHubToken = "fake",
-        };
+        var config = new HiveConfigFile();
 
         Assert.Null(config.GetPremiumModelForRole(role));
     }
@@ -53,14 +50,15 @@ public class PremiumModelSelectionTests
     [Fact]
     public void GetPremiumModelForRole_EnumValues_ReturnsCorrectModel()
     {
-        var config = new HiveConfiguration
+        var config = new HiveConfigFile
         {
-            Goal = "test",
-            GitHubToken = "fake",
-            PremiumCoderModel = "premium-coder",
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { PremiumModel = "premium-coder-model" },
+            },
         };
 
-        Assert.Equal("premium-coder", config.GetPremiumModelForRole(WorkerRole.Coder));
+        Assert.Equal("premium-coder-model", config.GetPremiumModelForRole(WorkerRole.Coder));
     }
 
     // -- GoalDispatcher premium model selection --
