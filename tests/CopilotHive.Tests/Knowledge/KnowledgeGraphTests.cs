@@ -540,6 +540,38 @@ public sealed class KnowledgeGraphTests : IDisposable
         Assert.Equal("arch-impl", implementedBy[0].Id);
     }
 
+    [Fact]
+    public async Task GetDependedOnBy_IgnoresNonDependsOnLinkTypes_ReturnsEmpty()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _graph.CreateDocumentAsync("arch-core", "Core", DocumentType.Implementation, "", ct: ct);
+        await _graph.CreateDocumentAsync("features-new", "New Feature", DocumentType.Feature, "", ct: ct);
+
+        // B implements A — should NOT appear in GetDependedOnBy(A)
+        _graph.AddLink("features-new", new DocumentLink("arch-core", LinkType.Implements));
+        Assert.Empty(_graph.GetDependedOnBy("arch-core"));
+
+        // B is related to A — should also NOT appear in GetDependedOnBy(A)
+        _graph.AddLink("features-new", new DocumentLink("arch-core", LinkType.Related));
+        Assert.Empty(_graph.GetDependedOnBy("arch-core"));
+    }
+
+    [Fact]
+    public async Task GetImplementedBy_IgnoresNonImplementsLinkTypes_ReturnsEmpty()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _graph.CreateDocumentAsync("features-spec", "Feature Spec", DocumentType.Feature, "", ct: ct);
+        await _graph.CreateDocumentAsync("arch-impl", "Implementation", DocumentType.Implementation, "", ct: ct);
+
+        // B depends on A — should NOT appear in GetImplementedBy(A)
+        _graph.AddLink("arch-impl", new DocumentLink("features-spec", LinkType.DependsOn));
+        Assert.Empty(_graph.GetImplementedBy("features-spec"));
+
+        // B is related to A — should also NOT appear in GetImplementedBy(A)
+        _graph.AddLink("arch-impl", new DocumentLink("features-spec", LinkType.Related));
+        Assert.Empty(_graph.GetImplementedBy("features-spec"));
+    }
+
     // ── GetRelated ────────────────────────────────────────────────────────────
 
     [Fact]
