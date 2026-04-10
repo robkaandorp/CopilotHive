@@ -1,3 +1,34 @@
+## [0.9.0] - 2026-04-11
+
+### Architecture & Refactoring
+
+- **DistributedBrain decomposed** — `DistributedBrain` was split into focused services: `BrainPromptBuilder` (static prompt construction), `BrainPlanParser` (plan parsing/validation), `BrainSessionManager` (session lifecycle), `BrainDecisionMaker` (planning/prompt-crafting LLM calls), and a slim `DistributedBrain` coordinator. This improves testability and makes each concern independently modifiable.
+- **GoalDispatcher extracted into services** — `GoalDispatcher` was decomposed from a ~800-line monolith into focused service classes: `PipelineDriver` (phase execution loop), `GoalLifecycleService` (mark completed/failed), `GoalMaintenanceService` (periodic cleanup), and `SyncAgentsService` (config repo sync). The dispatcher now delegates to these services.
+- **Unified model resolution** — `HiveConfiguration` was removed. All model configuration now flows through `HiveConfigFile` with a three-tier resolution chain: per-model overrides → per-role defaults → global default. This eliminated inconsistencies where the Brain and workers could pick different models.
+- **Sub-models extracted from GoalPipeline** — `BranchContext`, `ConversationTracker`, and `RoleSessionStore` were extracted as standalone types from `GoalPipeline`, reducing its surface area and improving encapsulation.
+- **GoalDispatcher forwarding wrappers removed** — Static forwarding wrappers in `GoalDispatcher` that just delegated to `PipelineDriver` methods were replaced with direct calls, reducing indirection.
+- **Strongly-typed Brain tool results** — `BrainToolCallResult` (a plain string) was replaced with discriminated-union records: `EscalateResult`, `IterationPlanResult`, and `GoalLookupResult`. This eliminated string-matching on Brain tool results.
+
+### Knowledge Graph
+
+- **Knowledge Graph data model** — Added `KnowledgeDocument`, `DocumentLink`, `DocumentType`, `DocumentStatus`, `LinkType` entities. `KnowledgeGraph` service with CRUD, link management, inverse queries, BFS traversal, YAML frontmatter handling, and path/ID round-tripping. `Goal.Documents` field added to `Goal.cs` with SQLite schema and serialization updates.
+- **Composer knowledge tools** — 9 new Composer tools: `create_document`, `read_document`, `update_document`, `delete_document`, `search_knowledge`, `list_documents`, `link_document`, `unlink_document`, `traverse_graph`. All mutating operations are immediately committed to the config repo.
+- **Brain knowledge tools** — `search_knowledge`, `read_document`, and `traverse_graph` tools added to the Brain for querying and exploring the knowledge graph during planning.
+- **Knowledge Graph dashboard** — `/knowledge` page with filterable document list. `/knowledge/{DocumentId}` detail page showing content, metadata, outgoing/incoming links, and related goals. 📚 Knowledge nav item in sidebar.
+
+### Bug Fixes
+
+- **Iteration/phase failure color** — Iteration tabs and phase indicators always showed green/successful even when a reviewer requested changes or tests failed. `PipelineDriver` was mapping `PhaseInput.RequestChanges` to `PhaseOutcome.Pass` instead of `PhaseOutcome.Fail`. Stored iteration tabs used a hardcoded `"iter-tab done"` class instead of checking for failed phases.
+- **PipelineDriver WorkerOutput** — `PipelineDriver` was overwriting `WorkerOutput` with raw `result.Output` instead of preferring `result.Metrics.Summary`, causing review feedback to be lost.
+- **Composer KnowledgeGraph injection** — The Composer factory was missing the `knowledgeGraph` parameter, causing all 9 knowledge tools to never be registered.
+- **Clarification deduplication** — Clarification escalation and cancellation handling was deduplicated.
+- **Compaction model display** — The Orchestrator dashboard now correctly renders the compaction model reasoning badge.
+- **Compaction model configuration** — Added `models.compaction` to `hive-config.yaml` for specifying a separate model for context compaction.
+
+### Dependencies
+
+- **SharpCoder upgraded to 0.8.0** — Picks up `AgentOptions.CompactionClient` for separate compaction model support.
+
 ## [0.8.1]
 
 ### Added
