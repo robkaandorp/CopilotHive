@@ -3,6 +3,7 @@ using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
+using CopilotHive.Knowledge;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Extensions.AI;
@@ -39,6 +40,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly string _systemPrompt;
     private readonly List<AITool> _composerTools;
     private readonly ConfigRepoManager? _configRepo;
+    private readonly KnowledgeGraph? _knowledgeGraph;
     private readonly Func<string, IChatClient>? _chatClientFactory;
 
     /// <summary>Models the Composer can switch between at runtime.</summary>
@@ -97,6 +99,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - Inspect repository history (git_log, git_diff, git_show, git_branch, git_blame)
         - List configured repositories (list_repositories)
         - Create and manage releases (create_release, list_releases, update_release)
+        - Manage knowledge documents in the knowledge graph (create_document, read_document, update_document, delete_document, search_knowledge, link_document, unlink_document, list_documents, traverse_graph)
         - Ask the user questions for clarification (ask_user)
 
         Guidelines for goal creation:
@@ -169,6 +172,37 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - One commit per logical change — do not bundle unrelated AGENTS.md updates
         """;
 
+    private const string KnowledgeGraphSystemPromptSection = """
+
+
+        ## Knowledge Graph
+        The knowledge graph stores documents as markdown files with YAML frontmatter under knowledge/ in the config repo.
+        Use it to capture and retrieve architectural decisions, feature designs, ideas, and persistent facts.
+
+        Knowledge graph tools:
+        - create_document(topic, slug, title, type, content, subtopic?, tags?, links?) — create a new knowledge document
+        - read_document(document_id) — read a document's full content, links, and metadata
+        - update_document(document_id, title?, content?, type?, status?, tags?, append_content?) — update a document
+        - delete_document(document_id) — delete a document (warns about incoming links)
+        - search_knowledge(query, topic?, type?, status?, tag?, limit?) — full-text search across all documents
+        - link_document(document_id, target_id, link_type, description?) — add an outgoing link
+        - unlink_document(document_id, target_id, link_type) — remove an outgoing link
+        - list_documents(topic?, type?, status?, tag?, limit?) — list documents with optional filters
+        - traverse_graph(document_id, depth?, direction?, link_types?) — explore the graph from a starting document
+
+        Document types: implementation, feature, idea, scratch, memory
+        Document statuses: draft, active, archived, superseded
+        Link types: parent, supersedes, depends_on, implements, related, references
+
+        Guidelines for using the knowledge graph:
+        - Use 'memory' type for persistent facts and decisions the LLM should recall
+        - Use 'implementation' for documenting existing code or architecture
+        - Use 'feature' for planned or in-progress feature designs
+        - Use 'idea' for unformed concepts needing exploration
+        - Use 'scratch' for working notes or temporary content
+        - All mutating operations (create, update, delete, link, unlink) are immediately committed to the config repo
+        """;
+
     /// <summary>
     /// Initialises a new <see cref="Composer"/> that connects to an LLM provider
     /// and uses the given goal store for CRUD operations.
@@ -188,7 +222,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         ConfigRepoManager? configRepo = null,
         IEnumerable<string>? availableModels = null,
         Func<string, IChatClient>? chatClientFactory = null,
-        string? compactionModel = null)
+        string? compactionModel = null,
+        KnowledgeGraph? knowledgeGraph = null)
     {
         _model = model;
         _maxContextTokens = maxContextTokens;
@@ -202,6 +237,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _ollamaApiKey = string.IsNullOrWhiteSpace(ollamaApiKey) ? null : ollamaApiKey;
         _hiveConfig = hiveConfig;
         _configRepo = configRepo;
+        _knowledgeGraph = knowledgeGraph;
         _chatClientFactory = chatClientFactory;
         _compactionModel = compactionModel;
         _session = AgentSession.Create("composer");
@@ -225,6 +261,9 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
         if (_configRepo is not null)
             _systemPrompt += ConfigRepoSystemPromptSection;
+
+        if (_knowledgeGraph is not null)
+            _systemPrompt += KnowledgeGraphSystemPromptSection;
 
         _composerTools = BuildComposerTools();
     }
@@ -566,6 +605,28 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 "Perform an exact string replacement in agents/{role}.agents.md in the config repo."));
             tools.Add(AIFunctionFactory.Create(CommitConfigChangesAsync, "commit_config_changes",
                 "Stage all changes in the config repo, commit, and push to the remote."));
+        }
+
+        if (_knowledgeGraph is not null)
+        {
+            tools.Add(AIFunctionFactory.Create(CreateDocumentAsync, "create_document",
+                "Create a new knowledge document in the config repo."));
+            tools.Add(AIFunctionFactory.Create(ReadDocumentAsync, "read_document",
+                "Read a knowledge document by ID. Returns full document including title, type, status, tags, links, and body."));
+            tools.Add(AIFunctionFactory.Create(UpdateDocumentAsync, "update_document",
+                "Update an existing knowledge document. Supports full replace or append mode for content."));
+            tools.Add(AIFunctionFactory.Create(DeleteDocumentAsync, "delete_document",
+                "Delete a knowledge document. Warns if other documents link to it."));
+            tools.Add(AIFunctionFactory.Create(SearchKnowledgeAsync, "search_knowledge",
+                "Full-text search across all knowledge documents, with optional filters."));
+            tools.Add(AIFunctionFactory.Create(LinkDocumentAsync, "link_document",
+                "Add an outgoing link from a document to another. Does not modify the target."));
+            tools.Add(AIFunctionFactory.Create(UnlinkDocumentAsync, "unlink_document",
+                "Remove an outgoing link from a document."));
+            tools.Add(AIFunctionFactory.Create(ListDocumentsAsync, "list_documents",
+                "List knowledge documents with optional filters for topic, type, status, and tag."));
+            tools.Add(AIFunctionFactory.Create(TraverseGraphAsync, "traverse_graph",
+                "Explore the knowledge graph from a starting document, following links up to a given depth."));
         }
 
         return tools;

@@ -302,6 +302,9 @@ public sealed partial class Composer
         sb.AppendLine($"- **Repositories:** {(goal.RepositoryNames.Count > 0 ? string.Join(", ", goal.RepositoryNames) : "(none)")}");
         sb.AppendLine($"- **Description:** {goal.Description}");
 
+        if (goal.Documents.Count > 0)
+            sb.AppendLine($"- **Documents:** {string.Join(", ", goal.Documents)}");
+
         if (goal.FailureReason is not null)
             sb.AppendLine($"- **Failure:** {goal.FailureReason}");
 
