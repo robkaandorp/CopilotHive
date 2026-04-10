@@ -86,7 +86,7 @@ public sealed partial class Composer
         sb.AppendLine($"- Repositories: {(repos.Count > 0 ? string.Join(", ", repos) : "(none)")}");
         sb.AppendLine($"- Dependencies: {(deps.Count > 0 ? string.Join(", ", deps) : "(none)")}");
         sb.Append("- Status: Draft (not yet dispatched — use approve_goal to queue it)");
-        AppendDocumentsJson(sb, goal.Documents);
+        AppendDocumentsList(sb, goal.Documents);
         return sb.ToString();
     }
 
@@ -646,35 +646,33 @@ public sealed partial class Composer
     }
 
     /// <summary>
-    /// Appends the Documents list as structured JSON to a response string if the goal has documents.
+    /// Appends the Documents list to a response string if the goal has documents.
+    /// Format: "- Documents: id (Title), id2 (Title2)"
     /// </summary>
     private string AppendDocuments(string response, Goal goal)
     {
         if (goal.Documents.Count == 0)
             return response;
         var sb = new System.Text.StringBuilder(response);
-        AppendDocumentsJson(sb, goal.Documents);
+        AppendDocumentsList(sb, goal.Documents);
         return sb.ToString();
     }
 
     /// <summary>
-    /// Appends a newline + "- documents: [...]" JSON array of {id, title} objects to the StringBuilder.
+    /// Appends a newline + "- Documents: id (Title), ..." to the StringBuilder.
     /// Does nothing if the list is empty.
     /// </summary>
-    private void AppendDocumentsJson(System.Text.StringBuilder sb, List<string> documentIds)
+    private void AppendDocumentsList(System.Text.StringBuilder sb, List<string> documentIds)
     {
         if (documentIds.Count == 0)
             return;
 
         var items = documentIds.Select(docId =>
         {
-            var title = _knowledgeGraph?.GetDocument(docId)?.Title ?? docId;
-            return $"{{\"id\":\"{EscapeJson(docId)}\",\"title\":\"{EscapeJson(title)}\"}}";
+            var title = _knowledgeGraph?.GetDocument(docId)?.Title;
+            return title is not null ? $"{docId} ({title})" : docId;
         });
         sb.AppendLine();
-        sb.Append($"- documents: [{string.Join(",", items)}]");
+        sb.Append($"- Documents: {string.Join(", ", items)}");
     }
-
-    private static string EscapeJson(string value)
-        => value.Replace("\\", "\\\\").Replace("\"", "\\\"");
 }

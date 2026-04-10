@@ -5927,11 +5927,12 @@ public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
 
         Assert.Contains("✅", result);
 
-        // Should contain JSON structured documents with id and title
-        Assert.Contains("\"id\":\"arch-brain\"", result);
-        Assert.Contains("\"title\":\"Brain Architecture\"", result);
-        Assert.Contains("\"id\":\"features-design\"", result);
-        Assert.Contains("\"title\":\"Feature Design\"", result);
+        // Should contain document IDs with titles in readable format
+        Assert.Contains("arch-brain", result);
+        Assert.Contains("Brain Architecture", result);
+        Assert.Contains("features-design", result);
+        Assert.Contains("Feature Design", result);
+        Assert.Contains("Documents", result);
     }
 
     [Fact]
@@ -5964,11 +5965,12 @@ public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
 
         Assert.Contains("✅", result);
 
-        // Should contain JSON structured documents with id and title
-        Assert.Contains("\"id\":\"arch-brain2\"", result);
-        Assert.Contains("\"title\":\"Brain Architecture v2\"", result);
-        Assert.Contains("\"id\":\"features-auth\"", result);
-        Assert.Contains("\"title\":\"Auth Feature\"", result);
+        // Should contain document IDs and titles in readable format
+        Assert.Contains("arch-brain2", result);
+        Assert.Contains("Brain Architecture v2", result);
+        Assert.Contains("features-auth", result);
+        Assert.Contains("Auth Feature", result);
+        Assert.Contains("Documents", result);
 
         // Verify documents were persisted to the store
         var goal = await _store.GetGoalAsync("goal-with-docs-create", ct);
