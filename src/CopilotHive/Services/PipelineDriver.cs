@@ -213,9 +213,12 @@ internal sealed class PipelineDriver
         {
             logEntry.CompletedAt = DateTime.UtcNow;
             logEntry.Verdict = verdict;
-            logEntry.WorkerOutput = result.Output.Length > 4000
-                ? result.Output[..4000] + $"... ({result.Output.Length} chars total)"
+            var workerOutput = !string.IsNullOrWhiteSpace(result.Metrics?.Summary)
+                ? result.Metrics.Summary
                 : result.Output;
+            logEntry.WorkerOutput = workerOutput.Length > 4000
+                ? workerOutput[..4000] + $"... ({workerOutput.Length} chars total)"
+                : workerOutput;
             logEntry.Result = phaseInput == PhaseInput.Failed ? PhaseOutcome.Fail : PhaseOutcome.Pass;
         }
 
