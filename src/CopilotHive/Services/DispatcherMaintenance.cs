@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using CopilotHive.Agents;
 using CopilotHive.Configuration;
 using CopilotHive.Goals;
+using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
 using CopilotHive.Workers;
 
@@ -21,6 +22,7 @@ internal sealed class DispatcherMaintenance
     private readonly IDistributedBrain? _brain;
     private readonly AgentsManager? _agentsManager;
     private readonly ConfigRepoManager? _configRepo;
+    private readonly KnowledgeGraph? _knowledgeGraph;
     private readonly ILogger _logger;
 
     // Mutable state shared with GoalDispatcher via reference
@@ -40,7 +42,8 @@ internal sealed class DispatcherMaintenance
         ConfigRepoManager? configRepo,
         ConcurrentDictionary<string, bool> dispatchedGoals,
         ConcurrentQueue<string> redispatchQueue,
-        ILogger logger)
+        ILogger logger,
+        KnowledgeGraph? knowledgeGraph = null)
     {
         _pipelineManager = pipelineManager;
         _goalManager = goalManager;
@@ -49,6 +52,7 @@ internal sealed class DispatcherMaintenance
         _brain = brain;
         _agentsManager = agentsManager;
         _configRepo = configRepo;
+        _knowledgeGraph = knowledgeGraph;
         _dispatchedGoals = dispatchedGoals;
         _redispatchQueue = redispatchQueue;
         _logger = logger;
@@ -90,6 +94,20 @@ internal sealed class DispatcherMaintenance
                 }
 
                 _logger.LogInformation("Synced {Role} AGENTS.md from config repo (changed)", roleName);
+            }
+
+            // Reload knowledge graph from the (now-synced) config repo
+            if (_knowledgeGraph is not null)
+            {
+                try
+                {
+                    await _knowledgeGraph.ReloadFromConfigRepoAsync(_configRepo.LocalPath, ct);
+                    _logger.LogInformation("Reloaded knowledge graph from config repo");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to reload knowledge graph from config repo");
+                }
             }
         }
         catch (Exception ex)

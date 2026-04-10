@@ -5,6 +5,7 @@ using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Improvement;
+using CopilotHive.Knowledge;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Workers;
@@ -64,6 +65,7 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="clarificationQueue">Optional clarification queue for human escalation.</param>
     /// <param name="startupDelay">Delay before the first dispatch poll; defaults to 10 seconds to give workers time to connect.</param>
     /// <param name="progressLog">Optional progress log for recording clarification events.</param>
+    /// <param name="knowledgeGraph">Optional knowledge graph for reloading on sync cycles.</param>
     public GoalDispatcher(
         GoalManager goalManager,
         GoalPipelineManager pipelineManager,
@@ -81,7 +83,8 @@ public sealed class GoalDispatcher : BackgroundService
         IClarificationRouter? clarificationRouter = null,
         ClarificationQueueService? clarificationQueue = null,
         TimeSpan? startupDelay = null,
-        ProgressLog? progressLog = null)
+        ProgressLog? progressLog = null,
+        KnowledgeGraph? knowledgeGraph = null)
     {
         _repoManager = repoManager ?? throw new ArgumentNullException(nameof(repoManager));
         _goalManager = goalManager;
@@ -102,7 +105,8 @@ public sealed class GoalDispatcher : BackgroundService
 
         _maintenance = new DispatcherMaintenance(
             pipelineManager, goalManager, taskQueue, workerGateway, brain,
-            agentsManager, configRepo, _dispatchedGoals, _redispatchQueue, logger);
+            agentsManager, configRepo, _dispatchedGoals, _redispatchQueue, logger,
+            knowledgeGraph);
 
         _pipelineDriver = new PipelineDriver(
             brain: brain,
