@@ -448,6 +448,98 @@ public sealed class KnowledgeGraphTests : IDisposable
         Assert.Equal("arch-brain-v2", supersededBy[0].Id);
     }
 
+    // ── GetDependedOnBy ───────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetDependedOnBy_ReturnsDocumentsWithDependsOnLinkToTarget()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _graph.CreateDocumentAsync("arch-core", "Core", DocumentType.Implementation, "", ct: ct);
+        await _graph.CreateDocumentAsync("features-new", "New Feature", DocumentType.Feature, "", ct: ct);
+
+        // features-new depends on arch-core
+        _graph.AddLink("features-new", new DocumentLink("arch-core", LinkType.DependsOn));
+
+        var dependedOnBy = _graph.GetDependedOnBy("arch-core");
+        Assert.Single(dependedOnBy);
+        Assert.Equal("features-new", dependedOnBy[0].Id);
+    }
+
+    [Fact]
+    public async Task GetDependedOnBy_NoDependsOnLinks_ReturnsEmpty()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _graph.CreateDocumentAsync("arch-core", "Core", DocumentType.Implementation, "", ct: ct);
+
+        Assert.Empty(_graph.GetDependedOnBy("arch-core"));
+    }
+
+    [Fact]
+    public async Task GetDependedOnBy_AfterRoundTrip_ReverseIndexRebuilt()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        await graph.CreateDocumentAsync("arch-core", "Core", DocumentType.Implementation, "", ct: ct);
+        await graph.CreateDocumentAsync("features-new", "New Feature", DocumentType.Feature, "", ct: ct);
+        graph.AddLink("features-new", new DocumentLink("arch-core", LinkType.DependsOn));
+
+        await graph.CommitToConfigRepoAsync(_tempDir, "round-trip", ct);
+
+        var graph2 = new KnowledgeGraph();
+        await graph2.ReloadFromConfigRepoAsync(_tempDir, ct);
+
+        var dependedOnBy = graph2.GetDependedOnBy("arch-core");
+        Assert.Single(dependedOnBy);
+        Assert.Equal("features-new", dependedOnBy[0].Id);
+    }
+
+    // ── GetImplementedBy ──────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetImplementedBy_ReturnsDocumentsWithImplementsLinkToTarget()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _graph.CreateDocumentAsync("features-spec", "Feature Spec", DocumentType.Feature, "", ct: ct);
+        await _graph.CreateDocumentAsync("arch-impl", "Implementation", DocumentType.Implementation, "", ct: ct);
+
+        // arch-impl implements features-spec
+        _graph.AddLink("arch-impl", new DocumentLink("features-spec", LinkType.Implements));
+
+        var implementedBy = _graph.GetImplementedBy("features-spec");
+        Assert.Single(implementedBy);
+        Assert.Equal("arch-impl", implementedBy[0].Id);
+    }
+
+    [Fact]
+    public async Task GetImplementedBy_NoImplementsLinks_ReturnsEmpty()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _graph.CreateDocumentAsync("features-spec", "Feature Spec", DocumentType.Feature, "", ct: ct);
+
+        Assert.Empty(_graph.GetImplementedBy("features-spec"));
+    }
+
+    [Fact]
+    public async Task GetImplementedBy_AfterRoundTrip_ReverseIndexRebuilt()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        await graph.CreateDocumentAsync("features-spec", "Feature Spec", DocumentType.Feature, "", ct: ct);
+        await graph.CreateDocumentAsync("arch-impl", "Implementation", DocumentType.Implementation, "", ct: ct);
+        graph.AddLink("arch-impl", new DocumentLink("features-spec", LinkType.Implements));
+
+        await graph.CommitToConfigRepoAsync(_tempDir, "round-trip-impl", ct);
+
+        var graph2 = new KnowledgeGraph();
+        await graph2.ReloadFromConfigRepoAsync(_tempDir, ct);
+
+        var implementedBy = graph2.GetImplementedBy("features-spec");
+        Assert.Single(implementedBy);
+        Assert.Equal("arch-impl", implementedBy[0].Id);
+    }
+
     // ── GetRelated ────────────────────────────────────────────────────────────
 
     [Fact]

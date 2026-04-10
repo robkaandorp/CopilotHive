@@ -252,6 +252,20 @@ public sealed class KnowledgeGraph
         => GetInverseDocuments(id, LinkType.Supersedes);
 
     /// <summary>
+    /// Returns all documents that have a <see cref="LinkType.DependsOn"/> link pointing to <paramref name="id"/>.
+    /// These are the documents that depend on the given document.
+    /// </summary>
+    public List<KnowledgeDocument> GetDependedOnBy(string id)
+        => GetInverseDocuments(id, LinkType.DependsOn);
+
+    /// <summary>
+    /// Returns all documents that have a <see cref="LinkType.Implements"/> link pointing to <paramref name="id"/>.
+    /// These are the documents that implement the given document (e.g. spec → implementation).
+    /// </summary>
+    public List<KnowledgeDocument> GetImplementedBy(string id)
+        => GetInverseDocuments(id, LinkType.Implements);
+
+    /// <summary>
     /// Performs a BFS traversal of forward links up to <paramref name="maxDepth"/> hops.
     /// Returns all reachable documents (excluding the starting document).
     /// </summary>
