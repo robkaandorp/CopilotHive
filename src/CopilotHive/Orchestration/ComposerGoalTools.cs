@@ -72,15 +72,20 @@ public sealed partial class Composer
         await _goalStore.CreateGoalAsync(goal);
         _logger.LogInformation("Composer created draft goal '{GoalId}'", id);
 
-        return $"""
-            ✅ Goal created as Draft:
-            - ID: {id}
-            - Priority: {goalPriority}
-            - Scope: {goalScope}
-            - Repositories: {(repos.Count > 0 ? string.Join(", ", repos) : "(none)")}
-            - Dependencies: {(deps.Count > 0 ? string.Join(", ", deps) : "(none)")}
-            - Status: Draft (not yet dispatched — use approve_goal to queue it)
-            """;
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("✅ Goal created as Draft:");
+        sb.AppendLine($"- ID: {id}");
+        sb.AppendLine($"- Priority: {goalPriority}");
+        sb.AppendLine($"- Scope: {goalScope}");
+        sb.AppendLine($"- Repositories: {(repos.Count > 0 ? string.Join(", ", repos) : "(none)")}");
+        sb.AppendLine($"- Dependencies: {(deps.Count > 0 ? string.Join(", ", deps) : "(none)")}");
+        sb.Append("- Status: Draft (not yet dispatched — use approve_goal to queue it)");
+        if (goal.Documents.Count > 0)
+        {
+            sb.AppendLine();
+            sb.Append($"- Documents: {string.Join(", ", goal.Documents)}");
+        }
+        return sb.ToString();
     }
 
     [Description("Approve a Draft goal, changing its status to Pending for dispatch.")]
@@ -252,7 +257,7 @@ public sealed partial class Composer
                 goal.Status = newStatus;
                 await _goalStore.UpdateGoalAsync(goal);
                 _logger.LogInformation("Composer updated goal '{GoalId}' status to {Status}", id, newStatus);
-                return $"✅ Goal '{id}' status updated to {newStatus.ToDisplayName()}.";
+                return AppendDocuments($"✅ Goal '{id}' status updated to {newStatus.ToDisplayName()}.", goal);
 
             case "repositories":
                 var repos = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
@@ -265,7 +270,7 @@ public sealed partial class Composer
                     goal.ReleaseId = null;
                     await _goalStore.UpdateGoalAsync(goal);
                     _logger.LogInformation("Composer cleared release on goal '{GoalId}'", id);
-                    return $"✅ Goal '{id}' release cleared.";
+                    return AppendDocuments($"✅ Goal '{id}' release cleared.", goal);
                 }
                 var release = await _goalStore.GetReleaseAsync(value);
                 if (release is null)
@@ -273,7 +278,7 @@ public sealed partial class Composer
                 goal.ReleaseId = release.Id;
                 await _goalStore.UpdateGoalAsync(goal);
                 _logger.LogInformation("Composer set release on goal '{GoalId}' to '{ReleaseId}'", id, release.Id);
-                return $"✅ Goal '{id}' release set to '{release.Id}'.";
+                return AppendDocuments($"✅ Goal '{id}' release set to '{release.Id}'.", goal);
 
             default:
                 return $"❌ Unknown field '{field}'. Valid fields: description, priority, status, repositories, release.";
@@ -636,5 +641,15 @@ public sealed partial class Composer
 
         _logger.LogInformation("Composer updated release '{ReleaseId}' field '{Field}'", id, field);
         return $"✅ Release '{id}' {field} updated.";
+    }
+
+    /// <summary>
+    /// Appends the Documents list to a response string if the goal has documents.
+    /// </summary>
+    private static string AppendDocuments(string response, Goal goal)
+    {
+        if (goal.Documents.Count == 0)
+            return response;
+        return response + $"\n- Documents: {string.Join(", ", goal.Documents)}";
     }
 }

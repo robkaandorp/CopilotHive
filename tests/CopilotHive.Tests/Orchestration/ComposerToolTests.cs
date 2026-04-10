@@ -5713,7 +5713,7 @@ public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
             new CopilotHive.Knowledge.DocumentLink("arch-tg-dep", CopilotHive.Knowledge.LinkType.DependsOn));
 
         // Filter to only "depends_on" type links
-        var result = await _composer.TraverseGraphAsync("arch-tg-root2", depth: 1, direction: "outgoing", link_types: "depends_on", cancellationToken: ct);
+        var result = await _composer.TraverseGraphAsync("arch-tg-root2", depth: 1, direction: "outgoing", link_types: ["depends_on"], cancellationToken: ct);
 
         Assert.Contains("arch-tg-dep", result);
         Assert.DoesNotContain("arch-tg-related", result);
@@ -5903,6 +5903,100 @@ public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
         // Verify reverse index is cleaned up
         var dependedOnByAfter = _knowledgeGraph.GetDependedOnBy("arch-ul-tgt2");
         Assert.Empty(dependedOnByAfter);
+    }
+
+    // ── UpdateGoal: response includes Documents when goal has documents ──
+
+    [Fact]
+    public async Task UpdateGoal_WithDocuments_StatusUpdate_ShowsDocuments()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("goal-docs-update", "A goal with documents attached");
+        var goal = await _store.GetGoalAsync("goal-docs-update", ct);
+        Assert.NotNull(goal);
+        goal!.Documents = ["arch-brain", "features-design"];
+        await _store.UpdateGoalAsync(goal, ct);
+
+        // Update status Draft→Pending triggers AppendDocuments
+        var result = await _composer.UpdateGoalAsync("goal-docs-update", "status", "Pending");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("arch-brain", result);
+        Assert.Contains("features-design", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_NoDocuments_ResponseOmitsDocumentsField()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("goal-no-docs-update", "A goal without documents");
+
+        var result = await _composer.UpdateGoalAsync("goal-no-docs-update", "status", "Pending");
+
+        Assert.Contains("✅", result);
+        Assert.DoesNotContain("Documents", result);
+    }
+
+    // ── delete_document: warns about related and references inverse links ──
+
+    [Fact]
+    public async Task DeleteDocument_WarnsAboutRelatedLinks()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateDocumentAsync("arch", "ref-src", "Ref Source", "implementation", "Source content", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("arch", "ref-tgt", "Ref Target", "feature", "Target content", cancellationToken: ct);
+
+        // ref-src has a Related link pointing to ref-tgt
+        _knowledgeGraph.AddLink("arch-ref-src",
+            new CopilotHive.Knowledge.DocumentLink("arch-ref-tgt", CopilotHive.Knowledge.LinkType.Related));
+
+        var result = await _composer.DeleteDocumentAsync("arch-ref-tgt", cancellationToken: ct);
+
+        Assert.Contains("✅", result);
+        Assert.Contains("⚠️", result);
+        Assert.Contains("arch-ref-src", result); // the source should be warned
+    }
+
+    [Fact]
+    public async Task DeleteDocument_WarnsAboutReferencesLinks()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateDocumentAsync("arch", "refs-src", "Refs Source", "implementation", "Source content", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("arch", "refs-tgt", "Refs Target", "feature", "Target content", cancellationToken: ct);
+
+        // refs-src has a References link pointing to refs-tgt
+        _knowledgeGraph.AddLink("arch-refs-src",
+            new CopilotHive.Knowledge.DocumentLink("arch-refs-tgt", CopilotHive.Knowledge.LinkType.References));
+
+        var result = await _composer.DeleteDocumentAsync("arch-refs-tgt", cancellationToken: ct);
+
+        Assert.Contains("✅", result);
+        Assert.Contains("⚠️", result);
+        Assert.Contains("arch-refs-src", result);
+    }
+
+    // ── traverse_graph: incoming direction finds related and references links ──
+
+    [Fact]
+    public async Task TraverseGraph_IncomingDirection_FindsRelatedAndReferencesLinks()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateDocumentAsync("arch", "tg-inc-center", "Center", "implementation", "Center content", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("arch", "tg-inc-rel", "Related Source", "feature", "Related content", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("arch", "tg-inc-ref", "References Source", "idea", "References content", cancellationToken: ct);
+
+        // Both tg-inc-rel and tg-inc-ref point to tg-inc-center via different link types
+        _knowledgeGraph.AddLink("arch-tg-inc-rel",
+            new CopilotHive.Knowledge.DocumentLink("arch-tg-inc-center", CopilotHive.Knowledge.LinkType.Related));
+        _knowledgeGraph.AddLink("arch-tg-inc-ref",
+            new CopilotHive.Knowledge.DocumentLink("arch-tg-inc-center", CopilotHive.Knowledge.LinkType.References));
+
+        var result = await _composer.TraverseGraphAsync("arch-tg-inc-center", depth: 1, direction: "incoming", cancellationToken: ct);
+
+        Assert.Contains("arch-tg-inc-rel", result);
+        Assert.Contains("arch-tg-inc-ref", result);
     }
 
     // ── traverse_graph: multi-level BFS traversal ──

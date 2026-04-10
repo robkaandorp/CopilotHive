@@ -258,6 +258,8 @@ public sealed partial class Composer
         var children = _knowledgeGraph.GetChildren(document_id);
         var implementedBy = _knowledgeGraph.GetImplementedBy(document_id);
         var supersededBy = _knowledgeGraph.GetSupersededBy(document_id);
+        var relatedBy = _knowledgeGraph.GetRelatedBy(document_id);
+        var referencedBy = _knowledgeGraph.GetReferencedBy(document_id);
 
         var warnings = new List<string>();
         if (dependedOnBy.Count > 0)
@@ -268,6 +270,10 @@ public sealed partial class Composer
             warnings.Add($"  - Implements links from: {string.Join(", ", implementedBy.Select(d => d.Id))}");
         if (supersededBy.Count > 0)
             warnings.Add($"  - Supersedes links from: {string.Join(", ", supersededBy.Select(d => d.Id))}");
+        if (relatedBy.Count > 0)
+            warnings.Add($"  - Related links from: {string.Join(", ", relatedBy.Select(d => d.Id))}");
+        if (referencedBy.Count > 0)
+            warnings.Add($"  - References links from: {string.Join(", ", referencedBy.Select(d => d.Id))}");
 
         try
         {
@@ -517,7 +523,7 @@ public sealed partial class Composer
         [Description("Starting document ID")] string document_id,
         [Description("Traversal depth (default 1, max 3)")] int depth = 1,
         [Description("Direction: 'outgoing' (default), 'incoming', or 'both'")] string direction = "outgoing",
-        [Description("Filter to specific link types (optional, comma-separated): parent, supersedes, depends_on, implements, related, references")] string? link_types = null,
+        [Description("Filter to specific link types (optional array): parent, supersedes, depends_on, implements, related, references")] string[]? link_types = null,
         CancellationToken cancellationToken = default)
     {
         if (_knowledgeGraph is null)
@@ -537,12 +543,12 @@ public sealed partial class Composer
         if (!validDirections.Contains(direction, StringComparer.OrdinalIgnoreCase))
             return Task.FromResult($"❌ Invalid direction '{direction}'. Valid values: outgoing, incoming, both.");
 
-        // Parse optional link type filter
+        // Parse optional link type filter from string array
         HashSet<LinkType>? linkTypeFilter = null;
-        if (!string.IsNullOrWhiteSpace(link_types))
+        if (link_types is { Length: > 0 })
         {
             linkTypeFilter = new HashSet<LinkType>();
-            foreach (var ltStr in link_types.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            foreach (var ltStr in link_types)
             {
                 var normalized = ltStr.Replace("_", "");
                 if (Enum.TryParse<LinkType>(normalized, ignoreCase: true, out var lt))
@@ -588,16 +594,18 @@ public sealed partial class Composer
                 }
             }
 
-            // Incoming links (from reverse index via GetRelated traversal approach)
+            // Incoming links (from reverse index via dedicated inverse-type methods)
             if (direction.Equals("incoming", StringComparison.OrdinalIgnoreCase) ||
                 direction.Equals("both", StringComparison.OrdinalIgnoreCase))
             {
-                // Combine all incoming docs from all inverse types
+                // Combine all incoming docs from all inverse types (including Related and References)
                 var incoming = new List<KnowledgeDocument>();
                 incoming.AddRange(_knowledgeGraph.GetChildren(currentId));
                 incoming.AddRange(_knowledgeGraph.GetSupersededBy(currentId));
                 incoming.AddRange(_knowledgeGraph.GetDependedOnBy(currentId));
                 incoming.AddRange(_knowledgeGraph.GetImplementedBy(currentId));
+                incoming.AddRange(_knowledgeGraph.GetRelatedBy(currentId));
+                incoming.AddRange(_knowledgeGraph.GetReferencedBy(currentId));
 
                 foreach (var incomingDoc in incoming.DistinctBy(d => d.Id))
                 {
