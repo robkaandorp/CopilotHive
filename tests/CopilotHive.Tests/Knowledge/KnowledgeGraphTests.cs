@@ -89,7 +89,7 @@ public sealed class KnowledgeGraphTests : IDisposable
         Assert.Equal(DocumentStatus.Draft, doc.Status);
         Assert.Equal("Some content", doc.Content);
         Assert.Equal("features", doc.Topic);
-        Assert.Equal("test", doc.Subtopic);
+        Assert.Null(doc.Subtopic); // no subtopic passed — defaults to null
 
         var fetched = _graph.GetDocument("features-test");
         Assert.NotNull(fetched);
@@ -706,5 +706,98 @@ public sealed class KnowledgeGraphTests : IDisposable
         Assert.Single(feature.Links);
         Assert.Equal("architecture-core", feature.Links[0].TargetId);
         Assert.Equal(LinkType.DependsOn, feature.Links[0].Type);
+    }
+
+    // ── Nested document path ─────────────────────────────────────────────────
+
+    [Fact]
+    public async Task CreateDocumentAsync_NestedPath_FileWrittenAtCorrectPath()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        // Create a deeply nested document with explicit topic and subtopic
+        var doc = await graph.CreateDocumentAsync(
+            "architecture-distributed-systems-brain-session-per-goal",
+            "Brain Session Per Goal",
+            DocumentType.Implementation,
+            "Session content.",
+            topic: "architecture",
+            subtopic: "distributed-systems",
+            ct: ct);
+
+        // FilePath should reflect the nested path with leaf-only filename
+        Assert.Equal(
+            "knowledge/architecture/distributed-systems/brain-session-per-goal.md",
+            doc.FilePath);
+
+        Assert.Equal("architecture", doc.Topic);
+        Assert.Equal("distributed-systems", doc.Subtopic);
+
+        // Write to disk and verify the file exists at the correct path
+        await graph.CommitToConfigRepoAsync(_tempDir, "nested-test", ct);
+
+        var expectedPath = Path.Combine(
+            _tempDir,
+            "knowledge", "architecture", "distributed-systems",
+            "brain-session-per-goal.md");
+        Assert.True(File.Exists(expectedPath), $"Expected nested file at {expectedPath}");
+    }
+
+    [Fact]
+    public async Task ReloadFromConfigRepoAsync_NestedDocument_TopicAndSubtopicFromPath()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        // Create and commit a nested document
+        await graph.CreateDocumentAsync(
+            "architecture-distributed-systems-brain-session-per-goal",
+            "Brain Session Per Goal",
+            DocumentType.Implementation,
+            "Session content.",
+            topic: "architecture",
+            subtopic: "distributed-systems",
+            ct: ct);
+        await graph.CommitToConfigRepoAsync(_tempDir, "nested-test", ct);
+
+        // Reload into a fresh graph
+        var graph2 = new KnowledgeGraph();
+        await graph2.ReloadFromConfigRepoAsync(_tempDir, ct);
+
+        var doc = graph2.GetDocument("architecture-distributed-systems-brain-session-per-goal");
+        Assert.NotNull(doc);
+        Assert.Equal("architecture", doc.Topic);
+        Assert.Equal("distributed-systems", doc.Subtopic);
+    }
+
+    // ── Delete persists across reload ─────────────────────────────────────────
+
+    [Fact]
+    public async Task DeleteDocumentAsync_CommitAndReload_DocumentIsGone()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        // Create and commit a document
+        var doc = await graph.CreateDocumentAsync(
+            "features-to-delete", "To Delete", DocumentType.Feature, "content", ct: ct);
+        await graph.CommitToConfigRepoAsync(_tempDir, "create", ct);
+
+        var writtenPath = Path.Combine(_tempDir, doc.FilePath);
+        Assert.True(File.Exists(writtenPath), "File should exist after commit.");
+
+        // Delete the document and commit
+        await graph.DeleteDocumentAsync("features-to-delete", ct);
+        await graph.CommitToConfigRepoAsync(_tempDir, "delete", ct);
+
+        // File should no longer exist on disk
+        Assert.False(File.Exists(writtenPath), "File should have been deleted from disk.");
+
+        // Reload into a fresh graph — document should not reappear
+        var graph2 = new KnowledgeGraph();
+        await graph2.ReloadFromConfigRepoAsync(_tempDir, ct);
+
+        Assert.Null(graph2.GetDocument("features-to-delete"));
     }
 }

@@ -20,6 +20,9 @@ public sealed class KnowledgeGraph
     // IDs of documents modified since the last load (need to be written back)
     private HashSet<string> _dirtyDocuments = [];
 
+    // File paths (relative to config repo root) for documents deleted since the last load
+    private HashSet<string> _deletedDocumentPaths = [];
+
     /// <summary>
     /// Initialises a new <see cref="KnowledgeGraph"/>.
     /// </summary>
@@ -37,11 +40,22 @@ public sealed class KnowledgeGraph
     /// Creates a new knowledge document and adds it to the in-memory graph.
     /// The document is marked dirty and will be written on the next <see cref="CommitToConfigRepoAsync"/>.
     /// </summary>
+    /// <param name="id">Unique document identifier (e.g. "architecture-distributed-systems-brain-session-per-goal").</param>
+    /// <param name="title">Human-readable title.</param>
+    /// <param name="type">Document type.</param>
+    /// <param name="content">Markdown body content.</param>
+    /// <param name="topic">Explicit topic (first directory level, e.g. "architecture"). Required.</param>
+    /// <param name="subtopic">Optional second directory level (e.g. "distributed-systems").</param>
+    /// <param name="author">Author of the document.</param>
+    /// <param name="tags">Optional tags.</param>
+    /// <param name="ct">Cancellation token.</param>
     public Task<KnowledgeDocument> CreateDocumentAsync(
         string id,
         string title,
         DocumentType type,
         string content,
+        string? topic = null,
+        string? subtopic = null,
         string? author = null,
         IEnumerable<string>? tags = null,
         CancellationToken ct = default)
@@ -53,14 +67,16 @@ public sealed class KnowledgeGraph
             throw new InvalidOperationException($"A document with id '{id}' already exists.");
 
         var now = DateTime.UtcNow;
-        var (topic, subtopic) = DeriveTopicFromId(id);
-        var filePath = DeriveFilePathFromId(id);
+
+        // Derive topic from the id when not explicitly provided (first segment before '-')
+        var resolvedTopic = !string.IsNullOrWhiteSpace(topic) ? topic : id.Split('-')[0];
+        var filePath = BuildFilePath(id, resolvedTopic, subtopic);
 
         var doc = new KnowledgeDocument
         {
             Id = id,
             Title = title,
-            Topic = topic,
+            Topic = resolvedTopic,
             Subtopic = subtopic,
             Type = type,
             Status = DocumentStatus.Draft,
@@ -115,6 +131,7 @@ public sealed class KnowledgeGraph
     /// <summary>
     /// Removes a document from the graph. Also removes it from the reverse index and
     /// strips all incoming links that point to it.
+    /// The file on disk will be deleted on the next <see cref="CommitToConfigRepoAsync"/>.
     /// </summary>
     public Task DeleteDocumentAsync(string id, CancellationToken ct = default)
     {
@@ -135,6 +152,9 @@ public sealed class KnowledgeGraph
             if (_reverseIndex[targetId].Count == 0)
                 _reverseIndex.Remove(targetId);
         }
+
+        // Track file for deletion on next commit
+        _deletedDocumentPaths.Add(doc.FilePath);
 
         _documents.Remove(id);
         _dirtyDocuments.Remove(id);
@@ -284,6 +304,7 @@ public sealed class KnowledgeGraph
             _documents = [];
             _reverseIndex = [];
             _dirtyDocuments = [];
+            _deletedDocumentPaths = [];
             return Task.CompletedTask;
         }
 
@@ -309,6 +330,7 @@ public sealed class KnowledgeGraph
         _documents = newDocuments;
         _reverseIndex = [];
         _dirtyDocuments = [];
+        _deletedDocumentPaths = [];
 
         // Rebuild reverse index from all loaded documents
         foreach (var doc in _documents.Values)
@@ -323,11 +345,14 @@ public sealed class KnowledgeGraph
 
     /// <summary>
     /// Writes all dirty documents to disk and commits each via <see cref="ConfigRepoManager.CommitFileAsync"/>.
+    /// Also deletes files for any documents that were removed since the last load.
     /// </summary>
     public async Task CommitToConfigRepoAsync(string configRepoPath, string message, CancellationToken ct = default)
     {
         var dirty = _dirtyDocuments.ToList();
-        if (dirty.Count == 0) return;
+        var toDelete = _deletedDocumentPaths.ToList();
+
+        if (dirty.Count == 0 && toDelete.Count == 0) return;
 
         foreach (var docId in dirty)
         {
@@ -348,7 +373,21 @@ public sealed class KnowledgeGraph
             }
         }
 
+        foreach (var filePath in toDelete)
+        {
+            var fullPath = Path.Combine(configRepoPath, filePath);
+            if (File.Exists(fullPath))
+                File.Delete(fullPath);
+
+            if (_configRepo is not null)
+            {
+                await _configRepo.CommitFileAsync(filePath, message, ct);
+                _logger?.LogInformation("Deleted knowledge document file {FilePath} from config repo", filePath);
+            }
+        }
+
         _dirtyDocuments.Clear();
+        _deletedDocumentPaths.Clear();
     }
 
     // ── ID / Path Helpers ──────────────────────────────────────────────────────
@@ -378,23 +417,33 @@ public sealed class KnowledgeGraph
 
     // ── Private Helpers ────────────────────────────────────────────────────────
 
-    private static (string Topic, string? Subtopic) DeriveTopicFromId(string id)
+    /// <summary>
+    /// Builds the relative file path for a document given its id, topic, and optional subtopic.
+    /// The file name is the id with the topic (and subtopic) directory prefix stripped,
+    /// so that <see cref="DeriveDocumentIdFromPath"/> round-trips correctly.
+    /// Examples:
+    ///   id="architecture-core", topic="architecture" → "knowledge/architecture/core.md"
+    ///   id="architecture-distributed-systems-brain-session-per-goal", topic="architecture", subtopic="distributed-systems"
+    ///       → "knowledge/architecture/distributed-systems/brain-session-per-goal.md"
+    /// </summary>
+    private static string BuildFilePath(string id, string topic, string? subtopic)
     {
-        var parts = id.Split('-');
-        return parts.Length >= 2 ? (parts[0], parts[1]) : (parts[0], null);
-    }
+        // Strip the topic prefix from the id to get the leaf slug
+        var topicPrefix = topic + "-";
+        var leaf = id.StartsWith(topicPrefix, StringComparison.OrdinalIgnoreCase)
+            ? id[topicPrefix.Length..] : id;
 
-    private static string DeriveFilePathFromId(string id)
-    {
-        // Convert dashes back to directory structure (best effort for new documents)
-        // For new docs, we use a flat structure under the first segment (topic)
-        var parts = id.Split('-');
-        if (parts.Length == 1)
-            return $"knowledge/{id}.md";
+        if (!string.IsNullOrWhiteSpace(subtopic))
+        {
+            // Strip subtopic prefix from the leaf
+            var subtopicPrefix = subtopic + "-";
+            if (leaf.StartsWith(subtopicPrefix, StringComparison.OrdinalIgnoreCase))
+                leaf = leaf[subtopicPrefix.Length..];
 
-        var topic = parts[0];
-        var slug = string.Join('-', parts[1..]);
-        return $"knowledge/{topic}/{slug}.md";
+            return $"knowledge/{topic}/{subtopic}/{leaf}.md";
+        }
+
+        return $"knowledge/{topic}/{leaf}.md";
     }
 
     private static (string Topic, string? Subtopic) DeriveTopicSubtopicFromPath(string relativePath)
