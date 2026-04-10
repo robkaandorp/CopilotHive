@@ -1403,4 +1403,56 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
 
         Assert.Empty(results);
     }
+
+    // ── Goal.Documents persistence ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task CreateGoal_WithDocuments_PersistsAndReturnsDocuments()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = MakeGoal("goal-with-docs");
+        goal.Documents = ["doc1", "doc2"];
+
+        await _store.CreateGoalAsync(goal, ct);
+
+        var fetched = await _store.GetGoalAsync("goal-with-docs", ct);
+        Assert.NotNull(fetched);
+        Assert.Equal(2, fetched.Documents.Count);
+        Assert.Contains("doc1", fetched.Documents);
+        Assert.Contains("doc2", fetched.Documents);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Documents_AddAndRemoveDocIds()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = MakeGoal("goal-docs-update");
+        goal.Documents = ["docA", "docB"];
+        await _store.CreateGoalAsync(goal, ct);
+
+        // Add one, remove one
+        goal.Documents = ["docB", "docC"];
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var fetched = await _store.GetGoalAsync("goal-docs-update", ct);
+        Assert.NotNull(fetched);
+        Assert.Equal(2, fetched.Documents.Count);
+        Assert.DoesNotContain("docA", fetched.Documents);
+        Assert.Contains("docB", fetched.Documents);
+        Assert.Contains("docC", fetched.Documents);
+    }
+
+    [Fact]
+    public async Task CreateGoal_NoDocuments_ReturnsEmptyList()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = MakeGoal("goal-no-docs");
+        // Documents defaults to empty list
+
+        await _store.CreateGoalAsync(goal, ct);
+
+        var fetched = await _store.GetGoalAsync("goal-no-docs", ct);
+        Assert.NotNull(fetched);
+        Assert.Empty(fetched.Documents);
+    }
 }

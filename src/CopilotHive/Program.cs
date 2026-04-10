@@ -7,6 +7,7 @@ using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Improvement;
 using CopilotHive.Metrics;
+using CopilotHive.Knowledge;
 using CopilotHive.Models;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
@@ -184,6 +185,18 @@ static async Task<int> RunServerAsync(string[] args)
 
         builder.Services.AddSingleton(configRepo);
         builder.Services.AddSingleton(hiveConfigFile);
+
+        // Knowledge graph: load from config repo on startup
+        var knowledgeGraph = new KnowledgeGraph(configRepo, null /* logger resolved later */);
+        try
+        {
+            await knowledgeGraph.ReloadFromConfigRepoAsync(configRepo.LocalPath);
+        }
+        catch (Exception)
+        {
+            // Best-effort: graph starts empty if knowledge/ directory doesn't exist yet
+        }
+        builder.Services.AddSingleton(knowledgeGraph);
 
         // If no explicit goals file, check config repo for goals.yaml
         if (string.IsNullOrEmpty(goalsFile))

@@ -46,6 +46,12 @@ public sealed class Goal
 
     /// <summary>Optional release identifier that groups this goal into a release, or <c>null</c> if unassigned.</summary>
     public string? ReleaseId { get; set; }
+
+    /// <summary>
+    /// IDs of knowledge documents related to this goal.
+    /// Set by the Composer when decomposing user intent into goals.
+    /// </summary>
+    public List<string> Documents { get; set; } = [];
 }
 
 /// <summary>Structured summary of a single completed (or failed) pipeline iteration.</summary>
