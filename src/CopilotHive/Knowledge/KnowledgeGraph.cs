@@ -381,7 +381,7 @@ public sealed class KnowledgeGraph
 
             if (_configRepo is not null)
             {
-                await _configRepo.CommitFileAsync(filePath, message, ct);
+                await _configRepo.DeleteFileAsync(filePath, message, ct);
                 _logger?.LogInformation("Deleted knowledge document file {FilePath} from config repo", filePath);
             }
         }

@@ -9,7 +9,7 @@ namespace CopilotHive.Configuration;
 /// Manages the configuration repository: clones/pulls the repo, reads hive-config.yaml
 /// and per-role AGENTS.md files, and commits AGENTS.md updates back.
 /// </summary>
-public sealed class ConfigRepoManager
+public class ConfigRepoManager
 {
     private readonly string _configRepoUrl;
     private readonly string _localPath;
@@ -163,12 +163,42 @@ public sealed class ConfigRepoManager
     /// Commits and pushes a single file that has already been written to disk.
     /// Used to persist goals.yaml status updates back to the config repo.
     /// </summary>
-    public async Task CommitFileAsync(string filePath, string commitMessage, CancellationToken ct = default)
+    public virtual async Task CommitFileAsync(string filePath, string commitMessage, CancellationToken ct = default)
     {
         await _gitLock.WaitAsync(ct);
         try
         {
             await RunGitAsync(_localPath, ["add", filePath], ct);
+            await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
+            try
+            {
+                await RunGitAsync(_localPath, ["pull"], ct);
+            }
+            catch
+            {
+                await TryAbortMergeAsync(_localPath, ct);
+                throw;
+            }
+            await RunGitAsync(_localPath, ["push"], ct);
+        }
+        finally
+        {
+            _gitLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Stages a file deletion and commits/pushes the removal.
+    /// The file should already be deleted from the working tree before calling this method.
+    /// Uses <c>git rm --cached</c> to stage the removal from the index without touching
+    /// the local file (which the caller has already removed).
+    /// </summary>
+    public virtual async Task DeleteFileAsync(string filePath, string commitMessage, CancellationToken ct = default)
+    {
+        await _gitLock.WaitAsync(ct);
+        try
+        {
+            await RunGitAsync(_localPath, ["rm", "--cached", filePath], ct);
             await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
             try
             {

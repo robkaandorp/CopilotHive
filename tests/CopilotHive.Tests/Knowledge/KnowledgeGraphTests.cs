@@ -1,3 +1,4 @@
+using CopilotHive.Configuration;
 using CopilotHive.Knowledge;
 
 namespace CopilotHive.Tests.Knowledge;
@@ -799,5 +800,89 @@ public sealed class KnowledgeGraphTests : IDisposable
         await graph2.ReloadFromConfigRepoAsync(_tempDir, ct);
 
         Assert.Null(graph2.GetDocument("features-to-delete"));
+    }
+}
+
+/// <summary>
+/// A spy <see cref="ConfigRepoManager"/> that records calls to <see cref="CommitFileAsync"/>
+/// and <see cref="DeleteFileAsync"/> without executing real git operations.
+/// </summary>
+internal sealed class SpyConfigRepoManager : ConfigRepoManager
+{
+    private static readonly string DummyPath = Path.Combine(Path.GetTempPath(), $"SpyCRM_{Guid.NewGuid():N}");
+
+    public readonly List<string> CommittedPaths = [];
+    public readonly List<string> DeletedPaths = [];
+
+    public SpyConfigRepoManager() : base("https://example.com/spy.git", DummyPath) { }
+
+    public override Task CommitFileAsync(string filePath, string commitMessage, CancellationToken ct = default)
+    {
+        CommittedPaths.Add(filePath);
+        return Task.CompletedTask;
+    }
+
+    public override Task DeleteFileAsync(string filePath, string commitMessage, CancellationToken ct = default)
+    {
+        DeletedPaths.Add(filePath);
+        return Task.CompletedTask;
+    }
+}
+
+public sealed class KnowledgeGraphDeletePersistenceTests : IDisposable
+{
+    private readonly string _tempDir;
+
+    public KnowledgeGraphDeletePersistenceTests()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), $"KGDeleteTest_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_tempDir);
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            if (Directory.Exists(_tempDir))
+                Directory.Delete(_tempDir, recursive: true);
+        }
+        catch
+        {
+            // best-effort cleanup
+        }
+    }
+
+    [Fact]
+    public async Task CommitToConfigRepoAsync_AfterDelete_CallsDeleteFileAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var spy = new SpyConfigRepoManager();
+        var graph = new KnowledgeGraph(spy);
+
+        // Create and "commit" a document (spy records the commit but no real git ops)
+        var doc = await graph.CreateDocumentAsync(
+            "features-spy-delete", "Spy Delete", DocumentType.Feature, "body", ct: ct);
+        await graph.CommitToConfigRepoAsync(_tempDir, "create", ct);
+
+        // The commit should have called CommitFileAsync for the new doc
+        Assert.Contains(doc.FilePath, spy.CommittedPaths);
+        Assert.Empty(spy.DeletedPaths);
+
+        // Delete the document and commit
+        await graph.DeleteDocumentAsync("features-spy-delete", ct);
+        await graph.CommitToConfigRepoAsync(_tempDir, "delete", ct);
+
+        // DeleteFileAsync must have been called with the correct path
+        Assert.Single(spy.DeletedPaths);
+        Assert.Equal(doc.FilePath, spy.DeletedPaths[0]);
+
+        // File should be deleted from disk
+        var fullPath = Path.Combine(_tempDir, doc.FilePath);
+        Assert.False(File.Exists(fullPath), "Local file should be gone after commit.");
+
+        // Reload into fresh graph — document must not reappear
+        var graph2 = new KnowledgeGraph(spy);
+        await graph2.ReloadFromConfigRepoAsync(_tempDir, ct);
+        Assert.Null(graph2.GetDocument("features-spy-delete"));
     }
 }
