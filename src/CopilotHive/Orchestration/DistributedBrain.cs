@@ -3,6 +3,7 @@ using System.Text.Json;
 using CopilotHive.Agents;
 using CopilotHive.Git;
 using CopilotHive.Goals;
+using CopilotHive.Knowledge;
 using CopilotHive.Metrics;
 using CopilotHive.Services;
 using CopilotHive.Workers;
@@ -31,6 +32,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly IGoalStore? _goalStore;
     private readonly string _stateDir;
     private readonly string? _compactionModel;
+    private readonly KnowledgeGraph? _knowledgeGraph;
 
     /// <summary>
     /// Directory used for persistent Brain state (session files).
@@ -67,7 +69,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         string? stateDir = null,
         IGoalStore? goalStore = null,
         IChatClient? chatClient = null,
-        string? compactionModel = null)
+        string? compactionModel = null,
+        KnowledgeGraph? knowledgeGraph = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -80,6 +83,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _chatClient = chatClient;
         _stateDir = stateDir ?? "/app/state";
         _compactionModel = compactionModel;
+        _knowledgeGraph = knowledgeGraph;
         _masterSession = AgentSession.Create("brain");
         _session = _masterSession;
 
@@ -196,16 +200,64 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                         ? $"Current iteration: {pipeline.Iteration}, Phase: {pipeline.Phase}"
                         : "Pipeline not active.";
 
+                    var relatedDocs = goal.Documents.Count > 0
+                        ? $"\nRelated docs: {string.Join(", ", goal.Documents.Select(docId =>
+                        {
+                            var title = _knowledgeGraph?.GetDocument(docId)?.Title;
+                            return title is not null ? $"{docId} ({title})" : docId;
+                        }))}"
+                        : "";
+
                     return $"""
                         Goal ID: {goal.Id}
                         Description: {goal.Description}
                         Status: {goal.Status}
                         Repositories: {string.Join(", ", goal.RepositoryNames)}
-                        {iterationInfo}
+                        {iterationInfo}{relatedDocs}
                         """;
                 },
                 "get_goal",
                 "Retrieve goal details (description, status, repositories, iteration info) by goal ID."),
+            AIFunctionFactory.Create(
+                ([Description("Search terms to look up in the knowledge graph.")] string query,
+                 [Description("Optional topic filter (e.g. \"architecture\", \"features\").")] string? topic = null,
+                 [Description("Optional document type filter (e.g. \"implementation\", \"feature\").")] string? type = null,
+                 [Description("Maximum number of results to return (default 5).")] int? limit = null) =>
+                {
+                    if (_knowledgeGraph is null)
+                        return "Knowledge graph not available.";
+
+                    var results = _knowledgeGraph.Search(query);
+
+                    if (topic is not null)
+                        results = results.Where(d => string.Equals(d.Topic, topic, StringComparison.OrdinalIgnoreCase)).ToList();
+
+                    if (type is not null && Enum.TryParse<DocumentType>(type, ignoreCase: true, out var docType))
+                        results = results.Where(d => d.Type == docType).ToList();
+
+                    var maxResults = limit ?? 5;
+                    results = results.Take(maxResults).ToList();
+
+                    if (results.Count == 0)
+                        return "No documents match your query.";
+
+                    var sb = new System.Text.StringBuilder();
+                    sb.AppendLine($"Found {results.Count} document{(results.Count == 1 ? "" : "s")}:");
+                    for (var i = 0; i < results.Count; i++)
+                    {
+                        var doc = results[i];
+                        sb.AppendLine();
+                        sb.AppendLine($"{i + 1}. [{doc.Id}] {doc.Title} ({doc.Type.ToString().ToLowerInvariant()}, {doc.Status.ToString().ToLowerInvariant()})");
+                        const int snippetLength = 300;
+                        var snippet = doc.Content.Length > snippetLength
+                            ? doc.Content[..snippetLength] + "..."
+                            : doc.Content;
+                        sb.Append($"   {snippet}");
+                    }
+                    return sb.ToString();
+                },
+                "search_knowledge",
+                "Search the knowledge graph for architecture and design documents by query. Supports optional topic, type, and limit filters."),
             AIFunctionFactory.Create(
                 ([Description("Ordered phase names, e.g. [\"coding\",\"testing\",\"docwriting\",\"review\",\"merging\"]")] string[] phases,
                  [Description("JSON object with per-phase instructions.\n  Single-round: {\"coding\": \"...\", \"review\": \"...\"}\n  Multi-round:  {\"coding-1\": \"step 1: revert...\", \"coding-2\": \"step 2: restructure...\", \"review\": \"...\"}")] string phase_instructions,

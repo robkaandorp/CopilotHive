@@ -105,7 +105,8 @@ static async Task<int> RunServerAsync(string[] args)
                 sp.GetService<IBrainRepoManager>(),
                 stateDir,
                 sp.GetRequiredService<IGoalStore>(),
-                compactionModel: config?.Models?.CompactionModel);
+                compactionModel: config?.Models?.CompactionModel,
+                knowledgeGraph: sp.GetService<KnowledgeGraph>());
         });
     }
 
