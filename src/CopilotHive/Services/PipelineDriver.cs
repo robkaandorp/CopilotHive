@@ -219,7 +219,7 @@ internal sealed class PipelineDriver
             logEntry.WorkerOutput = workerOutput.Length > 4000
                 ? workerOutput[..4000] + $"... ({workerOutput.Length} chars total)"
                 : workerOutput;
-            logEntry.Result = phaseInput == PhaseInput.Failed ? PhaseOutcome.Fail : PhaseOutcome.Pass;
+            logEntry.Result = phaseInput == PhaseInput.Succeeded ? PhaseOutcome.Pass : PhaseOutcome.Fail;
         }
 
         // State machine transition
