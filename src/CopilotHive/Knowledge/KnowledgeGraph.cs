@@ -248,8 +248,8 @@ public sealed class KnowledgeGraph
 
     /// <summary>
     /// Returns incoming links to the specified document — i.e., all links from other documents
-    /// that target this document. Each entry includes the source document ID, link type, and
-    /// the description stored on the outgoing link.
+    /// that target this document. Each entry includes the source document ID, the <em>inverse</em>
+    /// link type (from the perspective of this document), and the description stored on the outgoing link.
     /// Returns an empty list if no documents link to this one.
     /// </summary>
     public List<IncomingLink> GetIncomingLinks(string id)
@@ -264,7 +264,7 @@ public sealed class KnowledgeGraph
                 continue;
 
             var outgoing = sourceDoc.Links.FirstOrDefault(l => l.TargetId == id && l.Type == type);
-            result.Add(new IncomingLink(sourceId, type, outgoing?.Description));
+            result.Add(new IncomingLink(sourceId, type.Inverse(), outgoing?.Description));
         }
         return result;
     }

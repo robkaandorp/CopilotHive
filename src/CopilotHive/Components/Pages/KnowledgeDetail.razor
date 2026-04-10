@@ -213,6 +213,7 @@ else
         }
 
         PageHeader.SetTitle($"📚 {_doc.Title}");
+        PageHeader.SetBack("/knowledge");
 
         _outgoingLinks = _knowledgeGraph.GetOutgoingLinks(DocumentId);
         _incomingLinks = _knowledgeGraph.GetIncomingLinks(DocumentId);

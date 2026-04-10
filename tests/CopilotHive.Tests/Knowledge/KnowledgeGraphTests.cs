@@ -999,7 +999,7 @@ public sealed class KnowledgeGraphTests : IDisposable
         var incoming = _graph.GetIncomingLinks("doc-a");
         Assert.Single(incoming);
         Assert.Equal("doc-b", incoming[0].SourceId);
-        Assert.Equal(LinkType.Parent, incoming[0].Type);
+        Assert.Equal(LinkType.Child, incoming[0].Type);
         Assert.Equal("B is a child of A", incoming[0].Description);
     }
 
@@ -1016,7 +1016,7 @@ public sealed class KnowledgeGraphTests : IDisposable
 
         var incoming = _graph.GetIncomingLinks("target");
         Assert.Equal(2, incoming.Count);
-        Assert.Contains(incoming, l => l.SourceId == "source1" && l.Type == LinkType.DependsOn && l.Description == "depends on target");
+        Assert.Contains(incoming, l => l.SourceId == "source1" && l.Type == LinkType.DependedOnBy && l.Description == "depends on target");
         Assert.Contains(incoming, l => l.SourceId == "source2" && l.Type == LinkType.Related && l.Description == null);
     }
 
