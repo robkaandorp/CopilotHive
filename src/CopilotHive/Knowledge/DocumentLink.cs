@@ -8,6 +8,14 @@ namespace CopilotHive.Knowledge;
 /// <param name="Description">Optional description of the relationship.</param>
 public sealed record DocumentLink(string TargetId, LinkType Type, string? Description = null);
 
+/// <summary>
+/// Represents an incoming link to a knowledge document — a link originating from another document.
+/// </summary>
+/// <param name="SourceId">The ID of the document that has this outgoing link.</param>
+/// <param name="Type">The relationship type as declared on the outgoing link.</param>
+/// <param name="Description">Optional description from the outgoing link.</param>
+public sealed record IncomingLink(string SourceId, LinkType Type, string? Description = null);
+
 /// <summary>The category of knowledge this document represents.</summary>
 public enum DocumentType
 {

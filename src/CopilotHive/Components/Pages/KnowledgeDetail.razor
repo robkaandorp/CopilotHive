@@ -1,0 +1,270 @@
+@page "/knowledge/{DocumentId}"
+@using CopilotHive.Dashboard
+@using CopilotHive.Goals
+@using CopilotHive.Knowledge
+@using Markdig
+@inject DashboardStateService State
+@inject IGoalStore GoalStore
+@inject PageHeaderState PageHeader
+
+@if (_notFound)
+{
+    <div style="margin-top:2rem;text-align:center">
+        <p style="color:var(--text-muted);font-size:1.1rem">Document <code>@DocumentId</code> was not found.</p>
+        <a href="/knowledge" class="goal-link">← Back to Knowledge</a>
+    </div>
+}
+else if (_doc is not null)
+{
+    <div class="goal-detail-page">
+        <!-- Header strip -->
+        <div class="goal-detail-top">
+            <div class="goal-detail-meta-row">
+                <span class="badge @TypeBadge(_doc.Type)">@_doc.Type</span>
+                <span class="badge @StatusBadge(_doc.Status)">@_doc.Status</span>
+
+                <span style="color:var(--text-muted)">
+                    @_doc.Topic
+                    @if (!string.IsNullOrEmpty(_doc.Subtopic))
+                    {
+                        <span> / @_doc.Subtopic</span>
+                    }
+                </span>
+
+                @if (!string.IsNullOrEmpty(_doc.Author))
+                {
+                    <span style="color:var(--text-muted)">by @_doc.Author</span>
+                }
+
+                <code style="font-size:0.75rem;color:var(--text-muted)">@_doc.Id</code>
+            </div>
+
+            <div class="goal-detail-meta-row" style="font-size:0.8rem;color:var(--text-muted)">
+                <span>Created: @_doc.CreatedAt.ToString("yyyy-MM-dd HH:mm") UTC</span>
+                <span style="margin-left:0.75rem">Updated: @_doc.UpdatedAt.ToString("yyyy-MM-dd HH:mm") UTC</span>
+            </div>
+        </div>
+
+        <!-- Body -->
+        <div class="goal-detail-body">
+            <div class="goal-detail-left full-width">
+
+                <!-- Content -->
+                @if (!string.IsNullOrWhiteSpace(_doc.Content))
+                {
+                    <div class="card" style="margin-bottom:0.75rem">
+                        <div class="chat-msg-content">@((MarkupString)RenderMarkdown(_doc.Content))</div>
+                    </div>
+                }
+
+                <!-- Tags & ID -->
+                @if (_doc.Tags.Count > 0)
+                {
+                    <div class="card" style="margin-bottom:0.75rem">
+                        <div class="label" style="margin-bottom:0.4rem">Tags</div>
+                        <div>
+                            @foreach (var tag in _doc.Tags)
+                            {
+                                <span class="repo-tag" style="margin-right:0.4rem">@tag</span>
+                            }
+                        </div>
+                    </div>
+                }
+
+                <!-- Outgoing Links -->
+                @if (_outgoingLinks.Count > 0)
+                {
+                    <div class="card" style="margin-bottom:0.75rem">
+                        <div class="label" style="margin-bottom:0.5rem">Outgoing Links (@_outgoingLinks.Count)</div>
+                        <table class="goals-table">
+                            <thead>
+                                <tr>
+                                    <th>Target</th>
+                                    <th>Type</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var link in _outgoingLinks)
+                                {
+                                    <tr>
+                                        <td>
+                                            <a href="/knowledge/@link.TargetId" class="goal-link">@link.TargetId</a>
+                                            @if (_knowledgeGraph is not null)
+                                            {
+                                                var targetDoc = _knowledgeGraph.GetDocument(link.TargetId);
+                                                @if (targetDoc is not null)
+                                                {
+                                                    <div style="font-size:0.8rem;color:var(--text-muted)">@targetDoc.Title</div>
+                                                }
+                                            }
+                                        </td>
+                                        <td><span class="badge badge-muted">@link.Type</span></td>
+                                        <td style="color:var(--text-muted)">@(link.Description ?? "—")</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+
+                <!-- Incoming Links -->
+                @if (_incomingLinks.Count > 0)
+                {
+                    <div class="card" style="margin-bottom:0.75rem">
+                        <div class="label" style="margin-bottom:0.5rem">Incoming Links (@_incomingLinks.Count)</div>
+                        <table class="goals-table">
+                            <thead>
+                                <tr>
+                                    <th>Source</th>
+                                    <th>Link Type</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var link in _incomingLinks)
+                                {
+                                    <tr>
+                                        <td>
+                                            <a href="/knowledge/@link.SourceId" class="goal-link">@link.SourceId</a>
+                                            @if (_knowledgeGraph is not null)
+                                            {
+                                                var sourceDoc = _knowledgeGraph.GetDocument(link.SourceId);
+                                                @if (sourceDoc is not null)
+                                                {
+                                                    <div style="font-size:0.8rem;color:var(--text-muted)">@sourceDoc.Title</div>
+                                                }
+                                            }
+                                        </td>
+                                        <td><span class="badge badge-muted">@link.Type</span></td>
+                                        <td style="color:var(--text-muted)">@(link.Description ?? "—")</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+
+                <!-- Related Goals -->
+                @if (_relatedGoals.Count > 0)
+                {
+                    <div class="card" style="margin-bottom:0.75rem">
+                        <div class="label" style="margin-bottom:0.5rem">Related Goals (@_relatedGoals.Count)</div>
+                        <ul style="margin:0.25rem 0 0 1.2rem;font-size:0.9rem">
+                            @foreach (var goal in _relatedGoals)
+                            {
+                                <li>
+                                    <a href="/goals/@goal.Id" class="goal-link">@goal.Id</a>
+                                    <span class="badge @GoalStatusBadge(goal.Status)" style="margin-left:0.4rem">@goal.Status</span>
+                                    @if (!string.IsNullOrWhiteSpace(goal.Description))
+                                    {
+                                        <div class="goal-desc" style="margin-top:0.1rem">@Truncate(goal.Description, 100)</div>
+                                    }
+                                </li>
+                            }
+                        </ul>
+                    </div>
+                }
+
+            </div>
+        </div>
+    </div>
+}
+else
+{
+    <p style="color:var(--text-muted);margin-top:1rem">Loading…</p>
+}
+
+@code {
+    [Parameter] public string DocumentId { get; set; } = "";
+
+    private KnowledgeGraph? _knowledgeGraph;
+    private KnowledgeDocument? _doc;
+    private List<DocumentLink> _outgoingLinks = [];
+    private List<IncomingLink> _incomingLinks = [];
+    private List<Goal> _relatedGoals = [];
+    private bool _notFound;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _notFound = false;
+        _doc = null;
+        _outgoingLinks = [];
+        _incomingLinks = [];
+        _relatedGoals = [];
+
+        PageHeader.SetTitle($"📚 {DocumentId}");
+        PageHeader.SetBack("/knowledge");
+
+        _knowledgeGraph = State.KnowledgeGraph;
+
+        if (_knowledgeGraph is null)
+        {
+            _notFound = true;
+            return;
+        }
+
+        _doc = _knowledgeGraph.GetDocument(DocumentId);
+
+        if (_doc is null)
+        {
+            _notFound = true;
+            return;
+        }
+
+        PageHeader.SetTitle($"📚 {_doc.Title}");
+
+        _outgoingLinks = _knowledgeGraph.GetOutgoingLinks(DocumentId);
+        _incomingLinks = _knowledgeGraph.GetIncomingLinks(DocumentId);
+
+        // Find goals that reference this document
+        var allGoals = await GoalStore.GetAllGoalsAsync();
+        _relatedGoals = allGoals
+            .Where(g => g.Documents.Contains(DocumentId, StringComparer.OrdinalIgnoreCase))
+            .OrderByDescending(g => g.CreatedAt)
+            .ToList();
+    }
+
+    private static readonly MarkdownPipeline MdPipeline = new MarkdownPipelineBuilder()
+        .UseAdvancedExtensions()
+        .DisableHtml()
+        .Build();
+
+    private static string RenderMarkdown(string content)
+    {
+        if (string.IsNullOrEmpty(content)) return "";
+        return Markdown.ToHtml(content, MdPipeline);
+    }
+
+    private static string TypeBadge(DocumentType t) => t switch
+    {
+        DocumentType.Implementation => "badge-blue",
+        DocumentType.Feature => "badge-green",
+        DocumentType.Idea => "badge-yellow",
+        DocumentType.Scratch => "badge-muted",
+        DocumentType.Memory => "badge-muted",
+        _ => "badge-muted",
+    };
+
+    private static string StatusBadge(DocumentStatus s) => s switch
+    {
+        DocumentStatus.Active => "badge-green",
+        DocumentStatus.Draft => "badge-yellow",
+        DocumentStatus.Archived => "badge-muted",
+        DocumentStatus.Superseded => "badge-muted",
+        _ => "badge-muted",
+    };
+
+    private static string GoalStatusBadge(GoalStatus s) => s switch
+    {
+        GoalStatus.Completed => "badge-green",
+        GoalStatus.Failed => "badge-red",
+        GoalStatus.InProgress => "badge-blue",
+        GoalStatus.Pending => "badge-yellow",
+        GoalStatus.Cancelled => "badge-muted",
+        _ => "badge-muted",
+    };
+
+    private static string Truncate(string s, int max) =>
+        s.Length <= max ? s : s[..max] + "…";
+}
