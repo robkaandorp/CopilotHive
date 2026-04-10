@@ -558,7 +558,7 @@
                             @foreach (var iter in _storedIterations)
                             {
                                 var iterIsSelected = iter.Iteration == storedActive;
-                                <button class="iter-tab done @(iterIsSelected ? "selected" : "")"
+                                <button class="iter-tab @(iter.Phases.Any(p => p.Result == PhaseOutcome.Fail) ? "failed" : "done") @(iterIsSelected ? "selected" : "")"
                                         @onclick="() => SelectIteration(iter.Iteration)">
                                     Iteration @iter.Iteration
                                 </button>
