@@ -1460,14 +1460,25 @@ public sealed class DistributedBrainTests
     {
         // Arrange
         var kg = new CopilotHive.Knowledge.KnowledgeGraph();
+        var longBody = "This is the full body content of the Brain architecture document. " +
+                       "It contains detailed information about how the Brain orchestrates worker agents, " +
+                       "manages goal pipelines, and coordinates the coder-tester feedback loop. " +
+                       "The Brain uses a knowledge graph to store and retrieve architecture documents, " +
+                       "and it leverages LLM-powered decision making to plan iterations. " +
+                       "This body is intentionally longer than 300 characters to verify that the " +
+                       "read_document tool returns the full content rather than a truncated snippet.";
         await kg.CreateDocumentAsync(
             "architecture-brain",
             "Brain Architecture",
             CopilotHive.Knowledge.DocumentType.Implementation,
-            "This is the full body content of the Brain architecture document.",
+            longBody,
             topic: "architecture",
             tags: ["brain", "orchestration"],
             ct: TestContext.Current.CancellationToken);
+
+        // Add a link so we can verify links are returned
+        kg.AddLink("architecture-brain",
+            new CopilotHive.Knowledge.DocumentLink("architecture-workers", CopilotHive.Knowledge.LinkType.DependsOn));
 
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
             knowledgeGraph: kg);
@@ -1487,7 +1498,9 @@ public sealed class DistributedBrainTests
         Assert.Contains("**Type:**", result);
         Assert.Contains("**Status:**", result);
         Assert.Contains("**Tags:** brain, orchestration", result);
-        Assert.Contains("This is the full body content of the Brain architecture document.", result);
+        Assert.Contains("**Links:**", result);
+        Assert.Contains("architecture-workers", result);
+        Assert.Contains(longBody, result);
     }
 
     [Fact]
@@ -1526,8 +1539,8 @@ public sealed class DistributedBrainTests
         var args = new AIFunctionArguments(new Dictionary<string, object?> { ["document_id"] = "anything" });
         var result = (await readDocTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
 
-        // Assert
-        Assert.Contains("Knowledge graph not available", result);
+        // Assert: exact match per acceptance criteria
+        Assert.Equal("Knowledge graph not available.", result);
     }
 
     // -- traverse_graph Tool Tests --
@@ -1596,6 +1609,8 @@ public sealed class DistributedBrainTests
         // Assert: edge and reachable doc listed
         Assert.Contains("architecture-brain", result);
         Assert.Contains("architecture-workers", result);
+        Assert.Contains("Related", result);
+        Assert.Contains("Workers Architecture", result);
         Assert.Contains("Reachable Documents", result);
     }
 
@@ -1635,8 +1650,8 @@ public sealed class DistributedBrainTests
         var args = new AIFunctionArguments(new Dictionary<string, object?> { ["document_id"] = "anything" });
         var result = (await traverseTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
 
-        // Assert
-        Assert.Contains("Knowledge graph not available", result);
+        // Assert: exact match per acceptance criteria
+        Assert.Equal("Knowledge graph not available.", result);
     }
 
     // -- BuildCraftPromptText Goal ID Reference Tests (Change C) --
