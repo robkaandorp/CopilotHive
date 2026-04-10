@@ -29,7 +29,8 @@ public sealed partial class Composer
         [Description("Comma-separated repository names this goal applies to")] string? repositories = null,
         [Description("Priority: Low, Normal, High, or Critical. Default: Normal")] string? priority = null,
         [Description("Comma-separated goal IDs this goal depends on")] string? depends_on = null,
-        [Description("Scope: Patch, Feature, or Breaking. Default: Patch")] string? scope = null)
+        [Description("Scope: Patch, Feature, or Breaking. Default: Patch")] string? scope = null,
+        [Description("Comma-separated knowledge document IDs to attach to this goal")] string? documents = null)
     {
         var isValidId = IsValidGoalId(id);
         var error = Shared.ToolValidation.Check(
@@ -58,6 +59,10 @@ public sealed partial class Composer
             ? new List<string>()
             : depends_on.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
 
+        var docs = string.IsNullOrWhiteSpace(documents)
+            ? new List<string>()
+            : documents.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+
         var goal = new Goal
         {
             Id = id,
@@ -67,20 +72,22 @@ public sealed partial class Composer
             Status = GoalStatus.Draft,
             RepositoryNames = repos,
             DependsOn = deps,
+            Documents = docs,
         };
 
         await _goalStore.CreateGoalAsync(goal);
         _logger.LogInformation("Composer created draft goal '{GoalId}'", id);
 
-        return $"""
-            ✅ Goal created as Draft:
-            - ID: {id}
-            - Priority: {goalPriority}
-            - Scope: {goalScope}
-            - Repositories: {(repos.Count > 0 ? string.Join(", ", repos) : "(none)")}
-            - Dependencies: {(deps.Count > 0 ? string.Join(", ", deps) : "(none)")}
-            - Status: Draft (not yet dispatched — use approve_goal to queue it)
-            """;
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("✅ Goal created as Draft:");
+        sb.AppendLine($"- ID: {id}");
+        sb.AppendLine($"- Priority: {goalPriority}");
+        sb.AppendLine($"- Scope: {goalScope}");
+        sb.AppendLine($"- Repositories: {(repos.Count > 0 ? string.Join(", ", repos) : "(none)")}");
+        sb.AppendLine($"- Dependencies: {(deps.Count > 0 ? string.Join(", ", deps) : "(none)")}");
+        sb.Append("- Status: Draft (not yet dispatched — use approve_goal to queue it)");
+        AppendDocumentsList(sb, goal.Documents);
+        return sb.ToString();
     }
 
     [Description("Approve a Draft goal, changing its status to Pending for dispatch.")]
@@ -252,7 +259,7 @@ public sealed partial class Composer
                 goal.Status = newStatus;
                 await _goalStore.UpdateGoalAsync(goal);
                 _logger.LogInformation("Composer updated goal '{GoalId}' status to {Status}", id, newStatus);
-                return $"✅ Goal '{id}' status updated to {newStatus.ToDisplayName()}.";
+                return AppendDocuments($"✅ Goal '{id}' status updated to {newStatus.ToDisplayName()}.", goal);
 
             case "repositories":
                 var repos = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
@@ -265,7 +272,7 @@ public sealed partial class Composer
                     goal.ReleaseId = null;
                     await _goalStore.UpdateGoalAsync(goal);
                     _logger.LogInformation("Composer cleared release on goal '{GoalId}'", id);
-                    return $"✅ Goal '{id}' release cleared.";
+                    return AppendDocuments($"✅ Goal '{id}' release cleared.", goal);
                 }
                 var release = await _goalStore.GetReleaseAsync(value);
                 if (release is null)
@@ -273,7 +280,7 @@ public sealed partial class Composer
                 goal.ReleaseId = release.Id;
                 await _goalStore.UpdateGoalAsync(goal);
                 _logger.LogInformation("Composer set release on goal '{GoalId}' to '{ReleaseId}'", id, release.Id);
-                return $"✅ Goal '{id}' release set to '{release.Id}'.";
+                return AppendDocuments($"✅ Goal '{id}' release set to '{release.Id}'.", goal);
 
             default:
                 return $"❌ Unknown field '{field}'. Valid fields: description, priority, status, repositories, release.";
@@ -301,6 +308,9 @@ public sealed partial class Composer
         sb.AppendLine($"- **Created:** {goal.CreatedAt:yyyy-MM-dd HH:mm}");
         sb.AppendLine($"- **Repositories:** {(goal.RepositoryNames.Count > 0 ? string.Join(", ", goal.RepositoryNames) : "(none)")}");
         sb.AppendLine($"- **Description:** {goal.Description}");
+
+        if (goal.Documents.Count > 0)
+            sb.AppendLine($"- **Documents:** {string.Join(", ", goal.Documents)}");
 
         if (goal.FailureReason is not null)
             sb.AppendLine($"- **Failure:** {goal.FailureReason}");
@@ -633,5 +643,36 @@ public sealed partial class Composer
 
         _logger.LogInformation("Composer updated release '{ReleaseId}' field '{Field}'", id, field);
         return $"✅ Release '{id}' {field} updated.";
+    }
+
+    /// <summary>
+    /// Appends the Documents list to a response string if the goal has documents.
+    /// Format: "- Documents: id (Title), id2 (Title2)"
+    /// </summary>
+    private string AppendDocuments(string response, Goal goal)
+    {
+        if (goal.Documents.Count == 0)
+            return response;
+        var sb = new System.Text.StringBuilder(response);
+        AppendDocumentsList(sb, goal.Documents);
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Appends a newline + "- Documents: id (Title), ..." to the StringBuilder.
+    /// Does nothing if the list is empty.
+    /// </summary>
+    private void AppendDocumentsList(System.Text.StringBuilder sb, List<string> documentIds)
+    {
+        if (documentIds.Count == 0)
+            return;
+
+        var items = documentIds.Select(docId =>
+        {
+            var title = _knowledgeGraph?.GetDocument(docId)?.Title;
+            return title is not null ? $"{docId} ({title})" : docId;
+        });
+        sb.AppendLine();
+        sb.Append($"- Documents: {string.Join(", ", items)}");
     }
 }

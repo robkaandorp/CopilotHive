@@ -266,6 +266,18 @@ public sealed class KnowledgeGraph
         => GetInverseDocuments(id, LinkType.Implements);
 
     /// <summary>
+    /// Returns all documents that have a <see cref="LinkType.Related"/> link pointing to <paramref name="id"/>.
+    /// </summary>
+    public List<KnowledgeDocument> GetRelatedBy(string id)
+        => GetInverseDocuments(id, LinkType.Related);
+
+    /// <summary>
+    /// Returns all documents that have a <see cref="LinkType.References"/> link pointing to <paramref name="id"/>.
+    /// </summary>
+    public List<KnowledgeDocument> GetReferencedBy(string id)
+        => GetInverseDocuments(id, LinkType.References);
+
+    /// <summary>
     /// Performs a BFS traversal of forward links up to <paramref name="maxDepth"/> hops.
     /// Returns all reachable documents (excluding the starting document).
     /// </summary>
