@@ -1033,8 +1033,8 @@ public sealed class DistributedBrainTests
         // Note: AIFunctionFactory.Create returns AIFunction which is then cast to AITool
         // The tool is identified by its name parameter passed to AIFunctionFactory.Create
         Assert.NotEmpty(brainTools);
-        // Verify there are at least 4 tools (escalate_to_composer, get_goal, search_knowledge, report_iteration_plan)
-        Assert.True(brainTools.Count >= 4, "Brain should have at least 4 tools (escalate_to_composer, get_goal, search_knowledge, report_iteration_plan)");
+        // Verify there are at least 6 tools (escalate_to_composer, get_goal, search_knowledge, read_document, traverse_graph, report_iteration_plan)
+        Assert.True(brainTools.Count >= 6, "Brain should have at least 6 tools (escalate_to_composer, get_goal, search_knowledge, read_document, traverse_graph, report_iteration_plan)");
     }
 
     [Fact]
@@ -1432,6 +1432,226 @@ public sealed class DistributedBrainTests
 
         // Assert
         Assert.Contains("No documents match your query", result);
+    }
+
+    // -- read_document Tool Tests --
+
+    [Fact]
+    public void ReadDocumentTool_IsCreatedWithCorrectName()
+    {
+        // Arrange
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            knowledgeGraph: kg);
+
+        // Act
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+
+        // Assert
+        var readDocTool = brainTools.OfType<AIFunction>().FirstOrDefault(t => t.Name == "read_document");
+        Assert.NotNull(readDocTool);
+        Assert.Equal("read_document", readDocTool.Name);
+    }
+
+    [Fact]
+    public async Task ReadDocumentTool_ReturnsFullContent_WhenDocumentExists()
+    {
+        // Arrange
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
+        var longBody = "This is the full body content of the Brain architecture document. " +
+                       "It contains detailed information about how the Brain orchestrates worker agents, " +
+                       "manages goal pipelines, and coordinates the coder-tester feedback loop. " +
+                       "The Brain uses a knowledge graph to store and retrieve architecture documents, " +
+                       "and it leverages LLM-powered decision making to plan iterations. " +
+                       "This body is intentionally longer than 300 characters to verify that the " +
+                       "read_document tool returns the full content rather than a truncated snippet.";
+        await kg.CreateDocumentAsync(
+            "architecture-brain",
+            "Brain Architecture",
+            CopilotHive.Knowledge.DocumentType.Implementation,
+            longBody,
+            topic: "architecture",
+            tags: ["brain", "orchestration"],
+            ct: TestContext.Current.CancellationToken);
+
+        // Add a link so we can verify links are returned
+        kg.AddLink("architecture-brain",
+            new CopilotHive.Knowledge.DocumentLink("architecture-workers", CopilotHive.Knowledge.LinkType.DependsOn));
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            knowledgeGraph: kg);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var readDocTool = brainTools.OfType<AIFunction>().First(t => t.Name == "read_document");
+
+        // Act
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["document_id"] = "architecture-brain" });
+        var result = (await readDocTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: full content returned (not a snippet)
+        Assert.Contains("## Brain Architecture", result);
+        Assert.Contains("**ID:** architecture-brain", result);
+        Assert.Contains("**Type:**", result);
+        Assert.Contains("**Status:**", result);
+        Assert.Contains("**Tags:** brain, orchestration", result);
+        Assert.Contains("**Links:**", result);
+        Assert.Contains("architecture-workers", result);
+        Assert.Contains(longBody, result);
+    }
+
+    [Fact]
+    public async Task ReadDocumentTool_ReturnsNotFound_WhenDocumentDoesNotExist()
+    {
+        // Arrange
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            knowledgeGraph: kg);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var readDocTool = brainTools.OfType<AIFunction>().First(t => t.Name == "read_document");
+
+        // Act
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["document_id"] = "does-not-exist" });
+        var result = (await readDocTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert
+        Assert.Contains("not found", result);
+    }
+
+    [Fact]
+    public async Task ReadDocumentTool_ReturnsNotAvailable_WhenKnowledgeGraphIsNull()
+    {
+        // Arrange: Brain with no knowledge graph
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var readDocTool = brainTools.OfType<AIFunction>().First(t => t.Name == "read_document");
+
+        // Act
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["document_id"] = "anything" });
+        var result = (await readDocTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: exact match per acceptance criteria
+        Assert.Equal("Knowledge graph not available.", result);
+    }
+
+    // -- traverse_graph Tool Tests --
+
+    [Fact]
+    public void TraverseGraphTool_IsCreatedWithCorrectName()
+    {
+        // Arrange
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            knowledgeGraph: kg);
+
+        // Act
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+
+        // Assert
+        var traverseTool = brainTools.OfType<AIFunction>().FirstOrDefault(t => t.Name == "traverse_graph");
+        Assert.NotNull(traverseTool);
+        Assert.Equal("traverse_graph", traverseTool.Name);
+    }
+
+    [Fact]
+    public async Task TraverseGraphTool_ReturnsRelatedDocuments_WhenLinksExist()
+    {
+        // Arrange: two docs with a link
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
+        await kg.CreateDocumentAsync(
+            "architecture-brain",
+            "Brain Architecture",
+            CopilotHive.Knowledge.DocumentType.Implementation,
+            "Brain content.",
+            topic: "architecture",
+            ct: TestContext.Current.CancellationToken);
+
+        await kg.CreateDocumentAsync(
+            "architecture-workers",
+            "Workers Architecture",
+            CopilotHive.Knowledge.DocumentType.Implementation,
+            "Workers content.",
+            topic: "architecture",
+            ct: TestContext.Current.CancellationToken);
+
+        kg.AddLink(
+            "architecture-brain",
+            new CopilotHive.Knowledge.DocumentLink("architecture-workers", CopilotHive.Knowledge.LinkType.Related));
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            knowledgeGraph: kg);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var traverseTool = brainTools.OfType<AIFunction>().First(t => t.Name == "traverse_graph");
+
+        // Act
+        var args = new AIFunctionArguments(new Dictionary<string, object?>
+        {
+            ["document_id"] = "architecture-brain",
+            ["depth"] = 1,
+            ["direction"] = "outgoing"
+        });
+        var result = (await traverseTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: edge and reachable doc listed
+        Assert.Contains("architecture-brain", result);
+        Assert.Contains("architecture-workers", result);
+        Assert.Contains("Related", result);
+        Assert.Contains("Workers Architecture", result);
+        Assert.Contains("Reachable Documents", result);
+    }
+
+    [Fact]
+    public async Task TraverseGraphTool_ReturnsNotFound_WhenStartDocumentDoesNotExist()
+    {
+        // Arrange
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            knowledgeGraph: kg);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var traverseTool = brainTools.OfType<AIFunction>().First(t => t.Name == "traverse_graph");
+
+        // Act
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["document_id"] = "does-not-exist" });
+        var result = (await traverseTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert
+        Assert.Contains("not found", result);
+    }
+
+    [Fact]
+    public async Task TraverseGraphTool_ReturnsNotAvailable_WhenKnowledgeGraphIsNull()
+    {
+        // Arrange: Brain with no knowledge graph
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var traverseTool = brainTools.OfType<AIFunction>().First(t => t.Name == "traverse_graph");
+
+        // Act
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["document_id"] = "anything" });
+        var result = (await traverseTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: exact match per acceptance criteria
+        Assert.Equal("Knowledge graph not available.", result);
     }
 
     // -- BuildCraftPromptText Goal ID Reference Tests (Change C) --
