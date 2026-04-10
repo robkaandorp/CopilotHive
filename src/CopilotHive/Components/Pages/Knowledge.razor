@@ -1,0 +1,217 @@
+@page "/knowledge"
+@using CopilotHive.Dashboard
+@using CopilotHive.Knowledge
+@inject DashboardStateService State
+@inject PageHeaderState PageHeader
+
+<div class="goals-page">
+    @if (_knowledgeGraph is null)
+    {
+        <p style="color:var(--text-muted);margin-top:1rem">Knowledge graph is not configured — start the orchestrator with a config repo to enable it.</p>
+    }
+    else
+    {
+        <!-- Filter Bar -->
+        <div class="filter-bar">
+            <input type="text" placeholder="Search documents…" @bind="_searchText" @bind:event="oninput" @bind:after="ApplyFilters" />
+
+            <select @bind="_topicFilter" @bind:after="ApplyFilters">
+                <option value="">All topics</option>
+                @foreach (var t in _allTopics)
+                {
+                    var count = _allDocs.Count(d => string.Equals(d.Topic, t, StringComparison.OrdinalIgnoreCase));
+                    <option value="@t">@t (@count)</option>
+                }
+            </select>
+
+            <select @bind="_typeFilter" @bind:after="ApplyFilters">
+                <option value="">All types</option>
+                @foreach (var t in Enum.GetValues<DocumentType>())
+                {
+                    <option value="@t">@t</option>
+                }
+            </select>
+
+            <select @bind="_statusFilter" @bind:after="ApplyFilters">
+                <option value="">All statuses</option>
+                @foreach (var s in Enum.GetValues<DocumentStatus>())
+                {
+                    <option value="@s">@s</option>
+                }
+            </select>
+
+            <input type="text" placeholder="Filter by tag…" @bind="_tagFilter" @bind:event="oninput" @bind:after="ApplyFilters" />
+
+            @if (!string.IsNullOrWhiteSpace(_searchText) || !string.IsNullOrWhiteSpace(_topicFilter) ||
+                 !string.IsNullOrWhiteSpace(_typeFilter) || !string.IsNullOrWhiteSpace(_statusFilter) ||
+                 !string.IsNullOrWhiteSpace(_tagFilter))
+            {
+                <button class="filter-reset-btn" @onclick="ResetFilters" title="Reset filters">✕ Reset</button>
+            }
+
+            <span class="filter-count">@_filtered.Count document(s)</span>
+        </div>
+
+        <!-- Documents Table -->
+        @if (_filtered.Count > 0)
+        {
+            <div class="goals-table-wrap">
+                <table class="goals-table">
+                    <thead>
+                        <tr>
+                            <th>Title</th>
+                            <th>Type</th>
+                            <th>Status</th>
+                            <th>Topic</th>
+                            <th>Tags</th>
+                            <th>Updated</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var doc in _filtered)
+                        {
+                            var docId = doc.Id;
+                            <tr style="cursor:pointer" @onclick="() => NavigateTo(docId)">
+                                <td>
+                                    <a href="/knowledge/@doc.Id" class="goal-link" @onclick:stopPropagation="true">@doc.Title</a>
+                                    <div style="font-family:monospace;font-size:0.75rem;color:var(--text-muted)">@doc.Id</div>
+                                </td>
+                                <td><span class="badge @TypeBadge(doc.Type)">@doc.Type</span></td>
+                                <td><span class="badge @StatusBadge(doc.Status)">@doc.Status</span></td>
+                                <td>
+                                    @doc.Topic
+                                    @if (!string.IsNullOrEmpty(doc.Subtopic))
+                                    {
+                                        <span style="color:var(--text-muted)"> / @doc.Subtopic</span>
+                                    }
+                                </td>
+                                <td>
+                                    @foreach (var tag in doc.Tags)
+                                    {
+                                        <span class="repo-tag" style="margin-right:0.3rem">@tag</span>
+                                    }
+                                </td>
+                                <td style="color:var(--text-muted);white-space:nowrap">@doc.UpdatedAt.ToString("yyyy-MM-dd")</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        }
+        else if (_loaded)
+        {
+            <p style="color:var(--text-muted);margin-top:1rem">No documents match the current filters.</p>
+        }
+    }
+</div>
+
+@code {
+    [Inject] private NavigationManager Nav { get; set; } = default!;
+
+    private KnowledgeGraph? _knowledgeGraph;
+    private List<KnowledgeDocument> _allDocs = [];
+    private List<KnowledgeDocument> _filtered = [];
+    private List<string> _allTopics = [];
+    private bool _loaded;
+
+    private string _searchText = "";
+    private string _topicFilter = "";
+    private string _typeFilter = "";
+    private string _statusFilter = "";
+    private string _tagFilter = "";
+
+    protected override void OnInitialized()
+    {
+        PageHeader.SetTitle("📚 Knowledge");
+        _knowledgeGraph = State.KnowledgeGraph;
+
+        if (_knowledgeGraph is not null)
+        {
+            _allDocs = _knowledgeGraph.GetAllDocuments()
+                .OrderBy(d => d.Topic)
+                .ThenBy(d => d.Title)
+                .ToList();
+
+            _allTopics = _allDocs
+                .Select(d => d.Topic)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(t => t, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        _loaded = true;
+        ApplyFilters();
+    }
+
+    private void ApplyFilters()
+    {
+        if (_knowledgeGraph is null)
+        {
+            _filtered = [];
+            return;
+        }
+
+        IEnumerable<KnowledgeDocument> query;
+
+        // Use Search() when there's a search query; otherwise start from full list
+        if (!string.IsNullOrWhiteSpace(_searchText))
+        {
+            query = _knowledgeGraph.Search(_searchText.Trim());
+        }
+        else
+        {
+            query = _allDocs;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_topicFilter))
+            query = query.Where(d => string.Equals(d.Topic, _topicFilter, StringComparison.OrdinalIgnoreCase));
+
+        if (!string.IsNullOrWhiteSpace(_typeFilter) && Enum.TryParse<DocumentType>(_typeFilter, out var type))
+            query = query.Where(d => d.Type == type);
+
+        if (!string.IsNullOrWhiteSpace(_statusFilter) && Enum.TryParse<DocumentStatus>(_statusFilter, out var status))
+            query = query.Where(d => d.Status == status);
+
+        if (!string.IsNullOrWhiteSpace(_tagFilter))
+        {
+            var tag = _tagFilter.Trim();
+            query = query.Where(d => d.Tags.Any(t => t.Contains(tag, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        _filtered = query
+            .OrderBy(d => d.Topic)
+            .ThenBy(d => d.Title)
+            .ToList();
+    }
+
+    private void ResetFilters()
+    {
+        _searchText = "";
+        _topicFilter = "";
+        _typeFilter = "";
+        _statusFilter = "";
+        _tagFilter = "";
+        ApplyFilters();
+    }
+
+    private void NavigateTo(string docId) => Nav.NavigateTo($"/knowledge/{docId}");
+
+    private static string TypeBadge(DocumentType t) => t switch
+    {
+        DocumentType.Implementation => "badge-blue",
+        DocumentType.Feature => "badge-green",
+        DocumentType.Idea => "badge-yellow",
+        DocumentType.Scratch => "badge-muted",
+        DocumentType.Memory => "badge-muted",
+        _ => "badge-muted",
+    };
+
+    private static string StatusBadge(DocumentStatus s) => s switch
+    {
+        DocumentStatus.Active => "badge-green",
+        DocumentStatus.Draft => "badge-yellow",
+        DocumentStatus.Archived => "badge-muted",
+        DocumentStatus.Superseded => "badge-muted",
+        _ => "badge-muted",
+    };
+}

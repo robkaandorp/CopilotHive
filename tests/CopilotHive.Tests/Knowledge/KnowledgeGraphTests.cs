@@ -925,6 +925,107 @@ public sealed class KnowledgeGraphTests : IDisposable
 
         Assert.Null(graph2.GetDocument("features-to-delete"));
     }
+
+    // ── GetAllDocuments ──────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetAllDocuments_ReturnsAllDocuments()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _graph.CreateDocumentAsync("arch-brain", "Brain", DocumentType.Implementation, "", ct: ct);
+        await _graph.CreateDocumentAsync("features-kg", "KG", DocumentType.Feature, "", ct: ct);
+
+        var all = _graph.GetAllDocuments();
+        Assert.Equal(2, all.Count);
+        Assert.Contains(all, d => d.Id == "arch-brain");
+        Assert.Contains(all, d => d.Id == "features-kg");
+    }
+
+    [Fact]
+    public void GetAllDocuments_EmptyGraph_ReturnsEmptyList()
+    {
+        var all = _graph.GetAllDocuments();
+        Assert.Empty(all);
+    }
+
+    // ── GetOutgoingLinks ─────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetOutgoingLinks_ReturnsLinksFromDocument()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _graph.CreateDocumentAsync("doc-a", "A", DocumentType.Implementation, "", ct: ct);
+        await _graph.CreateDocumentAsync("doc-b", "B", DocumentType.Feature, "", ct: ct);
+        await _graph.CreateDocumentAsync("doc-c", "C", DocumentType.Idea, "", ct: ct);
+
+        _graph.AddLink("doc-a", new DocumentLink("doc-b", LinkType.Related, "A relates to B"));
+        _graph.AddLink("doc-a", new DocumentLink("doc-c", LinkType.DependsOn, "A depends on C"));
+
+        var links = _graph.GetOutgoingLinks("doc-a");
+        Assert.Equal(2, links.Count);
+        Assert.Contains(links, l => l.TargetId == "doc-b" && l.Type == LinkType.Related && l.Description == "A relates to B");
+        Assert.Contains(links, l => l.TargetId == "doc-c" && l.Type == LinkType.DependsOn && l.Description == "A depends on C");
+    }
+
+    [Fact]
+    public void GetOutgoingLinks_DocumentNotFound_ReturnsEmptyList()
+    {
+        var links = _graph.GetOutgoingLinks("nonexistent");
+        Assert.Empty(links);
+    }
+
+    [Fact]
+    public async Task GetOutgoingLinks_DocumentWithNoLinks_ReturnsEmptyList()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _graph.CreateDocumentAsync("doc-isolated", "Isolated", DocumentType.Implementation, "", ct: ct);
+
+        var links = _graph.GetOutgoingLinks("doc-isolated");
+        Assert.Empty(links);
+    }
+
+    // ── GetIncomingLinks ─────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetIncomingLinks_ReturnsLinksPointingToDocument()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _graph.CreateDocumentAsync("doc-a", "A", DocumentType.Implementation, "", ct: ct);
+        await _graph.CreateDocumentAsync("doc-b", "B", DocumentType.Feature, "", ct: ct);
+
+        // doc-b links to doc-a → doc-a has an incoming link from doc-b
+        _graph.AddLink("doc-b", new DocumentLink("doc-a", LinkType.Parent, "B is a child of A"));
+
+        var incoming = _graph.GetIncomingLinks("doc-a");
+        Assert.Single(incoming);
+        Assert.Equal("doc-b", incoming[0].SourceId);
+        Assert.Equal(LinkType.Child, incoming[0].Type);
+        Assert.Equal("B is a child of A", incoming[0].Description);
+    }
+
+    [Fact]
+    public async Task GetIncomingLinks_MultipleIncomingLinks_ReturnsAll()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _graph.CreateDocumentAsync("target", "Target", DocumentType.Feature, "", ct: ct);
+        await _graph.CreateDocumentAsync("source1", "Source 1", DocumentType.Implementation, "", ct: ct);
+        await _graph.CreateDocumentAsync("source2", "Source 2", DocumentType.Idea, "", ct: ct);
+
+        _graph.AddLink("source1", new DocumentLink("target", LinkType.DependsOn, "depends on target"));
+        _graph.AddLink("source2", new DocumentLink("target", LinkType.Related, null));
+
+        var incoming = _graph.GetIncomingLinks("target");
+        Assert.Equal(2, incoming.Count);
+        Assert.Contains(incoming, l => l.SourceId == "source1" && l.Type == LinkType.DependedOnBy && l.Description == "depends on target");
+        Assert.Contains(incoming, l => l.SourceId == "source2" && l.Type == LinkType.Related && l.Description == null);
+    }
+
+    [Fact]
+    public void GetIncomingLinks_NoLinks_ReturnsEmptyList()
+    {
+        var incoming = _graph.GetIncomingLinks("nonexistent");
+        Assert.Empty(incoming);
+    }
 }
 
 /// <summary>

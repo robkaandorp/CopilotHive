@@ -12,6 +12,13 @@
     </span>
 </NavLink>
 <NavLink href="/goals">🎯 <span class="nav-label">Goals</span></NavLink>
+<NavLink href="/knowledge">📚 <span class="nav-label">Knowledge
+    @if (_knowledgeDocCount > 0)
+    {
+        <span class="badge badge-muted" title="@_knowledgeDocCount document(s)">@_knowledgeDocCount</span>
+    }
+    </span>
+</NavLink>
 <NavLink href="/releases">📦 <span class="nav-label">Releases</span></NavLink>
 <NavLink href="/orchestrator">🎵 <span class="nav-label">Orchestrator</span></NavLink>
 <NavLink href="/workers">🐝 <span class="nav-label">Workers</span></NavLink>
@@ -23,10 +30,12 @@
     [Inject] private ClarificationQueueService ClarificationQueue { get; set; } = default!;
 
     private int _pendingClarifications;
+    private int _knowledgeDocCount;
 
     protected override void OnInitialized()
     {
         _pendingClarifications = ClarificationQueue.PendingHumanCount;
+        _knowledgeDocCount = State.GetKnowledgeDocumentCount();
         ClarificationQueue.OnChanged += HandleClarificationChanged;
     }
 

@@ -235,6 +235,40 @@ public sealed class KnowledgeGraph
     public List<KnowledgeDocument> FindByStatus(DocumentStatus status)
         => _documents.Values.Where(d => d.Status == status).ToList();
 
+    /// <summary>Returns all documents in the graph.</summary>
+    public List<KnowledgeDocument> GetAllDocuments()
+        => [.. _documents.Values];
+
+    /// <summary>
+    /// Returns the outgoing links from the specified document (the document's own link list).
+    /// Returns an empty list if the document is not found.
+    /// </summary>
+    public List<DocumentLink> GetOutgoingLinks(string id)
+        => _documents.TryGetValue(id, out var doc) ? [.. doc.Links] : [];
+
+    /// <summary>
+    /// Returns incoming links to the specified document — i.e., all links from other documents
+    /// that target this document. Each entry includes the source document ID, the <em>inverse</em>
+    /// link type (from the perspective of this document), and the description stored on the outgoing link.
+    /// Returns an empty list if no documents link to this one.
+    /// </summary>
+    public List<IncomingLink> GetIncomingLinks(string id)
+    {
+        if (!_reverseIndex.TryGetValue(id, out var entries))
+            return [];
+
+        var result = new List<IncomingLink>();
+        foreach (var (sourceId, type) in entries)
+        {
+            if (!_documents.TryGetValue(sourceId, out var sourceDoc))
+                continue;
+
+            var outgoing = sourceDoc.Links.FirstOrDefault(l => l.TargetId == id && l.Type == type);
+            result.Add(new IncomingLink(sourceId, type.Inverse(), outgoing?.Description));
+        }
+        return result;
+    }
+
     // ── Graph Traversal ────────────────────────────────────────────────────────
 
     /// <summary>

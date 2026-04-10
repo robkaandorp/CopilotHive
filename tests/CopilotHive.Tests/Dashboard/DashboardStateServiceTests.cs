@@ -1,6 +1,7 @@
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Goals;
+using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
@@ -2539,6 +2540,119 @@ public sealed class DashboardStateServiceTests : IDisposable
         return new DashboardStateService(
             workerPool, pipelineManager, goalManager,
             logSink, progressLog, goalStore: _store);
+    }
+
+    // ── Knowledge Graph ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetKnowledgeDocumentCount"/>
+    /// returns the correct number of documents when a KnowledgeGraph is provided.
+    /// </summary>
+    [Fact]
+    public async Task GetKnowledgeDocumentCount_WithKnowledgeGraph_ReturnsDocumentCount()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var knowledgeGraph = new KnowledgeGraph();
+        await knowledgeGraph.CreateDocumentAsync("doc-a", "Document A", DocumentType.Feature, "content", ct: ct);
+        await knowledgeGraph.CreateDocumentAsync("doc-b", "Document B", DocumentType.Idea, "content", ct: ct);
+        await knowledgeGraph.CreateDocumentAsync("doc-c", "Document C", DocumentType.Memory, "content", ct: ct);
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: null, knowledgeGraph: knowledgeGraph);
+
+        Assert.Equal(3, service.GetKnowledgeDocumentCount());
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetKnowledgeDocumentCount"/>
+    /// returns 0 when no KnowledgeGraph is provided.
+    /// </summary>
+    [Fact]
+    public void GetKnowledgeDocumentCount_WithoutKnowledgeGraph_ReturnsZero()
+    {
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: null, knowledgeGraph: null);
+
+        Assert.Equal(0, service.GetKnowledgeDocumentCount());
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.KnowledgeGraph"/> returns
+    /// the instance when one is provided.
+    /// </summary>
+    [Fact]
+    public void KnowledgeGraph_WhenProvided_ReturnsInstance()
+    {
+        var knowledgeGraph = new KnowledgeGraph();
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: null, knowledgeGraph: knowledgeGraph);
+
+        Assert.NotNull(service.KnowledgeGraph);
+        Assert.Same(knowledgeGraph, service.KnowledgeGraph);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.KnowledgeGraph"/> returns
+    /// null when no KnowledgeGraph is provided.
+    /// </summary>
+    [Fact]
+    public void KnowledgeGraph_WhenNotProvided_ReturnsNull()
+    {
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: null, knowledgeGraph: null);
+
+        Assert.Null(service.KnowledgeGraph);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetKnowledgeDocumentCount"/>
+    /// returns 0 for an empty KnowledgeGraph.
+    /// </summary>
+    [Fact]
+    public void GetKnowledgeDocumentCount_EmptyKnowledgeGraph_ReturnsZero()
+    {
+        var knowledgeGraph = new KnowledgeGraph();
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: null, knowledgeGraph: knowledgeGraph);
+
+        Assert.Equal(0, service.GetKnowledgeDocumentCount());
     }
 }
 

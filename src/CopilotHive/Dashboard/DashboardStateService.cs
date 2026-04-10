@@ -1,6 +1,7 @@
 using System.Reflection;
 using CopilotHive.Configuration;
 using CopilotHive.Goals;
+using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 
@@ -22,6 +23,7 @@ public sealed class DashboardStateService : IDisposable
     private readonly IDistributedBrain? _brain;
     private readonly Composer? _composer;
     private readonly HiveConfigFile? _config;
+    private readonly KnowledgeGraph? _knowledgeGraph;
     private readonly Timer _timer;
     private readonly DateTime _startTime = DateTime.UtcNow;
     private readonly string _version =
@@ -45,7 +47,8 @@ public sealed class DashboardStateService : IDisposable
         IDistributedBrain? brain = null,
         Composer? composer = null,
         HiveConfigFile? config = null,
-        IGoalStore? goalStore = null)
+        IGoalStore? goalStore = null,
+        KnowledgeGraph? knowledgeGraph = null)
     {
         _workerPool = workerPool;
         _pipelineManager = pipelineManager;
@@ -56,6 +59,7 @@ public sealed class DashboardStateService : IDisposable
         _composer = composer;
         _config = config;
         _goalStore = goalStore;
+        _knowledgeGraph = knowledgeGraph;
         _timer = new Timer(_ => PollAndNotify(), null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(3));
     }
 
@@ -334,6 +338,15 @@ public sealed class DashboardStateService : IDisposable
             return [];
         return await _goalStore.GetGoalsByReleaseAsync(releaseId, ct);
     }
+
+    // ── Knowledge Graph ───────────────────────────────────────────────────────
+
+    /// <summary>Returns the total number of knowledge documents, or 0 if the graph is not configured.</summary>
+    public int GetKnowledgeDocumentCount()
+        => _knowledgeGraph?.GetAllDocuments().Count ?? 0;
+
+    /// <summary>Returns the KnowledgeGraph instance, or null if not configured.</summary>
+    public KnowledgeGraph? KnowledgeGraph => _knowledgeGraph;
 
     // ── Orchestrator info ─────────────────────────────────────────────────────
 
