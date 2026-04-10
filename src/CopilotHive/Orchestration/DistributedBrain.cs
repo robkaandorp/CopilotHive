@@ -259,6 +259,189 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 "search_knowledge",
                 "Search the knowledge graph for architecture and design documents by query. Supports optional topic, type, and limit filters."),
             AIFunctionFactory.Create(
+                ([Description("The ID of the document to read.")] string document_id) =>
+                {
+                    if (_knowledgeGraph is null)
+                        return "Knowledge graph not available.";
+
+                    var doc = _knowledgeGraph.GetDocument(document_id);
+                    if (doc is null)
+                        return $"Document '{document_id}' not found.";
+
+                    var sb = new System.Text.StringBuilder();
+                    sb.AppendLine($"## {doc.Title}");
+                    sb.AppendLine($"- **ID:** {doc.Id}");
+                    sb.AppendLine($"- **Type:** {doc.Type}");
+                    sb.AppendLine($"- **Status:** {doc.Status}");
+                    sb.AppendLine($"- **Topic:** {doc.Topic}" + (doc.Subtopic is not null ? $"/{doc.Subtopic}" : ""));
+                    sb.AppendLine($"- **File:** {doc.FilePath}");
+                    sb.AppendLine($"- **Author:** {doc.Author}");
+                    sb.AppendLine($"- **Created:** {doc.CreatedAt:yyyy-MM-dd}");
+                    sb.AppendLine($"- **Updated:** {doc.UpdatedAt:yyyy-MM-dd}");
+
+                    if (doc.Tags.Count > 0)
+                        sb.AppendLine($"- **Tags:** {string.Join(", ", doc.Tags)}");
+
+                    if (doc.Links.Count > 0)
+                    {
+                        sb.AppendLine("- **Links:**");
+                        foreach (var link in doc.Links)
+                        {
+                            var descPart = link.Description is not null ? $" — {link.Description}" : "";
+                            sb.AppendLine($"  - [{link.Type}] → {link.TargetId}{descPart}");
+                        }
+                    }
+
+                    sb.AppendLine();
+                    sb.Append(doc.Content);
+
+                    return sb.ToString();
+                },
+                "read_document",
+                "Read a knowledge document by ID. Returns full document including title, type, status, tags, links, and markdown body."),
+            AIFunctionFactory.Create(
+                ([Description("Starting document ID")] string document_id,
+                 [Description("Traversal depth (default 1, max 3)")] int depth = 1,
+                 [Description("Direction: 'outgoing' (default), 'incoming', or 'both'")] string direction = "outgoing",
+                 [Description("Filter to specific link types (optional array): parent, supersedes, depends_on, implements, related, references")] string[]? link_types = null) =>
+                {
+                    if (_knowledgeGraph is null)
+                        return "Knowledge graph not available.";
+
+                    var startDoc = _knowledgeGraph.GetDocument(document_id);
+                    if (startDoc is null)
+                        return $"Document '{document_id}' not found.";
+
+                    // Clamp depth to [1, 3]
+                    depth = Math.Clamp(depth, 1, 3);
+
+                    var validDirections = new[] { "outgoing", "incoming", "both" };
+                    if (!validDirections.Contains(direction, StringComparer.OrdinalIgnoreCase))
+                        return $"Invalid direction '{direction}'. Valid values: outgoing, incoming, both.";
+
+                    // Parse optional link type filter from string array
+                    HashSet<Knowledge.LinkType>? linkTypeFilter = null;
+                    if (link_types is { Length: > 0 })
+                    {
+                        linkTypeFilter = new HashSet<Knowledge.LinkType>();
+                        foreach (var ltStr in link_types)
+                        {
+                            var normalized = ltStr.Replace("_", "");
+                            if (Enum.TryParse<Knowledge.LinkType>(normalized, ignoreCase: true, out var lt))
+                                linkTypeFilter.Add(lt);
+                        }
+                    }
+
+                    var sb = new System.Text.StringBuilder();
+                    sb.AppendLine($"## Knowledge Graph: {startDoc.Id}");
+                    sb.AppendLine($"**{startDoc.Title}** ({startDoc.Type}, {startDoc.Status})");
+                    sb.AppendLine();
+
+                    // BFS traversal
+                    var visited = new HashSet<string> { document_id };
+                    var queue = new Queue<(string Id, int CurrentDepth)>();
+                    queue.Enqueue((document_id, 0));
+                    var edges = new List<(string From, string To, Knowledge.LinkType LinkType, string Direction)>();
+
+                    while (queue.Count > 0)
+                    {
+                        var (currentId, currentDepth) = queue.Dequeue();
+                        if (currentDepth >= depth) continue;
+
+                        var currentDoc = _knowledgeGraph.GetDocument(currentId);
+                        if (currentDoc is null) continue;
+
+                        // Outgoing links
+                        if (direction.Equals("outgoing", StringComparison.OrdinalIgnoreCase) ||
+                            direction.Equals("both", StringComparison.OrdinalIgnoreCase))
+                        {
+                            foreach (var link in currentDoc.Links)
+                            {
+                                if (linkTypeFilter is not null && !linkTypeFilter.Contains(link.Type))
+                                    continue;
+
+                                edges.Add((currentId, link.TargetId, link.Type, "→"));
+
+                                if (!visited.Contains(link.TargetId))
+                                {
+                                    visited.Add(link.TargetId);
+                                    queue.Enqueue((link.TargetId, currentDepth + 1));
+                                }
+                            }
+                        }
+
+                        // Incoming links (from reverse index via dedicated inverse-type methods)
+                        if (direction.Equals("incoming", StringComparison.OrdinalIgnoreCase) ||
+                            direction.Equals("both", StringComparison.OrdinalIgnoreCase))
+                        {
+                            // Combine all incoming docs from all inverse types (including Related and References)
+                            var incoming = new List<Knowledge.KnowledgeDocument>();
+                            incoming.AddRange(_knowledgeGraph.GetChildren(currentId));
+                            incoming.AddRange(_knowledgeGraph.GetSupersededBy(currentId));
+                            incoming.AddRange(_knowledgeGraph.GetDependedOnBy(currentId));
+                            incoming.AddRange(_knowledgeGraph.GetImplementedBy(currentId));
+                            incoming.AddRange(_knowledgeGraph.GetRelatedBy(currentId));
+                            incoming.AddRange(_knowledgeGraph.GetReferencedBy(currentId));
+
+                            foreach (var incomingDoc in incoming.DistinctBy(d => d.Id))
+                            {
+                                foreach (var link in incomingDoc.Links.Where(l => l.TargetId == currentId))
+                                {
+                                    if (linkTypeFilter is not null && !linkTypeFilter.Contains(link.Type))
+                                        continue;
+
+                                    edges.Add((incomingDoc.Id, currentId, link.Type, "←"));
+
+                                    if (!visited.Contains(incomingDoc.Id))
+                                    {
+                                        visited.Add(incomingDoc.Id);
+                                        queue.Enqueue((incomingDoc.Id, currentDepth + 1));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (edges.Count == 0)
+                    {
+                        sb.AppendLine("No links found in the specified direction and depth.");
+                        return sb.ToString().TrimEnd();
+                    }
+
+                    sb.AppendLine("### Relationships\n");
+                    foreach (var (from, to, lt, dir) in edges)
+                    {
+                        var toDoc = _knowledgeGraph.GetDocument(to);
+                        var toTitle = toDoc is not null ? $" ({toDoc.Title})" : " [not found]";
+                        var fromDoc = _knowledgeGraph.GetDocument(from);
+                        var fromTitle = fromDoc is not null ? $" ({fromDoc.Title})" : " [not found]";
+
+                        if (dir == "→")
+                            sb.AppendLine($"- {from}{fromTitle} **{dir}[{lt}]** {to}{toTitle}");
+                        else
+                            sb.AppendLine($"- {from}{fromTitle} **{dir}[{lt}]** {to}{toTitle}");
+                    }
+
+                    // List all reachable documents (excluding start)
+                    var reachable = visited.Where(id => id != document_id).ToList();
+                    if (reachable.Count > 0)
+                    {
+                        sb.AppendLine($"\n### Reachable Documents ({reachable.Count})");
+                        foreach (var docId in reachable)
+                        {
+                            var d = _knowledgeGraph.GetDocument(docId);
+                            if (d is not null)
+                                sb.AppendLine($"- **{d.Id}** — {d.Title} ({d.Type}, {d.Status})");
+                            else
+                                sb.AppendLine($"- **{docId}** [not found]");
+                        }
+                    }
+
+                    return sb.ToString().TrimEnd();
+                },
+                "traverse_graph",
+                "Explore the knowledge graph from a starting document, following links up to a given depth."),
+            AIFunctionFactory.Create(
                 ([Description("Ordered phase names, e.g. [\"coding\",\"testing\",\"docwriting\",\"review\",\"merging\"]")] string[] phases,
                  [Description("JSON object with per-phase instructions.\n  Single-round: {\"coding\": \"...\", \"review\": \"...\"}\n  Multi-round:  {\"coding-1\": \"step 1: revert...\", \"coding-2\": \"step 2: restructure...\", \"review\": \"...\"}")] string phase_instructions,
                  [Description("Why you chose this iteration plan")] string reason,
