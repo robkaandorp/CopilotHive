@@ -1033,8 +1033,8 @@ public sealed class DistributedBrainTests
         // Note: AIFunctionFactory.Create returns AIFunction which is then cast to AITool
         // The tool is identified by its name parameter passed to AIFunctionFactory.Create
         Assert.NotEmpty(brainTools);
-        // Verify there are at least 3 tools (escalate_to_composer, get_goal, report_iteration_plan)
-        Assert.True(brainTools.Count >= 3, "Brain should have at least 3 tools (escalate_to_composer, get_goal, report_iteration_plan)");
+        // Verify there are at least 4 tools (escalate_to_composer, get_goal, search_knowledge, report_iteration_plan)
+        Assert.True(brainTools.Count >= 4, "Brain should have at least 4 tools (escalate_to_composer, get_goal, search_knowledge, report_iteration_plan)");
     }
 
     [Fact]
@@ -1158,6 +1158,280 @@ public sealed class DistributedBrainTests
 
         // Assert: graceful error when no goal store
         Assert.Contains("not available", result);
+    }
+
+    // -- get_goal Related Docs Tests --
+
+    [Fact]
+    public async Task GetGoalTool_IncludesRelatedDocs_WhenGoalHasDocuments()
+    {
+        // Arrange
+        var goalStore = new FakeGoalStore();
+        goalStore.AddGoal(new Goal
+        {
+            Id = "goal-with-docs",
+            Description = "Goal with related knowledge documents",
+            Status = GoalStatus.InProgress,
+            Documents = ["architecture-brain", "architecture-model-resolution"],
+        });
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            goalStore: goalStore);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
+
+        // Act
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "goal-with-docs" });
+        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: result includes Related docs section
+        Assert.Contains("Related docs:", result);
+        Assert.Contains("architecture-brain", result);
+        Assert.Contains("architecture-model-resolution", result);
+    }
+
+    [Fact]
+    public async Task GetGoalTool_OmitsRelatedDocs_WhenGoalHasNoDocuments()
+    {
+        // Arrange
+        var goalStore = new FakeGoalStore();
+        goalStore.AddGoal(new Goal
+        {
+            Id = "goal-no-docs",
+            Description = "Goal without related documents",
+            Status = GoalStatus.InProgress,
+        });
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            goalStore: goalStore);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
+
+        // Act
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "goal-no-docs" });
+        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: result does NOT include Related docs section
+        Assert.DoesNotContain("Related docs:", result);
+    }
+
+    [Fact]
+    public async Task GetGoalTool_IncludesRelatedDocsWithTitles_WhenKnowledgeGraphIsInjected()
+    {
+        // Arrange
+        var goalStore = new FakeGoalStore();
+        goalStore.AddGoal(new Goal
+        {
+            Id = "goal-with-titled-docs",
+            Description = "Goal with titled knowledge documents",
+            Status = GoalStatus.InProgress,
+            Documents = ["architecture-brain"],
+        });
+
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
+        await kg.CreateDocumentAsync("architecture-brain", "Brain Architecture", CopilotHive.Knowledge.DocumentType.Implementation, "The Brain is an LLM-powered orchestrator.", topic: "architecture", ct: TestContext.Current.CancellationToken);
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            goalStore: goalStore, knowledgeGraph: kg);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
+
+        // Act
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "goal-with-titled-docs" });
+        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: result includes doc id and title
+        Assert.Contains("architecture-brain (Brain Architecture)", result);
+    }
+
+    // -- search_knowledge Tool Tests --
+
+    [Fact]
+    public void SearchKnowledgeTool_IsCreatedWithCorrectName()
+    {
+        // Arrange
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            knowledgeGraph: kg);
+
+        // Act
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+
+        // Assert
+        var searchTool = brainTools.OfType<AIFunction>().FirstOrDefault(t => t.Name == "search_knowledge");
+        Assert.NotNull(searchTool);
+        Assert.Equal("search_knowledge", searchTool.Name);
+    }
+
+    [Fact]
+    public async Task SearchKnowledge_ReturnsFormattedResults_WhenKnowledgeGraphIsInjected()
+    {
+        // Arrange: populate KG with a document
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
+        await kg.CreateDocumentAsync(
+            "architecture-brain",
+            "Brain Architecture",
+            CopilotHive.Knowledge.DocumentType.Implementation,
+            "The Brain is an LLM-powered orchestrator component.",
+            topic: "architecture",
+            ct: TestContext.Current.CancellationToken);
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            knowledgeGraph: kg);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var searchTool = brainTools.OfType<AIFunction>().First(t => t.Name == "search_knowledge");
+
+        // Act
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["query"] = "Brain" });
+        var result = (await searchTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: formatted result with doc details
+        Assert.Contains("Found", result);
+        Assert.Contains("[architecture-brain]", result);
+        Assert.Contains("Brain Architecture", result);
+        Assert.Contains("implementation", result);
+    }
+
+    [Fact]
+    public async Task SearchKnowledge_ReturnsNotAvailable_WhenKnowledgeGraphIsNull()
+    {
+        // Arrange: Brain with no knowledge graph
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var searchTool = brainTools.OfType<AIFunction>().First(t => t.Name == "search_knowledge");
+
+        // Act
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["query"] = "anything" });
+        var result = (await searchTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert
+        Assert.Contains("Knowledge graph not available", result);
+    }
+
+    [Fact]
+    public async Task SearchKnowledge_FiltersByTopic_WhenTopicProvided()
+    {
+        // Arrange
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
+        await kg.CreateDocumentAsync("architecture-brain", "Brain Architecture", CopilotHive.Knowledge.DocumentType.Implementation, "Brain content", topic: "architecture", ct: TestContext.Current.CancellationToken);
+        await kg.CreateDocumentAsync("features-compaction", "Compaction Feature", CopilotHive.Knowledge.DocumentType.Feature, "Compaction content", topic: "features", ct: TestContext.Current.CancellationToken);
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            knowledgeGraph: kg);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var searchTool = brainTools.OfType<AIFunction>().First(t => t.Name == "search_knowledge");
+
+        // Act: search with topic=architecture, both docs contain "content"
+        var args = new AIFunctionArguments(new Dictionary<string, object?>
+        {
+            ["query"] = "content",
+            ["topic"] = "architecture"
+        });
+        var result = (await searchTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: only architecture doc returned
+        Assert.Contains("architecture-brain", result);
+        Assert.DoesNotContain("features-compaction", result);
+    }
+
+    [Fact]
+    public async Task SearchKnowledge_FiltersByType_WhenTypeProvided()
+    {
+        // Arrange
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
+        await kg.CreateDocumentAsync("architecture-brain", "Brain Architecture", CopilotHive.Knowledge.DocumentType.Implementation, "Brain content", topic: "architecture", ct: TestContext.Current.CancellationToken);
+        await kg.CreateDocumentAsync("features-compaction", "Compaction Feature", CopilotHive.Knowledge.DocumentType.Feature, "Compaction content", topic: "features", ct: TestContext.Current.CancellationToken);
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            knowledgeGraph: kg);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var searchTool = brainTools.OfType<AIFunction>().First(t => t.Name == "search_knowledge");
+
+        // Act: search with type=feature
+        var args = new AIFunctionArguments(new Dictionary<string, object?>
+        {
+            ["query"] = "content",
+            ["type"] = "feature"
+        });
+        var result = (await searchTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: only feature doc returned
+        Assert.Contains("features-compaction", result);
+        Assert.DoesNotContain("architecture-brain", result);
+    }
+
+    [Fact]
+    public async Task SearchKnowledge_RespectsLimit_WhenLimitProvided()
+    {
+        // Arrange: add 5 documents all matching "test"
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
+        for (var i = 1; i <= 5; i++)
+            await kg.CreateDocumentAsync($"architecture-doc-{i}", $"Doc {i}", CopilotHive.Knowledge.DocumentType.Implementation, $"test content {i}", topic: "architecture", ct: TestContext.Current.CancellationToken);
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            knowledgeGraph: kg);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var searchTool = brainTools.OfType<AIFunction>().First(t => t.Name == "search_knowledge");
+
+        // Act: search with limit=2
+        var args = new AIFunctionArguments(new Dictionary<string, object?>
+        {
+            ["query"] = "test",
+            ["limit"] = 2
+        });
+        var result = (await searchTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: at most 2 results
+        Assert.Contains("Found 2 document", result);
+    }
+
+    [Fact]
+    public async Task SearchKnowledge_ReturnsNoResults_WhenQueryMatchesNothing()
+    {
+        // Arrange: add a document that doesn't match the query
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
+        await kg.CreateDocumentAsync("architecture-brain", "Brain Architecture", CopilotHive.Knowledge.DocumentType.Implementation, "Brain content", topic: "architecture", ct: TestContext.Current.CancellationToken);
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            knowledgeGraph: kg);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var searchTool = brainTools.OfType<AIFunction>().First(t => t.Name == "search_knowledge");
+
+        // Act: query that matches nothing
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["query"] = "xyzzy_unlikely_to_match" });
+        var result = (await searchTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert
+        Assert.Contains("No documents match your query", result);
     }
 
     // -- BuildCraftPromptText Goal ID Reference Tests (Change C) --

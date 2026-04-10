@@ -31,6 +31,8 @@ public static class BrainPromptBuilder
         - If you need clarification during planning or prompt crafting that cannot be determined from the codebase, call the escalate_to_composer tool with a question and reason
         - Never include git checkout/branch/switch/push commands in prompts — infrastructure handles branching
         - Never include framework-specific build/test commands — workers use build and test skills
+        - When planning iterations, use the search_knowledge tool to look up architecture documents related to the goal's target components. This gives you deeper context about WHY code is structured the way it is, not just WHAT it looks like.
+        - When a goal has related docs (shown by get_goal), read them to understand the design intent before crafting worker prompts.
 
         WORKER PROMPT RULES:
         When crafting worker prompts, follow these rules per role:
