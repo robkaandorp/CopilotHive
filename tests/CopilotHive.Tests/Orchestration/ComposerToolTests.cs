@@ -5385,3 +5385,550 @@ public sealed class ComposerKnowledgeToolTests : IDisposable
         Assert.DoesNotContain("Documents", result);
     }
 }
+
+/// <summary>
+/// Additional integration tests for knowledge graph Composer tools.
+/// Covers gaps in the existing test suite: persistence round-trip, 
+/// combined field updates, inverse link warnings, snippet length,
+/// target-side immutability, list filters, graph traversal directions,
+/// and YAML frontmatter round-trip.
+/// </summary>
+public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
+{
+    private readonly SqliteConnection _connection;
+    private readonly SqliteGoalStore _store;
+    private readonly CopilotHive.Knowledge.KnowledgeGraph _knowledgeGraph;
+    private readonly Composer _composer;
+
+    // For persistence tests
+    private readonly string _configRepoDir;
+    private readonly string _remoteRepoDir;
+
+    public ComposerKnowledgeToolIntegrationTests()
+    {
+        _connection = new SqliteConnection("Data Source=:memory:");
+        _connection.Open();
+        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+
+        _knowledgeGraph = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
+        _composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            knowledgeGraph: _knowledgeGraph);
+
+        var baseDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        _configRepoDir = Path.Combine(baseDir, "config-repo");
+        _remoteRepoDir = Path.Combine(baseDir, "remote");
+        Directory.CreateDirectory(_configRepoDir);
+        Directory.CreateDirectory(_remoteRepoDir);
+    }
+
+    public void Dispose()
+    {
+        _connection.Dispose();
+        var baseDir = Path.GetDirectoryName(_configRepoDir);
+        if (baseDir is not null)
+        {
+            try { Directory.Delete(baseDir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    // ── create_document: persistence round-trip ──
+
+    [Fact]
+    public async Task CreateDocument_PersistsToFilesystemAndReloads()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create a document in memory — ID must match DeriveDocumentIdFromPath round-trip,
+        // so use "features-persistence-test" (topic-slug format)
+        var doc = await _knowledgeGraph.CreateDocumentAsync(
+            "features-persistence-test", "Persistent Doc", CopilotHive.Knowledge.DocumentType.Feature,
+            "This content should survive a round-trip.", topic: "features",
+            tags: ["round-trip", "persistence"], ct: ct);
+
+        // Commit to config repo directory (no ConfigRepoManager needed for file write)
+        await _knowledgeGraph.CommitToConfigRepoAsync(_configRepoDir, "Add persistent doc", ct);
+
+        // Verify file exists on disk
+        var filePath = Path.Combine(_configRepoDir, doc.FilePath);
+        Assert.True(File.Exists(filePath));
+
+        // Read the file and verify YAML frontmatter
+        var fileContent = await File.ReadAllTextAsync(filePath, ct);
+        Assert.Contains("title: Persistent Doc", fileContent);
+        Assert.Contains("type: feature", fileContent);
+        Assert.Contains("tags: [round-trip, persistence]", fileContent);
+        Assert.Contains("This content should survive a round-trip.", fileContent);
+
+        // Reload from disk into a new KnowledgeGraph instance
+        var reloadedGraph = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
+        await reloadedGraph.ReloadFromConfigRepoAsync(_configRepoDir, ct);
+
+        var reloadedDoc = reloadedGraph.GetDocument("features-persistence-test");
+        Assert.NotNull(reloadedDoc);
+        Assert.Equal("Persistent Doc", reloadedDoc!.Title);
+        Assert.Equal(CopilotHive.Knowledge.DocumentType.Feature, reloadedDoc.Type);
+        Assert.Equal(CopilotHive.Knowledge.DocumentStatus.Draft, reloadedDoc.Status);
+        Assert.Contains("round-trip", reloadedDoc.Tags);
+        Assert.Contains("persistence", reloadedDoc.Tags);
+        Assert.Contains("This content should survive a round-trip.", reloadedDoc.Content);
+    }
+
+    // ── read_document: full field verification ──
+
+    [Fact]
+    public async Task ReadDocument_ReturnsAllMetadataFields()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateDocumentAsync(
+            topic: "memory",
+            slug: "full-doc",
+            title: "Full Metadata Document",
+            type: "memory",
+            content: "The body content is here.",
+            tags: ["tag1", "tag2"],
+            cancellationToken: ct);
+        await _composer.UpdateDocumentAsync("memory-full-doc", status: "active", cancellationToken: ct);
+
+        var result = await _composer.ReadDocumentAsync("memory-full-doc", cancellationToken: ct);
+
+        // Verify all fields present in the output
+        Assert.Contains("memory-full-doc", result);
+        Assert.Contains("Full Metadata Document", result);
+        Assert.Contains("memory", result.ToLowerInvariant()); // type
+        Assert.Contains("active", result.ToLowerInvariant()); // status
+        Assert.Contains("tag1", result);
+        Assert.Contains("tag2", result);
+        Assert.Contains("The body content is here.", result);
+    }
+
+    // ── update_document: combined title, content, type, status, tags ──
+
+    [Fact]
+    public async Task UpdateDocument_CombinedFields_UpdatesAllFields()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateDocumentAsync("scratch", "combo", "Original", "scratch", "Original content", cancellationToken: ct);
+
+        var result = await _composer.UpdateDocumentAsync(
+            "scratch-combo",
+            title: "Updated Title",
+            content: "Updated content",
+            type: "idea",
+            status: "archived",
+            tags: ["new-tag"],
+            cancellationToken: ct);
+
+        Assert.Contains("✅", result);
+        var doc = _knowledgeGraph.GetDocument("scratch-combo");
+        Assert.NotNull(doc);
+        Assert.Equal("Updated Title", doc!.Title);
+        Assert.Equal("Updated content", doc.Content);
+        Assert.Equal(CopilotHive.Knowledge.DocumentType.Idea, doc.Type);
+        Assert.Equal(CopilotHive.Knowledge.DocumentStatus.Archived, doc.Status);
+        Assert.Equal(["new-tag"], doc.Tags);
+    }
+
+    // ── delete_document: warns about parent, implements, supersedes inverse links ──
+
+    [Fact]
+    public async Task DeleteDocument_WarnsAboutImplementsInverseLinks()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateDocumentAsync("arch", "spec", "Spec", "implementation", "Spec content", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("arch", "impl", "Impl", "feature", "Impl content", cancellationToken: ct);
+
+        // impl implements spec
+        _knowledgeGraph.AddLink("arch-impl",
+            new CopilotHive.Knowledge.DocumentLink("arch-spec", CopilotHive.Knowledge.LinkType.Implements));
+
+        var result = await _composer.DeleteDocumentAsync("arch-spec", cancellationToken: ct);
+
+        Assert.Contains("✅", result);
+        Assert.Contains("⚠️", result);
+        Assert.Contains("arch-impl", result); // inverse link source should be warned
+    }
+
+    [Fact]
+    public async Task DeleteDocument_WarnsAboutSupersedesInverseLinks()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateDocumentAsync("arch", "old", "Old Doc", "implementation", "Old content", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("arch", "new", "New Doc", "implementation", "New content", cancellationToken: ct);
+
+        // new supersedes old
+        _knowledgeGraph.AddLink("arch-new",
+            new CopilotHive.Knowledge.DocumentLink("arch-old", CopilotHive.Knowledge.LinkType.Supersedes));
+
+        var result = await _composer.DeleteDocumentAsync("arch-old", cancellationToken: ct);
+
+        Assert.Contains("✅", result);
+        Assert.Contains("⚠️", result);
+        Assert.Contains("arch-new", result);
+    }
+
+    [Fact]
+    public async Task DeleteDocument_WarnsAboutParentInverseLinks()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateDocumentAsync("arch", "parent-doc2", "Parent2", "implementation", "Parent content", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("arch", "child-doc2", "Child2", "feature", "Child content", cancellationToken: ct);
+
+        // child-doc2's parent is parent-doc2
+        _knowledgeGraph.AddLink("arch-child-doc2",
+            new CopilotHive.Knowledge.DocumentLink("arch-parent-doc2", CopilotHive.Knowledge.LinkType.Parent));
+
+        var result = await _composer.DeleteDocumentAsync("arch-parent-doc2", cancellationToken: ct);
+
+        Assert.Contains("✅", result);
+        Assert.Contains("⚠️", result);
+        Assert.Contains("arch-child-doc2", result);
+    }
+
+    // ── search_knowledge: 200-char snippet verification ──
+
+    [Fact]
+    public async Task SearchKnowledge_SnippetTruncated_WhenContentExceeds200Chars()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var longContent = new string('x', 300); // 300 chars
+        await _composer.CreateDocumentAsync("scratch", "long-snippet", "Long Snippet", "scratch", longContent, cancellationToken: ct);
+
+        var result = await _composer.SearchKnowledgeAsync("long snippet", cancellationToken: ct);
+
+        Assert.Contains("scratch-long-snippet", result);
+        // The snippet should be truncated; verify it contains "…"
+        Assert.Contains("…", result);
+    }
+
+    [Fact]
+    public async Task SearchKnowledge_SnippetNotTruncated_WhenContentShort()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var shortContent = "Short content";
+        await _composer.CreateDocumentAsync("scratch", "short-snippet", "Short Snippet", "scratch", shortContent, cancellationToken: ct);
+
+        var result = await _composer.SearchKnowledgeAsync("short snippet", cancellationToken: ct);
+
+        Assert.Contains("scratch-short-snippet", result);
+        Assert.Contains("Short content", result);
+        Assert.DoesNotContain("…", result);
+    }
+
+    // ── link_document: target document not modified ──
+
+    [Fact]
+    public async Task LinkDocument_DoesNotModifyTarget()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateDocumentAsync("arch", "link-src-2", "Link Src2", "implementation", "Source content", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("arch", "link-tgt-2", "Link Tgt2", "feature", "Target content", cancellationToken: ct);
+
+        var targetBeforeLink = _knowledgeGraph.GetDocument("arch-link-tgt-2");
+        var targetLinksBefore = targetBeforeLink!.Links.Count;
+
+        await _composer.LinkDocumentAsync("arch-link-src-2", "arch-link-tgt-2", "depends_on", cancellationToken: ct);
+
+        // Verify target's links have NOT changed
+        var targetAfterLink = _knowledgeGraph.GetDocument("arch-link-tgt-2");
+        Assert.Equal(targetLinksBefore, targetAfterLink!.Links.Count);
+
+        // Verify source's links HAVE changed
+        var sourceAfterLink = _knowledgeGraph.GetDocument("arch-link-src-2");
+        Assert.Single(sourceAfterLink!.Links);
+        Assert.Equal("arch-link-tgt-2", sourceAfterLink.Links[0].TargetId);
+    }
+
+    // ── list_documents: filter by status and tag ──
+
+    [Fact]
+    public async Task ListDocuments_FilterByStatus_FiltersCorrectly()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateDocumentAsync("memory", "active-mem", "Active Memory", "memory", "Content", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("scratch", "draft-scratch", "Draft Scratch", "scratch", "Content", cancellationToken: ct);
+        // Set first doc to active status
+        await _composer.UpdateDocumentAsync("memory-active-mem", status: "active", cancellationToken: ct);
+
+        var result = await _composer.ListDocumentsAsync(status: "active", cancellationToken: ct);
+
+        Assert.Contains("memory-active-mem", result);
+        // Draft scratch should not appear (still in draft status by default)
+        Assert.DoesNotContain("scratch-draft-scratch", result);
+    }
+
+    [Fact]
+    public async Task ListDocuments_FilterByTag_FiltersCorrectly()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateDocumentAsync("ideas", "tagged-idea", "Tagged Idea", "idea", "Content", tags: ["special-tag"], cancellationToken: ct);
+        await _composer.CreateDocumentAsync("ideas", "untagged-idea", "Untagged Idea", "idea", "Content", cancellationToken: ct);
+
+        var result = await _composer.ListDocumentsAsync(tag: "special-tag", cancellationToken: ct);
+
+        Assert.Contains("ideas-tagged-idea", result);
+        Assert.DoesNotContain("ideas-untagged-idea", result);
+    }
+
+    // ── traverse_graph: both direction ──
+
+    [Fact]
+    public async Task TraverseGraph_BothDirection_FollowsForwardAndReverseLinks()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // A → B (outgoing: related)
+        // C → A (incoming: depends_on)
+        await _composer.CreateDocumentAsync("arch", "tg-a", "TG A", "implementation", "Content A", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("arch", "tg-b", "TG B", "feature", "Content B", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("arch", "tg-c", "TG C", "idea", "Content C", cancellationToken: ct);
+
+        _knowledgeGraph.AddLink("arch-tg-a",
+            new CopilotHive.Knowledge.DocumentLink("arch-tg-b", CopilotHive.Knowledge.LinkType.Related));
+        _knowledgeGraph.AddLink("arch-tg-c",
+            new CopilotHive.Knowledge.DocumentLink("arch-tg-a", CopilotHive.Knowledge.LinkType.DependsOn));
+
+        var result = await _composer.TraverseGraphAsync("arch-tg-a", depth: 1, direction: "both", cancellationToken: ct);
+
+        // Should include both outgoing (tg-b) and incoming (tg-c) connections
+        Assert.Contains("arch-tg-b", result);
+        Assert.Contains("arch-tg-c", result);
+    }
+
+    // ── traverse_graph: link_types filter ──
+
+    [Fact]
+    public async Task TraverseGraph_LinkTypesFilter_FiltersToSpecifiedTypes()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateDocumentAsync("arch", "tg-root2", "TG Root2", "implementation", "Root", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("arch", "tg-related", "TG Related", "feature", "Related", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("arch", "tg-dep", "TG Dep", "idea", "Dep", cancellationToken: ct);
+
+        _knowledgeGraph.AddLink("arch-tg-root2",
+            new CopilotHive.Knowledge.DocumentLink("arch-tg-related", CopilotHive.Knowledge.LinkType.Related));
+        _knowledgeGraph.AddLink("arch-tg-root2",
+            new CopilotHive.Knowledge.DocumentLink("arch-tg-dep", CopilotHive.Knowledge.LinkType.DependsOn));
+
+        // Filter to only "depends_on" type links
+        var result = await _composer.TraverseGraphAsync("arch-tg-root2", depth: 1, direction: "outgoing", link_types: "depends_on", cancellationToken: ct);
+
+        Assert.Contains("arch-tg-dep", result);
+        Assert.DoesNotContain("arch-tg-related", result);
+    }
+
+    // ── KnowledgeGraph: YAML frontmatter round-trip ──
+
+    [Fact]
+    public async Task KnowledgeGraph_YamlRoundTrip_PreservesLinksAndMetadata()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Create documents with topic-prefixed IDs for round-trip correctness
+        var doc1 = await _knowledgeGraph.CreateDocumentAsync(
+            "features-rt-parent", "RT Parent", CopilotHive.Knowledge.DocumentType.Implementation,
+            "Parent content here.", topic: "features", author: "test-author",
+            tags: ["parent", "round-trip"], ct: ct);
+        _knowledgeGraph.AddLink("features-rt-parent",
+            new CopilotHive.Knowledge.DocumentLink("features-rt-child", CopilotHive.Knowledge.LinkType.Parent, "My child doc"));
+
+        var doc2 = await _knowledgeGraph.CreateDocumentAsync(
+            "features-rt-child", "RT Child", CopilotHive.Knowledge.DocumentType.Feature,
+            "Child content here.", topic: "features", ct: ct);
+
+        // Write to disk
+        await _knowledgeGraph.CommitToConfigRepoAsync(_configRepoDir, "Add parent and child", ct);
+
+        // Reload into new graph
+        var reloaded = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
+        await reloaded.ReloadFromConfigRepoAsync(_configRepoDir, ct);
+
+        var parent = reloaded.GetDocument("features-rt-parent");
+        Assert.NotNull(parent);
+        Assert.Equal("RT Parent", parent!.Title);
+        Assert.Equal(CopilotHive.Knowledge.DocumentType.Implementation, parent.Type);
+        Assert.Equal("test-author", parent.Author);
+        Assert.Contains("parent", parent.Tags);
+        Assert.Contains("round-trip", parent.Tags);
+        Assert.Contains("Parent content here.", parent.Content);
+        // Links should be round-tripped
+        Assert.Single(parent.Links);
+        Assert.Equal("features-rt-child", parent.Links[0].TargetId);
+        Assert.Equal(CopilotHive.Knowledge.LinkType.Parent, parent.Links[0].Type);
+        Assert.Equal("My child doc", parent.Links[0].Description);
+
+        var child = reloaded.GetDocument("features-rt-child");
+        Assert.NotNull(child);
+        Assert.Equal("RT Child", child!.Title);
+    }
+
+    // ── KnowledgeGraph: reverse index integrity after AddLink/RemoveLink ──
+
+    [Fact]
+    public async Task KnowledgeGraph_AddLink_UpdatesReverseIndex()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _knowledgeGraph.CreateDocumentAsync(
+            "ri-a", "RI A", CopilotHive.Knowledge.DocumentType.Implementation, "Content A", topic: "test", ct: ct);
+        await _knowledgeGraph.CreateDocumentAsync(
+            "ri-b", "RI B", CopilotHive.Knowledge.DocumentType.Feature, "Content B", topic: "test", ct: ct);
+
+        _knowledgeGraph.AddLink("ri-a",
+            new CopilotHive.Knowledge.DocumentLink("ri-b", CopilotHive.Knowledge.LinkType.DependsOn));
+
+        // Check reverse index via GetDependedOnBy
+        var dependedOnBy = _knowledgeGraph.GetDependedOnBy("ri-b");
+        Assert.Single(dependedOnBy);
+        Assert.Equal("ri-a", dependedOnBy[0].Id);
+    }
+
+    [Fact]
+    public async Task KnowledgeGraph_RemoveLink_CleansUpReverseIndex()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _knowledgeGraph.CreateDocumentAsync(
+            "rl-a", "RL A", CopilotHive.Knowledge.DocumentType.Implementation, "Content A", topic: "test", ct: ct);
+        await _knowledgeGraph.CreateDocumentAsync(
+            "rl-b", "RL B", CopilotHive.Knowledge.DocumentType.Feature, "Content B", topic: "test", ct: ct);
+
+        _knowledgeGraph.AddLink("rl-a",
+            new CopilotHive.Knowledge.DocumentLink("rl-b", CopilotHive.Knowledge.LinkType.DependsOn));
+
+        // Verify link was added
+        var dependedOnBy = _knowledgeGraph.GetDependedOnBy("rl-b");
+        Assert.Single(dependedOnBy);
+
+        // Remove the link
+        _knowledgeGraph.RemoveLink("rl-a", "rl-b", CopilotHive.Knowledge.LinkType.DependsOn);
+
+        // Verify reverse index is cleaned up
+        var dependedOnByAfter = _knowledgeGraph.GetDependedOnBy("rl-b");
+        Assert.Empty(dependedOnByAfter);
+
+        // Verify forward link is removed
+        var doc = _knowledgeGraph.GetDocument("rl-a");
+        Assert.Empty(doc!.Links);
+    }
+
+    // ── create_document: persists after CommitToConfigRepoAsync with config repo ──
+
+    [Fact]
+    public async Task CreateDocument_WithCommitToConfigRepo_WritesMarkdownFile()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Use a KnowledgeGraph with a config repo path for writing
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
+        var composerWithRepo = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            configRepo: null, // no ConfigRepoManager — just writing to disk
+            knowledgeGraph: kg);
+
+        await composerWithRepo.CreateDocumentAsync(
+            topic: "ideas",
+            slug: "persist-idea",
+            title: "Persisted Idea",
+            type: "idea",
+            content: "This idea should be persisted.",
+            tags: ["persist"],
+            cancellationToken: ct);
+
+        // Now commit manually
+        await kg.CommitToConfigRepoAsync(_configRepoDir, "Add persisted idea", ct);
+
+        // Verify file exists
+        var doc = kg.GetDocument("ideas-persist-idea");
+        Assert.NotNull(doc);
+        var filePath = Path.Combine(_configRepoDir, doc!.FilePath);
+        Assert.True(File.Exists(filePath));
+
+        var content = await File.ReadAllTextAsync(filePath, ct);
+        Assert.Contains("title: Persisted Idea", content);
+        Assert.Contains("type: idea", content);
+        Assert.Contains("tags: [persist]", content);
+        Assert.Contains("This idea should be persisted.", content);
+    }
+
+    // ── update_document: update with tags replacement ──
+
+    [Fact]
+    public async Task UpdateDocument_TagsReplacedEntirely()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateDocumentAsync("scratch", "tags-test", "Tags Test", "scratch", "Content", tags: ["old1", "old2"], cancellationToken: ct);
+
+        // Replace tags entirely
+        var result = await _composer.UpdateDocumentAsync("scratch-tags-test", tags: ["new1", "new2", "new3"], cancellationToken: ct);
+
+        Assert.Contains("✅", result);
+        var doc = _knowledgeGraph.GetDocument("scratch-tags-test");
+        Assert.NotNull(doc);
+        Assert.Equal(3, doc!.Tags.Count);
+        Assert.Contains("new1", doc.Tags);
+        Assert.Contains("new2", doc.Tags);
+        Assert.Contains("new3", doc.Tags);
+        Assert.DoesNotContain("old1", doc.Tags);
+    }
+
+    // ── unlink_document: verify link is removed from both forward and reverse indices ──
+
+    [Fact]
+    public async Task UnlinkDocument_RemovesFromForwardAndReverseIndex()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateDocumentAsync("arch", "ul-src2", "UL Src2", "implementation", "Content", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("arch", "ul-tgt2", "UL Tgt2", "implementation", "Content", cancellationToken: ct);
+
+        // Add a depends_on link
+        await _composer.LinkDocumentAsync("arch-ul-src2", "arch-ul-tgt2", "depends_on", cancellationToken: ct);
+
+        // Verify reverse index exists
+        var dependedOnBy = _knowledgeGraph.GetDependedOnBy("arch-ul-tgt2");
+        Assert.Single(dependedOnBy);
+
+        // Unlink
+        var result = await _composer.UnlinkDocumentAsync("arch-ul-src2", "arch-ul-tgt2", "depends_on", cancellationToken: ct);
+
+        Assert.Contains("✅", result);
+
+        // Verify forward link is removed
+        var src = _knowledgeGraph.GetDocument("arch-ul-src2");
+        Assert.Empty(src!.Links);
+
+        // Verify reverse index is cleaned up
+        var dependedOnByAfter = _knowledgeGraph.GetDependedOnBy("arch-ul-tgt2");
+        Assert.Empty(dependedOnByAfter);
+    }
+
+    // ── traverse_graph: multi-level BFS traversal ──
+
+    [Fact]
+    public async Task TraverseGraph_MultiLevel_FollowsTransitiveLinks()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // A → B → C (two hops)
+        await _composer.CreateDocumentAsync("arch", "ml-a", "ML A", "implementation", "A", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("arch", "ml-b", "ML B", "feature", "B", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("arch", "ml-c", "ML C", "idea", "C", cancellationToken: ct);
+
+        _knowledgeGraph.AddLink("arch-ml-a",
+            new CopilotHive.Knowledge.DocumentLink("arch-ml-b", CopilotHive.Knowledge.LinkType.Related));
+        _knowledgeGraph.AddLink("arch-ml-b",
+            new CopilotHive.Knowledge.DocumentLink("arch-ml-c", CopilotHive.Knowledge.LinkType.DependsOn));
+
+        // Depth 1 should only see direct neighbor (B)
+        var result1 = await _composer.TraverseGraphAsync("arch-ml-a", depth: 1, direction: "outgoing", cancellationToken: ct);
+        Assert.Contains("arch-ml-b", result1);
+        Assert.DoesNotContain("arch-ml-c", result1);
+
+        // Depth 2 should see both B and C
+        var result2 = await _composer.TraverseGraphAsync("arch-ml-a", depth: 2, direction: "outgoing", cancellationToken: ct);
+        Assert.Contains("arch-ml-b", result2);
+        Assert.Contains("arch-ml-c", result2);
+    }
+}
