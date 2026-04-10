@@ -5912,6 +5912,10 @@ public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
+        // Pre-create knowledge documents so titles are available
+        await _composer.CreateDocumentAsync("arch", "brain", "Brain Architecture", "implementation", "Brain content", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("features", "design", "Feature Design", "feature", "Design content", cancellationToken: ct);
+
         await _composer.CreateGoalAsync("goal-docs-update", "A goal with documents attached");
         var goal = await _store.GetGoalAsync("goal-docs-update", ct);
         Assert.NotNull(goal);
@@ -5922,8 +5926,12 @@ public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
         var result = await _composer.UpdateGoalAsync("goal-docs-update", "status", "Pending");
 
         Assert.Contains("✅", result);
-        Assert.Contains("arch-brain", result);
-        Assert.Contains("features-design", result);
+
+        // Should contain JSON structured documents with id and title
+        Assert.Contains("\"id\":\"arch-brain\"", result);
+        Assert.Contains("\"title\":\"Brain Architecture\"", result);
+        Assert.Contains("\"id\":\"features-design\"", result);
+        Assert.Contains("\"title\":\"Feature Design\"", result);
     }
 
     [Fact]
@@ -5937,6 +5945,36 @@ public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
 
         Assert.Contains("✅", result);
         Assert.DoesNotContain("Documents", result);
+    }
+
+    [Fact]
+    public async Task CreateGoal_DocumentsShown_WhenGoalHasDocuments()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Pre-create knowledge documents so titles are available
+        await _composer.CreateDocumentAsync("arch", "brain2", "Brain Architecture v2", "implementation", "Brain content", cancellationToken: ct);
+        await _composer.CreateDocumentAsync("features", "auth", "Auth Feature", "feature", "Auth content", cancellationToken: ct);
+
+        // Create goal with documents attached via the documents parameter
+        var result = await _composer.CreateGoalAsync(
+            "goal-with-docs-create",
+            "Goal with knowledge documents",
+            documents: "arch-brain2,features-auth");
+
+        Assert.Contains("✅", result);
+
+        // Should contain JSON structured documents with id and title
+        Assert.Contains("\"id\":\"arch-brain2\"", result);
+        Assert.Contains("\"title\":\"Brain Architecture v2\"", result);
+        Assert.Contains("\"id\":\"features-auth\"", result);
+        Assert.Contains("\"title\":\"Auth Feature\"", result);
+
+        // Verify documents were persisted to the store
+        var goal = await _store.GetGoalAsync("goal-with-docs-create", ct);
+        Assert.NotNull(goal);
+        Assert.Contains("arch-brain2", goal!.Documents);
+        Assert.Contains("features-auth", goal.Documents);
     }
 
     // ── delete_document: warns about related and references inverse links ──

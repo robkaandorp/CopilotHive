@@ -29,7 +29,8 @@ public sealed partial class Composer
         [Description("Comma-separated repository names this goal applies to")] string? repositories = null,
         [Description("Priority: Low, Normal, High, or Critical. Default: Normal")] string? priority = null,
         [Description("Comma-separated goal IDs this goal depends on")] string? depends_on = null,
-        [Description("Scope: Patch, Feature, or Breaking. Default: Patch")] string? scope = null)
+        [Description("Scope: Patch, Feature, or Breaking. Default: Patch")] string? scope = null,
+        [Description("Comma-separated knowledge document IDs to attach to this goal")] string? documents = null)
     {
         var isValidId = IsValidGoalId(id);
         var error = Shared.ToolValidation.Check(
@@ -58,6 +59,10 @@ public sealed partial class Composer
             ? new List<string>()
             : depends_on.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
 
+        var docs = string.IsNullOrWhiteSpace(documents)
+            ? new List<string>()
+            : documents.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+
         var goal = new Goal
         {
             Id = id,
@@ -67,6 +72,7 @@ public sealed partial class Composer
             Status = GoalStatus.Draft,
             RepositoryNames = repos,
             DependsOn = deps,
+            Documents = docs,
         };
 
         await _goalStore.CreateGoalAsync(goal);
@@ -80,11 +86,7 @@ public sealed partial class Composer
         sb.AppendLine($"- Repositories: {(repos.Count > 0 ? string.Join(", ", repos) : "(none)")}");
         sb.AppendLine($"- Dependencies: {(deps.Count > 0 ? string.Join(", ", deps) : "(none)")}");
         sb.Append("- Status: Draft (not yet dispatched — use approve_goal to queue it)");
-        if (goal.Documents.Count > 0)
-        {
-            sb.AppendLine();
-            sb.Append($"- Documents: {string.Join(", ", goal.Documents)}");
-        }
+        AppendDocumentsJson(sb, goal.Documents);
         return sb.ToString();
     }
 
@@ -644,12 +646,35 @@ public sealed partial class Composer
     }
 
     /// <summary>
-    /// Appends the Documents list to a response string if the goal has documents.
+    /// Appends the Documents list as structured JSON to a response string if the goal has documents.
     /// </summary>
-    private static string AppendDocuments(string response, Goal goal)
+    private string AppendDocuments(string response, Goal goal)
     {
         if (goal.Documents.Count == 0)
             return response;
-        return response + $"\n- Documents: {string.Join(", ", goal.Documents)}";
+        var sb = new System.Text.StringBuilder(response);
+        AppendDocumentsJson(sb, goal.Documents);
+        return sb.ToString();
     }
+
+    /// <summary>
+    /// Appends a newline + "- documents: [...]" JSON array of {id, title} objects to the StringBuilder.
+    /// Does nothing if the list is empty.
+    /// </summary>
+    private void AppendDocumentsJson(System.Text.StringBuilder sb, List<string> documentIds)
+    {
+        if (documentIds.Count == 0)
+            return;
+
+        var items = documentIds.Select(docId =>
+        {
+            var title = _knowledgeGraph?.GetDocument(docId)?.Title ?? docId;
+            return $"{{\"id\":\"{EscapeJson(docId)}\",\"title\":\"{EscapeJson(title)}\"}}";
+        });
+        sb.AppendLine();
+        sb.Append($"- documents: [{string.Join(",", items)}]");
+    }
+
+    private static string EscapeJson(string value)
+        => value.Replace("\\", "\\\\").Replace("\"", "\\\"");
 }
