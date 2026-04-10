@@ -141,7 +141,8 @@ static async Task<int> RunServerAsync(string[] args)
             sp.GetService<HiveConfigFile>(),
             sp.GetService<ConfigRepoManager>(),
             availableModels,
-            compactionModel: config?.Models?.CompactionModel);
+            compactionModel: config?.Models?.CompactionModel,
+            knowledgeGraph: sp.GetService<KnowledgeGraph>());
     });
     builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 
