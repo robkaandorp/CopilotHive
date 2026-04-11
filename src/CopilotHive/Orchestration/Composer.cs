@@ -145,6 +145,13 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - Never approve a goal unless the user explicitly requests it.
         - After creating a goal as Draft, inform the user and wait for their approval instruction.
         - Do not batch-approve multiple goals without the user confirming each one.
+
+        Knowledge consultation:
+        - At the start of each new conversation, search the knowledge graph for relevant context before making plans or creating goals.
+        - When making architectural decisions or discussing system behavior, search the knowledge graph for existing decisions, constraints, or memory documents.
+        - Use `search_knowledge` with keywords related to the topic at hand (e.g. "composer", "agents", "config", "release", "branch").
+        - Prefer `memory` type documents as they capture persistent facts and decisions you should recall.
+        - When you create a goal that involves config repo changes, AGENTS.md files, or system prompt modifications, search for the "architecture-composer-vs-workers-config" document first to ensure you follow the established patterns.
         """;
 
     private const string ConfigRepoSystemPromptSection = """
