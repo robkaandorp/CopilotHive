@@ -10,17 +10,17 @@ public sealed class Goal
     /// <summary>Unique identifier for this goal.</summary>
     public required string Id { get; init; }
     /// <summary>Human-readable description of what the goal requires.</summary>
-    public required string Description { get; init; }
+    public required string Description { get; set; }
     /// <summary>Scheduling priority; higher-priority goals are dispatched first.</summary>
-    public GoalPriority Priority { get; init; } = GoalPriority.Normal;
+    public GoalPriority Priority { get; set; } = GoalPriority.Normal;
     /// <summary>Scope of change this goal introduces.</summary>
-    public GoalScope Scope { get; init; } = GoalScope.Patch;
+    public GoalScope Scope { get; set; } = GoalScope.Patch;
     /// <summary>Current lifecycle status of the goal.</summary>
     public GoalStatus Status { get; set; } = GoalStatus.Pending;
     /// <summary>Names of repositories this goal applies to.</summary>
-    public List<string> RepositoryNames { get; init; } = [];
+    public List<string> RepositoryNames { get; set; } = [];
     /// <summary>IDs of goals that must complete before this goal can be dispatched.</summary>
-    public List<string> DependsOn { get; init; } = [];
+    public List<string> DependsOn { get; set; } = [];
     /// <summary>Arbitrary key/value metadata associated with the goal.</summary>
     public Dictionary<string, string> Metadata { get; init; } = [];
     /// <summary>UTC timestamp when the goal was created.</summary>

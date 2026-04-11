@@ -213,15 +213,16 @@ public sealed class ComposerToolTests : IDisposable
     }
 
     [Fact]
-    public async Task UpdateGoal_ImmutableField_ReturnsError()
+    public async Task UpdateGoal_Description_DraftGoal_UpdatesDescription()
     {
         var ct = TestContext.Current.CancellationToken;
 
         await _composer.CreateGoalAsync("update-me2", "Test goal");
         var result = await _composer.UpdateGoalAsync("update-me2", "description", "New desc");
 
-        Assert.Contains("❌", result);
-        Assert.Contains("cannot be changed", result);
+        Assert.Contains("✅", result);
+        var goal = await _store.GetGoalAsync("update-me2", ct);
+        Assert.Equal("New desc", goal!.Description);
     }
 
     [Fact]
@@ -493,6 +494,317 @@ public sealed class ComposerToolTests : IDisposable
         var goal = await _store.GetGoalAsync("release-goal-invalid", ct);
         Assert.NotNull(goal);
         Assert.Null(goal!.ReleaseId);
+    }
+
+    // ── update_goal — Draft-only editable fields ──
+
+    [Fact]
+    public async Task UpdateGoal_Priority_DraftGoal_UpdatesPriority()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("priority-draft", "Test goal");
+        var result = await _composer.UpdateGoalAsync("priority-draft", "priority", "High");
+
+        Assert.Contains("✅", result);
+        var goal = await _store.GetGoalAsync("priority-draft", ct);
+        Assert.Equal(GoalPriority.High, goal!.Priority);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Priority_InvalidValue_ReturnsError()
+    {
+        await _composer.CreateGoalAsync("priority-invalid", "Test goal");
+        var result = await _composer.UpdateGoalAsync("priority-invalid", "priority", "SuperHigh");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid priority", result);
+    }
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("1")]
+    [InlineData("999")]
+    public async Task UpdateGoal_Priority_NumericString_ReturnsError(string numericValue)
+    {
+        await _composer.CreateGoalAsync($"priority-numeric-{numericValue}", "Test goal");
+        var result = await _composer.UpdateGoalAsync($"priority-numeric-{numericValue}", "priority", numericValue);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid priority", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Repositories_DraftGoal_UpdatesRepositories()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("repos-draft", "Test goal");
+        var result = await _composer.UpdateGoalAsync("repos-draft", "repositories", "repo-a, repo-b");
+
+        Assert.Contains("✅", result);
+        var goal = await _store.GetGoalAsync("repos-draft", ct);
+        Assert.Equal(2, goal!.RepositoryNames.Count);
+        Assert.Contains("repo-a", goal.RepositoryNames);
+        Assert.Contains("repo-b", goal.RepositoryNames);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Scope_DraftGoal_UpdatesScope()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("scope-draft", "Test goal");
+        var result = await _composer.UpdateGoalAsync("scope-draft", "scope", "Feature");
+
+        Assert.Contains("✅", result);
+        var goal = await _store.GetGoalAsync("scope-draft", ct);
+        Assert.Equal(GoalScope.Feature, goal!.Scope);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Scope_InvalidValue_ReturnsError()
+    {
+        await _composer.CreateGoalAsync("scope-invalid", "Test goal");
+        var result = await _composer.UpdateGoalAsync("scope-invalid", "scope", "Enormous");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid scope", result);
+    }
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("1")]
+    [InlineData("999")]
+    public async Task UpdateGoal_Scope_NumericString_ReturnsError(string numericValue)
+    {
+        await _composer.CreateGoalAsync($"scope-numeric-{numericValue}", "Test goal");
+        var result = await _composer.UpdateGoalAsync($"scope-numeric-{numericValue}", "scope", numericValue);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid scope", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_DependsOn_DraftGoal_UpdatesDependsOn()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("depends-draft", "Test goal");
+        var result = await _composer.UpdateGoalAsync("depends-draft", "depends_on", "goal-a, goal-b");
+
+        Assert.Contains("✅", result);
+        var goal = await _store.GetGoalAsync("depends-draft", ct);
+        Assert.Equal(2, goal!.DependsOn.Count);
+        Assert.Contains("goal-a", goal.DependsOn);
+        Assert.Contains("goal-b", goal.DependsOn);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_DependsOn_EmptyValue_ClearsDependsOn()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("depends-clear", "Test goal", depends_on: "goal-x");
+        var result = await _composer.UpdateGoalAsync("depends-clear", "depends_on", "");
+
+        Assert.Contains("✅", result);
+        var goal = await _store.GetGoalAsync("depends-clear", ct);
+        Assert.Empty(goal!.DependsOn);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Documents_DraftGoal_UpdatesDocuments()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("docs-draft", "Test goal");
+        var result = await _composer.UpdateGoalAsync("docs-draft", "documents", "doc-1, doc-2");
+
+        Assert.Contains("✅", result);
+        var goal = await _store.GetGoalAsync("docs-draft", ct);
+        Assert.Equal(2, goal!.Documents.Count);
+        Assert.Contains("doc-1", goal.Documents);
+        Assert.Contains("doc-2", goal.Documents);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Documents_EmptyValue_ClearsDocuments()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("docs-clear", "Test goal", documents: "doc-x");
+        var result = await _composer.UpdateGoalAsync("docs-clear", "documents", "");
+
+        Assert.Contains("✅", result);
+        var goal = await _store.GetGoalAsync("docs-clear", ct);
+        Assert.Empty(goal!.Documents);
+    }
+
+    // ── update_goal — non-Draft rejection for all 6 editable fields ──
+
+    [Theory]
+    [InlineData("Pending")]
+    [InlineData("InProgress")]
+    [InlineData("Completed")]
+    [InlineData("Failed")]
+    [InlineData("Cancelled")]
+    public async Task UpdateGoal_Description_NonDraft_ReturnsError(string statusName)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goalId = $"desc-nondraft-{statusName.ToLower()}";
+
+        await _composer.CreateGoalAsync(goalId, "Original desc");
+        var goal = await _store.GetGoalAsync(goalId, ct);
+        goal!.Status = Enum.Parse<GoalStatus>(statusName);
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync(goalId, "description", "New desc");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Cannot edit description", result);
+        Assert.Contains(statusName, result);
+        Assert.Contains("Only Draft goals can be edited", result);
+    }
+
+    [Theory]
+    [InlineData("Pending")]
+    [InlineData("InProgress")]
+    [InlineData("Completed")]
+    [InlineData("Failed")]
+    [InlineData("Cancelled")]
+    public async Task UpdateGoal_Priority_NonDraft_ReturnsError(string statusName)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goalId = $"prio-nondraft-{statusName.ToLower()}";
+
+        await _composer.CreateGoalAsync(goalId, "Test goal");
+        var goal = await _store.GetGoalAsync(goalId, ct);
+        goal!.Status = Enum.Parse<GoalStatus>(statusName);
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync(goalId, "priority", "High");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Cannot edit priority", result);
+        Assert.Contains(statusName, result);
+        Assert.Contains("Only Draft goals can be edited", result);
+    }
+
+    [Theory]
+    [InlineData("Pending")]
+    [InlineData("InProgress")]
+    [InlineData("Completed")]
+    [InlineData("Failed")]
+    [InlineData("Cancelled")]
+    public async Task UpdateGoal_Scope_NonDraft_ReturnsError(string statusName)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goalId = $"scope-nondraft-{statusName.ToLower()}";
+
+        await _composer.CreateGoalAsync(goalId, "Test goal");
+        var goal = await _store.GetGoalAsync(goalId, ct);
+        goal!.Status = Enum.Parse<GoalStatus>(statusName);
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync(goalId, "scope", "Feature");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Cannot edit scope", result);
+        Assert.Contains(statusName, result);
+        Assert.Contains("Only Draft goals can be edited", result);
+    }
+
+    [Theory]
+    [InlineData("Pending")]
+    [InlineData("InProgress")]
+    [InlineData("Completed")]
+    [InlineData("Failed")]
+    [InlineData("Cancelled")]
+    public async Task UpdateGoal_Repositories_NonDraft_ReturnsError(string statusName)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goalId = $"repos-nondraft-{statusName.ToLower()}";
+
+        await _composer.CreateGoalAsync(goalId, "Test goal");
+        var goal = await _store.GetGoalAsync(goalId, ct);
+        goal!.Status = Enum.Parse<GoalStatus>(statusName);
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync(goalId, "repositories", "repo-a");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Cannot edit repositories", result);
+        Assert.Contains(statusName, result);
+        Assert.Contains("Only Draft goals can be edited", result);
+    }
+
+    [Theory]
+    [InlineData("Pending")]
+    [InlineData("InProgress")]
+    [InlineData("Completed")]
+    [InlineData("Failed")]
+    [InlineData("Cancelled")]
+    public async Task UpdateGoal_DependsOn_NonDraft_ReturnsError(string statusName)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goalId = $"deps-nondraft-{statusName.ToLower()}";
+
+        await _composer.CreateGoalAsync(goalId, "Test goal");
+        var goal = await _store.GetGoalAsync(goalId, ct);
+        goal!.Status = Enum.Parse<GoalStatus>(statusName);
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync(goalId, "depends_on", "other-goal");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Cannot edit depends_on", result);
+        Assert.Contains(statusName, result);
+        Assert.Contains("Only Draft goals can be edited", result);
+    }
+
+    [Theory]
+    [InlineData("Pending")]
+    [InlineData("InProgress")]
+    [InlineData("Completed")]
+    [InlineData("Failed")]
+    [InlineData("Cancelled")]
+    public async Task UpdateGoal_Documents_NonDraft_ReturnsError(string statusName)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goalId = $"docs-nondraft-{statusName.ToLower()}";
+
+        await _composer.CreateGoalAsync(goalId, "Test goal");
+        var goal = await _store.GetGoalAsync(goalId, ct);
+        goal!.Status = Enum.Parse<GoalStatus>(statusName);
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync(goalId, "documents", "doc-1");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Cannot edit documents", result);
+        Assert.Contains(statusName, result);
+        Assert.Contains("Only Draft goals can be edited", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Metadata_NotValidField_ReturnsUnknownFieldError()
+    {
+        await _composer.CreateGoalAsync("metadata-goal", "Test goal");
+        var result = await _composer.UpdateGoalAsync("metadata-goal", "metadata", "key=value");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Unknown field", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Id_NotValidField_ReturnsUnknownFieldError()
+    {
+        await _composer.CreateGoalAsync("id-goal", "Test goal");
+        var result = await _composer.UpdateGoalAsync("id-goal", "id", "new-id");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Unknown field", result);
     }
 
     // ── get_goal ──
@@ -1675,6 +1987,20 @@ public sealed class ComposerToolTests : IDisposable
     {
         Assert.Contains("get_phase_output", _composer.GetSystemPrompt());
         Assert.Contains("Drill into worker phase output", _composer.GetSystemPrompt());
+    }
+
+    [Fact]
+    public void SystemPrompt_UpdateGoal_MentionsDraftOnlyRestriction()
+    {
+        var prompt = _composer.GetSystemPrompt();
+        Assert.Contains("update_goal", prompt);
+        Assert.Contains("Draft goals", prompt);
+        Assert.Contains("description", prompt);
+        Assert.Contains("priority", prompt);
+        Assert.Contains("scope", prompt);
+        Assert.Contains("repositories", prompt);
+        Assert.Contains("depends_on", prompt);
+        Assert.Contains("documents", prompt);
     }
 
     // ── git tools — no repo manager configured ──
