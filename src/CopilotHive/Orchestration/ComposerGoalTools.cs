@@ -183,13 +183,16 @@ public sealed partial class Composer
     [Description("Update a field on an existing goal.")]
     internal async Task<string> UpdateGoalAsync(
         [Description("Goal ID to update")] string id,
-        [Description("Field to update: description, priority, repositories, status, or release")] string field,
+        [Description("Field to update: description, priority, scope, repositories, depends_on, documents, status, or release")] string field,
         [Description("New value for the field")] string value)
     {
         var error = Shared.ToolValidation.Check(
             (!string.IsNullOrWhiteSpace(id), "id is required"),
             (!string.IsNullOrWhiteSpace(field), "field is required"),
-            (string.Equals(field, "release", StringComparison.OrdinalIgnoreCase) || !string.IsNullOrWhiteSpace(value), "value is required"));
+            (string.Equals(field, "release", StringComparison.OrdinalIgnoreCase)
+             || string.Equals(field, "depends_on", StringComparison.OrdinalIgnoreCase)
+             || string.Equals(field, "documents", StringComparison.OrdinalIgnoreCase)
+             || !string.IsNullOrWhiteSpace(value), "value is required"));
         if (error is not null) return error;
 
         var goal = await _goalStore.GetGoalAsync(id);
@@ -199,15 +202,22 @@ public sealed partial class Composer
         switch (field.ToLowerInvariant())
         {
             case "description":
-                // Description is init-only, so we must re-create the goal record.
-                // For now, return an error — description is immutable once created.
-                return "❌ Description cannot be changed after creation. Delete and re-create the goal instead.";
+                if (goal.Status != GoalStatus.Draft)
+                    return $"❌ Cannot edit description of a goal in '{goal.Status}' status. Only Draft goals can be edited.";
+                goal.Description = value;
+                await _goalStore.UpdateGoalAsync(goal);
+                _logger.LogInformation("Composer updated goal '{GoalId}' description", id);
+                return AppendDocuments($"✅ Goal '{id}' description updated.", goal);
 
             case "priority":
                 if (!Enum.TryParse<GoalPriority>(value, ignoreCase: true, out var newPriority))
                     return $"❌ Invalid priority '{value}'. Valid: Low, Normal, High, Critical.";
-                // Priority is init-only in Goal; update via store directly
-                return $"❌ Priority cannot be changed after creation. Delete and re-create the goal instead.";
+                if (goal.Status != GoalStatus.Draft)
+                    return $"❌ Cannot edit priority of a goal in '{goal.Status}' status. Only Draft goals can be edited.";
+                goal.Priority = newPriority;
+                await _goalStore.UpdateGoalAsync(goal);
+                _logger.LogInformation("Composer updated goal '{GoalId}' priority to {Priority}", id, newPriority);
+                return AppendDocuments($"✅ Goal '{id}' priority updated to {newPriority}.", goal);
 
             case "status":
                 if (!Enum.TryParse<GoalStatus>(value, ignoreCase: true, out var newStatus))
@@ -262,9 +272,45 @@ public sealed partial class Composer
                 return AppendDocuments($"✅ Goal '{id}' status updated to {newStatus.ToDisplayName()}.", goal);
 
             case "repositories":
+                if (goal.Status != GoalStatus.Draft)
+                    return $"❌ Cannot edit repositories of a goal in '{goal.Status}' status. Only Draft goals can be edited.";
                 var repos = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-                // RepositoryNames is init-only; we'd need to recreate
-                return "❌ Repositories cannot be changed after creation. Delete and re-create the goal instead.";
+                goal.RepositoryNames = repos;
+                await _goalStore.UpdateGoalAsync(goal);
+                _logger.LogInformation("Composer updated goal '{GoalId}' repositories to {Repositories}", id, string.Join(", ", repos));
+                return AppendDocuments($"✅ Goal '{id}' repositories updated to: {(repos.Count > 0 ? string.Join(", ", repos) : "(none)")}.", goal);
+
+            case "scope":
+                if (!Enum.TryParse<GoalScope>(value, ignoreCase: true, out var newScope))
+                    return $"❌ Invalid scope '{value}'. Valid: Patch, Feature, Breaking.";
+                if (goal.Status != GoalStatus.Draft)
+                    return $"❌ Cannot edit scope of a goal in '{goal.Status}' status. Only Draft goals can be edited.";
+                goal.Scope = newScope;
+                await _goalStore.UpdateGoalAsync(goal);
+                _logger.LogInformation("Composer updated goal '{GoalId}' scope to {Scope}", id, newScope);
+                return AppendDocuments($"✅ Goal '{id}' scope updated to {newScope}.", goal);
+
+            case "depends_on":
+                if (goal.Status != GoalStatus.Draft)
+                    return $"❌ Cannot edit depends_on of a goal in '{goal.Status}' status. Only Draft goals can be edited.";
+                var deps = string.IsNullOrWhiteSpace(value)
+                    ? new List<string>()
+                    : value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+                goal.DependsOn = deps;
+                await _goalStore.UpdateGoalAsync(goal);
+                _logger.LogInformation("Composer updated goal '{GoalId}' depends_on to {DependsOn}", id, string.Join(", ", deps));
+                return AppendDocuments($"✅ Goal '{id}' depends_on updated to: {(deps.Count > 0 ? string.Join(", ", deps) : "(none)")}.", goal);
+
+            case "documents":
+                if (goal.Status != GoalStatus.Draft)
+                    return $"❌ Cannot edit documents of a goal in '{goal.Status}' status. Only Draft goals can be edited.";
+                var docs = string.IsNullOrWhiteSpace(value)
+                    ? new List<string>()
+                    : value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+                goal.Documents = docs;
+                await _goalStore.UpdateGoalAsync(goal);
+                _logger.LogInformation("Composer updated goal '{GoalId}' documents", id);
+                return AppendDocuments($"✅ Goal '{id}' documents updated.", goal);
 
             case "release":
                 if (string.IsNullOrWhiteSpace(value) || string.Equals(value, "none", StringComparison.OrdinalIgnoreCase))
@@ -283,7 +329,7 @@ public sealed partial class Composer
                 return AppendDocuments($"✅ Goal '{id}' release set to '{release.Id}'.", goal);
 
             default:
-                return $"❌ Unknown field '{field}'. Valid fields: description, priority, status, repositories, release.";
+                return $"❌ Unknown field '{field}'. Valid fields: description, priority, scope, repositories, depends_on, documents, status, release.";
         }
     }
 
