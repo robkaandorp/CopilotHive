@@ -521,6 +521,19 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("Invalid priority", result);
     }
 
+    [Theory]
+    [InlineData("0")]
+    [InlineData("1")]
+    [InlineData("999")]
+    public async Task UpdateGoal_Priority_NumericString_ReturnsError(string numericValue)
+    {
+        await _composer.CreateGoalAsync($"priority-numeric-{numericValue}", "Test goal");
+        var result = await _composer.UpdateGoalAsync($"priority-numeric-{numericValue}", "priority", numericValue);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid priority", result);
+    }
+
     [Fact]
     public async Task UpdateGoal_Repositories_DraftGoal_UpdatesRepositories()
     {
@@ -554,6 +567,19 @@ public sealed class ComposerToolTests : IDisposable
     {
         await _composer.CreateGoalAsync("scope-invalid", "Test goal");
         var result = await _composer.UpdateGoalAsync("scope-invalid", "scope", "Enormous");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Invalid scope", result);
+    }
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("1")]
+    [InlineData("999")]
+    public async Task UpdateGoal_Scope_NumericString_ReturnsError(string numericValue)
+    {
+        await _composer.CreateGoalAsync($"scope-numeric-{numericValue}", "Test goal");
+        var result = await _composer.UpdateGoalAsync($"scope-numeric-{numericValue}", "scope", numericValue);
 
         Assert.Contains("❌", result);
         Assert.Contains("Invalid scope", result);

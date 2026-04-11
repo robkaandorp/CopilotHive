@@ -210,7 +210,11 @@ public sealed partial class Composer
                 return AppendDocuments($"✅ Goal '{id}' description updated.", goal);
 
             case "priority":
+                if (int.TryParse(value, out _))
+                    return $"❌ Invalid priority '{value}'. Valid: Low, Normal, High, Critical.";
                 if (!Enum.TryParse<GoalPriority>(value, ignoreCase: true, out var newPriority))
+                    return $"❌ Invalid priority '{value}'. Valid: Low, Normal, High, Critical.";
+                if (!Enum.IsDefined(typeof(GoalPriority), newPriority))
                     return $"❌ Invalid priority '{value}'. Valid: Low, Normal, High, Critical.";
                 if (goal.Status != GoalStatus.Draft)
                     return $"❌ Cannot edit priority of a goal in '{goal.Status}' status. Only Draft goals can be edited.";
@@ -281,7 +285,11 @@ public sealed partial class Composer
                 return AppendDocuments($"✅ Goal '{id}' repositories updated to: {(repos.Count > 0 ? string.Join(", ", repos) : "(none)")}.", goal);
 
             case "scope":
+                if (int.TryParse(value, out _))
+                    return $"❌ Invalid scope '{value}'. Valid: Patch, Feature, Breaking.";
                 if (!Enum.TryParse<GoalScope>(value, ignoreCase: true, out var newScope))
+                    return $"❌ Invalid scope '{value}'. Valid: Patch, Feature, Breaking.";
+                if (!Enum.IsDefined(typeof(GoalScope), newScope))
                     return $"❌ Invalid scope '{value}'. Valid: Patch, Feature, Breaking.";
                 if (goal.Status != GoalStatus.Draft)
                     return $"❌ Cannot edit scope of a goal in '{goal.Status}' status. Only Draft goals can be edited.";
