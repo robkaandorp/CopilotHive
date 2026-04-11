@@ -454,4 +454,19 @@ public sealed class ReleaseTests : IDisposable
         Assert.Equal(ReleaseStatus.Released, fetched!.Status);
         Assert.NotNull(fetched.ReleasedAt);
     }
+
+    [Fact]
+    public async Task UpdateRelease_CanTransitionReleasedToPlanning()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var release = new Release { Id = "v1.0.0", Tag = "v1.0.0", Status = ReleaseStatus.Released };
+        await _store.CreateReleaseAsync(release, ct);
+
+        release.Status = ReleaseStatus.Planning;
+        await _store.UpdateReleaseAsync(release, ct);
+
+        var fetched = await _store.GetReleaseAsync("v1.0.0", ct);
+        Assert.NotNull(fetched);
+        Assert.Equal(ReleaseStatus.Planning, fetched!.Status);
+    }
 }

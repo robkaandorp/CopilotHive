@@ -815,6 +815,22 @@ tr:last-child td { border-bottom: none; }
 .approve-btn:hover { opacity: 0.85; }
 .approve-btn:active { opacity: 0.7; }
 
+/* Danger button (destructive actions like Unrelease) */
+.danger-btn {
+    background: var(--red, #e05252);
+    color: #fff;
+    border: none;
+    padding: 0.35rem 0.85rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-weight: 600;
+    transition: opacity 0.15s;
+    white-space: nowrap;
+}
+.danger-btn:hover { opacity: 0.85; }
+.danger-btn:active { opacity: 0.7; }
+
 /* Inline error message for approve/action failures */
 .error-msg {
     font-size: 0.78rem;
