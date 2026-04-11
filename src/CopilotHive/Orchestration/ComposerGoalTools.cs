@@ -139,14 +139,7 @@ public sealed partial class Composer
             var branchName = $"copilothive/{id}";
             foreach (var repoName in goal.RepositoryNames)
             {
-                try
-                {
-                    await _repoManager.DeleteRemoteBranchAsync(repoName, branchName);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to delete remote branch {Branch} from {Repo}", branchName, repoName);
-                }
+                _ = await _repoManager.DeleteRemoteBranchAsync(repoName, branchName);
             }
         }
 
@@ -256,16 +249,7 @@ public sealed partial class Composer
                         var branchName = $"copilothive/{id}";
                         foreach (var repoName in goal.RepositoryNames)
                         {
-                            try
-                            {
-                                await _repoManager.DeleteRemoteBranchAsync(repoName, branchName);
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger.LogWarning(ex,
-                                    "Failed to delete remote branch {Branch} from {Repo} during retry reset",
-                                    branchName, repoName);
-                            }
+                            _ = await _repoManager.DeleteRemoteBranchAsync(repoName, branchName);
                         }
                     }
                 }

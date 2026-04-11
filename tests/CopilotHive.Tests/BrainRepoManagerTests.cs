@@ -78,16 +78,15 @@ public sealed class BrainRepoManagerTests : IDisposable
     }
 
     [Fact]
-    public async Task DeleteRemoteBranchAsync_NoCloneExists_LogsWarningAndDoesNotThrow()
+    public async Task DeleteRemoteBranchAsync_NoCloneExists_ReturnsNotFound()
     {
         var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
         var ct = TestContext.Current.CancellationToken;
 
-        // No clone exists — method should not throw, just log a warning
-        var ex = await Record.ExceptionAsync(() =>
-            manager.DeleteRemoteBranchAsync("nonexistent-repo", "copilothive/test-goal", ct));
+        // No clone exists — method should return NotFound
+        var result = await manager.DeleteRemoteBranchAsync("nonexistent-repo", "copilothive/test-goal", ct);
 
-        Assert.Null(ex);
+        Assert.Equal(BranchDeleteResult.NotFound, result);
     }
 
     [Fact]
@@ -125,7 +124,7 @@ public sealed class BrainRepoManagerTests : IDisposable
 
         // This will fail to push --delete because there's no actual remote,
         // but the local branch deletion should still be attempted.
-        // The method should not throw - it logs warnings and continues.
+        // The method should not throw - it handles errors gracefully.
         var ex = await Record.ExceptionAsync(() =>
             manager.DeleteRemoteBranchAsync("test-repo", "copilothive/test-goal", ct));
 
@@ -156,21 +155,45 @@ public sealed class BrainRepoManagerTests : IDisposable
     }
 
     [Fact]
-    public async Task DeleteRemoteBranchAsync_LogsWarningWhenGitPushFails()
+    public async Task DeleteRemoteBranchAsync_RemoteBranchNotFound_ReturnsNotFoundAndLogsInfo()
     {
         var ct = TestContext.Current.CancellationToken;
-        var clonePath = InitTempGitRepoWithRemote(_tempDir, "test-repo");
+
+        // Set up a real bare remote so git push --delete can talk to it.
+        // The branch does not exist on the remote, so git should report "remote ref does not exist".
+        var remoteDir = Path.Combine(_tempDir, "bare-remote.git");
+        Directory.CreateDirectory(remoteDir);
+        Git(remoteDir, "init", "--bare", "-b", "main");
+
+        // Stage repo: push an initial commit so the remote is non-empty
+        var stagingDir = Path.Combine(_tempDir, "staging");
+        Directory.CreateDirectory(stagingDir);
+        Git(stagingDir, "init", "-b", "main");
+        Git(stagingDir, "config", "user.email", "test@test.com");
+        Git(stagingDir, "config", "user.name", "Test");
+        File.WriteAllText(Path.Combine(stagingDir, "README.md"), "# Test\n");
+        Git(stagingDir, "add", "README.md");
+        Git(stagingDir, "commit", "-m", "Initial commit");
+        Git(stagingDir, "remote", "add", "origin", remoteDir);
+        Git(stagingDir, "push", "origin", "main");
+
+        // Clone the remote into the repos directory managed by BrainRepoManager
+        var reposDir = Path.Combine(_tempDir, "repos");
+        Directory.CreateDirectory(reposDir);
+        Git(reposDir, "clone", remoteDir, "notfound-repo");
+        var clonePath = Path.Combine(reposDir, "notfound-repo");
+        Git(clonePath, "config", "user.email", "test@test.com");
+        Git(clonePath, "config", "user.name", "Test");
 
         var logger = new TestLogger<BrainRepoManager>();
         var manager = new BrainRepoManager(_tempDir, logger);
 
-        // Try to delete a branch that doesn't exist remotely - git push --delete will fail
-        await manager.DeleteRemoteBranchAsync("test-repo", "copilothive/nonexistent-branch", ct);
+        // The branch "copilothive/nonexistent-branch" does not exist on the remote.
+        // Git will report "remote ref does not exist" → NotFound
+        var result = await manager.DeleteRemoteBranchAsync("notfound-repo", "copilothive/nonexistent-branch", ct);
 
-        // Verify a warning was logged about the failed push
-        Assert.Contains(logger.LogEntries, e =>
-            e.LogLevel == LogLevel.Warning &&
-            e.Message.Contains("Failed to delete remote branch"));
+        // Should return NotFound (not Failed) since the branch simply isn't there
+        Assert.Equal(BranchDeleteResult.NotFound, result);
     }
 
     [Fact]

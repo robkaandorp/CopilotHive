@@ -394,10 +394,10 @@ public sealed class ComposerToolTests : IDisposable
         // Mock the repo manager
         var mockRepoManager = new Mock<IBrainRepoManager>();
         mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-x", "copilothive/retry-branch-cleanup", It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask)
+            .ReturnsAsync(BranchDeleteResult.Success)
             .Verifiable();
         mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-y", "copilothive/retry-branch-cleanup", It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask)
+            .ReturnsAsync(BranchDeleteResult.Success)
             .Verifiable();
 
         var composer = new Composer(
@@ -1030,10 +1030,10 @@ public sealed class ComposerToolTests : IDisposable
         // Mock the repo manager
         var mockRepoManager = new Mock<IBrainRepoManager>();
         mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-a", "copilothive/failed-goal-branches", It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask)
+            .ReturnsAsync(BranchDeleteResult.Success)
             .Verifiable();
         mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-b", "copilothive/failed-goal-branches", It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask)
+            .ReturnsAsync(BranchDeleteResult.Success)
             .Verifiable();
 
         var composer = new Composer(
@@ -1088,7 +1088,7 @@ public sealed class ComposerToolTests : IDisposable
     }
 
     [Fact]
-    public async Task DeleteGoal_FailedGoal_BestEffortCleanup_StillSucceedsWhenDeleteRemoteBranchThrows()
+    public async Task DeleteGoal_FailedGoal_BestEffortCleanup_StillSucceedsWhenDeleteRemoteBranchReturnsFailed()
     {
         var ct = TestContext.Current.CancellationToken;
 
@@ -1098,10 +1098,10 @@ public sealed class ComposerToolTests : IDisposable
         goal.Status = GoalStatus.Failed;
         await _store.UpdateGoalAsync(goal, ct);
 
-        // Mock the repo manager to throw when DeleteRemoteBranchAsync is called
+        // Mock the repo manager to return Failed (real BrainRepoManager does not throw — returns Failed)
         var mockRepoManager = new Mock<IBrainRepoManager>();
         mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-a", "copilothive/failed-cleanup", It.IsAny<CancellationToken>()))
-            .ThrowsAsync(new InvalidOperationException("Git operation failed"))
+            .ReturnsAsync(BranchDeleteResult.Failed)
             .Verifiable();
 
         var composer = new Composer(
@@ -1111,7 +1111,7 @@ public sealed class ComposerToolTests : IDisposable
             repoManager: mockRepoManager.Object,
             stateDir: Path.GetTempPath());
 
-        // DeleteRemoteBranchAsync will throw, but goal deletion should still succeed - this is "best-effort"
+        // DeleteRemoteBranchAsync returns Failed, but goal deletion should still succeed - this is "best-effort"
         var result = await composer.DeleteGoalAsync("failed-cleanup");
 
         // Verify the goal was deleted despite branch cleanup issues
@@ -1120,7 +1120,7 @@ public sealed class ComposerToolTests : IDisposable
         var deletedGoal = await _store.GetGoalAsync("failed-cleanup", ct);
         Assert.Null(deletedGoal);
 
-        // Verify that the cleanup was attempted (even though it threw)
+        // Verify that the cleanup was attempted (even though it returned Failed)
         mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-a", "copilothive/failed-cleanup", It.IsAny<CancellationToken>()), Times.Once);
     }
 

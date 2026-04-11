@@ -276,15 +276,15 @@ internal sealed class DispatcherMaintenance
             var allSucceeded = true;
             foreach (var repoName in goal.RepositoryNames)
             {
-                try
+                var deleteResult = await _repoManager.DeleteRemoteBranchAsync(repoName, branchName, ct);
+                if (deleteResult == BranchDeleteResult.Success || deleteResult == BranchDeleteResult.NotFound)
                 {
-                    await _repoManager.DeleteRemoteBranchAsync(repoName, branchName, ct);
-                    _logger.LogInformation("Branch cleanup: deleted {Branch} from {Repo} for goal {GoalId}",
-                        branchName, repoName, goal.Id);
+                    _logger.LogInformation("Branch cleanup: deleted {Branch} from {Repo} for goal {GoalId} (result: {Result})",
+                        branchName, repoName, goal.Id, deleteResult);
                 }
-                catch (Exception ex)
+                else
                 {
-                    _logger.LogWarning(ex, "Branch cleanup: failed to delete {Branch} from {Repo} for goal {GoalId}",
+                    _logger.LogWarning("Branch cleanup: failed to delete {Branch} from {Repo} for goal {GoalId}",
                         branchName, repoName, goal.Id);
                     allSucceeded = false;
                 }

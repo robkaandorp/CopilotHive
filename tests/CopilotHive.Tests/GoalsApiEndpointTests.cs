@@ -481,10 +481,10 @@ public class GoalsApiEndpointTests
         var mockRepoManager = new Mock<IBrainRepoManager>();
         mockRepoManager.Setup(r => r.WorkDirectory).Returns(Path.GetTempPath());
         mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-a", It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask)
+            .ReturnsAsync(BranchDeleteResult.Success)
             .Verifiable();
         mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-b", It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask)
+            .ReturnsAsync(BranchDeleteResult.Success)
             .Verifiable();
 
         // Create a new factory with the mock
@@ -655,10 +655,10 @@ public class GoalsApiEndpointTests
         var mockRepoManager = new Mock<IBrainRepoManager>();
         mockRepoManager.Setup(r => r.WorkDirectory).Returns(Path.GetTempPath());
         mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-a", It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask)
+            .ReturnsAsync(BranchDeleteResult.Success)
             .Verifiable();
         mockRepoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-b", It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask)
+            .ReturnsAsync(BranchDeleteResult.Success)
             .Verifiable();
 
         // Create a new factory with the mock

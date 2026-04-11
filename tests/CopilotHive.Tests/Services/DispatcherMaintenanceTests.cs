@@ -117,6 +117,8 @@ public sealed class DispatcherMaintenanceTests
             .ReturnsAsync((IReadOnlyList<Goal>)[goal]);
 
         var repoManager = new Mock<IBrainRepoManager>();
+        repoManager.Setup(r => r.DeleteRemoteBranchAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(BranchDeleteResult.Success);
         var config = new HiveConfigFile { Orchestrator = { BranchCleanupDelayHours = 48 } };
         var maintenance = CreateMaintenance(goalStore.Object, repoManager.Object, config);
 
@@ -135,6 +137,8 @@ public sealed class DispatcherMaintenanceTests
             .ReturnsAsync((IReadOnlyList<Goal>)[goal]);
 
         var repoManager = new Mock<IBrainRepoManager>();
+        repoManager.Setup(r => r.DeleteRemoteBranchAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(BranchDeleteResult.Success);
         var config = new HiveConfigFile { Orchestrator = { BranchCleanupDelayHours = 48 } };
         var maintenance = CreateMaintenance(goalStore.Object, repoManager.Object, config);
 
@@ -193,6 +197,8 @@ public sealed class DispatcherMaintenanceTests
             .ReturnsAsync((IReadOnlyList<Goal>)[goal]);
 
         var repoManager = new Mock<IBrainRepoManager>();
+        repoManager.Setup(r => r.DeleteRemoteBranchAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(BranchDeleteResult.Success);
         var config = new HiveConfigFile { Orchestrator = { BranchCleanupDelayHours = 0 } };
         var maintenance = CreateMaintenance(goalStore.Object, repoManager.Object, config);
 
@@ -221,9 +227,61 @@ public sealed class DispatcherMaintenanceTests
     }
 
     [Fact]
-    public async Task CleanupMergedBranches_FailedDeletion_LogsWarningButContinues()
+    public async Task CleanupMergedBranches_FailedDeletion_DoesNotSetBranchCleanedUp()
     {
-        // Two goals: first fails, second succeeds. Second should still be cleaned up.
+        // Deletion returns Failed (real contract — BrainRepoManager swallows git errors and returns Failed).
+        // BranchCleanedUp must NOT be set, keeping the goal eligible for the next cycle.
+        var goal = MakeCompletedGoal("fail-goal", completedAt: DateTime.UtcNow.AddHours(-72));
+
+        var goalStore = new Mock<IGoalStore>();
+        goalStore.Setup(s => s.GetGoalsByStatusAsync(GoalStatus.Completed, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((IReadOnlyList<Goal>)[goal]);
+
+        var repoManager = new Mock<IBrainRepoManager>();
+        // Real BrainRepoManager returns Failed — it does NOT throw
+        repoManager.Setup(r => r.DeleteRemoteBranchAsync("my-repo", "copilothive/fail-goal", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(BranchDeleteResult.Failed);
+
+        var config = new HiveConfigFile { Orchestrator = { BranchCleanupDelayHours = 48 } };
+        var maintenance = CreateMaintenance(goalStore.Object, repoManager.Object, config);
+
+        await maintenance.CleanupMergedBranchesAsync(CancellationToken.None);
+
+        // BranchCleanedUp must NOT be set when deletion failed
+        Assert.False(goal.BranchCleanedUp);
+        // UpdateGoalAsync must NOT be called — goal stays eligible for next cycle
+        goalStore.Verify(s => s.UpdateGoalAsync(It.IsAny<Goal>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task CleanupMergedBranches_NotFoundResult_TreatedAsSuccess_SetsBranchCleanedUp()
+    {
+        // Deletion returns NotFound (branch already deleted or never pushed).
+        // This should count as success — BranchCleanedUp is set to prevent future retries.
+        var goal = MakeCompletedGoal("notfound-goal", completedAt: DateTime.UtcNow.AddHours(-72));
+
+        var goalStore = new Mock<IGoalStore>();
+        goalStore.Setup(s => s.GetGoalsByStatusAsync(GoalStatus.Completed, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((IReadOnlyList<Goal>)[goal]);
+
+        var repoManager = new Mock<IBrainRepoManager>();
+        repoManager.Setup(r => r.DeleteRemoteBranchAsync("my-repo", "copilothive/notfound-goal", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(BranchDeleteResult.NotFound);
+
+        var config = new HiveConfigFile { Orchestrator = { BranchCleanupDelayHours = 48 } };
+        var maintenance = CreateMaintenance(goalStore.Object, repoManager.Object, config);
+
+        await maintenance.CleanupMergedBranchesAsync(CancellationToken.None);
+
+        Assert.True(goal.BranchCleanedUp);
+        goalStore.Verify(s => s.UpdateGoalAsync(goal, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task CleanupMergedBranches_TwoGoals_FirstFailsSecondSucceeds_OnlySecondPersisted()
+    {
+        // Two goals: first returns Failed, second returns Success.
+        // Second should still be cleaned up even though first failed.
         var goal1 = MakeCompletedGoal("fail-goal", completedAt: DateTime.UtcNow.AddHours(-72), repoName: "repo-a");
         var goal2 = MakeCompletedGoal("ok-goal", completedAt: DateTime.UtcNow.AddHours(-72), repoName: "repo-b");
 
@@ -232,12 +290,12 @@ public sealed class DispatcherMaintenanceTests
             .ReturnsAsync((IReadOnlyList<Goal>)[goal1, goal2]);
 
         var repoManager = new Mock<IBrainRepoManager>();
-        // First goal's repo throws
+        // First goal's repo returns Failed (real-world: git error, does not throw)
         repoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-a", "copilothive/fail-goal", It.IsAny<CancellationToken>()))
-            .ThrowsAsync(new InvalidOperationException("git push failed"));
-        // Second goal's repo succeeds
+            .ReturnsAsync(BranchDeleteResult.Failed);
+        // Second goal's repo returns Success
         repoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-b", "copilothive/ok-goal", It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
+            .ReturnsAsync(BranchDeleteResult.Success);
 
         var config = new HiveConfigFile { Orchestrator = { BranchCleanupDelayHours = 48 } };
         var maintenance = CreateMaintenance(goalStore.Object, repoManager.Object, config);
@@ -254,6 +312,46 @@ public sealed class DispatcherMaintenanceTests
         goalStore.Verify(s => s.UpdateGoalAsync(goal1, It.IsAny<CancellationToken>()), Times.Never);
     }
 
+    /// <summary>
+    /// Regression test: when deletion silently fails (real BrainRepoManager returns Failed,
+    /// not throw), BranchCleanedUp stays false and the goal remains eligible for the next hourly cycle.
+    /// </summary>
+    [Fact]
+    public async Task CleanupMergedBranches_SilentFailure_GoalRemainsEligibleForNextCycle()
+    {
+        var goal = MakeCompletedGoal("retry-goal", completedAt: DateTime.UtcNow.AddHours(-72));
+
+        var goalStore = new Mock<IGoalStore>();
+        goalStore.Setup(s => s.GetGoalsByStatusAsync(GoalStatus.Completed, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((IReadOnlyList<Goal>)[goal]);
+
+        var repoManager = new Mock<IBrainRepoManager>();
+        // Simulates real BrainRepoManager: git push fails internally, returns Failed without throwing
+        repoManager.Setup(r => r.DeleteRemoteBranchAsync("my-repo", "copilothive/retry-goal", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(BranchDeleteResult.Failed);
+
+        var config = new HiveConfigFile { Orchestrator = { BranchCleanupDelayHours = 48 } };
+        var maintenance = CreateMaintenance(goalStore.Object, repoManager.Object, config);
+
+        // First cleanup cycle — fails silently
+        await maintenance.CleanupMergedBranchesAsync(CancellationToken.None);
+
+        // BranchCleanedUp must NOT be true after a failed cycle
+        Assert.False(goal.BranchCleanedUp, "BranchCleanedUp must not be set after a failed deletion");
+        goalStore.Verify(s => s.UpdateGoalAsync(It.IsAny<Goal>(), It.IsAny<CancellationToken>()), Times.Never,
+            "UpdateGoalAsync must not be called when deletion failed");
+
+        // Now fix the deletion — simulate it succeeding on the next cycle
+        repoManager.Setup(r => r.DeleteRemoteBranchAsync("my-repo", "copilothive/retry-goal", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(BranchDeleteResult.Success);
+
+        // Second cleanup cycle — succeeds
+        await maintenance.CleanupMergedBranchesAsync(CancellationToken.None);
+
+        Assert.True(goal.BranchCleanedUp, "BranchCleanedUp must be set after a successful deletion");
+        goalStore.Verify(s => s.UpdateGoalAsync(goal, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
     [Fact]
     public async Task CleanupMergedBranches_DefaultConfig_Uses48HourDelay()
     {
@@ -266,6 +364,8 @@ public sealed class DispatcherMaintenanceTests
             .ReturnsAsync((IReadOnlyList<Goal>)[recentGoal, oldGoal]);
 
         var repoManager = new Mock<IBrainRepoManager>();
+        repoManager.Setup(r => r.DeleteRemoteBranchAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(BranchDeleteResult.Success);
         var maintenance = CreateMaintenance(goalStore.Object, repoManager.Object, config: null);
 
         await maintenance.CleanupMergedBranchesAsync(CancellationToken.None);
@@ -294,6 +394,8 @@ public sealed class DispatcherMaintenanceTests
             .ReturnsAsync((IReadOnlyList<Goal>)[goal]);
 
         var repoManager = new Mock<IBrainRepoManager>();
+        repoManager.Setup(r => r.DeleteRemoteBranchAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(BranchDeleteResult.Success);
         var config = new HiveConfigFile { Orchestrator = { BranchCleanupDelayHours = 48 } };
         var maintenance = CreateMaintenance(goalStore.Object, repoManager.Object, config);
 
@@ -302,5 +404,40 @@ public sealed class DispatcherMaintenanceTests
         repoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-a", "copilothive/multi-repo-goal", It.IsAny<CancellationToken>()), Times.Once);
         repoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-b", "copilothive/multi-repo-goal", It.IsAny<CancellationToken>()), Times.Once);
         Assert.True(goal.BranchCleanedUp);
+    }
+
+    [Fact]
+    public async Task CleanupMergedBranches_MultipleRepos_OneRepoFails_DoesNotSetBranchCleanedUp()
+    {
+        // Goal with two repos; one succeeds, one fails.
+        // BranchCleanedUp must NOT be set because partial cleanup leaves dangling branches.
+        var goal = new Goal
+        {
+            Id = "partial-fail-goal",
+            Description = "Partial fail",
+            Status = GoalStatus.Completed,
+            CompletedAt = DateTime.UtcNow.AddHours(-72),
+            MergeCommitHash = "abc123",
+            BranchCleanedUp = false,
+            RepositoryNames = ["repo-a", "repo-b"],
+        };
+
+        var goalStore = new Mock<IGoalStore>();
+        goalStore.Setup(s => s.GetGoalsByStatusAsync(GoalStatus.Completed, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((IReadOnlyList<Goal>)[goal]);
+
+        var repoManager = new Mock<IBrainRepoManager>();
+        repoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-a", It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(BranchDeleteResult.Success);
+        repoManager.Setup(r => r.DeleteRemoteBranchAsync("repo-b", It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(BranchDeleteResult.Failed);
+
+        var config = new HiveConfigFile { Orchestrator = { BranchCleanupDelayHours = 48 } };
+        var maintenance = CreateMaintenance(goalStore.Object, repoManager.Object, config);
+
+        await maintenance.CleanupMergedBranchesAsync(CancellationToken.None);
+
+        Assert.False(goal.BranchCleanedUp, "BranchCleanedUp must not be set when any repo deletion failed");
+        goalStore.Verify(s => s.UpdateGoalAsync(It.IsAny<Goal>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 }
