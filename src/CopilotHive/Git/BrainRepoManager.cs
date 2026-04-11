@@ -4,6 +4,21 @@ using Microsoft.Extensions.Logging;
 namespace CopilotHive.Git;
 
 /// <summary>
+/// Result of a remote branch deletion attempt.
+/// </summary>
+public enum BranchDeleteResult
+{
+    /// <summary>The remote branch was successfully deleted.</summary>
+    Success,
+
+    /// <summary>The remote branch did not exist (already deleted or never pushed).</summary>
+    NotFound,
+
+    /// <summary>The deletion attempt failed due to a git or network error.</summary>
+    Failed,
+}
+
+/// <summary>
 /// Manages persistent clones of target repositories for the Brain.
 /// </summary>
 public interface IBrainRepoManager
@@ -42,7 +57,12 @@ public interface IBrainRepoManager
     /// <param name="repoName">Short name of the repository.</param>
     /// <param name="branchName">Branch name to delete from the remote.</param>
     /// <param name="ct">Cancellation token.</param>
-    Task DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default);
+    /// <returns>
+    /// <see cref="BranchDeleteResult.Success"/> if the branch was deleted,
+    /// <see cref="BranchDeleteResult.NotFound"/> if the clone or branch did not exist,
+    /// <see cref="BranchDeleteResult.Failed"/> if the git operation failed.
+    /// </returns>
+    Task<BranchDeleteResult> DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default);
 
     /// <summary>
     /// Returns the clone path for a repository without performing any git operations.
@@ -337,13 +357,16 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
     /// <summary>
     /// Deletes a remote feature branch from the specified repository.
-    /// Best-effort: logs a warning if the branch doesn't exist or deletion fails.
-    /// Also attempts to delete the local tracking branch; failure is silently ignored.
+    /// Returns <see cref="BranchDeleteResult.NotFound"/> when the clone is absent.
+    /// Returns <see cref="BranchDeleteResult.Success"/> on a clean push --delete.
+    /// Returns <see cref="BranchDeleteResult.Failed"/> when git reports an error other than
+    /// "remote ref not found" (i.e. a genuine failure rather than a missing branch).
+    /// Also attempts to delete the local tracking branch; local-branch failure is silently ignored.
     /// </summary>
     /// <param name="repoName">Short name of the repository (must have been cloned via <see cref="EnsureCloneAsync"/>).</param>
     /// <param name="branchName">Branch name to delete from the remote (e.g. "copilothive/my-goal").</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default)
+    public async Task<BranchDeleteResult> DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default)
     {
         var clonePath = GetClonePath(repoName);
         if (!Directory.Exists(Path.Combine(clonePath, ".git")))
@@ -351,17 +374,34 @@ public sealed class BrainRepoManager : IBrainRepoManager
             _logger.LogWarning(
                 "Cannot delete remote branch {Branch} from {Repo}: no clone found at {Path}",
                 branchName, repoName, clonePath);
-            return;
+            return BranchDeleteResult.NotFound;
         }
 
+        BranchDeleteResult result;
         try
         {
             await RunGitAsync(clonePath, ["push", "origin", "--delete", branchName], ct);
             _logger.LogInformation("Deleted remote branch {Branch} from {Repo}", branchName, repoName);
+            result = BranchDeleteResult.Success;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to delete remote branch {Branch} from {Repo}", branchName, repoName);
+            var message = ex.Message;
+            // git reports "remote ref does not exist" or "error: unable to delete ... remote ref does not exist"
+            // when the branch was already absent — that is not a failure.
+            if (message.Contains("remote ref does not exist", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("did not match any", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogInformation(
+                    "Remote branch {Branch} does not exist on {Repo} — treating as already deleted",
+                    branchName, repoName);
+                result = BranchDeleteResult.NotFound;
+            }
+            else
+            {
+                _logger.LogWarning(ex, "Failed to delete remote branch {Branch} from {Repo}", branchName, repoName);
+                result = BranchDeleteResult.Failed;
+            }
         }
 
         // Best-effort: delete the local tracking branch
@@ -373,6 +413,8 @@ public sealed class BrainRepoManager : IBrainRepoManager
         {
             // Ignored — local branch may not exist
         }
+
+        return result;
     }
 
     /// <summary>

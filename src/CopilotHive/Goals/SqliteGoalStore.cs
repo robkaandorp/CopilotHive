@@ -69,7 +69,8 @@ public sealed class SqliteGoalStore : IGoalStore
                 total_duration_seconds REAL,
                 source_conversation_id TEXT,
                 depends_on             TEXT,
-                documents              TEXT
+                documents              TEXT,
+                branch_cleaned_up      INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS goal_iterations (
@@ -154,6 +155,14 @@ public sealed class SqliteGoalStore : IGoalStore
             alter.CommandText = "ALTER TABLE goals ADD COLUMN documents TEXT";
             alter.ExecuteNonQuery();
             _logger.LogInformation("Migrated goals table: added 'documents' column");
+        }
+
+        if (!existingColumns.Contains("branch_cleaned_up"))
+        {
+            using var alter = _db.CreateCommand();
+            alter.CommandText = "ALTER TABLE goals ADD COLUMN branch_cleaned_up INTEGER NOT NULL DEFAULT 0";
+            alter.ExecuteNonQuery();
+            _logger.LogInformation("Migrated goals table: added 'branch_cleaned_up' column");
         }
 
         var iterationColumns = GetTableColumns("goal_iterations");
@@ -324,8 +333,8 @@ public sealed class SqliteGoalStore : IGoalStore
         {
             using var cmd = _db.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO goals (id, description, title, status, priority, scope, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id, depends_on, merge_commit_hash, release_id, documents)
-                VALUES (@id, @desc, @title, @status, @priority, @scope, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId, @dependsOn, @mergeCommitHash, @releaseId, @documents)
+                INSERT INTO goals (id, description, title, status, priority, scope, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id, depends_on, merge_commit_hash, release_id, documents, branch_cleaned_up)
+                VALUES (@id, @desc, @title, @status, @priority, @scope, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId, @dependsOn, @mergeCommitHash, @releaseId, @documents, @branchCleanedUp)
                 """;
             BindGoalParams(cmd, goal);
             cmd.ExecuteNonQuery();
@@ -351,7 +360,8 @@ public sealed class SqliteGoalStore : IGoalStore
                     notes = @notes, phase_durations = @phaseDurations,
                     total_duration_seconds = @totalDuration, source_conversation_id = @sourceConvId,
                     depends_on = @dependsOn, merge_commit_hash = @mergeCommitHash,
-                    release_id = @releaseId, documents = @documents
+                    release_id = @releaseId, documents = @documents,
+                    branch_cleaned_up = @branchCleanedUp
                 WHERE id = @id
                 """;
             BindGoalParams(cmd, goal);
@@ -470,8 +480,8 @@ public sealed class SqliteGoalStore : IGoalStore
                     using var cmd = _db.CreateCommand();
                     cmd.Transaction = tx;
                     cmd.CommandText = """
-                        INSERT INTO goals (id, description, title, status, priority, scope, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id, depends_on, merge_commit_hash, release_id, documents)
-                        VALUES (@id, @desc, @title, @status, @priority, @scope, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId, @dependsOn, @mergeCommitHash, @releaseId, @documents)
+                        INSERT INTO goals (id, description, title, status, priority, scope, repositories, metadata, created_at, started_at, completed_at, iterations, failure_reason, notes, phase_durations, total_duration_seconds, source_conversation_id, depends_on, merge_commit_hash, release_id, documents, branch_cleaned_up)
+                        VALUES (@id, @desc, @title, @status, @priority, @scope, @repos, @meta, @createdAt, @startedAt, @completedAt, @iterations, @failureReason, @notes, @phaseDurations, @totalDuration, @sourceConvId, @dependsOn, @mergeCommitHash, @releaseId, @documents, @branchCleanedUp)
                         """;
                     BindGoalParams(cmd, goal);
                     cmd.ExecuteNonQuery();
@@ -871,6 +881,10 @@ public sealed class SqliteGoalStore : IGoalStore
             if (docs is not null) goal.Documents = docs;
         }
 
+        // branch_cleaned_up may be absent in databases created before migration
+        if (TryGetOrdinal(reader, "branch_cleaned_up", out var branchCleanedUpOrd) && !reader.IsDBNull(branchCleanedUpOrd))
+            goal.BranchCleanedUp = reader.GetInt32(branchCleanedUpOrd) == 1;
+
         return goal;
     }
 
@@ -903,6 +917,7 @@ public sealed class SqliteGoalStore : IGoalStore
         cmd.Parameters.AddWithValue("@releaseId", (object?)goal.ReleaseId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@documents", goal.Documents.Count > 0
             ? JsonSerializer.Serialize(goal.Documents, JsonOptions) : (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("@branchCleanedUp", goal.BranchCleanedUp ? 1 : 0);
     }
 
     private void InsertIterationCore(string goalId, IterationSummary summary, SqliteTransaction? transaction)

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using CopilotHive.Agents;
 using CopilotHive.Configuration;
+using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
@@ -24,6 +25,9 @@ internal sealed class DispatcherMaintenance
     private readonly ConfigRepoManager? _configRepo;
     private readonly KnowledgeGraph? _knowledgeGraph;
     private readonly ILogger _logger;
+    private readonly IGoalStore? _goalStore;
+    private readonly IBrainRepoManager? _repoManager;
+    private readonly HiveConfigFile? _config;
 
     // Mutable state shared with GoalDispatcher via reference
     private readonly ConcurrentDictionary<string, bool> _dispatchedGoals;
@@ -43,7 +47,10 @@ internal sealed class DispatcherMaintenance
         ConcurrentDictionary<string, bool> dispatchedGoals,
         ConcurrentQueue<string> redispatchQueue,
         ILogger logger,
-        KnowledgeGraph? knowledgeGraph = null)
+        KnowledgeGraph? knowledgeGraph = null,
+        IGoalStore? goalStore = null,
+        IBrainRepoManager? repoManager = null,
+        HiveConfigFile? config = null)
     {
         _pipelineManager = pipelineManager;
         _goalManager = goalManager;
@@ -56,6 +63,9 @@ internal sealed class DispatcherMaintenance
         _dispatchedGoals = dispatchedGoals;
         _redispatchQueue = redispatchQueue;
         _logger = logger;
+        _goalStore = goalStore;
+        _repoManager = repoManager;
+        _config = config;
     }
 
     /// <summary>
@@ -233,6 +243,59 @@ internal sealed class DispatcherMaintenance
 
         // Clean up any orphaned goal session files whose goals are no longer active
         await CleanupOrphanedGoalSessionsAsync(ct);
+    }
+
+    /// <summary>
+    /// Scans for Completed goals whose feature branches have been merged for longer
+    /// than the configured delay, and deletes those branches from the remote.
+    /// Best-effort: failures are logged but do not block other cleanups.
+    /// </summary>
+    public async Task CleanupMergedBranchesAsync(CancellationToken ct)
+    {
+        if (_repoManager is null) return;
+        if (_goalStore is null) return;
+
+        var delayHours = _config?.Orchestrator.BranchCleanupDelayHours ?? 48;
+        var cutoff = DateTime.UtcNow.AddHours(-delayHours);
+
+        var completedGoals = await _goalStore.GetGoalsByStatusAsync(GoalStatus.Completed, ct);
+        var eligible = completedGoals
+            .Where(g => g.CompletedAt.HasValue && g.CompletedAt.Value < cutoff)
+            .Where(g => !string.IsNullOrEmpty(g.MergeCommitHash))
+            .Where(g => !g.BranchCleanedUp)
+            .ToList();
+
+        if (eligible.Count == 0) return;
+
+        _logger.LogInformation("Branch cleanup: found {Count} eligible goal(s) with merged branches older than {Hours}h",
+            eligible.Count, delayHours);
+
+        foreach (var goal in eligible)
+        {
+            var branchName = $"copilothive/{goal.Id}";
+            var allSucceeded = true;
+            foreach (var repoName in goal.RepositoryNames)
+            {
+                var deleteResult = await _repoManager.DeleteRemoteBranchAsync(repoName, branchName, ct);
+                if (deleteResult == BranchDeleteResult.Success || deleteResult == BranchDeleteResult.NotFound)
+                {
+                    _logger.LogInformation("Branch cleanup: deleted {Branch} from {Repo} for goal {GoalId} (result: {Result})",
+                        branchName, repoName, goal.Id, deleteResult);
+                }
+                else
+                {
+                    _logger.LogWarning("Branch cleanup: failed to delete {Branch} from {Repo} for goal {GoalId}",
+                        branchName, repoName, goal.Id);
+                    allSucceeded = false;
+                }
+            }
+
+            if (allSucceeded)
+            {
+                goal.BranchCleanedUp = true;
+                await _goalStore.UpdateGoalAsync(goal, ct);
+            }
+        }
     }
 
     /// <summary>

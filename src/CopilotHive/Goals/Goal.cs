@@ -52,6 +52,9 @@ public sealed class Goal
     /// Set by the Composer when decomposing user intent into goals.
     /// </summary>
     public List<string> Documents { get; set; } = [];
+
+    /// <summary>Whether the feature branch has been cleaned up after completion.</summary>
+    public bool BranchCleanedUp { get; set; }
 }
 
 /// <summary>Structured summary of a single completed (or failed) pipeline iteration.</summary>

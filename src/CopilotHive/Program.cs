@@ -434,16 +434,7 @@ static async Task<int> RunServerAsync(string[] args)
                     var branchName = $"copilothive/{id}";
                     foreach (var repoName in existing.RepositoryNames)
                     {
-                        try
-                        {
-                            await repoManager.DeleteRemoteBranchAsync(repoName, branchName);
-                        }
-                        catch (Exception ex)
-                        {
-                            endpointLogger.LogWarning(ex,
-                                "Failed to delete remote branch {Branch} from {Repo} during retry reset",
-                                branchName, repoName);
-                        }
+                        _ = await repoManager.DeleteRemoteBranchAsync(repoName, branchName);
                     }
                 }
             }
@@ -483,14 +474,7 @@ static async Task<int> RunServerAsync(string[] args)
                 var branchName = $"copilothive/{id}";
                 foreach (var repoName in goal.RepositoryNames)
                 {
-                    try
-                    {
-                        await repoManager.DeleteRemoteBranchAsync(repoName, branchName);
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogWarning(ex, "Failed to delete remote branch {Branch} from {Repo}", branchName, repoName);
-                    }
+                    _ = await repoManager.DeleteRemoteBranchAsync(repoName, branchName);
                 }
             }
         }
