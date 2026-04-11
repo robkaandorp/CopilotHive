@@ -22,6 +22,7 @@ public sealed class GoalDispatcher : BackgroundService
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan AgentsSyncInterval = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan BranchCleanupInterval = TimeSpan.FromHours(1);
 
     private readonly GoalManager _goalManager;
     private readonly GoalPipelineManager _pipelineManager;
@@ -44,6 +45,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly GoalLifecycleService _lifecycleService;
     private readonly PipelineDriver _pipelineDriver;
     private readonly DispatcherMaintenance _maintenance;
+    private DateTime _lastBranchCleanup = DateTime.MinValue;
 
     /// <summary>
     /// Initialises a new <see cref="GoalDispatcher"/> with required and optional dependencies.
@@ -66,6 +68,7 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="startupDelay">Delay before the first dispatch poll; defaults to 10 seconds to give workers time to connect.</param>
     /// <param name="progressLog">Optional progress log for recording clarification events.</param>
     /// <param name="knowledgeGraph">Optional knowledge graph for reloading on sync cycles.</param>
+    /// <param name="goalStore">Optional goal store for direct CRUD operations such as branch cleanup.</param>
     public GoalDispatcher(
         GoalManager goalManager,
         GoalPipelineManager pipelineManager,
@@ -84,7 +87,8 @@ public sealed class GoalDispatcher : BackgroundService
         ClarificationQueueService? clarificationQueue = null,
         TimeSpan? startupDelay = null,
         ProgressLog? progressLog = null,
-        KnowledgeGraph? knowledgeGraph = null)
+        KnowledgeGraph? knowledgeGraph = null,
+        IGoalStore? goalStore = null)
     {
         _repoManager = repoManager ?? throw new ArgumentNullException(nameof(repoManager));
         _goalManager = goalManager;
@@ -106,7 +110,10 @@ public sealed class GoalDispatcher : BackgroundService
         _maintenance = new DispatcherMaintenance(
             pipelineManager, goalManager, taskQueue, workerGateway, brain,
             agentsManager, configRepo, _dispatchedGoals, _redispatchQueue, logger,
-            knowledgeGraph);
+            knowledgeGraph,
+            goalStore: goalStore,
+            repoManager: repoManager,
+            config: config);
 
         _pipelineDriver = new PipelineDriver(
             brain: brain,
@@ -275,6 +282,13 @@ public sealed class GoalDispatcher : BackgroundService
                 if (DateTime.UtcNow - _maintenance.LastAgentsSync > AgentsSyncInterval)
                 {
                     await SyncAgentsFromConfigRepoAsync(stoppingToken);
+                }
+
+                // Periodic branch cleanup for completed goals
+                if (DateTime.UtcNow - _lastBranchCleanup > BranchCleanupInterval)
+                {
+                    await _maintenance.CleanupMergedBranchesAsync(stoppingToken);
+                    _lastBranchCleanup = DateTime.UtcNow;
                 }
 
                 await DrainRedispatchQueueAsync(stoppingToken);

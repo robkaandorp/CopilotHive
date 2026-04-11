@@ -52,4 +52,59 @@ public sealed class HiveConfigFileTests
         Assert.Null(config.Models);
     }
 
+    // ── BranchCleanupDelayHours tests ────────────────────────────────────────
+
+    [Fact]
+    public void OrchestratorConfig_BranchCleanupDelayHours_DefaultIs48()
+    {
+        var config = new OrchestratorConfig();
+
+        Assert.Equal(48, config.BranchCleanupDelayHours);
+    }
+
+    [Fact]
+    public void Deserialize_OrchestratorSection_BranchCleanupDelayHoursNotSet_DefaultIs48()
+    {
+        const string yaml = """
+            version: "1.0"
+            orchestrator:
+              model: gpt-4
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        Assert.NotNull(config);
+        Assert.Equal(48, config.Orchestrator.BranchCleanupDelayHours);
+    }
+
+    [Fact]
+    public void Deserialize_OrchestratorSection_BranchCleanupDelayHoursSet_UsesValue()
+    {
+        const string yaml = """
+            version: "1.0"
+            orchestrator:
+              branch_cleanup_delay_hours: 24
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        Assert.NotNull(config);
+        Assert.Equal(24, config.Orchestrator.BranchCleanupDelayHours);
+    }
+
+    [Fact]
+    public void Deserialize_OrchestratorSection_BranchCleanupDelayHoursZero_AllowsZero()
+    {
+        const string yaml = """
+            version: "1.0"
+            orchestrator:
+              branch_cleanup_delay_hours: 0
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        Assert.NotNull(config);
+        Assert.Equal(0, config.Orchestrator.BranchCleanupDelayHours);
+    }
+
 }
