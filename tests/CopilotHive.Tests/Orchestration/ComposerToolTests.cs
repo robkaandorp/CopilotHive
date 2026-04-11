@@ -3098,6 +3098,7 @@ public sealed class ComposerToolTests : IDisposable
 
         var prompt = composer.GetSystemPrompt();
         Assert.Contains("You are the Composer", prompt);
+        Assert.Contains("Knowledge consultation", prompt);
         Assert.DoesNotContain("Configured repositories:", prompt);
     }
 
