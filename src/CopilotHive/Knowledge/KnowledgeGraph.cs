@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using CopilotHive.Configuration;
 using Microsoft.Extensions.Logging;
 
@@ -199,21 +200,35 @@ public sealed class KnowledgeGraph
     // ── Query ──────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Performs a simple case-insensitive substring search across document Title, Tags, and Content.
+    /// Performs a case-insensitive tokenized search across document Id, Title, Tags, and Content.
+    /// All query tokens must match (AND logic); each token is checked as a substring against any field.
     /// </summary>
     public List<KnowledgeDocument> Search(string query)
     {
         if (string.IsNullOrWhiteSpace(query))
             return [.. _documents.Values];
 
-        var lower = query.ToLowerInvariant();
+        var terms = Tokenize(query);
         return _documents.Values
             .Where(d =>
-                d.Title.ToLowerInvariant().Contains(lower) ||
-                d.Content.ToLowerInvariant().Contains(lower) ||
-                d.Tags.Any(t => t.ToLowerInvariant().Contains(lower)))
+            {
+                var id      = d.Id.ToLowerInvariant();
+                var title   = d.Title.ToLowerInvariant();
+                var content = d.Content.ToLowerInvariant();
+                var tags    = d.Tags.Select(t => t.ToLowerInvariant()).ToList();
+                return terms.All(term =>
+                    id.Contains(term) ||
+                    title.Contains(term) ||
+                    content.Contains(term) ||
+                    tags.Any(t => t.Contains(term)));
+            })
             .ToList();
     }
+
+    private static IReadOnlyList<string> Tokenize(string input)
+        => Regex.Split(input.ToLowerInvariant(), @"[\s\-_\p{P}]+")
+                .Where(t => t.Length > 0)
+                .ToArray();
 
     /// <summary>Returns all documents whose Topic matches the given topic (case-insensitive).</summary>
     public List<KnowledgeDocument> FindByTopic(string topic)

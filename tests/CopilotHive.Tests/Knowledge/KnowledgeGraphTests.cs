@@ -336,6 +336,82 @@ public sealed class KnowledgeGraphTests : IDisposable
         Assert.Equal(2, results.Count);
     }
 
+    [Fact]
+    public async Task Search_ByMultipleTerms_ReturnsIntersection()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _graph.CreateDocumentAsync("arch-idea-impl", "Idea-to-Implementation Transition",
+            DocumentType.Implementation, "content", ct: ct);
+        await _graph.CreateDocumentAsync("features-idea", "Idea Collection",
+            DocumentType.Feature, "content", ct: ct);
+
+        var results = _graph.Search("idea implementation");
+
+        Assert.Single(results);
+        Assert.Equal("arch-idea-impl", results[0].Id);
+    }
+
+    [Fact]
+    public async Task Search_TokenizesHyphenatedWords()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // Use neutral title and id that contain no part of the search query
+        await _graph.CreateDocumentAsync("cfg-doc", "General Setup",
+            DocumentType.Feature, "In-App Configuration", ct: ct);
+
+        var results = _graph.Search("in app");
+
+        Assert.Single(results);
+        Assert.Equal("cfg-doc", results[0].Id);
+        // Verify the match came from content, not title or id
+        Assert.Contains("In-App Configuration", results[0].Content);
+        Assert.DoesNotContain("in", results[0].Title.ToLowerInvariant());
+        Assert.DoesNotContain("app", results[0].Title.ToLowerInvariant());
+    }
+
+    [Fact]
+    public async Task Search_TokenizesQueryPunctuation()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _graph.CreateDocumentAsync("arch-brain", "Brain Architecture",
+            DocumentType.Implementation, "body", ct: ct);
+
+        var results = _graph.Search("brain, architecture!");
+
+        Assert.Single(results);
+        Assert.Equal("arch-brain", results[0].Id);
+    }
+
+    [Fact]
+    public async Task Search_ById_ReturnsMatch()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _graph.CreateDocumentAsync("memory-idea-to-implementation-transition",
+            "Memory Doc", DocumentType.Memory, "some content", ct: ct);
+
+        var results = _graph.Search("idea implementation");
+
+        Assert.Single(results);
+        Assert.Equal("memory-idea-to-implementation-transition", results[0].Id);
+    }
+
+    [Fact]
+    public async Task Search_PartialTermMatchInContent()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // Use neutral title and id that contain no part of the search query
+        await _graph.CreateDocumentAsync("proc-doc", "Workflow Steps",
+            DocumentType.Implementation, "The orchestration system", ct: ct);
+
+        var results = _graph.Search("orchestr");
+
+        Assert.Single(results);
+        Assert.Equal("proc-doc", results[0].Id);
+        // Verify the match came from content, not title or id
+        Assert.Contains("orchestration", results[0].Content);
+        Assert.DoesNotContain("orchestr", results[0].Title.ToLowerInvariant());
+    }
+
     // ── FindByTopic ───────────────────────────────────────────────────────────
 
     [Fact]

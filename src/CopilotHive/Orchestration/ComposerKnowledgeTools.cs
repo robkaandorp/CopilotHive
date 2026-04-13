@@ -307,7 +307,7 @@ public sealed partial class Composer
     /// </summary>
     [Description("Search knowledge documents by text query, with optional filters for topic, type, status, and tag.")]
     internal Task<string> SearchKnowledgeAsync(
-        [Description("Search terms — substring match across title, content, and tags")] string query,
+        [Description("Search terms — tokenized multi-term search with AND logic across id, title, content, and tags")] string query,
         [Description("Filter by topic (optional)")] string? topic = null,
         [Description("Filter by document type: implementation, feature, idea, scratch, or memory (optional)")] string? type = null,
         [Description("Filter by status: draft, active, archived, or superseded (optional)")] string? status = null,
