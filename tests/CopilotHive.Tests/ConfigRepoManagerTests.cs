@@ -299,6 +299,70 @@ public class ConfigRepoManagerTests : IDisposable
         Assert.Same(first, second);
     }
 
+    // ── WriteConfigAsync tests ────────────────────────────────────────────────
+
+    [Fact]
+    public async Task WriteConfigAsync_SerializesWithSnakeCaseKeys()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "test-model" },
+            Models = new ModelsConfig { CompactionModel = "mini-model" },
+        };
+        var manager = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+
+        await manager.WriteConfigAsync(config, TestContext.Current.CancellationToken);
+
+        var yaml = await File.ReadAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
+        Assert.Contains("compaction_model:", yaml);
+    }
+
+    [Fact]
+    public async Task WriteConfigAsync_OmitsNullDefaultValues()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "my-model" },
+        };
+        var manager = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+
+        await manager.WriteConfigAsync(config, TestContext.Current.CancellationToken);
+
+        var yaml = await File.ReadAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
+        Assert.DoesNotContain("available_models", yaml);
+        Assert.DoesNotContain("compaction_model", yaml);
+        Assert.DoesNotContain("composer", yaml);
+    }
+
+    [Fact]
+    public async Task WriteConfigAsync_UpdatesCachedConfig()
+    {
+        // Write initial config to disk so LoadConfigAsync can read it
+        await File.WriteAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"),
+            "version: \"1.0\"",
+            TestContext.Current.CancellationToken);
+
+        var manager = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+
+        // Load once to populate cache
+        var first = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.Equal("1.0", first.Version);
+
+        // Write new config
+        var updated = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "updated-model" },
+        };
+        await manager.WriteConfigAsync(updated, TestContext.Current.CancellationToken);
+
+        // Load again — should return the updated config from cache
+        var second = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.Equal("updated-model", second.Orchestrator.Model);
+    }
+
     // ── Helper ───────────────────────────────────────────────────────────────
 
     private async Task<ConfigRepoManager> CreateManagerWithConfigAsync(string yaml)
@@ -514,5 +578,17 @@ public class ConfigRepoManagerTests : IDisposable
         await Task.WhenAll(stdoutTask, stderrTask);
         await proc.WaitForExitAsync();
         return (stdoutTask.Result, stderrTask.Result);
+    }
+}
+
+// Fake subclass that no-ops CommitFileAsync to avoid real git calls in WriteConfigAsync tests
+internal sealed class FakeConfigRepoManager(string url, string path) : ConfigRepoManager(url, path)
+{
+    public List<(string File, string Message)> Commits { get; } = [];
+
+    public override Task CommitFileAsync(string filePath, string commitMessage, CancellationToken ct = default)
+    {
+        Commits.Add((filePath, commitMessage));
+        return Task.CompletedTask;
     }
 }

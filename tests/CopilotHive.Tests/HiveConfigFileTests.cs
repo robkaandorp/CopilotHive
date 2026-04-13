@@ -107,4 +107,48 @@ public sealed class HiveConfigFileTests
         Assert.Equal(0, config.Orchestrator.BranchCleanupDelayHours);
     }
 
+    // ── AvailableModels deserialization ─────────────────────────────────────
+
+    [Fact]
+    public void Deserialize_AvailableModels_YamlListDeserializesCorrectly()
+    {
+        const string yaml = """
+            version: "1.0"
+            models:
+              available_models:
+                - name: copilot/claude-sonnet-4.6
+                  context_window: 200000
+                - name: copilot/gpt-5.4-mini
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        Assert.NotNull(config);
+        Assert.NotNull(config.Models);
+        Assert.NotNull(config.Models.AvailableModels);
+        Assert.Equal(2, config.Models.AvailableModels.Count);
+        Assert.Equal("copilot/claude-sonnet-4.6", config.Models.AvailableModels[0].Name);
+        Assert.Equal(200000, config.Models.AvailableModels[0].ContextWindow);
+        Assert.Equal("copilot/gpt-5.4-mini", config.Models.AvailableModels[1].Name);
+        Assert.Null(config.Models.AvailableModels[1].ContextWindow);
+    }
+
+    [Fact]
+    public void Deserialize_ModelEntry_ContextWindow_DefaultsToNullWhenOmitted()
+    {
+        const string yaml = """
+            version: "1.0"
+            models:
+              available_models:
+                - name: copilot/gpt-5
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        Assert.NotNull(config);
+        Assert.NotNull(config.Models);
+        Assert.NotNull(config.Models!.AvailableModels);
+        Assert.Null(config.Models.AvailableModels[0].ContextWindow);
+    }
+
 }

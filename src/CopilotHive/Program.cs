@@ -200,6 +200,8 @@ static async Task<int> RunServerAsync(string[] args)
         }
         builder.Services.AddSingleton(knowledgeGraph);
 
+        builder.Services.AddSingleton<ConfigModelService>();
+
         // If no explicit goals file, check config repo for goals.yaml
         if (string.IsNullOrEmpty(goalsFile))
         {
@@ -296,6 +298,9 @@ static async Task<int> RunServerAsync(string[] args)
 
     // Composer model-management REST API
     app.MapComposerEndpoints(composer);
+
+    // Model configuration REST API
+    app.MapConfigEndpoints();
 
     // Eager clone all configured repos at startup
     var repoManager = app.Services.GetService<IBrainRepoManager>();

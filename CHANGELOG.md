@@ -1,3 +1,12 @@
+## [Unreleased]
+
+### Added
+
+- **`ModelEntry` and `AvailableModels` in `ModelsConfig`** — A new sealed `ModelEntry` class (with `Name` and optional `ContextWindow` properties) was added to `HiveConfigFile`. `ModelsConfig` now exposes a `List<ModelEntry>? AvailableModels` property, enabling the upcoming Configuration page to populate model dropdown selectors from the config file.
+- **`ConfigRepoManager.WriteConfigAsync`** — New method that serializes a `HiveConfigFile` to YAML (using `UnderscoredNamingConvention`, omitting null/default values) and writes it back to `hive-config.yaml` in the config repo working directory. Updates the in-memory cache on success.
+- **`ConfigModelService`** — New singleton service that applies model configuration changes (orchestrator, composer, per-role workers, compaction) to the in-memory `HiveConfigFile`, writes the updated YAML via `WriteConfigAsync`, and commits the change to the config repo with a descriptive message.
+- **REST endpoints `GET /api/config/models` and `PATCH /api/config/models`** — New minimal API endpoints registered via `ConfigHub.MapConfigEndpoints()`. `GET` returns the current model configuration and available model list. `PATCH` accepts a `ModelConfigUpdate` DTO and delegates to `ConfigModelService` to persist the change.
+
 ## [0.9.0] - 2026-04-11
 
 ### Architecture & Refactoring

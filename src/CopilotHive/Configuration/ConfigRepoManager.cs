@@ -37,6 +37,11 @@ public class ConfigRepoManager
         .IgnoreUnmatchedProperties()
         .Build();
 
+    private static readonly ISerializer YamlSerializer = new SerializerBuilder()
+        .WithNamingConvention(UnderscoredNamingConvention.Instance)
+        .ConfigureDefaultValuesHandling(DefaultValuesHandling.OmitDefaults | DefaultValuesHandling.OmitNull)
+        .Build();
+
     /// <summary>
     /// Initialises a new <see cref="ConfigRepoManager"/>.
     /// </summary>
@@ -131,6 +136,21 @@ public class ConfigRepoManager
     internal static HiveConfigFile ParseConfig(string yaml)
     {
         return YamlDeserializer.Deserialize<HiveConfigFile>(yaml) ?? new HiveConfigFile();
+    }
+
+    /// <summary>
+    /// Serializes <paramref name="config"/> to YAML and writes it to <c>hive-config.yaml</c>
+    /// in the local config repo path, then updates the in-memory cache.
+    /// Call <see cref="CommitFileAsync"/> afterward to commit and push the change.
+    /// </summary>
+    /// <param name="config">The updated configuration to persist.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task WriteConfigAsync(HiveConfigFile config, CancellationToken ct = default)
+    {
+        var yaml = YamlSerializer.Serialize(config);
+        var configPath = Path.Combine(_localPath, "hive-config.yaml");
+        await File.WriteAllTextAsync(configPath, yaml, ct);
+        _cachedConfig = config;
     }
 
     /// <summary>
