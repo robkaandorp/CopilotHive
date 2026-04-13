@@ -138,10 +138,6 @@ public sealed class OrchestratorConfig
     /// and agent compaction threshold.
     /// </summary>
     public int WorkerContextWindow { get; set; } = Constants.DefaultBrainContextWindow;
-    /// <summary>Docker image used to spawn worker containers.</summary>
-    public string DockerImage { get; set; } = "robkaandorp/copilot-acp-server:dev";
-    /// <summary>Starting TCP port for worker containers; each additional worker increments by one.</summary>
-    public int BasePort { get; set; } = Constants.DefaultBasePort;
     /// <summary>
     /// Delay in hours before deleting feature branches for completed goals.
     /// Default: 48 hours. Set to 0 for immediate cleanup.
