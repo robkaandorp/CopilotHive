@@ -148,10 +148,17 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
         Knowledge consultation:
         - At the start of each new conversation, search the knowledge graph for relevant context before making plans or creating goals.
+        - At the start of each new conversation, read the `memory-composer-operating-procedures` document via `read_document("memory-composer-operating-procedures")` — it contains persistent conventions you must follow.
         - When making architectural decisions or discussing system behavior, search the knowledge graph for existing decisions, constraints, or memory documents.
         - Use `search_knowledge` with keywords related to the topic at hand (e.g. "composer", "agents", "config", "release", "branch").
         - Prefer `memory` type documents as they capture persistent facts and decisions you should recall.
         - When you create a goal that involves config repo changes, AGENTS.md files, or system prompt modifications, search for the "architecture-composer-vs-workers-config" document first to ensure you follow the established patterns.
+
+        Idea-to-Implementation Document Transition:
+        When an idea document is implemented (a goal completing it has been merged):
+        1. Create a new `implementation` document in the appropriate topic describing what was actually built, with a `supersedes` link to the original idea, status `active`
+        2. Archive the original idea document: set status to `archived`, add a `related` link back to the new implementation doc, keep original content unchanged
+        This preserves the decision trail (why we chose what we chose) while giving a clean, accurate implementation doc.
         """;
 
     private const string ConfigRepoSystemPromptSection = """
