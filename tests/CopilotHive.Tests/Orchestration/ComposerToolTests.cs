@@ -6031,6 +6031,60 @@ public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
         Assert.DoesNotContain("ideas-untagged-idea", result);
     }
 
+    // ── list_documents: snippet behavior ──
+
+    [Fact]
+    public async Task ListDocuments_SnippetIsPresent_OutputContainsSnippetLine()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // Create two documents with distinct, recognisable content strings
+        const string alphaContent = "UNIQUE_CONTENT_ALPHA snip-alpha";
+        const string betaContent  = "UNIQUE_CONTENT_BETA  snip-beta";
+        await _composer.CreateDocumentAsync("scratch", "snip-alpha", "Snip Alpha", "scratch", alphaContent, cancellationToken: ct);
+        await _composer.CreateDocumentAsync("scratch", "snip-beta",  "Snip Beta",  "scratch", betaContent,  cancellationToken: ct);
+
+        var result = await _composer.ListDocumentsAsync(cancellationToken: ct);
+
+        // Each document must have its own Snippet: line
+        Assert.Contains("  Snippet: UNIQUE_CONTENT_ALPHA snip-alpha", result);
+        Assert.Contains("  Snippet: UNIQUE_CONTENT_BETA  snip-beta",  result);
+
+        // Count occurrences: two documents → two Snippet: lines
+        var snippetCount = result.Split('\n').Count(l => l.StartsWith("  Snippet:"));
+        Assert.Equal(2, snippetCount);
+    }
+
+    [Fact]
+    public async Task ListDocuments_Truncation_LongContentSnippetIsTruncated()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // 201+ characters to trigger truncation
+        var longContent = new string('x', 250);
+        await _composer.CreateDocumentAsync("scratch", "snip-long", "Snip Long", "scratch", longContent, cancellationToken: ct);
+
+        var result = await _composer.ListDocumentsAsync(cancellationToken: ct);
+
+        // The snippet should be exactly 200 chars followed by "…"
+        var expectedSnippet = new string('x', 200) + "…";
+        Assert.Contains($"  Snippet: {expectedSnippet}", result);
+    }
+
+    [Fact]
+    public async Task ListDocuments_NewlineReplacement_NewlinesBecomeSpaces()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // Content with newlines — must be replaced by spaces in snippet
+        var contentWithNewlines = "first line\nsecond line\nthird line";
+        await _composer.CreateDocumentAsync("scratch", "snip-newline", "Snip Newline", "scratch", contentWithNewlines, cancellationToken: ct);
+
+        var result = await _composer.ListDocumentsAsync(cancellationToken: ct);
+
+        Assert.Contains("  Snippet: first line second line third line", result);
+        // Verify no literal newlines appear within the snippet line itself
+        var snippetLine = result.Split('\n').First(l => l.StartsWith("  Snippet:"));
+        Assert.DoesNotContain('\n', snippetLine);
+    }
+
     // ── traverse_graph: both direction ──
 
     [Fact]

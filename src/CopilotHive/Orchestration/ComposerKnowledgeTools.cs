@@ -510,6 +510,9 @@ public sealed partial class Composer
             if (doc.Tags.Count > 0)
                 sb.Append($" | Tags: {string.Join(", ", doc.Tags)}");
             sb.AppendLine();
+            var snippet = doc.Content.Length > 200 ? doc.Content[..200] + "…" : doc.Content;
+            snippet = snippet.Replace('\n', ' ');
+            sb.AppendLine($"  Snippet: {snippet}");
         }
 
         return Task.FromResult(sb.ToString().TrimEnd());
