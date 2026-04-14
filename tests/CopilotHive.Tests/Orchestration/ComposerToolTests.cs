@@ -875,6 +875,35 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("No goals found", result);
     }
 
+    [Fact]
+    public async Task ListGoals_StripsMarkdownHeadingFromDescription()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal { Id = "heading-goal", Description = "## My Goal Title\nSome details here", Status = GoalStatus.Draft };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var result = await _composer.ListGoalsAsync();
+
+        Assert.Contains("heading-goal", result);
+        Assert.Contains("My Goal Title", result);
+        Assert.DoesNotContain("##", result);
+    }
+
+    [Fact]
+    public async Task ListGoals_ReplacesNewlinesWithSpacesInDescription()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal { Id = "newline-goal", Description = "First line\nSecond line", Status = GoalStatus.Draft };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var result = await _composer.ListGoalsAsync();
+
+        Assert.Contains("newline-goal", result);
+        Assert.Contains("First line Second line", result);
+    }
+
     // ── search_goals ──
 
     [Fact]

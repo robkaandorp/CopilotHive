@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Globalization;
+using System.Text.RegularExpressions;
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Goals;
@@ -21,6 +22,28 @@ public sealed partial class Composer
 
     private static string Truncate(string text, int maxLength) =>
         text.Length <= maxLength ? text : text[..(maxLength - 1)] + "…";
+
+    [GeneratedRegex(@"^\s*#{1,6}\s+", RegexOptions.Compiled)]
+    private static partial Regex HeadingMarkerRegex();
+
+    /// <summary>
+    /// Cleans a description for display in list contexts by stripping leading headings
+    ///, collapsing whitespace, and truncating to the specified max length.
+    /// </summary>
+    private static string CleanDescription(string? description, int maxLength)
+    {
+        if (string.IsNullOrWhiteSpace(description))
+            return string.Empty;
+
+        var cleaned = description.TrimStart();
+        cleaned = HeadingMarkerRegex().Replace(cleaned, string.Empty);
+        cleaned = cleaned.Replace("\r\n", " ").Replace("\r", " ").Replace("\n", " ");
+        // Collapse any extra spaces that may have resulted from newline replacement
+        while (cleaned.Contains("  "))
+            cleaned = cleaned.Replace("  ", " ");
+
+        return Truncate(cleaned, maxLength);
+    }
 
     [Description("Create a new goal as Draft status. Returns the created goal summary.")]
     internal async Task<string> CreateGoalAsync(
@@ -519,7 +542,7 @@ public sealed partial class Composer
 
         foreach (var g in goals.OrderByDescending(g => g.CreatedAt))
         {
-            sb.AppendLine($"- `{g.Id}` [{g.Status.ToDisplayName()}] {g.Priority} — {Truncate(g.Description, 80)}");
+            sb.AppendLine($"- `{g.Id}` [{g.Status.ToDisplayName()}] {g.Priority} — {CleanDescription(g.Description, 150)}");
         }
 
         return sb.ToString();
@@ -548,7 +571,7 @@ public sealed partial class Composer
 
         foreach (var g in results)
         {
-            sb.AppendLine($"- `{g.Id}` [{g.Status.ToDisplayName()}] — {Truncate(g.Description, 80)}");
+            sb.AppendLine($"- `{g.Id}` [{g.Status.ToDisplayName()}] — {CleanDescription(g.Description, 150)}");
         }
 
         return sb.ToString();
