@@ -548,7 +548,7 @@ public sealed partial class Composer
         return sb.ToString();
     }
 
-    [Description("Search goals by text query across ID, description, and failure reason.")]
+    [Description("Search goals using tokenized multi-term search (AND logic) across ID, description, and failure reason.")]
     internal async Task<string> SearchGoalsAsync(
         [Description("Search query text")] string query,
         [Description("Optional status filter: Draft, Pending, InProgress, Completed, Failed")] string? status = null)

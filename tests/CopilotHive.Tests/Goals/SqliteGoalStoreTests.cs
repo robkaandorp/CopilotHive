@@ -195,6 +195,65 @@ public sealed class SqliteGoalStoreTests : IDisposable
         Assert.Equal("g1", results[0].Id);
     }
 
+    [Fact]
+    public async Task SearchGoals_MultiTermAndLogic()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateGoalAsync(MakeGoal("add-docker-worker-support", "Do stuff"), ct);
+        await _store.CreateGoalAsync(MakeGoal("remove-docker-worker-dead-code", "Do things"), ct);
+        await _store.CreateGoalAsync(MakeGoal("fix-build-pipeline", "Fix the build"), ct);
+
+        var results = await _store.SearchGoalsAsync("docker worker", ct: ct);
+        Assert.Equal(2, results.Count);
+        Assert.All(results, r => Assert.Contains("docker", r.Id));
+        Assert.All(results, r => Assert.Contains("worker", r.Id));
+    }
+
+    [Fact]
+    public async Task SearchGoals_TokenizesHyphenatedId()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateGoalAsync(MakeGoal("remove-docker-worker-dead-code", "Do stuff"), ct);
+
+        var results = await _store.SearchGoalsAsync("docker worker", ct: ct);
+        Assert.Single(results);
+        Assert.Equal("remove-docker-worker-dead-code", results[0].Id);
+    }
+
+    [Fact]
+    public async Task SearchGoals_TokenizesHyphenatedQuery()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateGoalAsync(MakeGoal("goal-alpha", "Add model selector UI"), ct);
+
+        var results = await _store.SearchGoalsAsync("model-selector", ct: ct);
+        Assert.Single(results);
+        Assert.Equal("goal-alpha", results[0].Id);
+    }
+
+    [Fact]
+    public async Task SearchGoals_NoTerms_ReturnsAll()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateGoalAsync(MakeGoal("goal-one", "First goal description"), ct);
+        await _store.CreateGoalAsync(MakeGoal("goal-two", "Second goal description"), ct);
+
+        var results = await _store.SearchGoalsAsync("---", ct: ct);
+        Assert.Equal(2, results.Count);
+    }
+
+    [Fact]
+    public async Task SearchGoals_NoTerms_WithStatusFilter()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateGoalAsync(MakeGoal("goal-pending", "First goal", GoalStatus.Pending), ct);
+        await _store.CreateGoalAsync(MakeGoal("goal-completed", "Second goal", GoalStatus.Completed), ct);
+
+        var results = await _store.SearchGoalsAsync("---", GoalStatus.Pending, ct);
+        Assert.Single(results);
+        Assert.Equal("goal-pending", results[0].Id);
+    }
+
     // ── UpdateGoalStatusAsync ─────────────────────────────────────────────
 
     [Fact]

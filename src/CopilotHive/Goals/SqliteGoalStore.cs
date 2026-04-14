@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using CopilotHive.Configuration;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
@@ -398,19 +399,42 @@ public sealed class SqliteGoalStore : IGoalStore
 
     // ── Search ───────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Tokenizes a search query by splitting on whitespace, hyphens, underscores, and punctuation,
+    /// lowercasing each token, and filtering out empty tokens.
+    /// </summary>
+    private static List<string> TokenizeSearchQuery(string query)
+    {
+        var tokens = Regex.Split(query, @"[\s\-_\p{P}]+")
+            .Select(t => t.ToLowerInvariant())
+            .Where(t => !string.IsNullOrEmpty(t))
+            .ToList();
+        return tokens;
+    }
+
     /// <inheritdoc />
     public Task<IReadOnlyList<Goal>> SearchGoalsAsync(string query, GoalStatus? statusFilter = null, CancellationToken ct = default)
     {
         lock (_lock)
         {
-            var sql = "SELECT * FROM goals WHERE (id LIKE @q OR description LIKE @q OR failure_reason LIKE @q)";
+            var terms = TokenizeSearchQuery(query);
+            var clauses = new List<string>();
+
+            for (var i = 0; i < terms.Count; i++)
+                clauses.Add($"(id LIKE @term{i} OR description LIKE @term{i} OR failure_reason LIKE @term{i})");
+
             if (statusFilter.HasValue)
-                sql += " AND status = @status";
+                clauses.Add("status = @status");
+
+            var sql = "SELECT * FROM goals";
+            if (clauses.Count > 0)
+                sql += " WHERE " + string.Join(" AND ", clauses);
             sql += " ORDER BY created_at DESC";
 
             using var cmd = _db.CreateCommand();
             cmd.CommandText = sql;
-            cmd.Parameters.AddWithValue("@q", $"%{query}%");
+            for (var i = 0; i < terms.Count; i++)
+                cmd.Parameters.AddWithValue($"@term{i}", $"%{terms[i]}%");
             if (statusFilter.HasValue)
                 cmd.Parameters.AddWithValue("@status", statusFilter.Value.ToString().ToLowerInvariant());
 
