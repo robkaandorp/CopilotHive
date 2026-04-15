@@ -1,11 +1,22 @@
 ## [Unreleased]
 
+## [0.10.0] - 2026-04-13
+
 ### Added
 
-- **`ModelEntry` and `AvailableModels` in `ModelsConfig`** — A new sealed `ModelEntry` class (with `Name` and optional `ContextWindow` properties) was added to `HiveConfigFile`. `ModelsConfig` now exposes a `List<ModelEntry>? AvailableModels` property, enabling the upcoming Configuration page to populate model dropdown selectors from the config file.
-- **`ConfigRepoManager.WriteConfigAsync`** — New method that serializes a `HiveConfigFile` to YAML (using `UnderscoredNamingConvention`, omitting null/default values) and writes it back to `hive-config.yaml` in the config repo working directory. Updates the in-memory cache on success.
-- **`ConfigModelService`** — New singleton service that applies model configuration changes (orchestrator, composer, per-role workers, compaction) to the in-memory `HiveConfigFile`, writes the updated YAML via `WriteConfigAsync`, and commits the change to the config repo with a descriptive message.
-- **REST endpoints `GET /api/config/models` and `PATCH /api/config/models`** — New minimal API endpoints registered via `ConfigHub.MapConfigEndpoints()`. `GET` returns the current model configuration and available model list. `PATCH` accepts a `ModelConfigUpdate` DTO and delegates to `ConfigModelService` to persist the change.
+- **In-App Model Configuration** — Users can now change model configuration from the Configuration dashboard page. A new "Models" tab provides dropdown selectors for the orchestrator (Brain), composer, per-role workers, and compaction model, populated from the `available_models` list in `hive-config.yaml`. Changes take effect on the next goal dispatch and are written back to `hive-config.yaml` via `ConfigModelService`. Backend includes: `ModelEntry`/`AvailableModels` config model, `ConfigRepoManager.WriteConfigAsync` for YAML round-trip serialization, `ConfigModelService` singleton for applying and persisting changes, and REST endpoints `GET /api/config/models` and `PATCH /api/config/models`.
+- **Draft goal editing** — Draft goals are now fully editable via the Composer's `update_goal` tool. Description, priority, scope, repositories, depends_on, and documents can all be changed on Draft goals (previously only status and release were editable).
+- **"Unrelease" button** — The release detail page now has an "Unrelease" button that reverts a Released release back to Planning, allowing edits and goal reassignment.
+- **Automatic branch cleanup** — `DispatcherMaintenance` periodically deletes `copilothive/{goal-id}` feature branches from target repositories after a configurable delay once the goal is completed and merged.
+- **Composer operating procedures in system prompt** — The Composer's system prompt now includes an explicit startup instruction to read `memory-composer-operating-procedures` and the idea-to-implementation transition convention, ensuring these procedures survive session resets.
+- **Knowledge graph consultation guidance in Composer prompt** — The Composer's system prompt includes explicit guidance to proactively consult the knowledge graph during conversations.
+- **Tokenized multi-term search** — Both `KnowledgeGraph.Search()` and `SqliteGoalStore.SearchGoalsAsync()` now use tokenized multi-term matching (AND logic) instead of single contiguous substring matching. Queries are split on whitespace, hyphens, underscores, and punctuation, so `"docker worker"` matches `remove-docker-worker-dead-code` and `"idea to implementation"` matches documents containing `"Idea-to-Implementation"`. Document IDs are also now searchable.
+- **Content snippets in `list_documents`** — The `list_documents` tool now shows a 200-character content snippet for each document (matching `search_knowledge`), making it easier to scan and identify documents without calling `read_document` on each.
+- **Improved `list_goals` descriptions** — The `list_goals` tool now truncates descriptions to 150 characters (up from 80), strips leading markdown heading markers, and replaces newlines with spaces for cleaner single-line display.
+
+### Removed
+
+- **Docker worker dead code** — Removed the unused Docker-based worker management code (`DockerWorkerManager`, `IWorkerManager`, `WorkerInfo`, `FakeWorkerManager`), the `DockerImage` and `BasePort` config fields from `OrchestratorConfig`, `DefaultBasePort` from `Constants.cs`, and the `Docker.DotNet` NuGet package. The system exclusively uses the gRPC-based worker architecture.
 
 ## [0.9.0] - 2026-04-11
 
