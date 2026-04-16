@@ -1,23 +1,19 @@
 #pragma warning disable CS1591
 #pragma warning disable OPENAI001 // ResponsesClient.AsIChatClient is experimental
-using System;
-using System.Collections.Generic;
-using System.Net;
-using System.Net.Http;
-using System.Net.Http.Headers;
-using System.Text.Json.Nodes;
-using System.Threading;
-using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Http.Resilience;
-using OpenAI;
-using Polly;
-using Polly.Retry;
-using Polly.Timeout;
-using System.ClientModel;
+
 using OllamaSharp;
 
-namespace CopilotHive.SDK;
+using OpenAI;
+
+using Polly;
+
+using System.ClientModel;
+using System.Net.Http.Headers;
+using System.Text.Json.Nodes;
+
+namespace CopilotHive.Shared.AI;
 
 /// <summary>
 /// Creates <see cref="IChatClient"/> instances for various LLM providers.
@@ -38,46 +34,46 @@ public static class ChatClientFactory
         switch (provider)
         {
             case "ollama-cloud":
-            {
-                var apiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
-                if (string.IsNullOrEmpty(apiKey)) throw new InvalidOperationException("OLLAMA_API_KEY is required for ollama-cloud provider");
-
-                var httpClient = new HttpClient(CreateResilientHandler())
                 {
-                    BaseAddress = new Uri("https://ollama.com"),
-                    Timeout = Timeout.InfiniteTimeSpan,
-                };
-                httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+                    var apiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
+                    if (string.IsNullOrEmpty(apiKey)) throw new InvalidOperationException("OLLAMA_API_KEY is required for ollama-cloud provider");
 
-                model ??= Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "gpt-oss:120b";
-                var ollamaClient = new OllamaApiClient(httpClient);
-                ollamaClient.SelectedModel = model;
-                return ollamaClient;
-            }
+                    var httpClient = new HttpClient(CreateResilientHandler())
+                    {
+                        BaseAddress = new Uri("https://ollama.com"),
+                        Timeout = Timeout.InfiniteTimeSpan,
+                    };
+                    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+
+                    model ??= Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "gpt-oss:120b";
+                    var ollamaClient = new OllamaApiClient(httpClient);
+                    ollamaClient.SelectedModel = model;
+                    return ollamaClient;
+                }
 
             case "ollama-local":
-            {
-                var url = Environment.GetEnvironmentVariable("OLLAMA_URL") ?? "http://localhost:11434";
-                model ??= Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "llama3";
-                var ollamaClient = new OllamaApiClient(new Uri(url));
-                ollamaClient.SelectedModel = model;
-                return ollamaClient;
-            }
+                {
+                    var url = Environment.GetEnvironmentVariable("OLLAMA_URL") ?? "http://localhost:11434";
+                    model ??= Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "llama3";
+                    var ollamaClient = new OllamaApiClient(new Uri(url));
+                    ollamaClient.SelectedModel = model;
+                    return ollamaClient;
+                }
 
             case "github":
-            {
-                var token = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
-                if (string.IsNullOrEmpty(token)) throw new InvalidOperationException("GH_TOKEN or GITHUB_TOKEN is required for github provider");
+                {
+                    var token = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+                    if (string.IsNullOrEmpty(token)) throw new InvalidOperationException("GH_TOKEN or GITHUB_TOKEN is required for github provider");
 
-                model ??= Environment.GetEnvironmentVariable("GITHUB_MODEL") ?? "openai/gpt-4.1";
+                    model ??= Environment.GetEnvironmentVariable("GITHUB_MODEL") ?? "openai/gpt-4.1";
 
-                var openAiClient = new OpenAIClient(
-                    new ApiKeyCredential(token),
-                    new OpenAIClientOptions { Endpoint = new Uri("https://models.github.ai") }
-                );
+                    var openAiClient = new OpenAIClient(
+                        new ApiKeyCredential(token),
+                        new OpenAIClientOptions { Endpoint = new Uri("https://models.github.ai") }
+                    );
 
-                return openAiClient.GetChatClient(model).AsIChatClient();
-            }
+                    return openAiClient.GetChatClient(model).AsIChatClient();
+                }
 
             case "copilot":
                 return CreateCopilotClient(model ?? Environment.GetEnvironmentVariable("COPILOT_MODEL") ?? "claude-sonnet-4.6");

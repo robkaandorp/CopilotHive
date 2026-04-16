@@ -1,14 +1,18 @@
-using System.ComponentModel;
-using System.Text.Json;
 using CopilotHive.Agents;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
 using CopilotHive.Metrics;
 using CopilotHive.Services;
+using CopilotHive.Shared.AI;
 using CopilotHive.Workers;
+
 using Microsoft.Extensions.AI;
+
 using SharpCoder;
+
+using System.ComponentModel;
+using System.Text.Json;
 
 namespace CopilotHive.Orchestration;
 
@@ -87,7 +91,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _masterSession = AgentSession.Create("brain");
         _session = _masterSession;
 
-        var (_, _, reasoning) = SDK.ChatClientFactory.ParseProviderModelAndReasoning(modelOverride);
+        var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(modelOverride);
         _reasoningEffort = reasoning;
 
         _brainTools = BuildBrainTools();
@@ -103,7 +107,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     {
         _logger.LogInformation("Brain connecting with model '{Model}'…", _modelOverride);
 
-        _chatClient ??= SDK.ChatClientFactory.Create(_modelOverride);
+        _chatClient ??= ChatClientFactory.Create(_modelOverride);
 
         // Try to load a persisted master session from a previous run.
         // Migrate legacy brain-session.json to brain-master.json if needed.
@@ -530,7 +534,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             ReasoningEffort = _reasoningEffort,
             Logger = _logger,
             CompactionClient = !string.IsNullOrEmpty(_compactionModel)
-                ? CopilotHive.SDK.ChatClientFactory.Create(_compactionModel)
+                ? ChatClientFactory.Create(_compactionModel)
                 : null,
             OnCompacted = r =>
             {

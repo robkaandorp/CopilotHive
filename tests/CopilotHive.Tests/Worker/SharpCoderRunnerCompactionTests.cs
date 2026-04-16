@@ -1,11 +1,12 @@
-extern alias WorkerAssembly;
+using CopilotHive.Worker;
+using CopilotHive.Workers;
+
+using Microsoft.Extensions.AI;
+
+using SharpCoder;
 
 using System.Reflection;
 using System.Runtime.CompilerServices;
-using CopilotHive.Workers;
-using Microsoft.Extensions.AI;
-using SharpCoder;
-using WorkerAssembly::CopilotHive.Worker;
 
 namespace CopilotHive.Tests.Worker;
 

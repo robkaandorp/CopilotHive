@@ -1,14 +1,15 @@
-using System.ComponentModel;
 using CopilotHive.Configuration;
-using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
 using CopilotHive.Services;
-using CopilotHive.Workers;
+using CopilotHive.Shared.AI;
+
 using Microsoft.Extensions.AI;
-using Microsoft.Extensions.DependencyInjection;
+
 using SharpCoder;
+
+using System.ComponentModel;
 
 namespace CopilotHive.Orchestration;
 
@@ -258,7 +259,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
         AvailableModels = (availableModels?.ToList() ?? [model]).AsReadOnly();
 
-        var (_, _, reasoning) = SDK.ChatClientFactory.ParseProviderModelAndReasoning(model);
+        var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
         _reasoningEffort = reasoning;
 
         _systemPrompt = DefaultSystemPrompt;
@@ -333,11 +334,11 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
         // Update model and re-parse reasoning effort
         _model = model;
-        var (_, _, reasoning) = SDK.ChatClientFactory.ParseProviderModelAndReasoning(model);
+        var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
         _reasoningEffort = reasoning;
 
         // Create new client
-        _chatClient = (_chatClientFactory ?? SDK.ChatClientFactory.Create)(model);
+        _chatClient = (_chatClientFactory ?? ChatClientFactory.Create)(model);
 
         // Rebuild agent — session is preserved
         RecreateAgent();
@@ -352,7 +353,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     {
         _logger.LogInformation("Composer connecting with model '{Model}'…", _model);
 
-        _chatClient = (_chatClientFactory ?? SDK.ChatClientFactory.Create)(_model);
+        _chatClient = (_chatClientFactory ?? ChatClientFactory.Create)(_model);
 
         var sessionFile = GetSessionFilePath();
         if (File.Exists(sessionFile))
@@ -533,7 +534,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             ShowToolCallsInStream = true,
             Logger = _logger,
             CompactionClient = !string.IsNullOrEmpty(_compactionModel)
-                ? CopilotHive.SDK.ChatClientFactory.Create(_compactionModel)
+                ? ChatClientFactory.Create(_compactionModel)
                 : null,
             OnCompacting = () =>
             {

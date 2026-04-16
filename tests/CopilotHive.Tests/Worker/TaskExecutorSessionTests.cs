@@ -1,12 +1,13 @@
-extern alias WorkerAssembly;
-
-using System.Text.Json;
 using CopilotHive.Goals;
 using CopilotHive.Services;
+using CopilotHive.Worker;
 using CopilotHive.Workers;
+
 using Microsoft.Extensions.AI;
+
 using SharpCoder;
-using WorkerAssembly::CopilotHive.Worker;
+
+using System.Text.Json;
 
 namespace CopilotHive.Tests.Worker;
 

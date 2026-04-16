@@ -1,8 +1,6 @@
-extern alias WorkerAssembly;
-
-using System.Collections.Generic;
-using System.Reflection;
 using Microsoft.Extensions.AI;
+
+using System.Reflection;
 
 namespace CopilotHive.Tests.Worker;
 
@@ -17,7 +15,7 @@ public sealed class SharpCoderRunnerSummarizeMessageTests
     // ── Reflection helper ────────────────────────────────────────────────────
 
     private static readonly MethodInfo SummarizeMethod =
-        typeof(WorkerAssembly::CopilotHive.Worker.SharpCoderRunner)
+        typeof(CopilotHive.Worker.SharpCoderRunner)
             .GetMethod("SummarizeMessage", BindingFlags.NonPublic | BindingFlags.Static)!;
 
     /// <summary>

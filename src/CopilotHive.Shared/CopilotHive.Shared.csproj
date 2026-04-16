@@ -10,10 +10,17 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
     </PackageReference>
     <PackageReference Include="Google.Protobuf" Version="3.34.1" />
+    <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.5.0" />
+    <PackageReference Include="Microsoft.Extensions.Http.Resilience" Version="10.5.0" />
+    <PackageReference Include="OllamaSharp" Version="5.4.25" />
   </ItemGroup>
 
   <ItemGroup>
     <Protobuf Include="Protos\*.proto" GrpcServices="Both" />
+  </ItemGroup>
+
+  <ItemGroup>
+	<InternalsVisibleTo Include="CopilotHive.Tests" />
   </ItemGroup>
 
 </Project>

@@ -1,14 +1,13 @@
-extern alias WorkerAssembly;
-
-using System.Diagnostics;
 using CopilotHive.Git;
 using CopilotHive.Goals;
-using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
+using CopilotHive.Worker;
 using CopilotHive.Workers;
+
 using Microsoft.Extensions.Logging.Abstractions;
-using WorkerAssembly::CopilotHive.Worker;
+
+using System.Diagnostics;
 
 namespace CopilotHive.Tests;
 

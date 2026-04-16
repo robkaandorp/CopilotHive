@@ -1,7 +1,6 @@
-extern alias WorkerAssembly;
+using CopilotHive.Shared.AI;
 
 using System.Net;
-using WorkerAssembly::CopilotHive.SDK;
 
 namespace CopilotHive.Tests.Worker;
 
@@ -309,7 +308,7 @@ public sealed class CopilotResponsesHandlerTests
     /// text/event-stream), <see cref="ChatClientFactory.CopilotResponsesHandler"/>
     /// returns it immediately without reading or modifying the body, so the SSE stream
     /// can be consumed directly by the OpenAI SDK's streaming parser.
-/// </summary>
+    /// </summary>
     [Fact]
     public async Task StreamingResponse_PassesThrough_Intact()
     {
@@ -337,7 +336,7 @@ public sealed class CopilotResponsesHandlerTests
     /// Verifies that non-streaming (application/json) responses are still fully processed:
     /// the handler reads the body, parses it for turn history accumulation, and
     /// re-wraps it as StringContent.
-/// </summary>
+    /// </summary>
     [Fact]
     public async Task NonStreamingResponse_StillProcessed()
     {

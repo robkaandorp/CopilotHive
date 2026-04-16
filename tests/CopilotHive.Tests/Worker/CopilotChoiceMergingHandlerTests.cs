@@ -1,10 +1,8 @@
-extern alias WorkerAssembly;
-
 using System.Net;
 using System.Text;
 using System.Text.Json.Nodes;
-using WorkerAssembly::CopilotHive.SDK;
-using CopilotChoiceMergingHandler = WorkerAssembly::CopilotHive.SDK.ChatClientFactory.CopilotChoiceMergingHandler;
+
+using CopilotChoiceMergingHandler = CopilotHive.Shared.AI.ChatClientFactory.CopilotChoiceMergingHandler;
 
 namespace CopilotHive.Tests.Worker;
 

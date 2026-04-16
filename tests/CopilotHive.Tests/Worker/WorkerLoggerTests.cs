@@ -1,7 +1,4 @@
-extern alias WorkerAssembly;
-
-using System.IO;
-using WorkerAssembly::CopilotHive.Worker;
+using CopilotHive.Worker;
 
 namespace CopilotHive.Tests.Worker;
 

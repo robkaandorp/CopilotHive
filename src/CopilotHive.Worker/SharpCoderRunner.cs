@@ -1,24 +1,16 @@
 #pragma warning disable CS1591
 #pragma warning disable OPENAI001 // ResponsesClient.AsIChatClient is experimental
-using System;
-using System.Collections.Generic;
+using CopilotHive.Shared;
+using CopilotHive.Shared.AI;
+using CopilotHive.Workers;
+
+using Microsoft.Extensions.AI;
+
+using SharpCoder;
+
 using System.ComponentModel;
 using System.Diagnostics;
-using System.Linq;
-using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Text.Json;
-using System.Text.Json.Nodes;
-using System.Threading;
-using System.Threading.Tasks;
-using CopilotHive.Shared;
-using CopilotHive.Workers;
-using Microsoft.Extensions.AI;
-using OpenAI;
-using OpenAI.Responses;
-using System.ClientModel;
-using SharpCoder;
-using OllamaSharp;
 
 namespace CopilotHive.Worker;
 
@@ -39,7 +31,7 @@ public sealed class SharpCoderRunner : IAgentRunner
 
     /// <summary>
     /// Internal constructor for unit testing: injects a pre-created <see cref="IChatClient"/>
-    /// and model name, bypassing <see cref="CopilotHive.SDK.ChatClientFactory"/> so that tests
+    /// and model name, bypassing <see cref="Shared.AI.ChatClientFactory"/> so that tests
     /// can run without real LLM credentials.
     /// </summary>
     /// <param name="chatClient">The chat client to use for agent execution.</param>
@@ -301,7 +293,7 @@ public sealed class SharpCoderRunner : IAgentRunner
 
         var stopwatch = Stopwatch.StartNew();
         _log.Info($"Executing task as {_currentRole} with model {_currentModel}. WorkDir: {workDir}");
-        
+
         var options = new AgentOptions
         {
             WorkDirectory = workDir,
@@ -316,7 +308,7 @@ public sealed class SharpCoderRunner : IAgentRunner
         };
 
         if (!string.IsNullOrEmpty(_compactionModel))
-            options.CompactionClient = CopilotHive.SDK.ChatClientFactory.Create(_compactionModel);
+            options.CompactionClient = ChatClientFactory.Create(_compactionModel);
 
         // Write pre-execution diagnostics so we can inspect inputs even if the LLM call hangs or is killed
         WriteDiagnosticsFile(null, prompt, TimeSpan.Zero, options, "pre");
@@ -520,12 +512,12 @@ public sealed class SharpCoderRunner : IAgentRunner
 
     private IChatClient CreateChatClient(string? modelOverride = null)
     {
-        var (provider, model, reasoning) = CopilotHive.SDK.ChatClientFactory.ParseProviderModelAndReasoning(modelOverride);
+        var (provider, model, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(modelOverride);
         _currentModel = model ?? "(default)";
         _currentReasoning = reasoning;
         _log.Info($"Creating chat client: provider={provider}, model={_currentModel}" +
             (reasoning.HasValue ? $", reasoning={reasoning.Value}" : ""));
-        return CopilotHive.SDK.ChatClientFactory.Create(modelOverride);
+        return ChatClientFactory.Create(modelOverride);
     }
 
     private IList<AITool> BuildCustomTools()
@@ -535,7 +527,7 @@ public sealed class SharpCoderRunner : IAgentRunner
         if (_toolBridge != null)
         {
             tools.Add(AIFunctionFactory.Create(
-                async ([Description("Short status summary")] string status, 
+                async ([Description("Short status summary")] string status,
                        [Description("Detailed progress explanation")] string details) =>
                 {
                     if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";

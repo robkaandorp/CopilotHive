@@ -1,14 +1,10 @@
-extern alias WorkerAssembly;
+using CopilotHive.Worker;
+using CopilotHive.Workers;
 
-using System;
-using System.IO;
+using Microsoft.Extensions.AI;
+
 using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
-using CopilotHive.Workers;
-using Microsoft.Extensions.AI;
-using WorkerAssembly::CopilotHive.Worker;
 
 namespace CopilotHive.Tests.Worker;
 
