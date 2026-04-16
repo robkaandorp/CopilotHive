@@ -34,7 +34,7 @@ LABEL maintainer="CopilotHive" \
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install system packages and GitHub CLI (no Node.js/npm needed — SharpCoder handles LLM directly)
-RUN apt-get update \
+RUN apt-get -o Acquire::Retries=5 update \
     && apt-get install -y \
         git curl wget jq openssh-client ca-certificates gnupg \
         ripgrep fd-find tree file \
@@ -45,7 +45,7 @@ RUN apt-get update \
        | gpg --dearmor -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
        > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update \
+    && apt-get -o Acquire::Retries=5 update \
     && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/* /tmp/*
 
