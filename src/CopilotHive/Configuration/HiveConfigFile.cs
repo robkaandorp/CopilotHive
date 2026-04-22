@@ -73,6 +73,80 @@ public sealed class HiveConfigFile
     /// Delegates to <see cref="GetContextWindowForRole(string)"/> using the role's name.
     /// </summary>
     public int GetContextWindowForRole(WorkerRole role) => GetContextWindowForRole(role.ToRoleName());
+
+    /// <summary>
+    /// Deep-copies all top-level properties from <paramref name="source"/> onto this instance,
+    /// replacing old collections with new instances so callers holding the singleton reference
+    /// see the updated data immediately.
+    /// </summary>
+    public void ReloadFrom(HiveConfigFile source)
+    {
+        Version = source.Version;
+
+        Repositories = new List<RepositoryConfig>(
+            source.Repositories.Select(r => new RepositoryConfig
+            {
+                Name = r.Name,
+                Url = r.Url,
+                DefaultBranch = r.DefaultBranch
+            }));
+
+        Workers = new Dictionary<string, WorkerConfig>(
+            source.Workers.Select(kv => KeyValuePair.Create(
+                kv.Key,
+                new WorkerConfig
+                {
+                    Model = kv.Value.Model,
+                    PremiumModel = kv.Value.PremiumModel,
+                    ContextWindow = kv.Value.ContextWindow
+                })));
+
+        Orchestrator = new OrchestratorConfig
+        {
+            Model = source.Orchestrator.Model,
+            MaxIterations = source.Orchestrator.MaxIterations,
+            MaxRetriesPerTask = source.Orchestrator.MaxRetriesPerTask,
+            MaxParallelGoals = source.Orchestrator.MaxParallelGoals,
+            AlwaysImprove = source.Orchestrator.AlwaysImprove,
+            VerboseLogging = source.Orchestrator.VerboseLogging,
+            BrainContextWindow = source.Orchestrator.BrainContextWindow,
+            BrainMaxSteps = source.Orchestrator.BrainMaxSteps,
+            WorkerContextWindow = source.Orchestrator.WorkerContextWindow,
+            BranchCleanupDelayHours = source.Orchestrator.BranchCleanupDelayHours
+        };
+
+        if (source.Models is not null)
+        {
+            Models = new ModelsConfig
+            {
+                CompactionModel = source.Models.CompactionModel,
+                AvailableModels = source.Models.AvailableModels?.Select(m => new ModelEntry
+                {
+                    Name = m.Name,
+                    ContextWindow = m.ContextWindow
+                }).ToList()
+            };
+        }
+        else
+        {
+            Models = null;
+        }
+
+        if (source.Composer is not null)
+        {
+            Composer = new ComposerConfig
+            {
+                Model = source.Composer.Model,
+                Models = source.Composer.Models?.ToList(),
+                ContextWindow = source.Composer.ContextWindow,
+                MaxSteps = source.Composer.MaxSteps
+            };
+        }
+        else
+        {
+            Composer = null;
+        }
+    }
 }
 
 /// <summary>

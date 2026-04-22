@@ -119,6 +119,13 @@ internal sealed class DispatcherMaintenance
                     _logger.LogWarning(ex, "Failed to reload knowledge graph from config repo");
                 }
             }
+
+            if (_config is not null && _configRepo is not null)
+            {
+                var freshConfig = await _configRepo.LoadConfigAsync(ct);
+                _config.ReloadFrom(freshConfig);
+                _logger.LogInformation("Reloaded hive configuration from config repo");
+            }
         }
         catch (Exception ex)
         {
