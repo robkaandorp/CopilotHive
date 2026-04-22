@@ -77,6 +77,22 @@ public sealed class HiveConfigFile
     }
 
     /// <summary>
+    /// Returns the globally-configured available model names from <see cref="ModelsConfig.AvailableModels"/>,
+    /// or falls back to the composer-local list via <see cref="ComposerConfig.GetAvailableModels(string)"/>.
+    /// </summary>
+    /// <param name="fallback">Model to return when no models are configured anywhere.</param>
+    /// <returns>A non-empty list of model identifiers.</returns>
+    public List<string> GetComposerAvailableModels(string fallback)
+    {
+        if (Models?.AvailableModels is not null && Models.AvailableModels.Count > 0)
+        {
+            return Models.AvailableModels.Select(m => m.Name).ToList();
+        }
+
+        return Composer?.GetAvailableModels(fallback) ?? [fallback];
+    }
+
+    /// <summary>
     /// Resolves the model to use for a given role (typed overload).
     /// Delegates to <see cref="GetModelForRole(string)"/> using the role's name.
     /// </summary>

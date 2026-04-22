@@ -144,7 +144,7 @@ public sealed class Program
                     ?? config?.Orchestrator.BrainContextWindow
                     ?? Constants.DefaultBrainContextWindow;
                 var maxSteps = composerConfig?.MaxSteps ?? config?.Orchestrator.BrainMaxSteps ?? Constants.DefaultBrainMaxSteps;
-                var availableModels = composerConfig?.GetAvailableModels(model) ?? [model];
+                var availableModels = config?.GetComposerAvailableModels(model) ?? [model];
 
                 return new Composer(model, sp.GetRequiredService<ILogger<Composer>>(),
                     sp.GetRequiredService<IGoalStore>(),
@@ -312,7 +312,7 @@ public sealed class Program
             }
 
             // Composer model-management REST API
-            app.MapComposerEndpoints(composer);
+            app.MapComposerEndpoints(composer, app.Services.GetService<HiveConfigFile>());
 
             // Model configuration REST API
             app.MapConfigEndpoints();

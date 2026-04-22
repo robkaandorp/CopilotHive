@@ -1,3 +1,5 @@
+using CopilotHive.Configuration;
+
 namespace CopilotHive.Orchestration;
 
 /// <summary>
@@ -11,7 +13,8 @@ public static class ComposerHub
     /// </summary>
     /// <param name="routes">The route group to map endpoints onto.</param>
     /// <param name="composer">The Composer instance to expose.</param>
-    public static void MapComposerEndpoints(this WebApplication routes, Composer? composer)
+    /// <param name="config">Optional global configuration that may define a shared model list.</param>
+    public static void MapComposerEndpoints(this WebApplication routes, Composer? composer, HiveConfigFile? config = null)
     {
         if (composer is null) return;
 
@@ -19,12 +22,28 @@ public static class ComposerHub
             Results.Ok(new { model = composer.GetStats()?.Model ?? composer.AvailableModels.FirstOrDefault() ?? "" }));
 
         routes.MapGet("/api/composer/models", () =>
-            Results.Ok(new { models = composer.AvailableModels }));
+        {
+            var globalModelNames = config?.Models?.AvailableModels is { Count: > 0 } available
+                ? available.Select(m => m.Name).ToList()
+                : null;
+            return Results.Ok(new { models = globalModelNames ?? composer.AvailableModels });
+        });
 
         routes.MapPost("/api/composer/models/switch", async (string model) =>
         {
             try
             {
+                var globalModelNames = config?.Models?.AvailableModels is { Count: > 0 } available
+                    ? available.Select(m => m.Name).ToList()
+                    : null;
+                var validModels = globalModelNames ?? composer.AvailableModels.ToList();
+                if (!validModels.Contains(model, StringComparer.OrdinalIgnoreCase))
+                {
+                    throw new ArgumentException(
+                        $"Model '{model}' is not available. Available models: {string.Join(", ", validModels)}.",
+                        nameof(model));
+                }
+
                 await composer.SwitchModelAsync(model);
                 return Results.Ok(new { model = composer.GetStats()?.Model ?? model });
             }

@@ -43,9 +43,13 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly ConfigRepoManager? _configRepo;
     private readonly KnowledgeGraph? _knowledgeGraph;
     private readonly Func<string, IChatClient>? _chatClientFactory;
+    private readonly IReadOnlyList<string> _startupAvailableModels;
 
     /// <summary>Models the Composer can switch between at runtime.</summary>
-    public IReadOnlyList<string> AvailableModels { get; }
+    public IReadOnlyList<string> AvailableModels =>
+        _hiveConfig?.Models?.AvailableModels is { Count: > 0 } available
+            ? available.Select(m => m.Name).ToList().AsReadOnly()
+            : _startupAvailableModels;
 
     // Streaming state owned by the service (survives component navigation)
     private string _streamingContent = "";
@@ -257,7 +261,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _compactionModel = compactionModel;
         _session = AgentSession.Create("composer");
 
-        AvailableModels = (availableModels?.ToList() ?? [model]).AsReadOnly();
+        _startupAvailableModels = (availableModels?.ToList() ?? [model]).AsReadOnly();
 
         var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
         _reasoningEffort = reasoning;

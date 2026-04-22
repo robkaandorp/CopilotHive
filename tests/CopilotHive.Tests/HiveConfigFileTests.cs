@@ -489,4 +489,128 @@ public sealed class HiveConfigFileTests
         Assert.Equal("new-composer", receiver.Composer.Models[0]);
     }
 
+    // ── GetComposerAvailableModels tests ──────────────────────────────────────
+
+    /// <summary>
+    /// When Models.AvailableModels is populated, GetComposerAvailableModels returns
+    /// the names from that list.
+    /// </summary>
+    [Fact]
+    public void GetComposerAvailableModels_GlobalAvailableModels_ReturnsGlobalNames()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "copilot/claude-sonnet-4.6" },
+                    new ModelEntry { Name = "copilot/gpt-5.4-mini" },
+                    new ModelEntry { Name = "copilot/o3" }
+                ]
+            }
+        };
+
+        var result = config.GetComposerAvailableModels("fallback");
+
+        Assert.Equal(3, result.Count);
+        Assert.Equal("copilot/claude-sonnet-4.6", result[0]);
+        Assert.Equal("copilot/gpt-5.4-mini", result[1]);
+        Assert.Equal("copilot/o3", result[2]);
+    }
+
+    /// <summary>
+    /// When Models is null, GetComposerAvailableModels falls back to
+    /// ComposerConfig.GetAvailableModels(fallback).
+    /// </summary>
+    [Fact]
+    public void GetComposerAvailableModels_GlobalModelsNull_FallsBackToComposerConfig()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = null,
+            Composer = new ComposerConfig
+            {
+                Model = "composer-model",
+                Models = ["composer-model", "alt-model"]
+            }
+        };
+
+        var result = config.GetComposerAvailableModels("fallback");
+
+        // ComposerConfig.GetAvailableModels returns Model first, then Models
+        Assert.Equal(2, result.Count);
+        Assert.Equal("composer-model", result[0]);
+        Assert.Equal("alt-model", result[1]);
+    }
+
+    /// <summary>
+    /// When Models.AvailableModels is an empty list, GetComposerAvailableModels
+    /// falls back to ComposerConfig.GetAvailableModels(fallback).
+    /// </summary>
+    [Fact]
+    public void GetComposerAvailableModels_GlobalAvailableModelsEmpty_FallsBackToComposerConfig()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels = []
+            },
+            Composer = new ComposerConfig
+            {
+                Model = "fallback-model"
+            }
+        };
+
+        var result = config.GetComposerAvailableModels("fallback");
+
+        // Empty AvailableModels triggers fallback to ComposerConfig
+        Assert.Single(result);
+        Assert.Equal("fallback-model", result[0]);
+    }
+
+    /// <summary>
+    /// When both Models and Composer are null, GetComposerAvailableModels
+    /// returns a list containing just the fallback parameter.
+    /// </summary>
+    [Fact]
+    public void GetComposerAvailableModels_BothNull_ReturnsFallbackList()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = null,
+            Composer = null
+        };
+
+        var result = config.GetComposerAvailableModels("my-fallback-model");
+
+        Assert.Single(result);
+        Assert.Equal("my-fallback-model", result[0]);
+    }
+
+    /// <summary>
+    /// When Models has AvailableModels but Composer is null, the global list
+    /// is still returned (global takes precedence).
+    /// </summary>
+    [Fact]
+    public void GetComposerAvailableModels_GlobalListPresent_ComposerNull_ReturnsGlobalList()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "global-only-model" }
+                ]
+            },
+            Composer = null
+        };
+
+        var result = config.GetComposerAvailableModels("fallback");
+
+        Assert.Single(result);
+        Assert.Equal("global-only-model", result[0]);
+    }
 }
