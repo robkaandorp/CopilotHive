@@ -25,7 +25,9 @@ public static class ConfigHub
                 orchestrator   = config.Orchestrator.Model,
                 composer       = config.Composer?.Model,
                 compaction     = config.Models?.CompactionModel,
-                workers        = config.Workers,
+                workers        = config.Workers.ToDictionary(
+                    kv => kv.Key,
+                    kv => new { model = kv.Value.Model, premiumModel = kv.Value.PremiumModel }),
                 availableModels = config.Models?.AvailableModels,
             });
         });

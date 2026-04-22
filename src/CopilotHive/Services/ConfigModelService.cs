@@ -8,11 +8,13 @@ namespace CopilotHive.Services;
 /// <param name="OrchestratorModel">New orchestrator model, or <c>null</c> to leave unchanged.</param>
 /// <param name="ComposerModel">New Composer model, or <c>null</c> to leave unchanged.</param>
 /// <param name="WorkerModels">Per-role model overrides, keyed by role name. <c>null</c> to leave unchanged.</param>
+/// <param name="PremiumWorkerModels">Per-role premium model overrides, keyed by role name. <c>null</c> to leave unchanged.</param>
 /// <param name="CompactionModel">New compaction model, or <c>null</c> to leave unchanged.</param>
 public sealed record ModelConfigUpdate(
     string? OrchestratorModel,
     string? ComposerModel,
     Dictionary<string, string>? WorkerModels,
+    Dictionary<string, string>? PremiumWorkerModels,
     string? CompactionModel)
 {
     /// <summary>
@@ -25,6 +27,9 @@ public sealed record ModelConfigUpdate(
         CompactionModel    is not null ? $"compaction→{CompactionModel}" : null,
         WorkerModels?.Count > 0
             ? "workers: " + string.Join(", ", WorkerModels.Select(kv => $"{kv.Key}→{kv.Value}"))
+            : null,
+        PremiumWorkerModels?.Count > 0
+            ? "premium: " + string.Join(", ", PremiumWorkerModels.Select(kv => $"{kv.Key}→{kv.Value}"))
             : null,
     }.Where(s => !string.IsNullOrEmpty(s)));
 }
@@ -83,6 +88,20 @@ public sealed class ConfigModelService
                     _config.Workers[key] = wc;
                 }
                 wc.Model = model;
+            }
+        }
+
+        if (update.PremiumWorkerModels is not null)
+        {
+            foreach (var (role, model) in update.PremiumWorkerModels)
+            {
+                var key = role.ToLowerInvariant();
+                if (!_config.Workers.TryGetValue(key, out var wc))
+                {
+                    wc = new WorkerConfig();
+                    _config.Workers[key] = wc;
+                }
+                wc.PremiumModel = model;
             }
         }
 

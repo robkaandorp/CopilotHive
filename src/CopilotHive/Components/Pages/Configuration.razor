@@ -74,8 +74,26 @@ else
                         }
                     </select>
 
+                    <label style="color:var(--text-muted);font-size:0.9rem">Premium Coder</label>
+                    <select @bind="_coderPremiumModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="">(none)</option>
+                        @foreach (var m in models)
+                        {
+                            <option value="@m.Name">@m.Name</option>
+                        }
+                    </select>
+
                     <label style="color:var(--text-muted);font-size:0.9rem">Tester</label>
                     <select @bind="_testerModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        @foreach (var m in models)
+                        {
+                            <option value="@m.Name">@m.Name</option>
+                        }
+                    </select>
+
+                    <label style="color:var(--text-muted);font-size:0.9rem">Premium Tester</label>
+                    <select @bind="_testerPremiumModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="">(none)</option>
                         @foreach (var m in models)
                         {
                             <option value="@m.Name">@m.Name</option>
@@ -90,6 +108,15 @@ else
                         }
                     </select>
 
+                    <label style="color:var(--text-muted);font-size:0.9rem">Premium Reviewer</label>
+                    <select @bind="_reviewerPremiumModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="">(none)</option>
+                        @foreach (var m in models)
+                        {
+                            <option value="@m.Name">@m.Name</option>
+                        }
+                    </select>
+
                     <label style="color:var(--text-muted);font-size:0.9rem">Doc Writer</label>
                     <select @bind="_docwriterModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
                         @foreach (var m in models)
@@ -98,8 +125,26 @@ else
                         }
                     </select>
 
+                    <label style="color:var(--text-muted);font-size:0.9rem">Premium Doc Writer</label>
+                    <select @bind="_docwriterPremiumModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="">(none)</option>
+                        @foreach (var m in models)
+                        {
+                            <option value="@m.Name">@m.Name</option>
+                        }
+                    </select>
+
                     <label style="color:var(--text-muted);font-size:0.9rem">Improver</label>
                     <select @bind="_improverModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        @foreach (var m in models)
+                        {
+                            <option value="@m.Name">@m.Name</option>
+                        }
+                    </select>
+
+                    <label style="color:var(--text-muted);font-size:0.9rem">Premium Improver</label>
+                    <select @bind="_improverPremiumModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="">(none)</option>
                         @foreach (var m in models)
                         {
                             <option value="@m.Name">@m.Name</option>
@@ -160,7 +205,8 @@ else
         [property: JsonPropertyName("availableModels")] List<ModelEntryDto>? AvailableModels);
 
     private sealed record WorkerConfigDto(
-        [property: JsonPropertyName("model")] string? Model);
+        [property: JsonPropertyName("model")] string? Model,
+        [property: JsonPropertyName("premiumModel")] string? PremiumModel);
 
     private sealed record ModelEntryDto(
         [property: JsonPropertyName("name")] string Name);
@@ -186,6 +232,11 @@ else
     private string _reviewerModel = "";
     private string _docwriterModel = "";
     private string _improverModel = "";
+    private string _coderPremiumModel = "";
+    private string _testerPremiumModel = "";
+    private string _reviewerPremiumModel = "";
+    private string _docwriterPremiumModel = "";
+    private string _improverPremiumModel = "";
 
     protected override async Task OnInitializedAsync()
     {
@@ -250,6 +301,11 @@ else
                                      ?? _modelsData.Orchestrator ?? "";
                 _improverModel     = _modelsData.Workers?.GetValueOrDefault("improver")?.Model
                                      ?? _modelsData.Orchestrator ?? "";
+                _coderPremiumModel        = _modelsData.Workers?.GetValueOrDefault("coder")?.PremiumModel ?? "";
+                _testerPremiumModel       = _modelsData.Workers?.GetValueOrDefault("tester")?.PremiumModel ?? "";
+                _reviewerPremiumModel     = _modelsData.Workers?.GetValueOrDefault("reviewer")?.PremiumModel ?? "";
+                _docwriterPremiumModel    = _modelsData.Workers?.GetValueOrDefault("docwriter")?.PremiumModel ?? "";
+                _improverPremiumModel     = _modelsData.Workers?.GetValueOrDefault("improver")?.PremiumModel ?? "";
             }
         }
         catch (Exception ex)
@@ -281,6 +337,14 @@ else
                         ["reviewer"]   = _reviewerModel,
                         ["docwriter"]  = _docwriterModel,
                         ["improver"]   = _improverModel,
+                    },
+                    premiumWorkerModels = new Dictionary<string, string>
+                    {
+                        ["coder"]      = _coderPremiumModel,
+                        ["tester"]     = _testerPremiumModel,
+                        ["reviewer"]   = _reviewerPremiumModel,
+                        ["docwriter"]  = _docwriterPremiumModel,
+                        ["improver"]   = _improverPremiumModel,
                     },
                     compactionModel = _compactionModel,
                 }),

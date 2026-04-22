@@ -28,7 +28,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig { Model = "old-model" } };
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
-        var update = new ModelConfigUpdate("new-orch", null, null, null);
+        var update = new ModelConfigUpdate("new-orch", null, null, null, null);
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
@@ -43,7 +43,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
-        var update = new ModelConfigUpdate(null, "new-composer", null, null);
+        var update = new ModelConfigUpdate(null, "new-composer", null, null, null);
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
@@ -59,7 +59,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
-        var update = new ModelConfigUpdate(null, null, new Dictionary<string, string> { ["coder"] = "special-model" }, null);
+        var update = new ModelConfigUpdate(null, null, new Dictionary<string, string> { ["coder"] = "special-model" }, null, null);
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
@@ -75,7 +75,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
-        var update = new ModelConfigUpdate(null, null, null, "compact-model");
+        var update = new ModelConfigUpdate(null, null, null, null, "compact-model");
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
@@ -91,7 +91,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig { Model = "test" } };
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
-        var update = new ModelConfigUpdate("orch", null, null, null);
+        var update = new ModelConfigUpdate("orch", null, null, null, null);
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
@@ -105,7 +105,7 @@ public sealed class ConfigModelServiceTests : IDisposable
     [Fact]
     public void Description_OrchestratorOnly_ContainsOrchestratorOnly()
     {
-        var update = new ModelConfigUpdate("orch", null, null, null);
+        var update = new ModelConfigUpdate("orch", null, null, null, null);
         Assert.Contains("orchestrator→orch", update.Description);
         Assert.DoesNotContain("composer", update.Description);
         Assert.DoesNotContain("compaction", update.Description);
@@ -114,7 +114,7 @@ public sealed class ConfigModelServiceTests : IDisposable
     [Fact]
     public void Description_ComposerAndCompaction_ContainsBoth()
     {
-        var update = new ModelConfigUpdate(null, "comp", null, "mini");
+        var update = new ModelConfigUpdate(null, "comp", null, null, "mini");
         Assert.Contains("composer→comp", update.Description);
         Assert.Contains("compaction→mini", update.Description);
     }
@@ -122,7 +122,7 @@ public sealed class ConfigModelServiceTests : IDisposable
     [Fact]
     public void Description_AllFields_ContainsAllSegments()
     {
-        var update = new ModelConfigUpdate("orch", "comp", new Dictionary<string, string> { ["reviewer"] = "r-model" }, "mini");
+        var update = new ModelConfigUpdate("orch", "comp", new Dictionary<string, string> { ["reviewer"] = "r-model" }, null, "mini");
         Assert.Contains("orchestrator→orch", update.Description);
         Assert.Contains("composer→comp", update.Description);
         Assert.Contains("compaction→mini", update.Description);
@@ -134,14 +134,50 @@ public sealed class ConfigModelServiceTests : IDisposable
     [Fact]
     public void Description_AllNull_IsEmptyString()
     {
-        var update = new ModelConfigUpdate(null, null, null, null);
+        var update = new ModelConfigUpdate(null, null, null, null, null);
         Assert.Equal("", update.Description);
+    }
+
+    [Fact]
+    public async Task SaveModelConfigAsync_AppliesPremiumWorkerModels()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+        var update = new ModelConfigUpdate(null, null, null, new Dictionary<string, string> { ["coder"] = "premium-model" }, null);
+
+        await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.True(config.Workers.ContainsKey("coder"));
+        Assert.Equal("premium-model", config.Workers["coder"].PremiumModel);
+    }
+
+    [Fact]
+    public async Task SaveModelConfigAsync_PremiumWorkerModels_InitializesWorkerConfigIfNull()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+        var update = new ModelConfigUpdate(null, null, null, new Dictionary<string, string> { ["tester"] = "tester-premium" }, null);
+
+        await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.True(config.Workers.ContainsKey("tester"));
+        Assert.Equal("tester-premium", config.Workers["tester"].PremiumModel);
+    }
+
+    [Fact]
+    public void Description_ContainsPremiumWorkers()
+    {
+        var update = new ModelConfigUpdate(null, null, null, new Dictionary<string, string> { ["reviewer"] = "r-premium" }, null);
+        Assert.Contains("premium:", update.Description);
+        Assert.Contains("reviewer→r-premium", update.Description);
     }
 
     [Fact]
     public void Description_SingleField_NoTrailingCommasOrDoubleCommas()
     {
-        var update = new ModelConfigUpdate("only-orch", null, null, null);
+        var update = new ModelConfigUpdate("only-orch", null, null, null, null);
         var desc = update.Description;
         Assert.DoesNotMatch("^,", desc);
         Assert.DoesNotMatch(",$", desc);
