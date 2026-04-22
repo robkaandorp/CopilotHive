@@ -541,17 +541,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 _logger.LogInformation(
                     "Brain context compaction: {TokensBefore} \u2192 {TokensAfter} tokens ({ReductionPercent}% reduction), {MessagesBefore} \u2192 {MessagesAfter} messages",
                     r.TokensBefore, r.TokensAfter, r.ReductionPercent, r.MessagesBefore, r.MessagesAfter);
-
-                // Re-inject orchestrator instructions after compaction so they survive summarization
-                var instructions = _agentsManager?.GetAgentsMd(WorkerRole.Orchestrator);
-                if (!string.IsNullOrWhiteSpace(instructions))
-                {
-                    _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User,
-                        $"ORCHESTRATOR INSTRUCTIONS (re-injected after context compaction):\n\n{instructions}"));
-                    _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
-                        "Acknowledged. Orchestrator instructions refreshed."));
-                    _logger.LogInformation("Re-injected orchestrator instructions after compaction");
-                }
             },
         });
 
@@ -660,12 +649,16 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     {
         if (string.IsNullOrWhiteSpace(instructions)) return;
 
-        _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User,
-            $"ORCHESTRATOR INSTRUCTIONS UPDATE:\n\n{instructions}"));
-        _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
-            "Acknowledged. I will follow the updated orchestrator instructions for all future goals."));
+        // Update the system prompt with new orchestrator instructions and recreate the agent.
+        // CodingAgent rebuilds the system message every turn from SystemPrompt,
+        // so the updated instructions take effect immediately without injecting
+        // conversation turns. The session history is NOT cleared — the Brain is long-running.
+        _systemPrompt = string.IsNullOrWhiteSpace(instructions)
+            ? DefaultSystemPrompt
+            : $"{DefaultSystemPrompt}\n\n{instructions}";
+        RecreateAgent();
 
-        _logger.LogInformation("Injected orchestrator instructions into Brain session ({Chars} chars)",
+        _logger.LogInformation("Updated Brain system prompt with new orchestrator instructions ({Chars} chars)",
             instructions.Length);
 
         await SaveSessionAsync(ct);

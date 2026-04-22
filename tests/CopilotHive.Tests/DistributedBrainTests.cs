@@ -511,6 +511,91 @@ public sealed class DistributedBrainTests
         }
     }
 
+    [Fact]
+    public async Task InjectOrchestratorInstructionsAsync_UpdatesSystemPrompt_PreservesMessageHistory()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-inject-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient());
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var systemPromptField = typeof(DistributedBrain)
+                .GetField("_systemPrompt", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var masterSessionField = typeof(DistributedBrain)
+                .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var agentField = typeof(DistributedBrain)
+                .GetField("_agent", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+
+            var initialPrompt = (string)systemPromptField.GetValue(brain)!;
+            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+            var agentBefore = agentField.GetValue(brain);
+            var messageCountBefore = masterSession.MessageHistory.Count;
+
+            // Act: inject new orchestrator instructions
+            await brain.InjectOrchestratorInstructionsAsync("NEW_ORCHESTRATOR_RULES", TestContext.Current.CancellationToken);
+
+            // Assert: system prompt updated with new instructions
+            var updatedPrompt = (string)systemPromptField.GetValue(brain)!;
+            Assert.Contains("NEW_ORCHESTRATOR_RULES", updatedPrompt);
+            Assert.Contains(BrainPromptBuilder.DefaultSystemPrompt, updatedPrompt);
+
+            // Assert: RecreateAgent() was effectively called — the _agent field is a new object
+            var agentAfter = agentField.GetValue(brain);
+            Assert.NotSame(agentBefore, agentAfter);
+            Assert.NotNull(agentAfter);
+
+            // Assert: master session history is preserved (no injected User/Assistant turns)
+            Assert.Equal(messageCountBefore, masterSession.MessageHistory.Count);
+            Assert.DoesNotContain(masterSession.MessageHistory, m =>
+                m.Text.Contains("ORCHESTRATOR INSTRUCTIONS UPDATE", StringComparison.Ordinal));
+            Assert.DoesNotContain(masterSession.MessageHistory, m =>
+                m.Text.Contains("Acknowledged. I will follow the updated orchestrator instructions", StringComparison.Ordinal));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task InjectOrchestratorInstructionsAsync_EmptyInstructions_DoesNothing()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-inject-empty-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient());
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var systemPromptField = typeof(DistributedBrain)
+                .GetField("_systemPrompt", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var masterSessionField = typeof(DistributedBrain)
+                .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+
+            var initialPrompt = (string)systemPromptField.GetValue(brain)!;
+            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+            var messageCountBefore = masterSession.MessageHistory.Count;
+
+            // Act: inject empty / whitespace instructions
+            await brain.InjectOrchestratorInstructionsAsync("   ", TestContext.Current.CancellationToken);
+
+            // Assert: nothing changed
+            var updatedPrompt = (string)systemPromptField.GetValue(brain)!;
+            Assert.Equal(initialPrompt, updatedPrompt);
+            Assert.Equal(messageCountBefore, masterSession.MessageHistory.Count);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
     // -- Review Phase Guidance Static Verification --
 
     [Fact]
