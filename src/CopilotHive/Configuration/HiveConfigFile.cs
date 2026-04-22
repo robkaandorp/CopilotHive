@@ -40,9 +40,23 @@ public sealed class HiveConfigFile
             : null;
 
     /// <summary>
+    /// Looks up the model in <see cref="ModelsConfig.AvailableModels"/> and returns its
+    /// <see cref="ModelEntry.ContextWindow"/> if set and greater than 0.
+    /// </summary>
+    /// <param name="modelName">Model identifier to look up.</param>
+    /// <returns>The configured context window, or <c>null</c> if the model is not found or has no value set.</returns>
+    public int? TryGetContextWindowForModel(string modelName)
+    {
+        var entry = Models?.AvailableModels?.FirstOrDefault(
+            m => string.Equals(m.Name, modelName, StringComparison.OrdinalIgnoreCase));
+        return entry?.ContextWindow;
+    }
+
+    /// <summary>
     /// Resolves the context window size for a given role.
     /// Returns the per-role <c>context_window</c> if set and greater than 0,
-    /// otherwise the orchestrator's <c>worker_context_window</c>,
+    /// otherwise the model-specific context window from the global <c>available_models</c> list,
+    /// then the orchestrator's <c>worker_context_window</c>,
     /// or finally <see cref="Constants.DefaultBrainContextWindow"/>.
     /// </summary>
     /// <param name="roleName">Role name (e.g. "coder", "reviewer").</param>
@@ -51,6 +65,12 @@ public sealed class HiveConfigFile
     {
         if (Workers.TryGetValue(roleName.ToLowerInvariant(), out var wc) && wc.ContextWindow > 0)
             return wc.ContextWindow;
+
+        var roleModel = GetModelForRole(roleName);
+        var modelCtx = TryGetContextWindowForModel(roleModel);
+        if (modelCtx.HasValue && modelCtx.Value > 0)
+            return modelCtx.Value;
+
         if (Orchestrator.WorkerContextWindow > 0)
             return Orchestrator.WorkerContextWindow;
         return Constants.DefaultBrainContextWindow;

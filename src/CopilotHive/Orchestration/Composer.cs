@@ -22,7 +22,7 @@ namespace CopilotHive.Orchestration;
 public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 {
     private string _model;
-    private readonly int _maxContextTokens;
+    private int _maxContextTokens;
     private readonly int _maxSteps;
     private ReasoningEffort? _reasoningEffort;
     private readonly ILogger<Composer> _logger;
@@ -336,6 +336,16 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _model = model;
         var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
         _reasoningEffort = reasoning;
+
+        // Update context window when the new model has a different value in the global model list
+        var modelCtx = _hiveConfig?.TryGetContextWindowForModel(model);
+        if (modelCtx.HasValue && modelCtx.Value > 0 && _maxContextTokens != modelCtx.Value)
+        {
+            _logger.LogInformation(
+                "Updating Composer context window from {OldContextWindow} to {NewContextWindow} for model '{Model}'",
+                _maxContextTokens, modelCtx.Value, model);
+            _maxContextTokens = modelCtx.Value;
+        }
 
         // Create new client
         _chatClient = (_chatClientFactory ?? ChatClientFactory.Create)(model);

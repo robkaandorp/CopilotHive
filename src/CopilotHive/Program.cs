@@ -103,7 +103,9 @@ public sealed class Program
                         : brainModel;
                     var maxCtx = int.TryParse(brainContextWindowEnv, out var envCtx)
                         ? envCtx
-                        : config?.Orchestrator.BrainContextWindow ?? Constants.DefaultBrainContextWindow;
+                        : config?.TryGetContextWindowForModel(effectiveModel)
+                        ?? config?.Orchestrator.BrainContextWindow
+                        ?? Constants.DefaultBrainContextWindow;
                     var maxSteps = int.TryParse(brainMaxStepsEnv, out var envSteps)
                         ? envSteps
                         : config?.Orchestrator.BrainMaxSteps ?? Constants.DefaultBrainMaxSteps;
@@ -137,7 +139,10 @@ public sealed class Program
                 if (string.IsNullOrEmpty(model))
                     model = brainModel ?? Constants.DefaultWorkerModel;
 
-                var maxCtx = composerConfig?.ContextWindow ?? config?.Orchestrator.BrainContextWindow ?? Constants.DefaultBrainContextWindow;
+                var maxCtx = config?.TryGetContextWindowForModel(model)
+                    ?? composerConfig?.ContextWindow
+                    ?? config?.Orchestrator.BrainContextWindow
+                    ?? Constants.DefaultBrainContextWindow;
                 var maxSteps = composerConfig?.MaxSteps ?? config?.Orchestrator.BrainMaxSteps ?? Constants.DefaultBrainMaxSteps;
                 var availableModels = composerConfig?.GetAvailableModels(model) ?? [model];
 
