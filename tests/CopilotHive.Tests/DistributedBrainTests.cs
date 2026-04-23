@@ -2817,7 +2817,8 @@ public sealed class DistributedBrainTests
         try
         {
             var brain = new DistributedBrain("copilot/old-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: new FakeChatClient());
+                stateDir: tempDir, chatClient: new FakeChatClient(),
+                chatClientFactory: _ => new FakeChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
             var modelField = typeof(DistributedBrain)
@@ -2849,7 +2850,8 @@ public sealed class DistributedBrainTests
         try
         {
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: new FakeChatClient(), maxContextTokens: 64000);
+                stateDir: tempDir, chatClient: new FakeChatClient(), maxContextTokens: 64000,
+                chatClientFactory: _ => new FakeChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
             var maxCtxField = typeof(DistributedBrain)
@@ -2881,7 +2883,8 @@ public sealed class DistributedBrainTests
         try
         {
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: new FakeChatClient(), maxContextTokens: 64000);
+                stateDir: tempDir, chatClient: new FakeChatClient(), maxContextTokens: 64000,
+                chatClientFactory: _ => new FakeChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
             var maxCtxField = typeof(DistributedBrain)
@@ -2914,7 +2917,8 @@ public sealed class DistributedBrainTests
         {
             var disposableClient = new DisposableCountingChatClient();
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: disposableClient);
+                stateDir: tempDir, chatClient: disposableClient,
+                chatClientFactory: _ => new FakeChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
             var clientField = typeof(DistributedBrain)
@@ -2948,7 +2952,8 @@ public sealed class DistributedBrainTests
         try
         {
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: new FakeChatClient());
+                stateDir: tempDir, chatClient: new FakeChatClient(),
+                chatClientFactory: _ => new FakeChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
             var reasoningField = typeof(DistributedBrain)

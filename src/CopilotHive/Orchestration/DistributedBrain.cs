@@ -37,6 +37,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly string _stateDir;
     private readonly string? _compactionModel;
     private readonly KnowledgeGraph? _knowledgeGraph;
+    private readonly Func<string, IChatClient> _chatClientFactory;
 
     /// <summary>
     /// Directory used for persistent Brain state (session files).
@@ -74,7 +75,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         IGoalStore? goalStore = null,
         IChatClient? chatClient = null,
         string? compactionModel = null,
-        KnowledgeGraph? knowledgeGraph = null)
+        KnowledgeGraph? knowledgeGraph = null,
+        Func<string, IChatClient>? chatClientFactory = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -88,6 +90,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _stateDir = stateDir ?? "/app/state";
         _compactionModel = compactionModel;
         _knowledgeGraph = knowledgeGraph;
+        _chatClientFactory = chatClientFactory ?? ChatClientFactory.Create;
         _masterSession = AgentSession.Create("brain");
         _session = _masterSession;
 
@@ -107,7 +110,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     {
         _logger.LogInformation("Brain connecting with model '{Model}'…", _modelOverride);
 
-        _chatClient ??= ChatClientFactory.Create(_modelOverride);
+        _chatClient ??= _chatClientFactory(_modelOverride);
 
         // Try to load a persisted master session from a previous run.
         // Migrate legacy brain-session.json to brain-master.json if needed.
@@ -153,7 +156,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             if (_chatClient is not null)
                 _chatClient.Dispose();
 
-            _chatClient = ChatClientFactory.Create(model);
+            _chatClient = _chatClientFactory(model);
 
             var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
             _reasoningEffort = reasoning;
