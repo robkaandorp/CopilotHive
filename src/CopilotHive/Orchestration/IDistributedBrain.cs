@@ -172,6 +172,12 @@ public interface IDistributedBrain
     /// </returns>
     Task<BrainResponse> AskQuestionAsync(string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default);
 
+    /// <summary>
+    /// Updates the Brain model and optionally the context window, recreating the underlying
+    /// chat client and CodingAgent so subsequent calls use the new configuration.
+    /// </summary>
+    Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default);
+
     /// <summary>Returns current Brain context and usage statistics, or null if not connected.</summary>
     BrainStats? GetStats();
 

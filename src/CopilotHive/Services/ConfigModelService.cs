@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Orchestration;
 
 namespace CopilotHive.Services;
 
@@ -43,6 +44,7 @@ public sealed class ConfigModelService
     private readonly HiveConfigFile _config;
     private readonly ConfigRepoManager _configRepo;
     private readonly ILogger<ConfigModelService> _logger;
+    private readonly IDistributedBrain? _brain;
 
     /// <summary>
     /// Initialises a new <see cref="ConfigModelService"/>.
@@ -50,14 +52,17 @@ public sealed class ConfigModelService
     /// <param name="config">The live <see cref="HiveConfigFile"/> singleton.</param>
     /// <param name="configRepo">The config repository manager.</param>
     /// <param name="logger">Logger instance.</param>
+    /// <param name="brain">Optional distributed brain to update when the orchestrator model changes.</param>
     public ConfigModelService(
         HiveConfigFile config,
         ConfigRepoManager configRepo,
-        ILogger<ConfigModelService> logger)
+        ILogger<ConfigModelService> logger,
+        IDistributedBrain? brain = null)
     {
         _config = config;
         _configRepo = configRepo;
         _logger = logger;
+        _brain = brain;
     }
 
     /// <summary>
@@ -69,7 +74,19 @@ public sealed class ConfigModelService
     public async Task SaveModelConfigAsync(ModelConfigUpdate update, CancellationToken ct = default)
     {
         if (update.OrchestratorModel is not null)
+        {
             _config.Orchestrator.Model = update.OrchestratorModel;
+
+            var model = update.OrchestratorModel;
+            var contextWindow = _config.TryGetContextWindowForModel(model);
+            if (contextWindow is null or <= 0)
+                contextWindow = _config.Orchestrator.BrainContextWindow > 0
+                    ? _config.Orchestrator.BrainContextWindow
+                    : Constants.DefaultBrainContextWindow;
+
+            if (_brain is not null)
+                await _brain.UpdateModelAsync(model, contextWindow, ct);
+        }
 
         if (update.ComposerModel is not null)
         {

@@ -197,6 +197,8 @@ public sealed class BrainEscalationTests
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
+        public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) => Task.CompletedTask;
+
         public Task<PlanResult> PlanIterationAsync(
             GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
         {
@@ -260,6 +262,8 @@ public sealed class BrainEscalationTests
         public string? LastAdditionalContext { get; private set; }
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) => Task.CompletedTask;
 
         public Task<PlanResult> PlanIterationAsync(
             GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>

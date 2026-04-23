@@ -290,6 +290,9 @@ file sealed class CapturingBrain : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
+    public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
     public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
     {
         var plan = IterationPlan.Default();

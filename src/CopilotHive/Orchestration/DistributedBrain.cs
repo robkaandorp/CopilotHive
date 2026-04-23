@@ -26,10 +26,10 @@ namespace CopilotHive.Orchestration;
 /// </summary>
 public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 {
-    private readonly string _modelOverride;
-    private readonly int _maxContextTokens;
+    private string _modelOverride;
+    private int _maxContextTokens;
     private readonly int _maxSteps;
-    private readonly ReasoningEffort? _reasoningEffort;
+    private ReasoningEffort? _reasoningEffort;
     private readonly ILogger<DistributedBrain> _logger;
     private readonly MetricsTracker? _metricsTracker;
     private readonly IBrainRepoManager? _repoManager;
@@ -138,6 +138,36 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         _logger.LogInformation("Brain connected via CodingAgent (model={Model}, contextWindow={ContextWindow})",
             _modelOverride, _maxContextTokens);
+    }
+
+    /// <inheritdoc />
+    public async Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default)
+    {
+        await _brainCallGate.WaitAsync(ct);
+        try
+        {
+            _modelOverride = model;
+            if (maxContextTokens.HasValue)
+                _maxContextTokens = maxContextTokens.Value;
+
+            if (_chatClient is not null)
+                _chatClient.Dispose();
+
+            _chatClient = ChatClientFactory.Create(model);
+
+            var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
+            _reasoningEffort = reasoning;
+
+            RecreateAgent();
+
+            _logger.LogInformation(
+                "Brain model updated to '{Model}' with context window {ContextWindow}",
+                model, _maxContextTokens);
+        }
+        finally
+        {
+            _brainCallGate.Release();
+        }
     }
 
     /// <inheritdoc />

@@ -2807,6 +2807,169 @@ public sealed class DistributedBrainTests
         Assert.Equal("copilot/gpt-5.4-mini", field.GetValue(brain));
     }
 
+    // ── UpdateModelAsync Tests ────────────────────────────────────────────────
+
+    [Fact]
+    public async Task UpdateModelAsync_UpdatesModelOverride_AndRecreatesAgent()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/old-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient());
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var modelField = typeof(DistributedBrain)
+                .GetField("_modelOverride", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+
+            Assert.Equal("copilot/old-model", modelField.GetValue(brain));
+
+            await brain.UpdateModelAsync("copilot/new-model", null, TestContext.Current.CancellationToken);
+
+            Assert.Equal("copilot/new-model", modelField.GetValue(brain));
+
+            // Verify GetStats().Model also reflects the new model
+            var stats = brain.GetStats();
+            Assert.NotNull(stats);
+            Assert.Equal("copilot/new-model", stats.Model);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task UpdateModelAsync_UpdatesMaxContextTokens_WhenProvided()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient(), maxContextTokens: 64000);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var maxCtxField = typeof(DistributedBrain)
+                .GetField("_maxContextTokens", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+
+            Assert.Equal(64000, maxCtxField.GetValue(brain));
+
+            await brain.UpdateModelAsync("copilot/other-model", 128000, TestContext.Current.CancellationToken);
+
+            Assert.Equal(128000, maxCtxField.GetValue(brain));
+
+            // Verify GetStats().MaxContextTokens also reflects the new value
+            var stats = brain.GetStats();
+            Assert.NotNull(stats);
+            Assert.Equal(128000, stats.MaxContextTokens);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task UpdateModelAsync_PreservesMaxContextTokens_WhenNull()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient(), maxContextTokens: 64000);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var maxCtxField = typeof(DistributedBrain)
+                .GetField("_maxContextTokens", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+
+            Assert.Equal(64000, maxCtxField.GetValue(brain));
+
+            await brain.UpdateModelAsync("copilot/other-model", null, TestContext.Current.CancellationToken);
+
+            Assert.Equal(64000, maxCtxField.GetValue(brain));
+
+            // Verify GetStats().MaxContextTokens also retains the previous value
+            var stats = brain.GetStats();
+            Assert.NotNull(stats);
+            Assert.Equal(64000, stats.MaxContextTokens);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task UpdateModelAsync_DisposesOldChatClient_AndCreatesNewOne()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var disposableClient = new DisposableCountingChatClient();
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: disposableClient);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var clientField = typeof(DistributedBrain)
+                .GetField("_chatClient", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+
+            var originalClient = clientField.GetValue(brain);
+            Assert.Same(disposableClient, originalClient);
+            Assert.Equal(0, disposableClient.DisposeCount);
+
+            await brain.UpdateModelAsync("copilot/other-model", null, TestContext.Current.CancellationToken);
+
+            // The old chat client should have been disposed
+            Assert.Equal(1, disposableClient.DisposeCount);
+
+            var newClient = clientField.GetValue(brain);
+            Assert.NotSame(originalClient, newClient);
+            Assert.NotNull(newClient);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task UpdateModelAsync_ReparsesReasoningEffort()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient());
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var reasoningField = typeof(DistributedBrain)
+                .GetField("_reasoningEffort", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+
+            Assert.Null(reasoningField.GetValue(brain));
+
+            // Model with reasoning suffix
+            await brain.UpdateModelAsync("copilot/gpt-5.4:high", null, TestContext.Current.CancellationToken);
+
+            var effort = reasoningField.GetValue(brain);
+            Assert.NotNull(effort);
+            Assert.Equal(Microsoft.Extensions.AI.ReasoningEffort.High, effort);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
 }
 
 /// <summary>
@@ -2817,8 +2980,17 @@ file sealed class FakeDistributedBrain : IDistributedBrain
     public bool Connected { get; private set; }
     public int PlanIterationCalls { get; private set; }
     public int CraftCalls { get; private set; }
+    public string? LastModel { get; private set; }
+    public int? LastMaxContextTokens { get; private set; }
 
     public Task ConnectAsync(CancellationToken ct = default) { Connected = true; return Task.CompletedTask; }
+
+    public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default)
+    {
+        LastModel = model;
+        LastMaxContextTokens = maxContextTokens;
+        return Task.CompletedTask;
+    }
 
     public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
     {
@@ -3168,4 +3340,30 @@ file sealed class ThrowingStubClient : IChatClient
     public object? GetService(Type serviceType, object? serviceKey = null) => null;
 
     public void Dispose() { }
+}
+
+/// <summary>
+/// IChatClient stub that counts how many times <see cref="Dispose"/> is called,
+/// used to verify that <see cref="DistributedBrain.UpdateModelAsync"/> disposes the old client.
+/// </summary>
+file sealed class DisposableCountingChatClient : IChatClient
+{
+    public int DisposeCount { get; private set; }
+    public ChatClientMetadata Metadata => new("disposable-stub", null, "stub-model");
+
+    public Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "")));
+
+    public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException("Streaming not used in disposable-counting stub.");
+
+    public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+    public void Dispose() => DisposeCount++;
 }

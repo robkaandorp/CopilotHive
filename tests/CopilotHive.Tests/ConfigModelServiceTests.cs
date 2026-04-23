@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -183,4 +184,157 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.DoesNotMatch(",$", desc);
         Assert.DoesNotContain(", ,", desc);
     }
+
+    // ── UpdateModelAsync Wiring Tests ──────────────────────────────────────────
+
+    [Fact]
+    public async Task SaveModelConfigAsync_WithOrchestratorModel_CallsBrainUpdateModelAsync()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig { Model = "old-model" } };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var brain = new FakeDistributedBrain();
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
+        var update = new ModelConfigUpdate("new-orch", null, null, null, null);
+
+        await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.Equal("new-orch", brain.LastModel);
+    }
+
+    [Fact]
+    public async Task SaveModelConfigAsync_ModelInAvailableModels_PassesContextWindow()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "old-model" },
+            Models = new ModelsConfig
+            {
+                AvailableModels = new List<ModelEntry>
+                {
+                    new() { Name = "new-orch", ContextWindow = 256000 }
+                }
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var brain = new FakeDistributedBrain();
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
+        var update = new ModelConfigUpdate("new-orch", null, null, null, null);
+
+        await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.Equal("new-orch", brain.LastModel);
+        Assert.Equal(256000, brain.LastMaxContextTokens);
+    }
+
+    [Fact]
+    public async Task SaveModelConfigAsync_ModelNotInAvailableModels_FallsBackToBrainContextWindow()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "old-model", BrainContextWindow = 128000 },
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var brain = new FakeDistributedBrain();
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
+        var update = new ModelConfigUpdate("unknown-model", null, null, null, null);
+
+        await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.Equal("unknown-model", brain.LastModel);
+        Assert.Equal(128000, brain.LastMaxContextTokens);
+    }
+
+    [Fact]
+    public async Task SaveModelConfigAsync_NeitherLookupYieldsValue_PassesDefaultBrainContextWindow()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "old-model", BrainContextWindow = 0 },
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var brain = new FakeDistributedBrain();
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
+        var update = new ModelConfigUpdate("unknown-model", null, null, null, null);
+
+        await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.Equal("unknown-model", brain.LastModel);
+        Assert.Equal(Constants.DefaultBrainContextWindow, brain.LastMaxContextTokens);
+    }
+
+    [Fact]
+    public async Task SaveModelConfigAsync_NullOrchestratorModel_DoesNotCallUpdateModelAsync()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig { Model = "old-model" } };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var brain = new FakeDistributedBrain();
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
+        // OrchestratorModel is null — only ComposerModel is set
+        var update = new ModelConfigUpdate(null, "new-composer", null, null, null);
+
+        await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.Null(brain.LastModel);
+        Assert.Null(brain.LastMaxContextTokens);
+    }
+}
+
+/// <summary>
+/// Minimal fake implementing <see cref="IDistributedBrain"/> for unit tests.
+/// </summary>
+file sealed class FakeDistributedBrain : IDistributedBrain
+{
+    public bool Connected { get; private set; }
+    public int PlanIterationCalls { get; private set; }
+    public int CraftCalls { get; private set; }
+    public string? LastModel { get; private set; }
+    public int? LastMaxContextTokens { get; private set; }
+
+    public Task ConnectAsync(CancellationToken ct = default) { Connected = true; return Task.CompletedTask; }
+
+    public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default)
+    {
+        LastModel = model;
+        LastMaxContextTokens = maxContextTokens;
+        return Task.CompletedTask;
+    }
+
+    public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
+    {
+        PlanIterationCalls++;
+        return Task.FromResult(PlanResult.Success(IterationPlan.Default()));
+    }
+
+    public Task<PromptResult> CraftPromptAsync(
+        GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
+    {
+        CraftCalls++;
+        return Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+    }
+
+    public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult<string?>(null);
+
+    public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct) => Task.CompletedTask;
+
+    public Task<BrainResponse> AskQuestionAsync(
+        string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+        Task.FromResult(BrainResponse.Answer("Brain is not available. Please proceed with your best judgment."));
+
+    public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public void DeleteGoalSession(string goalId) { }
+
+    public bool GoalSessionExists(string goalId) => false;
+
+    public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
+
+    public BrainStats? GetStats() => null;
 }
