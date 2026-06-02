@@ -1,5 +1,25 @@
 ## [Unreleased]
 
+## [0.11.0] - 2026-04-14
+
+### Added
+
+- **Configuration Hot-Reload** — `HiveConfigFile.ReloadFrom(fresh)` copies updated properties onto the live singleton after each `SyncRepoAsync` cycle, so `hive-config.yaml` changes take effect without an orchestrator restart. `DispatcherMaintenance.SyncAgentsFromConfigRepoAsync` triggers the reload after `LoadConfigAsync` re-reads from disk. The `GET /api/config/models` endpoint reflects the new values within one sync cycle. (`copilothive-reload-config-on-sync`)
+
+- **Live Brain System Prompt Reload** — When `orchestrator.agents.md` changes, `DistributedBrain.InjectOrchestratorInstructionsAsync` reloads `_systemPrompt` and calls `RecreateAgent()`. The master session is preserved. The legacy `OnCompacted` re-injection workaround has been removed — it was redundant because SharpCoder's `CodingAgent` rebuilds the system prompt every turn from `AgentOptions.SystemPrompt`. (`copilothive-brain-reload-agents-md`)
+
+- **Live Brain Model Switching** — New `IDistributedBrain.UpdateModelAsync(model, maxContextTokens?, ct)` swaps the Brain's chat client, reasoning effort, and context window in place — no restart, no session loss. `ConfigModelService` invokes it automatically when the user saves a new orchestrator model from the Configuration page. The dashboard reflects the new model and context window within one refresh cycle (~3 seconds). (`copilothive-update-brain-model-on-config-change`)
+
+- **Premium Worker Models** — Each `WorkerConfig` now has an optional `premium_model` field. When the Brain escalates a phase to the `"premium"` tier (via the `model_tiers` section of `orchestrator.agents.md`), the dispatcher uses the role's premium model for that phase only. The Configuration page shows a premium-model dropdown for each of the 5 worker roles; saving commits standard, premium, and compaction model changes in one PATCH. Falls back to the role's standard model when no premium is configured. (`copilothive-config-premium-models`)
+
+- **Unified Model Lists** — `HiveConfigFile.GetComposerAvailableModels(fallback)` returns model names from the global `Models.AvailableModels` list. The Composer is constructed with this list, and `ComposerHub` endpoints serve it. `/api/composer/models/switch` validates against the global list. Eliminates the previous redundancy where `ComposerConfig.Models` and `Models.AvailableModels` were maintained independently. (`copilothive-composer-global-model-list`)
+
+- **Model-Specific Context Window Resolution** — New `HiveConfigFile.TryGetContextWindowForModel(string)` looks up a model's context window in `Models.AvailableModels`. `GetContextWindowForRole` now falls back through a 4-step chain: per-role override → model-specific (from global list) → orchestrator default → built-in default. Brain and Composer initialization resolve context windows via the global model list. `Composer._maxContextTokens` is mutable and updates on `SwitchModelAsync` when switching to a model with a different context window. (`copilothive-global-model-context-windows`)
+
+### Dependencies
+
+- **SharpCoder upgraded to 0.9.0** — Both `CopilotHive.csproj` and `CopilotHive.Worker.csproj` now reference `SharpCoder` 0.9.0, picking up the new `ContextCompactor` deduplication (shared `CompactMessageSliceAsync` core method) and the system-message-preservation behavior that makes the `OnCompacted` re-injection workaround unnecessary. (`copilothive-update-sharpcoder-090`)
+
 ## [0.10.0] - 2026-04-13
 
 ### Added
