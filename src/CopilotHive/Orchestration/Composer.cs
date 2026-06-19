@@ -550,6 +550,9 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             CompactionClient = !string.IsNullOrEmpty(_compactionModel)
                 ? ChatClientFactory.Create(_compactionModel)
                 : null,
+            CompactionMaxTokens = !string.IsNullOrEmpty(_compactionModel)
+                ? _hiveConfig?.TryGetContextWindowForModel(_compactionModel)
+                : null,
             OnCompacting = () =>
             {
                 IsCompacting = true;

@@ -1,4 +1,5 @@
 using CopilotHive.Agents;
+using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
@@ -38,6 +39,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly string? _compactionModel;
     private readonly KnowledgeGraph? _knowledgeGraph;
     private readonly Func<string, IChatClient> _chatClientFactory;
+    private readonly HiveConfigFile? _hiveConfig;
 
     /// <summary>
     /// Directory used for persistent Brain state (session files).
@@ -76,7 +78,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         IChatClient? chatClient = null,
         string? compactionModel = null,
         KnowledgeGraph? knowledgeGraph = null,
-        Func<string, IChatClient>? chatClientFactory = null)
+        Func<string, IChatClient>? chatClientFactory = null,
+        HiveConfigFile? hiveConfig = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -91,6 +94,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _compactionModel = compactionModel;
         _knowledgeGraph = knowledgeGraph;
         _chatClientFactory = chatClientFactory ?? ChatClientFactory.Create;
+        _hiveConfig = hiveConfig;
         _masterSession = AgentSession.Create("brain");
         _session = _masterSession;
 
@@ -568,6 +572,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Logger = _logger,
             CompactionClient = !string.IsNullOrEmpty(_compactionModel)
                 ? ChatClientFactory.Create(_compactionModel)
+                : null,
+            CompactionMaxTokens = !string.IsNullOrEmpty(_compactionModel)
+                ? _hiveConfig?.TryGetContextWindowForModel(_compactionModel)
                 : null,
             OnCompacted = r =>
             {

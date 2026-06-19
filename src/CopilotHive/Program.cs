@@ -118,7 +118,8 @@ public sealed class Program
                         stateDir,
                         sp.GetRequiredService<IGoalStore>(),
                         compactionModel: config?.Models?.CompactionModel,
-                        knowledgeGraph: sp.GetService<KnowledgeGraph>());
+                        knowledgeGraph: sp.GetService<KnowledgeGraph>(),
+                        hiveConfig: config);
                 });
             }
 

@@ -104,6 +104,7 @@ public sealed class TaskExecutorSessionTests
         public void SetCustomAgent(WorkerRole role, string agentsMdContent) { }
         public void SetMaxContextTokens(int maxTokens) { }
         public void SetCompactionModel(string? model) { }
+        public void SetCompactionMaxTokens(int? maxTokens) { }
 
         public void SetSession(object? session)
         {
@@ -420,6 +421,7 @@ public sealed class TaskExecutorSessionTests
         public void SetCustomAgent(WorkerRole role, string agentsMdContent) { }
         public void SetMaxContextTokens(int maxTokens) { }
         public void SetCompactionModel(string? model) { }
+        public void SetCompactionMaxTokens(int? maxTokens) { }
         public void SetSession(object? session) { }
         public object? GetSession() => null;
         public int GetContextUsagePercent() => 0;

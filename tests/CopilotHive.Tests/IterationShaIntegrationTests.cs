@@ -381,6 +381,7 @@ public sealed class IterationShaIntegrationTests : IAsyncDisposable
         public void SetCustomAgent(WorkerRole role, string agentsMdContent) { }
         public void SetMaxContextTokens(int maxTokens) { }
         public void SetCompactionModel(string? model) { }
+        public void SetCompactionMaxTokens(int? maxTokens) { }
         public void SetSession(object? session) => _session = session;
         public object? GetSession() => _session;
         public int GetContextUsagePercent() => 0;

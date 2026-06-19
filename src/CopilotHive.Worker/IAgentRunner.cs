@@ -74,6 +74,14 @@ public interface IAgentRunner : IAsyncDisposable
     /// </summary>
     void SetCompactionModel(string? model);
 
+    /// <summary>
+    /// Sets the maximum token threshold for context compaction summaries. Pass null to
+    /// let SharpCoder fall back to the main <c>MaxContextTokens</c> value.
+    /// Must be called before <see cref="SendPromptAsync"/>.
+    /// </summary>
+    /// <param name="maxTokens">Maximum tokens to pass to the compaction client, or <c>null</c> to use the fallback.</param>
+    void SetCompactionMaxTokens(int? maxTokens);
+
     /// <summary>Connects to the underlying AI agent engine.</summary>
     Task ConnectAsync(CancellationToken ct = default);
 
