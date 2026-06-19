@@ -1,11 +1,12 @@
-using System.Globalization;
-using System.Text.Json;
-using System.Text.RegularExpressions;
 using CopilotHive.Configuration;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
+
 using Microsoft.Data.Sqlite;
-using Microsoft.Extensions.Logging;
+
+using System.Globalization;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace CopilotHive.Goals;
 
