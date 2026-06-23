@@ -14,6 +14,7 @@ using CopilotHive.Services;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 
 using System.Reflection;
 
@@ -73,6 +74,9 @@ public sealed class Program
             var dbPath = Path.Combine(stateDir, "copilothive.db");
             builder.Services.AddSingleton(sp =>
                 new PipelineStore(dbPath, sp.GetRequiredService<ILogger<PipelineStore>>()));
+
+            builder.Services.AddDbContext<CopilotHiveDbContext>(options =>
+                options.UseSqlite($"Data Source={dbPath}"));
 
             // Metrics: per-iteration metrics persistence
             var metricsDir = Path.Combine(stateDir, "metrics");
@@ -264,6 +268,32 @@ public sealed class Program
 
             var logger = app.Services.GetRequiredService<ILogger<Program>>();
             logger.LogInformation("Starting gRPC server on port {GrpcPort}, HTTP on port {HttpPort}", port, port + 1);
+
+            try
+            {
+                using var scope = app.Services.CreateScope();
+                var dbContext = scope.ServiceProvider.GetRequiredService<CopilotHiveDbContext>();
+                dbContext.Database.EnsureCreated();
+                logger.LogInformation("CopilotHiveDbContext.EnsureCreated completed");
+            }
+            catch (DbUpdateConcurrencyException ex)
+            {
+                logger.LogError(ex, "DbUpdateConcurrencyException during EnsureCreated; rethrowing");
+                throw;
+            }
+            catch (DbUpdateException ex)
+            {
+                logger.LogError(ex, "Schema mismatch between EF and raw SQL stores; EnsureCreated failed");
+                throw;
+            }
+            catch (InvalidOperationException ex)
+            {
+                logger.LogWarning(ex, "EnsureCreated skipped due to DI scope issue; non-fatal");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Unexpected exception during CopilotHiveDbContext.EnsureCreated; continuing startup");
+            }
 
             if (!string.IsNullOrEmpty(brainModel))
                 logger.LogInformation("Brain enabled — model: {BrainModel}", brainModel);
