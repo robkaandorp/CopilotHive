@@ -8,7 +8,7 @@ using CopilotHive.Services;
 namespace CopilotHive.Dashboard;
 
 /// <summary>
-/// Aggregates live state from WorkerPool, GoalPipelineManager, and SqliteGoalStore
+/// Aggregates live state from WorkerPool, GoalPipelineManager, and IGoalStore
 /// into a snapshot that Blazor components can bind to. Polls every few seconds
 /// and fires <see cref="OnStateChanged"/> to trigger UI re-renders.
 /// </summary>

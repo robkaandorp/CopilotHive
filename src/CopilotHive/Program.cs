@@ -249,7 +249,7 @@ public sealed class Program
             builder.Services.AddSingleton(sp =>
             {
                 var manager = new GoalManager();
-                manager.AddSource(sp.GetRequiredService<SqliteGoalStore>());
+                manager.AddSource(sp.GetRequiredService<IGoalStore>());
                 return manager;
             });
 
@@ -371,7 +371,7 @@ public sealed class Program
             // Bootstrap: import goals from YAML file into SQLite (one-time migration)
             if (!string.IsNullOrEmpty(goalsFile) && File.Exists(goalsFile))
             {
-                var goalStore = app.Services.GetRequiredService<SqliteGoalStore>();
+                var goalStore = app.Services.GetRequiredService<IGoalStore>();
                 var fileSource = new FileGoalSource(goalsFile);
                 var yamlGoals = await fileSource.ReadGoalsAsync();
                 if (yamlGoals.Count > 0)
@@ -395,7 +395,7 @@ public sealed class Program
                 .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
                 ?? Assembly.GetExecutingAssembly().GetName().Version?.ToString()
                 ?? "unknown";
-            app.MapGet("/health", async (SqliteGoalStore goalStore, WorkerPool workerPool) =>
+            app.MapGet("/health", async (IGoalStore goalStore, WorkerPool workerPool) =>
             {
                 var count = Interlocked.Increment(ref _checkCount);
                 var uptime = DateTime.UtcNow - _serverStartTime;
@@ -421,16 +421,16 @@ public sealed class Program
             // ── Goals REST API ───────────────────────────────────────────────────────
             var goalsApi = app.MapGroup("/api/goals");
 
-            goalsApi.MapGet("/", async (SqliteGoalStore store) =>
+            goalsApi.MapGet("/", async (IGoalStore store) =>
                 Results.Ok(await store.GetAllGoalsAsync()));
 
-            goalsApi.MapGet("/{id}", async (string id, SqliteGoalStore store) =>
+            goalsApi.MapGet("/{id}", async (string id, IGoalStore store) =>
             {
                 var goal = await store.GetGoalAsync(id);
                 return goal is null ? Results.NotFound(new { error = $"Goal '{id}' not found." }) : Results.Ok(goal);
             });
 
-            goalsApi.MapPost("/", async (Goal goal, SqliteGoalStore store) =>
+            goalsApi.MapPost("/", async (Goal goal, IGoalStore store) =>
             {
                 try
                 {
@@ -451,7 +451,7 @@ public sealed class Program
                 }
             });
 
-            goalsApi.MapPatch("/{id}/status", async (string id, GoalStatusUpdate update, SqliteGoalStore store,
+            goalsApi.MapPatch("/{id}/status", async (string id, GoalStatusUpdate update, IGoalStore store,
                 IBrainRepoManager? repoManager, GoalDispatcher? dispatcher, ILogger<Program> endpointLogger) =>
             {
                 try
@@ -504,7 +504,7 @@ public sealed class Program
                 }
             });
 
-            goalsApi.MapDelete("/{id}", async (string id, SqliteGoalStore store, IBrainRepoManager? repoManager, ILogger<Program> logger) =>
+            goalsApi.MapDelete("/{id}", async (string id, IGoalStore store, IBrainRepoManager? repoManager, ILogger<Program> logger) =>
             {
                 var goal = await store.GetGoalAsync(id);
                 if (goal is null)
@@ -533,7 +533,7 @@ public sealed class Program
                 return Results.NoContent();
             });
 
-            goalsApi.MapPost("/{id}/cancel", async (string id, GoalDispatcher dispatcher, SqliteGoalStore store) =>
+            goalsApi.MapPost("/{id}/cancel", async (string id, GoalDispatcher dispatcher, IGoalStore store) =>
             {
                 var goal = await store.GetGoalAsync(id);
                 if (goal is null)
@@ -548,7 +548,7 @@ public sealed class Program
                     : Results.BadRequest(new { error = $"Goal '{id}' could not be cancelled (it may have already completed or failed)." });
             });
 
-            goalsApi.MapGet("/search", async (string q, string? status, SqliteGoalStore store) =>
+            goalsApi.MapGet("/search", async (string q, string? status, IGoalStore store) =>
             {
                 GoalStatus? statusFilter = null;
                 if (!string.IsNullOrEmpty(status) && Enum.TryParse<GoalStatus>(status, ignoreCase: true, out var s))
@@ -560,7 +560,7 @@ public sealed class Program
             // ── Releases REST API ────────────────────────────────────────────────────
             var releasesApi = app.MapGroup("/api/releases");
 
-            releasesApi.MapPost("/", async (CreateReleaseRequest request, SqliteGoalStore store) =>
+            releasesApi.MapPost("/", async (CreateReleaseRequest request, IGoalStore store) =>
             {
                 if (string.IsNullOrWhiteSpace(request.Version))
                     return Results.BadRequest(new { error = "Version is required." });
@@ -583,7 +583,7 @@ public sealed class Program
                 }
             });
 
-            releasesApi.MapPatch("/{id}/status", async (string id, UpdateReleaseStatusRequest request, SqliteGoalStore store) =>
+            releasesApi.MapPatch("/{id}/status", async (string id, UpdateReleaseStatusRequest request, IGoalStore store) =>
             {
                 var existing = await store.GetReleaseAsync(id);
                 if (existing is null)
@@ -603,7 +603,7 @@ public sealed class Program
                 return Results.Ok(existing);
             });
 
-            releasesApi.MapPatch("/{id}/notes", async (string id, UpdateReleaseNotesRequest request, SqliteGoalStore store) =>
+            releasesApi.MapPatch("/{id}/notes", async (string id, UpdateReleaseNotesRequest request, IGoalStore store) =>
             {
                 var existing = await store.GetReleaseAsync(id);
                 if (existing is null)
@@ -614,7 +614,7 @@ public sealed class Program
                 return Results.Ok(existing);
             });
 
-            releasesApi.MapPatch("/{id}/tag", async (string id, UpdateReleaseTagRequest request, SqliteGoalStore store) =>
+            releasesApi.MapPatch("/{id}/tag", async (string id, UpdateReleaseTagRequest request, IGoalStore store) =>
             {
                 if (string.IsNullOrWhiteSpace(request.Tag))
                     return Results.BadRequest(new { error = "Tag is required." });
@@ -636,7 +636,7 @@ public sealed class Program
                 return Results.Ok(updated);
             });
 
-            releasesApi.MapPatch("/{id}/repositories", async (string id, UpdateReleaseRepositoriesRequest request, SqliteGoalStore store) =>
+            releasesApi.MapPatch("/{id}/repositories", async (string id, UpdateReleaseRepositoriesRequest request, IGoalStore store) =>
             {
                 try
                 {
@@ -655,7 +655,7 @@ public sealed class Program
                 return Results.Ok(updated);
             });
 
-            goalsApi.MapPatch("/{id}/release", async (string id, AssignGoalReleaseRequest request, SqliteGoalStore store) =>
+            goalsApi.MapPatch("/{id}/release", async (string id, AssignGoalReleaseRequest request, IGoalStore store) =>
             {
                 var release = await store.GetReleaseAsync(request.ReleaseId);
                 if (release is null)

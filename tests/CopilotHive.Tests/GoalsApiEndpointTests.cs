@@ -356,7 +356,7 @@ public class GoalsApiEndpointTests
 
         // Directly set goal to InProgress (bypassing API validation)
         using var scope = _factory.Services.CreateScope();
-        var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+        var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
         var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
         Assert.NotNull(goal);
         goal!.Status = GoalStatus.InProgress;
@@ -381,7 +381,7 @@ public class GoalsApiEndpointTests
 
         // Directly set goal to Completed (bypassing API validation)
         using var scope = _factory.Services.CreateScope();
-        var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+        var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
         var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
         Assert.NotNull(goal);
         goal!.Status = GoalStatus.Completed;
@@ -406,7 +406,7 @@ public class GoalsApiEndpointTests
 
         // Directly set goal to Failed (bypassing API validation)
         using var scope = _factory.Services.CreateScope();
-        var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+        var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
         var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
         Assert.NotNull(goal);
         goal!.Status = GoalStatus.Failed;
@@ -439,7 +439,7 @@ public class GoalsApiEndpointTests
         // Set goal to Failed with iteration data
         using (var scope = _factory.Services.CreateScope())
         {
-            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
             var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
             Assert.NotNull(goal);
             goal!.Status = GoalStatus.Failed;
@@ -462,7 +462,7 @@ public class GoalsApiEndpointTests
         // Verify iteration data was cleared
         using (var scope = _factory.Services.CreateScope())
         {
-            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
             var updated = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
             Assert.NotNull(updated);
             Assert.Equal(GoalStatus.Draft, updated!.Status);
@@ -498,7 +498,7 @@ public class GoalsApiEndpointTests
         // Set goal to Failed status
         using (var scope = factory.Services.CreateScope())
         {
-            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
             var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
             Assert.NotNull(goal);
             goal!.Status = GoalStatus.Failed;
@@ -573,7 +573,7 @@ public class GoalsApiEndpointTests
         // Set goal to Failed status
         using (var scope = _factory.Services.CreateScope())
         {
-            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
             var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
             Assert.NotNull(goal);
             goal!.Status = GoalStatus.Failed;
@@ -596,7 +596,7 @@ public class GoalsApiEndpointTests
         // Set goal to Failed status
         using (var scope = _factory.Services.CreateScope())
         {
-            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
             var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
             Assert.NotNull(goal);
             goal!.Status = GoalStatus.Failed;
@@ -610,7 +610,7 @@ public class GoalsApiEndpointTests
         // Verify goal is actually deleted from store
         using (var scope = _factory.Services.CreateScope())
         {
-            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
             var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
             Assert.Null(goal);
         }
@@ -626,7 +626,7 @@ public class GoalsApiEndpointTests
         // Set goal to Failed status
         using (var scope = _factory.Services.CreateScope())
         {
-            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
             var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
             Assert.NotNull(goal);
             goal!.Status = GoalStatus.Failed;
@@ -642,7 +642,7 @@ public class GoalsApiEndpointTests
         // Verify goal is removed from store
         using (var scope = _factory.Services.CreateScope())
         {
-            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
             var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
             Assert.Null(goal);
         }
@@ -672,7 +672,7 @@ public class GoalsApiEndpointTests
         // Set goal to Failed status
         using (var scope = factory.Services.CreateScope())
         {
-            var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
             var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
             Assert.NotNull(goal);
             goal!.Status = GoalStatus.Failed;
@@ -736,7 +736,7 @@ public class GoalsApiEndpointTests
 
         // Set goal to InProgress directly
         using var scope = _factory.Services.CreateScope();
-        var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+        var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
         var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
         Assert.NotNull(goal);
         goal!.Status = GoalStatus.InProgress;
@@ -766,7 +766,7 @@ public class GoalsApiEndpointTests
 
         // Set goal to Completed directly
         using var scope = _factory.Services.CreateScope();
-        var store = scope.ServiceProvider.GetRequiredService<SqliteGoalStore>();
+        var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
         var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
         Assert.NotNull(goal);
         goal!.Status = GoalStatus.Completed;

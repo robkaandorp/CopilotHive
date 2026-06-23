@@ -142,8 +142,8 @@ public class HealthEndpointTests
         using var before = await GetHealthJsonAsync();
         var baselineActive = before.RootElement.GetProperty("activeGoals").GetInt32();
 
-        // Add a pending goal via the singleton SqliteGoalStore.
-        var goalStore = _factory.Services.GetRequiredService<SqliteGoalStore>();
+        // Add a pending goal via the singleton IGoalStore.
+        var goalStore = _factory.Services.GetRequiredService<IGoalStore>();
         await goalStore.CreateGoalAsync(new Goal { Id = "test-goal-" + Guid.NewGuid(), Description = "behavior test goal" }, TestContext.Current.CancellationToken);
 
         // Verify the count increased.
