@@ -35,6 +35,132 @@ public sealed class SqliteGoalStoreTests : IDisposable
             CreatedAt = new DateTime(2025, 1, 15, 10, 0, 0, DateTimeKind.Utc),
         };
 
+    // ── Backup ────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void BackupDatabaseIfExists_FileBasedDb_CreatesBackupFile()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"goalstore-backup-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        var dbPath = Path.Combine(tempDir, "goals.db");
+
+        // Pre-create the database file so the constructor sees an existing database
+        using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS preexisting (id INTEGER PRIMARY KEY);";
+            cmd.ExecuteNonQuery();
+        }
+
+        try
+        {
+            var store = new SqliteGoalStore(dbPath, NullLogger<SqliteGoalStore>.Instance);
+
+            var backupDir = Path.Combine(tempDir, "backups");
+            Assert.True(Directory.Exists(backupDir));
+            var backupFiles = Directory.GetFiles(backupDir, "goals.db.*.bak");
+            Assert.Single(backupFiles);
+        }
+        finally
+        {
+            ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    [Fact]
+    public void BackupDatabaseIfExists_InMemoryDb_SkipsBackup()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"goalstore-backup-inmem-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var store = new SqliteGoalStore(":memory:", NullLogger<SqliteGoalStore>.Instance);
+
+            var backupDir = Path.Combine(tempDir, "backups");
+            Assert.False(Directory.Exists(backupDir));
+        }
+        finally
+        {
+            ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    [Fact]
+    public void BackupDatabaseIfExists_FreshDbFile_SkipsBackup()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"goalstore-backup-fresh-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        var dbPath = Path.Combine(tempDir, "fresh.db");
+
+        try
+        {
+            Assert.False(File.Exists(dbPath));
+
+            var store = new SqliteGoalStore(dbPath, NullLogger<SqliteGoalStore>.Instance);
+
+            var backupDir = Path.Combine(tempDir, "backups");
+            Assert.False(Directory.Exists(backupDir));
+            Assert.True(File.Exists(dbPath));
+        }
+        finally
+        {
+            ForceDeleteDirectory(tempDir);
+        }
+    }
+
+
+
+    [Fact]
+    public void BackupDatabaseIfExists_KeepsOnlyLastTenBackups()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"goalstore-backup-retention-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        var dbPath = Path.Combine(tempDir, "retention.db");
+
+        // Pre-create the database file so the first store construction sees an existing database
+        using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS preexisting (id INTEGER PRIMARY KEY);";
+            cmd.ExecuteNonQuery();
+        }
+
+        try
+        {
+            var backupDir = Path.Combine(tempDir, "backups");
+
+            // Open the store 12 times; each time a new backup is created and the oldest beyond the
+            // last 10 is cleaned up, leaving exactly 10 backups. Sleep between constructions so the
+            // second-resolution timestamp in the backup filename advances and each backup is distinct.
+            for (var i = 0; i < 12; i++)
+            {
+                var store = new SqliteGoalStore(dbPath, NullLogger<SqliteGoalStore>.Instance);
+                if (i < 11)
+                    Thread.Sleep(1100);
+            }
+
+            var backupFiles = Directory.GetFiles(backupDir, "retention.db.*.bak");
+            Assert.Equal(10, backupFiles.Length);
+        }
+        finally
+        {
+            ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    private static void ForceDeleteDirectory(string path)
+    {
+        foreach (var file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+        {
+            File.SetAttributes(file, FileAttributes.Normal);
+        }
+
+        Directory.Delete(path, recursive: true);
+    }
+
     // ── CRUD ──────────────────────────────────────────────────────────────
 
     [Fact]

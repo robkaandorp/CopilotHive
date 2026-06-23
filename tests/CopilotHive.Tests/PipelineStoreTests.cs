@@ -30,6 +30,70 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         return new GoalPipeline(goal, maxRetries);
     }
 
+    #region Backup
+
+    [Fact]
+    public async Task BackupDatabaseIfExists_FileBasedDb_CreatesBackupFile()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"pipelinestore-backup-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        var dbPath = Path.Combine(tempDir, "pipelines.db");
+
+        // Pre-create the database file so the constructor sees an existing database
+        using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS preexisting (id INTEGER PRIMARY KEY);";
+            cmd.ExecuteNonQuery();
+        }
+
+        try
+        {
+            await using var store = new PipelineStore(dbPath, NullLogger<PipelineStore>.Instance);
+
+            var backupDir = Path.Combine(tempDir, "backups");
+            Assert.True(Directory.Exists(backupDir));
+            var backupFiles = Directory.GetFiles(backupDir, "pipelines.db.*.bak");
+            Assert.Single(backupFiles);
+        }
+        finally
+        {
+            ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task BackupDatabaseIfExists_InMemoryDb_SkipsBackup()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"pipelinestore-backup-inmem-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            await using var store = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+
+            var backupDir = Path.Combine(tempDir, "backups");
+            Assert.False(Directory.Exists(backupDir));
+        }
+        finally
+        {
+            ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    private static void ForceDeleteDirectory(string path)
+    {
+        foreach (var file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+        {
+            File.SetAttributes(file, FileAttributes.Normal);
+        }
+
+        Directory.Delete(path, recursive: true);
+    }
+
+    #endregion
+
     #region SavePipeline / LoadActivePipelines — Round-trip
 
     [Fact]

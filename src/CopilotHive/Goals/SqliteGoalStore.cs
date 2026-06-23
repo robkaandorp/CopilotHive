@@ -33,8 +33,10 @@ public sealed class SqliteGoalStore : IGoalStore
     {
         _logger = logger;
         _pipelineStore = pipelineStore;
+        var dbExisted = dbPath != ":memory:" && File.Exists(dbPath);
         _db = new SqliteConnection($"Data Source={dbPath}");
         _db.Open();
+        BackupDatabaseIfExists(dbPath, dbExisted);
         InitSchema();
         _logger.LogInformation("SqliteGoalStore initialised at {DbPath}", dbPath);
     }
@@ -46,6 +48,45 @@ public sealed class SqliteGoalStore : IGoalStore
         _pipelineStore = pipelineStore;
         _db = connection;
         InitSchema();
+    }
+
+    private void BackupDatabaseIfExists(string dbPath, bool dbExisted)
+    {
+        if (dbPath == ":memory:")
+            return;
+
+        if (!dbExisted)
+            return;
+
+        var dbDir = Path.GetDirectoryName(dbPath);
+        if (string.IsNullOrEmpty(dbDir))
+            dbDir = Directory.GetCurrentDirectory();
+
+        var backupDir = Path.Combine(dbDir, "backups");
+        Directory.CreateDirectory(backupDir);
+
+        var dbFileName = Path.GetFileName(dbPath);
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMddTHHmmss", CultureInfo.InvariantCulture);
+        var backupFileName = $"{dbFileName}.{timestamp}.bak";
+        var backupPath = Path.Combine(backupDir, backupFileName);
+
+        using var backupConn = new SqliteConnection($"Data Source={backupPath}");
+        backupConn.Open();
+        _db.BackupDatabase(backupConn);
+
+        _logger.LogInformation("Database backed up to {BackupPath}", backupPath);
+
+        var oldBackups = Directory
+            .EnumerateFiles(backupDir, $"{dbFileName}.*.bak")
+            .OrderByDescending(f => f)
+            .Skip(10)
+            .ToList();
+
+        foreach (var oldBackup in oldBackups)
+        {
+            File.Delete(oldBackup);
+            _logger.LogDebug("Removed old backup {BackupPath}", oldBackup);
+        }
     }
 
     private void InitSchema()
