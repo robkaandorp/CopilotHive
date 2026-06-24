@@ -654,7 +654,7 @@ public sealed class CopilotHiveDbContextTests
     /// <summary>
     /// Creates a DbContext backed by an open in-memory SQLite connection WITHOUT calling
     /// <c>EnsureCreated()</c>. This simulates a database file that exists but is missing tables,
-    /// allowing <see cref="Program.EnsureSchemaUpToDate"/> to be exercised against it.
+    /// allowing <see cref="DatabaseMigration.EnsureSchemaUpToDate"/> to be exercised against it.
     /// The connection is kept open by the returned DbContext for the lifetime of the database.
     /// </summary>
     private static CopilotHiveDbContext CreateEmptyDbContext()
@@ -689,7 +689,7 @@ public sealed class CopilotHiveDbContextTests
         // Sanity: no tables exist yet.
         Assert.Empty(GetAllTableNames(conn));
 
-        Program.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
 
         var tableNames = GetAllTableNames(conn);
         Assert.Contains("goals", tableNames);
@@ -711,7 +711,7 @@ public sealed class CopilotHiveDbContextTests
 
         Assert.Contains("pipelines", GetAllTableNames(conn));
 
-        Program.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
 
         var tableNames = GetAllTableNames(conn);
         Assert.Contains("goals", tableNames);
@@ -736,7 +736,7 @@ public sealed class CopilotHiveDbContextTests
         var conn = GetSqliteConnection(ctx);
 
         // All tables already exist via EnsureCreated; reconciliation must be a no-op.
-        Program.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
 
         var tableNames = GetAllTableNames(conn);
         Assert.Contains("goals", tableNames);
@@ -758,7 +758,7 @@ public sealed class CopilotHiveDbContextTests
         ctx.Database.ExecuteSqlRaw(
             "INSERT INTO pipelines (goal_id, description) VALUES ('goal-keep-1', 'preserved description')");
 
-        Program.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
 
         // Missing tables were added.
         var tableNames = GetAllTableNames(conn);
@@ -773,7 +773,7 @@ public sealed class CopilotHiveDbContextTests
 
     /// <summary>
     /// Verifies that indexes defined in the EF Core model are created by
-    /// <see cref="Program.EnsureSchemaUpToDate"/> on a fresh database — specifically the
+    /// <see cref="DatabaseMigration.EnsureSchemaUpToDate"/> on a fresh database — specifically the
     /// unique composite index <c>idx_goal_iterations_goal_iteration</c> on
     /// <c>goal_iterations(goal_id, iteration)</c>.
     /// </summary>
@@ -786,7 +786,7 @@ public sealed class CopilotHiveDbContextTests
         // Sanity: no indexes exist yet.
         Assert.Empty(GetAllIndexNames(conn));
 
-        Program.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
 
         var indexNames = GetAllIndexNames(conn);
 
@@ -839,7 +839,7 @@ public sealed class CopilotHiveDbContextTests
     {
         using var ctx = CreateEmptyDbContext();
 
-        Program.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
 
         // This would throw "no such table: goals" if the schema were not reconciled.
         var goals = ctx.Goals.ToList();
