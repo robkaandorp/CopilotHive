@@ -2,6 +2,7 @@
 @using CopilotHive.Dashboard
 @implements IDisposable
 @inject DashboardStateService State
+@inject ProgressReportService ProgressReports
 @inject PageHeaderState PageHeader
 
 @if (_worker is null)
@@ -112,7 +113,7 @@ else
     {
         var snap = await State.GetSnapshot();
         _worker = snap.Workers.FirstOrDefault(w => w.Id == WorkerId);
-        _progress = State.GetProgressForWorker(WorkerId);
+        _progress = ProgressReports.GetProgressForWorker(WorkerId);
         _info = State.GetOrchestratorInfo();
     }
 

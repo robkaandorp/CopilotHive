@@ -6,6 +6,7 @@
 @using Markdig
 @implements IDisposable
 @inject DashboardStateService State
+@inject ProgressReportService ProgressReports
 @inject IGoalStore GoalStore
 @inject IJSRuntime JS
 @inject NavigationManager Nav
@@ -813,7 +814,7 @@ else
     private async Task RefreshAsync()
     {
         _detail = await State.GetGoalDetail(GoalId);
-        _progress = State.GetProgressForGoal(GoalId);
+        _progress = ProgressReports.GetProgressForGoal(GoalId);
 
         // Fallback: load from SQLite for completed/failed goals not in active pipelines
         if (_detail is null)

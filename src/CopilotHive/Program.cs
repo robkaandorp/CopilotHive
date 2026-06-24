@@ -182,6 +182,7 @@ public sealed class Program
             var dashboardLogSink = new DashboardLogSink();
             builder.Services.AddSingleton(dashboardLogSink);
             builder.Services.AddSingleton<ProgressLog>();
+            builder.Services.AddSingleton<ProgressReportService>();
             builder.Logging.AddProvider(new DashboardLoggerProvider(dashboardLogSink));
 
             builder.Services.AddHostedService<StaleWorkerCleanupService>();
