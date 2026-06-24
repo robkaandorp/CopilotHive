@@ -4,7 +4,7 @@ using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
-using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests.Goals;
@@ -12,7 +12,7 @@ namespace CopilotHive.Tests.Goals;
 /// <summary>
 /// Integration tests for JSON round-trip compatibility after the PhaseResult refactor
 /// (string → GoalPhase/PhaseOutcome enums). These tests verify that:
-/// 1. New enum-typed PhaseResult persists correctly through SqliteGoalStore
+/// 1. New enum-typed PhaseResult persists correctly through GoalStore
 /// 2. Old JSON data with string values deserializes correctly into the new enum types
 /// 3. New serialization produces the same JSON format as before the refactor
 /// 4. IterationPlan with GoalPhase values round-trips through PipelineStore
@@ -20,33 +20,32 @@ namespace CopilotHive.Tests.Goals;
 /// </summary>
 public sealed class PhaseResultSerializationTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly SqliteGoalStore _store;
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
 
     public PhaseResultSerializationTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
     }
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _dbContext.Dispose();
     }
 
     /// <summary>
-    /// JsonSerializerOptions matching SqliteGoalStore's internal configuration.
+    /// JsonSerializerOptions matching GoalStore's internal configuration.
     /// </summary>
     private static readonly JsonSerializerOptions SqliteJsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
     };
 
-    // ─── Test 1: SqliteGoalStore persistence round-trip ────────────────────────
+    // ─── Test 1: GoalStore persistence round-trip ────────────────────────
 
     [Fact]
-    public async Task SqliteGoalStore_RoundTrip_PreservesEnumValues()
+    public async Task GoalStore_RoundTrip_PreservesEnumValues()
     {
         var ct = TestContext.Current.CancellationToken;
 

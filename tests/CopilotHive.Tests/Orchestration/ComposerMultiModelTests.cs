@@ -2,9 +2,9 @@ using System.Reflection;
 using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.AI;
@@ -135,15 +135,14 @@ public sealed class ComposerConfigTests
 /// </summary>
 public sealed class ComposerMultiModelTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly SqliteGoalStore _store;
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
     private readonly Composer _composer;
 
     public ComposerMultiModelTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
 
         _composer = new Composer(
             "claude-sonnet-4",
@@ -156,7 +155,7 @@ public sealed class ComposerMultiModelTests : IDisposable
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _dbContext.Dispose();
     }
 
     // ── AvailableModels Property ──
@@ -278,17 +277,16 @@ public sealed class ComposerMultiModelTests : IDisposable
 /// </summary>
 public sealed class ComposerHubTests : IAsyncLifetime
 {
-    private readonly SqliteConnection _connection;
-    private readonly SqliteGoalStore _store;
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
     private readonly Composer _composer;
     private WebApplication _app = null!;
     private HttpClient _client = null!;
 
     public ComposerHubTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
 
         _composer = new Composer(
             "claude-sonnet-4",
@@ -315,7 +313,7 @@ public sealed class ComposerHubTests : IAsyncLifetime
         _client?.Dispose();
         if (_app != null!)
             await _app.DisposeAsync();
-        _connection.Dispose();
+        _dbContext.Dispose();
     }
 
     // ── GET /api/composer/models ──
@@ -660,19 +658,18 @@ public sealed class ComposerHubNullTests : IAsyncLifetime
 /// </summary>
 public sealed class ComposerCompactionTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly SqliteGoalStore _store;
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
 
     public ComposerCompactionTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
     }
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _dbContext.Dispose();
     }
 
     /// <summary>
@@ -705,8 +702,8 @@ public sealed class ComposerCompactionTests : IDisposable
 /// </summary>
 public sealed class ComposerHubWithConfigFixture : IAsyncDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly SqliteGoalStore _store;
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
     private readonly Composer _composer;
     private WebApplication _app = null!;
     private HttpClient _client = null!;
@@ -716,9 +713,8 @@ public sealed class ComposerHubWithConfigFixture : IAsyncDisposable
     public ComposerHubWithConfigFixture(HiveConfigFile? config)
     {
         Config = config;
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
 
         _composer = new Composer(
             "claude-sonnet-4",
@@ -748,6 +744,6 @@ public sealed class ComposerHubWithConfigFixture : IAsyncDisposable
         _client?.Dispose();
         if (_app != null!)
             await _app.DisposeAsync();
-        _connection.Dispose();
+        _dbContext.Dispose();
     }
 }

@@ -9,6 +9,7 @@ using CopilotHive.Metrics;
 using CopilotHive.Models;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
+using CopilotHive.Persistence.Entities;
 using CopilotHive.Services;
 
 using Microsoft.AspNetCore.DataProtection;
@@ -16,7 +17,9 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 
+using System.Globalization;
 using System.Reflection;
+using System.Text.Json;
 
 namespace CopilotHive;
 
@@ -76,6 +79,9 @@ public sealed class Program
                 new PipelineStore(dbPath, sp.GetRequiredService<ILogger<PipelineStore>>()));
 
             builder.Services.AddDbContext<CopilotHiveDbContext>(options =>
+                options.UseSqlite($"Data Source={dbPath}"));
+
+            builder.Services.AddDbContextFactory<CopilotHiveDbContext>(options =>
                 options.UseSqlite($"Data Source={dbPath}"));
 
             // Metrics: per-iteration metrics persistence
@@ -239,12 +245,13 @@ public sealed class Program
                     builder.Logging.AddFilter("Grpc", LogLevel.Warning);
                 }
             }
-            // Goals: SQLite-backed goal store (primary source of truth)
-            var goalsDbPath = Path.Combine(stateDir, "goals.db");
-            builder.Services.AddSingleton(sp =>
-                new SqliteGoalStore(goalsDbPath, sp.GetRequiredService<ILogger<SqliteGoalStore>>(),
-                    sp.GetRequiredService<PipelineStore>()));
-            builder.Services.AddSingleton<IGoalStore>(sp => sp.GetRequiredService<SqliteGoalStore>());
+            // Goals: EF Core-backed goal store (primary source of truth)
+            builder.Services.AddSingleton<IGoalStore>(sp =>
+                new GoalStore(
+                    sp.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>(),
+                    sp.GetRequiredService<ILogger<GoalStore>>(),
+                    sp.GetRequiredService<PipelineStore>(),
+                    dbPath));
 
             builder.Services.AddSingleton(sp =>
             {
@@ -293,6 +300,23 @@ public sealed class Program
             catch (Exception ex)
             {
                 logger.LogError(ex, "Unexpected exception during CopilotHiveDbContext.EnsureCreated; continuing startup");
+            }
+
+            // ── Data migration: goals.db → copilothive.db ────────────────────
+            try
+            {
+                var legacyGoalsDbPath = Path.Combine(stateDir, "goals.db");
+                if (File.Exists(legacyGoalsDbPath))
+                {
+                    using var scope = app.Services.CreateScope();
+                    var dbContextFactory = scope.ServiceProvider.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>();
+                    MigrateGoalsDatabase(legacyGoalsDbPath, dbContextFactory, logger);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to migrate data from goals.db to copilothive.db");
+                throw;
             }
 
             if (!string.IsNullOrEmpty(brainModel))
@@ -719,6 +743,277 @@ public sealed class Program
             Console.WriteLine($"CopilotHive v{version}");
             Console.WriteLine($"Started at {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC");
         }
+    }
+
+    private static readonly JsonSerializerOptions MigrationJsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
+    /// <summary>
+    /// Migrates goals, iteration summaries, and releases from the legacy <c>goals.db</c> database
+    /// into the EF Core-managed <c>copilothive.db</c> database. After a successful migration the
+    /// legacy file is renamed to <c>goals.db.migrated</c> so the migration runs only once.
+    /// </summary>
+    /// <param name="oldDbPath">Path to the legacy goals.db SQLite database.</param>
+    /// <param name="dbContextFactory">Factory for creating the target <see cref="CopilotHiveDbContext"/>.</param>
+    /// <param name="logger">Logger for reporting migration progress.</param>
+    private static void MigrateGoalsDatabase(
+        string oldDbPath,
+        IDbContextFactory<CopilotHiveDbContext> dbContextFactory,
+        ILogger logger)
+    {
+        var goals = new List<Goal>();
+        var iterations = new List<IterationSummaryEntity>();
+        var releases = new List<Release>();
+
+        using (var conn = new SqliteConnection($"Data Source={oldDbPath}"))
+        {
+            conn.Open();
+
+            var existingTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var tablesCmd = conn.CreateCommand())
+            {
+                tablesCmd.CommandText = "SELECT name FROM sqlite_master WHERE type='table'";
+                using var tablesReader = tablesCmd.ExecuteReader();
+                while (tablesReader.Read())
+                    existingTables.Add(tablesReader.GetString(0));
+            }
+
+            if (existingTables.Contains("goals"))
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "SELECT * FROM goals";
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                    goals.Add(ReadMigrationGoal(reader));
+            }
+
+            if (existingTables.Contains("goal_iterations"))
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "SELECT * FROM goal_iterations";
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                    iterations.Add(ReadMigrationIteration(reader));
+            }
+
+            if (existingTables.Contains("releases"))
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "SELECT * FROM releases";
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                    releases.Add(ReadMigrationRelease(reader));
+            }
+        }
+
+        using (var db = dbContextFactory.CreateDbContext())
+        {
+            var importedGoals = 0;
+            foreach (var goal in goals)
+            {
+                if (db.Goals.Any(g => g.Id == goal.Id)) continue;
+                db.Goals.Add(goal);
+                importedGoals++;
+            }
+
+            var importedIterations = 0;
+            foreach (var iteration in iterations)
+            {
+                // Skip iterations whose goal is missing (preserve FK integrity).
+                if (!goals.Any(g => g.Id == iteration.GoalId) && !db.Goals.Any(g => g.Id == iteration.GoalId))
+                    continue;
+                db.IterationSummaries.Add(iteration);
+                importedIterations++;
+            }
+
+            var importedReleases = 0;
+            foreach (var release in releases)
+            {
+                if (db.Releases.Any(r => r.Id == release.Id)) continue;
+                db.Releases.Add(release);
+                importedReleases++;
+            }
+
+            db.SaveChanges();
+
+            logger.LogInformation(
+                "Migrated {Goals} goals, {Iterations} iteration summaries, {Releases} releases from goals.db to copilothive.db",
+                importedGoals, importedIterations, importedReleases);
+        }
+
+        var migratedPath = oldDbPath + ".migrated";
+        if (File.Exists(migratedPath))
+            File.Delete(migratedPath);
+        File.Move(oldDbPath, migratedPath);
+        logger.LogInformation("Renamed legacy database to {MigratedPath}", migratedPath);
+    }
+
+    private static bool MigrationColumnExists(SqliteDataReader reader, string columnName, out int ordinal)
+    {
+        for (var i = 0; i < reader.FieldCount; i++)
+        {
+            if (string.Equals(reader.GetName(i), columnName, StringComparison.OrdinalIgnoreCase))
+            {
+                ordinal = i;
+                return true;
+            }
+        }
+        ordinal = -1;
+        return false;
+    }
+
+    private static Goal ReadMigrationGoal(SqliteDataReader reader)
+    {
+        var scope = GoalScope.Patch;
+        if (MigrationColumnExists(reader, "scope", out var scopeOrd) && !reader.IsDBNull(scopeOrd))
+            Enum.TryParse<GoalScope>(reader.GetString(scopeOrd), ignoreCase: true, out scope);
+
+        var goal = new Goal
+        {
+            Id = reader.GetString(reader.GetOrdinal("id")),
+            Description = reader.GetString(reader.GetOrdinal("description")),
+            Status = Enum.Parse<GoalStatus>(reader.GetString(reader.GetOrdinal("status")), ignoreCase: true),
+            Priority = Enum.Parse<GoalPriority>(reader.GetString(reader.GetOrdinal("priority")), ignoreCase: true),
+            Scope = scope,
+            CreatedAt = DateTime.Parse(reader.GetString(reader.GetOrdinal("created_at")), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+        };
+
+        var reposOrd = reader.GetOrdinal("repositories");
+        if (!reader.IsDBNull(reposOrd))
+        {
+            var repos = JsonSerializer.Deserialize<List<string>>(reader.GetString(reposOrd), MigrationJsonOptions);
+            if (repos is not null) goal.RepositoryNames.AddRange(repos);
+        }
+
+        var metaOrd = reader.GetOrdinal("metadata");
+        if (!reader.IsDBNull(metaOrd))
+        {
+            var meta = JsonSerializer.Deserialize<Dictionary<string, string>>(reader.GetString(metaOrd), MigrationJsonOptions);
+            if (meta is not null)
+                foreach (var kvp in meta) goal.Metadata[kvp.Key] = kvp.Value;
+        }
+
+        var startedOrd = reader.GetOrdinal("started_at");
+        if (!reader.IsDBNull(startedOrd))
+            goal.StartedAt = DateTime.Parse(reader.GetString(startedOrd), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+
+        var completedOrd = reader.GetOrdinal("completed_at");
+        if (!reader.IsDBNull(completedOrd))
+            goal.CompletedAt = DateTime.Parse(reader.GetString(completedOrd), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+
+        var iterOrd = reader.GetOrdinal("iterations");
+        if (!reader.IsDBNull(iterOrd))
+            goal.Iterations = reader.GetInt32(iterOrd);
+
+        var failOrd = reader.GetOrdinal("failure_reason");
+        if (!reader.IsDBNull(failOrd))
+            goal.FailureReason = reader.GetString(failOrd);
+
+        var notesOrd = reader.GetOrdinal("notes");
+        if (!reader.IsDBNull(notesOrd))
+        {
+            var notes = JsonSerializer.Deserialize<List<string>>(reader.GetString(notesOrd), MigrationJsonOptions);
+            if (notes is not null) goal.Notes = notes;
+        }
+
+        var phaseDurOrd = reader.GetOrdinal("phase_durations");
+        if (!reader.IsDBNull(phaseDurOrd))
+            goal.PhaseDurations = JsonSerializer.Deserialize<Dictionary<string, double>>(reader.GetString(phaseDurOrd), MigrationJsonOptions);
+
+        var totalDurOrd = reader.GetOrdinal("total_duration_seconds");
+        if (!reader.IsDBNull(totalDurOrd))
+            goal.TotalDurationSeconds = reader.GetDouble(totalDurOrd);
+
+        if (MigrationColumnExists(reader, "depends_on", out var dependsOnOrd) && !reader.IsDBNull(dependsOnOrd))
+        {
+            var deps = JsonSerializer.Deserialize<List<string>>(reader.GetString(dependsOnOrd), MigrationJsonOptions);
+            if (deps is not null) goal.DependsOn.AddRange(deps);
+        }
+
+        if (MigrationColumnExists(reader, "merge_commit_hash", out var mergeHashOrd) && !reader.IsDBNull(mergeHashOrd))
+            goal.MergeCommitHash = reader.GetString(mergeHashOrd);
+
+        if (MigrationColumnExists(reader, "release_id", out var releaseIdOrd) && !reader.IsDBNull(releaseIdOrd))
+            goal.ReleaseId = reader.GetString(releaseIdOrd);
+
+        if (MigrationColumnExists(reader, "documents", out var documentsOrd) && !reader.IsDBNull(documentsOrd))
+        {
+            var docs = JsonSerializer.Deserialize<List<string>>(reader.GetString(documentsOrd), MigrationJsonOptions);
+            if (docs is not null) goal.Documents = docs;
+        }
+
+        if (MigrationColumnExists(reader, "branch_cleaned_up", out var branchCleanedUpOrd) && !reader.IsDBNull(branchCleanedUpOrd))
+            goal.BranchCleanedUp = reader.GetInt32(branchCleanedUpOrd) == 1;
+
+        return goal;
+    }
+
+    private static IterationSummaryEntity ReadMigrationIteration(SqliteDataReader reader)
+    {
+        var entity = new IterationSummaryEntity
+        {
+            GoalId = reader.GetString(reader.GetOrdinal("goal_id")),
+            Iteration = reader.GetInt32(reader.GetOrdinal("iteration")),
+        };
+
+        if (MigrationColumnExists(reader, "phases_json", out var phasesOrd) && !reader.IsDBNull(phasesOrd))
+            entity.PhasesJson = reader.GetString(phasesOrd);
+
+        if (MigrationColumnExists(reader, "test_total", out var ttOrd) && !reader.IsDBNull(ttOrd))
+            entity.TestTotal = reader.GetInt32(ttOrd);
+        if (MigrationColumnExists(reader, "test_passed", out var tpOrd) && !reader.IsDBNull(tpOrd))
+            entity.TestPassed = reader.GetInt32(tpOrd);
+        if (MigrationColumnExists(reader, "test_failed", out var tfOrd) && !reader.IsDBNull(tfOrd))
+            entity.TestFailed = reader.GetInt32(tfOrd);
+
+        if (MigrationColumnExists(reader, "review_verdict", out var rvOrd) && !reader.IsDBNull(rvOrd))
+            entity.ReviewVerdict = reader.GetString(rvOrd);
+
+        if (MigrationColumnExists(reader, "notes_json", out var notesOrd) && !reader.IsDBNull(notesOrd))
+            entity.NotesJson = reader.GetString(notesOrd);
+
+        if (MigrationColumnExists(reader, "phase_outputs_json", out var poOrd) && !reader.IsDBNull(poOrd))
+            entity.PhaseOutputsJson = reader.GetString(poOrd);
+
+        if (MigrationColumnExists(reader, "clarifications_json", out var clOrd) && !reader.IsDBNull(clOrd))
+            entity.ClarificationsJson = reader.GetString(clOrd);
+
+        if (MigrationColumnExists(reader, "build_success", out var bsOrd) && !reader.IsDBNull(bsOrd))
+            entity.BuildSuccess = reader.GetInt32(bsOrd) == 1;
+
+        if (MigrationColumnExists(reader, "created_at", out var caOrd) && !reader.IsDBNull(caOrd))
+            entity.CreatedAt = reader.GetString(caOrd);
+        else
+            entity.CreatedAt = DateTime.UtcNow.ToString("O");
+
+        return entity;
+    }
+
+    private static Release ReadMigrationRelease(SqliteDataReader reader)
+    {
+        var release = new Release
+        {
+            Id = reader.GetString(reader.GetOrdinal("id")),
+            Tag = reader.GetString(reader.GetOrdinal("tag")),
+            Status = Enum.Parse<ReleaseStatus>(reader.GetString(reader.GetOrdinal("status")), ignoreCase: true),
+            CreatedAt = DateTime.Parse(reader.GetString(reader.GetOrdinal("created_at")), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+        };
+
+        var notesOrd = reader.GetOrdinal("notes");
+        if (!reader.IsDBNull(notesOrd))
+            release.Notes = reader.GetString(notesOrd);
+
+        var releasedOrd = reader.GetOrdinal("released_at");
+        if (!reader.IsDBNull(releasedOrd))
+            release.ReleasedAt = DateTime.Parse(reader.GetString(releasedOrd), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+
+        var reposOrd = reader.GetOrdinal("repositories");
+        if (!reader.IsDBNull(reposOrd))
+        {
+            var repos = JsonSerializer.Deserialize<List<string>>(reader.GetString(reposOrd), MigrationJsonOptions);
+            if (repos is not null) release.RepositoryNames.AddRange(repos);
+        }
+
+        return release;
     }
 }
 

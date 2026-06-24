@@ -1,6 +1,7 @@
 using CopilotHive.Dashboard;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -532,15 +533,14 @@ public sealed class ClarificationLoggingTests
         Assert.Equal("waiting", statusAfter);
     }
 
-    // ── SqliteGoalStore round-trip ─────────────────────────────────────────
+    // ── GoalStore round-trip ─────────────────────────────────────────
 
     [Fact]
-    public async Task SqliteGoalStore_ClarificationsRoundTrip_PersistedAndLoaded()
+    public async Task GoalStore_ClarificationsRoundTrip_PersistedAndLoaded()
     {
         // Arrange — in-memory SQLite
-        var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
-        connection.Open();
-        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var store = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
 
         var goal = new Goal
         {
@@ -584,11 +584,10 @@ public sealed class ClarificationLoggingTests
     }
 
     [Fact]
-    public async Task SqliteGoalStore_NoClarifications_LoadsEmptyList()
+    public async Task GoalStore_NoClarifications_LoadsEmptyList()
     {
-        var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
-        connection.Open();
-        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var store = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
 
         var goal = new Goal { Id = "g-clarif-2", Description = "No clarifications", CreatedAt = DateTime.UtcNow };
         await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
@@ -612,11 +611,10 @@ public sealed class ClarificationLoggingTests
     /// IterationSummary with BuildSuccess=true is persisted and loaded correctly.
     /// </summary>
     [Fact]
-    public async Task SqliteGoalStore_BuildSuccessTrue_RoundTrips()
+    public async Task GoalStore_BuildSuccessTrue_RoundTrips()
     {
-        var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
-        connection.Open();
-        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var store = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
 
         var goal = new Goal { Id = "g-build-t", Description = "Build success test", CreatedAt = DateTime.UtcNow };
         await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
@@ -639,11 +637,10 @@ public sealed class ClarificationLoggingTests
     /// IterationSummary with BuildSuccess=false is persisted and loaded correctly.
     /// </summary>
     [Fact]
-    public async Task SqliteGoalStore_BuildSuccessFalse_RoundTrips()
+    public async Task GoalStore_BuildSuccessFalse_RoundTrips()
     {
-        var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
-        connection.Open();
-        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var store = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
 
         var goal = new Goal { Id = "g-build-f", Description = "Build failure test", CreatedAt = DateTime.UtcNow };
         await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
@@ -660,82 +657,6 @@ public sealed class ClarificationLoggingTests
         var iterations = await store.GetIterationsAsync(goal.Id, TestContext.Current.CancellationToken);
         var loaded = Assert.Single(iterations);
         Assert.False(loaded.BuildSuccess);
-    }
-
-    /// <summary>
-    /// Simulates an old database without the build_success column.
-    /// A freshly opened store must still load iteration summaries,
-    /// defaulting BuildSuccess to false for pre-migration rows.
-    /// </summary>
-    [Fact]
-    public async Task SqliteGoalStore_BackwardCompat_NoBuildSuccessColumn_DefaultsToFalse()
-    {
-        var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
-        connection.Open();
-
-        // Manually create the old schema without build_success column
-        using (var cmd = connection.CreateCommand())
-        {
-            cmd.CommandText = """
-                CREATE TABLE goals (
-                    id         TEXT PRIMARY KEY,
-                    description TEXT NOT NULL,
-                    status     TEXT NOT NULL DEFAULT 'pending',
-                    priority   TEXT NOT NULL DEFAULT 'normal',
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE goal_iterations (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    goal_id         TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
-                    iteration       INTEGER NOT NULL,
-                    phases_json     TEXT,
-                    test_total      INTEGER,
-                    test_passed     INTEGER,
-                    test_failed     INTEGER,
-                    review_verdict  TEXT,
-                    notes_json      TEXT,
-                    phase_outputs_json TEXT,
-                    clarifications_json TEXT,
-                    created_at      TEXT NOT NULL,
-                    UNIQUE(goal_id, iteration)
-                );
-                """;
-            cmd.ExecuteNonQuery();
-        }
-
-        // Insert a goal and an iteration directly (bypassing the store's INSERT)
-        using (var insertGoal = connection.CreateCommand())
-        {
-            insertGoal.CommandText = """
-                INSERT INTO goals (id, description, status, priority, created_at)
-                VALUES ('old-goal', 'Old schema goal', 'in_progress', 'normal', '2025-01-01T00:00:00Z')
-                """;
-            insertGoal.ExecuteNonQuery();
-        }
-
-        using (var insertIter = connection.CreateCommand())
-        {
-            insertIter.CommandText = """
-                INSERT INTO goal_iterations
-                    (goal_id, iteration, phases_json, test_total, test_passed, test_failed,
-                     review_verdict, notes_json, phase_outputs_json, clarifications_json, created_at)
-                VALUES
-                    ('old-goal', 1,
-                     '[{"name":"Coding","result":"pass","duration_seconds":45}]',
-                     5, 5, 0, NULL, NULL, NULL, NULL,
-                     '2025-01-01T00:00:00Z')
-                """;
-            insertIter.ExecuteNonQuery();
-        }
-
-        // Open with current store — migration adds build_success column
-        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
-
-        var iterations = await store.GetIterationsAsync("old-goal", TestContext.Current.CancellationToken);
-        var loaded = Assert.Single(iterations);
-        Assert.False(loaded.BuildSuccess,
-            "BuildSuccess must default to false when the column is absent (pre-migration).");
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────

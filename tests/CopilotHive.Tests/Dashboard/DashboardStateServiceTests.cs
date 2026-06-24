@@ -5,7 +5,7 @@ using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
-using Microsoft.Data.Sqlite;
+using CopilotHive.Persistence;
 using Microsoft.Extensions.Logging.Abstractions;
 
 using WorkerRole = CopilotHive.Workers.WorkerRole;
@@ -18,21 +18,20 @@ namespace CopilotHive.Tests.Dashboard;
 /// </summary>
 public sealed class DashboardStateServiceTests : IDisposable
 {
-    private readonly SqliteConnection _conn;
-    private readonly SqliteGoalStore _store;
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
 
     /// <summary>Initialises an in-memory SQLite goal store for each test.</summary>
     public DashboardStateServiceTests()
     {
-        _conn = new SqliteConnection("Data Source=:memory:");
-        _conn.Open();
-        _store = new SqliteGoalStore(_conn, NullLogger<SqliteGoalStore>.Instance);
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
     }
 
     /// <inheritdoc />
     public void Dispose()
     {
-        _conn.Dispose();
+        _dbContext.Dispose();
     }
 
     /// <summary>

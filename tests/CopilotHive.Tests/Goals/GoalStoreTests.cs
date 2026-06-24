@@ -2,26 +2,25 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
-using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests.Goals;
 
-public sealed class SqliteGoalStoreTests : IDisposable
+public sealed class GoalStoreTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly SqliteGoalStore _store;
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
 
-    public SqliteGoalStoreTests()
+    public GoalStoreTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
     }
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _dbContext.Dispose();
     }
 
     private static Goal MakeGoal(string id = "test-goal", string desc = "Do the thing",
@@ -34,132 +33,6 @@ public sealed class SqliteGoalStoreTests : IDisposable
             Priority = priority,
             CreatedAt = new DateTime(2025, 1, 15, 10, 0, 0, DateTimeKind.Utc),
         };
-
-    // ── Backup ────────────────────────────────────────────────────────────
-
-    [Fact]
-    public void BackupDatabaseIfExists_FileBasedDb_CreatesBackupFile()
-    {
-        var tempDir = Path.Combine(Path.GetTempPath(), $"goalstore-backup-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        var dbPath = Path.Combine(tempDir, "goals.db");
-
-        // Pre-create the database file so the constructor sees an existing database
-        using (var conn = new SqliteConnection($"Data Source={dbPath}"))
-        {
-            conn.Open();
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = "CREATE TABLE IF NOT EXISTS preexisting (id INTEGER PRIMARY KEY);";
-            cmd.ExecuteNonQuery();
-        }
-
-        try
-        {
-            var store = new SqliteGoalStore(dbPath, NullLogger<SqliteGoalStore>.Instance);
-
-            var backupDir = Path.Combine(tempDir, "backups");
-            Assert.True(Directory.Exists(backupDir));
-            var backupFiles = Directory.GetFiles(backupDir, "goals.db.*.bak");
-            Assert.Single(backupFiles);
-        }
-        finally
-        {
-            ForceDeleteDirectory(tempDir);
-        }
-    }
-
-    [Fact]
-    public void BackupDatabaseIfExists_InMemoryDb_SkipsBackup()
-    {
-        var tempDir = Path.Combine(Path.GetTempPath(), $"goalstore-backup-inmem-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-
-        try
-        {
-            var store = new SqliteGoalStore(":memory:", NullLogger<SqliteGoalStore>.Instance);
-
-            var backupDir = Path.Combine(tempDir, "backups");
-            Assert.False(Directory.Exists(backupDir));
-        }
-        finally
-        {
-            ForceDeleteDirectory(tempDir);
-        }
-    }
-
-    [Fact]
-    public void BackupDatabaseIfExists_FreshDbFile_SkipsBackup()
-    {
-        var tempDir = Path.Combine(Path.GetTempPath(), $"goalstore-backup-fresh-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        var dbPath = Path.Combine(tempDir, "fresh.db");
-
-        try
-        {
-            Assert.False(File.Exists(dbPath));
-
-            var store = new SqliteGoalStore(dbPath, NullLogger<SqliteGoalStore>.Instance);
-
-            var backupDir = Path.Combine(tempDir, "backups");
-            Assert.False(Directory.Exists(backupDir));
-            Assert.True(File.Exists(dbPath));
-        }
-        finally
-        {
-            ForceDeleteDirectory(tempDir);
-        }
-    }
-
-
-
-    [Fact]
-    public void BackupDatabaseIfExists_KeepsOnlyLastTenBackups()
-    {
-        var tempDir = Path.Combine(Path.GetTempPath(), $"goalstore-backup-retention-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        var dbPath = Path.Combine(tempDir, "retention.db");
-
-        // Pre-create the database file so the first store construction sees an existing database
-        using (var conn = new SqliteConnection($"Data Source={dbPath}"))
-        {
-            conn.Open();
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = "CREATE TABLE IF NOT EXISTS preexisting (id INTEGER PRIMARY KEY);";
-            cmd.ExecuteNonQuery();
-        }
-
-        try
-        {
-            var backupDir = Path.Combine(tempDir, "backups");
-
-            // Open the store 12 times; each time a new backup is created and the oldest beyond the
-            // last 10 is cleaned up, leaving exactly 10 backups. Sleep between constructions so the
-            // second-resolution timestamp in the backup filename advances and each backup is distinct.
-            for (var i = 0; i < 12; i++)
-            {
-                var store = new SqliteGoalStore(dbPath, NullLogger<SqliteGoalStore>.Instance);
-                if (i < 11)
-                    Thread.Sleep(1100);
-            }
-
-            var backupFiles = Directory.GetFiles(backupDir, "retention.db.*.bak");
-            Assert.Equal(10, backupFiles.Length);
-        }
-        finally
-        {
-            ForceDeleteDirectory(tempDir);
-        }
-    }
-
-    private static void ForceDeleteDirectory(string path)
-    {
-        foreach (var file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
-        {
-            File.SetAttributes(file, FileAttributes.Normal);
-        }
-
-        Directory.Delete(path, recursive: true);
-    }
 
     // ── CRUD ──────────────────────────────────────────────────────────────
 
@@ -185,7 +58,7 @@ public sealed class SqliteGoalStoreTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
         await _store.CreateGoalAsync(MakeGoal(), ct);
 
-        await Assert.ThrowsAsync<SqliteException>(() =>
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
             _store.CreateGoalAsync(MakeGoal(), ct));
     }
 
@@ -645,149 +518,12 @@ public sealed class SqliteGoalStoreTests : IDisposable
         Assert.Null(fetched.MergeCommitHash);
     }
 
-    [Fact]
-    public async Task Migration_AddsMergeCommitHashColumnToExistingDatabase()
-    {
-        var ct = TestContext.Current.CancellationToken;
-        using var oldConn = new SqliteConnection("Data Source=:memory:");
-        oldConn.Open();
-
-        // Create old schema WITHOUT merge_commit_hash column
-        using (var createCmd = oldConn.CreateCommand())
-        {
-            createCmd.CommandText = """
-                CREATE TABLE goals (
-                    id                    TEXT PRIMARY KEY,
-                    description           TEXT NOT NULL,
-                    title                 TEXT,
-                    status                TEXT NOT NULL DEFAULT 'pending',
-                    priority              TEXT NOT NULL DEFAULT 'normal',
-                    repositories          TEXT,
-                    metadata              TEXT,
-                    created_at            TEXT NOT NULL,
-                    started_at            TEXT,
-                    completed_at          TEXT,
-                    iterations            INTEGER,
-                    failure_reason        TEXT,
-                    notes                 TEXT,
-                    phase_durations       TEXT,
-                    total_duration_seconds REAL,
-                    source_conversation_id TEXT,
-                    depends_on             TEXT
-                );
-                """;
-            createCmd.ExecuteNonQuery();
-        }
-
-        // Insert a goal using old schema
-        using (var insertCmd = oldConn.CreateCommand())
-        {
-            insertCmd.CommandText = """
-                INSERT INTO goals (id, description, status, priority, created_at)
-                VALUES ('old-goal', 'Pre-migration goal', 'pending', 'normal', '2025-01-01T00:00:00Z')
-                """;
-            insertCmd.ExecuteNonQuery();
-        }
-
-        // Create store — triggers migration
-        var store = new SqliteGoalStore(oldConn, NullLogger<SqliteGoalStore>.Instance);
-
-        // Old goal should have null merge_commit_hash
-        var oldGoal = await store.GetGoalAsync("old-goal", ct);
-        Assert.NotNull(oldGoal);
-        Assert.Null(oldGoal.MergeCommitHash);
-
-        // New goal with hash should round-trip
-        var newGoal = new Goal
-        {
-            Id = "new-goal",
-            Description = "Post-migration goal",
-            MergeCommitHash = "post-migration-hash",
-            CreatedAt = new DateTime(2025, 6, 1, 0, 0, 0, DateTimeKind.Utc),
-        };
-        await store.CreateGoalAsync(newGoal, ct);
-
-        var fetched = await store.GetGoalAsync("new-goal", ct);
-        Assert.NotNull(fetched);
-        Assert.Equal("post-migration-hash", fetched.MergeCommitHash);
-    }
-
     // ── Name property ─────────────────────────────────────────────────────
 
     [Fact]
     public void Name_IsSqlite()
     {
         Assert.Equal("sqlite", _store.Name);
-    }
-
-    // ── Schema migration ──────────────────────────────────────────────────
-
-    [Fact]
-    public async Task Migration_AddsColumnToExistingDatabase()
-    {
-        // Simulate an older database that doesn't have the depends_on column
-        var ct = TestContext.Current.CancellationToken;
-        using var oldConn = new SqliteConnection("Data Source=:memory:");
-        oldConn.Open();
-
-        // Create old schema WITHOUT depends_on
-        using (var createCmd = oldConn.CreateCommand())
-        {
-            createCmd.CommandText = """
-                CREATE TABLE goals (
-                    id                    TEXT PRIMARY KEY,
-                    description           TEXT NOT NULL,
-                    title                 TEXT,
-                    status                TEXT NOT NULL DEFAULT 'pending',
-                    priority              TEXT NOT NULL DEFAULT 'normal',
-                    repositories          TEXT,
-                    metadata              TEXT,
-                    created_at            TEXT NOT NULL,
-                    started_at            TEXT,
-                    completed_at          TEXT,
-                    iterations            INTEGER,
-                    failure_reason        TEXT,
-                    notes                 TEXT,
-                    phase_durations       TEXT,
-                    total_duration_seconds REAL,
-                    source_conversation_id TEXT
-                );
-                """;
-            createCmd.ExecuteNonQuery();
-        }
-
-        // Insert a goal using old schema
-        using (var insertCmd = oldConn.CreateCommand())
-        {
-            insertCmd.CommandText = """
-                INSERT INTO goals (id, description, status, priority, created_at)
-                VALUES ('old-goal', 'Pre-migration goal', 'pending', 'normal', '2025-01-01T00:00:00Z')
-                """;
-            insertCmd.ExecuteNonQuery();
-        }
-
-        // Now create a SqliteGoalStore which triggers InitSchema + MigrateSchema
-        var store = new SqliteGoalStore(oldConn, NullLogger<SqliteGoalStore>.Instance);
-
-        // Verify old goal can still be read (depends_on should be empty)
-        var oldGoal = await store.GetGoalAsync("old-goal", ct);
-        Assert.NotNull(oldGoal);
-        Assert.Empty(oldGoal.DependsOn);
-
-        // Verify new goals with depends_on work
-        var newGoal = new Goal
-        {
-            Id = "new-goal",
-            Description = "Post-migration goal",
-            DependsOn = ["old-goal"],
-            CreatedAt = new DateTime(2025, 6, 1, 0, 0, 0, DateTimeKind.Utc),
-        };
-        await store.CreateGoalAsync(newGoal, ct);
-
-        var fetched = await store.GetGoalAsync("new-goal", ct);
-        Assert.NotNull(fetched);
-        Assert.Single(fetched.DependsOn);
-        Assert.Contains("old-goal", fetched.DependsOn);
     }
 
     // ── DeleteGoalAsync — PipelineStore cleanup ────────────────────────────
@@ -799,7 +535,7 @@ public sealed class SqliteGoalStoreTests : IDisposable
 
         // Create a PipelineStore alongside the GoalStore
         var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
-        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
 
         // Create a goal and pipeline with conversation entries
         var goal = MakeGoal("delete-pipeline-goal", status: GoalStatus.Draft);
@@ -844,19 +580,18 @@ public sealed class SqliteGoalStoreTests : IDisposable
 /// Tests that verify IterationSummary round-trip serialization with worker outputs
 /// through the SQLite JSON path.
 /// </summary>
-public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
+public sealed class GoalStoreWorkerOutputTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly SqliteGoalStore _store;
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
 
-    public SqliteGoalStoreWorkerOutputTests()
+    public GoalStoreWorkerOutputTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
     }
 
-    public void Dispose() => _connection.Dispose();
+    public void Dispose() => _dbContext.Dispose();
 
     private static Goal MakeGoal(string id = "worker-output-goal") => new()
     {
@@ -869,7 +604,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
     /// PhaseResult.WorkerOutput round-trips through the SQLite JSON column (phases_json).
     /// </summary>
     [Fact]
-    public async Task SqliteGoalStore_PhaseResultWorkerOutput_RoundTrips()
+    public async Task GoalStore_PhaseResultWorkerOutput_RoundTrips()
     {
         var ct = TestContext.Current.CancellationToken;
         await _store.CreateGoalAsync(MakeGoal(), ct);
@@ -912,7 +647,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
     /// IterationSummary.PhaseOutputs dictionary round-trips through the SQLite phase_outputs_json column.
     /// </summary>
     [Fact]
-    public async Task SqliteGoalStore_PhaseOutputsDictionary_RoundTrips()
+    public async Task GoalStore_PhaseOutputsDictionary_RoundTrips()
     {
         var ct = TestContext.Current.CancellationToken;
         await _store.CreateGoalAsync(MakeGoal("dict-goal"), ct);
@@ -947,7 +682,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
     /// When IterationSummary.PhaseOutputs is empty, it round-trips as an empty dictionary.
     /// </summary>
     [Fact]
-    public async Task SqliteGoalStore_EmptyPhaseOutputs_RoundTripsAsEmpty()
+    public async Task GoalStore_EmptyPhaseOutputs_RoundTripsAsEmpty()
     {
         var ct = TestContext.Current.CancellationToken;
         await _store.CreateGoalAsync(MakeGoal("empty-goal"), ct);
@@ -973,7 +708,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
     /// and GetIterationsAsync retrieves them correctly.
     /// </summary>
     [Fact]
-    public async Task SqliteGoalStore_AddAndGetIterations_PreservesWorkerOutput()
+    public async Task GoalStore_AddAndGetIterations_PreservesWorkerOutput()
     {
         var ct = TestContext.Current.CancellationToken;
         await _store.CreateGoalAsync(MakeGoal("iter-goal"), ct);
@@ -1070,7 +805,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        // SqliteGoalStore created without PipelineStore returns empty list
+        // GoalStore created without PipelineStore returns empty list
         var conversation = await _store.GetPipelineConversationAsync("any-goal", ct);
 
         Assert.Empty(conversation);
@@ -1083,7 +818,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
 
         // Create a PipelineStore alongside the GoalStore
         var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
-        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
 
         // Create a goal and pipeline with conversation entries
         var goal = MakeGoal("conv-goal");
@@ -1114,7 +849,7 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
-        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
 
         // Goal exists but no pipeline stored for it
         var goal = MakeGoal("no-pipeline-goal");
@@ -1576,11 +1311,13 @@ public sealed class SqliteGoalStoreWorkerOutputTests : IDisposable
 
         // Insert a row directly with an empty-string clarifications_json to simulate
         // legacy / corrupted data that bypasses the '[]' SQL filter.
-        using var cmd = _connection.CreateCommand();
+        using var cmd = _dbContext.Database.GetDbConnection().CreateCommand();
         cmd.CommandText = """
-            INSERT INTO goal_iterations (goal_id, iteration, phases_json, clarifications_json, created_at)
-            VALUES ('g-clarif-emptystr', 99, '[]', '', datetime('now'))
+            INSERT INTO goal_iterations (goal_id, iteration, phases_json, clarifications_json, build_success, created_at)
+            VALUES ('g-clarif-emptystr', 99, '[]', '', 0, datetime('now'))
             """;
+        if (cmd.Connection?.State != System.Data.ConnectionState.Open)
+            cmd.Connection?.Open();
         cmd.ExecuteNonQuery();
 
         // Must not throw and must return no clarifications.

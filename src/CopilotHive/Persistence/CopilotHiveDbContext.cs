@@ -13,9 +13,8 @@ namespace CopilotHive.Persistence;
 
 /// <summary>
 /// Entity Framework Core DbContext for the CopilotHive persistence layer.
-/// Runs alongside the existing raw ADO.NET stores (<see cref="SqliteGoalStore"/> and
-/// <see cref="PipelineStore"/>) as a non-breaking foundational step toward persistence
-/// modernization.
+/// Provides EF Core persistence for goals, releases, iteration summaries, and pipeline
+/// state via <see cref="GoalStore"/> and <see cref="PipelineStore"/>.
 /// </summary>
 public sealed class CopilotHiveDbContext : DbContext
 {
@@ -104,7 +103,7 @@ public sealed class CopilotHiveDbContext : DbContext
         entity.Property(e => e.MergeCommitHash).HasColumnName("merge_commit_hash");
         entity.Property(e => e.ReleaseId).HasColumnName("release_id");
 
-        // Derived collection loaded separately by SqliteGoalStore.
+        // Derived collection loaded separately by GoalStore.
         entity.Ignore(e => e.IterationSummaries);
 
         // Shadow properties for columns the domain model doesn't expose.

@@ -1,5 +1,6 @@
 using CopilotHive.Goals;
-using Microsoft.Data.Sqlite;
+using CopilotHive.Persistence;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests.Goals;
@@ -9,17 +10,16 @@ namespace CopilotHive.Tests.Goals;
 /// </summary>
 public sealed class ReleaseTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly SqliteGoalStore _store;
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
 
     public ReleaseTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
     }
 
-    public void Dispose() => _connection.Dispose();
+    public void Dispose() => _dbContext.Dispose();
 
     // ── Release CRUD ─────────────────────────────────────────────────────
 
@@ -289,111 +289,6 @@ public sealed class ReleaseTests : IDisposable
         Assert.Empty(goals);
     }
 
-    // ── Migration ──────────────────────────────────────────────────────────
-
-    [Fact]
-    public async Task Migration_AddsReleaseIdColumnToExistingDatabase()
-    {
-        var ct = TestContext.Current.CancellationToken;
-        using var oldConn = new SqliteConnection("Data Source=:memory:");
-        oldConn.Open();
-
-        // Create old schema WITHOUT release_id column
-        using (var createCmd = oldConn.CreateCommand())
-        {
-            createCmd.CommandText = """
-                CREATE TABLE goals (
-                    id                    TEXT PRIMARY KEY,
-                    description           TEXT NOT NULL,
-                    title                 TEXT,
-                    status                TEXT NOT NULL DEFAULT 'pending',
-                    priority              TEXT NOT NULL DEFAULT 'normal',
-                    scope                 TEXT NOT NULL DEFAULT 'patch',
-                    repositories          TEXT,
-                    metadata              TEXT,
-                    created_at            TEXT NOT NULL,
-                    started_at            TEXT,
-                    completed_at          TEXT,
-                    iterations            INTEGER,
-                    failure_reason        TEXT,
-                    notes                 TEXT,
-                    phase_durations       TEXT,
-                    total_duration_seconds REAL,
-                    source_conversation_id TEXT,
-                    depends_on            TEXT,
-                    merge_commit_hash     TEXT
-                );
-                """;
-            createCmd.ExecuteNonQuery();
-        }
-
-        // Insert a goal using old schema
-        using (var insertCmd = oldConn.CreateCommand())
-        {
-            insertCmd.CommandText = """
-                INSERT INTO goals (id, description, status, priority, scope, created_at)
-                VALUES ('old-goal', 'Pre-migration goal', 'pending', 'normal', 'patch', '2025-01-01T00:00:00Z')
-                """;
-            insertCmd.ExecuteNonQuery();
-        }
-
-        // Create store — triggers migration
-        var store = new SqliteGoalStore(oldConn, NullLogger<SqliteGoalStore>.Instance);
-
-        // Old goal should have null ReleaseId
-        var oldGoal = await store.GetGoalAsync("old-goal", ct);
-        Assert.NotNull(oldGoal);
-        Assert.Null(oldGoal!.ReleaseId);
-
-        // New goal with ReleaseId should round-trip
-        var newGoal = new Goal
-        {
-            Id = "new-goal",
-            Description = "Post-migration goal",
-            ReleaseId = "v1.0.0",
-            CreatedAt = DateTime.UtcNow,
-        };
-        await store.CreateGoalAsync(newGoal, ct);
-
-        var fetched = await store.GetGoalAsync("new-goal", ct);
-        Assert.NotNull(fetched);
-        Assert.Equal("v1.0.0", fetched!.ReleaseId);
-    }
-
-    [Fact]
-    public async Task Migration_CreatesReleasesTable()
-    {
-        var ct = TestContext.Current.CancellationToken;
-        using var oldConn = new SqliteConnection("Data Source=:memory:");
-        oldConn.Open();
-
-        // Create old schema WITHOUT releases table
-        using (var createCmd = oldConn.CreateCommand())
-        {
-            createCmd.CommandText = """
-                CREATE TABLE goals (
-                    id                    TEXT PRIMARY KEY,
-                    description           TEXT NOT NULL,
-                    status                TEXT NOT NULL DEFAULT 'pending',
-                    priority              TEXT NOT NULL DEFAULT 'normal',
-                    created_at            TEXT NOT NULL
-                );
-                """;
-            createCmd.ExecuteNonQuery();
-        }
-
-        // Create store — triggers migration
-        var store = new SqliteGoalStore(oldConn, NullLogger<SqliteGoalStore>.Instance);
-
-        // Should be able to create and retrieve releases
-        var release = new Release { Id = "v1.0.0", Tag = "v1.0.0" };
-        await store.CreateReleaseAsync(release, ct);
-
-        var fetched = await store.GetReleaseAsync("v1.0.0", ct);
-        Assert.NotNull(fetched);
-        Assert.Equal("v1.0.0", fetched!.Id);
-    }
-
     // ── ReleaseStatus Enum ────────────────────────────────────────────────
 
     [Fact]
@@ -410,8 +305,10 @@ public sealed class ReleaseTests : IDisposable
         // Status should serialize to lowercase 'planning'
         await _store.CreateReleaseAsync(release, ct);
 
-        using var cmd = _connection.CreateCommand();
+        using var cmd = _dbContext.Database.GetDbConnection().CreateCommand();
         cmd.CommandText = "SELECT status FROM releases WHERE id = 'status-test'";
+        if (cmd.Connection?.State != System.Data.ConnectionState.Open)
+            cmd.Connection?.Open();
         var status = cmd.ExecuteScalar() as string;
         Assert.Equal("planning", status);
     }
@@ -429,8 +326,10 @@ public sealed class ReleaseTests : IDisposable
 
         await _store.CreateReleaseAsync(release, ct);
 
-        using var cmd = _connection.CreateCommand();
+        using var cmd = _dbContext.Database.GetDbConnection().CreateCommand();
         cmd.CommandText = "SELECT status FROM releases WHERE id = 'status-released'";
+        if (cmd.Connection?.State != System.Data.ConnectionState.Open)
+            cmd.Connection?.Open();
         var status = cmd.ExecuteScalar() as string;
         Assert.Equal("released", status);
     }

@@ -5,7 +5,6 @@ using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
-using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -21,15 +20,14 @@ namespace CopilotHive.Tests.Orchestration;
 /// </summary>
 public sealed class ComposerToolTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly SqliteGoalStore _store;
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
     private readonly Composer _composer;
 
     public ComposerToolTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
 
         _composer = new Composer(
             "test-model",
@@ -40,7 +38,7 @@ public sealed class ComposerToolTests : IDisposable
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _dbContext.Dispose();
     }
 
     // ── create_goal ──
@@ -1778,9 +1776,9 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        // Create a PipelineStore and wire it to a new SqliteGoalStore
+        // Create a PipelineStore and wire it to a new GoalStore
         var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
-        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
         var composerWithPipeline = new Composer(
             "test-model",
             NullLogger<Composer>.Instance,
@@ -1820,9 +1818,9 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        // Create a PipelineStore and wire it to a new SqliteGoalStore
+        // Create a PipelineStore and wire it to a new GoalStore
         var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
-        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
         var composerWithPipeline = new Composer(
             "test-model",
             NullLogger<Composer>.Instance,
@@ -1864,7 +1862,7 @@ public sealed class ComposerToolTests : IDisposable
 
         // Create a PipelineStore and wire it
         var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
-        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
         var composerWithPipeline = new Composer(
             "test-model",
             NullLogger<Composer>.Instance,
@@ -1895,7 +1893,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
-        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
         var composerWithPipeline = new Composer(
             "test-model",
             NullLogger<Composer>.Instance,
@@ -1940,7 +1938,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
-        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
         var composerWithPipeline = new Composer(
             "test-model",
             NullLogger<Composer>.Instance,
@@ -3742,9 +3740,9 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        // Create a PipelineStore and wire it to a new SqliteGoalStore
+        // Create a PipelineStore and wire it to a new GoalStore
         var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
-        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
         var composerWithPipeline = new Composer(
             "test-model",
             NullLogger<Composer>.Instance,
@@ -3777,9 +3775,9 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        // Create a PipelineStore and wire it to a new SqliteGoalStore
+        // Create a PipelineStore and wire it to a new GoalStore
         var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
-        var storeWithPipeline = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance, pipelineStore);
+        var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
         var composerWithPipeline = new Composer(
             "test-model",
             NullLogger<Composer>.Instance,
@@ -3991,15 +3989,14 @@ internal sealed class TestLogger<T> : ILogger<T>
 
 public sealed class UpdateReleaseComposerToolTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly SqliteGoalStore _store;
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
     private readonly Composer _composer;
 
     public UpdateReleaseComposerToolTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
         _composer = new Composer(
             "test-model",
             NullLogger<Composer>.Instance,
@@ -4007,7 +4004,7 @@ public sealed class UpdateReleaseComposerToolTests : IDisposable
             stateDir: Path.GetTempPath());
     }
 
-    public void Dispose() => _connection.Dispose();
+    public void Dispose() => _dbContext.Dispose();
 
     [Fact]
     public async Task UpdateRelease_UpdatesTag_ReturnsSuccess()
@@ -4143,8 +4140,8 @@ public sealed class UpdateReleaseComposerToolTests : IDisposable
 /// </summary>
 public sealed class ComposerConfigRepoToolTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly SqliteGoalStore _store;
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
     private readonly string _configRepoDir;
     private readonly ConfigRepoManager _configRepo;
     private readonly Composer _composerWithConfigRepo;
@@ -4152,9 +4149,8 @@ public sealed class ComposerConfigRepoToolTests : IDisposable
 
     public ComposerConfigRepoToolTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
 
         // Create a real temporary directory to act as the config repo
         _configRepoDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -4179,7 +4175,7 @@ public sealed class ComposerConfigRepoToolTests : IDisposable
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _dbContext.Dispose();
         try { Directory.Delete(_configRepoDir, recursive: true); } catch { /* best-effort */ }
     }
 
@@ -4640,14 +4636,13 @@ public sealed class ComposerConfigRepoGitIntegrationTests : IDisposable
 {
     private readonly string _configRepoDir;
     private readonly string _remoteRepoDir;
-    private readonly SqliteConnection _connection;
-    private readonly SqliteGoalStore _store;
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
 
     public ComposerConfigRepoGitIntegrationTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
 
         // Create a temp directory structure for integration tests
         var baseDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -4660,7 +4655,7 @@ public sealed class ComposerConfigRepoGitIntegrationTests : IDisposable
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _dbContext.Dispose();
         // Clean up temp directories
         var baseDir = Path.GetDirectoryName(_configRepoDir);
         if (baseDir is not null)
@@ -4922,8 +4917,8 @@ public sealed class ComposerConfigRepoGitIntegrationTests : IDisposable
 /// </summary>
 public sealed class ComposerKnowledgeToolTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly SqliteGoalStore _store;
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
     private readonly CopilotHive.Knowledge.KnowledgeGraph _knowledgeGraph;
     private readonly Composer _composer;
 
@@ -4933,9 +4928,8 @@ public sealed class ComposerKnowledgeToolTests : IDisposable
 
     public ComposerKnowledgeToolTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
 
         _knowledgeGraph = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
         _composer = new Composer(
@@ -4955,7 +4949,7 @@ public sealed class ComposerKnowledgeToolTests : IDisposable
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _dbContext.Dispose();
         var baseDir = Path.GetDirectoryName(_configRepoDir);
         if (baseDir is not null)
         {
@@ -5753,8 +5747,8 @@ public sealed class ComposerKnowledgeToolTests : IDisposable
 /// </summary>
 public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly SqliteGoalStore _store;
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
     private readonly CopilotHive.Knowledge.KnowledgeGraph _knowledgeGraph;
     private readonly Composer _composer;
 
@@ -5764,9 +5758,8 @@ public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
 
     public ComposerKnowledgeToolIntegrationTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-        _store = new SqliteGoalStore(_connection, NullLogger<SqliteGoalStore>.Instance);
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
 
         _knowledgeGraph = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
         _composer = new Composer(
@@ -5785,7 +5778,7 @@ public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _dbContext.Dispose();
         var baseDir = Path.GetDirectoryName(_configRepoDir);
         if (baseDir is not null)
         {

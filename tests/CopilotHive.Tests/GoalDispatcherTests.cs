@@ -2,6 +2,7 @@ using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Extensions.Logging;
@@ -1790,9 +1791,8 @@ public sealed class GoalDispatcherAutoTagReleaseTests
         var ct = TestContext.Current.CancellationToken;
 
         // Create a goal store with a Planning release
-        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
-        connection.Open();
-        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var store = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
 
         // Create a Planning release
         var release = new Release { Id = "v1.0.0", Tag = "v1.0.0", Status = ReleaseStatus.Planning };
@@ -1828,9 +1828,8 @@ public sealed class GoalDispatcherAutoTagReleaseTests
     {
         var ct = TestContext.Current.CancellationToken;
 
-        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
-        connection.Open();
-        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var store = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
 
         // Create multiple Planning releases
         await store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0", Status = ReleaseStatus.Planning }, ct);
@@ -1863,9 +1862,8 @@ public sealed class GoalDispatcherAutoTagReleaseTests
     {
         var ct = TestContext.Current.CancellationToken;
 
-        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
-        connection.Open();
-        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var store = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
 
         // Create a Released release (not Planning)
         await store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0", Status = ReleaseStatus.Released }, ct);
@@ -1897,9 +1895,8 @@ public sealed class GoalDispatcherAutoTagReleaseTests
     {
         var ct = TestContext.Current.CancellationToken;
 
-        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
-        connection.Open();
-        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var store = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
 
         // Create a Planning release
         await store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0", Status = ReleaseStatus.Planning }, ct);
@@ -1925,9 +1922,8 @@ public sealed class GoalDispatcherAutoTagReleaseTests
     {
         var ct = TestContext.Current.CancellationToken;
 
-        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
-        connection.Open();
-        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var store = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
 
         // Create a Planning release
         await store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0", Status = ReleaseStatus.Planning }, ct);
@@ -1954,9 +1950,8 @@ public sealed class GoalDispatcherAutoTagReleaseTests
     {
         var ct = TestContext.Current.CancellationToken;
 
-        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
-        connection.Open();
-        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var store = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
 
         // Create a Planning release
         await store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0", Status = ReleaseStatus.Planning }, ct);
@@ -2009,9 +2004,8 @@ public sealed class GoalDispatcherAutoTagReleaseTests
     {
         var ct = TestContext.Current.CancellationToken;
 
-        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
-        connection.Open();
-        var store = new SqliteGoalStore(connection, NullLogger<SqliteGoalStore>.Instance);
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var store = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
 
         // Create a release
         await store.CreateReleaseAsync(new Release { Id = "v1.0.0", Tag = "v1.0.0" }, ct);
