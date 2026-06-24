@@ -325,9 +325,31 @@ internal sealed class PipelineDriver
             "New iteration {Iteration} for goal {GoalId}: {Phases}",
             pipeline.Iteration, pipeline.GoalId, string.Join(" → ", newPlan.Phases));
 
-        // Build context for the coder
-        var feedbackKind = isReviewRelated ? "Reviewer feedback" : "Test failures";
-        var context = $"{feedbackKind}: see previous output.";
+        // Build context for the coder from the previous iteration's phase output
+        var prevIteration = pipeline.Iteration - 1;
+        var relevantPhase = isReviewRelated ? GoalPhase.Review : GoalPhase.Testing;
+        var feedbackKindHeader = isReviewRelated
+            ? $"Reviewer feedback from iteration {prevIteration}:"
+            : $"Test failures from iteration {prevIteration}:";
+
+        var context = feedbackKindHeader;
+
+        var previousPhaseEntry = pipeline.PhaseLog
+            .LastOrDefault(e => e.Iteration == prevIteration && e.Name == relevantPhase);
+        var output = previousPhaseEntry?.WorkerOutput;
+
+        if (!string.IsNullOrWhiteSpace(output))
+        {
+            const int maxOutputChars = 3000;
+            var truncated = output.Length > maxOutputChars
+                ? output[..maxOutputChars] + "..."
+                : output;
+            context += $"\n{truncated}";
+        }
+        else
+        {
+            context += "\n(No detailed output available — check iteration summary.)";
+        }
 
         if (reviewIssues is { Count: > 0 })
         {
