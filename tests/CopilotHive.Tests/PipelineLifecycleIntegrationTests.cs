@@ -18,7 +18,7 @@ public sealed class PipelineLifecycleIntegrationTests : IAsyncDisposable
     /// <summary>Initialises the test with a fresh in-memory SQLite store.</summary>
     public PipelineLifecycleIntegrationTests()
     {
-        _store = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        _store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
     }
 
     /// <inheritdoc/>

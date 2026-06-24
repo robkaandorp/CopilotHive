@@ -76,7 +76,9 @@ public sealed class Program
             var stateDir = Environment.GetEnvironmentVariable("STATE_DIR") ?? "/app/state";
             var dbPath = Path.Combine(stateDir, "copilothive.db");
             builder.Services.AddSingleton(sp =>
-                new PipelineStore(dbPath, sp.GetRequiredService<ILogger<PipelineStore>>()));
+                new PipelineStore(
+                    sp.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>(),
+                    sp.GetRequiredService<ILogger<PipelineStore>>()));
 
             builder.Services.AddDbContext<CopilotHiveDbContext>(options =>
                 options.UseSqlite($"Data Source={dbPath}"));

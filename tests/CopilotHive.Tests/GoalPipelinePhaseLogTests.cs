@@ -226,7 +226,7 @@ public sealed class PipelineStorePhaseLogTests : IAsyncDisposable
 
     public PipelineStorePhaseLogTests()
     {
-        _store = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        _store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
     }
 
     public async ValueTask DisposeAsync() => await _store.DisposeAsync();

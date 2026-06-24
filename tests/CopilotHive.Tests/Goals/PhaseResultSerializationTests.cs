@@ -294,7 +294,7 @@ public sealed class PhaseResultSerializationTests : IDisposable
     [Fact]
     public void IterationPlan_GoalPhases_RoundTripThroughPipelineStore()
     {
-        var store = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
 
         var goal = new Goal
         {

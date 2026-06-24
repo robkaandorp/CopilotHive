@@ -4,7 +4,6 @@ using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
-using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests;
@@ -16,7 +15,7 @@ public sealed class PipelineStoreTests : IAsyncDisposable
     public PipelineStoreTests()
     {
         // Use in-memory SQLite for test isolation
-        _store = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        _store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
     }
 
     public async ValueTask DisposeAsync() => await _store.DisposeAsync();
@@ -29,70 +28,6 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         var goal = CreateGoal(id, desc);
         return new GoalPipeline(goal, maxRetries);
     }
-
-    #region Backup
-
-    [Fact]
-    public async Task BackupDatabaseIfExists_FileBasedDb_CreatesBackupFile()
-    {
-        var tempDir = Path.Combine(Path.GetTempPath(), $"pipelinestore-backup-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        var dbPath = Path.Combine(tempDir, "pipelines.db");
-
-        // Pre-create the database file so the constructor sees an existing database
-        using (var conn = new SqliteConnection($"Data Source={dbPath}"))
-        {
-            conn.Open();
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = "CREATE TABLE IF NOT EXISTS preexisting (id INTEGER PRIMARY KEY);";
-            cmd.ExecuteNonQuery();
-        }
-
-        try
-        {
-            await using var store = new PipelineStore(dbPath, NullLogger<PipelineStore>.Instance);
-
-            var backupDir = Path.Combine(tempDir, "backups");
-            Assert.True(Directory.Exists(backupDir));
-            var backupFiles = Directory.GetFiles(backupDir, "pipelines.db.*.bak");
-            Assert.Single(backupFiles);
-        }
-        finally
-        {
-            ForceDeleteDirectory(tempDir);
-        }
-    }
-
-    [Fact]
-    public async Task BackupDatabaseIfExists_InMemoryDb_SkipsBackup()
-    {
-        var tempDir = Path.Combine(Path.GetTempPath(), $"pipelinestore-backup-inmem-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-
-        try
-        {
-            await using var store = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
-
-            var backupDir = Path.Combine(tempDir, "backups");
-            Assert.False(Directory.Exists(backupDir));
-        }
-        finally
-        {
-            ForceDeleteDirectory(tempDir);
-        }
-    }
-
-    private static void ForceDeleteDirectory(string path)
-    {
-        foreach (var file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
-        {
-            File.SetAttributes(file, FileAttributes.Normal);
-        }
-
-        Directory.Delete(path, recursive: true);
-    }
-
-    #endregion
 
     #region SavePipeline / LoadActivePipelines — Round-trip
 
@@ -617,7 +552,7 @@ public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable{
 
     public GoalPipelineManagerPersistenceTests()
     {
-        _store = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        _store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
         _manager = new GoalPipelineManager(_store);
     }
 
@@ -723,261 +658,13 @@ public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable{
     }
 }
 
-/// <summary>
-/// Tests that PipelineStore automatically migrates an older SQLite schema when opened.
-/// </summary>
-public sealed class PipelineStoreSchemaMigrationTests
-{
-    private static Goal CreateGoal(string id = "goal-1") =>
-        new() { Id = id, Description = "Migration test goal", RepositoryNames = ["test-repo"] };
-
-    /// <summary>
-    /// Creates a named in-memory SQLite database with the old (incomplete) schema and returns
-    /// the shared-cache connection string so PipelineStore can open the same instance.
-    /// The seeder connection is stored in a field to prevent the named DB from being disposed.
-    /// </summary>
-    private (SqliteConnection Seeder, SqliteConnection Client) CreateOldSchemaConnections()
-    {
-        var name = $"migration-test-{Guid.NewGuid():N}";
-        var connStr = $"Data Source={name};Mode=Memory;Cache=Shared";
-
-        // Seeder keeps the named in-memory DB alive for the test's lifetime.
-        var seeder = new SqliteConnection(connStr);
-        seeder.Open();
-
-        using var cmd = seeder.CreateCommand();
-        // Old schema: missing max_iterations, improver_retries, phase_outputs, metrics_json, completed_at
-        cmd.CommandText = """
-            CREATE TABLE pipelines (
-                goal_id        TEXT PRIMARY KEY,
-                description    TEXT NOT NULL,
-                goal_json      TEXT NOT NULL,
-                phase          TEXT NOT NULL DEFAULT 'Planning',
-                iteration      INTEGER NOT NULL DEFAULT 1,
-                review_retries INTEGER NOT NULL DEFAULT 0,
-                test_retries   INTEGER NOT NULL DEFAULT 0,
-                max_retries    INTEGER NOT NULL DEFAULT 3,
-                active_task_id TEXT,
-                coder_branch   TEXT,
-                created_at     TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS conversation_entries (
-                id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                goal_id TEXT NOT NULL,
-                seq     INTEGER NOT NULL,
-                role    TEXT NOT NULL,
-                content TEXT NOT NULL,
-                FOREIGN KEY (goal_id) REFERENCES pipelines(goal_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_conversation_goal ON conversation_entries(goal_id, seq);
-            CREATE TABLE IF NOT EXISTS task_mappings (
-                task_id TEXT PRIMARY KEY,
-                goal_id TEXT NOT NULL
-            );
-            """;
-        cmd.ExecuteNonQuery();
-
-        // A second connection to the same named DB — handed to PipelineStore.
-        var client = new SqliteConnection(connStr);
-        client.Open();
-
-        return (seeder, client);
-    }
-
-    [Fact]
-    public async Task MigrateSchema_WhenColumnsAreMissing_StartsWithoutError()
-    {
-        var (seeder, client) = CreateOldSchemaConnections();
-        await using (seeder)
-        {
-            var store = new PipelineStore(client, NullLogger<PipelineStore>.Instance);
-            await store.DisposeAsync();
-        }
-    }
-
-    [Fact]
-    public async Task MigrateSchema_WhenColumnsAreMissing_AddsAllExpectedColumns()
-    {
-        var (seeder, client) = CreateOldSchemaConnections();
-        await using (seeder)
-        await using (var store = new PipelineStore(client, NullLogger<PipelineStore>.Instance))
-        {
-            // Inspect via the seeder connection after migration.
-            using var cmd = seeder.CreateCommand();
-            cmd.CommandText = "SELECT name FROM pragma_table_info('pipelines')";
-            using var reader = cmd.ExecuteReader();
-            var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            while (reader.Read())
-                columns.Add(reader.GetString(0));
-
-            Assert.Contains("max_iterations", columns);
-            Assert.Contains("improver_retries", columns);
-            Assert.Contains("phase_outputs", columns);
-            Assert.Contains("metrics_json", columns);
-            Assert.Contains("completed_at", columns);
-            Assert.Contains("merge_commit_hash", columns);
-            Assert.Contains("iteration_start_sha", columns);
-        }
-    }
-
-    [Fact]
-    public async Task MigrateSchema_WhenConversationColumnsMissing_AddsIterationAndPurpose()
-    {
-        var (seeder, client) = CreateOldSchemaConnections();
-        await using (seeder)
-        await using (var store = new PipelineStore(client, NullLogger<PipelineStore>.Instance))
-        {
-            // Verify conversation_entries got the new columns
-            using var cmd = seeder.CreateCommand();
-            cmd.CommandText = "SELECT name FROM pragma_table_info('conversation_entries')";
-            using var reader = cmd.ExecuteReader();
-            var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            while (reader.Read())
-                columns.Add(reader.GetString(0));
-
-            Assert.Contains("iteration", columns);
-            Assert.Contains("purpose", columns);
-        }
-    }
-
-    [Fact]
-    public async Task MigrateSchema_PreservesExistingConversationEntries()
-    {
-        var (seeder, client) = CreateOldSchemaConnections();
-        await using (seeder)
-        {
-            // Create a proper Goal JSON for the legacy entry using the same JSON options as PipelineStore
-            var jsonOptions = new System.Text.Json.JsonSerializerOptions
-            {
-                PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase
-            };
-            var goal = new Goal { Id = "mg-legacy", Description = "Legacy goal", RepositoryNames = ["test-repo"] };
-            var goalJson = System.Text.Json.JsonSerializer.Serialize(goal, jsonOptions);
-            var createdAt = DateTime.UtcNow.ToString("o");
-
-            // Insert a conversation entry into the old schema (no iteration/purpose columns)
-            using (var insertCmd = seeder.CreateCommand())
-            {
-                insertCmd.CommandText = """
-                    INSERT INTO pipelines (goal_id, description, goal_json, phase, iteration, review_retries, test_retries, max_retries, created_at)
-                    VALUES (@goalId, @description, @goalJson, 'Planning', 1, 0, 0, 3, @createdAt)
-                    """;
-                insertCmd.Parameters.AddWithValue("@goalId", "mg-legacy");
-                insertCmd.Parameters.AddWithValue("@description", "Legacy goal");
-                insertCmd.Parameters.AddWithValue("@goalJson", goalJson);
-                insertCmd.Parameters.AddWithValue("@createdAt", createdAt);
-                insertCmd.ExecuteNonQuery();
-            }
-            using (var insertCmd = seeder.CreateCommand())
-            {
-                insertCmd.CommandText = """
-                    INSERT INTO conversation_entries (goal_id, seq, role, content)
-                    VALUES ('mg-legacy', 0, 'user', 'Legacy message without metadata')
-                    """;
-                insertCmd.ExecuteNonQuery();
-            }
-
-            // Now open PipelineStore, which should migrate the schema
-            await using (var store = new PipelineStore(client, NullLogger<PipelineStore>.Instance))
-            {
-                // Load and verify the legacy entry is preserved with null metadata
-                var snapshots = store.LoadActivePipelines();
-                var snap = Assert.Single(snapshots);
-                Assert.Single(snap.Conversation);
-                Assert.Equal("user", snap.Conversation[0].Role);
-                Assert.Equal("Legacy message without metadata", snap.Conversation[0].Content);
-                Assert.Null(snap.Conversation[0].Iteration);
-                Assert.Null(snap.Conversation[0].Purpose);
-            }
-        }
-    }
-
-    [Fact]
-    public async Task MigrateSchema_CalledTwice_IsIdempotent()
-    {
-        var name = $"migration-test-{Guid.NewGuid():N}";
-        var connStr = $"Data Source={name};Mode=Memory;Cache=Shared";
-
-        var seeder = new SqliteConnection(connStr);
-        seeder.Open();
-        using var seedCmd = seeder.CreateCommand();
-        seedCmd.CommandText = """
-            CREATE TABLE pipelines (
-                goal_id TEXT PRIMARY KEY, description TEXT NOT NULL, goal_json TEXT NOT NULL,
-                phase TEXT NOT NULL DEFAULT 'Planning', iteration INTEGER NOT NULL DEFAULT 1,
-                review_retries INTEGER NOT NULL DEFAULT 0, test_retries INTEGER NOT NULL DEFAULT 0,
-                max_retries INTEGER NOT NULL DEFAULT 3, active_task_id TEXT, coder_branch TEXT,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS conversation_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, goal_id TEXT NOT NULL, seq INTEGER NOT NULL,
-                role TEXT NOT NULL, content TEXT NOT NULL,
-                FOREIGN KEY (goal_id) REFERENCES pipelines(goal_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_conversation_goal ON conversation_entries(goal_id, seq);
-            CREATE TABLE IF NOT EXISTS task_mappings (task_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL);
-            """;
-        seedCmd.ExecuteNonQuery();
-
-        await using (seeder)
-        {
-            // First migration pass.
-            var c1 = new SqliteConnection(connStr);
-            c1.Open();
-            await using (var first = new PipelineStore(c1, NullLogger<PipelineStore>.Instance)) { }
-
-            // Second migration pass on the already-migrated schema — must not throw.
-            var c2 = new SqliteConnection(connStr);
-            c2.Open();
-            await using (var second = new PipelineStore(c2, NullLogger<PipelineStore>.Instance)) { }
-
-            // Verify no duplicate columns.
-            using var cmd = seeder.CreateCommand();
-            cmd.CommandText = "SELECT name FROM pragma_table_info('pipelines')";
-            using var reader = cmd.ExecuteReader();
-            var columns = new List<string>();
-            while (reader.Read())
-                columns.Add(reader.GetString(0).ToLowerInvariant());
-
-            Assert.Equal(columns.Distinct().Count(), columns.Count);
-        }
-    }
-
-    [Fact]
-    public async Task MigrateSchema_AfterMigration_CanPersistAndReloadPipeline()
-    {
-        var (seeder, client) = CreateOldSchemaConnections();
-        await using (seeder)
-        await using (var store = new PipelineStore(client, NullLogger<PipelineStore>.Instance))
-        {
-            var pipeline = new GoalPipeline(CreateGoal("mg-1"));
-            pipeline.AdvanceTo(GoalPhase.Coding);
-            pipeline.IterationBudget.TryConsume();
-            pipeline.ReviewRetryBudget.TryConsume();
-            pipeline.Metrics.TotalTests = 7;
-            pipeline.Metrics.PassedTests = 7;
-
-            store.SavePipeline(pipeline);
-            var snapshots = store.LoadActivePipelines();
-
-            var snap = Assert.Single(snapshots);
-            Assert.Equal("mg-1", snap.GoalId);
-            Assert.Equal(GoalPhase.Coding, snap.Phase);
-            Assert.Equal(2, snap.Iteration);
-            Assert.Equal(1, snap.ReviewRetries);
-            Assert.Equal(7, snap.Metrics.TotalTests);
-            Assert.Equal(7, snap.Metrics.PassedTests);
-        }
-    }
-}
-
 public sealed class PipelineStoreRoleSessionTests : IAsyncDisposable
 {
     private readonly PipelineStore _store;
 
     public PipelineStoreRoleSessionTests()
     {
-        _store = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        _store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
     }
 
     public async ValueTask DisposeAsync() => await _store.DisposeAsync();

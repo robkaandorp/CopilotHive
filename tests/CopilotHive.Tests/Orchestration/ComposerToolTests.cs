@@ -1777,7 +1777,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // Create a PipelineStore and wire it to a new GoalStore
-        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var pipelineStore = new PipelineStore(_dbContext, NullLogger<PipelineStore>.Instance);
         var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
         var composerWithPipeline = new Composer(
             "test-model",
@@ -1819,7 +1819,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // Create a PipelineStore and wire it to a new GoalStore
-        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var pipelineStore = new PipelineStore(_dbContext, NullLogger<PipelineStore>.Instance);
         var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
         var composerWithPipeline = new Composer(
             "test-model",
@@ -1861,7 +1861,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // Create a PipelineStore and wire it
-        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var pipelineStore = new PipelineStore(_dbContext, NullLogger<PipelineStore>.Instance);
         var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
         var composerWithPipeline = new Composer(
             "test-model",
@@ -1892,7 +1892,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var pipelineStore = new PipelineStore(_dbContext, NullLogger<PipelineStore>.Instance);
         var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
         var composerWithPipeline = new Composer(
             "test-model",
@@ -1937,7 +1937,7 @@ public sealed class ComposerToolTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var pipelineStore = new PipelineStore(_dbContext, NullLogger<PipelineStore>.Instance);
         var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
         var composerWithPipeline = new Composer(
             "test-model",
@@ -3741,7 +3741,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // Create a PipelineStore and wire it to a new GoalStore
-        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var pipelineStore = new PipelineStore(_dbContext, NullLogger<PipelineStore>.Instance);
         var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
         var composerWithPipeline = new Composer(
             "test-model",
@@ -3776,7 +3776,7 @@ public sealed class ComposerToolTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // Create a PipelineStore and wire it to a new GoalStore
-        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var pipelineStore = new PipelineStore(_dbContext, NullLogger<PipelineStore>.Instance);
         var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
         var composerWithPipeline = new Composer(
             "test-model",

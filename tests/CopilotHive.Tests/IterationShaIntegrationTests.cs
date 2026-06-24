@@ -24,7 +24,7 @@ public sealed class IterationShaIntegrationTests : IAsyncDisposable
     {
         _tempDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
         Directory.CreateDirectory(_tempDir);
-        _store = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        _store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
     }
 
     public async ValueTask DisposeAsync()

@@ -761,7 +761,7 @@ public sealed class GoalPipelineManagerTests
     public async Task RemovePipeline_NotInMemory_CleansUpStoreRecord()
     {
         // Create a manager backed by a real in-memory store
-        await using var store = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
         var manager = new GoalPipelineManager(store);
 
         // Create and persist a pipeline, then manually remove it from memory
@@ -937,7 +937,7 @@ public sealed class GoalPipelineManagerTests
     public async Task SetRoleSession_WithStore_SessionSurvivesPipelineReload()
     {
         // Arrange — create a manager backed by a real in-memory SQLite store
-        await using var store = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
         var manager = new GoalPipelineManager(store);
 
         var goal = new Goal { Id = "persist-goal", Description = "Persistence test" };

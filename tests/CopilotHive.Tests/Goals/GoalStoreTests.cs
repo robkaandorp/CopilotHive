@@ -534,7 +534,7 @@ public sealed class GoalStoreTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // Create a PipelineStore alongside the GoalStore
-        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var pipelineStore = new PipelineStore(_dbContext, NullLogger<PipelineStore>.Instance);
         var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
 
         // Create a goal and pipeline with conversation entries
@@ -817,7 +817,7 @@ public sealed class GoalStoreWorkerOutputTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
 
         // Create a PipelineStore alongside the GoalStore
-        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var pipelineStore = new PipelineStore(_dbContext, NullLogger<PipelineStore>.Instance);
         var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
 
         // Create a goal and pipeline with conversation entries
@@ -848,7 +848,7 @@ public sealed class GoalStoreWorkerOutputTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
 
-        var pipelineStore = new PipelineStore(":memory:", NullLogger<PipelineStore>.Instance);
+        var pipelineStore = new PipelineStore(_dbContext, NullLogger<PipelineStore>.Instance);
         var storeWithPipeline = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance, pipelineStore);
 
         // Goal exists but no pipeline stored for it

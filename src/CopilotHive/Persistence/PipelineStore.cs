@@ -4,8 +4,9 @@ using System.Text.Json.Serialization;
 using CopilotHive.Goals;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
+using CopilotHive.Persistence.Entities;
 using CopilotHive.Services;
-using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
 namespace CopilotHive.Persistence;
@@ -76,14 +77,15 @@ internal sealed class LegacyPhaseInstructionsConverter : JsonConverter<Dictionar
 }
 
 /// <summary>
-/// Persists GoalPipeline state to SQLite so the orchestrator can recover after restarts.
-/// Thread-safe: all writes are serialized via a lock around the single connection.
+/// Persists GoalPipeline state via EF Core so the orchestrator can recover after restarts.
+/// Uses an <see cref="IDbContextFactory{TContext}"/> in production, creating a short-lived
+/// context per operation. A test constructor accepts a single owned context directly.
 /// </summary>
 public sealed class PipelineStore : IAsyncDisposable
 {
-    private readonly SqliteConnection _db;
+    private readonly IDbContextFactory<CopilotHiveDbContext>? _dbContextFactory;
+    private readonly CopilotHiveDbContext? _directDbContext;
     private readonly ILogger<PipelineStore> _logger;
-    private readonly Lock _lock = new();
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -93,389 +95,196 @@ public sealed class PipelineStore : IAsyncDisposable
     };
 
     /// <summary>
-    /// Initialises a new <see cref="PipelineStore"/>, opening or creating the SQLite database at the given path.
-    /// Pass <c>:memory:</c> for a transient in-memory database.
+    /// Initialises a new <see cref="PipelineStore"/> using a DbContext factory (production/DI).
     /// </summary>
-    /// <param name="dbPath">Full path to the SQLite database file, or <c>:memory:</c>.</param>
+    /// <param name="dbContextFactory">Factory used to create transient <see cref="CopilotHiveDbContext"/> instances.</param>
     /// <param name="logger">Logger instance.</param>
-    public PipelineStore(string dbPath, ILogger<PipelineStore> logger)
+    public PipelineStore(IDbContextFactory<CopilotHiveDbContext> dbContextFactory, ILogger<PipelineStore> logger)
     {
+        _dbContextFactory = dbContextFactory;
         _logger = logger;
-        var dir = Path.GetDirectoryName(dbPath);
-        if (!string.IsNullOrEmpty(dir))
-            Directory.CreateDirectory(dir);
-
-        var dbExisted = dbPath != ":memory:" && File.Exists(dbPath);
-        _db = new SqliteConnection($"Data Source={dbPath}");
-        _db.Open();
-        BackupDatabaseIfExists(dbPath, dbExisted);
-        InitializeSchema();
-        _logger.LogInformation("PipelineStore initialized at {DbPath}", dbPath);
+        _logger.LogInformation("PipelineStore initialized with DbContext factory");
     }
 
     /// <summary>
-    /// Initialises a new <see cref="PipelineStore"/> using an already-open <see cref="SqliteConnection"/>.
-    /// Intended for testing scenarios that require a pre-configured connection (e.g., shared-cache
-    /// named in-memory databases with an existing schema).
+    /// Initialises a new <see cref="PipelineStore"/> using a single owned <see cref="CopilotHiveDbContext"/>.
+    /// Intended for testing. The store does NOT dispose the context; the test owns it.
     /// </summary>
-    /// <param name="connection">An open SQLite connection. The store takes ownership and will dispose it.</param>
+    /// <param name="dbContext">An open context. The store does not take ownership.</param>
     /// <param name="logger">Logger instance.</param>
-    internal PipelineStore(SqliteConnection connection, ILogger<PipelineStore> logger)
+    internal PipelineStore(CopilotHiveDbContext dbContext, ILogger<PipelineStore> logger)
     {
+        _directDbContext = dbContext;
         _logger = logger;
-        _db = connection;
-        InitializeSchema();
-        _logger.LogInformation("PipelineStore initialized with existing connection");
+        _logger.LogInformation("PipelineStore initialized with existing context");
     }
-
-    private void BackupDatabaseIfExists(string dbPath, bool dbExisted)
-    {
-        if (dbPath == ":memory:")
-            return;
-
-        if (!dbExisted)
-            return;
-
-        var dbDir = Path.GetDirectoryName(dbPath);
-        if (string.IsNullOrEmpty(dbDir))
-            dbDir = Directory.GetCurrentDirectory();
-
-        var backupDir = Path.Combine(dbDir, "backups");
-        Directory.CreateDirectory(backupDir);
-
-        var dbFileName = Path.GetFileName(dbPath);
-        var timestamp = DateTime.UtcNow.ToString("yyyyMMddTHHmmss", CultureInfo.InvariantCulture);
-        var backupFileName = $"{dbFileName}.{timestamp}.bak";
-        var backupPath = Path.Combine(backupDir, backupFileName);
-
-        using var backupConn = new SqliteConnection($"Data Source={backupPath}");
-        backupConn.Open();
-        _db.BackupDatabase(backupConn);
-
-        _logger.LogInformation("Database backed up to {BackupPath}", backupPath);
-
-        var oldBackups = Directory
-            .EnumerateFiles(backupDir, $"{dbFileName}.*.bak")
-            .OrderByDescending(f => f)
-            .Skip(10)
-            .ToList();
-
-        foreach (var oldBackup in oldBackups)
-        {
-            File.Delete(oldBackup);
-            _logger.LogDebug("Removed old backup {BackupPath}", oldBackup);
-        }
-    }
-
-    private void InitializeSchema()
-    {
-        using var cmd = _db.CreateCommand();
-        cmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS pipelines (
-                goal_id           TEXT PRIMARY KEY,
-                description       TEXT NOT NULL,
-                goal_json         TEXT NOT NULL,
-                phase             TEXT NOT NULL DEFAULT 'Planning',
-                iteration         INTEGER NOT NULL DEFAULT 1,
-                review_retries    INTEGER NOT NULL DEFAULT 0,
-                test_retries      INTEGER NOT NULL DEFAULT 0,
-                improver_retries  INTEGER NOT NULL DEFAULT 0,
-                max_retries       INTEGER NOT NULL DEFAULT 3,
-                max_iterations    INTEGER NOT NULL DEFAULT 10,
-                active_task_id    TEXT,
-                coder_branch      TEXT,
-                plan_json         TEXT,
-                phase_outputs     TEXT NOT NULL DEFAULT '{}',
-                metrics_json      TEXT NOT NULL DEFAULT '{}',
-                created_at        TEXT NOT NULL,
-                completed_at      TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS conversation_entries (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                goal_id   TEXT NOT NULL,
-                seq       INTEGER NOT NULL,
-                role      TEXT NOT NULL,
-                content   TEXT NOT NULL,
-                FOREIGN KEY (goal_id) REFERENCES pipelines(goal_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_conversation_goal
-                ON conversation_entries(goal_id, seq);
-
-            CREATE TABLE IF NOT EXISTS task_mappings (
-                task_id   TEXT PRIMARY KEY,
-                goal_id   TEXT NOT NULL
-            );
-            """;
-        cmd.ExecuteNonQuery();
-
-        // Migration: add max_iterations column to existing databases
-        MigrateSchema();
-    }
-
-    // Columns that must exist in the pipelines table, keyed by name.
-    // Entries here cover columns added after the initial schema so older databases
-    // are automatically brought up to date on startup.
-    private static readonly (string Table, string Column, string Definition)[] SchemaColumns =
-    [
-        ("pipelines",             "max_iterations",    "INTEGER NOT NULL DEFAULT 10"),
-        ("pipelines",             "improver_retries",  "INTEGER NOT NULL DEFAULT 0"),
-        ("pipelines",             "phase_outputs",     "TEXT NOT NULL DEFAULT '{}'"),
-        ("pipelines",             "metrics_json",      "TEXT NOT NULL DEFAULT '{}'"),
-        ("pipelines",             "active_task_id",    "TEXT"),
-        ("pipelines",             "coder_branch",      "TEXT"),
-        ("pipelines",             "completed_at",      "TEXT"),
-        ("pipelines",             "goal_started_at",   "TEXT"),
-        ("pipelines",             "plan_json",         "TEXT"),
-        ("pipelines",             "merge_commit_hash",  "TEXT"),
-        ("pipelines",             "role_sessions_json", "TEXT NOT NULL DEFAULT '{}'"),
-        ("conversation_entries",  "iteration",         "INTEGER"),
-        ("conversation_entries",  "purpose",           "TEXT"),
-        ("pipelines",             "iteration_start_sha", "TEXT"),
-        ("pipelines",             "phase_occurrence",    "INTEGER NOT NULL DEFAULT 1"),
-        ("pipelines",             "phase_log_json",      "TEXT"),
-    ];
 
     /// <summary>
-    /// Ensures all expected columns exist in the database, adding any that are missing.
-    /// Safe to call repeatedly (idempotent): a column that already exists is left untouched.
+    /// Resolves a context for an operation. When a direct (test-owned) context is set, returns it
+    /// with <c>ownsContext = false</c> so the caller does not dispose it. Otherwise creates a transient
+    /// context via the factory with <c>ownsContext = true</c>.
     /// </summary>
-    private void MigrateSchema()
+    private (CopilotHiveDbContext Db, bool OwnsContext) ResolveDbContext()
     {
-        foreach (var (table, column, definition) in SchemaColumns)
-        {
-            var existingColumns = GetColumnNames(table);
-
-            if (existingColumns.Contains(column, StringComparer.OrdinalIgnoreCase))
-            {
-                _logger.LogDebug("Migration: column {Col} already exists in {Table}", column, table);
-                continue;
-            }
-
-            using var cmd = _db.CreateCommand();
-            cmd.CommandText = $"ALTER TABLE {table} ADD COLUMN {column} {definition}";
-            cmd.ExecuteNonQuery();
-            _logger.LogInformation("Migration: added column {Col} to {Table}", column, table);
-        }
-    }
-
-    /// <summary>Returns the set of column names for the given table using PRAGMA table_info.</summary>
-    private HashSet<string> GetColumnNames(string table)
-    {
-        using var cmd = _db.CreateCommand();
-        cmd.CommandText = $"SELECT name FROM pragma_table_info('{table}')";
-        using var reader = cmd.ExecuteReader();
-
-        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        while (reader.Read())
-            names.Add(reader.GetString(0));
-        return names;
+        if (_directDbContext is not null)
+            return (_directDbContext, false);
+        return (_dbContextFactory!.CreateDbContext(), true);
     }
 
     /// <summary>Insert or replace the full pipeline state.</summary>
     public void SavePipeline(GoalPipeline pipeline)
     {
-        lock (_lock)
+        var (db, ownsContext) = ResolveDbContext();
+        try
         {
-            using var tx = _db.BeginTransaction();
-            try
-            {
-                UpsertPipelineCore(pipeline, tx);
-                SaveConversationCore(pipeline, tx);
-                tx.Commit();
-            }
-            catch (Exception ex) { _logger.LogError(ex, "Failed to save pipeline for goal {GoalId}", pipeline.GoalId); tx.Rollback(); throw; }
+            UpsertPipelineCore(db, pipeline);
+            SaveConversationCore(db, pipeline);
+            db.SaveChanges();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to save pipeline for goal {GoalId}", pipeline.GoalId);
+            throw;
+        }
+        finally
+        {
+            if (ownsContext)
+                db.Dispose();
         }
     }
 
     /// <summary>Persist only the pipeline's scalar state (phase, iteration, retries, etc.).</summary>
     public void SavePipelineState(GoalPipeline pipeline)
     {
-        lock (_lock)
+        var (db, ownsContext) = ResolveDbContext();
+        try
         {
-            using var tx = _db.BeginTransaction();
-            try
-            {
-                UpsertPipelineCore(pipeline, tx);
-                tx.Commit();
-            }
-            catch (Exception ex) { _logger.LogError(ex, "Failed to save pipeline state for goal {GoalId}", pipeline.GoalId); tx.Rollback(); throw; }
+            UpsertPipelineCore(db, pipeline);
+            db.SaveChanges();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to save pipeline state for goal {GoalId}", pipeline.GoalId);
+            throw;
+        }
+        finally
+        {
+            if (ownsContext)
+                db.Dispose();
         }
     }
 
     /// <summary>Append a single conversation entry without rewriting the full conversation.</summary>
     public void AppendConversation(string goalId, ConversationEntry entry)
     {
-        lock (_lock)
+        var (db, ownsContext) = ResolveDbContext();
+        try
         {
-            using var cmd = _db.CreateCommand();
-            cmd.CommandText = """
-                INSERT INTO conversation_entries (goal_id, seq, role, content, iteration, purpose)
-                VALUES (@goalId, COALESCE((SELECT MAX(seq) FROM conversation_entries WHERE goal_id = @goalId), -1) + 1, @role, @content, @iteration, @purpose)
-                """;
-            cmd.Parameters.AddWithValue("@goalId", goalId);
-            cmd.Parameters.AddWithValue("@role", entry.Role);
-            cmd.Parameters.AddWithValue("@content", entry.Content);
-            cmd.Parameters.AddWithValue("@iteration", (object?)entry.Iteration ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@purpose", (object?)entry.Purpose ?? DBNull.Value);
-            cmd.ExecuteNonQuery();
+            var maxSeq = db.ConversationEntries
+                .Where(e => e.GoalId == goalId)
+                .Select(e => (int?)e.Seq)
+                .Max() ?? -1;
+
+            db.ConversationEntries.Add(new ConversationEntryEntity
+            {
+                GoalId = goalId,
+                Seq = maxSeq + 1,
+                Role = entry.Role,
+                Content = entry.Content,
+                Iteration = entry.Iteration,
+                Purpose = entry.Purpose,
+            });
+            db.SaveChanges();
+        }
+        finally
+        {
+            if (ownsContext)
+                db.Dispose();
         }
     }
 
     /// <summary>Register a task → goal mapping for recovery.</summary>
     public void SaveTaskMapping(string taskId, string goalId)
     {
-        lock (_lock)
+        var (db, ownsContext) = ResolveDbContext();
+        try
         {
-            using var cmd = _db.CreateCommand();
-            cmd.CommandText = "INSERT OR REPLACE INTO task_mappings (task_id, goal_id) VALUES (@taskId, @goalId)";
-            cmd.Parameters.AddWithValue("@taskId", taskId);
-            cmd.Parameters.AddWithValue("@goalId", goalId);
-            cmd.ExecuteNonQuery();
+            var existing = db.TaskMappings.Find(taskId);
+            if (existing is not null)
+            {
+                existing.GoalId = goalId;
+            }
+            else
+            {
+                db.TaskMappings.Add(new TaskMappingEntity { TaskId = taskId, GoalId = goalId });
+            }
+            db.SaveChanges();
+        }
+        finally
+        {
+            if (ownsContext)
+                db.Dispose();
         }
     }
 
     /// <summary>Remove a completed/failed pipeline from the store.</summary>
     public void RemovePipeline(string goalId)
     {
-        lock (_lock)
+        var (db, ownsContext) = ResolveDbContext();
+        try
         {
-            using var tx = _db.BeginTransaction();
-            try
-            {
-                Execute("DELETE FROM conversation_entries WHERE goal_id = @id", tx, ("@id", goalId));
-                Execute("DELETE FROM task_mappings WHERE goal_id = @id", tx, ("@id", goalId));
-                Execute("DELETE FROM pipelines WHERE goal_id = @id", tx, ("@id", goalId));
-                tx.Commit();
-            }
-            catch (Exception ex) { _logger.LogError(ex, "Failed to remove pipeline for goal {GoalId}", goalId); tx.Rollback(); throw; }
+            var conversations = db.ConversationEntries.Where(e => e.GoalId == goalId).ToList();
+            if (conversations.Count > 0)
+                db.ConversationEntries.RemoveRange(conversations);
+
+            var mappings = db.TaskMappings.Where(t => t.GoalId == goalId).ToList();
+            if (mappings.Count > 0)
+                db.TaskMappings.RemoveRange(mappings);
+
+            var pipeline = db.Pipelines.Find(goalId);
+            if (pipeline is not null)
+                db.Pipelines.Remove(pipeline);
+
+            db.SaveChanges();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to remove pipeline for goal {GoalId}", goalId);
+            throw;
+        }
+        finally
+        {
+            if (ownsContext)
+                db.Dispose();
         }
     }
 
     /// <summary>Load all non-terminal pipelines for restart recovery.</summary>
     public List<PipelineSnapshot> LoadActivePipelines()
     {
-        lock (_lock)
+        var (db, ownsContext) = ResolveDbContext();
+        try
         {
+            var entities = db.Pipelines
+                .Where(p => p.Phase != "Done" && p.Phase != "Failed")
+                .ToList();
+
             var results = new List<PipelineSnapshot>();
-
-            using var cmd = _db.CreateCommand();
-            cmd.CommandText = """
-                SELECT goal_id, description, goal_json, phase, iteration,
-                       review_retries, test_retries, max_retries, max_iterations,
-                       active_task_id, coder_branch, metrics_json,
-                       created_at, completed_at, goal_started_at, plan_json, merge_commit_hash,
-                       COALESCE(role_sessions_json, '{}'),
-                       iteration_start_sha,
-                       phase_log_json
-                FROM pipelines
-                WHERE phase NOT IN ('Done', 'Failed')
-                """;
-
-            using var reader = cmd.ExecuteReader();
-            while (reader.Read())
+            foreach (var entity in entities)
             {
-                var goalId = reader.GetString(0);
-                results.Add(new PipelineSnapshot
-                {
-                    GoalId = goalId,
-                    Description = reader.GetString(1),
-                    Goal = JsonSerializer.Deserialize<Goal>(reader.GetString(2), JsonOptions)!,
-                    Phase = Enum.Parse<GoalPhase>(reader.GetString(3)),
-                    Iteration = reader.GetInt32(4),
-                    ReviewRetries = reader.GetInt32(5),
-                    TestRetries = reader.GetInt32(6),
-                    MaxRetries = reader.GetInt32(7),
-                    MaxIterations = reader.GetInt32(8),
-                    ActiveTaskId = reader.IsDBNull(9) ? null : reader.GetString(9),
-                    CoderBranch = reader.IsDBNull(10) ? null : reader.GetString(10),
-                    Metrics = JsonSerializer.Deserialize<IterationMetrics>(reader.GetString(11), JsonOptions) ?? new() { Iteration = 1 },
-                    CreatedAt = DateTime.Parse(reader.GetString(12), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
-                    CompletedAt = reader.IsDBNull(13) ? null : DateTime.Parse(reader.GetString(13), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
-                    GoalStartedAt = reader.IsDBNull(14) ? null : DateTime.Parse(reader.GetString(14), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
-                    Plan = reader.IsDBNull(15) ? null : JsonSerializer.Deserialize<IterationPlan>(reader.GetString(15), JsonOptions),
-                    MergeCommitHash = reader.IsDBNull(16) ? null : reader.GetString(16),
-                    RoleSessions = JsonSerializer.Deserialize<Dictionary<string, string>>(reader.GetString(17), JsonOptions) ?? [],
-                    Conversation = LoadConversationCore(goalId),
-                    IterationStartSha = reader.IsDBNull(18) ? null : reader.GetString(18),
-                    PhaseLog = reader.IsDBNull(19) ? []
-                        : JsonSerializer.Deserialize<List<PhaseResult>>(reader.GetString(19), JsonOptions) ?? [],
-                });
+                var snapshot = ToSnapshot(entity);
+                snapshot.Conversation = LoadConversationCore(db, entity.GoalId);
+                snapshot.TaskMappings = LoadTaskMappingsCore(db, entity.GoalId);
+                results.Add(snapshot);
             }
-
-            foreach (var snap in results)
-                snap.TaskMappings = LoadTaskMappingsCore(snap.GoalId);
 
             _logger.LogInformation("Loaded {Count} active pipeline(s) from store", results.Count);
             return results;
         }
-    }
-
-    private void UpsertPipelineCore(GoalPipeline pipeline, SqliteTransaction tx)
-    {
-        using var cmd = _db.CreateCommand();
-        cmd.Transaction = tx;
-        cmd.CommandText = """
-            INSERT OR REPLACE INTO pipelines
-                (goal_id, description, goal_json, phase, iteration,
-                 review_retries, test_retries, max_retries, max_iterations,
-                 active_task_id, coder_branch, plan_json, metrics_json,
-                 created_at, completed_at, goal_started_at, merge_commit_hash,
-                 role_sessions_json, iteration_start_sha, phase_log_json)
-            VALUES
-                (@goalId, @desc, @goalJson, @phase, @iteration,
-                 @reviewRetries, @testRetries, @maxRetries, @maxIterations,
-                 @activeTaskId, @coderBranch, @planJson, @metricsJson,
-                 @createdAt, @completedAt, @goalStartedAt, @mergeCommitHash,
-                 @roleSessionsJson, @iterationStartSha, @phaseLogJson)
-            """;
-        cmd.Parameters.AddWithValue("@goalId", pipeline.GoalId);
-        cmd.Parameters.AddWithValue("@desc", pipeline.Description);
-        cmd.Parameters.AddWithValue("@goalJson", JsonSerializer.Serialize(pipeline.Goal, JsonOptions));
-        cmd.Parameters.AddWithValue("@phase", pipeline.Phase.ToString());
-        cmd.Parameters.AddWithValue("@iteration", pipeline.Iteration);
-        cmd.Parameters.AddWithValue("@reviewRetries", pipeline.ReviewRetries);
-        cmd.Parameters.AddWithValue("@testRetries", pipeline.TestRetries);
-        cmd.Parameters.AddWithValue("@maxRetries", pipeline.MaxRetries);
-        cmd.Parameters.AddWithValue("@maxIterations", pipeline.MaxIterations);
-        cmd.Parameters.AddWithValue("@activeTaskId", (object?)pipeline.ActiveTaskId ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@coderBranch", (object?)pipeline.CoderBranch ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@planJson",
-            pipeline.Plan is not null ? JsonSerializer.Serialize(pipeline.Plan, JsonOptions) : DBNull.Value);
-        cmd.Parameters.AddWithValue("@metricsJson", JsonSerializer.Serialize(pipeline.Metrics, JsonOptions));
-        cmd.Parameters.AddWithValue("@createdAt", pipeline.CreatedAt.ToString("O"));
-        cmd.Parameters.AddWithValue("@completedAt",
-            pipeline.CompletedAt.HasValue ? pipeline.CompletedAt.Value.ToString("O") : DBNull.Value);
-        cmd.Parameters.AddWithValue("@goalStartedAt",
-            pipeline.GoalStartedAt.HasValue ? pipeline.GoalStartedAt.Value.ToString("O") : DBNull.Value);
-        cmd.Parameters.AddWithValue("@mergeCommitHash", (object?)pipeline.MergeCommitHash ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@roleSessionsJson", JsonSerializer.Serialize(pipeline.RoleSessions.GetAll().ToDictionary(kv => kv.Key, kv => kv.Value), JsonOptions));
-        cmd.Parameters.AddWithValue("@iterationStartSha", (object?)pipeline.IterationStartSha ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@phaseLogJson",
-            pipeline.PhaseLog.Count > 0
-                ? JsonSerializer.Serialize(pipeline.PhaseLog, JsonOptions)
-                : DBNull.Value);
-        cmd.ExecuteNonQuery();
-    }
-
-    private void SaveConversationCore(GoalPipeline pipeline, SqliteTransaction tx)
-    {
-        Execute("DELETE FROM conversation_entries WHERE goal_id = @id", tx, ("@id", pipeline.GoalId));
-
-        for (var i = 0; i < pipeline.Conversation.Count; i++)
+        finally
         {
-            var entry = pipeline.Conversation[i];
-            using var ins = _db.CreateCommand();
-            ins.Transaction = tx;
-            ins.CommandText = "INSERT INTO conversation_entries (goal_id, seq, role, content, iteration, purpose) VALUES (@goalId, @seq, @role, @content, @iteration, @purpose)";
-            ins.Parameters.AddWithValue("@goalId", pipeline.GoalId);
-            ins.Parameters.AddWithValue("@seq", i);
-            ins.Parameters.AddWithValue("@role", entry.Role);
-            ins.Parameters.AddWithValue("@content", entry.Content);
-            ins.Parameters.AddWithValue("@iteration", (object?)entry.Iteration ?? DBNull.Value);
-            ins.Parameters.AddWithValue("@purpose", (object?)entry.Purpose ?? DBNull.Value);
-            ins.ExecuteNonQuery();
+            if (ownsContext)
+                db.Dispose();
         }
     }
 
@@ -484,56 +293,135 @@ public sealed class PipelineStore : IAsyncDisposable
     /// <returns>The conversation entries, or an empty list if no entries exist.</returns>
     public List<ConversationEntry> GetConversation(string goalId)
     {
-        lock (_lock)
+        var (db, ownsContext) = ResolveDbContext();
+        try
         {
-            return LoadConversationCore(goalId);
+            return LoadConversationCore(db, goalId);
+        }
+        finally
+        {
+            if (ownsContext)
+                db.Dispose();
         }
     }
 
-    private List<ConversationEntry> LoadConversationCore(string goalId)
+    private static void UpsertPipelineCore(CopilotHiveDbContext db, GoalPipeline pipeline)
     {
-        using var cmd = _db.CreateCommand();
-        cmd.CommandText = "SELECT role, content, iteration, purpose FROM conversation_entries WHERE goal_id = @goalId ORDER BY seq";
-        cmd.Parameters.AddWithValue("@goalId", goalId);
-
-        var entries = new List<ConversationEntry>();
-        using var reader = cmd.ExecuteReader();
-        while (reader.Read())
+        var existing = db.Pipelines.Find(pipeline.GoalId);
+        if (existing is not null)
         {
-            var iteration = reader.IsDBNull(2) ? (int?)null : reader.GetInt32(2);
-            var purpose   = reader.IsDBNull(3) ? null       : reader.GetString(3);
-            entries.Add(new ConversationEntry(reader.GetString(0), reader.GetString(1), iteration, purpose));
+            ApplyToEntity(pipeline, existing);
         }
-        return entries;
+        else
+        {
+            var entity = new PipelineEntity
+            {
+                GoalId = pipeline.GoalId,
+            };
+            ApplyToEntity(pipeline, entity);
+            db.Pipelines.Add(entity);
+        }
     }
 
-    private List<(string TaskId, string GoalId)> LoadTaskMappingsCore(string goalId)
+    private static void ApplyToEntity(GoalPipeline pipeline, PipelineEntity entity)
     {
-        using var cmd = _db.CreateCommand();
-        cmd.CommandText = "SELECT task_id, goal_id FROM task_mappings WHERE goal_id = @goalId";
-        cmd.Parameters.AddWithValue("@goalId", goalId);
-
-        var mappings = new List<(string, string)>();
-        using var reader = cmd.ExecuteReader();
-        while (reader.Read())
-            mappings.Add((reader.GetString(0), reader.GetString(1)));
-        return mappings;
+        entity.Description = pipeline.Description;
+        entity.GoalJson = JsonSerializer.Serialize(pipeline.Goal, JsonOptions);
+        entity.Phase = pipeline.Phase.ToString();
+        entity.Iteration = pipeline.Iteration;
+        entity.ReviewRetries = pipeline.ReviewRetries;
+        entity.TestRetries = pipeline.TestRetries;
+        entity.MaxRetries = pipeline.MaxRetries;
+        entity.MaxIterations = pipeline.MaxIterations;
+        entity.ActiveTaskId = pipeline.ActiveTaskId;
+        entity.CoderBranch = pipeline.CoderBranch;
+        entity.PlanJson = pipeline.Plan is not null ? JsonSerializer.Serialize(pipeline.Plan, JsonOptions) : null;
+        entity.MetricsJson = JsonSerializer.Serialize(pipeline.Metrics, JsonOptions);
+        entity.CreatedAt = pipeline.CreatedAt.ToString("O");
+        entity.CompletedAt = pipeline.CompletedAt.HasValue ? pipeline.CompletedAt.Value.ToString("O") : null;
+        entity.GoalStartedAt = pipeline.GoalStartedAt.HasValue ? pipeline.GoalStartedAt.Value.ToString("O") : null;
+        entity.MergeCommitHash = pipeline.MergeCommitHash;
+        entity.RoleSessionsJson = JsonSerializer.Serialize(
+            pipeline.RoleSessions.GetAll().ToDictionary(kv => kv.Key, kv => kv.Value), JsonOptions);
+        entity.IterationStartSha = pipeline.IterationStartSha;
+        entity.PhaseLogJson = pipeline.PhaseLog.Count > 0
+            ? JsonSerializer.Serialize(pipeline.PhaseLog, JsonOptions)
+            : null;
     }
 
-    private void Execute(string sql, SqliteTransaction tx, params (string Name, object Value)[] parameters)
+    private static PipelineSnapshot ToSnapshot(PipelineEntity entity)
     {
-        using var cmd = _db.CreateCommand();
-        cmd.Transaction = tx;
-        cmd.CommandText = sql;
-        foreach (var (name, value) in parameters)
-            cmd.Parameters.AddWithValue(name, value);
-        cmd.ExecuteNonQuery();
+        return new PipelineSnapshot
+        {
+            GoalId = entity.GoalId,
+            Description = entity.Description,
+            Goal = JsonSerializer.Deserialize<Goal>(entity.GoalJson, JsonOptions)!,
+            Phase = Enum.Parse<GoalPhase>(entity.Phase),
+            Iteration = entity.Iteration,
+            ReviewRetries = entity.ReviewRetries,
+            TestRetries = entity.TestRetries,
+            MaxRetries = entity.MaxRetries,
+            MaxIterations = entity.MaxIterations,
+            ActiveTaskId = entity.ActiveTaskId,
+            CoderBranch = entity.CoderBranch,
+            Metrics = JsonSerializer.Deserialize<IterationMetrics>(entity.MetricsJson, JsonOptions) ?? new() { Iteration = 1 },
+            CreatedAt = DateTime.Parse(entity.CreatedAt, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+            CompletedAt = entity.CompletedAt is null ? null : DateTime.Parse(entity.CompletedAt, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+            GoalStartedAt = entity.GoalStartedAt is null ? null : DateTime.Parse(entity.GoalStartedAt, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+            Plan = entity.PlanJson is null ? null : JsonSerializer.Deserialize<IterationPlan>(entity.PlanJson, JsonOptions),
+            MergeCommitHash = entity.MergeCommitHash,
+            RoleSessions = JsonSerializer.Deserialize<Dictionary<string, string>>(
+                string.IsNullOrEmpty(entity.RoleSessionsJson) ? "{}" : entity.RoleSessionsJson, JsonOptions) ?? [],
+            IterationStartSha = entity.IterationStartSha,
+            PhaseLog = entity.PhaseLogJson is null ? []
+                : JsonSerializer.Deserialize<List<PhaseResult>>(entity.PhaseLogJson, JsonOptions) ?? [],
+        };
     }
 
-    /// <summary>Closes and disposes the underlying SQLite connection.</summary>
-    public async ValueTask DisposeAsync()
+    private static void SaveConversationCore(CopilotHiveDbContext db, GoalPipeline pipeline)
     {
-        await _db.DisposeAsync();
+        var existing = db.ConversationEntries.Where(e => e.GoalId == pipeline.GoalId).ToList();
+        if (existing.Count > 0)
+            db.ConversationEntries.RemoveRange(existing);
+
+        for (var i = 0; i < pipeline.Conversation.Count; i++)
+        {
+            var entry = pipeline.Conversation[i];
+            db.ConversationEntries.Add(new ConversationEntryEntity
+            {
+                GoalId = pipeline.GoalId,
+                Seq = i,
+                Role = entry.Role,
+                Content = entry.Content,
+                Iteration = entry.Iteration,
+                Purpose = entry.Purpose,
+            });
+        }
+    }
+
+    private static List<ConversationEntry> LoadConversationCore(CopilotHiveDbContext db, string goalId)
+    {
+        return db.ConversationEntries
+            .Where(e => e.GoalId == goalId)
+            .OrderBy(e => e.Seq)
+            .Select(e => new ConversationEntry(e.Role, e.Content, e.Iteration, e.Purpose))
+            .ToList();
+    }
+
+    private static List<(string TaskId, string GoalId)> LoadTaskMappingsCore(CopilotHiveDbContext db, string goalId)
+    {
+        return db.TaskMappings
+            .Where(t => t.GoalId == goalId)
+            .Select(t => new { t.TaskId, t.GoalId })
+            .AsEnumerable()
+            .Select(t => (t.TaskId, t.GoalId))
+            .ToList();
+    }
+
+    /// <summary>No-op: contexts are either factory-created and disposed per operation, or test-owned.</summary>
+    public ValueTask DisposeAsync()
+    {
+        return ValueTask.CompletedTask;
     }
 }
 
@@ -575,7 +463,7 @@ public sealed class PipelineSnapshot
     /// <summary>UTC timestamp when the goal was started (captured at dispatch time).</summary>
     public DateTime? GoalStartedAt { get; init; }
     /// <summary>Conversation history for the Brain session associated with this pipeline.</summary>
-    public List<ConversationEntry> Conversation { get; init; } = [];
+    public List<ConversationEntry> Conversation { get; set; } = [];
     /// <summary>List of (TaskId, GoalId) pairs for task-to-goal resolution.</summary>
     public List<(string TaskId, string GoalId)> TaskMappings { get; set; } = [];
     /// <summary>SHA-1 hash of the merge commit for this pipeline's changes, or <c>null</c> if not yet merged.</summary>

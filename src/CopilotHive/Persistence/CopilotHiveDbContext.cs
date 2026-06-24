@@ -39,6 +39,9 @@ public sealed class CopilotHiveDbContext : DbContext
     /// <summary>Conversation entries table.</summary>
     public DbSet<ConversationEntryEntity> ConversationEntries { get; set; } = null!;
 
+    /// <summary>Task-to-goal mappings table.</summary>
+    public DbSet<TaskMappingEntity> TaskMappings { get; set; } = null!;
+
     /// <summary>
     /// Creates a new context instance for dependency injection.
     /// </summary>
@@ -75,6 +78,16 @@ public sealed class CopilotHiveDbContext : DbContext
         ConfigureIterationSummary(modelBuilder.Entity<IterationSummaryEntity>());
         ConfigurePipeline(modelBuilder.Entity<PipelineEntity>());
         ConfigureConversationEntry(modelBuilder.Entity<ConversationEntryEntity>());
+        ConfigureTaskMapping(modelBuilder.Entity<TaskMappingEntity>());
+    }
+
+    private static void ConfigureTaskMapping(EntityTypeBuilder<TaskMappingEntity> entity)
+    {
+        entity.ToTable("task_mappings");
+
+        entity.HasKey(e => e.TaskId);
+        entity.Property(e => e.TaskId).HasColumnName("task_id");
+        entity.Property(e => e.GoalId).HasColumnName("goal_id").IsRequired();
     }
 
     private static void ConfigureGoal(EntityTypeBuilder<Goal> entity)

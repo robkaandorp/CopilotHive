@@ -745,7 +745,7 @@ public sealed class GoalDispatcherSessionCleanupTests
 
             // PipelineStore needs a file path, not just the directory
             var dbPath = Path.Combine(tempDir, "pipelines.db");
-            var pipelineStore = new PipelineStore(dbPath, NullLogger<PipelineStore>.Instance);
+            var pipelineStore = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
             var pipelineManager = new GoalPipelineManager(pipelineStore);
             var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
             pipeline.AdvanceTo(GoalPhase.Coding);
@@ -820,7 +820,7 @@ public sealed class GoalDispatcherSessionCleanupTests
 
             // Pipeline manager with NO pipelines stored - RestoreFromStore returns empty
             var dbPath = Path.Combine(tempDir, "pipelines.db");
-            var pipelineStore = new PipelineStore(dbPath, NullLogger<PipelineStore>.Instance);
+            var pipelineStore = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
             var pipelineManager = new GoalPipelineManager(pipelineStore);
 
             var brain = new DistributedBrain(
