@@ -5,6 +5,7 @@ using CopilotHive.Persistence.Entities;
 
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests.Persistence;
 
@@ -646,5 +647,228 @@ public sealed class CopilotHiveDbContextTests
         while (reader.Read())
             columns.Add(reader.GetString(1)); // column name is at index 1
         return columns;
+    }
+
+    // ── 9. Schema reconciliation (EnsureSchemaUpToDate) ───────────────────
+
+    /// <summary>
+    /// Creates a DbContext backed by an open in-memory SQLite connection WITHOUT calling
+    /// <c>EnsureCreated()</c>. This simulates a database file that exists but is missing tables,
+    /// allowing <see cref="Program.EnsureSchemaUpToDate"/> to be exercised against it.
+    /// The connection is kept open by the returned DbContext for the lifetime of the database.
+    /// </summary>
+    private static CopilotHiveDbContext CreateEmptyDbContext()
+    {
+        var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+
+        var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+            .UseSqlite(connection)
+            .Options;
+
+        return new CopilotHiveDbContext(options);
+    }
+
+    private static HashSet<string> GetAllTableNames(SqliteConnection conn)
+    {
+        var tableNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT name FROM sqlite_master WHERE type = 'table'";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            tableNames.Add(reader.GetString(0));
+        return tableNames;
+    }
+
+    [Fact]
+    public void EnsureSchema_FreshDb_CreatesAllTables()
+    {
+        using var ctx = CreateEmptyDbContext();
+        var conn = GetSqliteConnection(ctx);
+
+        // Sanity: no tables exist yet.
+        Assert.Empty(GetAllTableNames(conn));
+
+        Program.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+
+        var tableNames = GetAllTableNames(conn);
+        Assert.Contains("goals", tableNames);
+        Assert.Contains("releases", tableNames);
+        Assert.Contains("goal_iterations", tableNames);
+        Assert.Contains("pipelines", tableNames);
+        Assert.Contains("conversation_entries", tableNames);
+    }
+
+    [Fact]
+    public void EnsureSchema_ExistingDb_MissingGoalsTable_CreatesMissingTables()
+    {
+        using var ctx = CreateEmptyDbContext();
+        var conn = GetSqliteConnection(ctx);
+
+        // Simulate an old database that only has the pipelines table.
+        ctx.Database.ExecuteSqlRaw(
+            "CREATE TABLE pipelines (goal_id TEXT NOT NULL PRIMARY KEY, description TEXT)");
+
+        Assert.Contains("pipelines", GetAllTableNames(conn));
+
+        Program.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+
+        var tableNames = GetAllTableNames(conn);
+        Assert.Contains("goals", tableNames);
+        Assert.Contains("releases", tableNames);
+        Assert.Contains("goal_iterations", tableNames);
+        Assert.Contains("conversation_entries", tableNames);
+
+        // The pre-existing pipelines table must still be present and unchanged
+        // (i.e. our minimal definition, NOT replaced by the EF schema).
+        Assert.Contains("pipelines", tableNames);
+        var pipelineColumns = GetTableColumns(conn, "pipelines");
+        Assert.Contains("goal_id", pipelineColumns);
+        Assert.Contains("description", pipelineColumns);
+        // Columns that exist in the EF schema but not in the minimal one must NOT have been added.
+        Assert.DoesNotContain("phase", pipelineColumns);
+    }
+
+    [Fact]
+    public void EnsureSchema_UpToDateDb_IsNoOp()
+    {
+        using var ctx = CopilotHiveDbContext.CreateInMemory();
+        var conn = GetSqliteConnection(ctx);
+
+        // All tables already exist via EnsureCreated; reconciliation must be a no-op.
+        Program.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+
+        var tableNames = GetAllTableNames(conn);
+        Assert.Contains("goals", tableNames);
+        Assert.Contains("releases", tableNames);
+        Assert.Contains("goal_iterations", tableNames);
+        Assert.Contains("pipelines", tableNames);
+        Assert.Contains("conversation_entries", tableNames);
+    }
+
+    [Fact]
+    public void EnsureSchema_PreservesExistingData()
+    {
+        using var ctx = CreateEmptyDbContext();
+        var conn = GetSqliteConnection(ctx);
+
+        // Simulate an old database with a pipelines table containing a row.
+        ctx.Database.ExecuteSqlRaw(
+            "CREATE TABLE pipelines (goal_id TEXT NOT NULL PRIMARY KEY, description TEXT)");
+        ctx.Database.ExecuteSqlRaw(
+            "INSERT INTO pipelines (goal_id, description) VALUES ('goal-keep-1', 'preserved description')");
+
+        Program.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+
+        // Missing tables were added.
+        var tableNames = GetAllTableNames(conn);
+        Assert.Contains("goals", tableNames);
+
+        // The pre-existing pipeline data must still be intact.
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT description FROM pipelines WHERE goal_id = 'goal-keep-1'";
+        var result = cmd.ExecuteScalar();
+        Assert.Equal("preserved description", result);
+    }
+
+    /// <summary>
+    /// Verifies that indexes defined in the EF Core model are created by
+    /// <see cref="Program.EnsureSchemaUpToDate"/> on a fresh database — specifically the
+    /// unique composite index <c>idx_goal_iterations_goal_iteration</c> on
+    /// <c>goal_iterations(goal_id, iteration)</c>.
+    /// </summary>
+    [Fact]
+    public void EnsureSchema_FreshDb_CreatesIndexes()
+    {
+        using var ctx = CreateEmptyDbContext();
+        var conn = GetSqliteConnection(ctx);
+
+        // Sanity: no indexes exist yet.
+        Assert.Empty(GetAllIndexNames(conn));
+
+        Program.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+
+        var indexNames = GetAllIndexNames(conn);
+
+        // The EF model defines a unique composite index on goal_iterations(goal_id, iteration).
+        Assert.Contains("idx_goal_iterations_goal_iteration", indexNames);
+
+        // Also verify the single-column index on goal_iterations(goal_id).
+        Assert.Contains("idx_goal_iterations_goal", indexNames);
+
+        // Verify the index is unique by inserting a goal, then an iteration, then attempting
+        // a duplicate (goal_id, iteration) pair — SQLite should reject it.
+        ctx.Goals.Add(new Goal
+        {
+            Id = "g-idx-1",
+            Description = "Index test goal",
+            Status = GoalStatus.Pending,
+            Priority = GoalPriority.Normal,
+            Scope = GoalScope.Patch,
+            CreatedAt = DateTime.UtcNow,
+        });
+        ctx.SaveChanges();
+
+        ctx.IterationSummaries.Add(new IterationSummaryEntity
+        {
+            GoalId = "g-idx-1",
+            Iteration = 1,
+            BuildSuccess = false,
+            CreatedAt = DateTime.UtcNow.ToString("o"),
+        });
+        ctx.SaveChanges();
+
+        // Attempting a second row with the same (goal_id, iteration) must fail due to uniqueness.
+        ctx.IterationSummaries.Add(new IterationSummaryEntity
+        {
+            GoalId = "g-idx-1",
+            Iteration = 1,
+            BuildSuccess = false,
+            CreatedAt = DateTime.UtcNow.ToString("o"),
+        });
+        Assert.Throws<DbUpdateException>(() => ctx.SaveChanges());
+    }
+
+    /// <summary>
+    /// Verifies that after EnsureSchemaUpToDate on a fresh database, the goals table
+    /// can be queried via the DbContext — exercising the full EF Core pipeline to confirm
+    /// the created schema is compatible with EF's expectations (not just raw SQL).
+    /// </summary>
+    [Fact]
+    public void EnsureSchema_FreshDb_DbContextCanQueryGoals()
+    {
+        using var ctx = CreateEmptyDbContext();
+
+        Program.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+
+        // This would throw "no such table: goals" if the schema were not reconciled.
+        var goals = ctx.Goals.ToList();
+        Assert.Empty(goals);
+
+        // Insert via DbContext and verify round-trip.
+        ctx.Goals.Add(new Goal
+        {
+            Id = "integration-goal-1",
+            Description = "Integration test goal",
+            Status = GoalStatus.Pending,
+            Priority = GoalPriority.Normal,
+            Scope = GoalScope.Patch,
+            CreatedAt = DateTime.UtcNow,
+        });
+        ctx.SaveChanges();
+
+        var retrieved = ctx.Goals.Single(g => g.Id == "integration-goal-1");
+        Assert.Equal("Integration test goal", retrieved.Description);
+    }
+
+    private static HashSet<string> GetAllIndexNames(SqliteConnection conn)
+    {
+        var indexNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT name FROM sqlite_master WHERE type = 'index'";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            indexNames.Add(reader.GetString(0));
+        return indexNames;
     }
 }
