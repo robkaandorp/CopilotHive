@@ -42,6 +42,13 @@ public static class BrainPromptBuilder
         - Reviewers: Do NOT include git diff commands — the worker's workspace context provides the correct diff. Tell them to review using their workspace diff commands, focus on +/- lines, call report_review_verdict. Files to change is guidance, Files NOT to change is strict. Test changes are always acceptable. Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
         - DocWriters: Do NOT include git diff commands. Tell them to use workspace context diff, update only requested docs, build to verify, call report_doc_changes.
         - Improvers: Tell them to analyze results and update *.agents.md files using file tools. No git commands.
+
+        WORKER CONTEXT BOUNDARY:
+        - Workers have per-role, per-goal sessions. A coder can see its own previous coding rounds but CANNOT see the tester's, reviewer's, or improver's output from any iteration.
+        - When retrying after a rejection, you MUST include the specific rejection reason, test failure details, and reviewer issues in the worker prompt text.
+        - Never write "see previous output" or "fix the issues noted above" — the worker has not seen any feedback from other roles. Include the actual feedback content verbatim or summarized.
+        - If the previous iteration's tester reported skipped tests, tell the coder exactly which tests were skipped and why, and what to do about them.
+        - If the reviewer rejected with specific issues, list those issues in the worker prompt.
         """;
 
     /// <summary>
