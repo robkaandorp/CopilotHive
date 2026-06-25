@@ -16,6 +16,10 @@ namespace CopilotHive.Persistence;
 /// Provides EF Core persistence for goals, releases, iteration summaries, and pipeline
 /// state via <see cref="GoalStore"/> and <see cref="PipelineStore"/>.
 /// </summary>
+// To add a new migration:
+//   dotnet ef migrations add <MigrationName> --project src/CopilotHive --startup-project src/CopilotHive
+// Migrations are applied automatically at startup via Database.MigrateAsync().
+// The Microsoft.EntityFrameworkCore.Design package is referenced in the test project for tooling.
 public sealed class CopilotHiveDbContext : DbContext
 {
     private static readonly JsonSerializerOptions JsonOptions = new()

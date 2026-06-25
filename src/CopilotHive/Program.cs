@@ -282,6 +282,8 @@ public sealed class Program
                 var dbContext = scope.ServiceProvider.GetRequiredService<CopilotHiveDbContext>();
                 DatabaseMigration.EnsureSchemaUpToDate(dbContext, logger);
                 logger.LogInformation("Database schema reconciliation completed");
+                await dbContext.Database.MigrateAsync();
+                logger.LogInformation("EF Core migrations applied");
             }
             catch (DbUpdateConcurrencyException ex)
             {
