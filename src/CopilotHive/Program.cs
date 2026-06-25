@@ -83,6 +83,12 @@ public sealed class Program
             builder.Services.AddDbContextFactory<CopilotHiveDbContext>(options =>
                 options.UseSqlite($"Data Source={dbPath}"));
 
+            // Backup service: creates tar.gz archives of runtime state
+            builder.Services.AddSingleton(sp =>
+                new BackupService(stateDir,
+                    sp.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>(),
+                    sp.GetRequiredService<ILogger<BackupService>>()));
+
             // Metrics: per-iteration metrics persistence
             var metricsDir = Path.Combine(stateDir, "metrics");
             Directory.CreateDirectory(metricsDir);
@@ -422,6 +428,7 @@ public sealed class Program
             app.MapGoalEndpoints();
             app.MapReleaseEndpoints();
             app.MapClarificationEndpoints();
+app.MapBackupEndpoints();
 
             await app.RunAsync();
             return 0;

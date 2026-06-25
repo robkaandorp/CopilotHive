@@ -2,8 +2,10 @@ using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Models;
 using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
 using CopilotHive.Services;
 
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.Sqlite;
 
 namespace CopilotHive;
@@ -343,6 +345,55 @@ public static class ApiEndpoints
                 return Results.NotFound(new { error = $"Clarification '{id}' not found." });
 
             return Results.Ok(new { message = $"Answer submitted for clarification '{id}'." });
+        });
+    }
+
+    /// <summary>
+    /// Registers the backup REST API endpoints under <c>/api/backup</c>.
+    /// </summary>
+    /// <param name="app">The web application to register routes on.</param>
+    public static void MapBackupEndpoints(this WebApplication app)
+    {
+        // ── Backup REST API ──────────────────────────────────────────────────────
+        var backupApi = app.MapGroup("/api/backup");
+
+        backupApi.MapPost("/", async ([FromServices] BackupService svc) =>
+        {
+            var path = await svc.CreateBackupAsync();
+            var fileName = Path.GetFileName(path);
+            var info = svc.ListBackups().First(b => b.FileName == fileName);
+            return Results.Ok(info);
+        });
+
+        backupApi.MapGet("/", ([FromServices] BackupService svc) =>
+            Results.Ok(svc.ListBackups()));
+
+        backupApi.MapGet("/{fileName}", (string fileName, [FromServices] BackupService svc) =>
+        {
+            // Path traversal protection: reject any fileName that is not a bare file name.
+            if (string.IsNullOrWhiteSpace(fileName)
+                || fileName.Contains('/')
+                || fileName.Contains('\\')
+                || fileName.Contains("..")
+                || Path.GetFileName(fileName) != fileName)
+            {
+                return Results.BadRequest(new { error = "Invalid file name." });
+            }
+
+            var backupDir = Path.GetFullPath(svc.BackupDirectory);
+            var fullPath = Path.GetFullPath(Path.Combine(backupDir, fileName));
+
+            // Ensure the resolved path stays within the backup directory.
+            var backupDirWithSep = backupDir.EndsWith(Path.DirectorySeparatorChar)
+                ? backupDir
+                : backupDir + Path.DirectorySeparatorChar;
+            if (!fullPath.StartsWith(backupDirWithSep, StringComparison.Ordinal))
+                return Results.BadRequest(new { error = "Invalid file name." });
+
+            if (!File.Exists(fullPath))
+                return Results.NotFound(new { error = "Backup not found." });
+
+            return Results.File(fullPath, "application/gzip", fileName);
         });
     }
 }

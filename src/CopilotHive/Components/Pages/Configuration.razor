@@ -177,6 +177,69 @@ else
                 </div>
             }
         }
+        else if (_activeTab == BackupTabName)
+        {
+            <div style="margin-top:1rem">
+                <div style="margin-bottom:1.5rem">
+                    <button class="approve-btn" disabled="@_backupCreating" @onclick="CreateBackupAsync">
+                        @if (_backupCreating)
+                        {
+                            <span>Creating backup…</span>
+                        }
+                        else
+                        {
+                            <span>📦 Create Backup</span>
+                        }
+                    </button>
+                    @if (_backupSuccess)
+                    {
+                        <span style="color:var(--accent);font-size:0.9rem;margin-left:1rem">✅ Backup created</span>
+                    }
+                    @if (_backupError is not null)
+                    {
+                        <span style="color:var(--red);font-size:0.9rem;margin-left:1rem">@_backupError</span>
+                    }
+                </div>
+
+                @if (_backupsLoading)
+                {
+                    <p style="color:var(--text-muted)">Loading backups…</p>
+                }
+                else if (_backupError is null && _backups.Count == 0)
+                {
+                    <p style="color:var(--text-muted);font-style:italic">No backups yet. Click "Create Backup" to create one.</p>
+                }
+                else if (_backupError is null)
+                {
+                    <div style="display:flex;flex-direction:column;gap:0.75rem;max-width:700px">
+                        @foreach (var backup in _backups)
+                        {
+                            <div style="display:flex;align-items:center;justify-content:space-between;padding:0.75rem 1rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px">
+                                <div>
+                                    <div style="font-size:0.9rem;font-weight:500">@backup.FileName</div>
+                                    <div style="color:var(--text-muted);font-size:0.8rem">
+                                        @FormatFileSize(backup.SizeBytes) · @backup.CreatedAt.ToString("yyyy-MM-dd HH:mm UTC")
+                                    </div>
+                                </div>
+                                <a href="@($"/api/backup/{backup.FileName}")" style="color:var(--accent);font-size:0.85rem;text-decoration:none">Download</a>
+                            </div>
+                        }
+                    </div>
+                }
+
+                <div style="margin-top:2rem;padding:1rem 1.25rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;max-width:700px">
+                    <h3 style="font-size:1rem;font-weight:600;margin-bottom:0.75rem">What's included</h3>
+                    <ul style="color:var(--text-muted);font-size:0.85rem;list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:0.4rem">
+                        <li>✓ Database (copilothive.db)</li>
+                        <li>✓ Brain master session (brain-master.json)</li>
+                        <li>✓ Brain goal sessions (brain-goal-*.json)</li>
+                        <li>✓ Composer session (composer-session.json)</li>
+                        <li>✓ Metrics (metrics/)</li>
+                        <li>✓ Data protection keys (keys/)</li>
+                    </ul>
+                </div>
+            </div>
+        }
         else if (ActiveTab?.EndsWith(".md") == true)
         {
             <div class="config-markdown">
@@ -196,6 +259,7 @@ else
 
 @code {
     private const string ModelsTabName = "Models";
+    private const string BackupTabName = "Backup";
 
     private sealed record ModelConfigResponse(
         [property: JsonPropertyName("orchestrator")]    string? Orchestrator,
@@ -210,6 +274,11 @@ else
 
     private sealed record ModelEntryDto(
         [property: JsonPropertyName("name")] string Name);
+
+    private sealed record BackupInfoResponse(
+        [property: JsonPropertyName("fileName")] string FileName,
+        [property: JsonPropertyName("sizeBytes")] long SizeBytes,
+        [property: JsonPropertyName("createdAt")] DateTime CreatedAt);
 
     private bool _loading = true;
     private string? _error;
@@ -238,6 +307,12 @@ else
     private string _docwriterPremiumModel = "";
     private string _improverPremiumModel = "";
 
+    private List<BackupInfoResponse> _backups = [];
+    private bool _backupsLoading;
+    private bool _backupCreating;
+    private string? _backupError;
+    private bool _backupSuccess;
+
     protected override async Task OnInitializedAsync()
     {
         PageHeader.SetTitle("⚙️ Configuration");
@@ -245,6 +320,7 @@ else
         {
             await LoadFilesAsync();
             await LoadModelsAsync();
+            await LoadBackupsAsync();
         }
         catch (Exception ex)
         {
@@ -278,6 +354,7 @@ else
 
         _tabs = [.. _files.Keys];
         _tabs.Insert(0, ModelsTabName);
+        _tabs.Insert(1, BackupTabName);
     }
 
     private async Task LoadModelsAsync()
@@ -376,9 +453,68 @@ else
         }
     }
 
+    private async Task LoadBackupsAsync()
+    {
+        _backupsLoading = true;
+        try
+        {
+            _backups = await HttpClient.GetFromJsonAsync<List<BackupInfoResponse>>("/api/backup") ?? [];
+            _backupError = null;
+        }
+        catch (Exception ex)
+        {
+            _backupError = $"Failed to load backups: {ex.Message}";
+            _backups = [];
+        }
+        finally
+        {
+            _backupsLoading = false;
+        }
+    }
+
+    private async Task CreateBackupAsync()
+    {
+        _backupCreating = true;
+        _backupSuccess = false;
+        _backupError = null;
+        try
+        {
+            var response = await HttpClient.PostAsync("/api/backup", null);
+            if (response.IsSuccessStatusCode)
+            {
+                await LoadBackupsAsync();
+                if (_backupError is null)
+                {
+                    _backupSuccess = true;
+                    await Task.Delay(3000);
+                    _backupSuccess = false;
+                }
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                _backupError = $"Backup failed ({(int)response.StatusCode}): {error}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _backupError = $"Backup failed: {ex.Message}";
+        }
+        finally
+        {
+            _backupCreating = false;
+            StateHasChanged();
+        }
+    }
+
+    private static string FormatFileSize(long bytes) =>
+        bytes >= 1_073_741_824 ? $"{bytes / 1_073_741_824.0:F1} GB"
+        : bytes >= 1_048_576 ? $"{bytes / 1_048_576.0:F1} MB"
+        : bytes >= 1024 ? $"{bytes / 1024.0:F1} KB"
+        : $"{bytes} B";
+
     private string GetActiveContent() =>
         _files.TryGetValue(_activeTab, out var content) ? content : "(empty)";
-
     private string? ActiveTab => _activeTab;
 
     private static readonly MarkdownPipeline MarkdownPipeline = new MarkdownPipelineBuilder()
