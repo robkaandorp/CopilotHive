@@ -49,6 +49,14 @@ public static class BrainPromptBuilder
         - Never write "see previous output" or "fix the issues noted above" — the worker has not seen any feedback from other roles. Include the actual feedback content verbatim or summarized.
         - If the previous iteration's tester reported skipped tests, tell the coder exactly which tests were skipped and why, and what to do about them.
         - If the reviewer rejected with specific issues, list those issues in the worker prompt.
+
+        BRANCH VISIBILITY:
+        - Your file tools (read_file, glob, grep) see the base branch (develop/main), NOT the worker's feature branch.
+        - Workers commit their changes to a feature branch (copilothive/{goal-id}). You CANNOT see these changes.
+        - When a reviewer rejects and a new iteration starts, the worker's previous changes ARE still on their feature branch — they are NOT lost.
+        - Do NOT assume the codebase needs to be reimplemented from scratch on a retry. The coder already has its previous work on its branch and in its session.
+        - When planning a retry, tell the coder to FIX the specific issues from the reviewer/tester feedback, not to reimplement everything.
+        - Only plan a full reimplementation if the reviewer explicitly says the approach is fundamentally wrong.
         """;
 
     /// <summary>
