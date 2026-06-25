@@ -55,7 +55,11 @@ public sealed class BackupService
     /// Creates a new tar.gz backup archive and returns its full path.
     /// </summary>
     /// <param name="ct">Cancellation token.</param>
-    public async Task<string> CreateBackupAsync(CancellationToken ct = default)
+    /// <param name="archivePrefix">
+    /// The archive file name prefix. Defaults to <c>"copilothive-backup"</c>. When a non-default
+    /// prefix is supplied (e.g. <c>"pre-restore"</c>), the archive is excluded from normal pruning.
+    /// </param>
+    public async Task<string> CreateBackupAsync(CancellationToken ct = default, string archivePrefix = "copilothive-backup")
     {
         Directory.CreateDirectory(BackupDirectory);
 
@@ -120,12 +124,15 @@ public sealed class BackupService
                 ct);
 
             // 8. Create the tar.gz archive
-            var archivePath = Path.Combine(BackupDirectory, $"copilothive-backup-{timestamp}.tar.gz");
+            var archivePath = Path.Combine(BackupDirectory, $"{archivePrefix}-{timestamp}.tar.gz");
             await CreateArchiveAsync(tempDir, archivePath, ct);
 
             _logger.LogInformation("Backup created at {ArchivePath}", archivePath);
 
-            PruneOldBackups();
+            // Only prune the standard backup set; custom-prefixed archives (e.g. pre-restore
+            // safety backups) are excluded from normal pruning entirely.
+            if (archivePrefix == "copilothive-backup")
+                PruneOldBackups();
 
             return archivePath;
         }
@@ -140,6 +147,125 @@ public sealed class BackupService
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to clean up temp backup directory {TempDir}", tempDir);
+            }
+        }
+    }
+
+    /// <summary>Describes the outcome of a restore operation.</summary>
+    /// <param name="DatabaseRestored">Whether the SQLite database was restored.</param>
+    /// <param name="BrainMasterSession">Whether the Brain master session file was restored.</param>
+    /// <param name="BrainGoalSessionCount">Number of Brain goal session files restored.</param>
+    /// <param name="ComposerSession">Whether the Composer session file was restored.</param>
+    /// <param name="MetricsCount">Number of metrics files restored.</param>
+    /// <param name="KeysCount">Number of data protection key files restored.</param>
+    /// <param name="SafetyBackupPath">Full path to the safety backup created before restoring.</param>
+    public sealed record RestoreResult(
+        bool DatabaseRestored,
+        bool BrainMasterSession,
+        int BrainGoalSessionCount,
+        bool ComposerSession,
+        int MetricsCount,
+        int KeysCount,
+        string SafetyBackupPath);
+
+    /// <summary>
+    /// Restores a previously created tar.gz backup archive, extracting and replacing the
+    /// database, Brain/Composer session files, metrics, and keys. A safety backup of the
+    /// current state is created before any files are replaced.
+    /// </summary>
+    /// <param name="archivePath">Full path to the backup archive to restore.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <exception cref="FileNotFoundException">Thrown when the archive file does not exist.</exception>
+    /// <exception cref="InvalidOperationException">Thrown when the archive is missing its manifest.</exception>
+    public async Task<RestoreResult> RestoreBackupAsync(string archivePath, CancellationToken ct = default)
+    {
+        if (!File.Exists(archivePath))
+            throw new FileNotFoundException("Backup archive not found.", archivePath);
+
+        Directory.CreateDirectory(BackupDirectory);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMddTHHmmss", CultureInfo.InvariantCulture);
+        var tempDir = Path.Combine(BackupDirectory, $"restore-tmp-{timestamp}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            // 1. Extract the tar.gz archive into the temp directory.
+            await ExtractArchiveAsync(archivePath, tempDir, ct);
+
+            // 2. Verify the manifest exists.
+            var manifestPath = Path.Combine(tempDir, "backup-manifest.json");
+            if (!File.Exists(manifestPath))
+                throw new InvalidOperationException("Backup archive is missing its manifest (backup-manifest.json).");
+
+            // 3. Create a safety backup of the current state before replacing files.
+            var safetyBackupPath = await CreateBackupAsync(ct, "pre-restore");
+
+            // 4. Restore the database.
+            var databaseRestored = RestoreDatabase(tempDir);
+
+            // 5. Restore the Brain master session.
+            var brainMasterSession = ReplaceFile(
+                Path.Combine(tempDir, "brain-master.json"),
+                Path.Combine(_stateDir, "brain-master.json"));
+
+            // 6. Restore the Brain goal sessions.
+            foreach (var existing in Directory.Exists(_stateDir)
+                ? Directory.GetFiles(_stateDir, "brain-goal-*.json")
+                : [])
+            {
+                File.Delete(existing);
+            }
+
+            var brainGoalSessionCount = 0;
+            foreach (var file in Directory.GetFiles(tempDir, "brain-goal-*.json"))
+            {
+                File.Copy(file, Path.Combine(_stateDir, Path.GetFileName(file)), overwrite: true);
+                brainGoalSessionCount++;
+            }
+
+            // 7. Restore the Composer session.
+            var composerSession = ReplaceFile(
+                Path.Combine(tempDir, "composer-session.json"),
+                Path.Combine(_stateDir, "composer-session.json"));
+
+            // 8. Restore the metrics directory.
+            var metricsCount = ReplaceDirectory(
+                Path.Combine(tempDir, "metrics"),
+                Path.Combine(_stateDir, "metrics"));
+
+            // 9. Restore the keys directory.
+            var keysCount = ReplaceDirectory(
+                Path.Combine(tempDir, "keys"),
+                Path.Combine(_stateDir, "keys"));
+
+            _logger.LogInformation(
+                "Restore complete from {ArchivePath}: database={DatabaseRestored}, brainMaster={BrainMasterSession}, "
+                + "brainGoals={BrainGoalSessionCount}, composer={ComposerSession}, metrics={MetricsCount}, keys={KeysCount}. "
+                + "Safety backup at {SafetyBackupPath}",
+                archivePath, databaseRestored, brainMasterSession, brainGoalSessionCount,
+                composerSession, metricsCount, keysCount, safetyBackupPath);
+
+            return new RestoreResult(
+                databaseRestored,
+                brainMasterSession,
+                brainGoalSessionCount,
+                composerSession,
+                metricsCount,
+                keysCount,
+                safetyBackupPath);
+        }
+        finally
+        {
+            // Clean up the temp extraction directory.
+            try
+            {
+                if (Directory.Exists(tempDir))
+                    Directory.Delete(tempDir, recursive: true);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to clean up temp restore directory {TempDir}", tempDir);
             }
         }
     }
@@ -191,6 +317,124 @@ public sealed class BackupService
         {
             _logger.LogWarning(ex, "Failed to back up database");
             return false;
+        }
+    }
+
+    private bool RestoreDatabase(string tempDir)
+    {
+        var extractedDb = Path.Combine(tempDir, "copilothive.db");
+        if (!File.Exists(extractedDb))
+            return false;
+
+        try
+        {
+            string? dbPath;
+            // Dispose the DbContext to close any open database connections.
+            using (var context = _dbContextFactory.CreateDbContext())
+            {
+                var connectionString = context.Database.GetConnectionString();
+                dbPath = ExtractDataSource(connectionString);
+            }
+
+            if (string.IsNullOrEmpty(dbPath) || dbPath == ":memory:")
+            {
+                _logger.LogWarning("Cannot restore database: invalid target path (path: {DbPath})", dbPath ?? "<null>");
+                return false;
+            }
+
+            // Drop pooled connections so file handles are released before deleting.
+            SqliteConnection.ClearAllPools();
+
+            // Delete the old database and its sidecar files.
+            DeleteIfExists(dbPath);
+            DeleteIfExists(dbPath + "-wal");
+            DeleteIfExists(dbPath + "-shm");
+
+            var targetDir = Path.GetDirectoryName(dbPath);
+            if (!string.IsNullOrEmpty(targetDir))
+                Directory.CreateDirectory(targetDir);
+
+            File.Copy(extractedDb, dbPath, overwrite: true);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to restore database");
+            return false;
+        }
+    }
+
+    private static void DeleteIfExists(string path)
+    {
+        if (File.Exists(path))
+            File.Delete(path);
+    }
+
+    private bool ReplaceFile(string sourcePath, string destPath)
+    {
+        DeleteIfExists(destPath);
+
+        if (!File.Exists(sourcePath))
+            return false;
+
+        var destDir = Path.GetDirectoryName(destPath);
+        if (!string.IsNullOrEmpty(destDir))
+            Directory.CreateDirectory(destDir);
+
+        File.Copy(sourcePath, destPath, overwrite: true);
+        return true;
+    }
+
+    private static int ReplaceDirectory(string sourceDir, string destDir)
+    {
+        if (Directory.Exists(destDir))
+            Directory.Delete(destDir, recursive: true);
+
+        return CopyDirectory(sourceDir, destDir);
+    }
+
+    private async Task ExtractArchiveAsync(string archivePath, string tempDir, CancellationToken ct)
+    {
+        var tempDirFull = Path.GetFullPath(tempDir).TrimEnd(Path.DirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+
+        using var fileStream = File.OpenRead(archivePath);
+        using var gzipStream = new GZipStream(fileStream, CompressionMode.Decompress);
+        using var tarReader = new TarReader(gzipStream);
+        TarEntry? entry;
+        while ((entry = await tarReader.GetNextEntryAsync(cancellationToken: ct)) is not null)
+        {
+            if (entry.EntryType != TarEntryType.RegularFile)
+                continue;
+
+            var entryName = entry.Name;
+
+            // Reject entries with parent-directory traversal segments.
+            if (entryName.Split('/', '\\').Any(segment => segment == ".."))
+            {
+                _logger.LogWarning("Skipping archive entry with path traversal segment: {EntryName}", entryName);
+                continue;
+            }
+
+            // Reject rooted/absolute entry names (e.g. "/etc/passwd" or "C:\\...").
+            var normalizedName = entryName.Replace('/', Path.DirectorySeparatorChar);
+            if (Path.IsPathRooted(normalizedName))
+            {
+                _logger.LogWarning("Skipping archive entry with rooted path: {EntryName}", entryName);
+                continue;
+            }
+
+            var destPath = Path.GetFullPath(Path.Combine(tempDir, normalizedName));
+
+            // Ensure the resolved path stays within the temp extraction directory.
+            if (!destPath.StartsWith(tempDirFull, StringComparison.Ordinal))
+            {
+                _logger.LogWarning("Skipping archive entry that escapes the extraction directory: {EntryName}", entryName);
+                continue;
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+            entry.ExtractToFile(destPath, overwrite: true);
         }
     }
 

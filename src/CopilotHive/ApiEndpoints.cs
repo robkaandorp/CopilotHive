@@ -395,6 +395,41 @@ public static class ApiEndpoints
 
             return Results.File(fullPath, "application/gzip", fileName);
         });
+
+        backupApi.MapPost("/restore", async (RestoreRequest request, [FromServices] BackupService svc) =>
+        {
+            if (string.IsNullOrWhiteSpace(request.FileName))
+                return Results.BadRequest(new { error = "FileName is required." });
+
+            var fileName = request.FileName;
+            if (fileName.Contains('/') || fileName.Contains('\\') || fileName.Contains("..")
+                || Path.GetFileName(fileName) != fileName)
+            {
+                return Results.BadRequest(new { error = "Invalid file name." });
+            }
+
+            var fullPath = Path.GetFullPath(Path.Combine(svc.BackupDirectory, fileName));
+            var backupDirWithSep = Path.GetFullPath(svc.BackupDirectory)
+                .TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            if (!fullPath.StartsWith(backupDirWithSep, StringComparison.Ordinal))
+                return Results.BadRequest(new { error = "Invalid file name." });
+
+            if (!File.Exists(fullPath))
+                return Results.NotFound(new { error = "Backup not found." });
+
+            var result = await svc.RestoreBackupAsync(fullPath);
+            return Results.Ok(new
+            {
+                message = "Restore complete. Restart the orchestrator for changes to take effect.",
+                result.DatabaseRestored,
+                result.BrainMasterSession,
+                result.BrainGoalSessionCount,
+                result.ComposerSession,
+                result.MetricsCount,
+                result.KeysCount,
+                result.SafetyBackupPath,
+            });
+        });
     }
 }
 
@@ -430,3 +465,7 @@ public record AssignGoalReleaseRequest(string ReleaseId);
 /// <summary>Request body for submitting an answer to a clarification request via the HTTP API.</summary>
 /// <param name="Answer">The answer text to submit.</param>
 public record SubmitClarificationRequest(string Answer);
+
+/// <summary>Request body for restoring a backup archive via the HTTP API.</summary>
+/// <param name="FileName">The backup archive file name to restore.</param>
+public record RestoreRequest(string FileName);
