@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Git;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -577,6 +578,478 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.True(result);
         Assert.Empty(config.Models!.AvailableModels!);
     }
+
+    // ── AddRepositoryAsync tests ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task AddRepositoryAsync_AddsRepositoryToConfig()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig(), Repositories = [] };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", TestContext.Current.CancellationToken);
+
+        var added = Assert.Single(config.Repositories);
+        Assert.Equal("my-repo", added.Name);
+        Assert.Equal("https://github.com/org/repo.git", added.Url);
+        Assert.Equal("main", added.DefaultBranch);
+    }
+
+    [Fact]
+    public async Task AddRepositoryAsync_DuplicateThrows()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig(), Repositories = [] };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", TestContext.Current.CancellationToken);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            svc.AddRepositoryAsync("MY-REPO", "https://github.com/org/other.git", "develop", TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task AddRepositoryAsync_DefaultsBranchToMain()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig(), Repositories = [] };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "", TestContext.Current.CancellationToken);
+
+        var added = Assert.Single(config.Repositories);
+        Assert.Equal("main", added.DefaultBranch);
+    }
+
+    [Fact]
+    public async Task AddRepositoryAsync_WritesAndCommits()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig(), Repositories = [] };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", TestContext.Current.CancellationToken);
+
+        Assert.Single(repo.Commits);
+        Assert.Equal("hive-config.yaml", repo.Commits[0].File);
+        Assert.Contains("add repository", repo.Commits[0].Message);
+    }
+
+    // ── UpdateRepositoryAsync tests ──────────────────────────────────────────
+
+    [Fact]
+    public async Task UpdateRepositoryAsync_UpdatesUrlAndBranch()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories = [new RepositoryConfig { Name = "my-repo", Url = "https://github.com/org/old.git", DefaultBranch = "main" }]
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateRepositoryAsync("my-repo", "https://github.com/org/new.git", "develop", TestContext.Current.CancellationToken);
+
+        var updated = Assert.Single(config.Repositories);
+        Assert.Equal("https://github.com/org/new.git", updated.Url);
+        Assert.Equal("develop", updated.DefaultBranch);
+    }
+
+    [Fact]
+    public async Task UpdateRepositoryAsync_NotFoundThrows()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig(), Repositories = [] };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            svc.UpdateRepositoryAsync("missing", "https://github.com/org/new.git", "main", TestContext.Current.CancellationToken));
+    }
+
+    // ── RemoveRepositoryAsync tests ──────────────────────────────────────────
+
+    [Fact]
+    public async Task RemoveRepositoryAsync_RemovesRepository()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig { Name = "repo-a", Url = "https://github.com/org/a.git", DefaultBranch = "main" },
+                new RepositoryConfig { Name = "repo-b", Url = "https://github.com/org/b.git", DefaultBranch = "main" }
+            ]
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.RemoveRepositoryAsync("repo-a", TestContext.Current.CancellationToken);
+
+        var remaining = Assert.Single(config.Repositories);
+        Assert.Equal("repo-b", remaining.Name);
+    }
+
+    [Fact]
+    public async Task RemoveRepositoryAsync_NotFoundReturnsFalse()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig(), Repositories = [] };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var result = await svc.RemoveRepositoryAsync("missing", TestContext.Current.CancellationToken);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task RemoveRepositoryAsync_WritesAndCommits()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories = [new RepositoryConfig { Name = "repo-a", Url = "https://github.com/org/a.git", DefaultBranch = "main" }]
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.RemoveRepositoryAsync("repo-a", TestContext.Current.CancellationToken);
+
+        Assert.Single(repo.Commits);
+        Assert.Equal("hive-config.yaml", repo.Commits[0].File);
+        Assert.Contains("remove repository", repo.Commits[0].Message);
+    }
+
+    // ── UpdateOrchestratorSettingsAsync tests ────────────────────────────────
+
+    [Fact]
+    public async Task UpdateOrchestratorSettingsAsync_UpdatesAllFields()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+        var update = new OrchestratorSettingsUpdate(
+            MaxIterations: 99, MaxRetriesPerTask: 7, MaxParallelGoals: 4,
+            AlwaysImprove: true, VerboseLogging: true,
+            BrainContextWindow: 256000, BrainMaxSteps: 120,
+            WorkerContextWindow: 128000, BranchCleanupDelayHours: 12);
+
+        await svc.UpdateOrchestratorSettingsAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.Equal(99, config.Orchestrator.MaxIterations);
+        Assert.Equal(7, config.Orchestrator.MaxRetriesPerTask);
+        Assert.Equal(4, config.Orchestrator.MaxParallelGoals);
+        Assert.True(config.Orchestrator.AlwaysImprove);
+        Assert.True(config.Orchestrator.VerboseLogging);
+        Assert.Equal(256000, config.Orchestrator.BrainContextWindow);
+        Assert.Equal(120, config.Orchestrator.BrainMaxSteps);
+        Assert.Equal(128000, config.Orchestrator.WorkerContextWindow);
+        Assert.Equal(12, config.Orchestrator.BranchCleanupDelayHours);
+    }
+
+    [Fact]
+    public async Task UpdateOrchestratorSettingsAsync_PartialUpdate_OnlyChangesProvidedFields()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig
+            {
+                MaxIterations = 10,
+                MaxRetriesPerTask = 3,
+                AlwaysImprove = false,
+                VerboseLogging = false
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+        var update = new OrchestratorSettingsUpdate(
+            MaxIterations: 50, MaxRetriesPerTask: null, MaxParallelGoals: null,
+            AlwaysImprove: true, VerboseLogging: null,
+            BrainContextWindow: null, BrainMaxSteps: null,
+            WorkerContextWindow: null, BranchCleanupDelayHours: null);
+
+        await svc.UpdateOrchestratorSettingsAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.Equal(50, config.Orchestrator.MaxIterations);
+        Assert.True(config.Orchestrator.AlwaysImprove);
+        // Unchanged
+        Assert.Equal(3, config.Orchestrator.MaxRetriesPerTask);
+        Assert.False(config.Orchestrator.VerboseLogging);
+    }
+
+    [Fact]
+    public async Task UpdateOrchestratorSettingsAsync_WritesAndCommits()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+        var update = new OrchestratorSettingsUpdate(
+            MaxIterations: 5, MaxRetriesPerTask: null, MaxParallelGoals: null,
+            AlwaysImprove: null, VerboseLogging: null,
+            BrainContextWindow: null, BrainMaxSteps: null,
+            WorkerContextWindow: null, BranchCleanupDelayHours: null);
+
+        await svc.UpdateOrchestratorSettingsAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.Single(repo.Commits);
+        Assert.Equal("hive-config.yaml", repo.Commits[0].File);
+        Assert.Contains("orchestrator", repo.Commits[0].Message);
+    }
+
+    // ── UpdateWorkerContextWindowsAsync tests ────────────────────────────────
+
+    [Fact]
+    public async Task UpdateWorkerContextWindowsAsync_UpdatesContextWindows()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Workers = new Dictionary<string, WorkerConfig>
+            {
+                ["coder"] = new WorkerConfig(),
+                ["tester"] = new WorkerConfig()
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateWorkerContextWindowsAsync(
+            new Dictionary<string, int> { ["coder"] = 50000, ["tester"] = 30000 },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(50000, config.Workers["coder"].ContextWindow);
+        Assert.Equal(30000, config.Workers["tester"].ContextWindow);
+    }
+
+    [Fact]
+    public async Task UpdateWorkerContextWindowsAsync_CreatesWorkerIfMissing()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateWorkerContextWindowsAsync(
+            new Dictionary<string, int> { ["reviewer"] = 40000 },
+            TestContext.Current.CancellationToken);
+
+        Assert.True(config.Workers.ContainsKey("reviewer"));
+        Assert.Equal(40000, config.Workers["reviewer"].ContextWindow);
+    }
+
+    [Fact]
+    public async Task UpdateWorkerContextWindowsAsync_WritesAndCommits()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateWorkerContextWindowsAsync(
+            new Dictionary<string, int> { ["coder"] = 50000 },
+            TestContext.Current.CancellationToken);
+
+        Assert.Single(repo.Commits);
+        Assert.Equal("hive-config.yaml", repo.Commits[0].File);
+        Assert.Contains("worker", repo.Commits[0].Message);
+    }
+
+    // ── UpdateComposerSettingsAsync tests ────────────────────────────────────
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_UpdatesContextWindow()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { ContextWindow = 100000, MaxSteps = 50 }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(200000, null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(200000, config.Composer!.ContextWindow);
+        Assert.Equal(50, config.Composer.MaxSteps);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_UpdatesMaxSteps()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { ContextWindow = 100000, MaxSteps = 50 }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(null, 99, TestContext.Current.CancellationToken);
+
+        Assert.Equal(99, config.Composer!.MaxSteps);
+        Assert.Equal(100000, config.Composer.ContextWindow);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_InitializesComposerIfNull()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig(), Composer = null };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(100000, 50, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(config.Composer);
+        Assert.Equal(100000, config.Composer!.ContextWindow);
+        Assert.Equal(50, config.Composer.MaxSteps);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_WritesAndCommits()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(100000, 50, TestContext.Current.CancellationToken);
+
+        Assert.Single(repo.Commits);
+        Assert.Equal("hive-config.yaml", repo.Commits[0].File);
+        Assert.Contains("composer", repo.Commits[0].Message);
+    }
+
+    // ── YAML write-back tests ──────────────────────────────────────────────────
+
+    [Fact]
+    public async Task AddRepositoryAsync_WritesYamlWithRepository()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", TestContext.Current.CancellationToken);
+
+        var yaml = await File.ReadAllTextAsync(Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
+        Assert.Contains("my-repo", yaml);
+        Assert.Contains("https://github.com/org/repo.git", yaml);
+        Assert.Contains("main", yaml);
+    }
+
+    [Fact]
+    public async Task UpdateOrchestratorSettingsAsync_WritesYamlWithSettings()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+        var update = new OrchestratorSettingsUpdate(
+            MaxIterations: 15, MaxRetriesPerTask: 5, MaxParallelGoals: 3,
+            AlwaysImprove: true, VerboseLogging: true,
+            BrainContextWindow: 200000, BrainMaxSteps: 75,
+            WorkerContextWindow: 100000, BranchCleanupDelayHours: 24);
+
+        await svc.UpdateOrchestratorSettingsAsync(update, TestContext.Current.CancellationToken);
+
+        var yaml = await File.ReadAllTextAsync(Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
+        Assert.Contains("max_iterations: 15", yaml);
+        Assert.Contains("max_retries_per_task: 5", yaml);
+        Assert.Contains("max_parallel_goals: 3", yaml);
+        Assert.Contains("always_improve: true", yaml);
+        Assert.Contains("verbose_logging: true", yaml);
+        Assert.Contains("brain_context_window: 200000", yaml);
+        Assert.Contains("brain_max_steps: 75", yaml);
+        Assert.Contains("worker_context_window: 100000", yaml);
+        Assert.Contains("branch_cleanup_delay_hours: 24", yaml);
+    }
+
+    [Fact]
+    public async Task UpdateWorkerContextWindowsAsync_WritesYamlWithContextWindows()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateWorkerContextWindowsAsync(
+            new Dictionary<string, int> { ["coder"] = 50000, ["tester"] = 30000 },
+            TestContext.Current.CancellationToken);
+
+        var yaml = await File.ReadAllTextAsync(Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
+        Assert.Contains("context_window: 50000", yaml);
+        Assert.Contains("context_window: 30000", yaml);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_WritesYamlWithComposerSettings()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(200000, 75, TestContext.Current.CancellationToken);
+
+        var yaml = await File.ReadAllTextAsync(Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
+        Assert.Contains("context_window: 200000", yaml);
+        Assert.Contains("max_steps: 75", yaml);
+    }
+
+    // ── Clone-triggering tests ─────────────────────────────────────────────────
+
+    [Fact]
+    public async Task AddRepositoryAsync_CallsEnsureCloneAsync()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var repoManager = new FakeBrainRepoManager();
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, null, repoManager);
+
+        await svc.AddRepositoryAsync("test-repo", "https://github.com/org/repo.git", "main", TestContext.Current.CancellationToken);
+
+        var call = Assert.Single(repoManager.CloneCalls);
+        Assert.Equal("test-repo", call.Name);
+        Assert.Equal("https://github.com/org/repo.git", call.Url);
+        Assert.Equal("main", call.Branch);
+    }
+
+    [Fact]
+    public async Task UpdateRepositoryAsync_CallsEnsureCloneAsync()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories = [new RepositoryConfig { Name = "existing-repo", Url = "https://old.com/repo.git", DefaultBranch = "main" }]
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var repoManager = new FakeBrainRepoManager();
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, null, repoManager);
+
+        await svc.UpdateRepositoryAsync("existing-repo", "https://new.com/repo.git", "develop", TestContext.Current.CancellationToken);
+
+        var call = Assert.Single(repoManager.CloneCalls);
+        Assert.Equal("existing-repo", call.Name);
+        Assert.Equal("https://new.com/repo.git", call.Url);
+        Assert.Equal("develop", call.Branch);
+    }
+
+    // ── Validation tests ───────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task AddRepositoryAsync_RejectsPathTraversalName()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            svc.AddRepositoryAsync("../../etc", "https://github.com/org/repo.git", "main", TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task AddRepositoryAsync_RejectsNullUrl()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            svc.AddRepositoryAsync("test-repo", "", "main", TestContext.Current.CancellationToken));
+    }
 }
 
 /// <summary>
@@ -637,4 +1110,27 @@ file sealed class FakeDistributedBrain : IDistributedBrain
         Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
 
     public BrainStats? GetStats() => null;
+}
+
+/// <summary>
+/// Minimal fake implementing <see cref="IBrainRepoManager"/> that records clone calls.
+/// </summary>
+file sealed class FakeBrainRepoManager : IBrainRepoManager
+{
+    public string WorkDirectory => "/fake/work";
+    public List<(string Name, string Url, string Branch)> CloneCalls { get; } = [];
+
+    public Task<string> EnsureCloneAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default)
+    {
+        CloneCalls.Add((repoName, repoUrl, defaultBranch));
+        return Task.FromResult($"/fake/work/{repoName}");
+    }
+
+    public Task<string> MergeFeatureBranchAsync(string repoName, string featureBranch, string defaultBranch, string commitMessage, CancellationToken ct = default) =>
+        Task.FromResult("fake-sha");
+    public Task<BranchDeleteResult> DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default) =>
+        Task.FromResult(BranchDeleteResult.Success);
+    public string GetClonePath(string repoName) => $"/fake/work/{repoName}";
+    public Task<string?> GetHeadShaAsync(string repoName, CancellationToken ct = default) =>
+        Task.FromResult<string?>(null);
 }

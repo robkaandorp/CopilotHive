@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Git;
 using CopilotHive.Services;
 using Microsoft.AspNetCore.Mvc;
 
@@ -91,6 +92,129 @@ public static class ConfigHub
                 return Results.Problem("Config service is not configured.");
             var removed = await svc.RemoveAvailableModelAsync(name);
             return removed ? Results.Ok(new { removed = true }) : Results.NotFound(new { error = $"Model '{name}' not found." });
+        });
+
+        // ── Repositories ────────────────────────────────────────────────────
+
+        // List repositories
+        app.MapGet("/api/config/repositories", ([FromServices] HiveConfigFile? config) =>
+        {
+            if (config is null)
+                return Results.NotFound(new { error = "Config repo not configured." });
+            return Results.Ok(config.Repositories);
+        });
+
+        // Add a repository
+        app.MapPost("/api/config/repositories", async (
+            RepositoryRequest req,
+            [FromServices] ConfigModelService? svc,
+            [FromServices] IBrainRepoManager? repoManager) =>
+        {
+            if (svc is null)
+                return Results.Problem("Config service is not configured.");
+            try
+            {
+                await svc.AddRepositoryAsync(req.Name, req.Url, req.DefaultBranch);
+                return Results.Ok(new { saved = true });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+        });
+
+        // Update a repository
+        app.MapPut("/api/config/repositories/{name}", async (
+            string name,
+            RepositoryRequest req,
+            [FromServices] ConfigModelService? svc,
+            [FromServices] IBrainRepoManager? repoManager) =>
+        {
+            if (svc is null)
+                return Results.Problem("Config service is not configured.");
+            try
+            {
+                await svc.UpdateRepositoryAsync(name, req.Url, req.DefaultBranch);
+                return Results.Ok(new { saved = true });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        // Remove a repository
+        app.MapDelete("/api/config/repositories/{name}", async (string name, [FromServices] ConfigModelService? svc) =>
+        {
+            if (svc is null)
+                return Results.Problem("Config service is not configured.");
+            var removed = await svc.RemoveRepositoryAsync(name);
+            return removed ? Results.Ok(new { removed = true }) : Results.NotFound(new { error = $"Repository '{name}' not found." });
+        });
+
+        // ── Orchestrator settings ───────────────────────────────────────────
+
+        // Get orchestrator settings
+        app.MapGet("/api/config/orchestrator", ([FromServices] HiveConfigFile? config) =>
+        {
+            if (config is null)
+                return Results.NotFound(new { error = "Config repo not configured." });
+            return Results.Ok(config.Orchestrator);
+        });
+
+        // Update orchestrator settings
+        app.MapMethods("/api/config/orchestrator", ["PATCH"], async (
+            OrchestratorSettingsUpdate update,
+            [FromServices] ConfigModelService? svc) =>
+        {
+            if (svc is null)
+                return Results.Problem("Config service is not configured.");
+            await svc.UpdateOrchestratorSettingsAsync(update);
+            return Results.Ok(new { saved = true });
+        });
+
+        // ── Worker settings ─────────────────────────────────────────────────
+
+        // Get workers
+        app.MapGet("/api/config/workers", ([FromServices] HiveConfigFile? config) =>
+        {
+            if (config is null)
+                return Results.NotFound(new { error = "Config repo not configured." });
+            return Results.Ok(config.Workers.ToDictionary(
+                kv => kv.Key,
+                kv => new { model = kv.Value.Model, premiumModel = kv.Value.PremiumModel, contextWindow = kv.Value.ContextWindow }));
+        });
+
+        // Update worker context windows
+        app.MapMethods("/api/config/workers", ["PATCH"], async (
+            Dictionary<string, int> contextWindows,
+            [FromServices] ConfigModelService? svc) =>
+        {
+            if (svc is null)
+                return Results.Problem("Config service is not configured.");
+            await svc.UpdateWorkerContextWindowsAsync(contextWindows);
+            return Results.Ok(new { saved = true });
+        });
+
+        // ── Composer settings ───────────────────────────────────────────────
+
+        // Get composer settings
+        app.MapGet("/api/config/composer", ([FromServices] HiveConfigFile? config) =>
+        {
+            if (config is null)
+                return Results.NotFound(new { error = "Config repo not configured." });
+            return Results.Ok(config.Composer);
+        });
+
+        // Update composer settings
+        app.MapMethods("/api/config/composer", ["PATCH"], async (
+            ComposerSettingsUpdate update,
+            [FromServices] ConfigModelService? svc) =>
+        {
+            if (svc is null)
+                return Results.Problem("Config service is not configured.");
+            await svc.UpdateComposerSettingsAsync(update.ContextWindow, update.MaxSteps);
+            return Results.Ok(new { saved = true });
         });
     }
 }

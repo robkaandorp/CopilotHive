@@ -396,6 +396,253 @@ else
                 </div>
             </div>
         }
+        else if (_activeTab == RepositoriesTabName)
+        {
+            <div style="margin-top:1rem">
+                <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1.25rem">
+                    <button class="approve-btn" @onclick="() => { _showAddRepoForm = !_showAddRepoForm; _repoError = null; _repoSuccess = null; }">
+                        ➕ Add Repository
+                    </button>
+                    @if (_repoSuccess is not null)
+                    {
+                        <span style="color:var(--accent);font-size:0.9rem">@_repoSuccess</span>
+                    }
+                    @if (_repoError is not null)
+                    {
+                        <span style="color:var(--red);font-size:0.9rem">@_repoError</span>
+                    }
+                </div>
+
+                @if (_showAddRepoForm)
+                {
+                    <div style="margin-bottom:1.5rem;padding:1rem 1.25rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;max-width:700px">
+                        <h3 style="font-size:1rem;font-weight:600;margin-bottom:0.75rem">Add Repository</h3>
+                        <div style="display:grid;grid-template-columns:10rem 1fr;gap:0.75rem 1rem;align-items:center">
+                            <label style="color:var(--text-muted);font-size:0.9rem">Name</label>
+                            <input @bind="_newRepoName" placeholder="e.g. my-app"
+                                   style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                            <label style="color:var(--text-muted);font-size:0.9rem">URL</label>
+                            <input @bind="_newRepoUrl" placeholder="https://github.com/org/repo.git"
+                                   style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                            <label style="color:var(--text-muted);font-size:0.9rem">Default Branch</label>
+                            <input @bind="_newRepoDefaultBranch" placeholder="main"
+                                   style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+                        </div>
+                        <div style="margin-top:1rem;display:flex;gap:0.75rem">
+                            <button class="approve-btn" disabled="@_repoSaving" @onclick="AddRepositoryAsync">@(_repoSaving ? "Saving…" : "💾 Save")</button>
+                            <button class="approve-btn" @onclick="() => _showAddRepoForm = false">Cancel</button>
+                        </div>
+                    </div>
+                }
+
+                @if (_reposLoading)
+                {
+                    <p style="color:var(--text-muted)">Loading repositories…</p>
+                }
+                else if (_repositories.Count == 0)
+                {
+                    <p style="color:var(--text-muted);font-style:italic">No repositories configured yet. Click "Add Repository" to add one.</p>
+                }
+                else
+                {
+                    <table style="border-collapse:collapse;width:100%;max-width:900px">
+                        <thead>
+                            <tr style="border-bottom:1px solid var(--border)">
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Name</th>
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">URL</th>
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Default Branch</th>
+                                <th style="text-align:right;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var r in _repositories)
+                            {
+                                <tr style="border-bottom:1px solid var(--border)">
+                                    @if (_editingRepoName == r.Name)
+                                    {
+                                        <td style="padding:0.5rem;font-size:0.9rem">@r.Name</td>
+                                        <td style="padding:0.5rem">
+                                            <input @bind="_editRepoUrl"
+                                                   style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:100%" />
+                                        </td>
+                                        <td style="padding:0.5rem">
+                                            <input @bind="_editRepoDefaultBranch"
+                                                   style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem" />
+                                        </td>
+                                        <td style="padding:0.5rem;text-align:right">
+                                            <button class="approve-btn" disabled="@_repoSaving" @onclick="SaveEditRepoAsync">💾 Save</button>
+                                            <button class="approve-btn" @onclick="CancelEditRepo">Cancel</button>
+                                        </td>
+                                    }
+                                    else
+                                    {
+                                        <td style="padding:0.5rem;font-size:0.9rem">@r.Name</td>
+                                        <td style="padding:0.5rem;font-size:0.9rem">@r.Url</td>
+                                        <td style="padding:0.5rem;font-size:0.9rem">@r.DefaultBranch</td>
+                                        <td style="padding:0.5rem;text-align:right">
+                                            <button class="approve-btn" @onclick="() => StartEditRepo(r)">✏️ Edit</button>
+                                            <button class="approve-btn" style="color:var(--red)" @onclick="() => RemoveRepositoryAsync(r.Name)">🗑️ Remove</button>
+                                        </td>
+                                    }
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                }
+            </div>
+        }
+        else if (_activeTab == OrchestratorTabName)
+        {
+            <div style="margin-top:1rem">
+                @if (_orchestratorLoading)
+                {
+                    <p style="color:var(--text-muted)">Loading orchestrator settings…</p>
+                }
+                else
+                {
+                    <div style="display:grid;grid-template-columns:14rem 1fr;gap:0.75rem 1rem;align-items:center;max-width:600px">
+                        <label style="color:var(--text-muted);font-size:0.9rem">Max Iterations</label>
+                        <input type="number" min="1" @bind="_orchMaxIterations"
+                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                        <label style="color:var(--text-muted);font-size:0.9rem">Max Retries Per Task</label>
+                        <input type="number" min="0" @bind="_orchMaxRetriesPerTask"
+                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                        <label style="color:var(--text-muted);font-size:0.9rem">Max Parallel Goals</label>
+                        <input type="number" min="1" @bind="_orchMaxParallelGoals"
+                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                        <label style="color:var(--text-muted);font-size:0.9rem">Always Improve</label>
+                        <input type="checkbox" @bind="_orchAlwaysImprove" style="width:1.1rem;height:1.1rem;cursor:pointer" />
+
+                        <label style="color:var(--text-muted);font-size:0.9rem">Verbose Logging</label>
+                        <input type="checkbox" @bind="_orchVerboseLogging" style="width:1.1rem;height:1.1rem;cursor:pointer" />
+
+                        <label style="color:var(--text-muted);font-size:0.9rem">Brain Context Window</label>
+                        <input type="number" @bind="_orchBrainContextWindow"
+                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                        <label style="color:var(--text-muted);font-size:0.9rem">Brain Max Steps</label>
+                        <input type="number" @bind="_orchBrainMaxSteps"
+                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                        <label style="color:var(--text-muted);font-size:0.9rem">Worker Context Window</label>
+                        <input type="number" @bind="_orchWorkerContextWindow"
+                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                        <label style="color:var(--text-muted);font-size:0.9rem">Branch Cleanup Delay Hours</label>
+                        <input type="number" min="0" @bind="_orchBranchCleanupDelayHours"
+                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+                    </div>
+
+                    <div style="margin-top:1.25rem;display:flex;align-items:center;gap:1rem">
+                        <button class="approve-btn" disabled="@_orchestratorSaving" @onclick="SaveOrchestratorAsync">
+                            @(_orchestratorSaving ? "Saving…" : "💾 Save")
+                        </button>
+                        @if (_orchestratorSaveSuccess is not null)
+                        {
+                            <span style="color:var(--accent);font-size:0.9rem">@_orchestratorSaveSuccess</span>
+                        }
+                        @if (_orchestratorSaveError is not null)
+                        {
+                            <span style="color:var(--red);font-size:0.9rem">@_orchestratorSaveError</span>
+                        }
+                    </div>
+                }
+            </div>
+        }
+        else if (_activeTab == WorkersTabName)
+        {
+            <div style="margin-top:1rem">
+                @if (_workersLoading)
+                {
+                    <p style="color:var(--text-muted)">Loading worker settings…</p>
+                }
+                else
+                {
+                    <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:1rem">
+                        Per-role context window overrides (in tokens). A value of <strong>0</strong> means "use orchestrator default".
+                    </p>
+                    <div style="display:grid;grid-template-columns:14rem 1fr;gap:0.75rem 1rem;align-items:center;max-width:600px">
+                        <label style="color:var(--text-muted);font-size:0.9rem">Coder</label>
+                        <input type="number" min="0" @bind="_coderContextWindow"
+                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                        <label style="color:var(--text-muted);font-size:0.9rem">Tester</label>
+                        <input type="number" min="0" @bind="_testerContextWindow"
+                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                        <label style="color:var(--text-muted);font-size:0.9rem">Reviewer</label>
+                        <input type="number" min="0" @bind="_reviewerContextWindow"
+                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                        <label style="color:var(--text-muted);font-size:0.9rem">Doc Writer</label>
+                        <input type="number" min="0" @bind="_docwriterContextWindow"
+                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                        <label style="color:var(--text-muted);font-size:0.9rem">Improver</label>
+                        <input type="number" min="0" @bind="_improverContextWindow"
+                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+                    </div>
+
+                    <div style="margin-top:1.25rem;display:flex;align-items:center;gap:1rem">
+                        <button class="approve-btn" disabled="@_workersSaving" @onclick="SaveWorkerContextWindowsAsync">
+                            @(_workersSaving ? "Saving…" : "💾 Save")
+                        </button>
+                        @if (_workersSaveSuccess is not null)
+                        {
+                            <span style="color:var(--accent);font-size:0.9rem">@_workersSaveSuccess</span>
+                        }
+                        @if (_workersSaveError is not null)
+                        {
+                            <span style="color:var(--red);font-size:0.9rem">@_workersSaveError</span>
+                        }
+                    </div>
+                }
+            </div>
+        }
+        else if (_activeTab == ComposerTabName)
+        {
+            <div style="margin-top:1rem">
+                @if (_composerLoading)
+                {
+                    <p style="color:var(--text-muted)">Loading composer settings…</p>
+                }
+                else
+                {
+                    @if (_composerData is null)
+                    {
+                        <p style="color:var(--text-muted);font-style:italic;margin-bottom:1rem">Composer is not configured yet. Set values below and save to create it.</p>
+                    }
+                    <div style="display:grid;grid-template-columns:14rem 1fr;gap:0.75rem 1rem;align-items:center;max-width:600px">
+                        <label style="color:var(--text-muted);font-size:0.9rem">Context Window</label>
+                        <input type="number" @bind="_composerContextWindow"
+                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                        <label style="color:var(--text-muted);font-size:0.9rem">Max Steps</label>
+                        <input type="number" @bind="_composerMaxSteps"
+                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+                    </div>
+
+                    <div style="margin-top:1.25rem;display:flex;align-items:center;gap:1rem">
+                        <button class="approve-btn" disabled="@_composerSaving" @onclick="SaveComposerAsync">
+                            @(_composerSaving ? "Saving…" : "💾 Save")
+                        </button>
+                        @if (_composerSaveSuccess is not null)
+                        {
+                            <span style="color:var(--accent);font-size:0.9rem">@_composerSaveSuccess</span>
+                        }
+                        @if (_composerSaveError is not null)
+                        {
+                            <span style="color:var(--red);font-size:0.9rem">@_composerSaveError</span>
+                        }
+                    </div>
+                }
+            </div>
+        }
         else if (ActiveTab?.EndsWith(".md") == true)
         {
             <div class="config-markdown">
@@ -417,6 +664,10 @@ else
     private const string ModelsTabName = "Models";
     private const string AvailableModelsTabName = "Available Models";
     private const string BackupTabName = "Backup";
+    private const string RepositoriesTabName = "Repositories";
+    private const string OrchestratorTabName = "Orchestrator";
+    private const string WorkersTabName = "Workers";
+    private const string ComposerTabName = "Composer";
 
     private sealed record ModelConfigResponse(
         [property: JsonPropertyName("orchestrator")]    string? Orchestrator,
@@ -445,6 +696,33 @@ else
         [property: JsonPropertyName("fileName")] string FileName,
         [property: JsonPropertyName("sizeBytes")] long SizeBytes,
         [property: JsonPropertyName("createdAt")] DateTime CreatedAt);
+
+    private sealed record RepositoryDto(
+        [property: JsonPropertyName("name")] string Name,
+        [property: JsonPropertyName("url")] string Url,
+        [property: JsonPropertyName("defaultBranch")] string DefaultBranch);
+
+    private sealed record OrchestratorConfigResponse(
+        [property: JsonPropertyName("model")] string? Model,
+        [property: JsonPropertyName("maxIterations")] int MaxIterations,
+        [property: JsonPropertyName("maxRetriesPerTask")] int MaxRetriesPerTask,
+        [property: JsonPropertyName("maxParallelGoals")] int MaxParallelGoals,
+        [property: JsonPropertyName("alwaysImprove")] bool AlwaysImprove,
+        [property: JsonPropertyName("verboseLogging")] bool VerboseLogging,
+        [property: JsonPropertyName("brainContextWindow")] int BrainContextWindow,
+        [property: JsonPropertyName("brainMaxSteps")] int BrainMaxSteps,
+        [property: JsonPropertyName("workerContextWindow")] int WorkerContextWindow,
+        [property: JsonPropertyName("branchCleanupDelayHours")] int BranchCleanupDelayHours);
+
+    private sealed record WorkerResponseDto(
+        [property: JsonPropertyName("model")] string? Model,
+        [property: JsonPropertyName("premiumModel")] string? PremiumModel,
+        [property: JsonPropertyName("contextWindow")] int ContextWindow);
+
+    private sealed record ComposerConfigResponse(
+        [property: JsonPropertyName("model")] string? Model,
+        [property: JsonPropertyName("contextWindow")] int ContextWindow,
+        [property: JsonPropertyName("maxSteps")] int MaxSteps);
 
     private bool _loading = true;
     private string? _error;
@@ -494,6 +772,57 @@ else
     private string? _availableModelsError;
     private string? _availableModelsSuccess;
 
+    // Repositories tab
+    private List<RepositoryDto> _repositories = [];
+    private bool _reposLoading;
+    private bool _repoSaving;
+    private string? _repoError;
+    private string? _repoSuccess;
+    private bool _showAddRepoForm;
+    private string _newRepoName = "";
+    private string _newRepoUrl = "";
+    private string _newRepoDefaultBranch = "main";
+    private string? _editingRepoName;
+    private string _editRepoUrl = "";
+    private string _editRepoDefaultBranch = "main";
+
+    // Orchestrator tab
+    private OrchestratorConfigResponse? _orchestratorData;
+    private bool _orchestratorLoading;
+    private bool _orchestratorSaving;
+    private string? _orchestratorSaveError;
+    private string? _orchestratorSaveSuccess;
+    private int _orchMaxIterations;
+    private int _orchMaxRetriesPerTask;
+    private int _orchMaxParallelGoals;
+    private bool _orchAlwaysImprove;
+    private bool _orchVerboseLogging;
+    private int _orchBrainContextWindow;
+    private int _orchBrainMaxSteps;
+    private int _orchWorkerContextWindow;
+    private int _orchBranchCleanupDelayHours;
+
+    // Workers tab
+    private Dictionary<string, WorkerResponseDto>? _workersData;
+    private bool _workersLoading;
+    private bool _workersSaving;
+    private string? _workersSaveError;
+    private string? _workersSaveSuccess;
+    private int _coderContextWindow;
+    private int _testerContextWindow;
+    private int _reviewerContextWindow;
+    private int _docwriterContextWindow;
+    private int _improverContextWindow;
+
+    // Composer tab
+    private ComposerConfigResponse? _composerData;
+    private bool _composerLoading;
+    private bool _composerSaving;
+    private string? _composerSaveError;
+    private string? _composerSaveSuccess;
+    private int _composerContextWindow;
+    private int _composerMaxSteps;
+
     protected override async Task OnInitializedAsync()
     {
         PageHeader.SetTitle("⚙️ Configuration");
@@ -502,6 +831,10 @@ else
             await LoadFilesAsync();
             await LoadModelsAsync();
             await LoadBackupsAsync();
+            await LoadRepositoriesAsync();
+            await LoadOrchestratorAsync();
+            await LoadWorkersAsync();
+            await LoadComposerAsync();
         }
         catch (Exception ex)
         {
@@ -537,6 +870,10 @@ else
         _tabs.Insert(0, ModelsTabName);
         _tabs.Insert(1, AvailableModelsTabName);
         _tabs.Insert(2, BackupTabName);
+        _tabs.Insert(3, RepositoriesTabName);
+        _tabs.Insert(4, OrchestratorTabName);
+        _tabs.Insert(5, WorkersTabName);
+        _tabs.Insert(6, ComposerTabName);
     }
 
     private async Task LoadModelsAsync()
@@ -687,6 +1024,330 @@ else
             _backupCreating = false;
             StateHasChanged();
         }
+    }
+
+    // ===== Repositories / Orchestrator / Workers / Composer tab methods =====
+
+    private async Task LoadRepositoriesAsync()
+    {
+        _reposLoading = true;
+        try
+        {
+            _repositories = await HttpClient.GetFromJsonAsync<List<RepositoryDto>>("/api/config/repositories") ?? [];
+            _repoError = null;
+        }
+        catch (Exception ex)
+        {
+            _repoError = $"Failed to load repositories: {ex.Message}";
+            _repositories = [];
+        }
+        finally { _reposLoading = false; }
+    }
+
+    private async Task LoadOrchestratorAsync()
+    {
+        _orchestratorLoading = true;
+        try
+        {
+            _orchestratorData = await HttpClient.GetFromJsonAsync<OrchestratorConfigResponse>("/api/config/orchestrator");
+            if (_orchestratorData is not null)
+            {
+                _orchMaxIterations = _orchestratorData.MaxIterations;
+                _orchMaxRetriesPerTask = _orchestratorData.MaxRetriesPerTask;
+                _orchMaxParallelGoals = _orchestratorData.MaxParallelGoals;
+                _orchAlwaysImprove = _orchestratorData.AlwaysImprove;
+                _orchVerboseLogging = _orchestratorData.VerboseLogging;
+                _orchBrainContextWindow = _orchestratorData.BrainContextWindow;
+                _orchBrainMaxSteps = _orchestratorData.BrainMaxSteps;
+                _orchWorkerContextWindow = _orchestratorData.WorkerContextWindow;
+                _orchBranchCleanupDelayHours = _orchestratorData.BranchCleanupDelayHours;
+            }
+        }
+        catch (Exception ex)
+        {
+            _orchestratorSaveError = $"Failed to load orchestrator settings: {ex.Message}";
+        }
+        finally { _orchestratorLoading = false; }
+    }
+
+    private async Task LoadWorkersAsync()
+    {
+        _workersLoading = true;
+        try
+        {
+            _workersData = await HttpClient.GetFromJsonAsync<Dictionary<string, WorkerResponseDto>>("/api/config/workers");
+            if (_workersData is not null)
+            {
+                _coderContextWindow = _workersData.GetValueOrDefault("coder")?.ContextWindow ?? 0;
+                _testerContextWindow = _workersData.GetValueOrDefault("tester")?.ContextWindow ?? 0;
+                _reviewerContextWindow = _workersData.GetValueOrDefault("reviewer")?.ContextWindow ?? 0;
+                _docwriterContextWindow = _workersData.GetValueOrDefault("docwriter")?.ContextWindow ?? 0;
+                _improverContextWindow = _workersData.GetValueOrDefault("improver")?.ContextWindow ?? 0;
+            }
+        }
+        catch (Exception ex)
+        {
+            _workersSaveError = $"Failed to load worker settings: {ex.Message}";
+        }
+        finally { _workersLoading = false; }
+    }
+
+    private async Task LoadComposerAsync()
+    {
+        _composerLoading = true;
+        try
+        {
+            _composerData = await HttpClient.GetFromJsonAsync<ComposerConfigResponse>("/api/config/composer");
+            if (_composerData is not null)
+            {
+                _composerContextWindow = _composerData.ContextWindow;
+                _composerMaxSteps = _composerData.MaxSteps;
+            }
+            else
+            {
+                // Composer not configured yet — show defaults so the user can create it
+                _composerContextWindow = CopilotHive.Constants.DefaultBrainContextWindow;
+                _composerMaxSteps = CopilotHive.Constants.DefaultBrainMaxSteps;
+            }
+        }
+        catch (Exception ex)
+        {
+            _composerSaveError = $"Failed to load composer settings: {ex.Message}";
+        }
+        finally { _composerLoading = false; }
+    }
+
+    private async Task SaveOrchestratorAsync()
+    {
+        _orchestratorSaving = true;
+        _orchestratorSaveSuccess = null;
+        _orchestratorSaveError = null;
+        try
+        {
+            var body = new StringContent(
+                System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    maxIterations = _orchMaxIterations,
+                    maxRetriesPerTask = _orchMaxRetriesPerTask,
+                    maxParallelGoals = _orchMaxParallelGoals,
+                    alwaysImprove = _orchAlwaysImprove,
+                    verboseLogging = _orchVerboseLogging,
+                    brainContextWindow = _orchBrainContextWindow,
+                    brainMaxSteps = _orchBrainMaxSteps,
+                    workerContextWindow = _orchWorkerContextWindow,
+                    branchCleanupDelayHours = _orchBranchCleanupDelayHours,
+                }),
+                System.Text.Encoding.UTF8,
+                "application/json");
+            var response = await HttpClient.PatchAsync("/api/config/orchestrator", body);
+            if (response.IsSuccessStatusCode)
+            {
+                await LoadOrchestratorAsync();
+                _orchestratorSaveSuccess = "✅ Saved successfully";
+                await Task.Delay(3000);
+                _orchestratorSaveSuccess = null;
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                _orchestratorSaveError = $"Save failed ({(int)response.StatusCode}): {error}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _orchestratorSaveError = $"Save failed: {ex.Message}";
+        }
+        finally { _orchestratorSaving = false; StateHasChanged(); }
+    }
+
+    private async Task SaveWorkerContextWindowsAsync()
+    {
+        _workersSaving = true;
+        _workersSaveSuccess = null;
+        _workersSaveError = null;
+        try
+        {
+            var body = new StringContent(
+                System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, int>
+                {
+                    ["coder"] = _coderContextWindow,
+                    ["tester"] = _testerContextWindow,
+                    ["reviewer"] = _reviewerContextWindow,
+                    ["docwriter"] = _docwriterContextWindow,
+                    ["improver"] = _improverContextWindow,
+                }),
+                System.Text.Encoding.UTF8,
+                "application/json");
+            var response = await HttpClient.PatchAsync("/api/config/workers", body);
+            if (response.IsSuccessStatusCode)
+            {
+                await LoadWorkersAsync();
+                _workersSaveSuccess = "✅ Saved successfully";
+                await Task.Delay(3000);
+                _workersSaveSuccess = null;
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                _workersSaveError = $"Save failed ({(int)response.StatusCode}): {error}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _workersSaveError = $"Save failed: {ex.Message}";
+        }
+        finally { _workersSaving = false; StateHasChanged(); }
+    }
+
+    private async Task SaveComposerAsync()
+    {
+        _composerSaving = true;
+        _composerSaveSuccess = null;
+        _composerSaveError = null;
+        try
+        {
+            var body = new StringContent(
+                System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    contextWindow = _composerContextWindow,
+                    maxSteps = _composerMaxSteps,
+                }),
+                System.Text.Encoding.UTF8,
+                "application/json");
+            var response = await HttpClient.PatchAsync("/api/config/composer", body);
+            if (response.IsSuccessStatusCode)
+            {
+                await LoadComposerAsync();
+                _composerSaveSuccess = "✅ Saved successfully";
+                await Task.Delay(3000);
+                _composerSaveSuccess = null;
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                _composerSaveError = $"Save failed ({(int)response.StatusCode}): {error}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _composerSaveError = $"Save failed: {ex.Message}";
+        }
+        finally { _composerSaving = false; StateHasChanged(); }
+    }
+
+    private async Task AddRepositoryAsync()
+    {
+        _repoSaving = true;
+        _repoError = null;
+        _repoSuccess = null;
+        if (string.IsNullOrWhiteSpace(_newRepoName) || string.IsNullOrWhiteSpace(_newRepoUrl))
+        {
+            _repoError = "Name and URL are required.";
+            _repoSaving = false;
+            return;
+        }
+        try
+        {
+            var branch = string.IsNullOrWhiteSpace(_newRepoDefaultBranch) ? "main" : _newRepoDefaultBranch;
+            var body = new StringContent(
+                System.Text.Json.JsonSerializer.Serialize(new { name = _newRepoName, url = _newRepoUrl, defaultBranch = branch }),
+                System.Text.Encoding.UTF8, "application/json");
+            var response = await HttpClient.PostAsync("/api/config/repositories", body);
+            if (response.IsSuccessStatusCode)
+            {
+                _newRepoName = ""; _newRepoUrl = ""; _newRepoDefaultBranch = "main";
+                _showAddRepoForm = false;
+                await LoadRepositoriesAsync();
+                _repoSuccess = "✅ Repository added and cloned";
+                await Task.Delay(3000);
+                _repoSuccess = null;
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                _repoError = $"Add failed ({(int)response.StatusCode}): {error}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _repoError = $"Add failed: {ex.Message}";
+        }
+        finally { _repoSaving = false; StateHasChanged(); }
+    }
+
+    private void StartEditRepo(RepositoryDto repo)
+    {
+        _editingRepoName = repo.Name;
+        _editRepoUrl = repo.Url;
+        _editRepoDefaultBranch = repo.DefaultBranch;
+        _repoError = null; _repoSuccess = null;
+    }
+
+    private void CancelEditRepo()
+    {
+        _editingRepoName = null;
+    }
+
+    private async Task SaveEditRepoAsync()
+    {
+        if (_editingRepoName is null) return;
+        _repoSaving = true;
+        _repoError = null;
+        _repoSuccess = null;
+        try
+        {
+            var branch = string.IsNullOrWhiteSpace(_editRepoDefaultBranch) ? "main" : _editRepoDefaultBranch;
+            var body = new StringContent(
+                System.Text.Json.JsonSerializer.Serialize(new { name = _editingRepoName, url = _editRepoUrl, defaultBranch = branch }),
+                System.Text.Encoding.UTF8, "application/json");
+            var response = await HttpClient.PutAsync($"/api/config/repositories/{Uri.EscapeDataString(_editingRepoName)}", body);
+            if (response.IsSuccessStatusCode)
+            {
+                _editingRepoName = null;
+                await LoadRepositoriesAsync();
+                _repoSuccess = "✅ Repository updated";
+                await Task.Delay(3000);
+                _repoSuccess = null;
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                _repoError = $"Update failed ({(int)response.StatusCode}): {error}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _repoError = $"Update failed: {ex.Message}";
+        }
+        finally { _repoSaving = false; StateHasChanged(); }
+    }
+
+    private async Task RemoveRepositoryAsync(string name)
+    {
+        _repoError = null; _repoSuccess = null;
+        var confirmed = await JS.InvokeAsync<bool>("confirm", $"Remove repository '{name}'?");
+        if (!confirmed) return;
+        try
+        {
+            var response = await HttpClient.DeleteAsync($"/api/config/repositories/{Uri.EscapeDataString(name)}");
+            if (response.IsSuccessStatusCode)
+            {
+                await LoadRepositoriesAsync();
+                _repoSuccess = "✅ Repository removed";
+                await Task.Delay(3000);
+                _repoSuccess = null;
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                _repoError = $"Remove failed ({(int)response.StatusCode}): {error}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _repoError = $"Remove failed: {ex.Message}";
+        }
+        finally { StateHasChanged(); }
     }
 
     // ===== Available Models tab methods =====

@@ -78,4 +78,122 @@ public class ConfigEndpointsTests
         Assert.NotEqual(HttpStatusCode.NotFound, response.StatusCode);
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
     }
+
+    // ── GET /api/config/repositories ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetRepositories_Endpoint_IsRouted()
+    {
+        var response = await _client.GetAsync("/api/config/repositories", TestContext.Current.CancellationToken);
+
+        // Route exists; returns NotFound (404) when HiveConfigFile is not registered (no config repo).
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    // ── POST /api/config/repositories ───────────────────────────────────────────
+
+    [Fact]
+    public async Task PostRepository_Endpoint_IsRouted()
+    {
+        var response = await _client.PostAsJsonAsync(
+            "/api/config/repositories",
+            new { name = "test-repo", url = "https://github.com/org/repo.git", defaultBranch = "main" },
+            TestContext.Current.CancellationToken);
+
+        Assert.NotEqual(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+    }
+
+    // ── PUT /api/config/repositories/{name} ──────────────────────────────────────
+
+    [Fact]
+    public async Task PutRepository_Endpoint_IsRouted()
+    {
+        var response = await _client.PutAsJsonAsync(
+            "/api/config/repositories/test-repo",
+            new { name = "test-repo", url = "https://github.com/org/repo.git", defaultBranch = "main" },
+            TestContext.Current.CancellationToken);
+
+        Assert.NotEqual(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+    }
+
+    // ── DELETE /api/config/repositories/{name} ───────────────────────────────────
+
+    [Fact]
+    public async Task DeleteRepository_Endpoint_IsRouted()
+    {
+        var response = await _client.DeleteAsync(
+            "/api/config/repositories/test-repo",
+            TestContext.Current.CancellationToken);
+
+        Assert.NotEqual(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+    }
+
+    // ── GET /api/config/orchestrator ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetOrchestrator_Endpoint_IsRouted()
+    {
+        var response = await _client.GetAsync("/api/config/orchestrator", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    // ── PATCH /api/config/orchestrator ───────────────────────────────────────────
+
+    [Fact]
+    public async Task PatchOrchestrator_Endpoint_IsRouted()
+    {
+        var content = new StringContent("{\"maxIterations\":10}", System.Text.Encoding.UTF8, "application/json");
+        var response = await _client.PatchAsync("/api/config/orchestrator", content, TestContext.Current.CancellationToken);
+
+        Assert.NotEqual(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+    }
+
+    // ── GET /api/config/workers ─────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetWorkers_Endpoint_IsRouted()
+    {
+        var response = await _client.GetAsync("/api/config/workers", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    // ── PATCH /api/config/workers ───────────────────────────────────────────────
+
+    [Fact]
+    public async Task PatchWorkers_Endpoint_IsRouted()
+    {
+        var content = new StringContent("{\"coder\":50000}", System.Text.Encoding.UTF8, "application/json");
+        var response = await _client.PatchAsync("/api/config/workers", content, TestContext.Current.CancellationToken);
+
+        Assert.NotEqual(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+    }
+
+    // ── GET /api/config/composer ────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetComposer_Endpoint_IsRouted()
+    {
+        var response = await _client.GetAsync("/api/config/composer", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    // ── PATCH /api/config/composer ──────────────────────────────────────────────
+
+    [Fact]
+    public async Task PatchComposer_Endpoint_IsRouted()
+    {
+        var content = new StringContent("{\"contextWindow\":200000,\"maxSteps\":50}", System.Text.Encoding.UTF8, "application/json");
+        var response = await _client.PatchAsync("/api/config/composer", content, TestContext.Current.CancellationToken);
+
+        Assert.NotEqual(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+    }
 }
