@@ -1,3 +1,33 @@
+## [0.12.0] - 2026-06-25
+
+### Added
+
+- **SharpCoder 0.10.0 with Chunked Compaction** — SharpCoder upgraded from 0.9.0 to 0.10.0, adding `AgentOptions.CompactionMaxTokens` for chunked compaction. When old messages exceed the compaction model's context window, they are split into token-budgeted chunks, each summarized separately, and concatenated. CopilotHive wires `CompactionMaxTokens` from `HiveConfigFile.TryGetContextWindowForModel` in DistributedBrain, Composer, and workers (via `task.Metadata["compaction_max_tokens"]`). (`copilothive-bump-sharpcoder-0-10-0`)
+
+- **Pre-Migration Database Backups** — Both `GoalStore` and `PipelineStore` now create timestamped SQLite backups via `SqliteConnection.BackupDatabase()` before any schema changes. Backups stored in `backups/` subdirectory, last 10 retained. In-memory databases skip backup. (`copilothive-db-backup-before-migration`)
+
+- **Entity Framework Core Persistence** — CopilotHive's persistence layer migrated from raw ADO.NET (hand-written SQL) to EF Core with SQLite. A single `CopilotHiveDbContext` manages all tables (goals, releases, iterations, pipelines, conversations, task_mappings) in a single `copilothive.db` file. `GoalStore` and `PipelineStore` both use `IDbContextFactory<CopilotHiveDbContext>`. The legacy `goals.db` is automatically migrated to `copilothive.db` on first startup. (`copilothive-ef-core-dbcontext`, `copilothive-fix-goalstore-abstraction`, `copilothive-rewrite-goalstore-ef-core`, `copilothive-rewrite-pipelinestore-ef-core`)
+
+- **EF Core Schema Reconciliation** — Startup now reconciles the database schema by creating missing tables via `EnsureSchemaUpToDate` (using `GenerateCreateScript()` + `CREATE TABLE IF NOT EXISTS`) and applying pending EF Core migrations via `Database.MigrateAsync()`. This makes upgrades safe on existing databases and enables restoring backups from older versions. (`copilothive-fix-schema-evolution-crash`, `copilothive-ef-core-migrations`)
+
+- **Backup & Restore** — `BackupService` creates tar.gz archives containing the database (`copilothive.db`), Brain session files (`brain-master.json`, `brain-goal-*.json`), Composer session (`composer-session.json`), metrics, and data protection keys. Backups are downloadable via REST API (`POST /api/backup`, `GET /api/backup`, `GET /api/backup/{filename}`) and a "Backup" tab on the Configuration dashboard page. Restore via `POST /api/backup/restore` creates a safety backup before replacing files. Old backups pruned to last 10. (`copilothive-backup-feature`, `copilothive-restore-feature`)
+
+- **Brain Worker Context Boundary** — The Brain's system prompt now explicitly states that workers have per-role sessions and cannot see other roles' output. The Brain must include specific rejection reasons and test failure details in worker prompts — never "see previous output". (`copilothive-brain-worker-context-prompt`)
+
+- **Brain Branch Visibility** — The Brain's system prompt now explains that its file tools see the base branch, not the worker's feature branch. Worker changes are NOT lost on retry — the Brain should plan fixes, not full reimplementations. (`copilothive-brain-branch-visibility`)
+
+### Changed
+
+- **Network Timeout Fix** — `OpenAIClientOptions.NetworkTimeout` set to 30 minutes in `ChatClientFactory.CreateCopilotClient`, preventing `TaskCanceledException` from the default 100-second SSE stream read timeout during long streaming LLM calls. (`copilothive-fix-network-timeout`)
+
+- **Pipeline Driver Retry Context** — `HandleNewIterationAsync` now includes actual tester/reviewer output from the previous iteration's `PhaseLog` in the `additionalContext`, instead of the vague "Test failures: see previous output." message. Output truncated to 3000 chars. (`copilothive-fix-pipeline-driver-context`)
+
+- **Code Quality: Split Program.cs** — REST endpoint definitions extracted to `ApiEndpoints.cs`, database migration helpers to `DatabaseMigration.cs`. `Program.cs` now contains only DI registration and startup orchestration. (`copilothive-split-program-cs`)
+
+- **Code Quality: Split HiveConfigFile.cs** — Config section classes (`RepositoryConfig`, `WorkerConfig`, `OrchestratorConfig`, `ModelsConfig`, `ComposerConfig`) extracted into separate files. (`copilothive-split-hiveconfigfile`)
+
+- **Code Quality: Split DashboardStateService** — Progress report methods extracted into `ProgressReportService`. (`copilothive-split-dashboard-state-service`)
+
 ## [Unreleased]
 
 ## [0.11.0] - 2026-04-14
