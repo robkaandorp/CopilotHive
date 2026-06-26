@@ -74,6 +74,7 @@ public static class ConfigHub
         {
             if (svc is null)
                 return Results.Problem("Config service is not configured.");
+            name = Uri.UnescapeDataString(name);
             try
             {
                 await svc.UpdateAvailableModelAsync(name, req.ContextWindow, req.ReasoningEffort);
@@ -90,6 +91,7 @@ public static class ConfigHub
         {
             if (svc is null)
                 return Results.Problem("Config service is not configured.");
+            name = Uri.UnescapeDataString(name);
             var removed = await svc.RemoveAvailableModelAsync(name);
             return removed ? Results.Ok(new { removed = true }) : Results.NotFound(new { error = $"Model '{name}' not found." });
         });

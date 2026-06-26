@@ -349,6 +349,81 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.Equal("high", model.ReasoningEffort);
     }
 
+    // ── AddAvailableModelAsync suffix-stripping tests ─────────────────────────
+
+    [Fact]
+    public async Task AddAvailableModelAsync_StripsKnownSuffix_FromName()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [] }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddAvailableModelAsync("copilot/claude-sonnet-4.6:high", null, null, TestContext.Current.CancellationToken);
+
+        var model = Assert.Single(config.Models!.AvailableModels!);
+        Assert.Equal("copilot/claude-sonnet-4.6", model.Name);
+        Assert.Equal("high", model.ReasoningEffort);
+    }
+
+    [Fact]
+    public async Task AddAvailableModelAsync_UnknownSuffix_LeavesNameUntouched()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [] }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddAvailableModelAsync("model:custom", null, null, TestContext.Current.CancellationToken);
+
+        var model = Assert.Single(config.Models!.AvailableModels!);
+        Assert.Equal("model:custom", model.Name);
+        Assert.Null(model.ReasoningEffort);
+    }
+
+    [Fact]
+    public async Task AddAvailableModelAsync_ExplicitReasoningEffort_TakesPrecedenceOverSuffix()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [] }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddAvailableModelAsync("model:high", null, "low", TestContext.Current.CancellationToken);
+
+        var model = Assert.Single(config.Models!.AvailableModels!);
+        Assert.Equal("model", model.Name);
+        Assert.Equal("low", model.ReasoningEffort);
+    }
+
+    [Fact]
+    public async Task AddAvailableModelAsync_NoSuffix_NoReasoningEffort()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [] }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddAvailableModelAsync("plain-model", 100000, null, TestContext.Current.CancellationToken);
+
+        var model = Assert.Single(config.Models!.AvailableModels!);
+        Assert.Equal("plain-model", model.Name);
+        Assert.Null(model.ReasoningEffort);
+        Assert.Equal(100000, model.ContextWindow);
+    }
+
     [Fact]
     public async Task AddAvailableModelAsync_InitializesModelsConfigIfNull()
     {

@@ -147,6 +147,80 @@ public class AvailableModelsEndpointTests : IDisposable
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
+
+    // ── PUT /api/config/available-models/{name} — URL-encoded slash ──────────
+
+    [Fact]
+    public async Task PutAvailableModel_UrlEncodedSlash_Returns200()
+    {
+        // Add a model with a slash in the name first
+        await _client.PostAsJsonAsync(
+            "/api/config/available-models",
+            new { name = "copilot/gemini-3.5-flash", contextWindow = 100000, reasoningEffort = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        // PUT with URL-encoded slash (%2F) — the endpoint must decode it back to "/"
+        var response = await _client.PutAsJsonAsync(
+            "/api/config/available-models/copilot%2Fgemini-3.5-flash",
+            new { name = "copilot/gemini-3.5-flash", contextWindow = 200000, reasoningEffort = "high" },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    // ── DELETE /api/config/available-models/{name} — URL-encoded slash ────────
+
+    [Fact]
+    public async Task DeleteAvailableModel_UrlEncodedSlash_Returns200()
+    {
+        // Add a model with a slash in the name first
+        await _client.PostAsJsonAsync(
+            "/api/config/available-models",
+            new { name = "copilot/ollama-model", contextWindow = (int?)null, reasoningEffort = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        // DELETE with URL-encoded slash (%2F) — the endpoint must decode it back to "/"
+        var response = await _client.DeleteAsync(
+            "/api/config/available-models/copilot%2Follama-model",
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    // ── POST /api/config/available-models — suffix stripped via endpoint ─────
+
+    [Fact]
+    public async Task PostAvailableModel_WithSuffix_StripsAndStoresReasoningEffort()
+    {
+        // POST a model whose name carries a known reasoning suffix
+        var postResponse = await _client.PostAsJsonAsync(
+            "/api/config/available-models",
+            new { name = "test-model:high", contextWindow = 128000, reasoningEffort = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, postResponse.StatusCode);
+
+        // GET /api/config/models and verify the suffix was stripped
+        var getResponse = await _client.GetAsync("/api/config/models", TestContext.Current.CancellationToken);
+        getResponse.EnsureSuccessStatusCode();
+        using var doc = await System.Text.Json.JsonDocument.ParseAsync(
+            await getResponse.Content.ReadAsStreamAsync(TestContext.Current.CancellationToken),
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        var availableModels = doc.RootElement.GetProperty("availableModels");
+        var found = false;
+        foreach (var entry in availableModels.EnumerateArray())
+        {
+            var entryName = entry.GetProperty("name").GetString();
+            if (entryName == "test-model")
+            {
+                Assert.Equal("high", entry.GetProperty("reasoningEffort").GetString());
+                found = true;
+                break;
+            }
+        }
+        Assert.True(found, "Expected a model with Name='test-model' and ReasoningEffort='high' in availableModels");
+    }
 }
 
 /// <summary>

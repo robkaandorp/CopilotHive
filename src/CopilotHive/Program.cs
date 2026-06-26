@@ -336,6 +336,43 @@ public sealed class Program
                         hiveConfigFile.Repositories.Count, hiveConfigFile.Workers.Count);
                     if (hiveConfigFile.Orchestrator.VerboseLogging)
                         logger.LogDebug("Verbose logging enabled (Debug level)");
+
+                    // One-time migration: split reasoning suffixes (e.g. ":high") out of
+                    // available model names into the ReasoningEffort field. Idempotent —
+                    // after the first run names no longer carry a known suffix.
+                    var knownReasoningLevels = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        "none", "low", "medium", "high", "extra_high"
+                    };
+                    var corrected = 0;
+                    foreach (var entry in hiveConfigFile.Models?.AvailableModels ?? [])
+                    {
+                        var entryName = entry.Name;
+                        if (string.IsNullOrEmpty(entryName))
+                            continue;
+                        var lastColon = entryName.LastIndexOf(':');
+                        if (lastColon > 0 && lastColon < entryName.Length - 1)
+                        {
+                            var suffix = entryName.Substring(lastColon + 1);
+                            if (knownReasoningLevels.Contains(suffix))
+                            {
+                                entry.Name = entryName.Substring(0, lastColon);
+                                if (string.IsNullOrEmpty(entry.ReasoningEffort))
+                                    entry.ReasoningEffort = suffix;
+                                corrected++;
+                            }
+                        }
+                    }
+                    if (corrected > 0 && configRepo is not null)
+                    {
+                        logger.LogInformation(
+                            "Migrating {Count} available model(s): stripped reasoning suffix into ReasoningEffort field",
+                            corrected);
+                        await configRepo.WriteConfigAsync(hiveConfigFile);
+                        await configRepo.CommitFileAsync(
+                            "hive-config.yaml",
+                            "chore: migrate reasoning suffixes out of available model names");
+                    }
                 }
             }
 

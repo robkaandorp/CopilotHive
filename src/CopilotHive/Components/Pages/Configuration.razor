@@ -294,36 +294,38 @@ else
                 {
                     <div style="position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:1000"
                          @onclick="() => _showDiscoveryModal = false">
-                        <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.5rem;max-width:700px;width:90%;max-height:80vh;overflow-y:auto"
+                        <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.5rem;max-width:700px;width:90%;max-height:80vh;display:flex;flex-direction:column"
                              @onclick:stopPropagation="true">
                             <h3 style="font-size:1.1rem;font-weight:600;margin-bottom:1rem">Discovered Provider Models</h3>
-                            @if (_discoveredModels.Count == 0)
-                            {
-                                <p style="color:var(--text-muted);font-style:italic">No models discovered. Check provider credentials (GH_TOKEN, OLLAMA_API_KEY/OLLAMA_URL).</p>
-                            }
-                            else
-                            {
-                                <div style="display:flex;flex-direction:column;gap:0.4rem;margin-bottom:1rem">
-                                    @foreach (var dm in _discoveredModels)
-                                    {
-                                        <label style="display:flex;align-items:center;gap:0.5rem;padding:0.4rem 0.5rem;border:1px solid var(--border);border-radius:6px;cursor:pointer">
-                                            <input type="checkbox"
-                                                   checked="@_selectedDiscoveredIds.Contains(dm.Id)"
-                                                   @onchange="(e) => ToggleDiscoveredSelection(dm.Id, (bool)(e.Value ?? false))" />
-                                            <span style="font-size:0.9rem;flex:1">@dm.Name</span>
-                                            <span style="font-size:0.8rem;color:var(--text-muted)">@dm.Id</span>
-                                            @if (dm.Vendor is not null)
-                                            {
-                                                <span style="font-size:0.75rem;color:var(--text-muted)">@dm.Vendor</span>
-                                            }
-                                            @if (dm.ContextWindow is not null)
-                                            {
-                                                <span style="font-size:0.75rem;color:var(--text-muted)">@dm.ContextWindow.Value.ToString("N0") tok</span>
-                                            }
-                                        </label>
-                                    }
-                                </div>
-                            }
+                            <div style="flex:1;overflow-y:auto;max-height:60vh">
+                                @if (_discoveredModels.Count == 0)
+                                {
+                                    <p style="color:var(--text-muted);font-style:italic">No models discovered. Check provider credentials (GH_TOKEN, OLLAMA_API_KEY/OLLAMA_URL).</p>
+                                }
+                                else
+                                {
+                                    <div style="display:flex;flex-direction:column;gap:0.4rem;margin-bottom:1rem">
+                                        @foreach (var dm in _discoveredModels)
+                                        {
+                                            <label style="display:flex;align-items:center;gap:0.5rem;padding:0.4rem 0.5rem;border:1px solid var(--border);border-radius:6px;cursor:pointer">
+                                                <input type="checkbox"
+                                                       checked="@_selectedDiscoveredIds.Contains(dm.Id)"
+                                                       @onchange="(e) => ToggleDiscoveredSelection(dm.Id, (bool)(e.Value ?? false))" />
+                                                <span style="font-size:0.9rem;flex:1">@dm.Name</span>
+                                                <span style="font-size:0.8rem;color:var(--text-muted)">@dm.Id</span>
+                                                @if (dm.Vendor is not null)
+                                                {
+                                                    <span style="font-size:0.75rem;color:var(--text-muted)">@dm.Vendor</span>
+                                                }
+                                                @if (dm.ContextWindow is not null)
+                                                {
+                                                    <span style="font-size:0.75rem;color:var(--text-muted)">@dm.ContextWindow.Value.ToString("N0") tok</span>
+                                                }
+                                            </label>
+                                        }
+                                    </div>
+                                }
+                            </div>
                             <div style="display:flex;gap:0.75rem;justify-content:flex-end">
                                 <button class="approve-btn" disabled="@(_selectedDiscoveredIds.Count == 0)" @onclick="AddSelectedDiscoveredAsync">➕ Add Selected</button>
                                 <button class="approve-btn" @onclick="() => _showDiscoveryModal = false">Close</button>
@@ -1368,6 +1370,7 @@ else
         try
         {
             _discoveredModels = await HttpClient.GetFromJsonAsync<List<DiscoveredModelDto>>("/api/config/models/discover") ?? [];
+            _discoveredModels = _discoveredModels.OrderBy(m => m.Name ?? m.Id, StringComparer.OrdinalIgnoreCase).ToList();
             _selectedDiscoveredIds.Clear();
             _showDiscoveryModal = true;
         }

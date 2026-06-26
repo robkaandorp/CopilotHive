@@ -83,6 +83,32 @@ public sealed class ConfigModelService
     private readonly IBrainRepoManager? _repoManager;
 
     /// <summary>
+    /// Known reasoning effort levels recognised as model-name suffixes (e.g. <c>:high</c>).
+    /// Mirrors the set in <see cref="HiveConfigFile"/> (which is private there).
+    /// </summary>
+    private static readonly HashSet<string> KnownReasoningLevels = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "none", "low", "medium", "high", "extra_high"
+    };
+
+    /// <summary>
+    /// Strips a known reasoning-effort suffix (e.g. <c>:high</c>) from a model name.
+    /// Returns the cleaned name and the extracted suffix (or <c>null</c> when no known suffix exists).
+    /// </summary>
+    /// <param name="name">Model name that may carry a reasoning suffix.</param>
+    private static (string CleanName, string? Suffix) StripReasoningSuffix(string name)
+    {
+        var lastColon = name.LastIndexOf(':');
+        if (lastColon > 0 && lastColon < name.Length - 1)
+        {
+            var suffix = name.Substring(lastColon + 1);
+            if (KnownReasoningLevels.Contains(suffix))
+                return (name.Substring(0, lastColon), suffix);
+        }
+        return (name, null);
+    }
+
+    /// <summary>
     /// Initialises a new <see cref="ConfigModelService"/>.
     /// </summary>
     /// <param name="config">The live <see cref="HiveConfigFile"/> singleton.</param>
@@ -191,6 +217,10 @@ public sealed class ConfigModelService
         _config.Models ??= new ModelsConfig();
         _config.Models.AvailableModels ??= new List<ModelEntry>();
 
+        var (cleanName, extractedSuffix) = StripReasoningSuffix(name);
+        name = cleanName;
+        var effectiveReasoningEffort = reasoningEffort ?? extractedSuffix;
+
         if (_config.Models.AvailableModels.Any(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)))
             throw new InvalidOperationException($"Model '{name}' already exists in available_models");
 
@@ -198,7 +228,7 @@ public sealed class ConfigModelService
         {
             Name = name,
             ContextWindow = contextWindow,
-            ReasoningEffort = reasoningEffort
+            ReasoningEffort = effectiveReasoningEffort
         });
 
         var message = $"chore: add available model '{name}'";
