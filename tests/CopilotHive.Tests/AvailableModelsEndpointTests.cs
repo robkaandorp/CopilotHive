@@ -159,12 +159,15 @@ public class AvailableModelsEndpointTests : IDisposable
 internal sealed class CustomEndpointFactory : WebApplicationFactory<Program>
 {
     private readonly string _tempDir;
+    private readonly string _stateDir;
     private readonly HiveConfigFile _config;
     private readonly FakeConfigRepoManager _repo;
 
     public CustomEndpointFactory(string tempDir)
     {
         _tempDir = tempDir;
+        _stateDir = Path.Combine(tempDir, "state");
+        Environment.SetEnvironmentVariable("STATE_DIR", _stateDir);
         _config = new HiveConfigFile
         {
             Orchestrator = new OrchestratorConfig(),
