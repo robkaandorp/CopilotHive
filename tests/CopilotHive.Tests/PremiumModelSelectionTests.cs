@@ -130,6 +130,80 @@ public class PremiumModelSelectionTests
         Assert.Equal("standard-tester-model", capturedModel);
     }
 
+    // -- GoalDispatcher reasoning effort suffix --
+
+    [Fact]
+    public async Task DispatchToRole_WhenModelHasReasoningEffort_AppliesSuffixToDispatchedModel()
+    {
+        var brain = new CapturingBrain(modelTierToReturn: "default");
+        var capturedModel = (string?)null;
+
+        var hiveConfigFile = new HiveConfigFile
+        {
+            Workers =
+            {
+                ["tester"] = new WorkerConfig { Model = "standard-tester-model" },
+            },
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "standard-tester-model", ReasoningEffort = "high" }
+                ]
+            },
+        };
+
+        var (dispatcher, pipeline, taskId, taskQueue) = CreateDispatcher(GoalPhase.Coding, brain, hiveConfigFile);
+        taskQueue.OnEnqueue = t => capturedModel = t.Model;
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "Done.",
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+            GitStatus = new GitChangeSummary { FilesChanged = 3 },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal("standard-tester-model:high", capturedModel);
+    }
+
+    [Fact]
+    public async Task DispatchToRole_WhenModelHasNoReasoningEffort_DoesNotAppendSuffix()
+    {
+        var brain = new CapturingBrain(modelTierToReturn: "default");
+        var capturedModel = (string?)null;
+
+        var hiveConfigFile = new HiveConfigFile
+        {
+            Workers =
+            {
+                ["tester"] = new WorkerConfig { Model = "standard-tester-model" },
+            },
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "standard-tester-model" }
+                ]
+            },
+        };
+
+        var (dispatcher, pipeline, taskId, taskQueue) = CreateDispatcher(GoalPhase.Coding, brain, hiveConfigFile);
+        taskQueue.OnEnqueue = t => capturedModel = t.Model;
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "Done.",
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+            GitStatus = new GitChangeSummary { FilesChanged = 3 },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal("standard-tester-model", capturedModel);
+    }
+
     // -- Helpers --
 
     private static (GoalDispatcher dispatcher, GoalPipeline pipeline, string taskId, TaskQueue taskQueue)

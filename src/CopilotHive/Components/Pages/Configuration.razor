@@ -8,6 +8,7 @@
 @inject ConfigRepoManager ConfigRepo
 @inject PageHeaderState PageHeader
 @inject HttpClient HttpClient
+@inject IJSRuntime JS
 
 <p style="color:var(--text-muted);margin-bottom:1.5rem">
     Config repo: <code style="font-size:0.85rem">@ConfigRepo.LocalPath</code>
@@ -177,6 +178,161 @@ else
                 </div>
             }
         }
+        else if (_activeTab == AvailableModelsTabName)
+        {
+            <div style="margin-top:1rem">
+                <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1.25rem">
+                    <button class="approve-btn" disabled="@_discoveringModels" @onclick="BrowseProviderModelsAsync">
+                        @(_discoveringModels ? "Discovering…" : "🔍 Browse Provider Models")
+                    </button>
+                    <button class="approve-btn" @onclick="() => { _showAddModelForm = !_showAddModelForm; _availableModelsError = null; _availableModelsSuccess = null; }">
+                        ➕ Add Model
+                    </button>
+                    @if (_availableModelsSuccess is not null)
+                    {
+                        <span style="color:var(--accent);font-size:0.9rem">@_availableModelsSuccess</span>
+                    }
+                    @if (_availableModelsError is not null)
+                    {
+                        <span style="color:var(--red);font-size:0.9rem">@_availableModelsError</span>
+                    }
+                </div>
+
+                @if (_showAddModelForm)
+                {
+                    <div style="margin-bottom:1.5rem;padding:1rem 1.25rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;max-width:700px">
+                        <h3 style="font-size:1rem;font-weight:600;margin-bottom:0.75rem">Add Model</h3>
+                        <div style="display:grid;grid-template-columns:10rem 1fr;gap:0.75rem 1rem;align-items:center">
+                            <label style="color:var(--text-muted);font-size:0.9rem">Name</label>
+                            <input @bind="_newModelName" placeholder="e.g. copilot/claude-sonnet-4.6"
+                                   style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                            <label style="color:var(--text-muted);font-size:0.9rem">Context Window</label>
+                            <input type="number" @bind="_newModelContextWindow" placeholder="optional"
+                                   style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                            <label style="color:var(--text-muted);font-size:0.9rem">Reasoning Effort</label>
+                            <select @bind="_newModelReasoningEffort"
+                                    style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                                <option value="">none</option>
+                                <option value="low">low</option>
+                                <option value="medium">medium</option>
+                                <option value="high">high</option>
+                                <option value="extra_high">extra_high</option>
+                            </select>
+                        </div>
+                        <div style="margin-top:1rem;display:flex;gap:0.75rem">
+                            <button class="approve-btn" @onclick="AddModelAsync">💾 Save</button>
+                            <button class="approve-btn" @onclick="() => _showAddModelForm = false">Cancel</button>
+                        </div>
+                    </div>
+                }
+
+                @{
+                    var availableModels = _modelsData?.AvailableModels;
+                }
+                @if (availableModels is null || availableModels.Count == 0)
+                {
+                    <p style="color:var(--text-muted);font-style:italic">
+                        No available models configured yet. Use "Browse Provider Models" or "Add Model" to add some.
+                    </p>
+                }
+                else
+                {
+                    <table style="border-collapse:collapse;width:100%;max-width:800px">
+                        <thead>
+                            <tr style="border-bottom:1px solid var(--border)">
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Name</th>
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Context Window</th>
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Reasoning Effort</th>
+                                <th style="text-align:right;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var model in availableModels)
+                            {
+                                <tr style="border-bottom:1px solid var(--border)">
+                                    @if (_editingModelName == model.Name)
+                                    {
+                                        <td style="padding:0.5rem;font-size:0.9rem">@model.Name</td>
+                                        <td style="padding:0.5rem">
+                                            <input type="number" @bind="_editModelContextWindow" placeholder="optional"
+                                                   style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem" />
+                                        </td>
+                                        <td style="padding:0.5rem">
+                                            <select @bind="_editModelReasoningEffort"
+                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;cursor:pointer">
+                                                <option value="">none</option>
+                                                <option value="low">low</option>
+                                                <option value="medium">medium</option>
+                                                <option value="high">high</option>
+                                                <option value="extra_high">extra_high</option>
+                                            </select>
+                                        </td>
+                                        <td style="padding:0.5rem;text-align:right">
+                                            <button class="approve-btn" @onclick="SaveEditModelAsync">💾 Save</button>
+                                            <button class="approve-btn" @onclick="CancelEditModel">Cancel</button>
+                                        </td>
+                                    }
+                                    else
+                                    {
+                                        <td style="padding:0.5rem;font-size:0.9rem">@model.Name</td>
+                                        <td style="padding:0.5rem;font-size:0.9rem">@(model.ContextWindow?.ToString() ?? "—")</td>
+                                        <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(model.ReasoningEffort) ? "—" : model.ReasoningEffort)</td>
+                                        <td style="padding:0.5rem;text-align:right">
+                                            <button class="approve-btn" @onclick="() => StartEditModel(model)">✏️ Edit</button>
+                                            <button class="approve-btn" style="color:var(--red)" @onclick="() => RemoveModelAsync(model.Name)">🗑️ Remove</button>
+                                        </td>
+                                    }
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                }
+
+                @if (_showDiscoveryModal)
+                {
+                    <div style="position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:1000"
+                         @onclick="() => _showDiscoveryModal = false">
+                        <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.5rem;max-width:700px;width:90%;max-height:80vh;overflow-y:auto"
+                             @onclick:stopPropagation="true">
+                            <h3 style="font-size:1.1rem;font-weight:600;margin-bottom:1rem">Discovered Provider Models</h3>
+                            @if (_discoveredModels.Count == 0)
+                            {
+                                <p style="color:var(--text-muted);font-style:italic">No models discovered. Check provider credentials (GH_TOKEN, OLLAMA_API_KEY/OLLAMA_URL).</p>
+                            }
+                            else
+                            {
+                                <div style="display:flex;flex-direction:column;gap:0.4rem;margin-bottom:1rem">
+                                    @foreach (var dm in _discoveredModels)
+                                    {
+                                        <label style="display:flex;align-items:center;gap:0.5rem;padding:0.4rem 0.5rem;border:1px solid var(--border);border-radius:6px;cursor:pointer">
+                                            <input type="checkbox"
+                                                   checked="@_selectedDiscoveredIds.Contains(dm.Id)"
+                                                   @onchange="(e) => ToggleDiscoveredSelection(dm.Id, (bool)(e.Value ?? false))" />
+                                            <span style="font-size:0.9rem;flex:1">@dm.Name</span>
+                                            <span style="font-size:0.8rem;color:var(--text-muted)">@dm.Id</span>
+                                            @if (dm.Vendor is not null)
+                                            {
+                                                <span style="font-size:0.75rem;color:var(--text-muted)">@dm.Vendor</span>
+                                            }
+                                            @if (dm.ContextWindow is not null)
+                                            {
+                                                <span style="font-size:0.75rem;color:var(--text-muted)">@dm.ContextWindow.Value.ToString("N0") tok</span>
+                                            }
+                                        </label>
+                                    }
+                                </div>
+                            }
+                            <div style="display:flex;gap:0.75rem;justify-content:flex-end">
+                                <button class="approve-btn" disabled="@(_selectedDiscoveredIds.Count == 0)" @onclick="AddSelectedDiscoveredAsync">➕ Add Selected</button>
+                                <button class="approve-btn" @onclick="() => _showDiscoveryModal = false">Close</button>
+                            </div>
+                        </div>
+                    </div>
+                }
+            </div>
+        }
         else if (_activeTab == BackupTabName)
         {
             <div style="margin-top:1rem">
@@ -259,6 +415,7 @@ else
 
 @code {
     private const string ModelsTabName = "Models";
+    private const string AvailableModelsTabName = "Available Models";
     private const string BackupTabName = "Backup";
 
     private sealed record ModelConfigResponse(
@@ -273,7 +430,16 @@ else
         [property: JsonPropertyName("premiumModel")] string? PremiumModel);
 
     private sealed record ModelEntryDto(
-        [property: JsonPropertyName("name")] string Name);
+        [property: JsonPropertyName("name")] string Name,
+        [property: JsonPropertyName("contextWindow")] int? ContextWindow,
+        [property: JsonPropertyName("reasoningEffort")] string? ReasoningEffort);
+
+    private sealed record DiscoveredModelDto(
+        [property: JsonPropertyName("id")] string Id,
+        [property: JsonPropertyName("name")] string Name,
+        [property: JsonPropertyName("vendor")] string? Vendor,
+        [property: JsonPropertyName("contextWindow")] int? ContextWindow,
+        [property: JsonPropertyName("enabled")] bool Enabled);
 
     private sealed record BackupInfoResponse(
         [property: JsonPropertyName("fileName")] string FileName,
@@ -312,6 +478,21 @@ else
     private bool _backupCreating;
     private string? _backupError;
     private bool _backupSuccess;
+
+    // Available Models tab state
+    private List<DiscoveredModelDto> _discoveredModels = [];
+    private bool _discoveringModels;
+    private bool _showDiscoveryModal;
+    private HashSet<string> _selectedDiscoveredIds = [];
+    private bool _showAddModelForm;
+    private string _newModelName = "";
+    private int? _newModelContextWindow;
+    private string _newModelReasoningEffort = "";
+    private string? _editingModelName;
+    private int? _editModelContextWindow;
+    private string _editModelReasoningEffort = "";
+    private string? _availableModelsError;
+    private string? _availableModelsSuccess;
 
     protected override async Task OnInitializedAsync()
     {
@@ -354,7 +535,8 @@ else
 
         _tabs = [.. _files.Keys];
         _tabs.Insert(0, ModelsTabName);
-        _tabs.Insert(1, BackupTabName);
+        _tabs.Insert(1, AvailableModelsTabName);
+        _tabs.Insert(2, BackupTabName);
     }
 
     private async Task LoadModelsAsync()
@@ -505,6 +687,210 @@ else
             _backupCreating = false;
             StateHasChanged();
         }
+    }
+
+    // ===== Available Models tab methods =====
+
+    private void ToggleDiscoveredSelection(string id, bool selected)
+    {
+        if (selected)
+            _selectedDiscoveredIds.Add(id);
+        else
+            _selectedDiscoveredIds.Remove(id);
+    }
+
+    private async Task BrowseProviderModelsAsync()
+    {
+        _discoveringModels = true;
+        _availableModelsError = null;
+        _availableModelsSuccess = null;
+        try
+        {
+            _discoveredModels = await HttpClient.GetFromJsonAsync<List<DiscoveredModelDto>>("/api/config/models/discover") ?? [];
+            _selectedDiscoveredIds.Clear();
+            _showDiscoveryModal = true;
+        }
+        catch (Exception ex)
+        {
+            _availableModelsError = $"Discovery failed: {ex.Message}";
+        }
+        finally
+        {
+            _discoveringModels = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task AddSelectedDiscoveredAsync()
+    {
+        _availableModelsError = null;
+        _availableModelsSuccess = null;
+        try
+        {
+            foreach (var dm in _discoveredModels.Where(m => _selectedDiscoveredIds.Contains(m.Id)))
+            {
+                var response = await PostAvailableModelAsync(dm.Id, dm.ContextWindow, null);
+                if (!response.IsSuccessStatusCode)
+                {
+                    var error = await response.Content.ReadAsStringAsync();
+                    _availableModelsError = $"Failed to add '{dm.Id}' ({(int)response.StatusCode}): {error}";
+                }
+            }
+            _selectedDiscoveredIds.Clear();
+            _showDiscoveryModal = false;
+            await LoadModelsAsync();
+            if (_availableModelsError is null)
+                _availableModelsSuccess = "✅ Models added";
+        }
+        catch (Exception ex)
+        {
+            _availableModelsError = $"Add failed: {ex.Message}";
+        }
+        finally
+        {
+            StateHasChanged();
+        }
+    }
+
+    private async Task AddModelAsync()
+    {
+        _availableModelsError = null;
+        _availableModelsSuccess = null;
+        if (string.IsNullOrWhiteSpace(_newModelName))
+        {
+            _availableModelsError = "Model name is required.";
+            return;
+        }
+        try
+        {
+            var reasoning = string.IsNullOrEmpty(_newModelReasoningEffort) ? null : _newModelReasoningEffort;
+            var response = await PostAvailableModelAsync(_newModelName, _newModelContextWindow, reasoning);
+            if (response.IsSuccessStatusCode)
+            {
+                _newModelName = "";
+                _newModelContextWindow = null;
+                _newModelReasoningEffort = "";
+                _showAddModelForm = false;
+                await LoadModelsAsync();
+                _availableModelsSuccess = "✅ Model added";
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                _availableModelsError = $"Add failed ({(int)response.StatusCode}): {error}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _availableModelsError = $"Add failed: {ex.Message}";
+        }
+        finally
+        {
+            StateHasChanged();
+        }
+    }
+
+    private void StartEditModel(ModelEntryDto model)
+    {
+        _editingModelName = model.Name;
+        _editModelContextWindow = model.ContextWindow;
+        _editModelReasoningEffort = model.ReasoningEffort ?? "";
+        _availableModelsError = null;
+        _availableModelsSuccess = null;
+    }
+
+    private void CancelEditModel()
+    {
+        _editingModelName = null;
+    }
+
+    private async Task SaveEditModelAsync()
+    {
+        if (_editingModelName is null)
+            return;
+        _availableModelsError = null;
+        _availableModelsSuccess = null;
+        try
+        {
+            var reasoning = string.IsNullOrEmpty(_editModelReasoningEffort) ? null : _editModelReasoningEffort;
+            var body = new StringContent(
+                System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    name = _editingModelName,
+                    contextWindow = _editModelContextWindow,
+                    reasoningEffort = reasoning,
+                }),
+                System.Text.Encoding.UTF8,
+                "application/json");
+
+            var response = await HttpClient.PutAsync($"/api/config/available-models/{Uri.EscapeDataString(_editingModelName)}", body);
+            if (response.IsSuccessStatusCode)
+            {
+                _editingModelName = null;
+                await LoadModelsAsync();
+                _availableModelsSuccess = "✅ Model updated";
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                _availableModelsError = $"Update failed ({(int)response.StatusCode}): {error}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _availableModelsError = $"Update failed: {ex.Message}";
+        }
+        finally
+        {
+            StateHasChanged();
+        }
+    }
+
+    private async Task RemoveModelAsync(string name)
+    {
+        _availableModelsError = null;
+        _availableModelsSuccess = null;
+
+        var confirmed = await JS.InvokeAsync<bool>("confirm", $"Remove model '{name}'?");
+        if (!confirmed)
+            return;
+
+        try
+        {
+            var response = await HttpClient.DeleteAsync($"/api/config/available-models/{Uri.EscapeDataString(name)}");
+            if (response.IsSuccessStatusCode)
+            {
+                await LoadModelsAsync();
+                _availableModelsSuccess = "✅ Model removed";
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                _availableModelsError = $"Remove failed ({(int)response.StatusCode}): {error}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _availableModelsError = $"Remove failed: {ex.Message}";
+        }
+        finally
+        {
+            StateHasChanged();
+        }
+    }
+
+    private Task<HttpResponseMessage> PostAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort)
+    {
+        var body = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new
+            {
+                name,
+                contextWindow,
+                reasoningEffort,
+            }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+        return HttpClient.PostAsync("/api/config/available-models", body);
     }
 
     private static string FormatFileSize(long bytes) =>

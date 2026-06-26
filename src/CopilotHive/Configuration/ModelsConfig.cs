@@ -9,6 +9,12 @@ public sealed class ModelEntry
     public required string Name { get; set; }
     /// <summary>Maximum context window in tokens, or <c>null</c> to use the global default.</summary>
     public int? ContextWindow { get; set; }
+    /// <summary>
+    /// Default reasoning effort for models that support extended thinking.
+    /// When set, this is used instead of the :suffix parsing in model names.
+    /// null = no reasoning configuration (use existing :suffix behavior).
+    /// </summary>
+    public string? ReasoningEffort { get; set; }
 }
 
 /// <summary>

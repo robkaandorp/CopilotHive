@@ -85,7 +85,11 @@ public sealed class ConfigModelService
                     : Constants.DefaultBrainContextWindow;
 
             if (_brain is not null)
-                await _brain.UpdateModelAsync(model, contextWindow, ct);
+            {
+                var reasoningEffort = _config.TryGetReasoningEffortForModel(model);
+                var modelWithReasoning = HiveConfigFile.ApplyReasoningSuffix(model, reasoningEffort);
+                await _brain.UpdateModelAsync(modelWithReasoning, contextWindow, ct);
+            }
         }
 
         if (update.ComposerModel is not null)
@@ -133,5 +137,82 @@ public sealed class ConfigModelService
 
         await _configRepo.WriteConfigAsync(_config, ct);
         await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+    }
+
+    /// <summary>
+    /// Adds a model to the available_models list. Throws <see cref="InvalidOperationException"/>
+    /// if a model with the same name already exists.
+    /// </summary>
+    /// <param name="name">Model name.</param>
+    /// <param name="contextWindow">Optional context window in tokens.</param>
+    /// <param name="reasoningEffort">Optional default reasoning effort.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task AddAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, CancellationToken ct = default)
+    {
+        _config.Models ??= new ModelsConfig();
+        _config.Models.AvailableModels ??= new List<ModelEntry>();
+
+        if (_config.Models.AvailableModels.Any(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidOperationException($"Model '{name}' already exists in available_models");
+
+        _config.Models.AvailableModels.Add(new ModelEntry
+        {
+            Name = name,
+            ContextWindow = contextWindow,
+            ReasoningEffort = reasoningEffort
+        });
+
+        var message = $"chore: add available model '{name}'";
+        _logger.LogInformation("Adding available model: {Name}", name);
+
+        await _configRepo.WriteConfigAsync(_config, ct);
+        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+    }
+
+    /// <summary>
+    /// Updates an existing model's context window and/or reasoning effort.
+    /// Throws <see cref="InvalidOperationException"/> if the model is not found.
+    /// </summary>
+    /// <param name="name">Model name to update.</param>
+    /// <param name="contextWindow">New context window (null clears it).</param>
+    /// <param name="reasoningEffort">New reasoning effort (null clears it).</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task UpdateAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, CancellationToken ct = default)
+    {
+        var model = _config.Models?.AvailableModels?
+            .FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
+        if (model is null)
+            throw new InvalidOperationException($"Model '{name}' not found in available_models");
+
+        model.ContextWindow = contextWindow;
+        model.ReasoningEffort = reasoningEffort;
+
+        var message = $"chore: update available model '{name}'";
+        _logger.LogInformation("Updating available model: {Name}", name);
+
+        await _configRepo.WriteConfigAsync(_config, ct);
+        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+    }
+
+    /// <summary>
+    /// Removes a model from the available_models list. Returns <c>false</c> if not found.
+    /// </summary>
+    /// <param name="name">Model name to remove.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<bool> RemoveAvailableModelAsync(string name, CancellationToken ct = default)
+    {
+        var model = _config.Models?.AvailableModels?
+            .FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
+        if (model is null)
+            return false;
+
+        _config.Models!.AvailableModels!.Remove(model);
+
+        var message = $"chore: remove available model '{name}'";
+        _logger.LogInformation("Removing available model: {Name}", name);
+
+        await _configRepo.WriteConfigAsync(_config, ct);
+        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+        return true;
     }
 }

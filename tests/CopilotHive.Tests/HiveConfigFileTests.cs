@@ -613,4 +613,135 @@ public sealed class HiveConfigFileTests
         Assert.Single(result);
         Assert.Equal("global-only-model", result[0]);
     }
+
+    // ── TryGetReasoningEffortForModel tests ──────────────────────────────────
+
+    [Fact]
+    public void TryGetReasoningEffortForModel_ModelWithReasoningEffort_ReturnsValue()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "copilot/claude-sonnet-4.6", ReasoningEffort = "high" }
+                ]
+            }
+        };
+
+        Assert.Equal("high", config.TryGetReasoningEffortForModel("copilot/claude-sonnet-4.6"));
+    }
+
+    [Fact]
+    public void TryGetReasoningEffortForModel_CaseInsensitive_ReturnsValue()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "copilot/claude-sonnet-4.6", ReasoningEffort = "medium" }
+                ]
+            }
+        };
+
+        Assert.Equal("medium", config.TryGetReasoningEffortForModel("COPILOT/CLAUDE-SONNET-4.6"));
+    }
+
+    [Fact]
+    public void TryGetReasoningEffortForModel_ModelNotFound_ReturnsNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "model-a", ReasoningEffort = "high" }]
+            }
+        };
+
+        Assert.Null(config.TryGetReasoningEffortForModel("model-b"));
+    }
+
+    [Fact]
+    public void TryGetReasoningEffortForModel_ModelsNull_ReturnsNull()
+    {
+        var config = new HiveConfigFile { Models = null };
+
+        Assert.Null(config.TryGetReasoningEffortForModel("any-model"));
+    }
+
+    [Fact]
+    public void TryGetReasoningEffortForModel_NoReasoningEffortSet_ReturnsNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "model-a", ReasoningEffort = null }]
+            }
+        };
+
+        Assert.Null(config.TryGetReasoningEffortForModel("model-a"));
+    }
+
+    // ── ApplyReasoningSuffix tests ───────────────────────────────────────────
+
+    [Fact]
+    public void ApplyReasoningSuffix_WithReasoningEffort_AppendsSuffix()
+    {
+        var result = HiveConfigFile.ApplyReasoningSuffix("copilot/claude-sonnet-4.6", "high");
+
+        Assert.Equal("copilot/claude-sonnet-4.6:high", result);
+    }
+
+    [Fact]
+    public void ApplyReasoningSuffix_NullReasoningEffort_ReturnsUnchanged()
+    {
+        var result = HiveConfigFile.ApplyReasoningSuffix("copilot/claude-sonnet-4.6", null);
+
+        Assert.Equal("copilot/claude-sonnet-4.6", result);
+    }
+
+    [Fact]
+    public void ApplyReasoningSuffix_EmptyReasoningEffort_ReturnsUnchanged()
+    {
+        var result = HiveConfigFile.ApplyReasoningSuffix("copilot/claude-sonnet-4.6", "");
+
+        Assert.Equal("copilot/claude-sonnet-4.6", result);
+    }
+
+    [Fact]
+    public void ApplyReasoningSuffix_ModelAlreadyHasKnownSuffix_DoesNotOverride()
+    {
+        // Explicit :suffix takes precedence over configured reasoning effort
+        var result = HiveConfigFile.ApplyReasoningSuffix("copilot/claude-sonnet-4.6:low", "high");
+
+        Assert.Equal("copilot/claude-sonnet-4.6:low", result);
+    }
+
+    [Fact]
+    public void ApplyReasoningSuffix_ModelHasUnknownSuffix_AppendsReasoning()
+    {
+        // A colon that is not a known reasoning level (e.g. a tag) should still get the reasoning suffix appended
+        var result = HiveConfigFile.ApplyReasoningSuffix("ollama/llama3.2:latest", "high");
+
+        Assert.Equal("ollama/llama3.2:latest:high", result);
+    }
+
+    [Theory]
+    [InlineData("none")]
+    [InlineData("low")]
+    [InlineData("medium")]
+    [InlineData("high")]
+    [InlineData("extra_high")]
+    public void ApplyReasoningSuffix_ExistingKnownSuffix_AllLevels_NotOverridden(string level)
+    {
+        var model = $"copilot/some-model:{level}";
+
+        var result = HiveConfigFile.ApplyReasoningSuffix(model, "high");
+
+        Assert.Equal(model, result);
+    }
 }

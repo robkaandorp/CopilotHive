@@ -414,6 +414,14 @@ public sealed class GoalDispatcher : BackgroundService
             if (premiumModel is not null)
                 model = premiumModel;
         }
+
+        // Apply configured reasoning effort as a model suffix (explicit :suffix takes precedence)
+        if (_config is not null && model is not null)
+        {
+            var reasoningEffort = _config.TryGetReasoningEffortForModel(model);
+            model = HiveConfigFile.ApplyReasoningSuffix(model, reasoningEffort);
+        }
+
         _logger.LogDebug("Model for {Role}: {Model} (tier={Tier}, configLoaded={ConfigLoaded})",
             roleName, model ?? "(null)", phaseTier, _config is not null);
 
@@ -458,8 +466,13 @@ public sealed class GoalDispatcher : BackgroundService
         var compactionModel = _config?.Models?.CompactionModel;
         if (!string.IsNullOrEmpty(compactionModel))
         {
-            task.Metadata["compaction_model"] = compactionModel;
             var compactionCtx = _config?.TryGetContextWindowForModel(compactionModel);
+
+            // Apply configured reasoning effort as a model suffix (explicit :suffix takes precedence)
+            var compactionReasoningEffort = _config?.TryGetReasoningEffortForModel(compactionModel);
+            compactionModel = HiveConfigFile.ApplyReasoningSuffix(compactionModel, compactionReasoningEffort);
+
+            task.Metadata["compaction_model"] = compactionModel;
             if (compactionCtx is int ctx && ctx > 0)
                 task.Metadata["compaction_max_tokens"] = ctx.ToString();
         }

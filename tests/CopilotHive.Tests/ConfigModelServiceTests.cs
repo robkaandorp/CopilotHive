@@ -227,6 +227,55 @@ public sealed class ConfigModelServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task SaveModelConfigAsync_ModelWithReasoningEffort_AppliesSuffixToBrain()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "old-model" },
+            Models = new ModelsConfig
+            {
+                AvailableModels = new List<ModelEntry>
+                {
+                    new() { Name = "new-orch", ContextWindow = 256000, ReasoningEffort = "high" }
+                }
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var brain = new FakeDistributedBrain();
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
+        var update = new ModelConfigUpdate("new-orch", null, null, null, null);
+
+        await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.Equal("new-orch:high", brain.LastModel);
+        Assert.Equal(256000, brain.LastMaxContextTokens);
+    }
+
+    [Fact]
+    public async Task SaveModelConfigAsync_ModelWithoutReasoningEffort_NoSuffixApplied()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "old-model" },
+            Models = new ModelsConfig
+            {
+                AvailableModels = new List<ModelEntry>
+                {
+                    new() { Name = "new-orch", ContextWindow = 256000 }
+                }
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var brain = new FakeDistributedBrain();
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
+        var update = new ModelConfigUpdate("new-orch", null, null, null, null);
+
+        await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.Equal("new-orch", brain.LastModel);
+    }
+
+    [Fact]
     public async Task SaveModelConfigAsync_ModelNotInAvailableModels_FallsBackToBrainContextWindow()
     {
         var config = new HiveConfigFile
@@ -276,6 +325,257 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         Assert.Null(brain.LastModel);
         Assert.Null(brain.LastMaxContextTokens);
+    }
+
+    // ── AddAvailableModelAsync tests ─────────────────────────────────────────
+
+    [Fact]
+    public async Task AddAvailableModelAsync_AddsModelToConfig()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [] }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddAvailableModelAsync("copilot/claude-sonnet-4.6", 200000, "high", TestContext.Current.CancellationToken);
+
+        var model = Assert.Single(config.Models!.AvailableModels!);
+        Assert.Equal("copilot/claude-sonnet-4.6", model.Name);
+        Assert.Equal(200000, model.ContextWindow);
+        Assert.Equal("high", model.ReasoningEffort);
+    }
+
+    [Fact]
+    public async Task AddAvailableModelAsync_InitializesModelsConfigIfNull()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddAvailableModelAsync("model-a", null, null, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(config.Models);
+        var model = Assert.Single(config.Models!.AvailableModels!);
+        Assert.Equal("model-a", model.Name);
+    }
+
+    [Fact]
+    public async Task AddAvailableModelAsync_DuplicateThrows()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddAvailableModelAsync("model-a", null, null, TestContext.Current.CancellationToken);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            svc.AddAvailableModelAsync("MODEL-A", null, null, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task AddAvailableModelAsync_WritesAndCommits()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddAvailableModelAsync("model-a", null, null, TestContext.Current.CancellationToken);
+
+        Assert.Single(repo.Commits);
+        Assert.Equal("hive-config.yaml", repo.Commits[0].File);
+        Assert.Contains("add available model", repo.Commits[0].Message);
+    }
+
+    // ── UpdateAvailableModelAsync tests ──────────────────────────────────────
+
+    [Fact]
+    public async Task UpdateAvailableModelAsync_UpdatesContextWindow()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "model-a", ContextWindow = 128000 }]
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateAvailableModelAsync("model-a", 256000, null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(256000, config.Models!.AvailableModels![0].ContextWindow);
+    }
+
+    [Fact]
+    public async Task UpdateAvailableModelAsync_UpdatesReasoningEffort()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "model-a", ReasoningEffort = null }]
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateAvailableModelAsync("model-a", null, "high", TestContext.Current.CancellationToken);
+
+        Assert.Equal("high", config.Models!.AvailableModels![0].ReasoningEffort);
+    }
+
+    [Fact]
+    public async Task UpdateAvailableModelAsync_ClearsReasoningEffort_WhenPassedNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "model-a", ReasoningEffort = "high" }]
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateAvailableModelAsync("model-a", null, null, TestContext.Current.CancellationToken);
+
+        Assert.Null(config.Models!.AvailableModels![0].ReasoningEffort);
+    }
+
+    [Fact]
+    public async Task UpdateAvailableModelAsync_NotFoundThrows()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            svc.UpdateAvailableModelAsync("missing", 1000, null, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task UpdateAvailableModelAsync_WritesAndCommits()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "model-a", ContextWindow = 128000 }]
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateAvailableModelAsync("model-a", 256000, null, TestContext.Current.CancellationToken);
+
+        Assert.Single(repo.Commits);
+        Assert.Equal("hive-config.yaml", repo.Commits[0].File);
+        Assert.Contains("update available model", repo.Commits[0].Message);
+    }
+
+    // ── RemoveAvailableModelAsync tests ──────────────────────────────────────
+
+    [Fact]
+    public async Task RemoveAvailableModelAsync_RemovesModel()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "model-a" },
+                    new ModelEntry { Name = "model-b" }
+                ]
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.RemoveAvailableModelAsync("model-a", TestContext.Current.CancellationToken);
+
+        var remaining = Assert.Single(config.Models!.AvailableModels!);
+        Assert.Equal("model-b", remaining.Name);
+    }
+
+    [Fact]
+    public async Task RemoveAvailableModelAsync_NotFoundReturnsFalse()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var result = await svc.RemoveAvailableModelAsync("missing", TestContext.Current.CancellationToken);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task RemoveAvailableModelAsync_RemovedModel_ReturnsTrue()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "model-a" }]
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var result = await svc.RemoveAvailableModelAsync("model-a", TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+    }
+
+    [Fact]
+    public async Task RemoveAvailableModelAsync_WritesAndCommits()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "model-a" }]
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.RemoveAvailableModelAsync("model-a", TestContext.Current.CancellationToken);
+
+        Assert.Single(repo.Commits);
+        Assert.Equal("hive-config.yaml", repo.Commits[0].File);
+        Assert.Contains("remove available model", repo.Commits[0].Message);
+    }
+
+    [Fact]
+    public async Task RemoveAvailableModelAsync_CaseInsensitive()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "copilot/claude-sonnet-4.6" }]
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var result = await svc.RemoveAvailableModelAsync("COPILOT/CLAUDE-SONNET-4.6", TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.Empty(config.Models!.AvailableModels!);
     }
 }
 

@@ -123,6 +123,11 @@ public sealed class Program
                     var maxSteps = int.TryParse(brainMaxStepsEnv, out var envSteps)
                         ? envSteps
                         : config?.Orchestrator.BrainMaxSteps ?? Constants.DefaultBrainMaxSteps;
+
+                    // Apply configured reasoning effort as a model suffix (explicit :suffix takes precedence)
+                    var reasoningEffort = config?.TryGetReasoningEffortForModel(effectiveModel);
+                    effectiveModel = HiveConfigFile.ApplyReasoningSuffix(effectiveModel, reasoningEffort);
+
                     return new DistributedBrain(effectiveModel, sp.GetRequiredService<ILogger<DistributedBrain>>(),
                         sp.GetRequiredService<MetricsTracker>(),
                         sp.GetService<AgentsManager>(),
@@ -160,6 +165,10 @@ public sealed class Program
                     ?? Constants.DefaultBrainContextWindow;
                 var maxSteps = composerConfig?.MaxSteps ?? config?.Orchestrator.BrainMaxSteps ?? Constants.DefaultBrainMaxSteps;
                 var availableModels = config?.GetComposerAvailableModels(model) ?? [model];
+
+                // Apply configured reasoning effort as a model suffix (explicit :suffix takes precedence)
+                var composerReasoningEffort = config?.TryGetReasoningEffortForModel(model);
+                model = HiveConfigFile.ApplyReasoningSuffix(model, composerReasoningEffort);
 
                 return new Composer(model, sp.GetRequiredService<ILogger<Composer>>(),
                     sp.GetRequiredService<IGoalStore>(),
@@ -232,6 +241,7 @@ public sealed class Program
                 builder.Services.AddSingleton(knowledgeGraph);
 
                 builder.Services.AddSingleton<ConfigModelService>();
+                builder.Services.AddSingleton<ModelDiscoveryService>();
 
                 // If no explicit goals file, check config repo for goals.yaml
                 if (string.IsNullOrEmpty(goalsFile))
