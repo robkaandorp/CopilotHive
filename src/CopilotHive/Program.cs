@@ -9,7 +9,6 @@ using CopilotHive.Metrics;
 using CopilotHive.Models;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
-using CopilotHive.Persistence.Entities;
 using CopilotHive.Services;
 
 using Microsoft.AspNetCore.DataProtection;
@@ -306,22 +305,6 @@ public sealed class Program
             catch (Exception ex)
             {
                 logger.LogError(ex, "Unexpected exception during CopilotHiveDbContext.EnsureCreated; continuing startup");
-            }
-
-            // ── Data migration: goals.db → copilothive.db ────────────────────
-            try
-            {
-                var legacyGoalsDbPath = Path.Combine(stateDir, "goals.db");
-                if (File.Exists(legacyGoalsDbPath))
-                {
-                    using var scope = app.Services.CreateScope();
-                    var dbContextFactory = scope.ServiceProvider.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>();
-                    DatabaseMigration.MigrateGoalsDatabase(legacyGoalsDbPath, dbContextFactory, logger);
-                }
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Failed to migrate data from goals.db to copilothive.db — continuing startup. Data can be manually migrated later.");
             }
 
             if (!string.IsNullOrEmpty(brainModel))
