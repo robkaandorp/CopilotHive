@@ -55,7 +55,13 @@ else
                     <select @bind="_orchestratorModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
                         @foreach (var m in models)
                         {
-                            <option value="@m.Name">@m.Name</option>
+                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name} ({m.ReasoningEffort})";
+                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name}:{m.ReasoningEffort}";
+                            <option value="@optionValue">@displayText</option>
                         }
                     </select>
 
@@ -63,7 +69,13 @@ else
                     <select @bind="_composerModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
                         @foreach (var m in models)
                         {
-                            <option value="@m.Name">@m.Name</option>
+                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name} ({m.ReasoningEffort})";
+                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name}:{m.ReasoningEffort}";
+                            <option value="@optionValue">@displayText</option>
                         }
                     </select>
 
@@ -71,7 +83,13 @@ else
                     <select @bind="_coderModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
                         @foreach (var m in models)
                         {
-                            <option value="@m.Name">@m.Name</option>
+                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name} ({m.ReasoningEffort})";
+                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name}:{m.ReasoningEffort}";
+                            <option value="@optionValue">@displayText</option>
                         }
                     </select>
 
@@ -80,7 +98,13 @@ else
                         <option value="">(none)</option>
                         @foreach (var m in models)
                         {
-                            <option value="@m.Name">@m.Name</option>
+                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name} ({m.ReasoningEffort})";
+                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name}:{m.ReasoningEffort}";
+                            <option value="@optionValue">@displayText</option>
                         }
                     </select>
 
@@ -88,7 +112,13 @@ else
                     <select @bind="_testerModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
                         @foreach (var m in models)
                         {
-                            <option value="@m.Name">@m.Name</option>
+                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name} ({m.ReasoningEffort})";
+                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name}:{m.ReasoningEffort}";
+                            <option value="@optionValue">@displayText</option>
                         }
                     </select>
 
@@ -97,7 +127,13 @@ else
                         <option value="">(none)</option>
                         @foreach (var m in models)
                         {
-                            <option value="@m.Name">@m.Name</option>
+                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name} ({m.ReasoningEffort})";
+                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name}:{m.ReasoningEffort}";
+                            <option value="@optionValue">@displayText</option>
                         }
                     </select>
 
@@ -105,7 +141,13 @@ else
                     <select @bind="_reviewerModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
                         @foreach (var m in models)
                         {
-                            <option value="@m.Name">@m.Name</option>
+                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name} ({m.ReasoningEffort})";
+                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name}:{m.ReasoningEffort}";
+                            <option value="@optionValue">@displayText</option>
                         }
                     </select>
 
@@ -114,7 +156,13 @@ else
                         <option value="">(none)</option>
                         @foreach (var m in models)
                         {
-                            <option value="@m.Name">@m.Name</option>
+                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name} ({m.ReasoningEffort})";
+                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name}:{m.ReasoningEffort}";
+                            <option value="@optionValue">@displayText</option>
                         }
                     </select>
 
@@ -122,7 +170,13 @@ else
                     <select @bind="_docwriterModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
                         @foreach (var m in models)
                         {
-                            <option value="@m.Name">@m.Name</option>
+                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name} ({m.ReasoningEffort})";
+                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name}:{m.ReasoningEffort}";
+                            <option value="@optionValue">@displayText</option>
                         }
                     </select>
 
@@ -131,7 +185,13 @@ else
                         <option value="">(none)</option>
                         @foreach (var m in models)
                         {
-                            <option value="@m.Name">@m.Name</option>
+                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name} ({m.ReasoningEffort})";
+                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name}:{m.ReasoningEffort}";
+                            <option value="@optionValue">@displayText</option>
                         }
                     </select>
 
@@ -139,7 +199,13 @@ else
                     <select @bind="_improverModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
                         @foreach (var m in models)
                         {
-                            <option value="@m.Name">@m.Name</option>
+                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name} ({m.ReasoningEffort})";
+                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name}:{m.ReasoningEffort}";
+                            <option value="@optionValue">@displayText</option>
                         }
                     </select>
 
@@ -148,7 +214,13 @@ else
                         <option value="">(none)</option>
                         @foreach (var m in models)
                         {
-                            <option value="@m.Name">@m.Name</option>
+                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name} ({m.ReasoningEffort})";
+                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name}:{m.ReasoningEffort}";
+                            <option value="@optionValue">@displayText</option>
                         }
                     </select>
 
@@ -157,7 +229,13 @@ else
                         <option value="">(use main model)</option>
                         @foreach (var m in models)
                         {
-                            <option value="@m.Name">@m.Name</option>
+                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name} ({m.ReasoningEffort})";
+                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
+                                ? m.Name
+                                : $"{m.Name}:{m.ReasoningEffort}";
+                            <option value="@optionValue">@displayText</option>
                         }
                     </select>
 
