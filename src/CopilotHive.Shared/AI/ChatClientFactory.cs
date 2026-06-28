@@ -21,6 +21,17 @@ namespace CopilotHive.Shared.AI;
 /// </summary>
 public static class ChatClientFactory
 {
+    private static Func<string?>? _tokenProvider;
+
+    /// <summary>
+    /// Registers a provider that supplies the GitHub access token to use for the Copilot
+    /// provider. When set and it returns a non-null value, the provided token is used in
+    /// preference to the <c>GH_TOKEN</c>/<c>GITHUB_TOKEN</c> environment variables. This is the
+    /// bridge that lets the orchestrator inject the OAuth access token stored in the database
+    /// without this shared class depending on the main project.
+    /// </summary>
+    public static void SetTokenProvider(Func<string?> provider) => _tokenProvider = provider;
+
     /// <summary>
     /// Creates an <see cref="IChatClient"/> for the given model string.
     /// The model string may include a provider prefix and reasoning suffix
@@ -205,7 +216,10 @@ public static class ChatClientFactory
 
     private static IChatClient CreateCopilotClient(string model)
     {
-        var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+        var oauthToken = _tokenProvider?.Invoke();
+        var ghToken = oauthToken
+            ?? Environment.GetEnvironmentVariable("GH_TOKEN")
+            ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
         if (string.IsNullOrEmpty(ghToken)) throw new InvalidOperationException("GH_TOKEN or GITHUB_TOKEN is required for copilot provider");
 
         if (RequiresResponsesEndpoint(model))

@@ -46,6 +46,9 @@ public sealed class CopilotHiveDbContext : DbContext
     /// <summary>Task-to-goal mappings table.</summary>
     public DbSet<TaskMappingEntity> TaskMappings { get; set; } = null!;
 
+    /// <summary>Users table (single-user admin model).</summary>
+    public DbSet<UserEntity> Users { get; set; } = null!;
+
     /// <summary>
     /// Creates a new context instance for dependency injection.
     /// </summary>
@@ -83,6 +86,28 @@ public sealed class CopilotHiveDbContext : DbContext
         ConfigurePipeline(modelBuilder.Entity<PipelineEntity>());
         ConfigureConversationEntry(modelBuilder.Entity<ConversationEntryEntity>());
         ConfigureTaskMapping(modelBuilder.Entity<TaskMappingEntity>());
+        ConfigureUser(modelBuilder.Entity<UserEntity>());
+    }
+
+    private static void ConfigureUser(EntityTypeBuilder<UserEntity> entity)
+    {
+        entity.ToTable("users");
+
+        entity.HasKey(e => e.Id);
+        entity.Property(e => e.Id).HasColumnName("id").ValueGeneratedOnAdd();
+        entity.Property(e => e.GitHubId).HasColumnName("github_id").IsRequired();
+        entity.Property(e => e.Username).HasColumnName("username").IsRequired();
+        entity.Property(e => e.DisplayName).HasColumnName("display_name");
+        entity.Property(e => e.AvatarUrl).HasColumnName("avatar_url");
+        entity.Property(e => e.Email).HasColumnName("email");
+        entity.Property(e => e.AccessToken).HasColumnName("access_token").IsRequired();
+        entity.Property(e => e.RefreshToken).HasColumnName("refresh_token");
+        entity.Property(e => e.TokenExpiresAt).HasColumnName("token_expires_at");
+        entity.Property(e => e.Role).HasColumnName("role").IsRequired().HasDefaultValue("admin");
+        entity.Property(e => e.CreatedAt).HasColumnName("created_at").IsRequired();
+        entity.Property(e => e.LastLoginAt).HasColumnName("last_login_at");
+
+        entity.HasIndex(e => e.GitHubId).IsUnique();
     }
 
     private static void ConfigureTaskMapping(EntityTypeBuilder<TaskMappingEntity> entity)

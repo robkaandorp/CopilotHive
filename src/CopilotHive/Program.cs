@@ -11,6 +11,7 @@ using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
 
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.EntityFrameworkCore;
@@ -144,6 +145,97 @@ public sealed class Program
 
             builder.Services.AddSingleton<WorkerUtilizationService>();
             builder.Services.AddSingleton<ClarificationQueueService>();
+
+            // ── Authentication: GitHub OAuth (single-user admin model) ─────────────────
+            // Enabled only when both OAuth env vars are set; otherwise the system runs in
+            // open mode (no authentication), preserving backward compatibility.
+            var oauthClientId = Environment.GetEnvironmentVariable("GITHUB_OAUTH_CLIENT_ID");
+            var oauthClientSecret = Environment.GetEnvironmentVariable("GITHUB_OAUTH_CLIENT_SECRET");
+            var authEnabled = !string.IsNullOrEmpty(oauthClientId) && !string.IsNullOrEmpty(oauthClientSecret);
+
+            builder.Services.AddSingleton<UserService>();
+
+            if (authEnabled)
+            {
+                builder.Services.AddAuthentication(options =>
+                    {
+                        options.DefaultScheme = Microsoft.AspNetCore.Authentication.Cookies.CookieAuthenticationDefaults.AuthenticationScheme;
+                        options.DefaultChallengeScheme = "GitHub";
+                    })
+                    .AddCookie(options =>
+                    {
+                        options.LoginPath = "/login";
+                        options.LogoutPath = "/logout";
+                        options.ExpireTimeSpan = TimeSpan.FromDays(30);
+                        options.Cookie.HttpOnly = true;
+                    })
+                    .AddGitHub("GitHub", options =>
+                    {
+                        options.ClientId = oauthClientId!;
+                        options.ClientSecret = oauthClientSecret!;
+                        options.CallbackPath = "/signin-github";
+                        options.Scope.Add("read:user");
+                        options.Scope.Add("copilot");
+                        options.SaveTokens = true;
+
+                        options.Events.OnCreatingTicket = async context =>
+                        {
+                            var userService = context.HttpContext.RequestServices.GetRequiredService<UserService>();
+                            var ct = context.HttpContext.RequestAborted;
+
+                            var githubId = context.Identity?.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
+                                ?? context.Principal?.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
+                                ?? string.Empty;
+                            var username = context.Identity?.FindFirst(System.Security.Claims.ClaimTypes.Name)?.Value
+                                ?? string.Empty;
+                            var displayName = context.Identity?.FindFirst("urn:github:name")?.Value;
+                            var avatarUrl = context.Identity?.FindFirst("urn:github:avatar")?.Value;
+                            var email = context.Identity?.FindFirst(System.Security.Claims.ClaimTypes.Email)?.Value;
+
+                            var userCount = await userService.GetUserCountAsync(ct);
+                            if (userCount == 0)
+                            {
+                                await userService.CreateOrUpdateUserAsync(
+                                    githubId, username, displayName, avatarUrl, email,
+                                    context.AccessToken ?? string.Empty, context.RefreshToken,
+                                    context.ExpiresIn is { } exp
+                                        ? DateTime.UtcNow.Add(exp).ToString("O", System.Globalization.CultureInfo.InvariantCulture)
+                                        : null,
+                                    ct);
+                            }
+                            else
+                            {
+                                var admin = await userService.GetAdminUserAsync(ct);
+                                if (admin is not null && admin.GitHubId == githubId)
+                                {
+                                    await userService.CreateOrUpdateUserAsync(
+                                        githubId, username, displayName, avatarUrl, email,
+                                        context.AccessToken ?? string.Empty, context.RefreshToken,
+                                        context.ExpiresIn is { } exp
+                                            ? DateTime.UtcNow.Add(exp).ToString("O", System.Globalization.CultureInfo.InvariantCulture)
+                                            : null,
+                                        ct);
+                                }
+                                else
+                                {
+                                    context.Fail("Only one user (admin) is allowed in this version.");
+                                }
+                            }
+                        };
+                    });
+
+                // Require authenticated users by default for every endpoint. Endpoints that
+                // must stay open (health, login, logout, gRPC) opt out via .AllowAnonymous().
+                // The fallback policy is only set when auth is enabled, so open mode remains
+                // fully accessible for backward compatibility.
+                builder.Services.AddAuthorization(options =>
+                {
+                    options.FallbackPolicy = new AuthorizationPolicyBuilder()
+                        .RequireAuthenticatedUser()
+                        .Build();
+                });
+                builder.Services.AddCascadingAuthenticationState();
+            }
 
             // Composer agent (optional — enabled when config has a composer section or BRAIN_MODEL is set)
             // Registered BEFORE GoalDispatcher so the IClarificationRouter forwarding is available.
@@ -317,6 +409,15 @@ public sealed class Program
                 logger.LogError(ex, "Unexpected exception during CopilotHiveDbContext.EnsureCreated; continuing startup");
             }
 
+            // Wire up the ChatClientFactory token provider BEFORE any chat clients are created
+            // (Brain/Composer connect below and instantiate Copilot clients). The Copilot client
+            // uses the OAuth access token stored in the database, falling back to GH_TOKEN/GITHUB_TOKEN
+            // when no user has authenticated yet. Done regardless of authEnabled — the provider
+            // returns null when no users exist.
+            var userService = app.Services.GetRequiredService<UserService>();
+            CopilotHive.Shared.AI.ChatClientFactory.SetTokenProvider(() =>
+                userService.GetActiveAccessTokenAsync(CancellationToken.None).GetAwaiter().GetResult());
+
             if (!string.IsNullOrEmpty(brainModel))
                 logger.LogInformation("Brain enabled — model: {BrainModel}", brainModel);
             else
@@ -441,10 +542,18 @@ public sealed class Program
                 }
             }
 
-            app.MapGrpcService<HiveOrchestratorService>();
+            app.MapGrpcService<HiveOrchestratorService>().AllowAnonymous();
 
             // Dashboard: Blazor Server (antiforgery keys persisted to state volume)
+            // Static files are intentionally placed before auth/authorization middleware
+            // so the fallback authorization policy does not challenge non-endpoint static
+            // asset requests (css, js, _framework, favicon, etc.).
             app.UseStaticFiles();
+            if (authEnabled)
+            {
+                app.UseAuthentication();
+                app.UseAuthorization();
+            }
             app.UseAntiforgery();
             app.MapRazorComponents<CopilotHive.Components.App>()
                 .AddInteractiveServerRenderMode();

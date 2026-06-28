@@ -5,6 +5,9 @@ using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
 
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.Sqlite;
 
@@ -46,9 +49,24 @@ public static class ApiEndpoints
                 CheckNumber = count,
                 WorkerPool = workerPool.GetDetailedStats(),
             });
-        });
+        }).AllowAnonymous();
 
-        app.MapGet("/health/utilization", (WorkerUtilizationService svc) => Results.Ok(svc.GetUtilization()));
+        app.MapGet("/health/utilization", (WorkerUtilizationService svc) => Results.Ok(svc.GetUtilization())).AllowAnonymous();
+
+        // Logout: clears the auth cookie and returns the user to the login page.
+        // Safe to register even when authentication is not configured — when the cookie
+        // scheme is absent the sign-out is skipped and the redirect still works.
+        app.MapPost("/logout", async (HttpContext ctx) =>
+        {
+            var schemeProvider = ctx.RequestServices.GetService<IAuthenticationSchemeProvider>();
+            if (schemeProvider is not null)
+            {
+                var cookieScheme = await schemeProvider.GetSchemeAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+                if (cookieScheme is not null)
+                    await ctx.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+            }
+            return Results.Redirect("/login");
+        }).AllowAnonymous().DisableAntiforgery();
     }
 
     /// <summary>

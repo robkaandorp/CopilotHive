@@ -1,0 +1,53 @@
+@page "/login"
+@layout EmptyLayout
+@attribute [Microsoft.AspNetCore.Authorization.AllowAnonymous]
+
+<div class="login-container">
+    <div class="login-card">
+        <h1 class="login-title">CopilotHive</h1>
+        <p class="login-subtitle">Please sign in to continue.</p>
+        <a class="login-button" href="/signin-github">Sign in with GitHub</a>
+    </div>
+</div>
+
+<style>
+    .login-container {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 80vh;
+    }
+
+    .login-card {
+        text-align: center;
+        padding: 2.5rem 3rem;
+        border: 1px solid var(--border, #2a2a2a);
+        border-radius: 12px;
+        background: var(--surface, #1a1a1a);
+        box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+    }
+
+    .login-title {
+        margin: 0 0 0.5rem;
+        font-size: 1.75rem;
+    }
+
+    .login-subtitle {
+        margin: 0 0 1.5rem;
+        color: var(--text-muted, #888);
+    }
+
+    .login-button {
+        display: inline-block;
+        padding: 0.65rem 1.5rem;
+        background: #24292f;
+        color: #fff;
+        border-radius: 6px;
+        text-decoration: none;
+        font-weight: 600;
+    }
+
+    .login-button:hover {
+        background: #30363d;
+    }
+</style>
