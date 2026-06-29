@@ -36,6 +36,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private IChatClient? _chatClient;
     private CodingAgent? _agent;
     private AgentSession _session;
+    private AgentOptions _agentOptions = null!;
 
     private readonly HiveConfigFile? _hiveConfig;
     private readonly string _systemPrompt;
@@ -536,6 +537,47 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _logger.LogDebug("Composer session saved ({Count} messages)", _session.MessageHistory.Count);
     }
 
+    /// <summary>
+    /// Force-compacts the Composer's conversation history into a summary, reducing token usage.
+    /// </summary>
+    /// <param name="ct">A token to cancel the compaction operation.</param>
+    /// <returns><c>true</c> if compaction occurred; otherwise <c>false</c>.</returns>
+    public async Task<bool> CompactSessionAsync(CancellationToken ct = default)
+    {
+        if (_agent is null)
+            throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
+
+        if (_isStreaming)
+            throw new InvalidOperationException("Cannot compact while streaming.");
+
+        IsCompacting = true;
+        OnCompactingStarted?.Invoke();
+
+        try
+        {
+            var compactor = new ContextCompactor(_agentOptions.CompactionClient ?? _chatClient!, _logger);
+            var result = await compactor.ForceCompactAsync(_session, _agentOptions, ct);
+            if (result)
+            {
+                await SaveSessionAsync(ct);
+                _logger.LogInformation(
+                    "Composer session manually compacted ({Count} messages remaining)",
+                    _session.MessageHistory.Count);
+            }
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Composer manual compaction failed");
+            return false;
+        }
+        finally
+        {
+            IsCompacting = false;
+            OnCompacted?.Invoke();
+        }
+    }
+
     private void RecreateAgent()
     {
         if (_chatClient is null)
@@ -543,7 +585,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
         var workDir = _repoManager?.WorkDirectory ?? _stateDir;
 
-        _agent = new CodingAgent(_chatClient, new AgentOptions
+        _agentOptions = new AgentOptions
         {
             WorkDirectory = workDir,
             MaxSteps = _maxSteps,
@@ -579,7 +621,9 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 WasCompacted = true;
                 OnCompacted?.Invoke();
             },
-        });
+        };
+
+        _agent = new CodingAgent(_chatClient, _agentOptions);
 
         _logger.LogDebug("Composer CodingAgent created with WorkDirectory={WorkDir}, FileOps={FileOps}",
             workDir, _repoManager is not null);

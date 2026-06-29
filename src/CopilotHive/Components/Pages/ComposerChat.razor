@@ -167,6 +167,16 @@ else
                 <button @onclick="ResetSession" disabled="@Composer.IsStreaming" class="chat-action-btn">
                     🔄 New Session
                 </button>
+                <button @onclick="CompactSession" disabled="@(Composer.IsStreaming || Composer.IsCompacting)" class="chat-action-btn">
+                    @if (Composer.IsCompacting)
+                    {
+                        <span>Compacting…</span>
+                    }
+                    else
+                    {
+                        <text>📦 Compact</text>
+                    }
+                </button>
                 <span class="text-muted chat-hint">
                     @(_messages.Count) msgs
                     @if (Composer.LastToolCalls > 0)
@@ -272,6 +282,24 @@ else
         await Composer.ResetSessionAsync();
         _messages.Clear();
         StateHasChanged();
+    }
+
+    private async Task CompactSession()
+    {
+        if (Composer.IsStreaming || Composer.IsCompacting) return;
+        try
+        {
+            var response = await HttpClient.PostAsync("/api/composer/compact", null);
+            if (response.IsSuccessStatusCode)
+            {
+                LoadHistory();
+            }
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ComposerChat] Compact failed: {ex.Message}");
+        }
     }
 
     private async Task LoadAvailableModelsAsync()
