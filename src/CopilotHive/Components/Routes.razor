@@ -1,8 +1,20 @@
 @using Microsoft.AspNetCore.Components.Routing
+@inject NavigationManager NavigationManager
 
 <Router AppAssembly="typeof(App).Assembly">
     <Found Context="routeData">
-        <RouteView RouteData="routeData" DefaultLayout="typeof(MainLayout)" />
+        @if (_authEnabled)
+        {
+            <AuthorizeRouteView RouteData="routeData" DefaultLayout="typeof(MainLayout)">
+                <NotAuthorized>
+                    <RedirectToLogin />
+                </NotAuthorized>
+            </AuthorizeRouteView>
+        }
+        else
+        {
+            <RouteView RouteData="routeData" DefaultLayout="typeof(MainLayout)" />
+        }
     </Found>
     <NotFound>
         <LayoutView Layout="typeof(MainLayout)">
@@ -10,3 +22,13 @@
         </LayoutView>
     </NotFound>
 </Router>
+
+@code {
+    // Authentication is only wired up (including the Task<AuthenticationState> cascade
+    // required by AuthorizeRouteView) when GitHub OAuth env vars are present — mirroring
+    // the logic in Program.cs. In open mode the cascade is absent, so fall back to a
+    // plain RouteView to preserve backward compatibility and avoid a missing-cascade throw.
+    private static readonly bool _authEnabled =
+        !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("GITHUB_OAUTH_CLIENT_ID"))
+        && !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("GITHUB_OAUTH_CLIENT_SECRET"));
+}

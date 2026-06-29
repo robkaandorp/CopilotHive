@@ -78,6 +78,60 @@ body {
 .hive-nav a:hover { background: var(--bg-card); color: var(--text); }
 .hive-nav a.active { background: var(--bg-card); color: var(--accent); }
 
+/* Authenticated user profile and sign-out pinned to the bottom of the nav */
+.nav-user {
+    margin-top: auto;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.nav-user-info {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0.5rem;
+}
+
+.nav-user-avatar {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.nav-user-name {
+    color: var(--text);
+    font-size: 0.85rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nav-user-logout {
+    margin: 0;
+}
+
+.nav-user-logout-btn {
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    padding: 0.5rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font: inherit;
+    transition: background 0.15s, color 0.15s;
+}
+
+.nav-user-logout-btn:hover {
+    background: var(--bg-card);
+    color: var(--text);
+}
+
 /* Version badge pinned to the bottom of the nav */
 .nav-version {
     margin-top: auto;

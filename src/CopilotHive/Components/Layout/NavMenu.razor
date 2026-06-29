@@ -25,12 +25,33 @@
 <NavLink href="/configuration">⚙️ <span class="nav-label">Configuration</span></NavLink>
 <NavLink href="/logs">🪵 <span class="nav-label">Logs</span></NavLink>
 
+@if (_authEnabled)
+{
+    <AuthorizeView>
+        <Authorized>
+            <div class="nav-user">
+                <div class="nav-user-info">
+                    <img class="nav-user-avatar" src="@context.User.FindFirst("urn:github:avatar")?.Value" alt="avatar" />
+                    <span class="nav-user-name nav-label">@context.User.Identity?.Name</span>
+                </div>
+                <form class="nav-user-logout" action="/logout" method="post">
+                    <AntiforgeryToken />
+                    <button type="submit" class="nav-user-logout-btn">
+                        🚪 <span class="nav-label">Sign out</span>
+                    </button>
+                </form>
+            </div>
+        </Authorized>
+    </AuthorizeView>
+}
+
 @code {
     [Inject] private DashboardStateService State { get; set; } = default!;
     [Inject] private ClarificationQueueService ClarificationQueue { get; set; } = default!;
 
     private int _pendingClarifications;
     private int _knowledgeDocCount;
+    private bool _authEnabled = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("GITHUB_OAUTH_CLIENT_ID"));
 
     protected override void OnInitialized()
     {

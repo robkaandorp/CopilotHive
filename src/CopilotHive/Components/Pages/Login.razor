@@ -1,53 +1,117 @@
 @page "/login"
 @layout EmptyLayout
 @attribute [Microsoft.AspNetCore.Authorization.AllowAnonymous]
+@inject NavigationManager NavigationManager
 
 <div class="login-container">
     <div class="login-card">
+        <div class="login-logo">🐝</div>
         <h1 class="login-title">CopilotHive</h1>
         <p class="login-subtitle">Please sign in to continue.</p>
-        <a class="login-button" href="/signin-github">Sign in with GitHub</a>
+
+        @if (!string.IsNullOrEmpty(_errorMessage))
+        {
+            <div class="login-error" role="alert">
+                @_errorMessage
+            </div>
+        }
+
+        <a class="login-button" href="/signin-github">
+            <svg class="login-button-icon" viewBox="0 0 16 16" width="20" height="20" aria-hidden="true">
+                <path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path>
+            </svg>
+            <span>Sign in with GitHub</span>
+        </a>
     </div>
 </div>
+
+@code {
+    private string? _errorMessage;
+
+    protected override void OnInitialized()
+    {
+        var uri = NavigationManager.ToAbsoluteUri(NavigationManager.Uri);
+        var query = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(uri.Query);
+
+        if (query.TryGetValue("error", out var error) && !string.IsNullOrWhiteSpace(error))
+        {
+            _errorMessage = error.ToString();
+        }
+        else if (query.TryGetValue("message", out var message) && !string.IsNullOrWhiteSpace(message))
+        {
+            _errorMessage = message.ToString();
+        }
+    }
+}
 
 <style>
     .login-container {
         display: flex;
         align-items: center;
         justify-content: center;
-        min-height: 80vh;
+        min-height: 100vh;
+        background: var(--bg, #0d1117);
     }
 
     .login-card {
         text-align: center;
         padding: 2.5rem 3rem;
-        border: 1px solid var(--border, #2a2a2a);
+        border: 1px solid var(--border, #30363d);
         border-radius: 12px;
-        background: var(--surface, #1a1a1a);
-        box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+        background: var(--bg-card, #161b22);
+        box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+        max-width: 360px;
+        width: 100%;
+    }
+
+    .login-logo {
+        font-size: 2.5rem;
+        margin-bottom: 0.5rem;
     }
 
     .login-title {
         margin: 0 0 0.5rem;
         font-size: 1.75rem;
+        color: var(--text, #e6edf3);
     }
 
     .login-subtitle {
         margin: 0 0 1.5rem;
-        color: var(--text-muted, #888);
+        color: var(--text-muted, #7d8590);
+    }
+
+    .login-error {
+        margin: 0 0 1.5rem;
+        padding: 0.75rem 1rem;
+        border: 1px solid var(--red, #f85149);
+        border-radius: 6px;
+        background: rgba(248, 81, 73, 0.1);
+        color: var(--red, #f85149);
+        font-size: 0.9rem;
+        text-align: left;
+        word-break: break-word;
     }
 
     .login-button {
-        display: inline-block;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.6rem;
+        width: 100%;
         padding: 0.65rem 1.5rem;
         background: #24292f;
         color: #fff;
         border-radius: 6px;
         text-decoration: none;
         font-weight: 600;
+        transition: background 0.15s;
     }
 
     .login-button:hover {
         background: #30363d;
+    }
+
+    .login-button-icon {
+        flex-shrink: 0;
     }
 </style>

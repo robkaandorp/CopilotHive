@@ -1,0 +1,12 @@
+@inject NavigationManager NavigationManager
+
+@code {
+    // Tiny helper component used by AuthorizeRouteView's <NotAuthorized> template to send
+    // unauthenticated users to the login page. The actual middleware FallbackPolicy will
+    // also redirect server-side, but this covers interactive navigation within the SPA.
+    protected override void OnInitialized()
+    {
+        var returnUrl = Uri.EscapeDataString(NavigationManager.ToBaseRelativePath(NavigationManager.Uri));
+        NavigationManager.NavigateTo($"/login?returnUrl={returnUrl}", forceLoad: true);
+    }
+}
