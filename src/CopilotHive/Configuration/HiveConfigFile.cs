@@ -45,10 +45,11 @@ public sealed class HiveConfigFile
     /// </summary>
     /// <param name="modelName">Model identifier to look up.</param>
     /// <returns>The configured context window, or <c>null</c> if the model is not found or has no value set.</returns>
-    public int? TryGetContextWindowForModel(string modelName)
+    public int? TryGetContextWindowForModel(string? modelName)
     {
+        var strippedName = StripReasoningSuffix(modelName);
         var entry = Models?.AvailableModels?.FirstOrDefault(
-            m => string.Equals(m.Name, modelName, StringComparison.OrdinalIgnoreCase));
+            m => string.Equals(m.Name, strippedName, StringComparison.OrdinalIgnoreCase));
         return entry?.ContextWindow;
     }
 
@@ -61,15 +62,37 @@ public sealed class HiveConfigFile
     };
 
     /// <summary>
+    /// Strips a known reasoning-effort suffix (e.g. <c>:high</c>) from a model name.
+    /// Returns the name unchanged if the suffix after the last colon is not a known
+    /// reasoning level, so provider prefixes like <c>ollama-cloud/gpt-oss:120b</c> are preserved.
+    /// </summary>
+    /// <param name="name">Model name that may carry a reasoning suffix.</param>
+    private static string StripReasoningSuffix(string? name)
+    {
+        if (string.IsNullOrEmpty(name))
+            return name ?? string.Empty;
+
+        var lastColon = name.LastIndexOf(':');
+        if (lastColon > 0 && lastColon < name.Length - 1)
+        {
+            var suffix = name.Substring(lastColon + 1);
+            if (KnownReasoningLevels.Contains(suffix))
+                return name.Substring(0, lastColon);
+        }
+        return name;
+    }
+
+    /// <summary>
     /// Looks up the model in <see cref="ModelsConfig.AvailableModels"/> and returns its
     /// <see cref="ModelEntry.ReasoningEffort"/> if set.
     /// </summary>
     /// <param name="modelName">Model identifier to look up.</param>
     /// <returns>The configured reasoning effort, or <c>null</c> if the model is not found or has no value set.</returns>
-    public string? TryGetReasoningEffortForModel(string modelName)
+    public string? TryGetReasoningEffortForModel(string? modelName)
     {
+        var strippedName = StripReasoningSuffix(modelName);
         var entry = Models?.AvailableModels?.FirstOrDefault(
-            m => string.Equals(m.Name, modelName, StringComparison.OrdinalIgnoreCase));
+            m => string.Equals(m.Name, strippedName, StringComparison.OrdinalIgnoreCase));
         return entry?.ReasoningEffort;
     }
 
