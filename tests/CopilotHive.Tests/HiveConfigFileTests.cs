@@ -181,9 +181,7 @@ public sealed class HiveConfigFileTests
                 MaxParallelGoals = 3,
                 AlwaysImprove = true,
                 VerboseLogging = true,
-                BrainContextWindow = 300000,
                 BrainMaxSteps = 50,
-                WorkerContextWindow = 180000,
                 BranchCleanupDelayHours = 24
             },
             Models = new ModelsConfig
@@ -199,7 +197,6 @@ public sealed class HiveConfigFileTests
             {
                 Model = "copilot/composer-model",
                 Models = ["copilot/composer-model", "copilot/alt-model"],
-                ContextWindow = 160000,
                 MaxSteps = 25
             }
         };
@@ -237,9 +234,7 @@ public sealed class HiveConfigFileTests
         Assert.Equal(3, receiver.Orchestrator.MaxParallelGoals);
         Assert.True(receiver.Orchestrator.AlwaysImprove);
         Assert.True(receiver.Orchestrator.VerboseLogging);
-        Assert.Equal(300000, receiver.Orchestrator.BrainContextWindow);
         Assert.Equal(50, receiver.Orchestrator.BrainMaxSteps);
-        Assert.Equal(180000, receiver.Orchestrator.WorkerContextWindow);
         Assert.Equal(24, receiver.Orchestrator.BranchCleanupDelayHours);
 
         // Assert — Models
@@ -257,7 +252,6 @@ public sealed class HiveConfigFileTests
         Assert.Equal(2, receiver.Composer.Models!.Count);
         Assert.Equal("copilot/composer-model", receiver.Composer.Models[0]);
         Assert.Equal("copilot/alt-model", receiver.Composer.Models[1]);
-        Assert.Equal(160000, receiver.Composer.ContextWindow);
         Assert.Equal(25, receiver.Composer.MaxSteps);
     }
 
@@ -280,7 +274,6 @@ public sealed class HiveConfigFileTests
             {
                 Model = "old-composer",
                 Models = ["old-composer", "old-alt"],
-                ContextWindow = 50000,
                 MaxSteps = 10
             }
         };
@@ -327,9 +320,7 @@ public sealed class HiveConfigFileTests
                 MaxParallelGoals = 1,
                 AlwaysImprove = false,
                 VerboseLogging = false,
-                BrainContextWindow = 200000,
                 BrainMaxSteps = 30,
-                WorkerContextWindow = 128000,
                 BranchCleanupDelayHours = 48
             },
             Models = new ModelsConfig
@@ -341,7 +332,6 @@ public sealed class HiveConfigFileTests
             {
                 Model = "orig-composer",
                 Models = ["orig-composer", "orig-alt"],
-                ContextWindow = 80000,
                 MaxSteps = 15
             }
         };
@@ -403,7 +393,6 @@ public sealed class HiveConfigFileTests
             {
                 Model = "old-composer",
                 Models = ["old-composer"],
-                ContextWindow = 40000,
                 MaxSteps = 5
             }
         };
@@ -431,9 +420,7 @@ public sealed class HiveConfigFileTests
                 MaxParallelGoals = 4,
                 AlwaysImprove = true,
                 VerboseLogging = false,
-                BrainContextWindow = 500000,
                 BrainMaxSteps = 100,
-                WorkerContextWindow = 200000,
                 BranchCleanupDelayHours = 12
             },
             Models = new ModelsConfig
@@ -445,7 +432,6 @@ public sealed class HiveConfigFileTests
             {
                 Model = "new-composer",
                 Models = ["new-composer", "new-alt"],
-                ContextWindow = 150000,
                 MaxSteps = 20
             }
         };
@@ -743,5 +729,166 @@ public sealed class HiveConfigFileTests
         var result = HiveConfigFile.ApplyReasoningSuffix(model, "high");
 
         Assert.Equal(model, result);
+    }
+
+    // ── TryGetContextWindowForModel tests (Brain & Composer resolution) ─────────
+
+    [Fact]
+    public void TryGetContextWindowForModel_ModelFound_ReturnsContextWindow()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "brain-model", ContextWindow = 200_000 },
+                    new ModelEntry { Name = "composer-model", ContextWindow = 128_000 }
+                ]
+            }
+        };
+
+        // Brain resolution: model-specific value returned
+        Assert.Equal(200_000, config.TryGetContextWindowForModel("brain-model"));
+        // Composer resolution: model-specific value returned
+        Assert.Equal(128_000, config.TryGetContextWindowForModel("composer-model"));
+    }
+
+    [Fact]
+    public void TryGetContextWindowForModel_ModelNotFound_ReturnsNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "known-model", ContextWindow = 200_000 }
+                ]
+            }
+        };
+
+        // Brain resolution: model not found → null (caller falls back to DefaultBrainContextWindow)
+        Assert.Null(config.TryGetContextWindowForModel("unknown-brain-model"));
+        // Composer resolution: model not found → null
+        Assert.Null(config.TryGetContextWindowForModel("unknown-composer-model"));
+    }
+
+    [Fact]
+    public void TryGetContextWindowForModel_NoModelsSection_ReturnsNull()
+    {
+        var config = new HiveConfigFile();
+
+        // No Models section at all → null for any model
+        Assert.Null(config.TryGetContextWindowForModel("any-model"));
+    }
+
+    [Fact]
+    public void TryGetContextWindowForModel_EmptyAvailableModels_ReturnsNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig { AvailableModels = [] }
+        };
+
+        Assert.Null(config.TryGetContextWindowForModel("any-model"));
+    }
+
+    [Fact]
+    public void TryGetContextWindowForModel_CaseInsensitive_ReturnsContextWindow()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "Copilot/Claude-Sonnet-4.6", ContextWindow = 200_000 }
+                ]
+            }
+        };
+
+        Assert.Equal(200_000, config.TryGetContextWindowForModel("copilot/claude-sonnet-4.6"));
+        Assert.Equal(200_000, config.TryGetContextWindowForModel("COPILOT/CLAUDE-SONNET-4.6"));
+    }
+
+    // ── YAML backward compatibility: removed fields still deserialize ───────────
+
+    [Fact]
+    public void Deserialize_OrchestratorBrainContextWindow_IgnoredWithoutError()
+    {
+        const string yaml = """
+            version: "1.0"
+            orchestrator:
+              model: copilot/test-model
+              brain_context_window: 256000
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        Assert.NotNull(config);
+        Assert.Equal("copilot/test-model", config.Orchestrator.Model);
+    }
+
+    [Fact]
+    public void Deserialize_OrchestratorWorkerContextWindow_IgnoredWithoutError()
+    {
+        const string yaml = """
+            version: "1.0"
+            orchestrator:
+              model: copilot/test-model
+              worker_context_window: 128000
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        Assert.NotNull(config);
+        Assert.Equal("copilot/test-model", config.Orchestrator.Model);
+    }
+
+    [Fact]
+    public void Deserialize_ComposerContextWindow_IgnoredWithoutError()
+    {
+        const string yaml = """
+            version: "1.0"
+            composer:
+              model: copilot/composer-model
+              context_window: 100000
+              max_steps: 50
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        Assert.NotNull(config);
+        Assert.NotNull(config.Composer);
+        Assert.Equal("copilot/composer-model", config.Composer.Model);
+        Assert.Equal(50, config.Composer.MaxSteps);
+    }
+
+    [Fact]
+    public void Deserialize_AllRemovedFieldsPresent_IgnoredWithoutError()
+    {
+        // All three removed fields present in the same YAML — should all be ignored
+        const string yaml = """
+            version: "1.0"
+            orchestrator:
+              model: copilot/test-model
+              brain_context_window: 300000
+              worker_context_window: 180000
+              brain_max_steps: 75
+            composer:
+              model: copilot/composer-model
+              context_window: 160000
+              max_steps: 25
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        Assert.NotNull(config);
+        Assert.Equal("copilot/test-model", config.Orchestrator.Model);
+        Assert.Equal(75, config.Orchestrator.BrainMaxSteps);
+        Assert.NotNull(config.Composer);
+        Assert.Equal("copilot/composer-model", config.Composer.Model);
+        Assert.Equal(25, config.Composer.MaxSteps);
     }
 }

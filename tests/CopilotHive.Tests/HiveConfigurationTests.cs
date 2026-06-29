@@ -79,7 +79,6 @@ public class HiveConfigurationTests
         const int coderWindow = 200_000;
         var config = new HiveConfigFile
         {
-            Orchestrator = { WorkerContextWindow = 100_000 },
             Workers =
             {
                 ["coder"] = new WorkerConfig { ContextWindow = coderWindow },
@@ -90,15 +89,16 @@ public class HiveConfigurationTests
     }
 
     [Fact]
-    public void GetContextWindowForRole_NoPerRole_FallsBackToOrchestratorWorkerContextWindow()
+    public void GetContextWindowForRole_NoPerRole_FallsBackToModelSpecificContextWindow()
     {
-        const int orchestratorWindow = 120_000;
+        const int modelWindow = 120_000;
         var config = new HiveConfigFile
         {
-            Orchestrator = { WorkerContextWindow = orchestratorWindow },
+            Orchestrator = { Model = "test-model" },
+            Models = new ModelsConfig { AvailableModels = [new ModelEntry { Name = "test-model", ContextWindow = modelWindow }] }
         };
 
-        Assert.Equal(orchestratorWindow, config.GetContextWindowForRole(WorkerRole.Tester));
+        Assert.Equal(modelWindow, config.GetContextWindowForRole(WorkerRole.Tester));
     }
 
     [Fact]
@@ -107,5 +107,106 @@ public class HiveConfigurationTests
         var config = new HiveConfigFile();
 
         Assert.Equal(Constants.DefaultBrainContextWindow, config.GetContextWindowForRole(WorkerRole.Coder));
+    }
+
+    // ── Integration tests for simplified context window resolution chains ────────
+
+    [Fact]
+    public void GetContextWindowForRole_PerRoleOverrideWins_WhenModelSpecificAlsoSet()
+    {
+        const int perRoleWindow = 250_000;
+        const int modelWindow = 120_000;
+        var config = new HiveConfigFile
+        {
+            Orchestrator = { Model = "coder-model" },
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { ContextWindow = perRoleWindow, Model = "coder-model" },
+            },
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "coder-model", ContextWindow = modelWindow }]
+            }
+        };
+
+        // Per-role override should win over model-specific
+        Assert.Equal(perRoleWindow, config.GetContextWindowForRole(WorkerRole.Coder));
+    }
+
+    [Fact]
+    public void GetContextWindowForRole_ModelSpecificFallback_WhenNoPerRoleSet()
+    {
+        const int modelWindow = 180_000;
+        var config = new HiveConfigFile
+        {
+            Orchestrator = { Model = "fallback-model" },
+            Workers =
+            {
+                // No ContextWindow set on the worker — only Model
+                ["tester"] = new WorkerConfig { Model = "tester-specific-model" },
+            },
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "tester-specific-model", ContextWindow = modelWindow }]
+            }
+        };
+
+        // No per-role ContextWindow, but model-specific should be returned
+        Assert.Equal(modelWindow, config.GetContextWindowForRole(WorkerRole.Tester));
+    }
+
+    [Fact]
+    public void GetContextWindowForRole_DefaultBrainContextWindow_WhenNothingConfigured()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = { Model = "unknown-model" },
+            // No per-role workers, no AvailableModels — should fall back to DefaultBrainContextWindow
+        };
+
+        Assert.Equal(Constants.DefaultBrainContextWindow, config.GetContextWindowForRole(WorkerRole.Coder));
+        Assert.Equal(Constants.DefaultBrainContextWindow, config.GetContextWindowForRole(WorkerRole.Tester));
+        Assert.Equal(Constants.DefaultBrainContextWindow, config.GetContextWindowForRole(WorkerRole.Reviewer));
+    }
+
+    [Fact]
+    public void GetContextWindowForRole_ModelNotInAvailableModels_FallsBackToDefault()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = { Model = "orchestrator-model" },
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "other-model", ContextWindow = 100_000 }
+                ]
+            }
+        };
+
+        // The orchestrator-model is not in AvailableModels, so no model-specific value found
+        Assert.Equal(Constants.DefaultBrainContextWindow, config.GetContextWindowForRole(WorkerRole.Coder));
+    }
+
+    [Fact]
+    public void GetContextWindowForRole_PerRoleZero_FallsThroughToModelSpecific()
+    {
+        const int modelWindow = 150_000;
+        var config = new HiveConfigFile
+        {
+            Orchestrator = { Model = "test-model" },
+            Workers =
+            {
+                // ContextWindow of 0 means "not set" — should fall through
+                ["coder"] = new WorkerConfig { ContextWindow = 0, Model = "test-model" },
+            },
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "test-model", ContextWindow = modelWindow }]
+            }
+        };
+
+        // Per-role is 0 (not set), should fall through to model-specific
+        Assert.Equal(modelWindow, config.GetContextWindowForRole(WorkerRole.Coder));
     }
 }

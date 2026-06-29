@@ -102,7 +102,6 @@ public sealed class HiveConfigFile
     /// Resolves the context window size for a given role.
     /// Returns the per-role <c>context_window</c> if set and greater than 0,
     /// otherwise the model-specific context window from the global <c>available_models</c> list,
-    /// then the orchestrator's <c>worker_context_window</c>,
     /// or finally <see cref="Constants.DefaultBrainContextWindow"/>.
     /// </summary>
     /// <param name="roleName">Role name (e.g. "coder", "reviewer").</param>
@@ -117,8 +116,6 @@ public sealed class HiveConfigFile
         if (modelCtx.HasValue && modelCtx.Value > 0)
             return modelCtx.Value;
 
-        if (Orchestrator.WorkerContextWindow > 0)
-            return Orchestrator.WorkerContextWindow;
         return Constants.DefaultBrainContextWindow;
     }
 
@@ -191,9 +188,7 @@ public sealed class HiveConfigFile
             MaxParallelGoals = source.Orchestrator.MaxParallelGoals,
             AlwaysImprove = source.Orchestrator.AlwaysImprove,
             VerboseLogging = source.Orchestrator.VerboseLogging,
-            BrainContextWindow = source.Orchestrator.BrainContextWindow,
             BrainMaxSteps = source.Orchestrator.BrainMaxSteps,
-            WorkerContextWindow = source.Orchestrator.WorkerContextWindow,
             BranchCleanupDelayHours = source.Orchestrator.BranchCleanupDelayHours
         };
 
@@ -221,7 +216,6 @@ public sealed class HiveConfigFile
             {
                 Model = source.Composer.Model,
                 Models = source.Composer.Models?.ToList(),
-                ContextWindow = source.Composer.ContextWindow,
                 MaxSteps = source.Composer.MaxSteps
             };
         }

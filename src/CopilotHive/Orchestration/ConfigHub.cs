@@ -215,7 +215,7 @@ public static class ConfigHub
         {
             if (svc is null)
                 return Results.Problem("Config service is not configured.");
-            await svc.UpdateComposerSettingsAsync(update.ContextWindow, update.MaxSteps);
+            await svc.UpdateComposerSettingsAsync(update.MaxSteps);
             return Results.Ok(new { saved = true });
         });
     }

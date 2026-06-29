@@ -601,16 +601,8 @@ else
                         <label style="color:var(--text-muted);font-size:0.9rem">Verbose Logging</label>
                         <input type="checkbox" @bind="_orchVerboseLogging" style="width:1.1rem;height:1.1rem;cursor:pointer" />
 
-                        <label style="color:var(--text-muted);font-size:0.9rem">Brain Context Window</label>
-                        <input type="number" @bind="_orchBrainContextWindow"
-                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
-
                         <label style="color:var(--text-muted);font-size:0.9rem">Brain Max Steps</label>
                         <input type="number" @bind="_orchBrainMaxSteps"
-                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
-
-                        <label style="color:var(--text-muted);font-size:0.9rem">Worker Context Window</label>
-                        <input type="number" @bind="_orchWorkerContextWindow"
                                style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
 
                         <label style="color:var(--text-muted);font-size:0.9rem">Branch Cleanup Delay Hours</label>
@@ -698,10 +690,6 @@ else
                         <p style="color:var(--text-muted);font-style:italic;margin-bottom:1rem">Composer is not configured yet. Set values below and save to create it.</p>
                     }
                     <div style="display:grid;grid-template-columns:14rem 1fr;gap:0.75rem 1rem;align-items:center;max-width:600px">
-                        <label style="color:var(--text-muted);font-size:0.9rem">Context Window</label>
-                        <input type="number" @bind="_composerContextWindow"
-                               style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
-
                         <label style="color:var(--text-muted);font-size:0.9rem">Max Steps</label>
                         <input type="number" @bind="_composerMaxSteps"
                                style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
@@ -789,9 +777,7 @@ else
         [property: JsonPropertyName("maxParallelGoals")] int MaxParallelGoals,
         [property: JsonPropertyName("alwaysImprove")] bool AlwaysImprove,
         [property: JsonPropertyName("verboseLogging")] bool VerboseLogging,
-        [property: JsonPropertyName("brainContextWindow")] int BrainContextWindow,
         [property: JsonPropertyName("brainMaxSteps")] int BrainMaxSteps,
-        [property: JsonPropertyName("workerContextWindow")] int WorkerContextWindow,
         [property: JsonPropertyName("branchCleanupDelayHours")] int BranchCleanupDelayHours);
 
     private sealed record WorkerResponseDto(
@@ -801,7 +787,6 @@ else
 
     private sealed record ComposerConfigResponse(
         [property: JsonPropertyName("model")] string? Model,
-        [property: JsonPropertyName("contextWindow")] int ContextWindow,
         [property: JsonPropertyName("maxSteps")] int MaxSteps);
 
     private bool _loading = true;
@@ -877,9 +862,7 @@ else
     private int _orchMaxParallelGoals;
     private bool _orchAlwaysImprove;
     private bool _orchVerboseLogging;
-    private int _orchBrainContextWindow;
     private int _orchBrainMaxSteps;
-    private int _orchWorkerContextWindow;
     private int _orchBranchCleanupDelayHours;
 
     // Workers tab
@@ -900,7 +883,6 @@ else
     private bool _composerSaving;
     private string? _composerSaveError;
     private string? _composerSaveSuccess;
-    private int _composerContextWindow;
     private int _composerMaxSteps;
 
     protected override async Task OnInitializedAsync()
@@ -1137,9 +1119,7 @@ else
                 _orchMaxParallelGoals = _orchestratorData.MaxParallelGoals;
                 _orchAlwaysImprove = _orchestratorData.AlwaysImprove;
                 _orchVerboseLogging = _orchestratorData.VerboseLogging;
-                _orchBrainContextWindow = _orchestratorData.BrainContextWindow;
                 _orchBrainMaxSteps = _orchestratorData.BrainMaxSteps;
-                _orchWorkerContextWindow = _orchestratorData.WorkerContextWindow;
                 _orchBranchCleanupDelayHours = _orchestratorData.BranchCleanupDelayHours;
             }
         }
@@ -1180,13 +1160,11 @@ else
             _composerData = await HttpClient.GetFromJsonAsync<ComposerConfigResponse>("/api/config/composer");
             if (_composerData is not null)
             {
-                _composerContextWindow = _composerData.ContextWindow;
                 _composerMaxSteps = _composerData.MaxSteps;
             }
             else
             {
                 // Composer not configured yet — show defaults so the user can create it
-                _composerContextWindow = CopilotHive.Constants.DefaultBrainContextWindow;
                 _composerMaxSteps = CopilotHive.Constants.DefaultBrainMaxSteps;
             }
         }
@@ -1212,9 +1190,7 @@ else
                     maxParallelGoals = _orchMaxParallelGoals,
                     alwaysImprove = _orchAlwaysImprove,
                     verboseLogging = _orchVerboseLogging,
-                    brainContextWindow = _orchBrainContextWindow,
                     brainMaxSteps = _orchBrainMaxSteps,
-                    workerContextWindow = _orchWorkerContextWindow,
                     branchCleanupDelayHours = _orchBranchCleanupDelayHours,
                 }),
                 System.Text.Encoding.UTF8,
@@ -1289,7 +1265,6 @@ else
             var body = new StringContent(
                 System.Text.Json.JsonSerializer.Serialize(new
                 {
-                    contextWindow = _composerContextWindow,
                     maxSteps = _composerMaxSteps,
                 }),
                 System.Text.Encoding.UTF8,

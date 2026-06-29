@@ -45,15 +45,13 @@ public sealed record ModelConfigUpdate(
 /// <param name="MaxParallelGoals">New maximum number of parallel goals.</param>
 /// <param name="AlwaysImprove">Whether the improver runs after every iteration.</param>
 /// <param name="VerboseLogging">Whether verbose logging is enabled.</param>
-/// <param name="BrainContextWindow">New Brain context window in tokens.</param>
 /// <param name="BrainMaxSteps">New maximum Brain tool-call steps.</param>
-/// <param name="WorkerContextWindow">New default worker context window in tokens.</param>
 /// <param name="BranchCleanupDelayHours">New branch cleanup delay in hours.</param>
 public sealed record OrchestratorSettingsUpdate(
     int? MaxIterations, int? MaxRetriesPerTask, int? MaxParallelGoals,
     bool? AlwaysImprove, bool? VerboseLogging,
-    int? BrainContextWindow, int? BrainMaxSteps,
-    int? WorkerContextWindow, int? BranchCleanupDelayHours);
+    int? BrainMaxSteps,
+    int? BranchCleanupDelayHours);
 
 /// <summary>
 /// Request body for adding or updating a repository.
@@ -66,9 +64,8 @@ public sealed record RepositoryRequest(string Name, string Url, string DefaultBr
 /// <summary>
 /// Describes Composer setting changes to apply. Each field is applied only when non-null.
 /// </summary>
-/// <param name="ContextWindow">New Composer context window in tokens.</param>
 /// <param name="MaxSteps">New maximum Composer tool-call steps.</param>
-public sealed record ComposerSettingsUpdate(int? ContextWindow, int? MaxSteps);
+public sealed record ComposerSettingsUpdate(int? MaxSteps);
 
 /// <summary>
 /// Applies model configuration changes in-memory, writes the config file,
@@ -145,9 +142,7 @@ public sealed class ConfigModelService
             var model = update.OrchestratorModel;
             var contextWindow = _config.TryGetContextWindowForModel(model);
             if (contextWindow is null or <= 0)
-                contextWindow = _config.Orchestrator.BrainContextWindow > 0
-                    ? _config.Orchestrator.BrainContextWindow
-                    : Constants.DefaultBrainContextWindow;
+                contextWindow = Constants.DefaultBrainContextWindow;
 
             if (_brain is not null)
             {
@@ -407,12 +402,8 @@ public sealed class ConfigModelService
             _config.Orchestrator.AlwaysImprove = update.AlwaysImprove.Value;
         if (update.VerboseLogging is not null)
             _config.Orchestrator.VerboseLogging = update.VerboseLogging.Value;
-        if (update.BrainContextWindow is not null)
-            _config.Orchestrator.BrainContextWindow = update.BrainContextWindow.Value;
         if (update.BrainMaxSteps is not null)
             _config.Orchestrator.BrainMaxSteps = update.BrainMaxSteps.Value;
-        if (update.WorkerContextWindow is not null)
-            _config.Orchestrator.WorkerContextWindow = update.WorkerContextWindow.Value;
         if (update.BranchCleanupDelayHours is not null)
             _config.Orchestrator.BranchCleanupDelayHours = update.BranchCleanupDelayHours.Value;
 
@@ -453,15 +444,12 @@ public sealed class ConfigModelService
     /// Applies Composer setting changes. Only non-null fields are applied.
     /// Creates a <see cref="ComposerConfig"/> if none exists.
     /// </summary>
-    /// <param name="contextWindow">New context window in tokens, or <c>null</c> to leave unchanged.</param>
     /// <param name="maxSteps">New maximum tool-call steps, or <c>null</c> to leave unchanged.</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task UpdateComposerSettingsAsync(int? contextWindow, int? maxSteps, CancellationToken ct = default)
+    public async Task UpdateComposerSettingsAsync(int? maxSteps, CancellationToken ct = default)
     {
         _config.Composer ??= new ComposerConfig();
 
-        if (contextWindow is not null)
-            _config.Composer.ContextWindow = contextWindow.Value;
         if (maxSteps is not null)
             _config.Composer.MaxSteps = maxSteps.Value;
 

@@ -277,11 +277,11 @@ public sealed class ConfigModelServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task SaveModelConfigAsync_ModelNotInAvailableModels_FallsBackToBrainContextWindow()
+    public async Task SaveModelConfigAsync_ModelNotInAvailableModels_FallsBackToDefaultBrainContextWindow()
     {
         var config = new HiveConfigFile
         {
-            Orchestrator = new OrchestratorConfig { Model = "old-model", BrainContextWindow = 128000 },
+            Orchestrator = new OrchestratorConfig { Model = "old-model" },
         };
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var brain = new FakeDistributedBrain();
@@ -291,7 +291,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
         Assert.Equal("unknown-model", brain.LastModel);
-        Assert.Equal(128000, brain.LastMaxContextTokens);
+        Assert.Equal(Constants.DefaultBrainContextWindow, brain.LastMaxContextTokens);
     }
 
     [Fact]
@@ -299,7 +299,7 @@ public sealed class ConfigModelServiceTests : IDisposable
     {
         var config = new HiveConfigFile
         {
-            Orchestrator = new OrchestratorConfig { Model = "old-model", BrainContextWindow = 0 },
+            Orchestrator = new OrchestratorConfig { Model = "old-model" },
         };
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var brain = new FakeDistributedBrain();
@@ -806,8 +806,8 @@ public sealed class ConfigModelServiceTests : IDisposable
         var update = new OrchestratorSettingsUpdate(
             MaxIterations: 99, MaxRetriesPerTask: 7, MaxParallelGoals: 4,
             AlwaysImprove: true, VerboseLogging: true,
-            BrainContextWindow: 256000, BrainMaxSteps: 120,
-            WorkerContextWindow: 128000, BranchCleanupDelayHours: 12);
+            BrainMaxSteps: 120,
+            BranchCleanupDelayHours: 12);
 
         await svc.UpdateOrchestratorSettingsAsync(update, TestContext.Current.CancellationToken);
 
@@ -816,9 +816,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.Equal(4, config.Orchestrator.MaxParallelGoals);
         Assert.True(config.Orchestrator.AlwaysImprove);
         Assert.True(config.Orchestrator.VerboseLogging);
-        Assert.Equal(256000, config.Orchestrator.BrainContextWindow);
         Assert.Equal(120, config.Orchestrator.BrainMaxSteps);
-        Assert.Equal(128000, config.Orchestrator.WorkerContextWindow);
         Assert.Equal(12, config.Orchestrator.BranchCleanupDelayHours);
     }
 
@@ -840,8 +838,8 @@ public sealed class ConfigModelServiceTests : IDisposable
         var update = new OrchestratorSettingsUpdate(
             MaxIterations: 50, MaxRetriesPerTask: null, MaxParallelGoals: null,
             AlwaysImprove: true, VerboseLogging: null,
-            BrainContextWindow: null, BrainMaxSteps: null,
-            WorkerContextWindow: null, BranchCleanupDelayHours: null);
+            BrainMaxSteps: null,
+            BranchCleanupDelayHours: null);
 
         await svc.UpdateOrchestratorSettingsAsync(update, TestContext.Current.CancellationToken);
 
@@ -861,8 +859,8 @@ public sealed class ConfigModelServiceTests : IDisposable
         var update = new OrchestratorSettingsUpdate(
             MaxIterations: 5, MaxRetriesPerTask: null, MaxParallelGoals: null,
             AlwaysImprove: null, VerboseLogging: null,
-            BrainContextWindow: null, BrainMaxSteps: null,
-            WorkerContextWindow: null, BranchCleanupDelayHours: null);
+            BrainMaxSteps: null,
+            BranchCleanupDelayHours: null);
 
         await svc.UpdateOrchestratorSettingsAsync(update, TestContext.Current.CancellationToken);
 
@@ -935,15 +933,14 @@ public sealed class ConfigModelServiceTests : IDisposable
         var config = new HiveConfigFile
         {
             Orchestrator = new OrchestratorConfig(),
-            Composer = new ComposerConfig { ContextWindow = 100000, MaxSteps = 50 }
+            Composer = new ComposerConfig { MaxSteps = 50 }
         };
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateComposerSettingsAsync(200000, null, TestContext.Current.CancellationToken);
+        await svc.UpdateComposerSettingsAsync(null, TestContext.Current.CancellationToken);
 
-        Assert.Equal(200000, config.Composer!.ContextWindow);
-        Assert.Equal(50, config.Composer.MaxSteps);
+        Assert.Equal(50, config.Composer!.MaxSteps);
     }
 
     [Fact]
@@ -952,15 +949,14 @@ public sealed class ConfigModelServiceTests : IDisposable
         var config = new HiveConfigFile
         {
             Orchestrator = new OrchestratorConfig(),
-            Composer = new ComposerConfig { ContextWindow = 100000, MaxSteps = 50 }
+            Composer = new ComposerConfig { MaxSteps = 50 }
         };
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateComposerSettingsAsync(null, 99, TestContext.Current.CancellationToken);
+        await svc.UpdateComposerSettingsAsync(99, TestContext.Current.CancellationToken);
 
         Assert.Equal(99, config.Composer!.MaxSteps);
-        Assert.Equal(100000, config.Composer.ContextWindow);
     }
 
     [Fact]
@@ -970,11 +966,10 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateComposerSettingsAsync(100000, 50, TestContext.Current.CancellationToken);
+        await svc.UpdateComposerSettingsAsync(50, TestContext.Current.CancellationToken);
 
         Assert.NotNull(config.Composer);
-        Assert.Equal(100000, config.Composer!.ContextWindow);
-        Assert.Equal(50, config.Composer.MaxSteps);
+        Assert.Equal(50, config.Composer!.MaxSteps);
     }
 
     [Fact]
@@ -984,7 +979,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateComposerSettingsAsync(100000, 50, TestContext.Current.CancellationToken);
+        await svc.UpdateComposerSettingsAsync(50, TestContext.Current.CancellationToken);
 
         Assert.Single(repo.Commits);
         Assert.Equal("hive-config.yaml", repo.Commits[0].File);
@@ -1017,8 +1012,8 @@ public sealed class ConfigModelServiceTests : IDisposable
         var update = new OrchestratorSettingsUpdate(
             MaxIterations: 15, MaxRetriesPerTask: 5, MaxParallelGoals: 3,
             AlwaysImprove: true, VerboseLogging: true,
-            BrainContextWindow: 200000, BrainMaxSteps: 75,
-            WorkerContextWindow: 100000, BranchCleanupDelayHours: 24);
+            BrainMaxSteps: 75,
+            BranchCleanupDelayHours: 24);
 
         await svc.UpdateOrchestratorSettingsAsync(update, TestContext.Current.CancellationToken);
 
@@ -1028,9 +1023,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.Contains("max_parallel_goals: 3", yaml);
         Assert.Contains("always_improve: true", yaml);
         Assert.Contains("verbose_logging: true", yaml);
-        Assert.Contains("brain_context_window: 200000", yaml);
         Assert.Contains("brain_max_steps: 75", yaml);
-        Assert.Contains("worker_context_window: 100000", yaml);
         Assert.Contains("branch_cleanup_delay_hours: 24", yaml);
     }
 
@@ -1057,10 +1050,9 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateComposerSettingsAsync(200000, 75, TestContext.Current.CancellationToken);
+        await svc.UpdateComposerSettingsAsync(75, TestContext.Current.CancellationToken);
 
         var yaml = await File.ReadAllTextAsync(Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
-        Assert.Contains("context_window: 200000", yaml);
         Assert.Contains("max_steps: 75", yaml);
     }
 

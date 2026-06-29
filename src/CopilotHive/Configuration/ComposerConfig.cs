@@ -9,8 +9,6 @@ public sealed class ComposerConfig
     public string? Model { get; set; }
     /// <summary>Additional models available for switching at runtime. The <see cref="Model"/> entry is always first.</summary>
     public List<string>? Models { get; set; }
-    /// <summary>Maximum context window size in tokens.</summary>
-    public int ContextWindow { get; set; } = Constants.DefaultBrainContextWindow;
     /// <summary>Maximum tool-call steps per Composer request.</summary>
     public int MaxSteps { get; set; } = Constants.DefaultBrainMaxSteps;
 

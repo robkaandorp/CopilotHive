@@ -21,16 +21,8 @@ public sealed class OrchestratorConfig
     public bool AlwaysImprove { get; set; }
     /// <summary>When <c>true</c>, enables verbose logging of prompts, worker output, and Brain reasoning.</summary>
     public bool VerboseLogging { get; set; }
-    /// <summary>Maximum context window size in tokens for the Brain model. Used for compaction decisions.</summary>
-    public int BrainContextWindow { get; set; } = Constants.DefaultBrainContextWindow;
     /// <summary>Maximum tool-call steps the Brain agent may take per request.</summary>
     public int BrainMaxSteps { get; set; } = Constants.DefaultBrainMaxSteps;
-    /// <summary>
-    /// Default context window size in tokens for all workers. Individual roles can override
-    /// this via <c>workers.&lt;role&gt;.context_window</c>. Used for heartbeat Ctx% calculation
-    /// and agent compaction threshold.
-    /// </summary>
-    public int WorkerContextWindow { get; set; } = Constants.DefaultBrainContextWindow;
     /// <summary>
     /// Delay in hours before deleting feature branches for completed goals.
     /// Default: 48 hours. Set to 0 for immediate cleanup.
