@@ -48,7 +48,9 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <summary>Models the Composer can switch between at runtime.</summary>
     public IReadOnlyList<string> AvailableModels =>
         _hiveConfig?.Models?.AvailableModels is { Count: > 0 } available
-            ? available.Select(m => m.Name).ToList().AsReadOnly()
+            ? available.Select(m => string.IsNullOrEmpty(m.ReasoningEffort)
+                ? m.Name
+                : $"{m.Name}:{m.ReasoningEffort}").ToList().AsReadOnly()
             : _startupAvailableModels;
 
     // Streaming state owned by the service (survives component navigation)
@@ -341,8 +343,18 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
         _reasoningEffort = reasoning;
 
-        // Update context window when the new model has a different value in the global model list
-        var modelCtx = _hiveConfig?.TryGetContextWindowForModel(model);
+        // Update context window when the new model has a different value in the global model list.
+        // Strip only the reasoning suffix (if present) while preserving the provider prefix and any
+        // tag (e.g. ollama-cloud/gpt-oss:120b:medium → ollama-cloud/gpt-oss:120b) so the lookup
+        // matches ModelEntry.Name.
+        var modelForLookup = model;
+        if (reasoning is not null)
+        {
+            var lastColon = model.LastIndexOf(':');
+            if (lastColon > 0)
+                modelForLookup = model.Substring(0, lastColon);
+        }
+        var modelCtx = _hiveConfig?.TryGetContextWindowForModel(modelForLookup);
         if (modelCtx.HasValue && modelCtx.Value > 0 && _maxContextTokens != modelCtx.Value)
         {
             _logger.LogInformation(

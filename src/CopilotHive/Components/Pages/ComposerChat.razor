@@ -151,7 +151,17 @@ else
                 <select disabled="@Composer.IsStreaming" class="chat-model-select" @onchange="HandleModelChange">
                     @foreach (var model in _availableModels)
                     {
-                        <option value="@model" selected="@(_selectedModel == model)">@model</option>
+                        var display = model;
+                        var lastColon = model.LastIndexOf(':');
+                        if (lastColon > 0 && lastColon < model.Length - 1)
+                        {
+                            var suffix = model[(lastColon + 1)..];
+                            if (suffix is "none" or "low" or "medium" or "high" or "extra_high")
+                            {
+                                display = $"{model[..lastColon]} ({suffix})";
+                            }
+                        }
+                        <option value="@model" selected="@(_selectedModel == model)">@display</option>
                     }
                 </select>
                 <button @onclick="ResetSession" disabled="@Composer.IsStreaming" class="chat-action-btn">

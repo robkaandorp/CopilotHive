@@ -24,7 +24,9 @@ public static class ComposerHub
         routes.MapGet("/api/composer/models", () =>
         {
             var globalModelNames = config?.Models?.AvailableModels is { Count: > 0 } available
-                ? available.Select(m => m.Name).ToList()
+                ? available.Select(m => string.IsNullOrEmpty(m.ReasoningEffort)
+                    ? m.Name
+                    : $"{m.Name}:{m.ReasoningEffort}").ToList()
                 : null;
             return Results.Ok(new { models = globalModelNames ?? composer.AvailableModels });
         });
@@ -34,7 +36,9 @@ public static class ComposerHub
             try
             {
                 var globalModelNames = config?.Models?.AvailableModels is { Count: > 0 } available
-                    ? available.Select(m => m.Name).ToList()
+                    ? available.Select(m => string.IsNullOrEmpty(m.ReasoningEffort)
+                        ? m.Name
+                        : $"{m.Name}:{m.ReasoningEffort}").ToList()
                     : null;
                 var validModels = globalModelNames ?? composer.AvailableModels.ToList();
                 if (!validModels.Contains(model, StringComparer.OrdinalIgnoreCase))
