@@ -1,10 +1,13 @@
 using System.Reflection;
 using System.Text.Json;
+using CopilotHive;
 using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -358,5 +361,304 @@ public sealed class ComposerCompactTests
             dbContext.Dispose();
             Directory.Delete(tmpDir, recursive: true);
         }
+    }
+
+    // ── 8. CompactOldestPercentAsync_WhenNotConnected_ThrowsInvalidOperationException ──
+
+    [Fact]
+    public async Task CompactOldestPercentAsync_WhenNotConnected_ThrowsInvalidOperationException()
+    {
+        var composer = CreateComposerWithMockSummaryClient(out _);
+
+        // Do NOT call ConnectAsync or InjectFakeChatClient — _agent is null.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => composer.CompactOldestPercentAsync(50, TestContext.Current.CancellationToken));
+
+        Assert.Contains("not connected", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // ── 9. CompactOldestPercentAsync_WhileStreaming_ThrowsInvalidOperationException ──
+
+    [Fact]
+    public async Task CompactOldestPercentAsync_WhileStreaming_ThrowsInvalidOperationException()
+    {
+        var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var store = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            // Create a Composer whose AI client throws on both streaming and non-streaming paths.
+            var overflowEx = new InvalidOperationException("model_max_prompt_tokens_exceeded");
+            var mockClient = new Mock<IChatClient>();
+            mockClient
+                .Setup(c => c.GetStreamingResponseAsync(
+                    It.IsAny<IEnumerable<ChatMessage>>(),
+                    It.IsAny<ChatOptions?>(),
+                    It.IsAny<CancellationToken>()))
+                .Throws(overflowEx);
+            mockClient
+                .Setup(c => c.GetResponseAsync(
+                    It.IsAny<IEnumerable<ChatMessage>>(),
+                    It.IsAny<ChatOptions?>(),
+                    It.IsAny<CancellationToken>()))
+                .ThrowsAsync(overflowEx);
+
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                store,
+                stateDir: tmpDir);
+
+            InjectFakeChatClient(composer, mockClient.Object);
+
+            // Trigger streaming — it will fail quickly due to the throwing client.
+            composer.SendMessage("test");
+
+            // Wait for IsStreaming to become false.
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (composer.IsStreaming && DateTime.UtcNow < deadline)
+                await Task.Delay(20, TestContext.Current.CancellationToken);
+
+            Assert.False(composer.IsStreaming, "Streaming should have finished after the error");
+
+            // Manually set _isStreaming to true to simulate an active stream.
+            SetIsStreaming(composer, true);
+            try
+            {
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => composer.CompactOldestPercentAsync(50, TestContext.Current.CancellationToken));
+                Assert.Contains("Cannot compact while streaming", ex.Message);
+            }
+            finally
+            {
+                // Cleanup: reset _isStreaming so the Composer doesn't hang.
+                SetIsStreaming(composer, false);
+            }
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
+    // ── 10. CompactOldestPercentAsync_WithEnoughMessages_ReturnsTrueAndCompacts ──
+
+    [Fact]
+    public async Task CompactOldestPercentAsync_WithEnoughMessages_ReturnsTrueAndCompacts()
+    {
+        var composer = CreateComposerWithMockSummaryClient(out var mockClient);
+        InjectFakeChatClient(composer, mockClient.Object);
+
+        var session = GetSession(composer);
+        // 1 system + 30 user/assistant = 31 total. 50% of 30 non-system messages
+        // must yield at least CompactionRetainRecent+1 (11) messages to compact.
+        PopulateSession(session, 30);
+        var originalCount = session.MessageHistory.Count;
+        Assert.Equal(31, originalCount);
+
+        var result = await composer.CompactOldestPercentAsync(50, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+        Assert.False(composer.IsCompacting);
+        Assert.True(session.MessageHistory.Count < originalCount,
+            $"Message count should have decreased after compaction (was {originalCount}, now {session.MessageHistory.Count})");
+    }
+
+    // ── 11. CompactOldestPercentAsync_WithTooFewMessages_ReturnsFalse ──
+
+    [Fact]
+    public async Task CompactOldestPercentAsync_WithTooFewMessages_ReturnsFalse()
+    {
+        var composer = CreateComposerWithMockSummaryClient(out var mockClient);
+        InjectFakeChatClient(composer, mockClient.Object);
+
+        var session = GetSession(composer);
+        PopulateSession(session, 2); // 1 system + 2 user/assistant = 3 total
+
+        var result = await composer.CompactOldestPercentAsync(50, TestContext.Current.CancellationToken);
+
+        Assert.False(result);
+        Assert.False(composer.IsCompacting);
+    }
+
+    // ── 12. PostCompactPartial_ReturnsOk_WhenEnoughMessages ──
+
+    [Fact]
+    public async Task PostCompactPartial_ReturnsOk_WhenEnoughMessages()
+    {
+        await using var fixture = new ComposerHubWithConfigFixture(null);
+        await fixture.InitializeAsync();
+
+        // Access the fixture's private _composer field via reflection.
+        var composerField = typeof(ComposerHubWithConfigFixture).GetField("_composer",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("_composer field not found on fixture");
+        var composer = (Composer)composerField.GetValue(fixture)!;
+
+        // Replace the default mock IChatClient with one that returns a summary response.
+        var mockClient = new Mock<IChatClient>();
+        mockClient
+            .Setup(c => c.GetResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new ChatResponse(new ChatMessage(ChatRole.Assistant, "summary")));
+        InjectFakeChatClient(composer, mockClient.Object);
+
+        // Add enough messages to trigger compaction.
+        var session = GetSession(composer);
+        // 1 system + 30 user/assistant = 31 total. 50% of 30 non-system messages
+        // must yield at least CompactionRetainRecent+1 (11) messages to compact.
+        PopulateSession(session, 30);
+
+        var response = await fixture.Client.PostAsync("/api/composer/compact-partial?percent=50", null, TestContext.Current.CancellationToken);
+
+        Assert.True(response.IsSuccessStatusCode);
+        var json = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        using var doc = JsonDocument.Parse(json);
+        Assert.True(doc.RootElement.GetProperty("compacted").GetBoolean());
+        Assert.True(doc.RootElement.GetProperty("messageCount").TryGetInt32(out _),
+            "messageCount should be an integer");
+    }
+
+    // ── 13. PostCompactPartial_ReturnsOkWithFalse_WhenTooFewMessages ──
+
+    [Fact]
+    public async Task PostCompactPartial_ReturnsOkWithFalse_WhenTooFewMessages()
+    {
+        await using var fixture = new ComposerHubWithConfigFixture(null);
+        await fixture.InitializeAsync();
+
+        // Access the fixture's private _composer field via reflection.
+        var composerField = typeof(ComposerHubWithConfigFixture).GetField("_composer",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("_composer field not found on fixture");
+        var composer = (Composer)composerField.GetValue(fixture)!;
+
+        // Inject a mock chat client so the Composer has a valid agent.
+        var mockClient = new Mock<IChatClient>();
+        mockClient
+            .Setup(c => c.GetResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new ChatResponse(new ChatMessage(ChatRole.Assistant, "summary")));
+        InjectFakeChatClient(composer, mockClient.Object);
+
+        // Do NOT add any messages — session starts empty (0 messages).
+
+        var response = await fixture.Client.PostAsync("/api/composer/compact-partial?percent=50", null, TestContext.Current.CancellationToken);
+
+        Assert.True(response.IsSuccessStatusCode);
+        var json = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        using var doc = JsonDocument.Parse(json);
+        Assert.False(doc.RootElement.GetProperty("compacted").GetBoolean());
+    }
+
+    // ── 14. PostCompactPartial_ReturnsBadRequest_WhenNotConnected ──
+    //
+    // This test boots the real application via WebApplicationFactory<Program>,
+    // so it lives in its own [Collection("HiveIntegration")] class below
+    // (ComposerCompactPartialNotConnectedTests) to avoid parallel SQLite write
+    // conflicts and to comply with the project convention of using
+    // WebApplicationFactory<Program> for endpoint hosting.
+}
+
+/// <summary>
+/// Integration test for the <c>POST /api/composer/compact-partial</c> endpoint when the
+/// Composer has not been connected. Uses <see cref="WebApplicationFactory{Program}"/> via
+/// <see cref="ComposerCompactPartialEndpointFactory"/> (per project convention) instead of
+/// constructing a host with <c>WebApplication.CreateBuilder()</c>.
+/// </summary>
+[Collection("HiveIntegration")]
+public sealed class ComposerCompactPartialNotConnectedTests
+{
+    [Fact]
+    public async Task PostCompactPartial_ReturnsBadRequest_WhenNotConnected()
+    {
+        using var factory = new ComposerCompactPartialEndpointFactory();
+        var client = factory.CreateClient();
+
+        var response = await client.PostAsync(
+            "/api/composer/compact-partial?percent=50",
+            null,
+            TestContext.Current.CancellationToken);
+
+        Assert.False(response.IsSuccessStatusCode,
+            "Should return a non-success status code when not connected");
+
+        var json = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        using var doc = JsonDocument.Parse(json);
+        Assert.True(doc.RootElement.TryGetProperty("error", out var errorProp),
+            "Response should contain an 'error' property");
+        Assert.Contains("not connected", errorProp.GetString()!, StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+/// <summary>
+/// Custom <see cref="WebApplicationFactory{Program}"/> that replaces the real Composer
+/// singleton with an unconnected instance (its <c>_agent</c> is null because
+/// <c>ConnectAsync</c> is never invoked on it). This lets the
+/// <c>/api/composer/compact-partial</c> endpoint exercise the "not connected" path.
+/// </summary>
+internal sealed class ComposerCompactPartialEndpointFactory : WebApplicationFactory<Program>
+{
+    private readonly string _tmpDir =
+        Path.Combine(Path.GetTempPath(), $"copilothive-compactpartial-{Guid.NewGuid():N}");
+    private readonly string _stateDir;
+    private CopilotHiveDbContext? _dbContext;
+
+    public ComposerCompactPartialEndpointFactory()
+    {
+        _stateDir = Path.Combine(_tmpDir, "state");
+        Directory.CreateDirectory(_stateDir);
+        Environment.SetEnvironmentVariable("STATE_DIR", _stateDir);
+    }
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.UseEnvironment("Testing");
+
+        builder.ConfigureServices(services =>
+        {
+            // Replace the real Composer singleton with an unconnected instance.
+            var existing = services.SingleOrDefault(d => d.ServiceType == typeof(Composer));
+            if (existing is not null)
+                services.Remove(existing);
+
+            _dbContext = CopilotHiveDbContext.CreateInMemory();
+            var store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
+
+            // NOT connected: the chat-client factory throws, so Program.cs's
+            // startup call to composer.ConnectAsync() (wrapped in try/catch) fails
+            // gracefully and leaves _agent null — the "not connected" state under test.
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                store,
+                stateDir: _tmpDir,
+                chatClientFactory: _ => throw new InvalidOperationException(
+                    "chat client unavailable in test — Composer stays unconnected"));
+
+            services.AddSingleton(composer);
+        });
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        base.Dispose(disposing);
+        Environment.SetEnvironmentVariable("STATE_DIR", null);
+        _dbContext?.Dispose();
+
+        if (!disposing || !Directory.Exists(_tmpDir))
+            return;
+
+        try
+        {
+            Directory.Delete(_tmpDir, recursive: true);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 }

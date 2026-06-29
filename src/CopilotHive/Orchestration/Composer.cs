@@ -578,6 +578,50 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Partially compacts the Composer session by summarizing only the oldest <paramref name="percent"/>%
+    /// of the estimated token budget. The newest messages are kept verbatim.
+    /// Returns true if compaction was performed, false if there were too few messages.
+    /// </summary>
+    public async Task<bool> CompactOldestPercentAsync(int percent, CancellationToken ct = default)
+    {
+        if (_agent is null)
+            throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
+        if (_isStreaming)
+            throw new InvalidOperationException("Cannot compact while streaming.");
+
+        IsCompacting = true;
+        OnCompactingStarted?.Invoke();
+
+        try
+        {
+            var compactor = new ContextCompactor(
+                _agentOptions.CompactionClient ?? _chatClient!,
+                _logger);
+
+            var result = await compactor.CompactOldestPercentAsync(_session, _agentOptions, percent, ct);
+
+            if (result)
+            {
+                await SaveSessionAsync(ct);
+                _logger.LogInformation("Composer session partially compacted ({Percent}% oldest, {Count} messages remaining)",
+                    percent, _session.MessageHistory.Count);
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Composer partial compaction failed");
+            return false;
+        }
+        finally
+        {
+            IsCompacting = false;
+            OnCompacted?.Invoke();
+        }
+    }
+
     private void RecreateAgent()
     {
         if (_chatClient is null)

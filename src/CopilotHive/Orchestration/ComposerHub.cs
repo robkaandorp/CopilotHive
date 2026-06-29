@@ -69,5 +69,18 @@ public static class ComposerHub
                 return Results.BadRequest(new { error = ex.Message });
             }
         });
+
+        routes.MapPost("/api/composer/compact-partial", async (int percent) =>
+        {
+            try
+            {
+                var result = await composer.CompactOldestPercentAsync(percent);
+                return Results.Ok(new { compacted = result, messageCount = composer.GetStats()?.MessageCount ?? 0 });
+            }
+            catch (Exception ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
     }
 }

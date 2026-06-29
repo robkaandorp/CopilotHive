@@ -177,6 +177,16 @@ else
                         <text>📦 Compact</text>
                     }
                 </button>
+                <button @onclick="CompactPartial" disabled="@(Composer.IsStreaming || Composer.IsCompacting)" class="chat-action-btn">
+                    @if (Composer.IsCompacting)
+                    {
+                        <span>Compacting…</span>
+                    }
+                    else
+                    {
+                        <text>📦 Compact 50%</text>
+                    }
+                </button>
                 <span class="text-muted chat-hint">
                     @(_messages.Count) msgs
                     @if (Composer.LastToolCalls > 0)
@@ -299,6 +309,24 @@ else
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[ComposerChat] Compact failed: {ex.Message}");
+        }
+    }
+
+    private async Task CompactPartial()
+    {
+        if (Composer.IsStreaming || Composer.IsCompacting) return;
+        try
+        {
+            var response = await HttpClient.PostAsync("/api/composer/compact-partial?percent=50", null);
+            if (response.IsSuccessStatusCode)
+            {
+                LoadHistory();
+            }
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ComposerChat] Partial compact failed: {ex.Message}");
         }
     }
 
