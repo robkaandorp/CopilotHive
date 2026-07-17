@@ -109,6 +109,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - Create and manage releases (create_release, list_releases, update_release)
         - Manage knowledge documents in the knowledge graph (create_document, read_document, update_document, delete_document, search_knowledge, link_document, unlink_document, list_documents, traverse_graph)
         - Ask the user questions for clarification (ask_user)
+        - Get the current date and time (get_current_time)
 
         Guidelines for goal creation:
         - Each goal should be completable in 1-3 iterations (small, focused)
@@ -715,6 +716,20 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 "List all releases with their status and goal count."),
             AIFunctionFactory.Create(UpdateReleaseAsync, "update_release",
                 "Update a field (tag, notes, or repositories) on a Planning release. Non-Planning releases cannot be edited."),
+            AIFunctionFactory.Create(
+                () =>
+                {
+                    var now = DateTime.UtcNow;
+                    return System.Text.Json.JsonSerializer.Serialize(new
+                    {
+                        date = now.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+                        time = now.ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture),
+                        iso = now.ToString("o", System.Globalization.CultureInfo.InvariantCulture),
+                        timezone = "UTC"
+                    });
+                },
+                "get_current_time",
+                "Get the current date and time in UTC. Use when you need to know the current date for changelog entries, release notes, or other date-sensitive content."),
         };
 
         if (_ollamaApiKey is not null)

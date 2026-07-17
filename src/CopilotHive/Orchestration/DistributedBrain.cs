@@ -483,6 +483,20 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 "traverse_graph",
                 "Explore the knowledge graph from a starting document, following links up to a given depth."),
             AIFunctionFactory.Create(
+                () =>
+                {
+                    var now = DateTime.UtcNow;
+                    return System.Text.Json.JsonSerializer.Serialize(new
+                    {
+                        date = now.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+                        time = now.ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture),
+                        iso = now.ToString("o", System.Globalization.CultureInfo.InvariantCulture),
+                        timezone = "UTC"
+                    });
+                },
+                "get_current_time",
+                "Get the current date and time in UTC. Use when you need to know the current date for changelog entries, release notes, or other date-sensitive content."),
+            AIFunctionFactory.Create(
                 ([Description("Ordered phase names, e.g. [\"coding\",\"testing\",\"docwriting\",\"review\",\"merging\"]")] string[] phases,
                  [Description("JSON object with per-phase instructions.\n  Single-round: {\"coding\": \"...\", \"review\": \"...\"}\n  Multi-round:  {\"coding-1\": \"step 1: revert...\", \"coding-2\": \"step 2: restructure...\", \"review\": \"...\"}")] string phase_instructions,
                  [Description("Why you chose this iteration plan")] string reason,

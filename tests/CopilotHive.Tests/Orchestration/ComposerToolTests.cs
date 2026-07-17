@@ -2010,10 +2010,61 @@ public sealed class ComposerToolTests : IDisposable
     }
 
     [Fact]
+    public void BuildComposerTools_IncludesGetCurrentTime()
+    {
+        var tools = _composer.BuildComposerTools();
+        var names = tools.OfType<AIFunction>().Select(t => t.Name).ToList();
+        Assert.Contains("get_current_time", names);
+    }
+
+    [Fact]
+    public async Task GetCurrentTimeTool_ReturnsValidJsonWithExpectedFields()
+    {
+        var tools = _composer.BuildComposerTools();
+        var tool = tools.OfType<AIFunction>().First(t => t.Name == "get_current_time");
+
+        // Act: invoke the get_current_time tool (no arguments needed)
+        var result = (await tool.InvokeAsync(new AIFunctionArguments(), TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: the result is valid JSON containing the expected fields
+        Assert.False(string.IsNullOrWhiteSpace(result));
+        using var doc = System.Text.Json.JsonDocument.Parse(result);
+        var root = doc.RootElement;
+
+        Assert.True(root.TryGetProperty("date", out var dateEl), "Result should contain 'date' field");
+        Assert.True(root.TryGetProperty("time", out var timeEl), "Result should contain 'time' field");
+        Assert.True(root.TryGetProperty("iso", out var isoEl), "Result should contain 'iso' field");
+        Assert.True(root.TryGetProperty("timezone", out var tzEl), "Result should contain 'timezone' field");
+
+        var date = dateEl.GetString()!;
+        var time = timeEl.GetString()!;
+        var iso = isoEl.GetString()!;
+        var timezone = tzEl.GetString()!;
+
+        // date must be YYYY-MM-DD format
+        Assert.Matches(@"^\d{4}-\d{2}-\d{2}$", date);
+        // time must be HH:MM:SS format
+        Assert.Matches(@"^\d{2}:\d{2}:\d{2}$", time);
+        // iso must be ISO 8601 format (round-trip "o" format from DateTime.UtcNow)
+        Assert.Matches(@"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", iso);
+        // timezone must be "UTC"
+        Assert.Equal("UTC", timezone);
+
+        // The date should match today's UTC date
+        Assert.Equal(DateTime.UtcNow.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture), date);
+    }
+
+    [Fact]
     public void SystemPrompt_IncludesDrillIntoPhaseOutput()
     {
         Assert.Contains("get_phase_output", _composer.GetSystemPrompt());
         Assert.Contains("Drill into worker phase output", _composer.GetSystemPrompt());
+    }
+
+    [Fact]
+    public void SystemPrompt_MentionsGetCurrentTime()
+    {
+        Assert.Contains("get_current_time", _composer.GetSystemPrompt());
     }
 
     [Fact]
