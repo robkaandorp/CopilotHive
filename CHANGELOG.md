@@ -1,3 +1,35 @@
+## [0.13.0] - 2026-07-17
+
+### Added
+
+- **Available Models Management** — Users can now add, edit, and remove models from the `models.available_models` list via the Configuration page. A "Browse Provider Models" button queries GitHub Copilot (`GET https://api.githubcopilot.com/models`) and/or Ollama (`GET /api/tags`) for available models, auto-filling model names and context windows. New `ModelEntry.ReasoningEffort` field allows per-model reasoning effort configuration (none/low/medium/high/extra_high) instead of using `:suffix` in model names. (`copilothive-available-models-management`)
+
+- **Full In-App Configuration** — All `hive-config.yaml` settings are now editable from the dashboard. New tabs for Repositories (add/edit/remove with auto-clone), Orchestrator settings (max_iterations, max_retries, max_parallel_goals, always_improve, verbose_logging, brain_max_steps, branch_cleanup_delay_hours), Worker context windows (per-role), and Composer settings (max_steps). Changes are written back to `hive-config.yaml` and hot-reloaded. (`copilothive-full-config-management`)
+
+- **GitHub OAuth Authentication** — Single-user GitHub OAuth authentication. When `GITHUB_OAUTH_CLIENT_ID` and `GITHUB_OAUTH_CLIENT_SECRET` environment variables are set, all dashboard pages and REST endpoints require authentication. The first GitHub user to sign in becomes the admin. The OAuth access token is stored in the database (`users` table) and used for Copilot API access, eliminating the need for `GH_TOKEN`. When OAuth env vars are not set, the system runs in "open mode" (backward compatible). Login page with "Sign in with GitHub" button, logout, user profile (avatar + username) in nav bar. (`copilothive-github-oauth-backend`, `copilothive-github-oauth-ui-v2`)
+
+- **Composer Session Compaction** — Two new buttons in the Composer chat: "Compact" (full compaction via `ForceCompactAsync`) and "Compact 50%" (partial compaction via `CompactOldestPercentAsync` from SharpCoder 0.11.0). The partial compaction summarizes only the oldest 50% of tokens, keeping the newest 50% verbatim — gentler than full compaction. (`copilothive-composer-compact-button`, `copilothive-composer-compact-partial`)
+
+- **SharpCoder 0.11.0** — Upgraded from 0.10.0, adding `CompactOldestPercentAsync` for partial context compaction. (`sharpcoder-partial-compaction`, `sharpcoder-bump-version-0110`, `sharpcoder-v0110-changelog-readme`)
+
+### Changed
+
+- **Model Dropdowns Show Reasoning Effort** — All model dropdowns (Configuration page Models tab and Composer chat) now display reasoning effort (e.g., `copilot/claude-sonnet-4.6 (high)`) and use composite `name:effort` values so the selected model matches the config and reasoning effort is preserved on save. (`copilothive-fix-model-dropdowns-reasoning`, `copilothive-fix-composer-model-dropdown`)
+
+- **Context Window Resolution Fix** — `HiveConfigFile.TryGetContextWindowForModel` and `TryGetReasoningEffortForModel` now strip known reasoning suffixes before matching against `AvailableModels`, fixing incorrect context window percentages (e.g., 330% instead of 27%) after restart. (`copilothive-fix-context-window-suffix-lookup`)
+
+### Removed
+
+- **Legacy goals.db Migration Code** — Removed ~250 lines of `MigrateGoalsDatabase` and helper methods. All installations have been updated to v0.12.0. (`copilothive-remove-legacy-goalsdb-migration`)
+
+- **Redundant Context Window Fields** — Removed `OrchestratorConfig.BrainContextWindow`, `OrchestratorConfig.WorkerContextWindow`, and `ComposerConfig.ContextWindow` — these were fallbacks from before per-model context windows were available via `AvailableModels`. Resolution now falls from model-specific directly to `DefaultBrainContextWindow` (150K). Per-role `WorkerConfig.ContextWindow` is preserved. (`copilothive-remove-redundant-context-windows`)
+
+### Fixed
+
+- **Available Models Bugs** — Reasoning suffix stripping on startup, browse modal scrollable list with fixed buttons, URL-encoded model name in PUT/DELETE endpoints. (`copilothive-fix-available-models-bugs`)
+
+- **CI Test Failure** — `AvailableModelsEndpointTests` failed in CI because `CustomEndpointFactory` didn't set `STATE_DIR` environment variable. (`copilothive-fix-available-models-ci`)
+
 ## [0.12.0] - 2026-06-25
 
 ### Added
