@@ -1,6 +1,14 @@
 using CopilotHive.Worker;
+using Xunit;
 
 namespace CopilotHive.Tests.Worker;
+
+/// <summary>
+/// Defines the "ConsoleOutput" collection so xUnit serializes all tests that
+/// redirect Console.Out / Console.Error, preventing cross-test output leakage.
+/// </summary>
+[CollectionDefinition("ConsoleOutput")]
+public sealed class ConsoleOutputCollection { }
 
 /// <summary>
 /// Unit tests for <see cref="WorkerLogger"/>: verifies that Info, Error, Debug,
