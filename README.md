@@ -2,7 +2,7 @@
 
 # CopilotHive
 
-CopilotHive is a **self-improving multi-agent orchestration system** powered by **[SharpCoder](https://github.com/robkaandorp/SharpCoder)** 0.10.0 (an autonomous coding agent library). A pool of generic worker agents collaborate autonomously inside Docker containers — dynamically taking on roles (coder, tester, doc-writer, reviewer, improver) per task — to implement software goals without human intervention. A conversational **Composer** agent helps decompose high-level intent into actionable goals through a streaming chat interface.
+CopilotHive is a **self-improving multi-agent orchestration system** powered by **[SharpCoder](https://github.com/robkaandorp/SharpCoder)** 0.11.0 (an autonomous coding agent library). A pool of generic worker agents collaborate autonomously inside Docker containers — dynamically taking on roles (coder, tester, doc-writer, reviewer, improver) per task — to implement software goals without human intervention. A conversational **Composer** agent helps decompose high-level intent into actionable goals through a streaming chat interface.
 
 ## Architecture
 
@@ -44,7 +44,7 @@ Goals flow through a structured pipeline:
 
 If testing or review fails, the pipeline retries the coding step (up to a configured limit).
 
-The **Brain** (`DistributedBrain`) plans iteration phases and crafts worker prompts using SharpCoder's `CodingAgent` for LLM communication. The Brain maintains a **single persistent session** across all goals with automatic context compaction (infinite context), and has **read-only file access** to target repositories for informed decision-making. Goals are processed **in parallel** (up to a configurable `MaxParallelGoals` limit) with each goal running its own Brain session forked from a shared master session. Workers report structured verdicts via tool calls, and the pipeline state machine (`PipelineStateMachine`) drives sequencing — retrying, advancing, or failing based on those verdicts. Pipeline state and goals are persisted to a single **SQLite** database (`copilothive.db`) via **Entity Framework Core**, and the Brain session is persisted to `brain-master.json`, so the server can resume after restarts. Metrics feed into the **improver** for self-improvement: the system tunes its own `agents.md` instructions over time.
+The **Brain** (`DistributedBrain`) plans iteration phases and crafts worker prompts using SharpCoder's `CodingAgent` for LLM communication. The Brain maintains a **single persistent session** across all goals with automatic context compaction (infinite context), and has **read-only file access** to target repositories for informed decision-making. Goals are processed **in parallel** (up to a configurable `MaxParallelGoals` limit) with each goal running its own Brain session forked from a shared master session. Workers report structured verdicts via tool calls, and the pipeline state machine (`PipelineStateMachine`) drives sequencing — retrying, advancing, or failing based on those verdicts. Pipeline state and goals are persisted to a single **SQLite** database (`copilothive.db`) via **Entity Framework Core**, and the Brain and Composer sessions are persisted to `brain-master.json` and `composer-session.json` respectively, so the server can resume after restarts. Optional **GitHub OAuth authentication** protects the dashboard when configured. Metrics feed into the **improver** for self-improvement: the system tunes its own `agents.md` instructions over time.
 
 ## Getting Started
 
@@ -76,6 +76,19 @@ The **Brain** (`DistributedBrain`) plans iteration phases and crafts worker prom
    This starts a **gRPC server** on port 9000 and an **HTTP health endpoint** on port 9001.
 
    Set `BRAIN_CONTEXT_WINDOW` to configure the Brain's maximum context window in tokens (default: 150,000). Worker context windows are configured via `orchestrator.worker_context_window` (global default) or `workers.<role>.context_window` (per-role override) in `hive-config.yaml`.
+
+### Authentication (Optional)
+
+By default, CopilotHive runs without authentication (open mode). To enable GitHub OAuth authentication:
+
+1. Create a GitHub OAuth App (GitHub → Settings → Developer settings → OAuth Apps → New OAuth App)
+   - Authorization callback URL: `http://localhost:9001/signin-github`
+2. Set environment variables:
+   - `GITHUB_OAUTH_CLIENT_ID` — your OAuth App Client ID
+   - `GITHUB_OAUTH_CLIENT_SECRET` — your OAuth App Client Secret
+3. Restart CopilotHive — the dashboard will require authentication
+
+The first GitHub user to sign in becomes the admin. The OAuth access token replaces the need for `GH_TOKEN`.
 
 ### Configuring Goals
 
@@ -166,7 +179,7 @@ goals:
 | `src/CopilotHive/` | Main orchestrator — Brain, GoalDispatcher, persistence, metrics |
 | `src/CopilotHive.Shared/` | Shared protobuf definitions and DTOs |
 | `src/CopilotHive.Worker/` | Worker process (runs inside Docker containers) |
-| `tests/` | 2188+ xUnit tests |
+| `tests/` | 2350+ xUnit tests |
 | `agents/` | Default agent templates (overridden by config repo at runtime) |
 | `docker/` | Dockerfiles and container configuration |
 
@@ -191,8 +204,12 @@ goals:
 - **Goals page sticky header** — Filter bar and table headers remain pinned while scrolling through goal rows
 - **Worker utilization metrics** — `GET /health/utilization` endpoint provides per-role worker utilization and bottleneck detection
 - **Self-improvement loop** — the improver modifies `agents.md` based on accumulated metrics
-- **EF Core persistence** — All state is persisted in a single `copilothive.db` SQLite database via Entity Framework Core (`CopilotHiveDbContext`). `GoalStore` (goals, releases, iterations) and `PipelineStore` (pipelines, conversations, task mappings) both use `IDbContextFactory<CopilotHiveDbContext>`. Schema reconciliation at startup creates missing tables (`EnsureSchemaUpToDate`) and applies pending EF Core migrations (`Database.MigrateAsync`). The legacy `goals.db` is automatically migrated to `copilothive.db` on first startup. Pre-migration backups created via SQLite's online backup API
+- **EF Core persistence** — All state is persisted in a single `copilothive.db` SQLite database via Entity Framework Core (`CopilotHiveDbContext`). `GoalStore` (goals, releases, iterations) and `PipelineStore` (pipelines, conversations, task mappings) both use `IDbContextFactory<CopilotHiveDbContext>`. Schema reconciliation at startup creates missing tables (`EnsureSchemaUpToDate`) and applies pending EF Core migrations (`Database.MigrateAsync()`). Pre-migration backups created via SQLite's online backup API
 - **Backup & Restore** — `BackupService` creates tar.gz archives containing the database, Brain session files (`brain-master.json`, `brain-goal-*.json`), Composer session (`composer-session.json`), metrics, and data protection keys. Backups are created on-demand via the Configuration page "Backup" tab or `POST /api/backup`, listed via `GET /api/backup`, and downloaded via `GET /api/backup/{filename}`. Restore via `POST /api/backup/restore` creates a safety backup before replacing files; orchestrator restart required after restore. Old backups pruned to last 10
+- **Full In-App Configuration** — All `hive-config.yaml` settings are editable from the dashboard Configuration page. New tabs: Available Models (add/edit/remove models, browse provider models from GitHub Copilot and Ollama APIs, per-model reasoning effort), Repositories (add/edit/remove with auto-clone), Orchestrator settings (max_iterations, max_retries, max_parallel_goals, always_improve, verbose_logging, brain_max_steps, branch_cleanup_delay_hours), Worker context windows (per-role), and Composer settings (max_steps). Changes are written back to `hive-config.yaml` and hot-reloaded
+- **GitHub OAuth Authentication** — When `GITHUB_OAUTH_CLIENT_ID` and `GITHUB_OAUTH_CLIENT_SECRET` environment variables are set, all dashboard pages and REST endpoints require authentication via GitHub OAuth. The first user to sign in becomes the admin (single-user model). The OAuth access token is stored in the database and used for Copilot API access, eliminating the need for `GH_TOKEN`. When OAuth env vars are not set, the system runs in "open mode" (no authentication, backward compatible). Login page with "Sign in with GitHub" button, user profile (avatar + username) in nav bar, logout button
+- **Per-Model Reasoning Effort** — Each model in `available_models` can have a `reasoning_effort` field (none/low/medium/high/extra_high). Model dropdowns show the reasoning effort (e.g., `copilot/claude-sonnet-4.6 (high)`). Configured at runtime instead of via `:suffix` in model names
+- **Composer Session Compaction** — Manual "Compact" and "Compact 50%" buttons in the Composer chat. Full compaction summarizes the entire session (except recent messages). Partial compaction (50%) summarizes only the oldest 50% of tokens, keeping the newest 50% verbatim — gentler, preserves more recent context. Uses SharpCoder 0.11.0's `CompactOldestPercentAsync`
 - **Goals REST API** — `GET/POST/PATCH/DELETE /api/goals`, `GET /api/goals/{id}`, `GET /api/goals/search?q=…&status=…`, `POST /api/goals/{id}/cancel`
 - **Releases REST API** — `GET/POST/PATCH/DELETE /api/releases`, `GET /api/releases/{id}`; release statuses follow the lifecycle **Planning → In Progress → Released**; goals can be assigned to a release via the API or the Composer
 - **Dashboard** — Blazor Server UI with **shared header bar**, **sticky nav/footer**, and **emoji icons** on nav items; goals browser (filterable/searchable by status, priority, repository, and **release filter with Planning release support**), goal detail with iteration timeline and dependency visualization, **Releases page** (list all releases with status and goal count; detail page showing assigned goals and progress), release assignment visible on the Goals page, worker status (including actual model being used per task with premium tier display), orchestrator view (Brain + Composer stats, with Reset Brain Session button), live logs, and configuration; configuration page displays `hive-config.yaml` with YAML syntax highlighting (keys, comments, booleans, numbers); nav bar and footer display the running **CopilotHive version** sourced from assembly metadata; responsive sidebar navigation (collapses to icon-only at ≤768px); 🔔 clarification bell icon in the global header opens a slide-out drawer when workers request human clarification (visible from any page); Workers page shows real-time context usage % per worker (updated every 30 seconds via heartbeat)
