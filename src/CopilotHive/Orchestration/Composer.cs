@@ -224,6 +224,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - Use 'idea' for unformed concepts needing exploration
         - Use 'scratch' for working notes or temporary content
         - All mutating operations (create, update, delete, link, unlink) are immediately committed to the config repo
+        - Progress documents live under the 'progress' topic (document IDs: `progress-{goal-id}`). They are living 'scratch' documents maintained automatically during a goal's execution — use read_document to inspect the Brain's iteration plans, worker narratives, and iteration summaries for a goal.
         """;
 
     /// <summary>

@@ -32,6 +32,9 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly IBrainRepoManager _repoManager;
     private readonly ILogger<GoalDispatcher> _logger;
     private readonly HiveConfigFile? _config;
+    private readonly KnowledgeGraph? _knowledgeGraph;
+    private readonly ConfigRepoManager? _configRepo;
+    private readonly IGoalStore? _goalStore;
 
     private readonly BranchCoordinator _branchCoordinator = new();
     private readonly TaskBuilder _taskBuilder = new(new BranchCoordinator());
@@ -102,6 +105,9 @@ public sealed class GoalDispatcher : BackgroundService
         _clarificationQueue = clarificationQueue;
         _startupDelay = startupDelay ?? TimeSpan.FromSeconds(10);
         _progressLog = progressLog;
+        _knowledgeGraph = knowledgeGraph;
+        _configRepo = configRepo;
+        _goalStore = goalStore;
         _clarificationHandler = new ClarificationHandler(brain, clarificationRouter, clarificationQueue, logger);
 
         _lifecycleService = new GoalLifecycleService(
@@ -129,7 +135,9 @@ public sealed class GoalDispatcher : BackgroundService
             resolveRepositories: ResolveRepositories,
             syncAgents: ct => _maintenance.SyncAgentsFromConfigRepoAsync(ct),
             generateMergeCommitMessage: GenerateMergeCommitMessageAsync,
-            logger: logger);
+            logger: logger,
+            knowledgeGraph: _knowledgeGraph,
+            configRepo: _configRepo);
 
         completionNotifier.OnTaskCompleted+= result => HandleTaskCompletionAsync(result);
     }
@@ -666,6 +674,9 @@ public sealed class GoalDispatcher : BackgroundService
         var firstPhase = iterationPlan.Phases[0];
         pipeline.AdvanceTo(firstPhase);
 
+        // Create a living progress document in the knowledge graph for this goal.
+        await CreateProgressDocumentAsync(goal, pipeline, iterationPlan, ct);
+
         // Craft prompt for first phase and dispatch
         var firstPhasePrompt = _brain is not null
             ? await ResolvePromptAsync(pipeline, firstPhase, null, ct)
@@ -687,6 +698,56 @@ public sealed class GoalDispatcher : BackgroundService
         await DispatchToRole(pipeline, firstRole, firstPhasePrompt, ct);
 
         _pipelineManager.PersistFull(pipeline);
+    }
+
+    /// <summary>
+    /// Creates a living progress document in the knowledge graph for the given goal, links it to the
+    /// goal via the <see cref="Goal.Documents"/> field, and appends the Brain's initial iteration plan.
+    /// Failures are logged and swallowed — the progress document is best-effort and never blocks dispatch.
+    /// </summary>
+    private async Task CreateProgressDocumentAsync(Goal goal, GoalPipeline pipeline, IterationPlan iterationPlan, CancellationToken ct)
+    {
+        if (_knowledgeGraph is null)
+            return;
+
+        var docId = $"progress-{goal.Id}";
+        try
+        {
+            var firstLine = (goal.Description ?? goal.Id).Split('\n')[0];
+            var title = $"Progress: {firstLine}";
+            var headerContent = $"# {title}\n";
+
+            await _knowledgeGraph.CreateDocumentAsync(
+                id: docId,
+                title: title,
+                type: DocumentType.Scratch,
+                content: headerContent,
+                topic: "progress",
+                ct: ct);
+
+            // Link the document to the goal via the documents field
+            if (_goalStore is not null && !goal.Documents.Contains(docId))
+            {
+                goal.Documents.Add(docId);
+                await _goalStore.UpdateGoalAsync(goal, ct);
+            }
+
+            // Append the Brain's initial iteration plan
+            var planText = PipelineProgressFormatting.BuildPlanSection(pipeline.Iteration, iterationPlan);
+            var doc = _knowledgeGraph.GetDocument(docId);
+            if (doc is not null)
+            {
+                var newContent = doc.Content.TrimEnd() + "\n\n" + planText;
+                await _knowledgeGraph.UpdateDocumentAsync(docId, content: newContent, ct: ct);
+            }
+
+            if (_configRepo is not null)
+                await _knowledgeGraph.CommitToConfigRepoAsync(_configRepo.LocalPath, $"Create progress document: {docId}", ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to create progress document for goal {GoalId}", goal.Id);
+        }
     }
 
     /// <summary>

@@ -1,7 +1,9 @@
 using CopilotHive.Agents;
+using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Improvement;
+using CopilotHive.Knowledge;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Workers;
@@ -24,6 +26,8 @@ internal sealed class PipelineDriver
     private readonly AgentsManager? _agentsManager;
     private readonly MetricsTracker? _metricsTracker;
     private readonly ILogger _logger;
+    private readonly KnowledgeGraph? _knowledgeGraph;
+    private readonly ConfigRepoManager? _configRepo;
 
     // Callbacks into GoalDispatcher
     private readonly Func<GoalPipeline, WorkerRole, string?, CancellationToken, Task> _dispatchToRole;
@@ -47,7 +51,9 @@ internal sealed class PipelineDriver
         Func<Goal, List<TargetRepository>> resolveRepositories,
         Func<CancellationToken, Task> syncAgents,
         Func<GoalPipeline, CancellationToken, Task<string>> generateMergeCommitMessage,
-        ILogger logger)
+        ILogger logger,
+        KnowledgeGraph? knowledgeGraph = null,
+        ConfigRepoManager? configRepo = null)
     {
         _brain = brain;
         _lifecycleService = lifecycleService;
@@ -63,6 +69,61 @@ internal sealed class PipelineDriver
         _syncAgents = syncAgents;
         _generateMergeCommitMessage = generateMergeCommitMessage;
         _logger = logger;
+        _knowledgeGraph = knowledgeGraph;
+        _configRepo = configRepo;
+    }
+
+    /// <summary>
+    /// Appends content to the goal's living progress document in the knowledge graph and commits it.
+    /// No-op when no knowledge graph is configured or the document does not exist.
+    /// Failures are logged and swallowed — progress updates are best-effort and never block the pipeline.
+    /// </summary>
+    private async Task AppendToProgressDocumentAsync(string goalId, string content, CancellationToken ct)
+    {
+        if (_knowledgeGraph is null)
+            return;
+
+        var docId = $"progress-{goalId}";
+        try
+        {
+            var doc = _knowledgeGraph.GetDocument(docId);
+            if (doc is null)
+                return;
+
+            var newContent = doc.Content.TrimEnd() + "\n\n" + content;
+            await _knowledgeGraph.UpdateDocumentAsync(docId, content: newContent, ct: ct);
+
+            if (_configRepo is not null)
+                await _knowledgeGraph.CommitToConfigRepoAsync(_configRepo.LocalPath, $"Update progress document: {docId}", ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to append to progress document for goal {GoalId}", goalId);
+        }
+    }
+
+    /// <summary>
+    /// Appends the worker narratives reported during the just-completed phase to the progress document.
+    /// Narratives are filtered by the completing task's ID and ordered chronologically.
+    /// </summary>
+    private async Task AppendPhaseNarrativesAsync(GoalPipeline pipeline, TaskResult result, string workerRole, CancellationToken ct)
+    {
+        if (_knowledgeGraph is null || pipeline.Narratives.IsEmpty)
+            return;
+
+        var narratives = pipeline.Narratives
+            .Where(n => n.TaskId == result.TaskId)
+            .OrderBy(n => n.Timestamp)
+            .ToList();
+
+        if (narratives.Count == 0)
+            return;
+
+        var narrativeText = "";
+        foreach (var entry in narratives)
+            narrativeText += $"### {workerRole} (narrative)\n{entry.Content}\n\n";
+
+        await AppendToProgressDocumentAsync(pipeline.GoalId, narrativeText.TrimEnd(), ct);
     }
 
     public async Task DriveNextPhaseAsync(GoalPipeline pipeline, TaskResult result, CancellationToken ct)
@@ -179,6 +240,9 @@ internal sealed class PipelineDriver
         var outputSummary = PipelineHelpers.BuildWorkerOutputSummary(pipeline.Phase, verdict, result);
         pipeline.Conversation.Add(new ConversationEntry(workerRole, outputSummary, pipeline.Iteration, "worker-output"));
 
+        // Append worker narratives for the completed phase to the living progress document.
+        await AppendPhaseNarrativesAsync(pipeline, result, workerRole, ct);
+
         // After Improver: sync config repo to pick up the changes it pushed directly
         if (pipeline.Phase == GoalPhase.Improve)
         {
@@ -240,6 +304,8 @@ internal sealed class PipelineDriver
 
             case TransitionEffect.Completed:
                 pipeline.AdvanceTo(GoalPhase.Done);
+                await AppendToProgressDocumentAsync(pipeline.GoalId,
+                    "### Brain Summary (Final)\nGoal completed successfully.", ct);
                 await _lifecycleService.MarkGoalCompletedAsync(pipeline, ct);
                 break;
         }
@@ -321,6 +387,13 @@ internal sealed class PipelineDriver
         pipeline.SetPlan(newPlan);
         pipeline.StateMachine.StartIteration(newPlan.Phases);
 
+        // Append a Brain summary of the completed iteration and the new plan to the progress document.
+        var summaryAndPlan =
+            $"### Brain Summary (Iteration {pipeline.Iteration - 1})\n" +
+            $"Iteration resulted in: {verdict}. Proceeding to iteration {pipeline.Iteration}.\n\n" +
+            PipelineProgressFormatting.BuildPlanSection(pipeline.Iteration, newPlan);
+        await AppendToProgressDocumentAsync(pipeline.GoalId, summaryAndPlan, ct);
+
         _logger.LogInformation(
             "New iteration {Iteration} for goal {GoalId}: {Phases}",
             pipeline.Iteration, pipeline.GoalId, string.Join(" → ", newPlan.Phases));
@@ -384,6 +457,8 @@ internal sealed class PipelineDriver
         {
             pipeline.StateMachine.Fail();
             pipeline.AdvanceTo(GoalPhase.Failed);
+            await AppendToProgressDocumentAsync(pipeline.GoalId,
+                $"### Brain Summary (Final)\nMerge failed after max retries: {errorMessage}", ct);
             await _lifecycleService.MarkGoalFailedAsync(pipeline, $"Merge failed after max retries: {errorMessage}", ct);
             return;
         }
@@ -396,6 +471,8 @@ internal sealed class PipelineDriver
         {
             pipeline.StateMachine.Fail();
             pipeline.AdvanceTo(GoalPhase.Failed);
+            await AppendToProgressDocumentAsync(pipeline.GoalId,
+                "### Brain Summary (Final)\nExceeded max iterations during merge conflict resolution.", ct);
             await _lifecycleService.MarkGoalFailedAsync(pipeline, "Exceeded max iterations during merge conflict resolution", ct);
             return;
         }
@@ -447,6 +524,13 @@ internal sealed class PipelineDriver
 
         pipeline.SetPlan(newPlan);
         pipeline.StateMachine.StartIteration(newPlan.Phases);
+
+        // Append a Brain summary of the failed-merge iteration and the new plan to the progress document.
+        var mergeSummaryAndPlan =
+            $"### Brain Summary (Iteration {pipeline.Iteration - 1})\n" +
+            $"Merge conflict encountered. Retrying with rebase. {errorMessage}\n\n" +
+            PipelineProgressFormatting.BuildPlanSection(pipeline.Iteration, newPlan);
+        await AppendToProgressDocumentAsync(pipeline.GoalId, mergeSummaryAndPlan, ct);
 
         var fixPrompt = _brain is not null
             ? await _resolvePrompt(pipeline, GoalPhase.Coding, rebaseContext, ct)
@@ -514,7 +598,11 @@ internal sealed class PipelineDriver
                     if (skipResult.Effect == TransitionEffect.Continue)
                         await DispatchPhaseAsync(pipeline, skipResult.NextPhase, null, ct);
                     else if (skipResult.Effect == TransitionEffect.Completed)
+                    {
+                        await AppendToProgressDocumentAsync(pipeline.GoalId,
+                            "### Brain Summary (Final)\nGoal completed successfully.", ct);
                         await _lifecycleService.MarkGoalCompletedAsync(pipeline, ct);
+                    }
                 }
                 break;
 
@@ -596,11 +684,12 @@ internal sealed class PipelineDriver
             }
 
             // Summarize and merge goal session into master
+            string? brainSummary = null;
             if (_brain is not null)
             {
                 try
                 {
-                    await _brain.SummarizeAndMergeAsync(pipeline, ct);
+                    brainSummary = await _brain.SummarizeAndMergeAsync(pipeline, ct);
                 }
                 catch (Exception ex)
                 {
@@ -608,6 +697,15 @@ internal sealed class PipelineDriver
                     _brain.DeleteGoalSession(pipeline.GoalId);
                 }
             }
+
+            // Append the final Brain summary to the living progress document. This is the REAL normal
+            // completion path (Merging phase → PerformMergeAsync), not the DriveNextPhaseAsync
+            // TransitionEffect.Completed case which only fires for worker-driven completions.
+            var finalSummary = !string.IsNullOrWhiteSpace(brainSummary)
+                ? brainSummary
+                : "Goal completed successfully.";
+            await AppendToProgressDocumentAsync(pipeline.GoalId,
+                $"### Brain Summary (Final)\n{finalSummary}", ct);
 
             await _lifecycleService.MarkGoalCompletedAsync(pipeline, ct);
         }
