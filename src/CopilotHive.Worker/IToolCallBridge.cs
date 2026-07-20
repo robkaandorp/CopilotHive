@@ -20,6 +20,12 @@ public interface IToolCallBridge
     Task ReportProgressAsync(string taskId, string status, string details, CancellationToken ct);
 
     /// <summary>
+    /// Report a narrative summary of the worker's experience back to the orchestrator.
+    /// Fire-and-forget — does not block on a response.
+    /// </summary>
+    Task ReportNarrativeAsync(string taskId, string narrative, CancellationToken ct);
+
+    /// <summary>
     /// Fetch the full goal description and acceptance criteria directly from the orchestrator.
     /// Returns id/status/description/repositories/priority as JSON.
     /// </summary>

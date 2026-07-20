@@ -93,6 +93,11 @@ public sealed class GoalPipeline
     public ConcurrentBag<ProgressEntry> ProgressReports { get; } = [];
 
     /// <summary>
+    /// Worker narrative reports (report_narrative tool calls) generated during this goal's execution.
+    /// </summary>
+    public ConcurrentBag<NarrativeEntry> Narratives { get; } = [];
+
+    /// <summary>
     /// When <c>true</c>, the active phase is paused waiting for a clarification answer.
     /// The dashboard displays this phase with status "waiting".
     /// </summary>
@@ -265,6 +270,18 @@ public sealed class GoalPipeline
         });
     }
 
+    /// <summary>Records a worker narrative report into the pipeline's log.</summary>
+    public void AddNarrativeEntry(string workerId, string taskId, string content)
+    {
+        Narratives.Add(new NarrativeEntry
+        {
+            Timestamp = DateTime.UtcNow,
+            WorkerId = workerId,
+            TaskId = taskId,
+            Content = content,
+        });
+    }
+
     /// <summary>Returns the persisted session JSON for the given role, or <c>null</c> if not found.</summary>
     public string? GetRoleSession(string roleName) =>
         RoleSessions.Get(roleName);
@@ -292,4 +309,17 @@ public sealed class GoalPipeline
         GoalPhase.Failed     => "Failed",
         _                    => throw new InvalidOperationException($"Unhandled GoalPhase: {phase}")
     };
+}
+
+/// <summary>A single worker narrative report.</summary>
+public sealed class NarrativeEntry
+{
+    /// <summary>When the narrative was received.</summary>
+    public DateTime Timestamp { get; init; }
+    /// <summary>Worker that reported.</summary>
+    public string WorkerId { get; init; } = "";
+    /// <summary>Task ID associated with this narrative.</summary>
+    public string TaskId { get; init; } = "";
+    /// <summary>Narrative content from the worker.</summary>
+    public string Content { get; init; } = "";
 }

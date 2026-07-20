@@ -308,7 +308,11 @@ public sealed class HiveOrchestratorService(
             progress.TaskId, worker.Id, progress.Status, progress.ProgressPercent, progress.Message);
     }
 
-    private async Task HandleToolCallRequestAsync(ConnectedWorker worker, ToolCallRequest request, CancellationToken ct)
+    /// <summary>
+    /// Handles a tool call request from a worker (e.g. report_progress, report_narrative, get_goal).
+    /// Exposed as <c>internal</c> for unit testing via <c>InternalsVisibleTo</c>.
+    /// </summary>
+    internal async Task HandleToolCallRequestAsync(ConnectedWorker worker, ToolCallRequest request, CancellationToken ct)
     {
         logger.LogInformation("Tool call '{Tool}' from {WorkerId} (task={TaskId})",
             request.ToolName, worker.Id, request.TaskId);
@@ -347,6 +351,18 @@ public sealed class HiveOrchestratorService(
                         worker.Id, status, details);
                     var progressPipeline = pipelineManager.GetByTaskId(request.TaskId);
                     progressPipeline?.AddProgressReport(worker.Id, status, details);
+                    resultJson = System.Text.Json.JsonSerializer.Serialize(new { acknowledged = true });
+                    break;
+
+                case "report_narrative":
+                    var narrativeArgs = System.Text.Json.JsonDocument.Parse(request.ArgumentsJson);
+                    var narrative = narrativeArgs.RootElement.GetProperty("narrative").GetString() ?? "";
+                    if (!string.IsNullOrWhiteSpace(narrative))
+                    {
+                        logger.LogInformation("Narrative from {WorkerId}: {Narrative}", worker.Id, narrative);
+                        var narrativePipeline = pipelineManager.GetByTaskId(request.TaskId);
+                        narrativePipeline?.AddNarrativeEntry(worker.Id, request.TaskId, narrative);
+                    }
                     resultJson = System.Text.Json.JsonSerializer.Serialize(new { acknowledged = true });
                     break;
 

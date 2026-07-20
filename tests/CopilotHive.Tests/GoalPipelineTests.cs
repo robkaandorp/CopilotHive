@@ -299,6 +299,39 @@ public sealed class GoalPipelineTests
 
     #endregion
 
+    #region GoalPipeline — Narratives
+
+    [Fact]
+    public void AddNarrativeEntry_StoresEntryWithCorrectFieldsAndTimestamp()
+    {
+        var pipeline = new GoalPipeline(CreateGoal("g1", "Test goal"));
+
+        pipeline.AddNarrativeEntry("worker-1", "task-42", "I tried several approaches.");
+
+        var entry = Assert.Single(pipeline.Narratives);
+        Assert.Equal("worker-1", entry.WorkerId);
+        Assert.Equal("task-42", entry.TaskId);
+        Assert.Equal("I tried several approaches.", entry.Content);
+        Assert.NotEqual(default(DateTime), entry.Timestamp);
+    }
+
+    [Fact]
+    public void Narratives_StartsEmptyAndAccumulatesAcrossCalls()
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+
+        Assert.Empty(pipeline.Narratives);
+
+        pipeline.AddNarrativeEntry("w1", "t1", "First narrative.");
+        pipeline.AddNarrativeEntry("w2", "t2", "Second narrative.");
+
+        Assert.Equal(2, pipeline.Narratives.Count);
+        Assert.Contains(pipeline.Narratives, n => n.WorkerId == "w1" && n.Content == "First narrative.");
+        Assert.Contains(pipeline.Narratives, n => n.WorkerId == "w2" && n.Content == "Second narrative.");
+    }
+
+    #endregion
+
     #region GoalPipeline — BuildContextSummary
 
     [Fact]

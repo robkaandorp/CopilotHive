@@ -241,6 +241,14 @@ public sealed class WorkerService(
     }
 
     /// <inheritdoc/>
+    public async Task ReportNarrativeAsync(string taskId, string narrative, CancellationToken ct)
+    {
+        var requestId = Guid.NewGuid().ToString("N");
+        await SendToolCallRequest(requestId, taskId, "report_narrative",
+            System.Text.Json.JsonSerializer.Serialize(new { narrative }), ct);
+    }
+
+    /// <inheritdoc/>
     public async Task<string> GetGoalAsync(string taskId, string goalId, CancellationToken ct)
     {
         var requestId = Guid.NewGuid().ToString("N");

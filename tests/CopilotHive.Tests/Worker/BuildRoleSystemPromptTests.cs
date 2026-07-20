@@ -32,6 +32,36 @@ public sealed class BuildRoleSystemPromptTests
         Assert.Contains("request_clarification", prompt);
     }
 
+    /// <summary>
+    /// The shared preamble must instruct workers to call <c>report_narrative</c>.
+    /// </summary>
+    [Fact]
+    public void BuildRoleSystemPrompt_Coder_ContainsReportNarrativeInstruction()
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Coder, null);
+
+        Assert.Contains("report_narrative", prompt);
+        Assert.Contains("2-5 sentences", prompt);
+    }
+
+    /// <summary>
+    /// The <c>report_narrative</c> guidance lives in the shared preamble, so every role
+    /// must receive the instruction regardless of which role-specific prompt is generated.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    [InlineData(WorkerRole.Reviewer)]
+    [InlineData(WorkerRole.DocWriter)]
+    [InlineData(WorkerRole.Improver)]
+    public void BuildRoleSystemPrompt_AllRoles_ContainNarrativeGuidance(WorkerRole role)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
+
+        Assert.Contains("report_narrative", prompt);
+        Assert.Contains("2-5 sentences", prompt);
+    }
+
     // ── Role identity ─────────────────────────────────────────────────────────
 
     /// <summary>

@@ -105,6 +105,7 @@ public sealed class SharpCoderRunner : IAgentRunner
             - NEVER run `git checkout`, `git branch`, or `git switch` — the infrastructure handles branching.
             - When the goal description is ambiguous, files-to-change seem incomplete, or acceptance criteria conflict, call `request_clarification` instead of guessing.
             - Call `report_progress` at each meaningful step (e.g. "Reading files", "Building", "Tests passing", "Committing") so the user can follow your progress in real time.
+            - Call `report_narrative` at the end of your work, before calling your report tool (report_code_changes, report_test_results, report_review_verdict, report_doc_changes). Write 2-5 sentences about what you tried, what worked, what you struggled with, and why. This helps the system learn and improve.
             """;
 
         var roleSpecific = role switch
@@ -544,6 +545,18 @@ public sealed class SharpCoderRunner : IAgentRunner
                 },
                 "report_progress",
                 "Report current progress to the orchestrator."
+            ));
+
+            tools.Add(AIFunctionFactory.Create(
+                async ([Description("2-5 sentence narrative of what you tried, what worked, what you struggled with, and why")] string narrative) =>
+                {
+                    if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";
+                    _log.Info("Tool call: report_narrative()");
+                    await _toolBridge.ReportNarrativeAsync(_currentTaskId, narrative, CancellationToken.None);
+                    return "Narrative recorded.";
+                },
+                "report_narrative",
+                "Report a narrative summary of your work experience to help the system learn and improve."
             ));
 
             tools.Add(AIFunctionFactory.Create(
