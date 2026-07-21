@@ -65,6 +65,7 @@ internal static class GoalDetailViewBuilder
             CoderBranch = pipeline?.CoderBranch,
             Notes = effectiveGoal.Notes,
             DependsOn = effectiveGoal.DependsOn,
+            Documents = effectiveGoal.Documents,
             Iterations = iterations,
             Conversation = pipeline?.Conversation.ToList() ?? [],
             MergeCommitHash = pipeline?.MergeCommitHash ?? effectiveGoal.MergeCommitHash,

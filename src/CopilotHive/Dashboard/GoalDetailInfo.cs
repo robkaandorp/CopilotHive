@@ -33,6 +33,8 @@ public sealed class GoalDetailInfo
     public List<string> Notes { get; init; } = [];
     /// <summary>IDs of goals that must complete before this goal can be dispatched.</summary>
     public List<string> DependsOn { get; init; } = [];
+    /// <summary>IDs of knowledge documents linked to this goal.</summary>
+    public List<string> Documents { get; init; } = [];
     /// <summary>Per-iteration detail with phases.</summary>
     public List<IterationViewInfo> Iterations { get; init; } = [];
     /// <summary>Brain conversation log.</summary>

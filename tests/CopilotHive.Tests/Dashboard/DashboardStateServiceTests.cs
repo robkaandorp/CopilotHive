@@ -128,6 +128,98 @@ public sealed class DashboardStateServiceTests : IDisposable
     }
 
     /// <summary>
+    /// Verifies that <see cref="GoalDetailInfo.Documents"/> is populated correctly
+    /// when the underlying <see cref="Goal"/> has document IDs set.
+    /// </summary>
+    [Fact]
+    public void GoalDetailInfo_Documents_PopulatedFromGoal()
+    {
+        var goal = new Goal
+        {
+            Id = "doc-goal",
+            Description = "A goal with linked documents",
+            Documents = ["doc-1", "doc-2"],
+        };
+
+        var detail = new GoalDetailInfo
+        {
+            GoalId = goal.Id,
+            Description = goal.Description,
+            Status = goal.Status,
+            Priority = goal.Priority,
+            Documents = goal.Documents,
+        };
+
+        Assert.Equal(2, detail.Documents.Count);
+        Assert.Contains("doc-1", detail.Documents);
+        Assert.Contains("doc-2", detail.Documents);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetGoalDetail"/> populates
+    /// <see cref="GoalDetailInfo.Documents"/> with the correct document IDs
+    /// for a goal that was stored with linked documents.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_GoalWithDocuments_PopulatesDocuments()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Arrange: persist a goal that has linked documents
+        var documentId = "architecture-brain";
+        var goal = new Goal
+        {
+            Id = "doc-linked-goal",
+            Description = "Goal linked to a document",
+            Documents = [documentId],
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store);
+
+        // Act
+        var detail = await service.GetGoalDetail("doc-linked-goal");
+
+        // Assert
+        Assert.NotNull(detail);
+        Assert.Single(detail.Documents);
+        Assert.Contains(documentId, detail.Documents);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="GoalDetailInfo.Documents"/> defaults to an
+    /// empty list when the goal has no documents.
+    /// </summary>
+    [Fact]
+    public void GoalDetailInfo_Documents_EmptyWhenNoDocuments()
+    {
+        var goal = new Goal
+        {
+            Id = "no-doc-goal",
+            Description = "No documents",
+        };
+
+        var detail = new GoalDetailInfo
+        {
+            GoalId = goal.Id,
+            Description = goal.Description,
+            Status = goal.Status,
+            Priority = goal.Priority,
+        };
+
+        Assert.Empty(detail.Documents);
+    }
+
+    /// <summary>
     /// Verifies that <see cref="DashboardStateService.GetGoalDetail"/> populates
     /// <see cref="GoalDetailInfo.DependsOn"/> from the goal stored in the
     /// <see cref="IGoalStore"/> when no active pipeline exists.
