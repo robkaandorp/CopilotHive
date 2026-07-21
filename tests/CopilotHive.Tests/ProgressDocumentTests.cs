@@ -656,10 +656,35 @@ public sealed class ProgressDocumentTests
         Assert.NotNull(doc);
         // The title must NOT contain the raw "## Goal" markdown heading.
         Assert.DoesNotContain("## Goal", doc!.Content);
-        // The title must contain the actual goal summary from the second line.
-        Assert.Contains("Update all NuGet package references", doc.Content);
-        // The document header line (# ...) must use the clean title, not "## Goal".
-        Assert.Contains("# Progress: Update all NuGet package references", doc.Content);
+        // The document header line (# ...) must use the goal identifier as the title.
+        Assert.Contains($"# Progress: {goal.Id}", doc.Content);
+    }
+
+    [Fact]
+    public async Task DispatchNextGoal_WithMultilineGoalDescription_TitleUsesGoalIdNotDescription()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+        var goal = new Goal
+        {
+            Id = $"goal-progress-{Guid.NewGuid():N}",
+            Description = "## Goal\n\nSimplify the progress document title to use the goal ID directly instead of trying to extract a title from the goal description.",
+            RepositoryNames = ["test-repo"],
+        };
+        var dispatcher = CreateDispatcher(goal, graph, out _, out _);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        var doc = graph.GetDocument($"progress-{goal.Id}");
+        Assert.NotNull(doc);
+
+        // The title must be exactly "Progress: {goal.Id}" — not derived from the description.
+        var expectedTitle = $"Progress: {goal.Id}";
+        Assert.DoesNotContain("## Goal", doc!.Content);
+        Assert.DoesNotContain("Simplify the progress document title", doc.Content[..Math.Min(200, doc.Content.Length)]);
+
+        // The document content must start with the "# Progress: {goal.Id}" header.
+        Assert.StartsWith($"# {expectedTitle}\n", doc.Content);
     }
 
     // ── Formatting: Brain Plan blank line ────────────────────────────────────

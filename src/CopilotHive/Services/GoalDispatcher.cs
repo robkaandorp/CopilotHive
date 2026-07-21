@@ -701,37 +701,6 @@ public sealed class GoalDispatcher : BackgroundService
     }
 
     /// <summary>
-    /// Extracts a meaningful one-line title from a goal description. Strips leading markdown heading
-    /// characters and whitespace, skips blank lines and generic headers like "Goal", and falls back
-    /// to the goal identifier when no usable title is found.
-    /// </summary>
-    private static string ExtractGoalTitle(string description, string goalId)
-    {
-        if (string.IsNullOrWhiteSpace(description))
-            return goalId;
-
-        foreach (var line in description.Split('\n'))
-        {
-            var trimmed = line.Trim();
-            if (string.IsNullOrWhiteSpace(trimmed))
-                continue;
-
-            // Strip leading markdown heading characters (#) and any remaining whitespace.
-            var withoutHashPrefix = trimmed.TrimStart('#').Trim();
-            if (string.IsNullOrWhiteSpace(withoutHashPrefix))
-                continue;
-
-            // Skip generic headers like "Goal".
-            if (withoutHashPrefix.Equals("Goal", StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            return withoutHashPrefix;
-        }
-
-        return goalId;
-    }
-
-    /// <summary>
     /// Creates a living progress document in the knowledge graph for the given goal, links it to the
     /// goal via the <see cref="Goal.Documents"/> field, and appends the Brain's initial iteration plan.
     /// Failures are logged and swallowed — the progress document is best-effort and never blocks dispatch.
@@ -744,7 +713,7 @@ public sealed class GoalDispatcher : BackgroundService
         var docId = $"progress-{goal.Id}";
         try
         {
-            var title = $"Progress: {ExtractGoalTitle(goal.Description ?? goal.Id, goal.Id)}";
+            var title = $"Progress: {goal.Id}";
             var headerContent = $"# {title}\n";
 
             await _knowledgeGraph.CreateDocumentAsync(
