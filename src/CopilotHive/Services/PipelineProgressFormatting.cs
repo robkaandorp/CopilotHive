@@ -12,11 +12,11 @@ internal static class PipelineProgressFormatting
     /// </summary>
     public static string BuildPlanSection(int iteration, IterationPlan plan)
     {
-        var text = $"## Iteration {iteration}\n\n### Brain Plan\n" +
-            $"Phases: {string.Join(" → ", plan.Phases)}\n";
+        var text = $"## Iteration {iteration}\n\n### Brain Plan\n\n" +
+            $"Phases: {string.Join(" → ", plan.Phases)}\n\n";
 
         if (!string.IsNullOrWhiteSpace(plan.Reason))
-            text += $"Reasoning: {plan.Reason}\n";
+            text += $"Reasoning: {plan.Reason}\n\n";
 
         // Use occurrence-based instruction lookup so multi-round plans (e.g. coding → testing →
         // coding → testing) surface the per-occurrence instructions ("coding-1", "coding-2") rather
@@ -29,7 +29,7 @@ internal static class PipelineProgressFormatting
             occurrences[phase] = occurrences.GetValueOrDefault(phase, 0) + 1;
             var instructions = plan.GetPhaseInstruction(phase, occurrences[phase]);
             if (!string.IsNullOrWhiteSpace(instructions))
-                text += $"\n**{phase}**: {instructions}\n";
+                text += $"**{phase}**: {instructions}\n";
         }
 
         return text;

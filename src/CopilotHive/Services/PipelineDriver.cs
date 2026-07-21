@@ -121,7 +121,7 @@ internal sealed class PipelineDriver
 
         var narrativeText = "";
         foreach (var entry in narratives)
-            narrativeText += $"### {workerRole} (narrative)\n{entry.Content}\n\n";
+            narrativeText += $"### {workerRole} (narrative)\n\n{entry.Content}\n\n";
 
         await AppendToProgressDocumentAsync(pipeline.GoalId, narrativeText.TrimEnd(), ct);
     }
@@ -305,7 +305,7 @@ internal sealed class PipelineDriver
             case TransitionEffect.Completed:
                 pipeline.AdvanceTo(GoalPhase.Done);
                 await AppendToProgressDocumentAsync(pipeline.GoalId,
-                    "### Brain Summary (Final)\nGoal completed successfully.", ct);
+                    "### Brain Summary (Final)\n\nGoal completed successfully.", ct);
                 await _lifecycleService.MarkGoalCompletedAsync(pipeline, ct);
                 break;
         }
@@ -389,7 +389,7 @@ internal sealed class PipelineDriver
 
         // Append a Brain summary of the completed iteration and the new plan to the progress document.
         var summaryAndPlan =
-            $"### Brain Summary (Iteration {pipeline.Iteration - 1})\n" +
+            $"### Brain Summary (Iteration {pipeline.Iteration - 1})\n\n" +
             $"Iteration resulted in: {verdict}. Proceeding to iteration {pipeline.Iteration}.\n\n" +
             PipelineProgressFormatting.BuildPlanSection(pipeline.Iteration, newPlan);
         await AppendToProgressDocumentAsync(pipeline.GoalId, summaryAndPlan, ct);
@@ -458,7 +458,7 @@ internal sealed class PipelineDriver
             pipeline.StateMachine.Fail();
             pipeline.AdvanceTo(GoalPhase.Failed);
             await AppendToProgressDocumentAsync(pipeline.GoalId,
-                $"### Brain Summary (Final)\nMerge failed after max retries: {errorMessage}", ct);
+                $"### Brain Summary (Final)\n\nMerge failed after max retries: {errorMessage}", ct);
             await _lifecycleService.MarkGoalFailedAsync(pipeline, $"Merge failed after max retries: {errorMessage}", ct);
             return;
         }
@@ -472,7 +472,7 @@ internal sealed class PipelineDriver
             pipeline.StateMachine.Fail();
             pipeline.AdvanceTo(GoalPhase.Failed);
             await AppendToProgressDocumentAsync(pipeline.GoalId,
-                "### Brain Summary (Final)\nExceeded max iterations during merge conflict resolution.", ct);
+                "### Brain Summary (Final)\n\nExceeded max iterations during merge conflict resolution.", ct);
             await _lifecycleService.MarkGoalFailedAsync(pipeline, "Exceeded max iterations during merge conflict resolution", ct);
             return;
         }
@@ -527,7 +527,7 @@ internal sealed class PipelineDriver
 
         // Append a Brain summary of the failed-merge iteration and the new plan to the progress document.
         var mergeSummaryAndPlan =
-            $"### Brain Summary (Iteration {pipeline.Iteration - 1})\n" +
+            $"### Brain Summary (Iteration {pipeline.Iteration - 1})\n\n" +
             $"Merge conflict encountered. Retrying with rebase. {errorMessage}\n\n" +
             PipelineProgressFormatting.BuildPlanSection(pipeline.Iteration, newPlan);
         await AppendToProgressDocumentAsync(pipeline.GoalId, mergeSummaryAndPlan, ct);
@@ -600,7 +600,7 @@ internal sealed class PipelineDriver
                     else if (skipResult.Effect == TransitionEffect.Completed)
                     {
                         await AppendToProgressDocumentAsync(pipeline.GoalId,
-                            "### Brain Summary (Final)\nGoal completed successfully.", ct);
+                            "### Brain Summary (Final)\n\nGoal completed successfully.", ct);
                         await _lifecycleService.MarkGoalCompletedAsync(pipeline, ct);
                     }
                 }
@@ -705,7 +705,7 @@ internal sealed class PipelineDriver
                 ? brainSummary
                 : "Goal completed successfully.";
             await AppendToProgressDocumentAsync(pipeline.GoalId,
-                $"### Brain Summary (Final)\n{finalSummary}", ct);
+                $"### Brain Summary (Final)\n\n{finalSummary}", ct);
 
             await _lifecycleService.MarkGoalCompletedAsync(pipeline, ct);
         }

@@ -635,6 +635,115 @@ public sealed class ProgressDocumentTests
         Assert.Contains(customSummary, doc.Content);
     }
 
+    // ── Formatting: title extraction ─────────────────────────────────────────
+
+    [Fact]
+    public async Task DispatchNextGoal_WithMarkdownHeadingDescription_TitleStripsHeadingPrefix()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+        var goal = new Goal
+        {
+            Id = $"goal-progress-{Guid.NewGuid():N}",
+            Description = "## Goal\nUpdate all NuGet package references to the latest versions.",
+            RepositoryNames = ["test-repo"],
+        };
+        var dispatcher = CreateDispatcher(goal, graph, out _, out _);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        var doc = graph.GetDocument($"progress-{goal.Id}");
+        Assert.NotNull(doc);
+        // The title must NOT contain the raw "## Goal" markdown heading.
+        Assert.DoesNotContain("## Goal", doc!.Content);
+        // The title must contain the actual goal summary from the second line.
+        Assert.Contains("Update all NuGet package references", doc.Content);
+        // The document header line (# ...) must use the clean title, not "## Goal".
+        Assert.Contains("# Progress: Update all NuGet package references", doc.Content);
+    }
+
+    // ── Formatting: Brain Plan blank line ────────────────────────────────────
+
+    [Fact]
+    public void BuildPlanSection_HasBlankLineAfterBrainPlanHeading()
+    {
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.Testing],
+            Reason = "A simple plan",
+        };
+
+        var section = PipelineProgressFormatting.BuildPlanSection(1, plan);
+
+        // There must be a blank line after "### Brain Plan" — content contains
+        // "### Brain Plan\n\n" (heading followed by blank line).
+        Assert.Contains("### Brain Plan\n\n", section);
+    }
+
+    // ── Formatting: worker narrative blank line ─────────────────────────────
+
+    [Fact]
+    public async Task PhaseCompletion_NarrativeHasBlankLineAfterHeading()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+        var goal = new Goal { Id = $"goal-progress-{Guid.NewGuid():N}", Description = "Implement feature X", RepositoryNames = ["test-repo"] };
+        var dispatcher = CreateDispatcher(goal, graph, out var pipelineManager, out _);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        var pipeline = pipelineManager.GetByGoalId(goal.Id);
+        Assert.NotNull(pipeline);
+
+        var taskId = pipeline!.ActiveTaskId;
+        Assert.NotNull(taskId);
+
+        pipeline.AddNarrativeEntry("worker-1", taskId!, "I explored the codebase and implemented the change.");
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId!,
+            Status = TaskOutcome.Completed,
+            Output = "Made changes",
+            GitStatus = new GitChangeSummary { FilesChanged = 2 },
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+        }, ct);
+
+        var doc = graph.GetDocument($"progress-{goal.Id}");
+        Assert.NotNull(doc);
+        // The narrative heading must be followed by a blank line:
+        // "### coder (narrative)\n\n"
+        Assert.Contains("### coder (narrative)\n\n", doc!.Content);
+    }
+
+    // ── Formatting: Brain Summary blank line ────────────────────────────────
+
+    [Fact]
+    public async Task NewIteration_BrainSummaryHasBlankLineAfterHeading()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+        var goal = new Goal { Id = $"goal-progress-{Guid.NewGuid():N}", Description = "Implement feature X", RepositoryNames = ["test-repo"] };
+        var dispatcher = CreateDispatcher(goal, graph, out var pipelineManager, out _, maxRetries: 3);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        var pipeline = pipelineManager.GetByGoalId(goal.Id);
+        Assert.NotNull(pipeline);
+
+        // Drive through Coding → Testing → DocWriting → Review with REQUEST_CHANGES
+        // to trigger a new iteration, which appends a Brain Summary section.
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS", filesChanged: 2);
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "REQUEST_CHANGES");
+
+        var doc = graph.GetDocument($"progress-{goal.Id}");
+        Assert.NotNull(doc);
+        // The Brain Summary heading must be followed by a blank line.
+        Assert.Contains("### Brain Summary (Iteration 1)\n\n", doc!.Content);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static GoalDispatcher CreateDispatcher(
