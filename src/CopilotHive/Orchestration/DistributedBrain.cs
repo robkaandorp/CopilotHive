@@ -1069,7 +1069,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 _session.MessageHistory.Count, estimatedTokens, _maxContextTokens,
                 usagePct, _session.InputTokensUsed, _session.OutputTokensUsed);
 
-            _logger.LogInformation("{Message}", FormatContextUsageMessage(_session.InputTokensUsed, _maxContextTokens, callerName));
+            var contextTokens = _session.LastKnownContextTokens > 0
+                ? _session.LastKnownContextTokens
+                : _session.EstimatedContextTokens;
+            _logger.LogInformation("{Message}", FormatContextUsageMessage(contextTokens, _maxContextTokens, callerName));
 
             _logger.LogDebug("Brain response ({Length} chars), tool={Tool}",
                 responseText.Length, _lastToolCallResult?.ToolName ?? "none");
