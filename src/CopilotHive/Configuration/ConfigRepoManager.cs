@@ -190,16 +190,7 @@ public class ConfigRepoManager
         {
             await RunGitAsync(_localPath, ["add", filePath], ct);
             await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
-            try
-            {
-                await RunGitAsync(_localPath, ["pull"], ct);
-            }
-            catch
-            {
-                await TryAbortMergeAsync(_localPath, ct);
-                throw;
-            }
-            await RunGitAsync(_localPath, ["push"], ct);
+            await PushWithConflictRecoveryAsync(ct);
         }
         finally
         {
@@ -220,16 +211,7 @@ public class ConfigRepoManager
         {
             await RunGitAsync(_localPath, ["rm", "--cached", filePath], ct);
             await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
-            try
-            {
-                await RunGitAsync(_localPath, ["pull"], ct);
-            }
-            catch
-            {
-                await TryAbortMergeAsync(_localPath, ct);
-                throw;
-            }
-            await RunGitAsync(_localPath, ["push"], ct);
+            await PushWithConflictRecoveryAsync(ct);
         }
         finally
         {
@@ -250,16 +232,58 @@ public class ConfigRepoManager
         {
             await RunGitAsync(_localPath, ["add", "--all"], ct);
             await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
+            await PushWithConflictRecoveryAsync(ct);
+        }
+        finally
+        {
+            _gitLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Pulls the latest changes and pushes the local commit, recovering from merge conflicts.
+    /// If a plain pull fails (likely a conflict), the merge is aborted, the working tree is
+    /// reset to the local commit, and a rebase pull is attempted. If the rebase also fails,
+    /// the rebase is aborted, the tree is reset hard, and the local commit is pushed as-is.
+    /// </summary>
+    private async Task PushWithConflictRecoveryAsync(CancellationToken ct)
+    {
+        try
+        {
+            await RunGitAsync(_localPath, ["pull"], ct);
+        }
+        catch
+        {
+            // Pull failed — likely a merge conflict. Recover by aborting the merge,
+            // resetting to the local commit, and retrying with rebase.
+            await TryAbortMergeAsync(_localPath, ct);
+            await RunGitAsync(_localPath, ["reset", "--hard", "HEAD"], ct);
             try
             {
-                await RunGitAsync(_localPath, ["pull"], ct);
+                await RunGitAsync(_localPath, ["pull", "--rebase"], ct);
             }
             catch
             {
-                await TryAbortMergeAsync(_localPath, ct);
-                throw;
+                // Rebase also failed — abort rebase, reset hard, and push local commit as-is
+                await RunGitAsync(_localPath, ["rebase", "--abort"], ct);
+                await RunGitAsync(_localPath, ["reset", "--hard", "HEAD"], ct);
             }
-            await RunGitAsync(_localPath, ["push"], ct);
+        }
+        await RunGitAsync(_localPath, ["push"], ct);
+    }
+
+    /// <summary>
+    /// Resets the local config repo clone to match the remote, discarding any local changes.
+    /// Used for recovery when the repo is stuck in a conflicted state.
+    /// </summary>
+    public async Task ResetToRemoteAsync(CancellationToken ct = default)
+    {
+        await _gitLock.WaitAsync(ct);
+        try
+        {
+            await TryAbortMergeAsync(_localPath, ct);
+            await RunGitAsync(_localPath, ["fetch", "origin"], ct);
+            await RunGitAsync(_localPath, ["reset", "--hard", "origin/HEAD"], ct);
         }
         finally
         {

@@ -540,6 +540,417 @@ public class ConfigRepoManagerTests : IDisposable
         }
     }
 
+    // ── Conflict recovery (PushWithConflictRecoveryAsync via CommitFileAsync) ──
+
+    [Fact]
+    public async Task CommitFileAsync_WhenPullConflicts_RebasesAndPushes()
+    {
+        var bareDir = Path.Combine(Path.GetTempPath(), $"cfgtest-bare-{Guid.NewGuid():N}");
+        var clone1Dir = Path.Combine(Path.GetTempPath(), $"cfgtest-clone1-{Guid.NewGuid():N}");
+        var clone2Dir = Path.Combine(Path.GetTempPath(), $"cfgtest-clone2-{Guid.NewGuid():N}");
+
+        try
+        {
+            // Create bare repo and initial commit in clone1.
+            Directory.CreateDirectory(bareDir);
+            await RunGitCommandAsync(bareDir, ["init", "--bare"]);
+            Directory.CreateDirectory(clone1Dir);
+            await RunGitCommandAsync(Path.GetDirectoryName(clone1Dir)!,
+                ["clone", bareDir, Path.GetFileName(clone1Dir)]);
+            await RunGitCommandAsync(clone1Dir, ["config", "user.email", "test@test.com"]);
+            await RunGitCommandAsync(clone1Dir, ["config", "user.name", "Test1"]);
+
+            // Write initial file and push.
+            await File.WriteAllTextAsync(Path.Combine(clone1Dir, "config.txt"), "base content\n",
+                TestContext.Current.CancellationToken);
+            await RunGitCommandAsync(clone1Dir, ["add", "config.txt"]);
+            await RunGitCommandAsync(clone1Dir, ["commit", "-m", "initial"]);
+            await RunGitCommandAsync(clone1Dir, ["push", "origin", "HEAD"]);
+
+            // Clone2: clone from bare.
+            Directory.CreateDirectory(clone2Dir);
+            await RunGitCommandAsync(Path.GetDirectoryName(clone2Dir)!,
+                ["clone", bareDir, Path.GetFileName(clone2Dir)]);
+            await RunGitCommandAsync(clone2Dir, ["config", "user.email", "test2@test.com"]);
+            await RunGitCommandAsync(clone2Dir, ["config", "user.name", "Test2"]);
+
+            // Clone1: push a conflicting change to the same file (different line, rebase-friendly).
+            await File.WriteAllTextAsync(Path.Combine(clone1Dir, "config.txt"), "base content\nremote line\n",
+                TestContext.Current.CancellationToken);
+            await RunGitCommandAsync(clone1Dir, ["add", "config.txt"]);
+            await RunGitCommandAsync(clone1Dir, ["commit", "-m", "remote change"]);
+            await RunGitCommandAsync(clone1Dir, ["push", "origin", "HEAD"]);
+
+            // Clone2: write a local change to a DIFFERENT line so rebase can succeed.
+            await File.WriteAllTextAsync(Path.Combine(clone2Dir, "config.txt"), "local content\nbase content\n",
+                TestContext.Current.CancellationToken);
+
+            // Set pull.rebase false so plain pull attempts a merge (which will conflict).
+            await RunGitCommandAsync(clone2Dir, ["config", "pull.rebase", "false"]);
+
+            // Act — CommitFileAsync should detect the conflict, abort merge, reset,
+            // rebase onto remote, and push. No exception should be thrown.
+            var manager = new ConfigRepoManager(bareDir, clone2Dir);
+            await manager.CommitFileAsync("config.txt", "local change", TestContext.Current.CancellationToken);
+
+            // Assert — the remote now has both commits (rebase succeeded).
+            // Clone the remote to a fresh clone to verify state.
+            var verifyDir = Path.Combine(Path.GetTempPath(), $"cfgtest-verify-{Guid.NewGuid():N}");
+            try
+            {
+                Directory.CreateDirectory(verifyDir);
+                await RunGitCommandAsync(Path.GetDirectoryName(verifyDir)!,
+                    ["clone", bareDir, Path.GetFileName(verifyDir)]);
+                var remoteContent = await File.ReadAllTextAsync(
+                    Path.Combine(verifyDir, "config.txt"), TestContext.Current.CancellationToken);
+
+                // After a successful rebase, both lines should be present since they
+                // modified different parts of the file.
+                Assert.Contains("base content", remoteContent);
+                Assert.Contains("local content", remoteContent);
+                Assert.Contains("remote line", remoteContent);
+
+                // Verify both commits exist on the remote.
+                var (logOutput, _) = await RunGitCommandRawAsync(verifyDir, ["log", "--oneline"]);
+                Assert.Contains("local change", logOutput);
+                Assert.Contains("remote change", logOutput);
+            }
+            finally
+            {
+                if (Directory.Exists(verifyDir))
+                    try { Directory.Delete(verifyDir, recursive: true); } catch { }
+            }
+
+            // Clone2 should be in a clean state (not mid-merge or mid-rebase).
+            var (statusOutput, _) = await RunGitCommandRawAsync(clone2Dir, ["status"]);
+            Assert.DoesNotContain("MERGING", statusOutput, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("REBASE", statusOutput, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("working tree clean", statusOutput, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            foreach (var dir in new[] { bareDir, clone1Dir, clone2Dir })
+                if (Directory.Exists(dir))
+                    try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task CommitFileAsync_WhenPullAndRebaseBothFail_ResetsAndPushes()
+    {
+        var bareDir = Path.Combine(Path.GetTempPath(), $"cfgtest-bare-{Guid.NewGuid():N}");
+        var clone1Dir = Path.Combine(Path.GetTempPath(), $"cfgtest-clone1-{Guid.NewGuid():N}");
+        var clone2Dir = Path.Combine(Path.GetTempPath(), $"cfgtest-clone2-{Guid.NewGuid():N}");
+
+        try
+        {
+            // Create bare repo and initial commit in clone1.
+            Directory.CreateDirectory(bareDir);
+            await RunGitCommandAsync(bareDir, ["init", "--bare"]);
+            Directory.CreateDirectory(clone1Dir);
+            await RunGitCommandAsync(Path.GetDirectoryName(clone1Dir)!,
+                ["clone", bareDir, Path.GetFileName(clone1Dir)]);
+            await RunGitCommandAsync(clone1Dir, ["config", "user.email", "test@test.com"]);
+            await RunGitCommandAsync(clone1Dir, ["config", "user.name", "Test1"]);
+
+            // Write initial file and push.
+            await File.WriteAllTextAsync(Path.Combine(clone1Dir, "config.txt"), "line1\n",
+                TestContext.Current.CancellationToken);
+            await RunGitCommandAsync(clone1Dir, ["add", "config.txt"]);
+            await RunGitCommandAsync(clone1Dir, ["commit", "-m", "initial"]);
+            await RunGitCommandAsync(clone1Dir, ["push", "origin", "HEAD"]);
+
+            // Clone2: clone from bare.
+            Directory.CreateDirectory(clone2Dir);
+            await RunGitCommandAsync(Path.GetDirectoryName(clone2Dir)!,
+                ["clone", bareDir, Path.GetFileName(clone2Dir)]);
+            await RunGitCommandAsync(clone2Dir, ["config", "user.email", "test2@test.com"]);
+            await RunGitCommandAsync(clone2Dir, ["config", "user.name", "Test2"]);
+
+            // Clone1: push a conflicting change to the SAME line.
+            await File.WriteAllTextAsync(Path.Combine(clone1Dir, "config.txt"), "remote-only-content\n",
+                TestContext.Current.CancellationToken);
+            await RunGitCommandAsync(clone1Dir, ["add", "config.txt"]);
+            await RunGitCommandAsync(clone1Dir, ["commit", "-m", "remote change"]);
+            await RunGitCommandAsync(clone1Dir, ["push", "origin", "HEAD"]);
+
+            // Clone2: write a local change to the SAME line (will conflict on rebase too).
+            await File.WriteAllTextAsync(Path.Combine(clone2Dir, "config.txt"), "local-only-content\n",
+                TestContext.Current.CancellationToken);
+
+            // Set pull.rebase false so plain pull attempts a merge (which will conflict).
+            await RunGitCommandAsync(clone2Dir, ["config", "pull.rebase", "false"]);
+
+            // Act — CommitFileAsync should: pull fails → abort merge → reset →
+            // pull --rebase fails → abort rebase → reset hard → push local commit.
+            // The push will also fail (non-fast-forward) since the local commit diverged.
+            // The exception from git push propagates, but the repo must be in a clean state.
+            var manager = new ConfigRepoManager(bareDir, clone2Dir);
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => manager.CommitFileAsync("config.txt", "local change", TestContext.Current.CancellationToken));
+
+            // The exception should come from the push failure (not a merge/rebase conflict).
+            Assert.Contains("git exited with code", ex.Message);
+
+            // The repo should be in a clean state — not mid-merge or mid-rebase.
+            // This is the key assertion: even though the push failed, the recovery
+            // logic (abort merge, reset hard, abort rebase, reset hard) ensured the
+            // repo is not stuck in a conflicted state.
+            var (statusOutput, _) = await RunGitCommandRawAsync(clone2Dir, ["status"]);
+            Assert.DoesNotContain("MERGING", statusOutput, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("REBASE", statusOutput, StringComparison.OrdinalIgnoreCase);
+
+            // Verify the local file still contains the local commit's content
+            // (reset --hard HEAD preserved the local commit).
+            var localContent = await File.ReadAllTextAsync(
+                Path.Combine(clone2Dir, "config.txt"), TestContext.Current.CancellationToken);
+            Assert.Contains("local-only-content", localContent);
+
+            // Verify the local commit exists in the local log.
+            var (logOutput, _) = await RunGitCommandRawAsync(clone2Dir, ["log", "--oneline"]);
+            Assert.Contains("local change", logOutput);
+        }
+        finally
+        {
+            foreach (var dir in new[] { bareDir, clone1Dir, clone2Dir })
+                if (Directory.Exists(dir))
+                    try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task CommitAllChangesAsync_WhenPullConflicts_RebasesAndPushes()
+    {
+        var bareDir = Path.Combine(Path.GetTempPath(), $"cfgtest-bare-{Guid.NewGuid():N}");
+        var clone1Dir = Path.Combine(Path.GetTempPath(), $"cfgtest-clone1-{Guid.NewGuid():N}");
+        var clone2Dir = Path.Combine(Path.GetTempPath(), $"cfgtest-clone2-{Guid.NewGuid():N}");
+
+        try
+        {
+            // Create bare repo and initial commit in clone1.
+            Directory.CreateDirectory(bareDir);
+            await RunGitCommandAsync(bareDir, ["init", "--bare"]);
+            Directory.CreateDirectory(clone1Dir);
+            await RunGitCommandAsync(Path.GetDirectoryName(clone1Dir)!,
+                ["clone", bareDir, Path.GetFileName(clone1Dir)]);
+            await RunGitCommandAsync(clone1Dir, ["config", "user.email", "test@test.com"]);
+            await RunGitCommandAsync(clone1Dir, ["config", "user.name", "Test1"]);
+
+            // Write initial file and push.
+            await File.WriteAllTextAsync(Path.Combine(clone1Dir, "data.txt"), "base\n",
+                TestContext.Current.CancellationToken);
+            await RunGitCommandAsync(clone1Dir, ["add", "data.txt"]);
+            await RunGitCommandAsync(clone1Dir, ["commit", "-m", "initial"]);
+            await RunGitCommandAsync(clone1Dir, ["push", "origin", "HEAD"]);
+
+            // Clone2: clone from bare.
+            Directory.CreateDirectory(clone2Dir);
+            await RunGitCommandAsync(Path.GetDirectoryName(clone2Dir)!,
+                ["clone", bareDir, Path.GetFileName(clone2Dir)]);
+            await RunGitCommandAsync(clone2Dir, ["config", "user.email", "test2@test.com"]);
+            await RunGitCommandAsync(clone2Dir, ["config", "user.name", "Test2"]);
+
+            // Clone1: push a conflicting change to the same file (different line for rebase success).
+            await File.WriteAllTextAsync(Path.Combine(clone1Dir, "data.txt"), "base\nremote line\n",
+                TestContext.Current.CancellationToken);
+            await RunGitCommandAsync(clone1Dir, ["add", "data.txt"]);
+            await RunGitCommandAsync(clone1Dir, ["commit", "-m", "remote change"]);
+            await RunGitCommandAsync(clone1Dir, ["push", "origin", "HEAD"]);
+
+            // Clone2: write a local change to a DIFFERENT line so rebase can succeed.
+            await File.WriteAllTextAsync(Path.Combine(clone2Dir, "data.txt"), "local line\nbase\n",
+                TestContext.Current.CancellationToken);
+
+            // Set pull.rebase false so plain pull attempts a merge (which will conflict).
+            await RunGitCommandAsync(clone2Dir, ["config", "pull.rebase", "false"]);
+
+            // Act — CommitAllChangesAsync should detect the conflict, abort merge,
+            // reset, rebase onto remote, and push. No exception should be thrown.
+            var manager = new ConfigRepoManager(bareDir, clone2Dir);
+            await manager.CommitAllChangesAsync("local change via commit-all", TestContext.Current.CancellationToken);
+
+            // Assert — the remote now has both commits (rebase succeeded).
+            var verifyDir = Path.Combine(Path.GetTempPath(), $"cfgtest-verify-{Guid.NewGuid():N}");
+            try
+            {
+                Directory.CreateDirectory(verifyDir);
+                await RunGitCommandAsync(Path.GetDirectoryName(verifyDir)!,
+                    ["clone", bareDir, Path.GetFileName(verifyDir)]);
+                var remoteContent = await File.ReadAllTextAsync(
+                    Path.Combine(verifyDir, "data.txt"), TestContext.Current.CancellationToken);
+
+                // After a successful rebase, both lines should be present.
+                Assert.Contains("base", remoteContent);
+                Assert.Contains("local line", remoteContent);
+                Assert.Contains("remote line", remoteContent);
+
+                // Verify the local commit exists on the remote.
+                var (logOutput, _) = await RunGitCommandRawAsync(verifyDir, ["log", "--oneline"]);
+                Assert.Contains("local change via commit-all", logOutput);
+                Assert.Contains("remote change", logOutput);
+            }
+            finally
+            {
+                if (Directory.Exists(verifyDir))
+                    try { Directory.Delete(verifyDir, recursive: true); } catch { }
+            }
+
+            // Clone2 should be in a clean state.
+            var (statusOutput, _) = await RunGitCommandRawAsync(clone2Dir, ["status"]);
+            Assert.DoesNotContain("MERGING", statusOutput, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("REBASE", statusOutput, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            foreach (var dir in new[] { bareDir, clone1Dir, clone2Dir })
+                if (Directory.Exists(dir))
+                    try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    // ── ResetToRemoteAsync ─────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task ResetToRemoteAsync_ResetsToRemoteState()
+    {
+        var bareDir = Path.Combine(Path.GetTempPath(), $"cfgtest-bare-{Guid.NewGuid():N}");
+        var clone1Dir = Path.Combine(Path.GetTempPath(), $"cfgtest-clone1-{Guid.NewGuid():N}");
+        var clone2Dir = Path.Combine(Path.GetTempPath(), $"cfgtest-clone2-{Guid.NewGuid():N}");
+
+        try
+        {
+            // Create bare repo and initial commit in clone1.
+            Directory.CreateDirectory(bareDir);
+            await RunGitCommandAsync(bareDir, ["init", "--bare"]);
+            Directory.CreateDirectory(clone1Dir);
+            await RunGitCommandAsync(Path.GetDirectoryName(clone1Dir)!,
+                ["clone", bareDir, Path.GetFileName(clone1Dir)]);
+            await RunGitCommandAsync(clone1Dir, ["config", "user.email", "test@test.com"]);
+            await RunGitCommandAsync(clone1Dir, ["config", "user.name", "Test1"]);
+
+            // Write initial file and push.
+            await File.WriteAllTextAsync(Path.Combine(clone1Dir, "config.txt"), "remote content\n",
+                TestContext.Current.CancellationToken);
+            await RunGitCommandAsync(clone1Dir, ["add", "config.txt"]);
+            await RunGitCommandAsync(clone1Dir, ["commit", "-m", "remote commit"]);
+            await RunGitCommandAsync(clone1Dir, ["push", "origin", "HEAD"]);
+
+            // Clone2: clone from bare, then make local commits.
+            Directory.CreateDirectory(clone2Dir);
+            await RunGitCommandAsync(Path.GetDirectoryName(clone2Dir)!,
+                ["clone", bareDir, Path.GetFileName(clone2Dir)]);
+            await RunGitCommandAsync(clone2Dir, ["config", "user.email", "test2@test.com"]);
+            await RunGitCommandAsync(clone2Dir, ["config", "user.name", "Test2"]);
+
+            // Make a local commit that diverges from remote.
+            await File.WriteAllTextAsync(Path.Combine(clone2Dir, "config.txt"), "local content\n",
+                TestContext.Current.CancellationToken);
+            await RunGitCommandAsync(clone2Dir, ["add", "config.txt"]);
+            await RunGitCommandAsync(clone2Dir, ["commit", "-m", "local commit"]);
+
+            // Act — ResetToRemoteAsync should discard local commits and match remote.
+            var manager = new ConfigRepoManager(bareDir, clone2Dir);
+            await manager.ResetToRemoteAsync(TestContext.Current.CancellationToken);
+
+            // Assert — local file matches remote content.
+            var localContent = await File.ReadAllTextAsync(
+                Path.Combine(clone2Dir, "config.txt"), TestContext.Current.CancellationToken);
+            Assert.Equal("remote content\n", localContent);
+
+            // Git status should be clean (no local changes, working tree clean).
+            var (statusOutput, _) = await RunGitCommandRawAsync(clone2Dir, ["status"]);
+            Assert.Contains("working tree clean", statusOutput, StringComparison.OrdinalIgnoreCase);
+
+            // Local log should match remote log — no "local commit".
+            var (logOutput, _) = await RunGitCommandRawAsync(clone2Dir, ["log", "--oneline"]);
+            Assert.Contains("remote commit", logOutput);
+            Assert.DoesNotContain("local commit", logOutput);
+        }
+        finally
+        {
+            foreach (var dir in new[] { bareDir, clone1Dir, clone2Dir })
+                if (Directory.Exists(dir))
+                    try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ResetToRemoteAsync_AbortsActiveMerge()
+    {
+        var bareDir = Path.Combine(Path.GetTempPath(), $"cfgtest-bare-{Guid.NewGuid():N}");
+        var clone1Dir = Path.Combine(Path.GetTempPath(), $"cfgtest-clone1-{Guid.NewGuid():N}");
+        var clone2Dir = Path.Combine(Path.GetTempPath(), $"cfgtest-clone2-{Guid.NewGuid():N}");
+
+        try
+        {
+            // Create bare repo and initial commit in clone1.
+            Directory.CreateDirectory(bareDir);
+            await RunGitCommandAsync(bareDir, ["init", "--bare"]);
+            Directory.CreateDirectory(clone1Dir);
+            await RunGitCommandAsync(Path.GetDirectoryName(clone1Dir)!,
+                ["clone", bareDir, Path.GetFileName(clone1Dir)]);
+            await RunGitCommandAsync(clone1Dir, ["config", "user.email", "test@test.com"]);
+            await RunGitCommandAsync(clone1Dir, ["config", "user.name", "Test1"]);
+
+            // Write initial file and push.
+            await File.WriteAllTextAsync(Path.Combine(clone1Dir, "config.txt"), "base\n",
+                TestContext.Current.CancellationToken);
+            await RunGitCommandAsync(clone1Dir, ["add", "config.txt"]);
+            await RunGitCommandAsync(clone1Dir, ["commit", "-m", "initial"]);
+            await RunGitCommandAsync(clone1Dir, ["push", "origin", "HEAD"]);
+
+            // Clone2: clone from bare (at "initial" commit), then make a local conflicting commit.
+            Directory.CreateDirectory(clone2Dir);
+            await RunGitCommandAsync(Path.GetDirectoryName(clone2Dir)!,
+                ["clone", bareDir, Path.GetFileName(clone2Dir)]);
+            await RunGitCommandAsync(clone2Dir, ["config", "user.email", "test2@test.com"]);
+            await RunGitCommandAsync(clone2Dir, ["config", "user.name", "Test2"]);
+
+            await File.WriteAllTextAsync(Path.Combine(clone2Dir, "config.txt"), "local change\n",
+                TestContext.Current.CancellationToken);
+            await RunGitCommandAsync(clone2Dir, ["add", "config.txt"]);
+            await RunGitCommandAsync(clone2Dir, ["commit", "-m", "local change"]);
+
+            // Clone1: push a conflicting change to the SAME line (diverges from clone2).
+            await File.WriteAllTextAsync(Path.Combine(clone1Dir, "config.txt"), "remote change\n",
+                TestContext.Current.CancellationToken);
+            await RunGitCommandAsync(clone1Dir, ["add", "config.txt"]);
+            await RunGitCommandAsync(clone1Dir, ["commit", "-m", "remote change"]);
+            await RunGitCommandAsync(clone1Dir, ["push", "origin", "HEAD"]);
+
+            // Clone2: fetch the remote change, then start a merge that will conflict.
+            await RunGitCommandAsync(clone2Dir, ["fetch", "origin"]);
+            // merge will fail with a conflict — this puts the repo in a merging state.
+            var (_, _) = await RunGitCommandRawAsync(clone2Dir, ["merge", "origin/HEAD"]);
+            // Verify we're in a merging state (git status shows "unmerged paths").
+            var (statusBefore, _) = await RunGitCommandRawAsync(clone2Dir, ["status"]);
+            Assert.Contains("unmerged", statusBefore, StringComparison.OrdinalIgnoreCase);
+
+            // Act — ResetToRemoteAsync should abort the merge and reset to remote.
+            var manager = new ConfigRepoManager(bareDir, clone2Dir);
+            await manager.ResetToRemoteAsync(TestContext.Current.CancellationToken);
+
+            // Assert — repo is no longer in a merging state.
+            var (statusAfter, _) = await RunGitCommandRawAsync(clone2Dir, ["status"]);
+            Assert.DoesNotContain("unmerged", statusAfter, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("MERGING", statusAfter, StringComparison.OrdinalIgnoreCase);
+
+            // The local content should now match the remote.
+            var localContent = await File.ReadAllTextAsync(
+                Path.Combine(clone2Dir, "config.txt"), TestContext.Current.CancellationToken);
+            Assert.Equal("remote change\n", localContent);
+
+            // Status should be clean.
+            Assert.Contains("working tree clean", statusAfter, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            foreach (var dir in new[] { bareDir, clone1Dir, clone2Dir })
+                if (Directory.Exists(dir))
+                    try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
     // ── Git helper for tests ──────────────────────────────────────────────────
 
     private static SemaphoreSlim GetGitLock(ConfigRepoManager manager)

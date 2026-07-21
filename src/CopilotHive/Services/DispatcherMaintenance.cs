@@ -116,7 +116,17 @@ internal sealed class DispatcherMaintenance
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed to reload knowledge graph from config repo");
+                    _logger.LogWarning(ex, "Failed to reload knowledge graph from config repo — attempting reset");
+                    try
+                    {
+                        await _configRepo.ResetToRemoteAsync(ct);
+                        await _knowledgeGraph.ReloadFromConfigRepoAsync(_configRepo.LocalPath, ct);
+                        _logger.LogInformation("Reloaded knowledge graph from config repo after reset");
+                    }
+                    catch (Exception ex2)
+                    {
+                        _logger.LogError(ex2, "Failed to recover config repo after reset");
+                    }
                 }
             }
 
