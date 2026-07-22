@@ -38,6 +38,17 @@
                     <span class="badge @StatusBadge(_storedGoal.Status)">@_storedGoal.Status</span>
                 }
 
+                @* Review status badge *@
+                @{
+                    var reviewStatus = _detail?.ReviewStatus ?? _storedGoal?.ReviewStatus ?? ReviewStatus.None;
+                }
+                @if (reviewStatus != ReviewStatus.None)
+                {
+                    <span class="badge @ReviewStatusBadge(reviewStatus)">
+                        @ReviewStatusText(reviewStatus)
+                    </span>
+                }
+
                 @* Priority *@
                 @if (_detail is not null)
                 {
@@ -744,10 +755,27 @@
                 @* Approve — Draft only *@
                 @if (_detail?.Status == GoalStatus.Draft || _storedGoal?.Status == GoalStatus.Draft)
                 {
+                    @if ((_detail?.ReviewStatus ?? _storedGoal?.ReviewStatus ?? ReviewStatus.None) == ReviewStatus.NeedsChanges)
+                    {
+                        <span class="warning-msg" style="color:var(--red);font-size:0.85rem">
+                            ⚠️ This goal was reviewed and needs changes. Consider updating it before approving.
+                        </span>
+                    }
+
                     <button class="approve-btn" @onclick="ApproveGoal">▶ Approve</button>
                     @if (!string.IsNullOrEmpty(_approveError))
                     {
                         <span class="error-msg">@_approveError</span>
+                    }
+
+                    @* Review Goal — Draft only, when not already pending *@
+                    @if ((_detail?.ReviewStatus ?? _storedGoal?.ReviewStatus ?? ReviewStatus.None) is ReviewStatus.None or ReviewStatus.NeedsChanges)
+                    {
+                        <button class="review-btn" @onclick="ReviewGoal">🔍 Review Goal</button>
+                        @if (!string.IsNullOrEmpty(_reviewError))
+                        {
+                            <span class="error-msg">@_reviewError</span>
+                        }
                     }
                 }
 
@@ -805,6 +833,7 @@ else
     private ElementReference _iterContentRef;
     private int _lastTimelineCount;
     private string? _approveError;
+    private string? _reviewError;
     private string? _revertError;
     private string? _cancelError;
     private string? _deleteError;
@@ -1005,6 +1034,22 @@ else
         _ => "badge-muted",
     };
 
+    private static string ReviewStatusBadge(ReviewStatus s) => s switch
+    {
+        ReviewStatus.Pending => "badge-warning",
+        ReviewStatus.Approved => "badge-success",
+        ReviewStatus.NeedsChanges => "badge-danger",
+        _ => "badge-muted",
+    };
+
+    private static string ReviewStatusText(ReviewStatus s) => s switch
+    {
+        ReviewStatus.Pending => "🔄 Review in progress",
+        ReviewStatus.Approved => "✅ Reviewed: Approved",
+        ReviewStatus.NeedsChanges => "⚠️ Reviewed: Needs Changes",
+        _ => s.ToString(),
+    };
+
     private static string PhaseBadge(string status) => status switch
     {
         "completed" => "badge-green",
@@ -1107,6 +1152,23 @@ else
         {
             var errorContent = await response.Content.ReadAsStringAsync();
             _approveError = $"Error {(int)response.StatusCode}: {errorContent}";
+        }
+    }
+
+    private async Task ReviewGoal()
+    {
+        _reviewError = null;
+        var response = await HttpClient.PostAsync($"/api/goals/{GoalId}/review", null);
+        if (response.IsSuccessStatusCode)
+        {
+            await RefreshAsync();
+            StateHasChanged();
+        }
+        else
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            _reviewError = $"Error {(int)response.StatusCode}: {errorContent}";
+            StateHasChanged();
         }
     }
 

@@ -101,6 +101,13 @@
                         }
                     </td>
                     <td><span class="badge @StatusBadge(g.Status)">@g.Status</span>
+                        @if (g.ReviewStatus != ReviewStatus.None)
+                        {
+                            <span title="Review: @g.ReviewStatus" style="font-size:0.8rem">
+                                @(g.ReviewStatus == ReviewStatus.Approved ? "✅" :
+                                  g.ReviewStatus == ReviewStatus.Pending ? "🔄" : "⚠️")
+                            </span>
+                        }
                         @if (g.DependsOn.Count > 0)
                         {
                             var hasBlocked = g.DependsOn.Any(depId => !IsDependencyCompleted(depId));
