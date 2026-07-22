@@ -252,6 +252,29 @@ public static class ApiEndpoints
             var updated = await store.GetGoalAsync(id);
             return Results.Ok(updated);
         });
+
+        goalsApi.MapPost("/{goalId}/review", async (string goalId, GoalReviewService reviewService, IGoalStore goalStore, CancellationToken ct) =>
+        {
+            var goal = await goalStore.GetGoalAsync(goalId, ct);
+            if (goal is null)
+                return Results.NotFound(new { error = $"Goal '{goalId}' not found." });
+
+            if (goal.Status != GoalStatus.Draft)
+                return Results.BadRequest(new { error = "Only Draft goals can be reviewed." });
+
+            if (goal.ReviewStatus == ReviewStatus.Pending)
+                return Results.Conflict(new { error = "A review is already in progress for this goal." });
+
+            try
+            {
+                var result = await reviewService.ReviewGoalAsync(goal, ct);
+                return Results.Ok(result);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+        });
     }
 
     /// <summary>

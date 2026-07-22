@@ -4,6 +4,8 @@ using System.Text;
 using System.Text.Json;
 using CopilotHive.Goals;
 using CopilotHive.Git;
+using CopilotHive.Services;
+using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Moq;
 
@@ -1002,5 +1004,194 @@ public class GoalsApiEndpointTests
         var response = await _client.PostAsync("/api/goals/nonexistent-goal-xyz/cancel", null, TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    // ── GET /api/goals/{id} reflects review status badge value ───────────
+
+    /// <summary>
+    /// The goal detail page renders a review-status badge sourced from the goal's
+    /// <c>reviewStatus</c> field. There is no Blazor component test host in this project,
+    /// so this verifies the underlying data contract: after PATCHing the review status to
+    /// each non-None value, GET <c>/api/goals/{id}</c> returns the matching value that the
+    /// badge would render.
+    /// </summary>
+    [Theory]
+    [InlineData("Pending")]
+    [InlineData("Approved")]
+    [InlineData("NeedsChanges")]
+    public async Task GetGoalById_AfterPatchReviewStatus_ReturnsUpdatedReviewStatus(string reviewStatus)
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        var patchResponse = await _client.PatchAsync(
+            $"/api/goals/{id}/review-status",
+            new StringContent(JsonSerializer.Serialize(new { reviewStatus }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, patchResponse.StatusCode);
+
+        var getResponse = await _client.GetAsync($"/api/goals/{id}",
+            TestContext.Current.CancellationToken);
+        getResponse.EnsureSuccessStatusCode();
+
+        var body = await getResponse.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        using var doc = JsonDocument.Parse(body);
+        Assert.True(doc.RootElement.TryGetProperty("reviewStatus", out var reviewStatusElement),
+            "Response should contain 'reviewStatus' field");
+
+        var expected = Enum.Parse<ReviewStatus>(reviewStatus);
+        var matches = reviewStatusElement.ValueKind == JsonValueKind.Number
+            ? reviewStatusElement.GetInt32() == (int)expected
+            : string.Equals(reviewStatusElement.GetString(), reviewStatus, StringComparison.OrdinalIgnoreCase);
+        Assert.True(matches, $"Expected reviewStatus to be {reviewStatus} but got: {reviewStatusElement}");
+    }
+
+    // ── POST /api/goals/{id}/review ──────────────────────────────────────
+
+    /// <summary>
+    /// Creates a <see cref="WebApplicationFactory{TEntryPoint}"/> derived from the shared fixture
+    /// with the <see cref="GoalReviewService"/> replaced by one using a stubbed chat client so no
+    /// real LLM call is made. Uses <c>WithWebHostBuilder</c> so it does NOT create a new
+    /// <see cref="HiveTestFactory"/> or touch the process-wide <c>STATE_DIR</c>. Seed goals via
+    /// the returned factory's <c>Services</c> so they share the derived host's service provider.
+    /// </summary>
+    private WebApplicationFactory<Program> CreateReviewFactory() =>
+        _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                var existing = services.SingleOrDefault(d => d.ServiceType == typeof(GoalReviewService));
+                if (existing is not null)
+                    services.Remove(existing);
+
+                services.AddSingleton(sp => new GoalReviewService(
+                    sp.GetService<CopilotHive.Knowledge.KnowledgeGraph>(),
+                    sp.GetService<CopilotHive.Configuration.ConfigRepoManager>(),
+                    sp.GetService<CopilotHive.Configuration.HiveConfigFile>(),
+                    sp.GetRequiredService<IGoalStore>(),
+                    sp.GetService<CopilotHive.Git.IBrainRepoManager>(),
+                    Environment.GetEnvironmentVariable("STATE_DIR") ?? Path.GetTempPath(),
+                    sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<GoalReviewService>>(),
+                    _ => new StubChatClient(
+                        """{"verdict":"Approved","issues":[],"verified":[],"recommendation":"Looks good"}""")));
+            });
+        });
+
+    [Fact]
+    public async Task PostReview_ValidDraftGoal_Returns200WithApprovedVerdict()
+    {
+        var id = UniqueId();
+        using var factory = CreateReviewFactory();
+        using var client = factory.CreateClient();
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            var goal = new Goal { Id = id, Description = "Test review goal" };
+            await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+            goal.Status = GoalStatus.Draft;
+            await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
+        }
+
+        var response = await client.PostAsync($"/api/goals/{id}/review", null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.Contains("Approved", body);
+    }
+
+    [Fact]
+    public async Task PostReview_NonExistentGoal_Returns404()
+    {
+        using var factory = CreateReviewFactory();
+        using var client = factory.CreateClient();
+
+        var response = await client.PostAsync("/api/goals/nonexistent-review-goal/review", null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PostReview_NonDraftGoal_Returns400()
+    {
+        var id = UniqueId();
+        using var factory = CreateReviewFactory();
+        using var client = factory.CreateClient();
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            var goal = new Goal { Id = id, Description = "Test review goal" };
+            await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+        }
+
+        var response = await client.PostAsync($"/api/goals/{id}/review", null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PostReview_ReviewAlreadyPending_Returns409()
+    {
+        var id = UniqueId();
+        using var factory = CreateReviewFactory();
+        using var client = factory.CreateClient();
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            var goal = new Goal { Id = id, Description = "Test review goal" };
+            await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+            goal.Status = GoalStatus.Draft;
+            goal.ReviewStatus = ReviewStatus.Pending;
+            await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
+        }
+
+        var response = await client.PostAsync($"/api/goals/{id}/review", null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+    }
+
+    /// <summary>
+    /// Stub <see cref="Microsoft.Extensions.AI.IChatClient"/> returning a canned reply so
+    /// review endpoint tests never invoke a real LLM.
+    /// </summary>
+    private sealed class StubChatClient(string reply) : Microsoft.Extensions.AI.IChatClient
+    {
+        public Microsoft.Extensions.AI.ChatClientMetadata Metadata => new("stub", null, "stub-model");
+
+        public Task<Microsoft.Extensions.AI.ChatResponse> GetResponseAsync(
+            IEnumerable<Microsoft.Extensions.AI.ChatMessage> messages,
+            Microsoft.Extensions.AI.ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(new Microsoft.Extensions.AI.ChatResponse(
+                new Microsoft.Extensions.AI.ChatMessage(Microsoft.Extensions.AI.ChatRole.Assistant, reply))
+            {
+                FinishReason = Microsoft.Extensions.AI.ChatFinishReason.Stop,
+            });
+        }
+
+        public async IAsyncEnumerable<Microsoft.Extensions.AI.ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<Microsoft.Extensions.AI.ChatMessage> messages,
+            Microsoft.Extensions.AI.ChatOptions? options = null,
+            [System.Runtime.CompilerServices.EnumeratorCancellation]
+            CancellationToken cancellationToken = default)
+        {
+            await Task.Yield();
+            yield return new Microsoft.Extensions.AI.ChatResponseUpdate(
+                Microsoft.Extensions.AI.ChatRole.Assistant,
+                [new Microsoft.Extensions.AI.TextContent(reply)]);
+            yield return new Microsoft.Extensions.AI.ChatResponseUpdate
+            {
+                FinishReason = Microsoft.Extensions.AI.ChatFinishReason.Stop,
+                Role = Microsoft.Extensions.AI.ChatRole.Assistant,
+            };
+        }
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+        public void Dispose() { }
     }
 }

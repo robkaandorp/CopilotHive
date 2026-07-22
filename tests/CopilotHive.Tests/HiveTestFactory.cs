@@ -1,5 +1,7 @@
 using CopilotHive;
 using CopilotHive.Git;
+using CopilotHive.Goals;
+using CopilotHive.Services;
 
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -38,6 +40,17 @@ public sealed class HiveTestFactory : WebApplicationFactory<Program>
     public IBrainRepoManager? MockRepoManager { get; set; }
 
     /// <summary>
+    /// Optional stub for GoalReviewService. If set, it will replace the real implementation in DI.
+    /// </summary>
+    public GoalReviewService? MockGoalReviewService { get; set; }
+
+    /// <summary>
+    /// Optional chat-client factory used to stub out the LLM calls in <see cref="GoalReviewService"/>.
+    /// When set, the real GoalReviewService is re-registered with this factory.
+    /// </summary>
+    public Func<string, Microsoft.Extensions.AI.IChatClient>? ReviewChatClientFactory { get; set; }
+
+    /// <summary>
     /// Initialises the factory and points <c>STATE_DIR</c> at a temporary directory.
     /// </summary>
     public HiveTestFactory()
@@ -63,6 +76,42 @@ public sealed class HiveTestFactory : WebApplicationFactory<Program>
 
                 // Add mock
                 services.AddSingleton(MockRepoManager);
+            });
+        }
+
+        // Replace GoalReviewService with stub if set
+        if (MockGoalReviewService is not null)
+        {
+            builder.ConfigureServices(services =>
+            {
+                var existingDescriptor = services.SingleOrDefault(
+                    d => d.ServiceType == typeof(GoalReviewService));
+                if (existingDescriptor is not null)
+                    services.Remove(existingDescriptor);
+
+                services.AddSingleton(MockGoalReviewService);
+            });
+        }
+
+        // Re-register GoalReviewService with a custom chat-client factory to avoid real LLM calls.
+        if (ReviewChatClientFactory is not null)
+        {
+            builder.ConfigureServices(services =>
+            {
+                var existingDescriptor = services.SingleOrDefault(
+                    d => d.ServiceType == typeof(GoalReviewService));
+                if (existingDescriptor is not null)
+                    services.Remove(existingDescriptor);
+
+                services.AddSingleton(sp => new GoalReviewService(
+                    sp.GetService<CopilotHive.Knowledge.KnowledgeGraph>(),
+                    sp.GetService<CopilotHive.Configuration.ConfigRepoManager>(),
+                    sp.GetService<CopilotHive.Configuration.HiveConfigFile>(),
+                    sp.GetRequiredService<IGoalStore>(),
+                    sp.GetService<CopilotHive.Git.IBrainRepoManager>(),
+                    Environment.GetEnvironmentVariable("STATE_DIR") ?? Path.GetTempPath(),
+                    sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<GoalReviewService>>(),
+                    ReviewChatClientFactory));
             });
         }
     }
