@@ -28,9 +28,15 @@ public sealed class AuthenticatedModeTests : IDisposable
     {
         private readonly string _stateDir =
             Path.Combine(Path.GetTempPath(), $"copilothive-authtest-{Guid.NewGuid():N}");
+        private readonly string? _previousStateDir;
+        private readonly string? _previousOAuthClientId;
+        private readonly string? _previousOAuthClientSecret;
 
         public AuthEnabledFactory()
         {
+            _previousStateDir = Environment.GetEnvironmentVariable("STATE_DIR");
+            _previousOAuthClientId = Environment.GetEnvironmentVariable("GITHUB_OAUTH_CLIENT_ID");
+            _previousOAuthClientSecret = Environment.GetEnvironmentVariable("GITHUB_OAUTH_CLIENT_SECRET");
             Environment.SetEnvironmentVariable("STATE_DIR", _stateDir);
             Environment.SetEnvironmentVariable("GITHUB_OAUTH_CLIENT_ID", "test-client-id");
             Environment.SetEnvironmentVariable("GITHUB_OAUTH_CLIENT_SECRET", "test-secret");
@@ -45,9 +51,9 @@ public sealed class AuthenticatedModeTests : IDisposable
         {
             base.Dispose(disposing);
 
-            Environment.SetEnvironmentVariable("STATE_DIR", null);
-            Environment.SetEnvironmentVariable("GITHUB_OAUTH_CLIENT_ID", null);
-            Environment.SetEnvironmentVariable("GITHUB_OAUTH_CLIENT_SECRET", null);
+            Environment.SetEnvironmentVariable("STATE_DIR", _previousStateDir);
+            Environment.SetEnvironmentVariable("GITHUB_OAUTH_CLIENT_ID", _previousOAuthClientId);
+            Environment.SetEnvironmentVariable("GITHUB_OAUTH_CLIENT_SECRET", _previousOAuthClientSecret);
 
             if (!disposing || !Directory.Exists(_stateDir))
                 return;

@@ -33,6 +33,7 @@ public sealed class HiveTestFactory : WebApplicationFactory<Program>
 {
     private readonly string _stateDir =
         Path.Combine(Path.GetTempPath(), $"copilothive-test-{Guid.NewGuid():N}");
+    private readonly string? _previousStateDir;
 
     /// <summary>
     /// Optional mock for IBrainRepoManager. If set, it will replace the real implementation in DI.
@@ -55,7 +56,9 @@ public sealed class HiveTestFactory : WebApplicationFactory<Program>
     /// </summary>
     public HiveTestFactory()
     {
+        _previousStateDir = Environment.GetEnvironmentVariable("STATE_DIR");
         Environment.SetEnvironmentVariable("STATE_DIR", _stateDir);
+        Directory.CreateDirectory(_stateDir);
     }
 
     /// <inheritdoc />
@@ -120,7 +123,7 @@ public sealed class HiveTestFactory : WebApplicationFactory<Program>
     protected override void Dispose(bool disposing)
     {
         base.Dispose(disposing);
-        Environment.SetEnvironmentVariable("STATE_DIR", null);
+        Environment.SetEnvironmentVariable("STATE_DIR", _previousStateDir);
 
         if (!disposing || !Directory.Exists(_stateDir))
             return;
