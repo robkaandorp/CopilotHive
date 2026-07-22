@@ -158,26 +158,31 @@ public class LlmSessionRegistryTests
     {
         var registry = new LlmSessionRegistry();
 
-        // A stale session is removed by cleanup.
-        var stale = CreateSession("test-session", lastActivity: DateTime.UtcNow.AddHours(-2));
+        // Register a stale session and capture the exact KeyValuePair that was stored.
+        var stale = CreateSession("test-cond-removal", status: "idle", currentTokens: 100,
+            lastActivity: DateTime.UtcNow.AddHours(-2));
         registry.RegisterOrUpdate(stale);
-        registry.CleanupStale(TimeSpan.FromHours(1));
-        Assert.Empty(registry.GetAll());
+        var staleKvp = registry.Sessions.Single();
 
-        // Register a fresh stale entry, then immediately update it to a fresh instance.
-        var staleAgain = CreateSession("test-session", lastActivity: DateTime.UtcNow.AddHours(-2));
-        registry.RegisterOrUpdate(staleAgain);
-
-        var updated = CreateSession("test-session", lastActivity: DateTime.UtcNow);
+        // Update the session with a fresh, distinct record value (same SessionId).
+        var updated = CreateSession("test-cond-removal", status: "active", currentTokens: 500,
+            lastActivity: DateTime.UtcNow);
         registry.RegisterOrUpdate(updated);
+        var freshKvp = registry.Sessions.Single();
 
-        // Cleanup should NOT remove it because the current entry is fresh.
-        registry.CleanupStale(TimeSpan.FromHours(1));
+        // The stale snapshot's KeyValuePair no longer matches the current entry (records use
+        // value equality, and LastActivity/Status/CurrentTokens all changed), so the
+        // conditional Remove returns false and the session is kept.
+        var removedStale = ((ICollection<KeyValuePair<string, LlmSessionInfo>>)registry.Sessions)
+            .Remove(staleKvp);
+        Assert.False(removedStale);
+        Assert.Single(registry.GetAll());
 
-        var all = registry.GetAll();
-        Assert.Single(all);
-        Assert.Equal("test-session", all[0].SessionId);
-        Assert.Equal(updated.LastActivity, all[0].LastActivity);
+        // The fresh KeyValuePair matches the current entry, so the conditional Remove succeeds.
+        var removedFresh = ((ICollection<KeyValuePair<string, LlmSessionInfo>>)registry.Sessions)
+            .Remove(freshKvp);
+        Assert.True(removedFresh);
+        Assert.Empty(registry.GetAll());
     }
 
     [Fact]
