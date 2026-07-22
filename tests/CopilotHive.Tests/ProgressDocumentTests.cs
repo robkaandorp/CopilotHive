@@ -687,6 +687,145 @@ public sealed class ProgressDocumentTests
         Assert.StartsWith($"# {expectedTitle}\n", doc.Content);
     }
 
+    // ── Progress document appended to improver prompt ────────────────────────
+
+    [Fact]
+    public async Task ImproverPrompt_WhenProgressDocumentExists_IncludesProgressSectionAndContent()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+        var goal = new Goal { Id = $"goal-progress-{Guid.NewGuid():N}", Description = "Implement feature X", RepositoryNames = ["test-repo"] };
+        const string progressBody = "### coder (narrative)\n\nI explored the codebase and implemented the change.";
+
+        // Use a plan that includes Improve so the improver phase is reached in one iteration.
+        var capturingBrain = new ProgressFakeBrainCapturingPrompts(planWithImprove: true);
+        var dispatcher = CreateDispatcher(goal, graph, out var pipelineManager, out _, brain: capturingBrain);
+
+        // Dispatch creates the progress document and starts at Coding.
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Populate the progress document with qualitative content.
+        var docId = $"progress-{goal.Id}";
+        var doc = graph.GetDocument(docId);
+        Assert.NotNull(doc);
+        await graph.UpdateDocumentAsync(docId, content: doc!.Content.TrimEnd() + "\n\n" + progressBody, ct: ct);
+
+        var pipeline = pipelineManager.GetByGoalId(goal.Id);
+        Assert.NotNull(pipeline);
+
+        // Drive through the standard plan until we reach Improve.
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS", filesChanged: 2);   // Coding
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                     // Testing
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                     // DocWriting
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                     // Review → Improve
+
+        Assert.Equal(GoalPhase.Improve, pipeline!.Phase);
+
+        // The improver prompt was captured by the fake brain when DispatchImproverCoreAsync called ResolvePrompt.
+        var improverPrompt = capturingBrain.LastImproverPrompt;
+        Assert.NotNull(improverPrompt);
+        Assert.Contains("## Iteration Progress Document", improverPrompt);
+        Assert.Contains(progressBody, improverPrompt);
+    }
+
+    [Fact]
+    public async Task ImproverPrompt_WhenNoProgressDocument_DoesNotIncludeProgressSection()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = new Goal { Id = $"goal-progress-{Guid.NewGuid():N}", Description = "Implement feature X", RepositoryNames = ["test-repo"] };
+
+        var capturingBrain = new ProgressFakeBrainCapturingPrompts(planWithImprove: true);
+        // No knowledge graph => no progress document.
+        var dispatcher = CreateDispatcher(goal, knowledgeGraph: null, out var pipelineManager, out _, brain: capturingBrain);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        var pipeline = pipelineManager.GetByGoalId(goal.Id);
+        Assert.NotNull(pipeline);
+
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS", filesChanged: 2);   // Coding
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                       // Testing
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                       // DocWriting
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                       // Review → Improve
+
+        var improverPrompt = capturingBrain.LastImproverPrompt;
+        Assert.NotNull(improverPrompt);
+        Assert.DoesNotContain("## Iteration Progress Document", improverPrompt);
+    }
+
+    [Fact]
+    public async Task ImproverPrompt_WhenProgressDocumentEmpty_DoesNotIncludeProgressSection()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+        var goal = new Goal { Id = $"goal-progress-{Guid.NewGuid():N}", Description = "Implement feature X", RepositoryNames = ["test-repo"] };
+
+        var capturingBrain = new ProgressFakeBrainCapturingPrompts(planWithImprove: true);
+        var dispatcher = CreateDispatcher(goal, graph, out var pipelineManager, out _, brain: capturingBrain);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // The progress document exists but only has the auto-created header. Trim it to whitespace
+        // so the improver logic's guard treats it as empty and does not append it.
+        var docId = $"progress-{goal.Id}";
+        await graph.UpdateDocumentAsync(docId, content: "   \n\t  ", ct: ct);
+
+        var pipeline = pipelineManager.GetByGoalId(goal.Id);
+        Assert.NotNull(pipeline);
+
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS", filesChanged: 2);   // Coding
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                     // Testing
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                     // DocWriting
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                     // Review → Improve
+
+        var improverPrompt = capturingBrain.LastImproverPrompt;
+        Assert.NotNull(improverPrompt);
+        Assert.DoesNotContain("## Iteration Progress Document", improverPrompt);
+    }
+
+    [Fact]
+    public async Task ImproverPrompt_ProgressDocumentSectionAppearsAfterTelemetrySection()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+        var goal = new Goal { Id = $"goal-progress-{Guid.NewGuid():N}", Description = "Implement feature X", RepositoryNames = ["test-repo"] };
+        const string progressBody = "### coder (narrative)\n\nI explored the codebase and implemented the change.";
+
+        var capturingBrain = new ProgressFakeBrainCapturingPrompts(planWithImprove: true);
+        var dispatcher = CreateDispatcher(goal, graph, out var pipelineManager, out _, brain: capturingBrain);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        var docId = $"progress-{goal.Id}";
+        var doc = graph.GetDocument(docId);
+        Assert.NotNull(doc);
+        await graph.UpdateDocumentAsync(docId, content: doc!.Content.TrimEnd() + "\n\n" + progressBody, ct: ct);
+
+        var pipeline = pipelineManager.GetByGoalId(goal.Id);
+        Assert.NotNull(pipeline);
+
+        // Write a telemetry file so that ## Telemetry is populated.
+        var stateDir = Environment.GetEnvironmentVariable("STATE_DIR") ?? "/app/state";
+        Directory.CreateDirectory(stateDir);
+        var telemetryPath = Path.Combine(stateDir, "traces-coder.jsonl");
+        await File.WriteAllTextAsync(telemetryPath,
+            "{\"input_tokens\":100,\"output_tokens\":50,\"cache_read_tokens\":0,\"cache_write_tokens\":0,\"duration_ms\":1234,\"cost\":0.01,\"api_call_id\":\"call-1\"}\n", ct);
+
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS", filesChanged: 2);   // Coding
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                     // Testing
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                     // DocWriting
+        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                     // Review → Improve
+
+        var improverPrompt = capturingBrain.LastImproverPrompt;
+        Assert.NotNull(improverPrompt);
+
+        var telemetryIndex = improverPrompt!.IndexOf("## Telemetry", StringComparison.Ordinal);
+        var progressIndex = improverPrompt.IndexOf("## Iteration Progress Document", StringComparison.Ordinal);
+
+        Assert.True(telemetryIndex >= 0, "Telemetry section should be present");
+        Assert.True(progressIndex > telemetryIndex, "Progress document section should appear after telemetry section");
+    }
+
     // ── Formatting: Brain Plan blank line ────────────────────────────────────
 
     [Fact]
@@ -910,6 +1049,58 @@ file class ProgressFakeBrain : IDistributedBrain
     public bool GoalSessionExists(string goalId) => false;
 
     public virtual Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
+
+    public BrainStats? GetStats() => null;
+}
+
+/// <summary>Brain stub that records the additionalContext passed to CraftPromptAsync for the Improve phase.</summary>
+file sealed class ProgressFakeBrainCapturingPrompts(bool planWithImprove = false) : IDistributedBrain
+{
+    public string? LastImproverPrompt { get; private set; }
+
+    public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
+        Task.FromResult(PlanResult.Success(IterationPlan.Default(includeImprove: planWithImprove)));
+
+    public Task<PromptResult> CraftPromptAsync(
+        GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
+    {
+        if (phase == GoalPhase.Improve)
+            LastImproverPrompt = additionalContext;
+
+        return Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+    }
+
+    public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult<string?>(null);
+
+    public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct) =>
+        Task.CompletedTask;
+
+    public Task<BrainResponse> AskQuestionAsync(
+        string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+        Task.FromResult(BrainResponse.Answer("proceed"));
+
+    public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public void DeleteGoalSession(string goalId) { }
+
+    public bool GoalSessionExists(string goalId) => false;
+
+    public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
         Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
 
     public BrainStats? GetStats() => null;

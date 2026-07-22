@@ -240,6 +240,11 @@ public sealed class SharpCoderRunner : IAgentRunner
 
                 The updated agents.md file MUST NOT exceed 4000 characters. Count characters before finalising.
 
+                Do NOT add "Iteration History" or changelog-style entries to agents.md files. agents.md files contain
+                guidance rules and quality standards, not logs of past iterations. Extract actionable lessons from the
+                iteration and add them as guidance rules (e.g., "Always check X before Y", "When doing Z, prefer approach
+                A over B"). If a lesson was already captured in a previous iteration, do not duplicate it.
+
                 **Never remove or weaken safety constraints** — do not remove instructions about git workflow,
                 test requirements, output format compliance, or tool call contracts.
 

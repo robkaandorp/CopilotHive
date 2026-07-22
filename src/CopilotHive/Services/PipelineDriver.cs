@@ -644,6 +644,19 @@ internal sealed class PipelineDriver
             improveContext += "\n\n## Telemetry\n" + telemetryText;
         telemetryAggregator.ClearTelemetryFiles(stateDir, telemetryRoleNames);
 
+        if (_knowledgeGraph is not null)
+        {
+            var progressDoc = _knowledgeGraph.GetDocument($"progress-{pipeline.GoalId}");
+            if (progressDoc is not null && !string.IsNullOrWhiteSpace(progressDoc.Content))
+            {
+                improveContext +=
+                    "\n\n## Iteration Progress Document\n" +
+                    "Use the qualitative context below to identify recurring patterns and extract actionable " +
+                    "guidance rules for agents.md. Do NOT copy it as a changelog or iteration history.\n\n" +
+                    progressDoc.Content;
+            }
+        }
+
         var improvePrompt = _brain is not null
             ? await _resolvePrompt(pipeline, GoalPhase.Improve, improveContext, ct)
             : "Update the *.agents.md files based on iteration results.\n\n" + analysis;

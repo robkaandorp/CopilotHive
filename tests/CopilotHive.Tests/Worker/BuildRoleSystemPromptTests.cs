@@ -132,6 +132,23 @@ public sealed class BuildRoleSystemPromptTests
         Assert.Contains("safety constraints", prompt);
     }
 
+    /// <summary>
+    /// The Improver prompt must forbid changelog-style entries and instruct the improver
+    /// to extract actionable guidance rules instead.
+    /// </summary>
+    [Fact]
+    public void BuildRoleSystemPrompt_Improver_ContainsAntiChangelogGuidance()
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Improver, null);
+
+        Assert.Contains("Do NOT add \"Iteration History\" or changelog-style entries", prompt);
+        Assert.Contains("guidance rules and quality standards, not logs of past iterations", prompt);
+        Assert.Contains("Extract actionable lessons from the", prompt);
+        Assert.Contains("\"Always check X before Y\"", prompt);
+        Assert.Contains("\"When doing Z, prefer approach", prompt);
+        Assert.Contains("do not duplicate it", prompt);
+    }
+
     // ── Learned heuristics appendix ───────────────────────────────────────────
 
     /// <summary>
