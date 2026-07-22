@@ -144,6 +144,7 @@ public sealed class Program
 
             builder.Services.AddSingleton<WorkerUtilizationService>();
             builder.Services.AddSingleton<ClarificationQueueService>();
+            builder.Services.AddSingleton<LlmSessionRegistry>();
 
             // ── Authentication: GitHub OAuth (single-user admin model) ─────────────────
             // Enabled only when both OAuth env vars are set; otherwise the system runs in
@@ -574,7 +575,8 @@ public sealed class Program
             app.MapGoalEndpoints();
             app.MapReleaseEndpoints();
             app.MapClarificationEndpoints();
-app.MapBackupEndpoints();
+            app.MapSessionEndpoints();
+            app.MapBackupEndpoints();
 
             await app.RunAsync();
             return 0;
