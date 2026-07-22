@@ -5,6 +5,6 @@
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
-    <VersionPrefix>0.13.0</VersionPrefix>
+    <VersionPrefix>0.14.0</VersionPrefix>
   </PropertyGroup>
 </Project>
