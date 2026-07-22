@@ -1158,16 +1158,25 @@ else
     private async Task ReviewGoal()
     {
         _reviewError = null;
-        var response = await HttpClient.PostAsync($"/api/goals/{GoalId}/review", null);
-        if (response.IsSuccessStatusCode)
+        try
         {
-            await RefreshAsync();
-            StateHasChanged();
+            var response = await HttpClient.PostAsync($"/api/goals/{GoalId}/review", null);
+            if (response.IsSuccessStatusCode)
+            {
+                _reviewError = null;
+                await RefreshAsync();
+                StateHasChanged();
+            }
+            else
+            {
+                var errorContent = await response.Content.ReadAsStringAsync();
+                _reviewError = $"Error {(int)response.StatusCode}: {errorContent}";
+                StateHasChanged();
+            }
         }
-        else
+        catch (Exception ex)
         {
-            var errorContent = await response.Content.ReadAsStringAsync();
-            _reviewError = $"Error {(int)response.StatusCode}: {errorContent}";
+            _reviewError = ex.Message;
             StateHasChanged();
         }
     }
