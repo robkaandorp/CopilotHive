@@ -814,8 +814,7 @@ public sealed class ProgressDocumentTests
         Environment.SetEnvironmentVariable("STATE_DIR", stateDir);
         try
         {
-            if (ownsStateDir)
-                Directory.CreateDirectory(stateDir);
+            Directory.CreateDirectory(stateDir);
             var telemetryPath = Path.Combine(stateDir, "traces-coder.jsonl");
             await File.WriteAllTextAsync(telemetryPath,
                 "{\"input_tokens\":100,\"output_tokens\":50,\"cache_read_tokens\":0,\"cache_write_tokens\":0,\"duration_ms\":1234,\"cost\":0.01,\"api_call_id\":\"call-1\"}\n", ct);
@@ -837,6 +836,10 @@ public sealed class ProgressDocumentTests
         finally
         {
             Environment.SetEnvironmentVariable("STATE_DIR", previousStateDir);
+            if (ownsStateDir && Directory.Exists(stateDir))
+            {
+                try { Directory.Delete(stateDir, recursive: true); } catch { }
+            }
         }
     }
 

@@ -58,6 +58,7 @@ public sealed class HiveTestFactory : WebApplicationFactory<Program>
     {
         _previousStateDir = Environment.GetEnvironmentVariable("STATE_DIR");
         Environment.SetEnvironmentVariable("STATE_DIR", _stateDir);
+        Directory.CreateDirectory(_stateDir);
     }
 
     /// <inheritdoc />
