@@ -1,3 +1,4 @@
+using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Models;
@@ -495,6 +496,17 @@ public static class ApiEndpoints
                 result.SafetyBackupPath,
             });
         });
+    }
+
+    /// <summary>
+    /// Registers the LLM sessions REST API endpoints under <c>/api/sessions</c>.
+    /// </summary>
+    /// <param name="app">The web application to register routes on.</param>
+    public static void MapSessionEndpoints(this WebApplication app)
+    {
+        // ── LLM Sessions REST API ────────────────────────────────────────────────
+        app.MapGet("/api/sessions", (LlmSessionRegistry registry) =>
+            Results.Ok(registry.GetAll())).AllowAnonymous();
     }
 }
 
