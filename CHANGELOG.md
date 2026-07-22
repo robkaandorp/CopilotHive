@@ -1,3 +1,37 @@
+## [Unreleased]
+
+## [0.14.0] - 2026-07-22
+
+### Added
+
+- **Goal Progress Narratives** — Workers now write reflective narratives (what they tried, what worked, what they struggled with) via a new `report_narrative` tool call. Narratives are stored on the pipeline and appended to a living progress document in the knowledge graph. The progress document is created when a goal is dispatched, linked to the goal via the `documents` field, and updated with the Brain's iteration plan, worker narratives, and Brain summary after each phase. The Composer can read progress documents to answer human questions about goal execution. (`copilothive-worker-narrative-rpc`, `copilothive-progress-document-lifecycle`)
+
+- **`get_current_time` Tool** — Added a `get_current_time` tool to the Brain and Composer that returns the current UTC date, time, ISO timestamp, and timezone. The LLM calls it on demand when it needs the date for changelog entries, release notes, or other date-sensitive content. (`copilothive-get-current-time-tool`)
+
+- **Linked Documents on Goal Detail Page** — The goal detail page now shows a "Linked Documents" section with clickable links to knowledge graph documents attached to the goal, including progress documents. (`copilothive-goal-detail-documents`)
+
+- **Brain Progress Document Guidance** — The Brain's hardcoded system prompt now instructs it to read the goal's progress document before planning new iterations, giving it access to worker narratives and qualitative context beyond structured phase outputs. (`copilothive-brain-progress-document-guidance`)
+
+- **Improver Progress Document** — The improver's prompt now includes the goal's progress document content, giving the improver qualitative context (worker narratives, brain plan, brain summary) for making targeted AGENTS.md improvements instead of relying only on quantitative metrics. The improver system prompt also now explicitly discourages changelog-style "Iteration History" entries in agents.md files. (`copilothive-improver-progress-document`)
+
+### Changed
+
+- **NuGet Package Updates** — Updated 12 packages in CopilotHive and 9 in SharpCoder to their latest stable versions, including Microsoft.Extensions.AI.OpenAI 10.8.1, Microsoft.NET.Test.Sdk 18.8.1, YamlDotNet 18.1.0, and System.CommandLine 2.0.10. (`copilothive-update-nuget-packages`)
+
+- **Progress Document Title** — Simplified to use the goal ID directly (`Progress: {goalId}`) instead of attempting to extract a title from the goal description. (`copilothive-fix-progress-document-title`)
+
+- **Progress Document Formatting** — Added blank lines after section headings (Brain Plan, narratives, Brain Summary) and between Phases/Reasoning for improved readability. (`copilothive-fix-progress-document-formatting`)
+
+### Fixed
+
+- **Config Repo Git Conflict Recovery** — `ConfigRepoManager.CommitFileAsync` now recovers from `git pull` merge conflicts by aborting the merge, resetting, and retrying with rebase. A `ResetToRemoteAsync` method allows `DispatcherMaintenance` to auto-recover when the config repo is stuck in a broken state. Previously, a single conflict would break all config repo operations for the entire session. (`copilothive-config-repo-conflict-recovery`)
+
+- **Brain Context Usage Logging** — Fixed misleading context usage percentage that used cumulative input tokens instead of the current session token estimate (e.g., showing 155% when actual usage was 17%). (`copilothive-fix-brain-context-usage-logging`)
+
+- **Console Output Test Isolation** — Added missing `[CollectionDefinition("ConsoleOutput")]` so xUnit serializes tests that redirect `Console.Out`/`Console.Error`, preventing cross-test output leakage. (`copilothive-fix-console-output-collection`)
+
+- **Progress Document Test CI** — Fixed `ProgressDocumentTests` failing in CI due to `STATE_DIR` defaulting to `/app/state`. (`copilothive-fix-progress-test-state-dir`)
+
 ## [0.13.0] - 2026-07-17
 
 ### Added
@@ -185,7 +219,7 @@
 
 ### Fixed
 
-**Plan reason pinned above scrollable timeline.** The Brain's plan reason text (📋) was previously inside the scrollable `.iter-content` div, causing it to scroll out of view when the progress timeline filled with entries. It is now rendered above the scroll area as a sibling element, always visible.
+**Plan reason pinned above scrollable timeline.** The Brain's plan reason text (📝) was previously inside the scrollable `.iter-content` div, causing it to scroll out of view when the progress timeline filled with entries. It is now rendered above the scroll area as a sibling element, always visible.
 
 **Page header `h1` bottom margin removed.** The `h1` inside `.hive-header` no longer has a bottom margin, eliminating unwanted spacing in the header bar.
 
