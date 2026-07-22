@@ -278,6 +278,15 @@ public sealed class Program
             builder.Services.AddSingleton<GoalDispatcher>();
             builder.Services.AddHostedService(sp => sp.GetRequiredService<GoalDispatcher>());
 
+            builder.Services.AddSingleton<GoalReviewService>(sp => new GoalReviewService(
+                sp.GetService<KnowledgeGraph>(),
+                sp.GetService<ConfigRepoManager>(),
+                sp.GetService<HiveConfigFile>(),
+                sp.GetService<IGoalStore>(),
+                sp.GetService<IBrainRepoManager>(),
+                stateDir,
+                sp.GetRequiredService<ILogger<GoalReviewService>>()));
+
             // Dashboard: log capture (registered early so logger provider can reference it)
             var dashboardLogSink = new DashboardLogSink();
             builder.Services.AddSingleton(dashboardLogSink);
