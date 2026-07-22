@@ -210,6 +210,25 @@
         <div class="goal-detail-body">
             @* LEFT PANEL *@
             <div class="goal-detail-left @(hasAnyIterations ? "" : "full-width")">
+                @* Linked Documents *@
+                @{
+                    var docs = _detail?.Documents ?? _storedGoal?.Documents ?? [];
+                }
+                @if (docs.Count > 0)
+                {
+                    <div class="card goal-documents" style="margin-bottom:0.75rem">
+                        <div class="label">Linked Documents</div>
+                        <ul style="margin:0.5rem 0 0 1.2rem;font-size:0.9rem">
+                            @foreach (var docId in docs)
+                            {
+                                <li>
+                                    <a href="/knowledge/@docId" class="goal-link">@docId</a>
+                                </li>
+                            }
+                        </ul>
+                    </div>
+                }
+
                 @* Description *@
                 @if (_detail is not null)
                 {
@@ -266,25 +285,6 @@
                                     {
                                         <span style="margin-left:0.4rem">@GetStatusIcon(null)</span>
                                     }
-                                </li>
-                            }
-                        </ul>
-                    </div>
-                }
-
-                @* Linked Documents *@
-                @{
-                    var docs = _detail?.Documents ?? _storedGoal?.Documents ?? [];
-                }
-                @if (docs.Count > 0)
-                {
-                    <div class="card goal-documents" style="margin-bottom:0.75rem">
-                        <div class="label">Linked Documents</div>
-                        <ul style="margin:0.5rem 0 0 1.2rem;font-size:0.9rem">
-                            @foreach (var docId in docs)
-                            {
-                                <li>
-                                    <a href="/knowledge/@docId" class="goal-link">@docId</a>
                                 </li>
                             }
                         </ul>
