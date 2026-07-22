@@ -16,6 +16,7 @@ namespace CopilotHive.Tests;
 /// Tests that verify the living progress document is created in the knowledge graph when a goal is
 /// dispatched, linked to the goal, and appended to with Brain plans, worker narratives, and summaries.
 /// </summary>
+[Collection("HiveIntegration")]
 public sealed class ProgressDocumentTests
 {
     [Fact]
@@ -805,12 +806,16 @@ public sealed class ProgressDocumentTests
         Assert.NotNull(pipeline);
 
         // Write a telemetry file so that ## Telemetry is populated.
-        var stateDir = Environment.GetEnvironmentVariable("STATE_DIR")
-            ?? Path.Combine(Path.GetTempPath(), $"copilothive-test-{Guid.NewGuid():N}");
+        var previousStateDir = Environment.GetEnvironmentVariable("STATE_DIR");
+        var ownsStateDir = string.IsNullOrEmpty(previousStateDir);
+        var stateDir = ownsStateDir
+            ? Path.Combine(Path.GetTempPath(), $"copilothive-test-{Guid.NewGuid():N}")
+            : previousStateDir!;
         Environment.SetEnvironmentVariable("STATE_DIR", stateDir);
         try
         {
-            Directory.CreateDirectory(stateDir);
+            if (ownsStateDir)
+                Directory.CreateDirectory(stateDir);
             var telemetryPath = Path.Combine(stateDir, "traces-coder.jsonl");
             await File.WriteAllTextAsync(telemetryPath,
                 "{\"input_tokens\":100,\"output_tokens\":50,\"cache_read_tokens\":0,\"cache_write_tokens\":0,\"duration_ms\":1234,\"cost\":0.01,\"api_call_id\":\"call-1\"}\n", ct);
@@ -831,7 +836,7 @@ public sealed class ProgressDocumentTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("STATE_DIR", null);
+            Environment.SetEnvironmentVariable("STATE_DIR", previousStateDir);
         }
     }
 

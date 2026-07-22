@@ -234,6 +234,7 @@ internal sealed class CustomEndpointFactory : WebApplicationFactory<Program>
 {
     private readonly string _tempDir;
     private readonly string _stateDir;
+    private readonly string? _previousStateDir;
     private readonly HiveConfigFile _config;
     private readonly FakeConfigRepoManager _repo;
 
@@ -241,6 +242,7 @@ internal sealed class CustomEndpointFactory : WebApplicationFactory<Program>
     {
         _tempDir = tempDir;
         _stateDir = Path.Combine(tempDir, "state");
+        _previousStateDir = Environment.GetEnvironmentVariable("STATE_DIR");
         Environment.SetEnvironmentVariable("STATE_DIR", _stateDir);
         _config = new HiveConfigFile
         {
@@ -248,6 +250,12 @@ internal sealed class CustomEndpointFactory : WebApplicationFactory<Program>
             Models = new ModelsConfig { AvailableModels = [] }
         };
         _repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        base.Dispose(disposing);
+        Environment.SetEnvironmentVariable("STATE_DIR", _previousStateDir);
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)

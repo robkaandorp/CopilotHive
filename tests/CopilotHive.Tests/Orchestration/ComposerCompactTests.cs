@@ -607,10 +607,12 @@ internal sealed class ComposerCompactPartialEndpointFactory : WebApplicationFact
     private readonly string _tmpDir =
         Path.Combine(Path.GetTempPath(), $"copilothive-compactpartial-{Guid.NewGuid():N}");
     private readonly string _stateDir;
+    private readonly string? _previousStateDir;
     private CopilotHiveDbContext? _dbContext;
 
     public ComposerCompactPartialEndpointFactory()
     {
+        _previousStateDir = Environment.GetEnvironmentVariable("STATE_DIR");
         _stateDir = Path.Combine(_tmpDir, "state");
         Directory.CreateDirectory(_stateDir);
         Environment.SetEnvironmentVariable("STATE_DIR", _stateDir);
@@ -648,7 +650,7 @@ internal sealed class ComposerCompactPartialEndpointFactory : WebApplicationFact
     protected override void Dispose(bool disposing)
     {
         base.Dispose(disposing);
-        Environment.SetEnvironmentVariable("STATE_DIR", null);
+        Environment.SetEnvironmentVariable("STATE_DIR", _previousStateDir);
         _dbContext?.Dispose();
 
         if (!disposing || !Directory.Exists(_tmpDir))
