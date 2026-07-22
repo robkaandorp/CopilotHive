@@ -116,8 +116,13 @@ public class LlmSessionRegistryTests
     }
 
     [Fact]
-    public void CleanupStale_DoesNotRemoveConcurrentlyUpdatedSession()
+    public void CleanupStale_KeepsSessionUpdatedBeforeCleanup()
     {
+        // Sequential update case: a stale session is registered, then replaced by a fresh
+        // instance (same SessionId) BEFORE CleanupStale runs. When CleanupStale enumerates
+        // the dictionary it observes the fresh (non-stale) session, so it is not removed.
+        // This documents the sequential ordering — it does NOT exercise the conditional
+        // removal race; see CleanupStale_ConditionalRemovalPreventsDeletingUpdatedEntry.
         var registry = new LlmSessionRegistry();
         var stale = CreateSession("session-1", lastActivity: DateTime.UtcNow.AddHours(-2));
         registry.RegisterOrUpdate(stale);
@@ -129,6 +134,49 @@ public class LlmSessionRegistryTests
 
         var all = registry.GetAll();
         Assert.Single(all);
+        Assert.Equal(updated.LastActivity, all[0].LastActivity);
+    }
+
+    [Fact]
+    public void CleanupStale_RemovesOnlyStaleSession()
+    {
+        var registry = new LlmSessionRegistry();
+        var sessionA = CreateSession("session-A", lastActivity: DateTime.UtcNow.AddHours(-2));
+        var sessionB = CreateSession("session-B", lastActivity: DateTime.UtcNow);
+        registry.RegisterOrUpdate(sessionA);
+        registry.RegisterOrUpdate(sessionB);
+
+        registry.CleanupStale(TimeSpan.FromHours(1));
+
+        var all = registry.GetAll();
+        Assert.Single(all);
+        Assert.Equal("session-B", all[0].SessionId);
+    }
+
+    [Fact]
+    public void CleanupStale_ConditionalRemovalPreventsDeletingUpdatedEntry()
+    {
+        var registry = new LlmSessionRegistry();
+
+        // A stale session is removed by cleanup.
+        var stale = CreateSession("test-session", lastActivity: DateTime.UtcNow.AddHours(-2));
+        registry.RegisterOrUpdate(stale);
+        registry.CleanupStale(TimeSpan.FromHours(1));
+        Assert.Empty(registry.GetAll());
+
+        // Register a fresh stale entry, then immediately update it to a fresh instance.
+        var staleAgain = CreateSession("test-session", lastActivity: DateTime.UtcNow.AddHours(-2));
+        registry.RegisterOrUpdate(staleAgain);
+
+        var updated = CreateSession("test-session", lastActivity: DateTime.UtcNow);
+        registry.RegisterOrUpdate(updated);
+
+        // Cleanup should NOT remove it because the current entry is fresh.
+        registry.CleanupStale(TimeSpan.FromHours(1));
+
+        var all = registry.GetAll();
+        Assert.Single(all);
+        Assert.Equal("test-session", all[0].SessionId);
         Assert.Equal(updated.LastActivity, all[0].LastActivity);
     }
 

@@ -506,7 +506,7 @@ public static class ApiEndpoints
     {
         // ── LLM Sessions REST API ────────────────────────────────────────────────
         app.MapGet("/api/sessions", (LlmSessionRegistry registry) =>
-            Results.Ok(registry.GetAll())).AllowAnonymous();
+            Results.Ok(registry.GetAll()));
     }
 }
 
