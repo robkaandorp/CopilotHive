@@ -805,25 +805,34 @@ public sealed class ProgressDocumentTests
         Assert.NotNull(pipeline);
 
         // Write a telemetry file so that ## Telemetry is populated.
-        var stateDir = Environment.GetEnvironmentVariable("STATE_DIR") ?? "/app/state";
-        Directory.CreateDirectory(stateDir);
-        var telemetryPath = Path.Combine(stateDir, "traces-coder.jsonl");
-        await File.WriteAllTextAsync(telemetryPath,
-            "{\"input_tokens\":100,\"output_tokens\":50,\"cache_read_tokens\":0,\"cache_write_tokens\":0,\"duration_ms\":1234,\"cost\":0.01,\"api_call_id\":\"call-1\"}\n", ct);
+        var stateDir = Environment.GetEnvironmentVariable("STATE_DIR")
+            ?? Path.Combine(Path.GetTempPath(), $"copilothive-test-{Guid.NewGuid():N}");
+        Environment.SetEnvironmentVariable("STATE_DIR", stateDir);
+        try
+        {
+            Directory.CreateDirectory(stateDir);
+            var telemetryPath = Path.Combine(stateDir, "traces-coder.jsonl");
+            await File.WriteAllTextAsync(telemetryPath,
+                "{\"input_tokens\":100,\"output_tokens\":50,\"cache_read_tokens\":0,\"cache_write_tokens\":0,\"duration_ms\":1234,\"cost\":0.01,\"api_call_id\":\"call-1\"}\n", ct);
 
-        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS", filesChanged: 2);   // Coding
-        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                     // Testing
-        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                     // DocWriting
-        await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                     // Review → Improve
+            await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS", filesChanged: 2);   // Coding
+            await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                     // Testing
+            await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                     // DocWriting
+            await CompleteActivePhaseAsync(dispatcher, pipeline!, ct, "PASS");                     // Review → Improve
 
-        var improverPrompt = capturingBrain.LastImproverPrompt;
-        Assert.NotNull(improverPrompt);
+            var improverPrompt = capturingBrain.LastImproverPrompt;
+            Assert.NotNull(improverPrompt);
 
-        var telemetryIndex = improverPrompt!.IndexOf("## Telemetry", StringComparison.Ordinal);
-        var progressIndex = improverPrompt.IndexOf("## Iteration Progress Document", StringComparison.Ordinal);
+            var telemetryIndex = improverPrompt!.IndexOf("## Telemetry", StringComparison.Ordinal);
+            var progressIndex = improverPrompt.IndexOf("## Iteration Progress Document", StringComparison.Ordinal);
 
-        Assert.True(telemetryIndex >= 0, "Telemetry section should be present");
-        Assert.True(progressIndex > telemetryIndex, "Progress document section should appear after telemetry section");
+            Assert.True(telemetryIndex >= 0, "Telemetry section should be present");
+            Assert.True(progressIndex > telemetryIndex, "Progress document section should appear after telemetry section");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("STATE_DIR", null);
+        }
     }
 
     // ── Formatting: Brain Plan blank line ────────────────────────────────────
