@@ -365,6 +365,7 @@ public sealed partial class Composer
         var sb = new System.Text.StringBuilder();
         sb.AppendLine($"## Goal: {goal.Id}");
         sb.AppendLine($"- **Status:** {goal.Status.ToDisplayName()}");
+        sb.AppendLine($"- **Review Status:** {goal.ReviewStatus}");
         sb.AppendLine($"- **Priority:** {goal.Priority}");
         sb.AppendLine($"- **Created:** {goal.CreatedAt:yyyy-MM-dd HH:mm}");
         sb.AppendLine($"- **Repositories:** {(goal.RepositoryNames.Count > 0 ? string.Join(", ", goal.RepositoryNames) : "(none)")}");

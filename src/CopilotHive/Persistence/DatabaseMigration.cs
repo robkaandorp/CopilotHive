@@ -67,7 +67,12 @@ public static class DatabaseMigration
                 {
                     var tableName = ExtractBracketedName(statement, "CREATE TABLE");
                     if (tableName is not null && existingTables.Contains(tableName))
+                    {
+                        // Table already exists — reconcile any columns the EF model added since
+                        // the table was originally created (e.g. a new property on an entity).
+                        ReconcileColumns(connection, tableName, statement, logger);
                         continue;
+                    }
 
                     logger.LogInformation("Creating missing table {TableName}", tableName ?? "<unknown>");
                     ExecuteRaw(connection, statement);
@@ -107,6 +112,174 @@ public static class DatabaseMigration
         using var cmd = connection.CreateCommand();
         cmd.CommandText = sql;
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Reconciles the columns of an existing table with the EF Core model by adding any
+    /// columns present in the generated <c>CREATE TABLE</c> statement that are missing from
+    /// the live table. Each added column uses the full type and constraint text (including
+    /// any <c>DEFAULT</c> clause) from the DDL so that existing rows receive the default value.
+    /// This is a general solution that works for any missing column on any existing table.
+    /// </summary>
+    /// <param name="connection">Open database connection.</param>
+    /// <param name="tableName">Name of the existing table to reconcile.</param>
+    /// <param name="createStatement">The EF Core-generated <c>CREATE TABLE</c> statement for the table.</param>
+    /// <param name="logger">Logger for reporting added columns.</param>
+    private static void ReconcileColumns(
+        System.Data.Common.DbConnection connection,
+        string tableName,
+        string createStatement,
+        ILogger logger)
+    {
+        // Discover the columns that already exist on the live table.
+        var existingColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = $"PRAGMA table_info(\"{tableName}\")";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                // PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
+                existingColumns.Add(reader.GetString(1));
+            }
+        }
+
+        // Parse the column definitions from the CREATE TABLE statement body.
+        foreach (var (columnName, definition) in ParseColumnDefinitions(createStatement))
+        {
+            if (existingColumns.Contains(columnName))
+                continue;
+
+            // SQLite cannot ALTER TABLE ADD a NOT NULL column without a DEFAULT when the table
+            // already has rows ("Cannot add a NOT NULL column with default value NULL"). Skip such
+            // columns — they cannot be reconciled in place and require a full table rebuild/migration.
+            var isNotNull = definition.Contains("NOT NULL", StringComparison.OrdinalIgnoreCase);
+            var hasDefault = definition.Contains("DEFAULT", StringComparison.OrdinalIgnoreCase);
+            if (isNotNull && !hasDefault)
+            {
+                logger.LogWarning(
+                    "Skipping reconciliation of column {ColumnName} on table {TableName}: NOT NULL without a DEFAULT cannot be added via ALTER TABLE.",
+                    columnName, tableName);
+                continue;
+            }
+
+            var alter = $"ALTER TABLE \"{tableName}\" ADD COLUMN {definition}";
+            logger.LogInformation("Adding missing column {ColumnName} to table {TableName}", columnName, tableName);
+            ExecuteRaw(connection, alter);
+        }
+    }
+
+    /// <summary>
+    /// Parses individual column definitions from the body of an EF Core-generated
+    /// <c>CREATE TABLE</c> statement (the text between the outermost parentheses). Returns
+    /// each column's unquoted name paired with its full definition text (name + type +
+    /// constraints, with the identifier normalised to double quotes). Table-level constraints
+    /// such as <c>PRIMARY KEY</c>, <c>FOREIGN KEY</c>, <c>UNIQUE</c>, and <c>CONSTRAINT</c> are
+    /// skipped because they are not column definitions.
+    /// </summary>
+    private static IEnumerable<(string ColumnName, string Definition)> ParseColumnDefinitions(string createStatement)
+    {
+        var open = createStatement.IndexOf('(');
+        var close = createStatement.LastIndexOf(')');
+        if (open < 0 || close <= open)
+            yield break;
+
+        var body = createStatement.Substring(open + 1, close - open - 1);
+
+        // Split on commas that are not nested inside parentheses (e.g. DECIMAL(10,2)).
+        foreach (var rawPart in SplitTopLevel(body))
+        {
+            var part = rawPart.Trim();
+            if (part.Length == 0)
+                continue;
+
+            // Skip table-level constraints — these are not column definitions.
+            if (part.StartsWith("PRIMARY KEY", StringComparison.OrdinalIgnoreCase) ||
+                part.StartsWith("FOREIGN KEY", StringComparison.OrdinalIgnoreCase) ||
+                part.StartsWith("UNIQUE", StringComparison.OrdinalIgnoreCase) ||
+                part.StartsWith("CONSTRAINT", StringComparison.OrdinalIgnoreCase) ||
+                part.StartsWith("CHECK", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var columnName = ExtractLeadingIdentifier(part);
+            if (columnName is null)
+                continue;
+
+            // Normalise the identifier to double-quoted form for the ALTER statement.
+            var remainder = part[FindIdentifierEnd(part)..].TrimStart();
+            var definition = $"\"{columnName}\" {remainder}".TrimEnd();
+            yield return (columnName, definition);
+        }
+    }
+
+    /// <summary>Splits a string on top-level commas, ignoring commas nested inside parentheses.</summary>
+    private static IEnumerable<string> SplitTopLevel(string text)
+    {
+        var depth = 0;
+        var start = 0;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var c = text[i];
+            if (c == '(')
+                depth++;
+            else if (c == ')')
+                depth--;
+            else if (c == ',' && depth == 0)
+            {
+                yield return text[start..i];
+                start = i + 1;
+            }
+        }
+        if (start < text.Length)
+            yield return text[start..];
+    }
+
+    /// <summary>
+    /// Extracts the leading quoted identifier from a column definition. Supports bracket
+    /// (<c>[col]</c>) and double-quote (<c>"col"</c>) quoting. Returns the unquoted name,
+    /// or <c>null</c> if the part does not begin with a quoted identifier.
+    /// </summary>
+    private static string? ExtractLeadingIdentifier(string part)
+    {
+        if (part.Length == 0)
+            return null;
+
+        if (part[0] == '[')
+        {
+            var close = part.IndexOf(']', 1);
+            return close < 0 ? null : part.Substring(1, close - 1);
+        }
+
+        if (part[0] == '"')
+        {
+            var close = part.IndexOf('"', 1);
+            return close < 0 ? null : part.Substring(1, close - 1);
+        }
+
+        return null;
+    }
+
+    /// <summary>Returns the index just past the leading quoted identifier in a column definition.</summary>
+    private static int FindIdentifierEnd(string part)
+    {
+        if (part.Length == 0)
+            return 0;
+
+        if (part[0] == '[')
+        {
+            var close = part.IndexOf(']', 1);
+            return close < 0 ? part.Length : close + 1;
+        }
+
+        if (part[0] == '"')
+        {
+            var close = part.IndexOf('"', 1);
+            return close < 0 ? part.Length : close + 1;
+        }
+
+        return 0;
     }
 
     /// <summary>

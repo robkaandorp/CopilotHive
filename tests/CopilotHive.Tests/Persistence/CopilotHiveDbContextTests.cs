@@ -719,14 +719,15 @@ public sealed class CopilotHiveDbContextTests
         Assert.Contains("goal_iterations", tableNames);
         Assert.Contains("conversation_entries", tableNames);
 
-        // The pre-existing pipelines table must still be present and unchanged
-        // (i.e. our minimal definition, NOT replaced by the EF schema).
+        // The pre-existing pipelines table must still be present with its original columns.
         Assert.Contains("pipelines", tableNames);
         var pipelineColumns = GetTableColumns(conn, "pipelines");
         Assert.Contains("goal_id", pipelineColumns);
         Assert.Contains("description", pipelineColumns);
-        // Columns that exist in the EF schema but not in the minimal one must NOT have been added.
-        Assert.DoesNotContain("phase", pipelineColumns);
+        // Columns defined in the EF model but missing from the minimal table are now
+        // reconciled in place (added via ALTER TABLE) as long as they are safe to add —
+        // i.e. nullable or carrying a DEFAULT. The 'phase' column has DEFAULT 'Planning'.
+        Assert.Contains("phase", pipelineColumns);
     }
 
     [Fact]
@@ -769,6 +770,136 @@ public sealed class CopilotHiveDbContextTests
         cmd.CommandText = "SELECT description FROM pipelines WHERE goal_id = 'goal-keep-1'";
         var result = cmd.ExecuteScalar();
         Assert.Equal("preserved description", result);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DatabaseMigration.EnsureSchemaUpToDate"/> adds the
+    /// <c>review_status</c> column to an existing <c>goals</c> table that was created
+    /// before the column existed, and that existing rows receive the default value.
+    /// </summary>
+    [Fact]
+    public void EnsureSchema_ExistingDb_MissingReviewStatusColumn_AddsColumnWithDefault()
+    {
+        using var ctx = CreateEmptyDbContext();
+        var conn = GetSqliteConnection(ctx);
+
+        // Create a goals table with the OLD columns but WITHOUT review_status.
+        ctx.Database.ExecuteSqlRaw(
+            """
+            CREATE TABLE goals (
+                id TEXT NOT NULL PRIMARY KEY,
+                description TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                priority TEXT NOT NULL DEFAULT 'normal',
+                scope TEXT NOT NULL DEFAULT 'patch',
+                repositories TEXT,
+                metadata TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                iterations INTEGER NOT NULL DEFAULT 0,
+                failure_reason TEXT,
+                notes TEXT,
+                phase_durations TEXT,
+                total_duration_seconds REAL,
+                depends_on TEXT,
+                documents TEXT,
+                branch_cleaned_up INTEGER NOT NULL DEFAULT 0,
+                merge_commit_hash TEXT,
+                release_id TEXT,
+                title TEXT,
+                source_conversation_id TEXT
+            )
+            """);
+
+        // Insert a row with minimum required columns.
+        ctx.Database.ExecuteSqlRaw(
+            "INSERT INTO goals (id, description, created_at) VALUES ('legacy-goal-1', 'Legacy goal', '2025-01-01T00:00:00Z')");
+
+        // Sanity: review_status column should NOT exist yet.
+        var columnsBefore = GetTableColumns(conn, "goals");
+        Assert.DoesNotContain("review_status", columnsBefore);
+
+        // Run migration — should add the missing review_status column.
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+
+        // Verify the column was added.
+        var columnsAfter = GetTableColumns(conn, "goals");
+        Assert.Contains("review_status", columnsAfter);
+
+        // Verify the existing row got the default value ('none' per the LowercaseEnumConverter).
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT review_status FROM goals WHERE id = 'legacy-goal-1'";
+        var reviewStatusValue = cmd.ExecuteScalar();
+        Assert.NotNull(reviewStatusValue);
+        Assert.Equal("none", reviewStatusValue);
+    }
+
+    /// <summary>
+    /// Verifies that running <see cref="DatabaseMigration.EnsureSchemaUpToDate"/> twice
+    /// is idempotent — the second run does not error or duplicate columns.
+    /// </summary>
+    [Fact]
+    public void EnsureSchema_ExistingDb_MissingReviewStatusColumn_IdempotentOnSecondRun()
+    {
+        using var ctx = CreateEmptyDbContext();
+        var conn = GetSqliteConnection(ctx);
+
+        // Create a goals table without review_status.
+        ctx.Database.ExecuteSqlRaw(
+            """
+            CREATE TABLE goals (
+                id TEXT NOT NULL PRIMARY KEY,
+                description TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                priority TEXT NOT NULL DEFAULT 'normal',
+                scope TEXT NOT NULL DEFAULT 'patch',
+                repositories TEXT,
+                metadata TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                iterations INTEGER NOT NULL DEFAULT 0,
+                failure_reason TEXT,
+                notes TEXT,
+                phase_durations TEXT,
+                total_duration_seconds REAL,
+                depends_on TEXT,
+                documents TEXT,
+                branch_cleaned_up INTEGER NOT NULL DEFAULT 0,
+                merge_commit_hash TEXT,
+                release_id TEXT,
+                title TEXT,
+                source_conversation_id TEXT
+            )
+            """);
+
+        ctx.Database.ExecuteSqlRaw(
+            "INSERT INTO goals (id, description, created_at) VALUES ('idem-goal-1', 'Idempotent test', '2025-01-01T00:00:00Z')");
+
+        // First run adds review_status.
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        var columnsAfterFirst = GetTableColumns(conn, "goals");
+        Assert.Contains("review_status", columnsAfterFirst);
+
+        // Second run should not throw and should not duplicate the column.
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+        var columnsAfterSecond = GetTableColumns(conn, "goals");
+        Assert.Contains("review_status", columnsAfterSecond);
+
+        // Count occurrences of review_status — should be exactly 1.
+        using var countCmd = conn.CreateCommand();
+        countCmd.CommandText = "PRAGMA table_info(goals)";
+        var reviewCount = 0;
+        using (var reader = countCmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                if (string.Equals(reader.GetString(1), "review_status", StringComparison.OrdinalIgnoreCase))
+                    reviewCount++;
+            }
+        }
+        Assert.Equal(1, reviewCount);
     }
 
     /// <summary>

@@ -55,6 +55,9 @@ public sealed class Goal
 
     /// <summary>Whether the feature branch has been cleaned up after completion.</summary>
     public bool BranchCleanedUp { get; set; }
+
+    /// <summary>Pre-execution review status. None = not reviewed, Pending = in progress, Approved = passed, NeedsChanges = issues found.</summary>
+    public ReviewStatus ReviewStatus { get; set; } = ReviewStatus.None;
 }
 
 /// <summary>Structured summary of a single completed (or failed) pipeline iteration.</summary>
@@ -221,4 +224,17 @@ public enum GoalStatus
     Failed,
     /// <summary>Goal was cancelled before completion.</summary>
     Cancelled,
+}
+
+/// <summary>Pre-execution review status values for a goal.</summary>
+public enum ReviewStatus
+{
+    /// <summary>Not reviewed (default).</summary>
+    None,
+    /// <summary>Review is in progress.</summary>
+    Pending,
+    /// <summary>Review passed.</summary>
+    Approved,
+    /// <summary>Review found issues that need to be addressed.</summary>
+    NeedsChanges,
 }

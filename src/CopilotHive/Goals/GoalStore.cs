@@ -326,6 +326,7 @@ public sealed class GoalStore : IGoalStore
             existing.ReleaseId = goal.ReleaseId;
             existing.Documents = goal.Documents;
             existing.BranchCleanedUp = goal.BranchCleanedUp;
+            existing.ReviewStatus = goal.ReviewStatus;
 
             // Metadata is init-only; set via the EF Core metadata API.
             db.Entry(existing).Property(e => e.Metadata).CurrentValue = goal.Metadata;

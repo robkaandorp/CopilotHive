@@ -253,6 +253,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                         Goal ID: {goal.Id}
                         Description: {goal.Description}
                         Status: {goal.Status}
+                        Review Status: {goal.ReviewStatus}
                         Repositories: {string.Join(", ", goal.RepositoryNames)}
                         {iterationInfo}{relatedDocs}
                         """;

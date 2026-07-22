@@ -228,6 +228,30 @@ public static class ApiEndpoints
             await store.UpdateGoalAsync(goal);
             return Results.Ok(goal);
         });
+
+        goalsApi.MapPatch("/{id}/review-status", async (string id, GoalReviewStatusUpdate update, IGoalStore store) =>
+        {
+            var goal = await store.GetGoalAsync(id);
+            if (goal is null)
+                return Results.NotFound(new { error = $"Goal '{id}' not found." });
+
+            // Reject numeric input — only named enum values are accepted.
+            if (int.TryParse(update.ReviewStatus, out _))
+                return Results.BadRequest(new { error = "Invalid review status. Valid values: none, pending, approved, needschanges." });
+
+            // Parse and validate that the result is a defined single enum value.
+            if (!Enum.TryParse<ReviewStatus>(update.ReviewStatus, ignoreCase: true, out var reviewStatus) || !Enum.IsDefined(reviewStatus))
+                return Results.BadRequest(new { error = "Invalid review status. Valid values: none, pending, approved, needschanges." });
+
+            // Reject comma-combined inputs (e.g. "Pending, Approved") that Enum.TryParse may accept via bitwise OR.
+            if (update.ReviewStatus.Contains(','))
+                return Results.BadRequest(new { error = "Invalid review status. Valid values: none, pending, approved, needschanges." });
+
+            goal.ReviewStatus = reviewStatus;
+            await store.UpdateGoalAsync(goal);
+            var updated = await store.GetGoalAsync(id);
+            return Results.Ok(updated);
+        });
     }
 
     /// <summary>
@@ -454,6 +478,10 @@ public static class ApiEndpoints
 /// <summary>Request body for updating the status of a goal via the HTTP API.</summary>
 /// <param name="Status">New status string (e.g. "completed", "failed").</param>
 public record GoalStatusUpdate(string Status);
+
+/// <summary>Request body for updating the pre-execution review status of a goal via the HTTP API.</summary>
+/// <param name="ReviewStatus">New review status string: none, pending, approved, or needschanges.</param>
+public record GoalReviewStatusUpdate(string ReviewStatus);
 
 /// <summary>Request body for creating a new release via the HTTP API.</summary>
 /// <param name="Version">Version tag for the release (e.g. "v1.2.0").</param>

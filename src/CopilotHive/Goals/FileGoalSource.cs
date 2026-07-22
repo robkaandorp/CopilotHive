@@ -129,6 +129,7 @@ public sealed class FileGoalSource : IGoalSource
                     ? g.IterationSummaries.Select(MapIterationSummaryEntry).ToList()
                     : null,
                 MergeCommitHash = g.MergeCommitHash,
+                Review_status = g.ReviewStatus == ReviewStatus.None ? null : g.ReviewStatus.ToString().ToLowerInvariant(),
             }).ToList(),
         };
 
@@ -164,6 +165,7 @@ public sealed class FileGoalSource : IGoalSource
             TotalDurationSeconds = entry.Total_duration_seconds,
             IterationSummaries = entry.IterationSummaries?.Select(MapIterationSummary).ToList() ?? [],
             MergeCommitHash = entry.MergeCommitHash,
+            ReviewStatus = ParseReviewStatus(entry.Review_status),
         };
     }
 
@@ -190,6 +192,14 @@ public sealed class FileGoalSource : IGoalSource
         "failed" => GoalStatus.Failed,
         "cancelled" => GoalStatus.Cancelled,
         _ => GoalStatus.Pending,
+    };
+
+    private static ReviewStatus ParseReviewStatus(string? value) => value?.ToLowerInvariant() switch
+    {
+        "pending" => ReviewStatus.Pending,
+        "approved" => ReviewStatus.Approved,
+        "needschanges" => ReviewStatus.NeedsChanges,
+        _ => ReviewStatus.None,
     };
 
     private static string FormatStatus(GoalStatus status) => status switch
@@ -291,6 +301,7 @@ public sealed class FileGoalSource : IGoalSource
         public List<IterationSummaryEntry>? IterationSummaries { get; set; }
         /// <summary>SHA-1 hash of the merge commit that landed this goal's changes.</summary>
         public string? MergeCommitHash { get; set; }
+        public string? Review_status { get; set; }
     }
 
     /// <summary>YAML-serializable representation of an <see cref="IterationSummary"/>.</summary>

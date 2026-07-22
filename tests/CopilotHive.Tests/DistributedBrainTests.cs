@@ -1238,6 +1238,38 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
+    public async Task GetGoalTool_ReturnsReviewStatus_WhenGoalHasReviewStatus()
+    {
+        // Arrange: Create a brain with a goal store that has a goal with ReviewStatus set.
+        // Use a Status other than Pending so "Pending" can only match the Review Status line.
+        var goalStore = new FakeGoalStore();
+        goalStore.AddGoal(new Goal
+        {
+            Id = "review-status-goal",
+            Description = "Goal with review status pending",
+            Status = GoalStatus.InProgress,
+            ReviewStatus = ReviewStatus.Pending,
+            RepositoryNames = ["my-repo"],
+        });
+
+        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+            goalStore: goalStore);
+
+        var brainToolsField = typeof(DistributedBrain)
+            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
+        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
+
+        // Act: invoke the get_goal tool with a valid goal ID
+        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "review-status-goal" });
+        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        // Assert: result contains the review status on its own line (exact substring),
+        // proving the value is sourced from ReviewStatus and not the Status field.
+        Assert.Contains("Review Status: Pending", result);
+    }
+
+    [Fact]
     public async Task GetGoalTool_ReturnsNotFound_WhenGoalDoesNotExist()
     {
         // Arrange

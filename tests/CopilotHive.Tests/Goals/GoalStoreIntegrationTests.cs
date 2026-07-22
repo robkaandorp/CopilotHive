@@ -39,6 +39,7 @@ public sealed class GoalStoreIntegrationTests
             Documents = ["doc-1", "doc-2"],
             ReleaseId = "rel-x",
             BranchCleanedUp = false,
+            ReviewStatus = ReviewStatus.Approved,
         };
 
         await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
@@ -59,6 +60,27 @@ public sealed class GoalStoreIntegrationTests
         Assert.Equal(["doc-1", "doc-2"], retrieved.Documents);
         Assert.Equal("rel-x", retrieved.ReleaseId);
         Assert.False(retrieved.BranchCleanedUp);
+        Assert.Equal(ReviewStatus.Approved, retrieved.ReviewStatus);
+    }
+
+    [Fact]
+    public async Task CreateGoalAsync_GoalWithoutReviewStatus_DefaultsToNone()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var goal = new Goal
+        {
+            Id = "default-review-status",
+            Description = "Goal without explicit ReviewStatus",
+        };
+
+        await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var retrieved = await store.GetGoalAsync("default-review-status", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(retrieved);
+        Assert.Equal(ReviewStatus.None, retrieved!.ReviewStatus);
     }
 
     [Fact]
@@ -131,6 +153,7 @@ public sealed class GoalStoreIntegrationTests
         toUpdate.ReleaseId = "rel-updated";
         toUpdate.Documents = ["doc-updated"];
         toUpdate.BranchCleanedUp = true;
+        toUpdate.ReviewStatus = ReviewStatus.NeedsChanges;
 
         await store.UpdateGoalAsync(toUpdate, TestContext.Current.CancellationToken);
 
@@ -155,6 +178,7 @@ public sealed class GoalStoreIntegrationTests
         Assert.Equal("rel-updated", retrieved.ReleaseId);
         Assert.Equal(["doc-updated"], retrieved.Documents);
         Assert.True(retrieved.BranchCleanedUp);
+        Assert.Equal(ReviewStatus.NeedsChanges, retrieved.ReviewStatus);
     }
 
     [Fact]

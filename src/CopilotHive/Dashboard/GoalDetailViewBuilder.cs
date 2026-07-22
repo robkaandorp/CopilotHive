@@ -57,6 +57,7 @@ internal static class GoalDetailViewBuilder
             Status = effectiveStatus,
             Priority = effectiveGoal.Priority,
             Scope = effectiveGoal.Scope,
+            ReviewStatus = effectiveGoal.ReviewStatus,
             CurrentIteration = pipeline?.Iteration ?? 0,
             CurrentPhase = pipeline?.Phase.ToDisplayName() ?? "",
             CreatedAt = pipeline?.CreatedAt ?? effectiveGoal.CreatedAt,

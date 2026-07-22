@@ -691,6 +691,223 @@ public class GoalsApiEndpointTests
         mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-b", expectedBranchName, It.IsAny<CancellationToken>()), Times.Once);
     }
 
+    // ── GET /api/goals/{id} returns ReviewStatus ─────────────────────────
+
+    [Fact]
+    public async Task GetGoalById_ResponseBodyContainsReviewStatus()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        var getResponse = await _client.GetAsync($"/api/goals/{id}",
+            TestContext.Current.CancellationToken);
+        getResponse.EnsureSuccessStatusCode();
+
+        var body = await getResponse.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        using var doc = JsonDocument.Parse(body);
+        // reviewStatus should be present; default is None (0 as integer or "None" as string)
+        Assert.True(doc.RootElement.TryGetProperty("reviewStatus", out var reviewStatusElement),
+            "Response should contain 'reviewStatus' field");
+        var isNone = reviewStatusElement.ValueKind == JsonValueKind.Number
+            ? reviewStatusElement.GetInt32() == (int)ReviewStatus.None
+            : string.Equals(reviewStatusElement.GetString(), "None", StringComparison.OrdinalIgnoreCase);
+        Assert.True(isNone, $"Expected reviewStatus to be None but got: {reviewStatusElement}");
+    }
+
+    // ── PATCH /api/goals/{id}/review-status ──────────────────────────────
+
+    [Fact]
+    public async Task PatchReviewStatus_ValidStatus_Returns200()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/review-status",
+            new StringContent(JsonSerializer.Serialize(new { reviewStatus = "Approved" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // Verify the response body contains the updated review status
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        using var doc = JsonDocument.Parse(body);
+        Assert.True(doc.RootElement.TryGetProperty("reviewStatus", out var reviewStatusElement),
+            "Response should contain 'reviewStatus' field");
+        var isApproved = reviewStatusElement.ValueKind == JsonValueKind.Number
+            ? reviewStatusElement.GetInt32() == (int)ReviewStatus.Approved
+            : string.Equals(reviewStatusElement.GetString(), "Approved", StringComparison.OrdinalIgnoreCase);
+        Assert.True(isApproved, $"Expected reviewStatus to be Approved but got: {reviewStatusElement}");
+    }
+
+    [Fact]
+    public async Task PatchReviewStatus_InvalidValue_Returns400()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/review-status",
+            new StringContent(JsonSerializer.Serialize(new { reviewStatus = "notastatus" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PatchReviewStatus_NonExistentGoal_Returns404()
+    {
+        var response = await _client.PatchAsync(
+            "/api/goals/nonexistent-goal-xyz/review-status",
+            new StringContent(JsonSerializer.Serialize(new { reviewStatus = "Approved" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PatchReviewStatus_NumericOutOfRange_Returns400()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/review-status",
+            new StringContent(JsonSerializer.Serialize(new { reviewStatus = "99" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PatchReviewStatus_NegativeOutOfRange_Returns400()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/review-status",
+            new StringContent(JsonSerializer.Serialize(new { reviewStatus = "-1" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PatchReviewStatus_PersistsAndConfirmsViaGet()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        // PATCH the review status to Approved
+        var patchResponse = await _client.PatchAsync(
+            $"/api/goals/{id}/review-status",
+            new StringContent(JsonSerializer.Serialize(new { reviewStatus = "Approved" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, patchResponse.StatusCode);
+
+        // Do a separate GET and verify the persisted value is still Approved
+        var getResponse = await _client.GetAsync($"/api/goals/{id}",
+            TestContext.Current.CancellationToken);
+        getResponse.EnsureSuccessStatusCode();
+
+        var body = await getResponse.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        using var doc = JsonDocument.Parse(body);
+        Assert.True(doc.RootElement.TryGetProperty("reviewStatus", out var reviewStatusElement),
+            "GET response should contain 'reviewStatus' field");
+        var isApproved = reviewStatusElement.ValueKind == JsonValueKind.Number
+            ? reviewStatusElement.GetInt32() == (int)ReviewStatus.Approved
+            : string.Equals(reviewStatusElement.GetString(), "Approved", StringComparison.OrdinalIgnoreCase);
+        Assert.True(isApproved, $"Expected reviewStatus to be Approved after GET but got: {reviewStatusElement}");
+    }
+
+    // ── Iteration 3: numeric input rejection (defined enum integer values) ──
+
+    [Fact]
+    public async Task PatchReviewStatus_DefinedNumericValueOne_Returns400()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        // "1" is the integer value of ReviewStatus.Pending — Enum.TryParse would accept it,
+        // but the int.TryParse guard should reject it before that check.
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/review-status",
+            new StringContent(JsonSerializer.Serialize(new { reviewStatus = "1" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PatchReviewStatus_DefinedNumericValueZero_Returns400()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        // "0" is the integer value of ReviewStatus.None — should be rejected as numeric input.
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/review-status",
+            new StringContent(JsonSerializer.Serialize(new { reviewStatus = "0" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    // ── Iteration 3: comma-combined value rejection ──────────────────────
+
+    [Fact]
+    public async Task PatchReviewStatus_CommaCombinedValue_Returns400()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        // Enum.TryParse can accept "Pending, Approved" via bitwise OR, producing an unexpected
+        // enum value. The comma guard should reject this.
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/review-status",
+            new StringContent(JsonSerializer.Serialize(new { reviewStatus = "Pending, Approved" }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    // ── Iteration 3: all valid named values accepted ─────────────────────
+
+    [Theory]
+    [InlineData("none")]
+    [InlineData("pending")]
+    [InlineData("approved")]
+    [InlineData("needschanges")]
+    [InlineData("None")]
+    [InlineData("Pending")]
+    [InlineData("Approved")]
+    [InlineData("NeedsChanges")]
+    [InlineData("NEEDSCHANGES")]
+    public async Task PatchReviewStatus_ValidNamedValue_Returns200(string value)
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        var response = await _client.PatchAsync(
+            $"/api/goals/{id}/review-status",
+            new StringContent(JsonSerializer.Serialize(new { reviewStatus = value }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
     // ── GET /api/goals/search ─────────────────────────────────────────────
 
     [Fact]

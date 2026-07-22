@@ -830,6 +830,24 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("not found", result);
     }
 
+    [Fact]
+    public async Task GetGoal_GoalWithReviewStatus_IncludesReviewStatusInOutput()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("review-goal", "A goal with review status");
+        // Set the review status via the store directly
+        var goal = await _store.GetGoalAsync("review-goal", ct);
+        Assert.NotNull(goal);
+        goal!.ReviewStatus = ReviewStatus.Approved;
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.GetGoalAsync("review-goal");
+
+        Assert.Contains("Review Status", result);
+        Assert.Contains("Approved", result);
+    }
+
     // ── list_goals ──
 
     [Fact]

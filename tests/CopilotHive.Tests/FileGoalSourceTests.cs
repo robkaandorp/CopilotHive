@@ -249,4 +249,92 @@ public sealed class FileGoalSourceTests : IDisposable
         // Patch is the default; it should be omitted (null) to keep YAML clean
         Assert.DoesNotContain("scope: patch", yaml);
     }
+
+    /// <summary>
+    /// Verifies that <c>review_status</c> round-trips through YAML serialization
+    /// for all non-default values (Approved, Pending, NeedsChanges).
+    /// </summary>
+    [Fact]
+    public async Task WriteGoalsAsync_ReviewStatus_RoundTripsThroughYaml()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var path = WriteTempYaml(
+            """
+            goals:
+              - id: review-approved
+                description: Approved goal
+                review_status: approved
+              - id: review-pending
+                description: Pending goal
+                review_status: pending
+              - id: review-needs-changes
+                description: NeedsChanges goal
+                review_status: needschanges
+            """);
+
+        var source = new FileGoalSource(path);
+
+        // Read goals and verify review_status parsed correctly
+        var goals = await source.ReadGoalsAsync(ct);
+        Assert.Equal(3, goals.Count);
+        Assert.Equal(ReviewStatus.Approved, goals.First(g => g.Id == "review-approved").ReviewStatus);
+        Assert.Equal(ReviewStatus.Pending, goals.First(g => g.Id == "review-pending").ReviewStatus);
+        Assert.Equal(ReviewStatus.NeedsChanges, goals.First(g => g.Id == "review-needs-changes").ReviewStatus);
+
+        // Trigger a write by updating status, then re-read to verify round-trip
+        await source.UpdateGoalStatusAsync("review-approved", GoalStatus.Completed, null, ct);
+        await source.UpdateGoalStatusAsync("review-pending", GoalStatus.Completed, null, ct);
+        await source.UpdateGoalStatusAsync("review-needs-changes", GoalStatus.Completed, null, ct);
+
+        // Verify the YAML contains the review_status fields
+        var yaml = await File.ReadAllTextAsync(path, ct);
+        Assert.Contains("review_status: approved", yaml);
+        Assert.Contains("review_status: pending", yaml);
+        Assert.Contains("review_status: needschanges", yaml);
+
+        // Re-read and verify values survived the write round-trip
+        var source2 = new FileGoalSource(path);
+        var goals2 = await source2.ReadGoalsAsync(ct);
+        Assert.Equal(3, goals2.Count);
+        Assert.Equal(ReviewStatus.Approved, goals2.First(g => g.Id == "review-approved").ReviewStatus);
+        Assert.Equal(ReviewStatus.Pending, goals2.First(g => g.Id == "review-pending").ReviewStatus);
+        Assert.Equal(ReviewStatus.NeedsChanges, goals2.First(g => g.Id == "review-needs-changes").ReviewStatus);
+    }
+
+    /// <summary>
+    /// Verifies that a goal with <c>ReviewStatus.None</c> omits the
+    /// <c>review_status</c> field from YAML, and that reading YAML without a
+    /// <c>review_status</c> field defaults to <c>ReviewStatus.None</c>.
+    /// </summary>
+    [Fact]
+    public async Task WriteGoalsAsync_ReviewStatusNone_OmitsFieldFromYaml()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var path = WriteTempYaml(
+            """
+            goals:
+              - id: review-none
+                description: Goal with no review status
+            """);
+
+        var source = new FileGoalSource(path);
+
+        // Read: should default to None when field is absent
+        var goals = await source.ReadGoalsAsync(ct);
+        var goal = Assert.Single(goals);
+        Assert.Equal(ReviewStatus.None, goal.ReviewStatus);
+
+        // Trigger a write by updating status
+        await source.UpdateGoalStatusAsync("review-none", GoalStatus.Completed, null, ct);
+
+        // Verify the YAML does NOT contain review_status (None is the default, omitted)
+        var yaml = await File.ReadAllTextAsync(path, ct);
+        Assert.DoesNotContain("review_status", yaml);
+
+        // Re-read and verify it still defaults to None
+        var source2 = new FileGoalSource(path);
+        var goals2 = await source2.ReadGoalsAsync(ct);
+        var goal2 = Assert.Single(goals2);
+        Assert.Equal(ReviewStatus.None, goal2.ReviewStatus);
+    }
 }

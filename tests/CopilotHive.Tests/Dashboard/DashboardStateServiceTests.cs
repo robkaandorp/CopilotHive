@@ -1639,6 +1639,60 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Equal(GoalScope.Breaking, detail!.Scope);
     }
 
+    /// <summary>
+    /// Verifies that <see cref="GoalDetailInfo.ReviewStatus"/> is populated from the underlying <see cref="Goal"/>.
+    /// </summary>
+    [Fact]
+    public void GoalDetailInfo_ReviewStatus_ReflectsGoalReviewStatus()
+    {
+        var detail = new GoalDetailInfo
+        {
+            GoalId = "reviewed-goal",
+            Description = "An approved goal",
+            Status = GoalStatus.Pending,
+            Priority = GoalPriority.Normal,
+            Scope = GoalScope.Feature,
+            ReviewStatus = ReviewStatus.Approved,
+        };
+
+        Assert.Equal(ReviewStatus.Approved, detail.ReviewStatus);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetGoalDetail"/> populates
+    /// <see cref="GoalDetailInfo.ReviewStatus"/> from a stored goal.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_GoalWithReviewStatus_PopulatesReviewStatus()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "pending-review-goal",
+            Description = "Goal pending review",
+            ReviewStatus = ReviewStatus.Pending,
+            Status = GoalStatus.Pending,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store);
+
+        var detail = await service.GetGoalDetail("pending-review-goal");
+
+        Assert.NotNull(detail);
+        Assert.Equal(ReviewStatus.Pending, detail!.ReviewStatus);
+    }
+
     // ── Release methods ───────────────────────────────────────────────
 
     /// <summary>

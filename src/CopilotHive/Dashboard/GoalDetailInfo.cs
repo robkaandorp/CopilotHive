@@ -17,6 +17,8 @@ public sealed class GoalDetailInfo
     public GoalPriority Priority { get; init; }
     /// <summary>Goal scope.</summary>
     public GoalScope Scope { get; init; }
+    /// <summary>Pre-execution review status of the goal.</summary>
+    public ReviewStatus ReviewStatus { get; init; }
     /// <summary>Current iteration number (zero if not started).</summary>
     public int CurrentIteration { get; init; }
     /// <summary>Name of the current pipeline phase.</summary>
