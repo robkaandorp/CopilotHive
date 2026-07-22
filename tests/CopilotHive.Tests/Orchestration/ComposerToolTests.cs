@@ -3884,6 +3884,200 @@ public sealed class ComposerToolTests : IDisposable
         services.AddSingleton(dispatcher);
         return services.BuildServiceProvider();
     }
+
+    // ── review_goal ──
+
+    /// <summary>Minimal <see cref="IChatClient"/> stub that returns a fixed text response.</summary>
+    private sealed class StubChatClient(string replyText) : IChatClient
+    {
+        public ChatClientMetadata Metadata => new("stub", null, "stub-model");
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+        {
+            var response = new ChatResponse(new ChatMessage(ChatRole.Assistant, replyText))
+            {
+                FinishReason = ChatFinishReason.Stop,
+            };
+            return Task.FromResult(response);
+        }
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+        {
+            return GetStreamingUpdatesAsync(replyText, cancellationToken);
+        }
+
+        private static async IAsyncEnumerable<ChatResponseUpdate> GetStreamingUpdatesAsync(
+            string replyText, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await Task.Yield();
+            if (!cancellationToken.IsCancellationRequested)
+                yield return new ChatResponseUpdate(ChatRole.Assistant, replyText) { FinishReason = ChatFinishReason.Stop };
+        }
+
+        public void Dispose() { }
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+    }
+
+    /// <summary>Stub GoalReviewService that returns a fixed result via the chat-client factory seam.</summary>
+    private sealed class StubGoalReviewService : GoalReviewService
+    {
+        public StubGoalReviewService(ReviewResult result)
+            : base(
+                null,
+                null,
+                null,
+                null,
+                null,
+                Path.GetTempPath(),
+                NullLogger<GoalReviewService>.Instance,
+                _ => new StubChatClient(BuildJson(result)))
+        {
+        }
+
+        private static string BuildJson(ReviewResult result)
+        {
+            var issues = result.Issues == "No issues found."
+                ? ""
+                : string.Join(",", result.Issues.Split('\n').Select(i =>
+                {
+                    var description = i.StartsWith("[MAJOR] ", StringComparison.Ordinal) ? i["[MAJOR] ".Length..] : i;
+                    return $"{{\"severity\":\"MAJOR\",\"description\":\"{Escape(description)}\"}}";
+                }));
+
+            return $"{{\"verdict\":\"{result.Verdict}\",\"issues\":[{issues}],\"verified\":[],\"recommendation\":\"{Escape(result.Summary)}\"}}";
+        }
+
+        private static string Escape(string value) =>
+            value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n");
+    }
+
+    [Fact]
+    public void BuildComposerTools_IncludesReviewGoal()
+    {
+        var tools = _composer.BuildComposerTools();
+        var names = tools.Select(t => t.Name).ToList();
+        Assert.Contains("review_goal", names);
+    }
+
+    [Fact]
+    public async Task ReviewGoal_NonDraftGoal_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            goalReviewService: new StubGoalReviewService(new ReviewResult("Approved", "No issues found", "Goal looks good")));
+
+        await composer.CreateGoalAsync("review-nondraft", "Test goal");
+        await composer.ApproveGoalAsync("review-nondraft"); // Draft → Pending
+
+        var result = await composer.ReviewGoalAsync("review-nondraft");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Draft", result);
+    }
+
+    [Fact]
+    public async Task ReviewGoal_AlreadyPending_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            goalReviewService: new StubGoalReviewService(new ReviewResult("Approved", "No issues found", "Goal looks good")));
+
+        await composer.CreateGoalAsync("review-pending", "Test goal");
+        var goal = await _store.GetGoalAsync("review-pending", ct);
+        Assert.NotNull(goal);
+        goal!.ReviewStatus = ReviewStatus.Pending;
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await composer.ReviewGoalAsync("review-pending");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("already in progress", result);
+    }
+
+    [Fact]
+    public async Task ReviewGoal_Approved_ReturnsSuccess()
+    {
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            goalReviewService: new StubGoalReviewService(new ReviewResult("Approved", "No issues found", "Goal looks good")));
+
+        await composer.CreateGoalAsync("review-approved-goal", "Test goal");
+
+        var result = await composer.ReviewGoalAsync("review-approved-goal");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("approved", result);
+    }
+
+    [Fact]
+    public async Task ReviewGoal_NeedsChanges_ReturnsIssuesAndSummary()
+    {
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            goalReviewService: new StubGoalReviewService(new ReviewResult("NeedsChanges", "Missing acceptance criteria", "Add clear acceptance criteria")));
+
+        await composer.CreateGoalAsync("review-needs-changes-goal", "Test goal");
+
+        var result = await composer.ReviewGoalAsync("review-needs-changes-goal");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Missing acceptance criteria", result);
+        Assert.Contains("Add clear acceptance criteria", result);
+        Assert.Contains("review-", result);
+    }
+
+    [Fact]
+    public async Task ReviewGoal_ServiceNull_ReturnsError()
+    {
+        await _composer.CreateGoalAsync("review-no-service", "Test goal");
+
+        var result = await _composer.ReviewGoalAsync("review-no-service");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not available", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Description_ResetsReviewStatus()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("review-reset-desc", "Original desc");
+        var goal = await _store.GetGoalAsync("review-reset-desc", ct);
+        Assert.NotNull(goal);
+        goal!.ReviewStatus = ReviewStatus.Approved;
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync("review-reset-desc", "description", "Updated desc");
+
+        Assert.Contains("✅", result);
+        var updated = await _store.GetGoalAsync("review-reset-desc", ct);
+        Assert.NotNull(updated);
+        Assert.Equal(ReviewStatus.None, updated!.ReviewStatus);
+    }
 }
 
 /// <summary>

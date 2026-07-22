@@ -43,6 +43,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly List<AITool> _composerTools;
     private readonly ConfigRepoManager? _configRepo;
     private readonly KnowledgeGraph? _knowledgeGraph;
+    private readonly GoalReviewService? _goalReviewService;
     private readonly Func<string, IChatClient>? _chatClientFactory;
     private readonly IReadOnlyList<string> _startupAvailableModels;
 
@@ -110,6 +111,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - Manage knowledge documents in the knowledge graph (create_document, read_document, update_document, delete_document, search_knowledge, link_document, unlink_document, list_documents, traverse_graph)
         - Ask the user questions for clarification (ask_user)
         - Get the current date and time (get_current_time)
+        - Review draft goals before dispatch (review_goal) — triggers an automated pre-execution review that checks for issues
+        - When review_goal returns NeedsChanges, read the review document (read_document "review-{goal-id}") and update the goal to address the feedback, then re-review
 
         Guidelines for goal creation:
         - Each goal should be completable in 1-3 iterations (small, focused)
@@ -247,7 +250,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         IEnumerable<string>? availableModels = null,
         Func<string, IChatClient>? chatClientFactory = null,
         string? compactionModel = null,
-        KnowledgeGraph? knowledgeGraph = null)
+        KnowledgeGraph? knowledgeGraph = null,
+        GoalReviewService? goalReviewService = null)
     {
         _model = model;
         _maxContextTokens = maxContextTokens;
@@ -262,6 +266,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _hiveConfig = hiveConfig;
         _configRepo = configRepo;
         _knowledgeGraph = knowledgeGraph;
+        _goalReviewService = goalReviewService;
         _chatClientFactory = chatClientFactory;
         _compactionModel = compactionModel;
         _session = AgentSession.Create("composer");
@@ -731,6 +736,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 },
                 "get_current_time",
                 "Get the current date and time in UTC. Use when you need to know the current date for changelog entries, release notes, or other date-sensitive content."),
+            AIFunctionFactory.Create(ReviewGoalAsync, "review_goal",
+                "Trigger a pre-execution review on a Draft goal. Returns the review verdict, issues, and recommendations."),
         };
 
         if (_ollamaApiKey is not null)

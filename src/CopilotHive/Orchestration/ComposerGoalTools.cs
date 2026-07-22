@@ -196,6 +196,37 @@ public sealed partial class Composer
         return $"✅ Goal '{id}' has been cancelled.";
     }
 
+    [Description("Trigger a pre-execution review on a Draft goal. Returns the review verdict, issues, and recommendations.")]
+    internal async Task<string> ReviewGoalAsync(
+        [Description("Goal ID to review")] string goal_id)
+    {
+        var error = Shared.ToolValidation.Check(
+            (!string.IsNullOrWhiteSpace(goal_id), "goal_id is required"));
+        if (error is not null) return error;
+
+        if (_goalReviewService is null)
+            return "❌ Goal review service is not available.";
+
+        var goal = await _goalStore.GetGoalAsync(goal_id);
+        if (goal is null)
+            return $"❌ Goal '{goal_id}' not found.";
+
+        if (goal.Status != GoalStatus.Draft)
+            return $"❌ Goal '{goal_id}' is in '{goal.Status.ToDisplayName()}' status. Only Draft goals can be reviewed.";
+
+        if (goal.ReviewStatus == ReviewStatus.Pending)
+            return $"❌ A review is already in progress for goal '{goal_id}'. Wait for it to complete.";
+
+        var result = await _goalReviewService.ReviewGoalAsync(goal, CancellationToken.None);
+
+        _logger.LogInformation("Composer reviewed goal '{GoalId}' — verdict: {Verdict}", goal_id, result.Verdict);
+
+        if (result.Verdict == "Approved")
+            return $"✅ Goal '{goal_id}' has been reviewed and approved. The goal is ready to be approved for dispatch.";
+
+        return $"❌ Goal '{goal_id}' needs changes before it can be approved.\n\n**Issues:**\n{result.Issues}\n\n**Summary:**\n{result.Summary}\n\nReview document: review-{goal_id}";
+    }
+
     [Description("Update a field on an existing goal.")]
     internal async Task<string> UpdateGoalAsync(
         [Description("Goal ID to update")] string id,
@@ -221,6 +252,7 @@ public sealed partial class Composer
                 if (goal.Status != GoalStatus.Draft)
                     return $"❌ Cannot edit description of a goal in '{goal.Status}' status. Only Draft goals can be edited.";
                 goal.Description = value;
+                goal.ReviewStatus = ReviewStatus.None;
                 await _goalStore.UpdateGoalAsync(goal);
                 _logger.LogInformation("Composer updated goal '{GoalId}' description", id);
                 return AppendDocuments($"✅ Goal '{id}' description updated.", goal);

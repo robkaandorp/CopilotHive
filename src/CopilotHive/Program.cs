@@ -271,7 +271,8 @@ public sealed class Program
                     sp.GetService<ConfigRepoManager>(),
                     availableModels,
                     compactionModel: config?.Models?.CompactionModel,
-                    knowledgeGraph: sp.GetService<KnowledgeGraph>());
+                    knowledgeGraph: sp.GetService<KnowledgeGraph>(),
+                    goalReviewService: sp.GetService<GoalReviewService>());
             });
             builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 
