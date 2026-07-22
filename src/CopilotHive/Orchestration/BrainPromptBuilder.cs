@@ -35,6 +35,7 @@ public static class BrainPromptBuilder
         - When a goal has related docs, use `read_document` to read their full content before crafting worker prompts.
         - Use `traverse_graph` to discover related documents by following links from documents you have found.
         - Use the get_current_time tool when you need to know the current date (e.g., for changelog entries or release dates).
+        - Before planning a new iteration, read the goal's progress document via `read_document("progress-{goal-id}")` to see worker narratives from previous iterations. These narratives contain what workers tried, what worked, what they struggled with, and why they made their choices — valuable context for planning the next iteration that goes beyond the structured phase outputs.
 
         WORKER PROMPT RULES:
         When crafting worker prompts, follow these rules per role:

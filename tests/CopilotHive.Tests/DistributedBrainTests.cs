@@ -1917,6 +1917,7 @@ public sealed class DistributedBrainTests
         Assert.Contains("DocWriters: Do NOT include git diff commands", systemPrompt);
         Assert.Contains("Improvers: Tell them to analyze results", systemPrompt);
         Assert.Contains("Use the testing phase results to verify that all tests pass", systemPrompt);
+        Assert.Contains("progress-{goal-id}", systemPrompt);
     }
 
     // -- Target Repositories in Prompt Tests --
