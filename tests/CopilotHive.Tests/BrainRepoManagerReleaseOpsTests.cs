@@ -544,6 +544,53 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
             manager.MergeBranchAsync("repo", "foo//bar", "main", ct));
     }
 
+    [Fact]
+    public async Task ValidateBranchOrTagName_RejectsComponentStartingWithDot()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeBranchAsync("repo", "foo/.bar", "main", ct));
+    }
+
+    [Fact]
+    public async Task ValidateBranchOrTagName_RejectsComponentEndingWithLock()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeBranchAsync("repo", "foo/bar.lock", "main", ct));
+    }
+
+    [Fact]
+    public async Task ValidateBranchOrTagName_RejectsLoneDotComponent()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        // "foo/./bar" — the middle component "." starts with '.' and is rejected.
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeBranchAsync("repo", "foo/./bar", "main", ct));
+    }
+
+    [Fact]
+    public async Task ValidateBranchOrTagName_AcceptsValidSlashNames()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (_, _, manager) = SetupRepo("valid-slash-repo");
+
+        // Valid slash-separated names must pass validation. They will fail later because the
+        // source branch does not exist on origin — an InvalidOperationException, NOT an
+        // ArgumentException. Getting past validation is what we assert here.
+        foreach (var branch in new[] { "foo/bar", "release/v1.0", "copilothive/feature-branch" })
+        {
+            var ex = await Record.ExceptionAsync(() =>
+                manager.MergeBranchAsync("valid-slash-repo", branch, "main", ct));
+            Assert.NotNull(ex);
+            Assert.IsNotType<ArgumentException>(ex);
+            Assert.IsType<InvalidOperationException>(ex);
+        }
+    }
+
     // ---------- Symlink containment ----------
 
     [Fact]
@@ -578,13 +625,34 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
     }
 
     // ---------- Cancellation cleanup ----------
-    //
-    // Deterministically racing a real `git merge` against caller-token cancellation is timing
-    // dependent and flaky in CI (the merge may complete before cancellation is observed). The
-    // production code guards the path via a `mergeStarted` flag plus process-tree kill in
-    // RunGitCaptureAsync and a fresh bounded token for MERGE_HEAD abort; these are exercised
-    // indirectly by MergeBranchAsync_MergeConflict_ThrowsMergeConflictException (which leaves and
-    // then aborts a MERGE state). A dedicated timing test is intentionally omitted to avoid flakiness.
+
+    [Fact]
+    public async Task MergeBranchAsync_AlreadyCanceledToken_ThrowsAndLeavesNoMergeState()
+    {
+        // Deterministic cancellation test: pass an already-canceled token. The first git
+        // subprocess (fetch) observes cancellation immediately, RunGitCaptureAsync/RunGitAsync
+        // terminate the process tree, and the method throws OperationCanceledException. Crucially,
+        // no MERGE_HEAD must be left behind (the merge either never started or was aborted by the
+        // finally-block cleanup, which runs on a fresh bounded token).
+        var (remoteDir, clonePath, manager) = SetupRepo("cancel-repo");
+        CreateBranchWithCommit(remoteDir, "main", "feature", "feature.txt", "content");
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            manager.MergeBranchAsync("cancel-repo", "feature", "main", cts.Token));
+
+        // No leftover MERGE state.
+        Assert.False(File.Exists(Path.Combine(clonePath, ".git", "MERGE_HEAD")));
+    }
+
+    // Note: reliably racing cancellation against a *mid-flight* merge (as opposed to an
+    // already-canceled token) is timing-dependent and flaky, because it requires the merge
+    // subprocess to still be writing when the token trips. The production code guards that path via
+    // a `mergeStarted` flag, process-tree kill with bounded wait in RunGitCaptureAsync, and a
+    // fresh-token MERGE_HEAD abort in the finally block. Fully deterministic coverage would require
+    // an injectable process factory to pause the merge; that refactor is out of scope here.
 
     // ---------- Helpers ----------
 

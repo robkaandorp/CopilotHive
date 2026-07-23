@@ -767,43 +767,58 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// <summary>
     /// Validates that a branch or tag name is safe to pass to git as an argument: it must not
     /// enable option injection and must satisfy git's <c>check-ref-format</c> rules.
+    /// <para>
+    /// git ref-format rules apply PER slash-separated component, so this validator splits the name
+    /// on <c>/</c> and applies component-level checks to each segment (empty, leading <c>.</c>,
+    /// trailing <c>.</c>/<c>.lock</c>, lone <c>@</c>, <c>..</c>, <c>@{</c>, forbidden and control
+    /// characters), in addition to whole-name checks (null/empty/whitespace, leading <c>-</c>).
+    /// This rejects names like <c>foo/.hidden/bar</c> and <c>foo.lock/bar</c> that whole-name-only
+    /// checks would miss.
+    /// </para>
     /// </summary>
     private static void ValidateBranchOrTagName(string name)
     {
         if (string.IsNullOrWhiteSpace(name))
             throw new ArgumentException("Branch or tag name must not be null or whitespace.", nameof(name));
 
+        // Whole-name option-injection guard.
         if (name.StartsWith('-'))
             throw new ArgumentException($"Branch or tag name '{name}' must not start with '-'.", nameof(name));
 
-        // Reject control characters (anything below 0x20) and DEL.
-        foreach (var c in name)
-        {
-            if (c < 0x20 || c == 0x7f)
-                throw new ArgumentException(
-                    $"Branch or tag name '{name}' contains control characters.", nameof(name));
-        }
-
+        // A trailing slash produces an empty final component; a leading slash an empty first one —
+        // both are caught by the per-component empty check below after Split.
+        var components = name.Split('/');
         char[] forbidden = [' ', '~', '^', ':', '?', '*', '[', '\\'];
-        if (name.IndexOfAny(forbidden) >= 0)
-            throw new ArgumentException(
-                $"Branch or tag name '{name}' contains forbidden characters.", nameof(name));
 
-        // git check-ref-format rules that the character list above does not cover.
-        if (name.Contains(".."))
-            throw new ArgumentException($"Branch or tag name '{name}' must not contain '..'.", nameof(name));
-        if (name.Contains("@{"))
-            throw new ArgumentException($"Branch or tag name '{name}' must not contain '@{{'.", nameof(name));
-        if (name.Contains("//"))
-            throw new ArgumentException($"Branch or tag name '{name}' must not contain '//'.", nameof(name));
-        if (name == "@")
-            throw new ArgumentException("Branch or tag name must not be a lone '@'.", nameof(name));
-        if (name.StartsWith('.') || name.EndsWith('.'))
-            throw new ArgumentException($"Branch or tag name '{name}' must not begin or end with '.'.", nameof(name));
-        if (name.StartsWith('/') || name.EndsWith('/'))
-            throw new ArgumentException($"Branch or tag name '{name}' must not begin or end with '/'.", nameof(name));
-        if (name.EndsWith(".lock", StringComparison.Ordinal))
-            throw new ArgumentException($"Branch or tag name '{name}' must not end with '.lock'.", nameof(name));
+        foreach (var component in components)
+        {
+            // Empty component catches leading '/', trailing '/', and '//'.
+            if (component.Length == 0)
+                throw new ArgumentException($"Branch or tag name '{name}' must not contain empty path components ('/', '//').", nameof(name));
+
+            // Control characters (below 0x20) and DEL.
+            foreach (var c in component)
+            {
+                if (c < 0x20 || c == 0x7f)
+                    throw new ArgumentException($"Branch or tag name '{name}' contains control characters.", nameof(name));
+            }
+
+            if (component.IndexOfAny(forbidden) >= 0)
+                throw new ArgumentException($"Branch or tag name '{name}' contains forbidden characters.", nameof(name));
+
+            if (component.StartsWith('.'))
+                throw new ArgumentException($"Branch or tag name component '{component}' must not begin with '.'.", nameof(name));
+            if (component.EndsWith('.'))
+                throw new ArgumentException($"Branch or tag name component '{component}' must not end with '.'.", nameof(name));
+            if (component.EndsWith(".lock", StringComparison.Ordinal))
+                throw new ArgumentException($"Branch or tag name component '{component}' must not end with '.lock'.", nameof(name));
+            if (component == "@")
+                throw new ArgumentException($"Branch or tag name component must not be a lone '@' in '{name}'.", nameof(name));
+            if (component.Contains(".."))
+                throw new ArgumentException($"Branch or tag name '{name}' must not contain '..'.", nameof(name));
+            if (component.Contains("@{"))
+                throw new ArgumentException($"Branch or tag name '{name}' must not contain '@{{'.", nameof(name));
+        }
     }
 
     /// <summary>
@@ -841,22 +856,44 @@ public sealed class BrainRepoManager : IBrainRepoManager
         catch (OperationCanceledException)
         {
             // The caller's token was canceled while the git process was still running.
-            // WaitForExitAsync/ReadToEndAsync do NOT terminate the child process, so kill the
-            // whole process tree and wait (bounded) for it to actually exit before returning.
-            // This guarantees the process is dead before any post-cancellation cleanup runs.
+            // WaitForExitAsync/ReadToEndAsync do NOT terminate the child process, so kill the whole
+            // process tree and wait (bounded) for it to actually exit before rethrowing. We must not
+            // silently swallow kill/wait failures: we check process.HasExited before and after each
+            // step so post-cancellation cleanup does not race a still-running merge process.
             try
             {
                 if (!process.HasExited)
                 {
-                    process.Kill(entireProcessTree: true);
-                    process.WaitForExit(TimeSpan.FromSeconds(5));
+                    try
+                    {
+                        process.Kill(entireProcessTree: true);
+                    }
+                    catch (InvalidOperationException) when (process.HasExited)
+                    {
+                        // Process already exited between the HasExited check and Kill — safe to proceed.
+                    }
+                    catch (Exception)
+                    {
+                        // Kill failed for another reason. If the process has since exited we are safe;
+                        // otherwise there is nothing more we can do — proceed best-effort. The
+                        // MergeBranchAsync finally block runs its cleanup on a fresh bounded token and
+                        // tolerates failures, so a still-running process cannot deadlock cleanup.
+                    }
+
+                    if (!process.HasExited)
+                    {
+                        // Best-effort bounded wait. If this returns false the process may still be
+                        // alive after 5s; we still rethrow so cancellation propagates, and cleanup
+                        // (guarded by a fresh token) degrades gracefully.
+                        process.WaitForExit(5000);
+                    }
                 }
             }
             catch
             {
-                // Best-effort — the process may have already exited.
+                // Last-resort guard: never prevent the cancellation from propagating.
             }
-            throw;
+            throw; // Always rethrow the OperationCanceledException.
         }
 
         return (process.ExitCode, stdoutTask.Result, stderrTask.Result);
