@@ -57,6 +57,13 @@
         </div>
     }
 
+    @if (_isValid && _validationErrors.Count == 0)
+    {
+        <div class="card" style="margin-top:0.5rem;border-color:var(--green)">
+            <span style="color:var(--green)">✅ Validation passed — ready to release</span>
+        </div>
+    }
+
     @if (_releaseResult is not null)
     {
         <div class="card" style="margin-top:1rem">
