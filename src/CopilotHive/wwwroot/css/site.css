@@ -280,6 +280,29 @@ tr:last-child td { border-bottom: none; }
 .util-bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
 .util-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
 
+.session-context-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 140px;
+}
+
+.session-context-track {
+    flex: 1;
+    height: 6px;
+    background: var(--bg-secondary, #333);
+    border-radius: 3px;
+    overflow: hidden;
+    min-width: 60px;
+}
+
+.session-context-fill {
+    height: 100%;
+    background: var(--accent, #4a9);
+    border-radius: 3px;
+    transition: width 0.3s ease;
+}
+
 /* Configuration tabs */
 .config-tabs {
     display: flex;

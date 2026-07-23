@@ -7,6 +7,7 @@
 @inject IJSRuntime JS
 @inject IGoalStore GoalStore
 @inject PageHeaderState PageHeader
+@inject CopilotHive.Dashboard.LlmSessionRegistry SessionRegistry
 
 <div class="cards">
     <div class="card">
@@ -153,6 +154,54 @@ else
     <p style="color:var(--text-muted)">Composer not connected.</p>
 }
 
+@if (_llmSessions.Count > 0)
+{
+    <div class="card" style="margin-top:1rem">
+        <h2 style="font-size:1rem;font-weight:600;margin-bottom:0.75rem">LLM Sessions</h2>
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Type</th>
+                    <th>Goal</th>
+                    <th>Model</th>
+                    <th>Context</th>
+                    <th>Status</th>
+                    <th>Last Activity</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var session in _llmSessions)
+                {
+                    <tr>
+                        <td>@GetSessionTypeIcon(session.SessionType) @session.SessionType</td>
+                        <td>
+                            @if (session.GoalId is not null)
+                            {
+                                <a href="/goals/@session.GoalId" class="goal-link">@session.GoalId</a>
+                            }
+                            else
+                            {
+                                <span style="color:var(--text-muted)">—</span>
+                            }
+                        </td>
+                        <td>@session.Model</td>
+                        <td>
+                            <div class="session-context-bar">
+                                <div class="session-context-track">
+                                    <div class="session-context-fill" style="width:@(session.ContextUsagePercent)%"></div>
+                                </div>
+                                <span style="font-size:0.8rem;color:var(--text-muted)">@session.ContextUsagePercent% (@FormatTokens(session.CurrentTokens)/@FormatTokens(session.MaxTokens))</span>
+                            </div>
+                        </td>
+                        <td>@session.Status</td>
+                        <td>@FormatLastActivity(session.LastActivity)</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}
+
 <h2 style="margin-top:1.5rem">Clarifications</h2>
 
 <div class="cards" style="margin-bottom:1rem">
@@ -226,6 +275,7 @@ else
     private OrchestratorInfo _info = new();
     private bool _resettingBrain;
     private IReadOnlyList<(string GoalId, PersistedClarification Clarification)> _clarifications = [];
+    private List<CopilotHive.Dashboard.LlmSessionInfo> _llmSessions = [];
 
     protected override async Task OnInitializedAsync()
     {
@@ -245,6 +295,7 @@ else
         _stats = State.GetBrainStats();
         _composerStats = State.GetComposerStats();
         _info = State.GetOrchestratorInfo();
+        _llmSessions = SessionRegistry.GetAll().OrderByDescending(s => s.LastActivity).ToList();
     }
 
     private void RefreshState() => InvokeAsync(() => { Refresh(); StateHasChanged(); });
@@ -275,6 +326,23 @@ else
     private static string FormatUptime(TimeSpan ts) => ts.TotalHours >= 1
         ? $"{(int)ts.TotalHours}h {ts.Minutes}m {ts.Seconds}s"
         : $"{ts.Minutes}m {ts.Seconds}s";
+
+    private static string GetSessionTypeIcon(string type) => type switch
+    {
+        "BrainMaster" => "🧠",
+        "BrainGoal" => "🧠",
+        "Composer" => "🎵",
+        "GoalReview" => "🔍",
+        _ => "💬"
+    };
+
+    private static string FormatLastActivity(DateTime lastActivity)
+    {
+        var ago = DateTime.UtcNow - lastActivity;
+        if (ago.TotalSeconds < 60) return $"{(int)ago.TotalSeconds}s ago";
+        if (ago.TotalMinutes < 60) return $"{(int)ago.TotalMinutes}m ago";
+        return $"{(int)ago.TotalHours}h ago";
+    }
 
     private static readonly HashSet<string> KnownReasoningLevels = new(StringComparer.OrdinalIgnoreCase)
         { "none", "low", "medium", "high", "extra_high" };
