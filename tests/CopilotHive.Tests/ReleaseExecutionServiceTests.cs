@@ -1,8 +1,14 @@
+using System.Net;
+using System.Text;
+using System.Text.Json;
 using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests;
@@ -302,6 +308,42 @@ public sealed class ReleaseExecutionServiceTests : IDisposable
         var stored = await _store.GetReleaseAsync("v1.0.0", ct);
         Assert.Equal(ReleaseExecutionState.Failed, stored!.ExecutionState);
     }
+
+    [Fact]
+    public async Task ExecuteReleaseAsync_SkipsReposWithNoReleaseConfig()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // repo3 exists in the config but has Release = null.
+        var config = new HiveConfigFile
+        {
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "repo3", Url = "https://github.com/test/repo3", DefaultBranch = "main",
+                    Release = null, // no release config → should be skipped
+                },
+            ],
+        };
+        var release = new Release { Id = "v1.0.0", Tag = "v1.0.0", RepositoryNames = ["repo3"] };
+        await _store.CreateReleaseAsync(release, ct);
+        await _store.CreateGoalAsync(
+            new Goal { Id = "goal-a", Description = "Test", ReleaseId = "v1.0.0", Status = GoalStatus.Completed }, ct);
+
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+        var service = CreateService(config, fake);
+
+        var result = await service.ExecuteReleaseAsync(release, ct);
+
+        // Execution succeeds overall (the repo is skipped, not a failure).
+        Assert.True(result.Success);
+        // The result contains a RepoReleaseResult with Skipped = true for repo3.
+        var skippedRepo = Assert.Single(result.Results, r => r.RepoName == "repo3");
+        Assert.True(skippedRepo.Skipped);
+        // No tag or merge operations were performed for the skipped repo.
+        Assert.DoesNotContain(fake.CreateTagCalls, c => c.Repo == "repo3");
+        Assert.DoesNotContain(fake.MergeCalls, c => c.Repo == "repo3");
+    }
 }
 
 /// <summary>
@@ -352,5 +394,179 @@ internal sealed class ConfigurableFakeRepoManager : IBrainRepoManager
     {
         DeleteTagCalls.Add((repoName, tag));
         return Task.FromResult(true);
+    }
+}
+
+/// <summary>
+/// Integration tests for the PATCH /api/releases/{id}/status endpoint, verifying HTTP status
+/// codes for release execution transitions. Uses <see cref="HiveTestFactory"/> with
+/// <c>WithWebHostBuilder</c> to register a <see cref="ReleaseExecutionService"/> and
+/// <see cref="HiveConfigFile"/> with a mock <see cref="IBrainRepoManager"/>.
+/// </summary>
+[Collection("HiveIntegration")]
+public sealed class ReleaseStatusApiEndpointTests
+{
+    private static readonly JsonSerializerOptions JsonOpts =
+        new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
+    private static string UniqueId() => "test-" + Guid.NewGuid().ToString("N")[..16];
+
+    private static HiveConfigFile CreateApiConfig() => new()
+    {
+        Repositories =
+        [
+            new RepositoryConfig
+            {
+                Name = "repo1", Url = "https://github.com/test/repo1", DefaultBranch = "main",
+                Release = new ReleaseRepoConfig { MergeTo = "main", TagBranch = "main" },
+            },
+        ],
+    };
+
+    /// <summary>
+    /// Creates a test factory that has <see cref="ReleaseExecutionService"/>,
+    /// <see cref="HiveConfigFile"/>, and a configurable fake
+    /// <see cref="IBrainRepoManager"/> registered.
+    /// </summary>
+    private static WebApplicationFactory<Program> CreateFactory(ConfigurableFakeRepoManager fake)
+    {
+        var config = CreateApiConfig();
+        var baseFactory = new HiveTestFactory { MockRepoManager = fake };
+        return baseFactory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                // Remove any existing HiveConfigFile (unlikely but safe).
+                var existingConfig = services.SingleOrDefault(d => d.ServiceType == typeof(HiveConfigFile));
+                if (existingConfig is not null)
+                    services.Remove(existingConfig);
+                services.AddSingleton(config);
+
+                // Register ReleaseExecutionService using the same config and the mock repo manager.
+                services.AddSingleton(sp => new ReleaseExecutionService(
+                    sp.GetRequiredService<IGoalStore>(),
+                    config,
+                    sp.GetRequiredService<IBrainRepoManager>(),
+                    sp.GetRequiredService<ILogger<ReleaseExecutionService>>()));
+            });
+        });
+    }
+
+    private static StringContent StatusJson(string status) =>
+        new(JsonSerializer.Serialize(new { status }, JsonOpts), Encoding.UTF8, "application/json");
+
+    // ── API test 15: Planning → Released returns 200 ─────────────────────
+
+    [Fact]
+    public async Task PatchReleaseStatus_PlanningToReleased_Returns200()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+        using var factory = CreateFactory(fake);
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        // Seed release and a completed goal directly through the store.
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId, Tag = "v1.0.0", RepositoryNames = ["repo1"],
+            }, ct);
+            await store.CreateGoalAsync(
+                new Goal { Id = UniqueId(), Description = "Test", ReleaseId = releaseId, Status = GoalStatus.Completed }, ct);
+        }
+
+        var response = await client.PatchAsync(
+            $"/api/releases/{releaseId}/status", StatusJson("Released"), ct);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // Verify the release is now Released in the store (persisted).
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            var stored = await store.GetReleaseAsync(releaseId, ct);
+            Assert.NotNull(stored);
+            Assert.Equal(ReleaseStatus.Released, stored!.Status);
+        }
+    }
+
+    // ── API test 16: numeric status rejected with 400 ────────────────────
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("1")]
+    public async Task PatchReleaseStatus_NumericValue_Returns400(string numericStatus)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+        using var factory = CreateFactory(fake);
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release { Id = releaseId, Tag = "v1.0.0" }, ct);
+        }
+
+        var response = await client.PatchAsync(
+            $"/api/releases/{releaseId}/status", StatusJson(numericStatus), ct);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    // ── API test 17: Released → Planning returns 409 ─────────────────────
+
+    [Fact]
+    public async Task PatchReleaseStatus_ReleasedToPlanning_Returns409()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+        using var factory = CreateFactory(fake);
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId, Tag = "v1.0.0", Status = ReleaseStatus.Released,
+            }, ct);
+        }
+
+        var response = await client.PatchAsync(
+            $"/api/releases/{releaseId}/status", StatusJson("Planning"), ct);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+    }
+
+    // ── API test 18: already-Released → Released returns 409 ──────────────
+
+    [Fact]
+    public async Task PatchReleaseStatus_ReleasedToReleased_Returns409()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+        using var factory = CreateFactory(fake);
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId, Tag = "v1.0.0", Status = ReleaseStatus.Released,
+            }, ct);
+        }
+
+        var response = await client.PatchAsync(
+            $"/api/releases/{releaseId}/status", StatusJson("Released"), ct);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
     }
 }
