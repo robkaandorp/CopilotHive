@@ -657,11 +657,12 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
     [Fact]
     public async Task MergeBranchAsync_CanceledDuringMerge_KillsProcessAndCleansUp()
     {
-        // Deterministically cancel WHILE the merge process is running by installing a
-        // prepare-commit-msg hook that sleeps. A non-conflicting merge succeeds tree resolution
-        // and enters the commit phase, which invokes the hook and keeps the git process alive long
-        // enough for the token to trip mid-merge. This exercises RunGitCaptureAsync's process-tree
-        // kill and the fresh-token MERGE_HEAD cleanup in MergeBranchAsync.
+        // Deterministically cancel WHILE the directly-managed merge process is running. A hook
+        // creates a marker file as its first action; a background task waits for that marker before
+        // canceling, so the token can only trip AFTER the merge process has started (not during
+        // fetch/checkout/pre-merge steps). This exercises MergeBranchAsync's directly-managed merge
+        // process path: Process.Start, Kill(entireProcessTree), the blocking WaitForExit, and the
+        // fresh-token MERGE_HEAD abort in the finally block. (The merge no longer uses RunGitCaptureAsync.)
         var (remoteDir, clonePath, manager) = SetupRepo("cancel-mid-repo");
         // Diverge both branches (non-conflicting, different files) so the merge creates a real
         // merge commit rather than fast-forwarding — a merge commit invokes prepare-commit-msg.
@@ -676,19 +677,21 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
         Git(mainStaging, "commit", "-m", "Add main-extra.txt");
         Git(mainStaging, "push", "origin", "main");
 
+        // Marker file the hook creates when the merge process starts running.
+        var markerPath = Path.Combine(clonePath, ".git", "merge_started.marker");
+        if (File.Exists(markerPath))
+            File.Delete(markerPath);
+
+        // Install a prepare-commit-msg hook that (1) touches the marker, then (2) sleeps long
+        // enough to be killed. The hook file MUST be named exactly "prepare-commit-msg" (no
+        // extension) — git discovers hooks by this exact name on all platforms, and git on Windows
+        // (via Git Bash) executes "#!/bin/sh" scripts without an extension or chmod.
         var hooksDir = Path.Combine(clonePath, ".git", "hooks");
         Directory.CreateDirectory(hooksDir);
-
-        if (OperatingSystem.IsWindows())
+        var hookPath = Path.Combine(hooksDir, "prepare-commit-msg");
+        File.WriteAllText(hookPath, $"#!/bin/sh\ntouch \"{markerPath}\"\nsleep 30\n");
+        if (!OperatingSystem.IsWindows())
         {
-            // Windows: a batch hook that waits ~10 seconds via ping.
-            var hookPath = Path.Combine(hooksDir, "prepare-commit-msg.bat");
-            File.WriteAllText(hookPath, "@echo off\r\nping -n 10 127.0.0.1 > nul\r\n");
-        }
-        else
-        {
-            var hookPath = Path.Combine(hooksDir, "prepare-commit-msg");
-            File.WriteAllText(hookPath, "#!/bin/sh\nsleep 10\n");
             var chmodPsi = new ProcessStartInfo("chmod")
             {
                 RedirectStandardOutput = true,
@@ -701,11 +704,34 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
             chmod.WaitForExit();
         }
 
-        // Cancel after 1 second — the merge process is still sleeping inside the hook.
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+        // Manually controlled token — cancellation is triggered by the marker poll, not a timer.
+        using var cts = new CancellationTokenSource();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+        // Background task: poll for the marker (up to 10s), then cancel. This guarantees the token
+        // is canceled only after the merge process has started.
+        _ = Task.Run(async () =>
+        {
+            for (var i = 0; i < 100; i++)
+            {
+                if (File.Exists(markerPath))
+                {
+                    // Merge process is running inside the hook sleep — give it a moment, then cancel.
+                    await Task.Delay(100, CancellationToken.None);
+                    cts.Cancel();
+                    return;
+                }
+                await Task.Delay(100, CancellationToken.None);
+            }
+            // Timeout guard — cancel anyway to avoid hanging the test.
+            cts.Cancel();
+        }, CancellationToken.None);
+
+        var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             manager.MergeBranchAsync("cancel-mid-repo", "feature", "main", cts.Token));
+
+        // The merge process actually started (the hook ran and created the marker).
+        Assert.True(File.Exists(markerPath),
+            "Marker file should exist — the merge process must have started before cancellation");
 
         // The merge process was killed and the finally-block cleanup aborted the MERGE state.
         Assert.False(File.Exists(Path.Combine(clonePath, ".git", "MERGE_HEAD")),
