@@ -162,6 +162,7 @@ public sealed class CopilotHiveDbContext : DbContext
         entity.Property(e => e.Id).HasColumnName("id");
         entity.Property(e => e.Tag).HasColumnName("tag").IsRequired();
         entity.Property(e => e.Status).HasColumnName("status").IsRequired().HasConversion(LowercaseEnumConverter<ReleaseStatus>());
+        entity.Property(e => e.ExecutionState).HasColumnName("execution_state").IsRequired().HasConversion(LowercaseEnumConverter<ReleaseExecutionState>()).HasDefaultValue(ReleaseExecutionState.None);
         entity.Property(e => e.Notes).HasColumnName("notes");
         entity.Property(e => e.CreatedAt).HasColumnName("created_at").IsRequired().HasConversion(DateTimeToIsoConverter);
         entity.Property(e => e.ReleasedAt).HasColumnName("released_at").HasConversion(DateTimeToIsoConverter);

@@ -345,6 +345,10 @@ public sealed class Program
 
                 builder.Services.AddSingleton<ConfigModelService>();
                 builder.Services.AddSingleton<ModelDiscoveryService>();
+                builder.Services.AddSingleton(sp => new ReleaseExecutionService(
+                    sp.GetRequiredService<IGoalStore>(), hiveConfigFile,
+                    sp.GetRequiredService<IBrainRepoManager>(),
+                    sp.GetRequiredService<ILogger<ReleaseExecutionService>>()));
 
                 // If no explicit goals file, check config repo for goals.yaml
                 if (string.IsNullOrEmpty(goalsFile))
