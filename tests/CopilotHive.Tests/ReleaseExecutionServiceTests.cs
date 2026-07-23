@@ -792,7 +792,7 @@ public sealed class ReleaseStatusApiEndpointTests
         // would not have these fields) cannot satisfy the test.
         var body = await response.Content.ReadAsStringAsync(ct);
         using var doc = JsonDocument.Parse(body);
-        var error = doc.RootElement.GetProperty("error").GetString();
+        var error = doc.RootElement.GetProperty("detail").GetString();
         Assert.False(string.IsNullOrWhiteSpace(error));
         Assert.Contains("repo1", error);
 

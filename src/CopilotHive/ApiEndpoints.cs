@@ -342,7 +342,7 @@ public static class ApiEndpoints
             {
                 var execService = services.GetService<ReleaseExecutionService>();
                 if (execService is null)
-                    return Results.Json(new { error = "Release execution service is not available." }, statusCode: 503);
+                    return Results.Json(new { detail = "Release execution service is not available." }, statusCode: 503);
 
                 var result = await execService.ExecuteReleaseAsync(existing, HttpContext.RequestAborted);
                 if (!result.Success)
@@ -352,8 +352,8 @@ public static class ApiEndpoints
                         ReleaseExecutionFailure.NotFound => Results.NotFound(new { error = result.Error }),
                         ReleaseExecutionFailure.AlreadyReleased => Results.Json(new { error = result.Error }, statusCode: 409),
                         ReleaseExecutionFailure.AlreadyExecuting => Results.Json(new { error = result.Error }, statusCode: 409),
-                        ReleaseExecutionFailure.Validation => Results.BadRequest(new { error = result.Error }),
-                        ReleaseExecutionFailure.Execution => Results.Json(new { error = result.Error, results = result.Results }, statusCode: 500),
+                        ReleaseExecutionFailure.Validation => Results.BadRequest(new { errors = new[] { result.Error ?? "Validation failed." } }),
+                        ReleaseExecutionFailure.Execution => Results.Json(new { detail = result.Error, results = result.Results }, statusCode: 500),
                         _ => throw new InvalidOperationException($"Unhandled release execution failure: {result.Failure}"),
                     };
                 }
