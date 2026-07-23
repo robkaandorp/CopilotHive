@@ -363,7 +363,7 @@ public static class ApiEndpoints
                 updated!.Status = ReleaseStatus.Released;
                 updated.ReleasedAt = DateTime.UtcNow;
                 await store.UpdateReleaseAsync(updated);
-                return Results.Ok(updated);
+                return Results.Ok(new { release = updated, result = result });
             }
 
             existing.Status = newStatus;
@@ -421,6 +421,16 @@ public static class ApiEndpoints
 
             var updated = await store.GetReleaseAsync(id);
             return Results.Ok(updated);
+        });
+
+        releasesApi.MapGet("/{id}/validate", async (string id, IGoalStore store, IServiceProvider sp, CancellationToken ct) =>
+        {
+            var release = await store.GetReleaseAsync(id, ct);
+            if (release is null) return Results.NotFound(new { error = $"Release '{id}' not found." });
+            var execService = sp.GetService<ReleaseExecutionService>();
+            if (execService is null) return Results.Ok(new { valid = true, errors = Array.Empty<string>() });
+            var validation = await execService.ValidateReleaseAsync(release, ct);
+            return Results.Ok(new { valid = validation.IsValid, errors = validation.Errors });
         });
     }
 

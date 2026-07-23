@@ -650,7 +650,7 @@ public sealed class ReleaseStatusApiEndpointTests
         // The response body reports the release as Released.
         var body = await response.Content.ReadAsStringAsync(ct);
         using var doc = JsonDocument.Parse(body);
-        Assert.Equal(ReleaseStatus.Released, ReadStatus(doc.RootElement));
+        Assert.Equal(ReleaseStatus.Released, ReadStatus(doc.RootElement.GetProperty("release")));
 
         // The release is now Released with ExecutionState = Completed in the store (persisted).
         using (var scope = factory.Services.CreateScope())
