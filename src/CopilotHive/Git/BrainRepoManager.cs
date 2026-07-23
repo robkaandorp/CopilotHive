@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 
@@ -79,6 +80,39 @@ public interface IBrainRepoManager
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The full SHA-1 hash of HEAD, or <c>null</c> when it cannot be determined.</returns>
     Task<string?> GetHeadShaAsync(string repoName, CancellationToken ct = default);
+
+    /// <summary>
+    /// Merges a source branch into a target branch (non-squash) and pushes the result.
+    /// </summary>
+    /// <param name="repoName">Short name of the repository (must have been cloned via <see cref="EnsureCloneAsync"/>).</param>
+    /// <param name="sourceBranch">The branch to merge from.</param>
+    /// <param name="targetBranch">The branch to merge into.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>
+    /// The full SHA-1 hash of the resulting merge commit on the target branch, or <c>null</c>
+    /// when the merge was a no-op (the target branch already contained the source).
+    /// </returns>
+    Task<string?> MergeBranchAsync(string repoName, string sourceBranch, string targetBranch, CancellationToken ct = default);
+
+    /// <summary>
+    /// Creates an annotated tag pointing at the given branch and pushes it.
+    /// </summary>
+    /// <param name="repoName">Short name of the repository.</param>
+    /// <param name="tag">The tag name to create.</param>
+    /// <param name="branch">The branch whose tip the tag should point at.</param>
+    /// <param name="message">The annotation message for the tag.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns><c>true</c> if the tag was created and pushed; <c>false</c> otherwise.</returns>
+    Task<bool> CreateTagAsync(string repoName, string tag, string branch, string message, CancellationToken ct = default);
+
+    /// <summary>
+    /// Deletes a tag from the remote (and local clone).
+    /// </summary>
+    /// <param name="repoName">Short name of the repository.</param>
+    /// <param name="tag">The tag name to delete.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns><c>true</c> if the tag was deleted; <c>false</c> otherwise.</returns>
+    Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -93,6 +127,9 @@ public sealed class BrainRepoManager : IBrainRepoManager
 {
     private readonly string _basePath;
     private readonly ILogger _logger;
+
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _repoLocks =
+        new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// Initialises a new <see cref="BrainRepoManager"/>.
@@ -128,58 +165,66 @@ public sealed class BrainRepoManager : IBrainRepoManager
     public async Task<string> EnsureCloneAsync(
         string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default)
     {
-        var clonePath = GetClonePath(repoName);
-
-        if (Directory.Exists(Path.Combine(clonePath, ".git")))
+        var semaphore = await AcquireRepoLockAsync(repoName, ct);
+        try
         {
-            _logger.LogInformation(
-                "Brain clone exists for {Repo}, pulling latest on {Branch}",
-                repoName, defaultBranch);
+            var clonePath = GetClonePath(repoName);
 
-            await RunGitAsync(clonePath, ["fetch", "origin"], ct);
-
-            if (!await RemoteBranchExistsAsync(clonePath, defaultBranch, ct))
+            if (Directory.Exists(Path.Combine(clonePath, ".git")))
             {
-                _logger.LogWarning(
-                    "Default branch '{Branch}' does not exist on origin for {Repo} — skipping checkout/reset (empty repository)",
-                    defaultBranch, repoName);
+                _logger.LogInformation(
+                    "Brain clone exists for {Repo}, pulling latest on {Branch}",
+                    repoName, defaultBranch);
+
+                await RunGitAsync(clonePath, ["fetch", "origin"], ct);
+
+                if (!await RemoteBranchExistsAsync(clonePath, defaultBranch, ct))
+                {
+                    _logger.LogWarning(
+                        "Default branch '{Branch}' does not exist on origin for {Repo} — skipping checkout/reset (empty repository)",
+                        defaultBranch, repoName);
+                }
+                else
+                {
+                    await RunGitAsync(clonePath, ["checkout", defaultBranch], ct);
+                    await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct);
+                }
             }
             else
             {
-                await RunGitAsync(clonePath, ["checkout", defaultBranch], ct);
-                await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct);
+                _logger.LogInformation(
+                    "Creating Brain clone for {Repo} from {Url} (branch: {Branch})",
+                    repoName, repoUrl, defaultBranch);
+
+                Directory.CreateDirectory(WorkDirectory);
+                try
+                {
+                    await RunGitAsync(WorkDirectory,
+                        ["clone", "--branch", defaultBranch, repoUrl, repoName], ct);
+                }
+                catch (InvalidOperationException ex) when (ex.Message.Contains("not found in upstream"))
+                {
+                    _logger.LogWarning(
+                        "Branch '{Branch}' not found in upstream for {Repo} — retrying clone without --branch",
+                        defaultBranch, repoName);
+
+                    if (Directory.Exists(clonePath))
+                        await ForceDeleteDirectoryAsync(clonePath);
+
+                    await RunGitAsync(WorkDirectory, ["clone", repoUrl, repoName], ct);
+                }
+
+                // Configure git identity for merge commits
+                await RunGitAsync(clonePath, ["config", "user.email", "copilothive@local"], ct);
+                await RunGitAsync(clonePath, ["config", "user.name", "CopilotHive"], ct);
             }
+
+            return clonePath;
         }
-        else
+        finally
         {
-            _logger.LogInformation(
-                "Creating Brain clone for {Repo} from {Url} (branch: {Branch})",
-                repoName, repoUrl, defaultBranch);
-
-            Directory.CreateDirectory(WorkDirectory);
-            try
-            {
-                await RunGitAsync(WorkDirectory,
-                    ["clone", "--branch", defaultBranch, repoUrl, repoName], ct);
-            }
-            catch (InvalidOperationException ex) when (ex.Message.Contains("not found in upstream"))
-            {
-                _logger.LogWarning(
-                    "Branch '{Branch}' not found in upstream for {Repo} — retrying clone without --branch",
-                    defaultBranch, repoName);
-
-                if (Directory.Exists(clonePath))
-                    await ForceDeleteDirectoryAsync(clonePath);
-
-                await RunGitAsync(WorkDirectory, ["clone", repoUrl, repoName], ct);
-            }
-
-            // Configure git identity for merge commits
-            await RunGitAsync(clonePath, ["config", "user.email", "copilothive@local"], ct);
-            await RunGitAsync(clonePath, ["config", "user.name", "CopilotHive"], ct);
+            semaphore.Release();
         }
-
-        return clonePath;
     }
 
     /// <summary>
@@ -213,90 +258,98 @@ public sealed class BrainRepoManager : IBrainRepoManager
         string repoName, string featureBranch, string defaultBranch, string commitMessage,
         CancellationToken ct = default)
     {
-        var clonePath = GetClonePath(repoName);
-        if (!Directory.Exists(Path.Combine(clonePath, ".git")))
-            throw new InvalidOperationException(
-                $"No brain clone found for '{repoName}'. Call EnsureCloneAsync first.");
-
-        _logger.LogInformation("Squash-merging {Branch} into {Base} for {Repo}",
-            featureBranch, defaultBranch, repoName);
-
-        // Ensure we're on the base branch with latest remote state
-        await RunGitAsync(clonePath, ["fetch", "origin"], ct);
-
-        if (!await RemoteBranchExistsAsync(clonePath, defaultBranch, ct))
-        {
-            // Check whether the feature branch exists on origin
-            if (!await RemoteBranchExistsAsync(clonePath, featureBranch, ct))
-            {
-                // Truly empty repository — neither branch exists yet
-                _logger.LogWarning(
-                    "Cannot merge into '{Branch}' for '{Repo}': neither the default branch nor the feature branch exists on origin (empty repository). Skipping merge.",
-                    defaultBranch, repoName);
-                return string.Empty;
-            }
-
-            // Default branch is absent but the feature branch is present — create the default
-            // branch from the feature branch tip so subsequent goals have a base to build on.
-            _logger.LogInformation(
-                "Default branch '{DefaultBranch}' does not exist on origin for '{Repo}'. Creating it from feature branch '{FeatureBranch}'.",
-                defaultBranch, repoName, featureBranch);
-
-            await RunGitAsync(clonePath, ["fetch", "origin", featureBranch], ct);
-            await RunGitAsync(clonePath, ["checkout", "-B", defaultBranch, $"origin/{featureBranch}"], ct);
-            await RunGitAsync(clonePath, ["push", "origin", defaultBranch], ct);
-
-            var newBranchHash = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct);
-            return newBranchHash.Trim();
-        }
-
-        await RunGitAsync(clonePath, ["checkout", defaultBranch], ct);
-        await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct);
-
-        // Fetch the feature branch and attempt squash merge
-        await RunGitAsync(clonePath, ["fetch", "origin", featureBranch], ct);
-
+        var semaphore = await AcquireRepoLockAsync(repoName, ct);
         try
         {
-            await RunGitAsync(clonePath,
-                ["merge", "--squash", $"origin/{featureBranch}"], ct);
-        }
-        catch (Exception mergeEx)
-        {
-            _logger.LogWarning(mergeEx, "Squash merge failed for {Repo} — resetting clone to clean state", repoName);
+            var clonePath = GetClonePath(repoName);
+            if (!Directory.Exists(Path.Combine(clonePath, ".git")))
+                throw new InvalidOperationException(
+                    $"No brain clone found for '{repoName}'. Call EnsureCloneAsync first.");
 
-            // Abort the merge and reset to clean state
-            try { await RunGitAsync(clonePath, ["merge", "--abort"], ct); } catch { }
-            await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct);
-            await RunGitAsync(clonePath, ["clean", "-fd"], ct);
-
-            throw;
-        }
-
-        // Check whether the squash produced any staged changes before committing
-        var statusResult = await RunGitWithOutputAsync(clonePath, ["status", "--porcelain"], ct);
-        if (string.IsNullOrWhiteSpace(statusResult))
-        {
-            _logger.LogInformation(
-                "Squash merge of {Branch} into {Base} for {Repo} produced no changes — skipping commit",
+            _logger.LogInformation("Squash-merging {Branch} into {Base} for {Repo}",
                 featureBranch, defaultBranch, repoName);
 
-            // Return the current HEAD since nothing new was committed
-            var currentHash = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct);
-            return currentHash.Trim();
+            // Ensure we're on the base branch with latest remote state
+            await RunGitAsync(clonePath, ["fetch", "origin"], ct);
+
+            if (!await RemoteBranchExistsAsync(clonePath, defaultBranch, ct))
+            {
+                // Check whether the feature branch exists on origin
+                if (!await RemoteBranchExistsAsync(clonePath, featureBranch, ct))
+                {
+                    // Truly empty repository — neither branch exists yet
+                    _logger.LogWarning(
+                        "Cannot merge into '{Branch}' for '{Repo}': neither the default branch nor the feature branch exists on origin (empty repository). Skipping merge.",
+                        defaultBranch, repoName);
+                    return string.Empty;
+                }
+
+                // Default branch is absent but the feature branch is present — create the default
+                // branch from the feature branch tip so subsequent goals have a base to build on.
+                _logger.LogInformation(
+                    "Default branch '{DefaultBranch}' does not exist on origin for '{Repo}'. Creating it from feature branch '{FeatureBranch}'.",
+                    defaultBranch, repoName, featureBranch);
+
+                await RunGitAsync(clonePath, ["fetch", "origin", featureBranch], ct);
+                await RunGitAsync(clonePath, ["checkout", "-B", defaultBranch, $"origin/{featureBranch}"], ct);
+                await RunGitAsync(clonePath, ["push", "origin", defaultBranch], ct);
+
+                var newBranchHash = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct);
+                return newBranchHash.Trim();
+            }
+
+            await RunGitAsync(clonePath, ["checkout", defaultBranch], ct);
+            await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct);
+
+            // Fetch the feature branch and attempt squash merge
+            await RunGitAsync(clonePath, ["fetch", "origin", featureBranch], ct);
+
+            try
+            {
+                await RunGitAsync(clonePath,
+                    ["merge", "--squash", $"origin/{featureBranch}"], ct);
+            }
+            catch (Exception mergeEx)
+            {
+                _logger.LogWarning(mergeEx, "Squash merge failed for {Repo} — resetting clone to clean state", repoName);
+
+                // Abort the merge and reset to clean state
+                try { await RunGitAsync(clonePath, ["merge", "--abort"], ct); } catch { }
+                await RunGitAsync(clonePath, ["reset", "--hard", $"origin/{defaultBranch}"], ct);
+                await RunGitAsync(clonePath, ["clean", "-fd"], ct);
+
+                throw;
+            }
+
+            // Check whether the squash produced any staged changes before committing
+            var statusResult = await RunGitWithOutputAsync(clonePath, ["status", "--porcelain"], ct);
+            if (string.IsNullOrWhiteSpace(statusResult))
+            {
+                _logger.LogInformation(
+                    "Squash merge of {Branch} into {Base} for {Repo} produced no changes — skipping commit",
+                    featureBranch, defaultBranch, repoName);
+
+                // Return the current HEAD since nothing new was committed
+                var currentHash = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct);
+                return currentHash.Trim();
+            }
+
+            // Commit the squashed changes as a single commit
+            await RunGitAsync(clonePath, ["commit", "-m", commitMessage], ct);
+
+            // Push the squash commit
+            await RunGitAsync(clonePath, ["push", "origin", defaultBranch], ct);
+
+            _logger.LogInformation("Successfully squash-merged {Branch} into {Base} for {Repo}",
+                featureBranch, defaultBranch, repoName);
+
+            var hashResult = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct);
+            return hashResult.Trim();
         }
-
-        // Commit the squashed changes as a single commit
-        await RunGitAsync(clonePath, ["commit", "-m", commitMessage], ct);
-
-        // Push the squash commit
-        await RunGitAsync(clonePath, ["push", "origin", defaultBranch], ct);
-
-        _logger.LogInformation("Successfully squash-merged {Branch} into {Base} for {Repo}",
-            featureBranch, defaultBranch, repoName);
-
-        var hashResult = await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct);
-        return hashResult.Trim();
+        finally
+        {
+            semaphore.Release();
+        }
     }
 
     /// <summary>
@@ -368,53 +421,61 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// <param name="ct">Cancellation token.</param>
     public async Task<BranchDeleteResult> DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default)
     {
-        var clonePath = GetClonePath(repoName);
-        if (!Directory.Exists(Path.Combine(clonePath, ".git")))
-        {
-            _logger.LogWarning(
-                "Cannot delete remote branch {Branch} from {Repo}: no clone found at {Path}",
-                branchName, repoName, clonePath);
-            return BranchDeleteResult.NotFound;
-        }
-
-        BranchDeleteResult result;
+        var semaphore = await AcquireRepoLockAsync(repoName, ct);
         try
         {
-            await RunGitAsync(clonePath, ["push", "origin", "--delete", branchName], ct);
-            _logger.LogInformation("Deleted remote branch {Branch} from {Repo}", branchName, repoName);
-            result = BranchDeleteResult.Success;
-        }
-        catch (Exception ex)
-        {
-            var message = ex.Message;
-            // git reports "remote ref does not exist" or "error: unable to delete ... remote ref does not exist"
-            // when the branch was already absent — that is not a failure.
-            if (message.Contains("remote ref does not exist", StringComparison.OrdinalIgnoreCase) ||
-                message.Contains("did not match any", StringComparison.OrdinalIgnoreCase))
+            var clonePath = GetClonePath(repoName);
+            if (!Directory.Exists(Path.Combine(clonePath, ".git")))
             {
-                _logger.LogInformation(
-                    "Remote branch {Branch} does not exist on {Repo} — treating as already deleted",
-                    branchName, repoName);
-                result = BranchDeleteResult.NotFound;
+                _logger.LogWarning(
+                    "Cannot delete remote branch {Branch} from {Repo}: no clone found at {Path}",
+                    branchName, repoName, clonePath);
+                return BranchDeleteResult.NotFound;
             }
-            else
+
+            BranchDeleteResult result;
+            try
             {
-                _logger.LogWarning(ex, "Failed to delete remote branch {Branch} from {Repo}", branchName, repoName);
-                result = BranchDeleteResult.Failed;
+                await RunGitAsync(clonePath, ["push", "origin", "--delete", branchName], ct);
+                _logger.LogInformation("Deleted remote branch {Branch} from {Repo}", branchName, repoName);
+                result = BranchDeleteResult.Success;
             }
-        }
+            catch (Exception ex)
+            {
+                var message = ex.Message;
+                // git reports "remote ref does not exist" or "error: unable to delete ... remote ref does not exist"
+                // when the branch was already absent — that is not a failure.
+                if (message.Contains("remote ref does not exist", StringComparison.OrdinalIgnoreCase) ||
+                    message.Contains("did not match any", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogInformation(
+                        "Remote branch {Branch} does not exist on {Repo} — treating as already deleted",
+                        branchName, repoName);
+                    result = BranchDeleteResult.NotFound;
+                }
+                else
+                {
+                    _logger.LogWarning(ex, "Failed to delete remote branch {Branch} from {Repo}", branchName, repoName);
+                    result = BranchDeleteResult.Failed;
+                }
+            }
 
-        // Best-effort: delete the local tracking branch
-        try
-        {
-            await RunGitAsync(clonePath, ["branch", "-D", branchName], ct);
-        }
-        catch
-        {
-            // Ignored — local branch may not exist
-        }
+            // Best-effort: delete the local tracking branch
+            try
+            {
+                await RunGitAsync(clonePath, ["branch", "-D", branchName], ct);
+            }
+            catch
+            {
+                // Ignored — local branch may not exist
+            }
 
-        return result;
+            return result;
+        }
+        finally
+        {
+            semaphore.Release();
+        }
     }
 
     /// <summary>
@@ -513,4 +574,218 @@ public sealed class BrainRepoManager : IBrainRepoManager
                 $"git {string.Join(' ', args)} failed (exit {process.ExitCode}): {stderr}");
         }
     }
+
+    /// <summary>
+    /// Merges a source branch into a target branch (non-squash) and pushes the result.
+    /// </summary>
+    /// <param name="repoName">Repository name (must have been cloned via <see cref="EnsureCloneAsync"/>).</param>
+    /// <param name="sourceBranch">The branch to merge from.</param>
+    /// <param name="targetBranch">The branch to merge into.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>
+    /// The full SHA-1 hash of the resulting merge commit on the target branch, or <c>null</c>
+    /// when the merge was a no-op (the target branch already contained the source).
+    /// </returns>
+    /// <exception cref="MergeConflictException">Thrown when the merge fails due to conflicts.</exception>
+    /// <exception cref="InvalidOperationException">Thrown when the clone is missing, a branch is absent, or the merge fails for another reason.</exception>
+    public async Task<string?> MergeBranchAsync(
+        string repoName, string sourceBranch, string targetBranch, CancellationToken ct = default)
+    {
+        ValidateRepoName(repoName);
+        ValidateBranchOrTagName(sourceBranch);
+        ValidateBranchOrTagName(targetBranch);
+
+        var semaphore = await AcquireRepoLockAsync(repoName, ct);
+        try
+        {
+            var clonePath = GetClonePath(repoName);
+            if (!Directory.Exists(Path.Combine(clonePath, ".git")))
+                throw new InvalidOperationException($"Repository '{repoName}' is not cloned.");
+
+            _logger.LogInformation("Merging {Source} into {Target} for {Repo}",
+                sourceBranch, targetBranch, repoName);
+
+            await RunGitAsync(clonePath, ["fetch", "origin"], ct);
+
+            // Clean worktree so checkout/merge operations are not blocked by leftover state.
+            var status = await RunGitWithOutputAsync(clonePath, ["status", "--porcelain"], ct);
+            if (!string.IsNullOrWhiteSpace(status))
+            {
+                await RunGitAsync(clonePath, ["reset", "--hard"], ct);
+                await RunGitAsync(clonePath, ["clean", "-fd"], ct);
+            }
+
+            if (!await RemoteBranchExistsAsync(clonePath, targetBranch, ct))
+                throw new InvalidOperationException(
+                    $"Remote branch 'origin/{targetBranch}' does not exist for '{repoName}'.");
+
+            if (!await RemoteBranchExistsAsync(clonePath, sourceBranch, ct))
+                throw new InvalidOperationException(
+                    $"Remote branch 'origin/{sourceBranch}' does not exist for '{repoName}'.");
+
+            await RunGitAsync(clonePath, ["checkout", "-B", targetBranch, $"origin/{targetBranch}"], ct);
+
+            var preMergeSha = (await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct)).Trim();
+
+            var mergeExitCode = 0;
+            try
+            {
+                var (exitCode, stdout, stderr) = await RunGitCaptureAsync(
+                    clonePath, ["merge", $"origin/{sourceBranch}", "--no-edit"], ct);
+                mergeExitCode = exitCode;
+
+                if (exitCode != 0)
+                {
+                    var combined = stdout + stderr;
+                    if (combined.Contains("CONFLICT", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _logger.LogWarning(
+                            "Merge conflict merging {Source} into {Target} for {Repo}",
+                            sourceBranch, targetBranch, repoName);
+                        throw new MergeConflictException(repoName, sourceBranch, targetBranch);
+                    }
+
+                    throw new InvalidOperationException(
+                        $"git merge origin/{sourceBranch} failed (exit {exitCode}): {stderr}");
+                }
+
+                var postMergeSha = (await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct)).Trim();
+                if (postMergeSha == preMergeSha)
+                {
+                    _logger.LogInformation(
+                        "Merge of {Source} into {Target} for {Repo} was a no-op (target already contained source)",
+                        sourceBranch, targetBranch, repoName);
+                    return null;
+                }
+
+                await RunGitAsync(clonePath, ["push", "origin", targetBranch], ct);
+
+                _logger.LogInformation("Successfully merged {Source} into {Target} for {Repo}",
+                    sourceBranch, targetBranch, repoName);
+
+                return postMergeSha;
+            }
+            finally
+            {
+                // If the merge command failed, ensure we are not left in a merge state.
+                // Use a fresh token so cleanup runs even if the caller's token is canceled.
+                if (mergeExitCode != 0)
+                {
+                    using var cleanupCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    try
+                    {
+                        var (verifyExit, _, _) = await RunGitCaptureAsync(
+                            clonePath, ["rev-parse", "--verify", "-q", "MERGE_HEAD"], cleanupCts.Token);
+                        if (verifyExit == 0)
+                            await RunGitCaptureAsync(clonePath, ["merge", "--abort"], cleanupCts.Token);
+                    }
+                    catch
+                    {
+                        // Best-effort cleanup — ignore failures.
+                    }
+                }
+            }
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    }
+
+    /// <summary>
+    /// Acquires the per-repository lock, creating it on first use.
+    /// </summary>
+    private async Task<SemaphoreSlim> AcquireRepoLockAsync(string repoName, CancellationToken ct)
+    {
+        var semaphore = _repoLocks.GetOrAdd(repoName, _ => new SemaphoreSlim(1, 1));
+        await semaphore.WaitAsync(ct);
+        return semaphore;
+    }
+
+    /// <summary>
+    /// Validates that a repository name is a safe single path segment directly under <see cref="WorkDirectory"/>.
+    /// </summary>
+    private void ValidateRepoName(string repoName)
+    {
+        if (string.IsNullOrWhiteSpace(repoName))
+            throw new ArgumentException("Repository name must not be null or whitespace.", nameof(repoName));
+
+        if (repoName.StartsWith('-'))
+            throw new ArgumentException($"Repository name '{repoName}' must not start with '-'.", nameof(repoName));
+
+        if (repoName.Contains('/') || repoName.Contains('\\') || repoName.Contains(".."))
+            throw new ArgumentException(
+                $"Repository name '{repoName}' must be a single path segment (no '/', '\\', or '..').", nameof(repoName));
+
+        var workDirFull = Path.GetFullPath(WorkDirectory);
+        var resolved = Path.GetFullPath(Path.Combine(workDirFull, repoName));
+        var parent = Path.GetDirectoryName(resolved);
+        if (!string.Equals(parent, workDirFull, StringComparison.Ordinal))
+            throw new ArgumentException(
+                $"Repository name '{repoName}' does not resolve to a direct child of the work directory.", nameof(repoName));
+    }
+
+    /// <summary>
+    /// Validates that a branch or tag name does not contain option-injection or unsafe characters.
+    /// </summary>
+    private static void ValidateBranchOrTagName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException("Branch or tag name must not be null or whitespace.", nameof(name));
+
+        if (name.StartsWith('-'))
+            throw new ArgumentException($"Branch or tag name '{name}' must not start with '-'.", nameof(name));
+
+        char[] forbidden = [' ', '~', '^', ':', '?', '*', '[', '\\'];
+        if (name.IndexOfAny(forbidden) >= 0)
+            throw new ArgumentException(
+                $"Branch or tag name '{name}' contains forbidden characters.", nameof(name));
+    }
+
+    /// <summary>
+    /// Runs a git command capturing exit code, stdout, and stderr without throwing on non-zero exit.
+    /// </summary>
+    /// <param name="workingDir">Working directory for the git process.</param>
+    /// <param name="args">Arguments to pass to git.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The exit code, standard output, and standard error of the git command.</returns>
+    private static async Task<(int exitCode, string stdout, string stderr)> RunGitCaptureAsync(
+        string workingDir, string[] args, CancellationToken ct)
+    {
+        var psi = new ProcessStartInfo("git")
+        {
+            WorkingDirectory = workingDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
+
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to start git process");
+
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
+        var stderrTask = process.StandardError.ReadToEndAsync(ct);
+
+        await Task.WhenAll(stdoutTask, stderrTask);
+        await process.WaitForExitAsync(ct);
+
+        return (process.ExitCode, stdoutTask.Result, stderrTask.Result);
+    }
+
+    /// <summary>
+    /// Creates an annotated tag pointing at the given branch and pushes it.
+    /// Implemented in a subsequent round.
+    /// </summary>
+    public Task<bool> CreateTagAsync(string repoName, string tag, string branch, string message, CancellationToken ct = default) =>
+        throw new NotImplementedException();
+
+    /// <summary>
+    /// Deletes a tag from the remote (and local clone).
+    /// Implemented in a subsequent round.
+    /// </summary>
+    public Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default) =>
+        throw new NotImplementedException();
 }
