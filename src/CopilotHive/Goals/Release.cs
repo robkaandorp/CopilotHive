@@ -31,6 +31,21 @@ public enum ReleaseStatus
 }
 
 /// <summary>
+/// Execution status for release automation: None, Executing, Completed, Failed.
+/// </summary>
+public enum ReleaseExecutionState
+{
+    /// <summary>No execution has been attempted.</summary>
+    None,
+    /// <summary>Release automation is currently running.</summary>
+    Executing,
+    /// <summary>Release automation completed successfully.</summary>
+    Completed,
+    /// <summary>Release automation failed.</summary>
+    Failed,
+}
+
+/// <summary>
 /// Represents a named release that groups completed goals together.
 /// </summary>
 public sealed class Release
@@ -55,4 +70,7 @@ public sealed class Release
 
     /// <summary>Names of repositories this release applies to.</summary>
     public List<string> RepositoryNames { get; init; } = [];
+
+    /// <summary>Execution status for release automation: None, Executing, Completed, Failed.</summary>
+    public ReleaseExecutionState ExecutionState { get; set; } = ReleaseExecutionState.None;
 }

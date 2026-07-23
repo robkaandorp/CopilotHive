@@ -589,6 +589,7 @@ public sealed class GoalStore : IGoalStore
             existing.Status = release.Status;
             existing.Notes = release.Notes;
             existing.ReleasedAt = release.ReleasedAt;
+            existing.ExecutionState = release.ExecutionState;
 
             // RepositoryNames is init-only; set via the EF Core metadata API.
             db.Entry(existing).Property(e => e.RepositoryNames).CurrentValue = release.RepositoryNames;

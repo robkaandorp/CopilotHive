@@ -310,7 +310,7 @@ public static class ApiEndpoints
             }
         });
 
-        releasesApi.MapPatch("/{id}/status", async (string id, UpdateReleaseStatusRequest request, IGoalStore store) =>
+        releasesApi.MapPatch("/{id}/status", async (string id, UpdateReleaseStatusRequest request, IGoalStore store, IServiceProvider services, HttpContext HttpContext) =>
         {
             var existing = await store.GetReleaseAsync(id);
             if (existing is null)
@@ -319,13 +319,54 @@ public static class ApiEndpoints
             if (string.IsNullOrEmpty(request.Status))
                 return Results.BadRequest(new { error = "Status is required." });
 
-            if (!Enum.TryParse<ReleaseStatus>(request.Status, ignoreCase: true, out var newStatus))
-                return Results.BadRequest(new { error = $"Invalid status '{request.Status}'." });
+            if (int.TryParse(request.Status, out _))
+                return Results.BadRequest(new { error = $"Invalid status '{request.Status}'. Valid values: Planning, Released." });
+
+            if (!Enum.TryParse<ReleaseStatus>(request.Status, ignoreCase: true, out var newStatus) || !Enum.IsDefined(newStatus))
+                return Results.BadRequest(new { error = $"Invalid status '{request.Status}'. Valid values: Planning, Released." });
+
+            // Reject comma-combined inputs (e.g. "Released,Planning") that Enum.TryParse may accept via bitwise OR.
+            if (request.Status.Contains(','))
+                return Results.BadRequest(new { error = $"Invalid status '{request.Status}'. Valid values: Planning, Released." });
+
+            if (existing.Status == ReleaseStatus.Released && newStatus == ReleaseStatus.Released)
+                return Results.Json(new { error = "Release is already in 'Released' status." }, statusCode: 409);
+
+            if (newStatus == ReleaseStatus.Planning && existing.Status == ReleaseStatus.Released)
+                return Results.Json(new { error = "Cannot revert a Released release back to Planning." }, statusCode: 409);
+
+            if (newStatus == ReleaseStatus.Planning && existing.Status == ReleaseStatus.Planning)
+                return Results.Ok(existing);
+
+            if (newStatus == ReleaseStatus.Released)
+            {
+                var execService = services.GetService<ReleaseExecutionService>();
+                if (execService is null)
+                    return Results.Json(new { error = "Release execution service is not available." }, statusCode: 503);
+
+                var result = await execService.ExecuteReleaseAsync(existing, HttpContext.RequestAborted);
+                if (!result.Success)
+                {
+                    return result.Failure switch
+                    {
+                        ReleaseExecutionFailure.NotFound => Results.NotFound(new { error = result.Error }),
+                        ReleaseExecutionFailure.AlreadyReleased => Results.Json(new { error = result.Error }, statusCode: 409),
+                        ReleaseExecutionFailure.AlreadyExecuting => Results.Json(new { error = result.Error }, statusCode: 409),
+                        ReleaseExecutionFailure.Validation => Results.BadRequest(new { error = result.Error }),
+                        ReleaseExecutionFailure.Execution => Results.Json(new { error = result.Error, results = result.Results }, statusCode: 500),
+                        _ => throw new InvalidOperationException($"Unhandled release execution failure: {result.Failure}"),
+                    };
+                }
+
+                // Re-read to avoid overwriting fields that changed during execution.
+                var updated = await store.GetReleaseAsync(id);
+                updated!.Status = ReleaseStatus.Released;
+                updated.ReleasedAt = DateTime.UtcNow;
+                await store.UpdateReleaseAsync(updated);
+                return Results.Ok(updated);
+            }
 
             existing.Status = newStatus;
-            if (newStatus == ReleaseStatus.Released && existing.ReleasedAt is null)
-                existing.ReleasedAt = DateTime.UtcNow;
-
             await store.UpdateReleaseAsync(existing);
             return Results.Ok(existing);
         });
