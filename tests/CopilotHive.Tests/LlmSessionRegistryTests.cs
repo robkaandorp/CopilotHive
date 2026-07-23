@@ -16,7 +16,7 @@ public class LlmSessionRegistryTests
         return new LlmSessionInfo
         {
             SessionId = sessionId,
-            SessionType = "brain",
+            SessionType = LlmSessionType.Brain,
             Model = "test-model",
             Status = status,
             GoalId = goalId,

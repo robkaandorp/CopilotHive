@@ -1,4 +1,23 @@
+using System.Text.Json.Serialization;
+
 namespace CopilotHive.Dashboard;
+
+/// <summary>Classification of an LLM session tracked by the dashboard.</summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum LlmSessionType
+{
+    /// <summary>The master Brain session that maintains cross-goal context.</summary>
+    Brain,
+
+    /// <summary>A goal-specific fork of the Brain session.</summary>
+    BrainGoal,
+
+    /// <summary>The Composer conversational agent session.</summary>
+    Composer,
+
+    /// <summary>A temporary pre-execution goal review session.</summary>
+    GoalReview,
+}
 
 /// <summary>Information about an active LLM session tracked by the dashboard.</summary>
 public sealed record LlmSessionInfo
@@ -6,8 +25,8 @@ public sealed record LlmSessionInfo
     /// <summary>Unique session identifier.</summary>
     public required string SessionId { get; init; }
 
-    /// <summary>Session classification, e.g. "brain", "composer", or "worker".</summary>
-    public required string SessionType { get; init; }
+    /// <summary>Session classification.</summary>
+    public required LlmSessionType SessionType { get; init; }
 
     /// <summary>Model identifier used by the session.</summary>
     public required string Model { get; init; }

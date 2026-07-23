@@ -73,7 +73,7 @@ public class SessionEndpointsTests : IDisposable
         var session = new LlmSessionInfo
         {
             SessionId = sessionId,
-            SessionType = "brain",
+            SessionType = LlmSessionType.Brain,
             Model = "test-model",
             Status = "active",
             CurrentTokens = 1000,
@@ -88,9 +88,17 @@ public class SessionEndpointsTests : IDisposable
         var sessions = await response.Content.ReadFromJsonAsync<List<LlmSessionInfo>>(TestContext.Current.CancellationToken);
         Assert.NotNull(sessions);
         var registered = sessions.Single(s => s.SessionId == sessionId);
-        Assert.Equal("brain", registered.SessionType);
+        Assert.Equal(LlmSessionType.Brain, registered.SessionType);
         Assert.Equal("test-model", registered.Model);
         Assert.Equal("active", registered.Status);
+
+        // Verify the sessionType property serializes as a JSON string, not an integer.
+        var content = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        using var document = JsonDocument.Parse(content);
+        var first = document.RootElement.EnumerateArray().Single(e => e.GetProperty("sessionId").GetString() == sessionId);
+        var sessionType = first.GetProperty("sessionType");
+        Assert.Equal(JsonValueKind.String, sessionType.ValueKind);
+        Assert.Equal("Brain", sessionType.GetString());
     }
 
     [Fact]
