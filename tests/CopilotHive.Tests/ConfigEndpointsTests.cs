@@ -104,6 +104,28 @@ public class ConfigEndpointsTests
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
     }
 
+    // ── POST /api/config/repositories with release body ─────────────────────────
+
+    [Fact]
+    public async Task PostRepository_WithReleaseBody_EndpointIsRouted()
+    {
+        var response = await _client.PostAsJsonAsync(
+            "/api/config/repositories",
+            new
+            {
+                name = "test-repo",
+                url = "https://github.com/org/repo.git",
+                defaultBranch = "main",
+                release = new { mergeTo = "main", tagBranch = "main" }
+            },
+            TestContext.Current.CancellationToken);
+
+        // The route must accept the camelCase release.mergeTo/release.tagBranch fields
+        // (not 404). Without a registered config service it returns 500.
+        Assert.NotEqual(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+    }
+
     // ── PUT /api/config/repositories/{name} ──────────────────────────────────────
 
     [Fact]
@@ -119,6 +141,46 @@ public class ConfigEndpointsTests
     }
 
     // ── DELETE /api/config/repositories/{name} ───────────────────────────────────
+
+    [Fact]
+    public async Task PutRepository_WithReleaseBody_EndpointIsRouted()
+    {
+        var response = await _client.PutAsJsonAsync(
+            "/api/config/repositories/test-repo",
+            new
+            {
+                name = "test-repo",
+                url = "https://github.com/org/repo.git",
+                defaultBranch = "main",
+                release = new { mergeTo = "main", tagBranch = "main" }
+            },
+            TestContext.Current.CancellationToken);
+
+        // The route must accept the camelCase release.mergeTo/release.tagBranch fields
+        // (not 404). Without a registered config service it returns 500.
+        Assert.NotEqual(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PutRepository_WithEmptyReleaseObject_EndpointIsRouted()
+    {
+        var response = await _client.PutAsJsonAsync(
+            "/api/config/repositories/test-repo",
+            new
+            {
+                name = "test-repo",
+                url = "https://github.com/org/repo.git",
+                defaultBranch = "main",
+                release = new { mergeTo = (string?)null, tagBranch = (string?)null }
+            },
+            TestContext.Current.CancellationToken);
+
+        // The clear case: an explicit empty release object must bind and be forwarded
+        // (not 404). Without a registered config service it returns 500.
+        Assert.NotEqual(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+    }
 
     [Fact]
     public async Task DeleteRepository_Endpoint_IsRouted()

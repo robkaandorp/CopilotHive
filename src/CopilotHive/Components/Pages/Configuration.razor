@@ -1388,11 +1388,14 @@ else
         try
         {
             var branch = string.IsNullOrWhiteSpace(_editRepoDefaultBranch) ? "main" : _editRepoDefaultBranch;
-            object? release = null;
-            if (!string.IsNullOrWhiteSpace(_editRepoMergeTo) || !string.IsNullOrWhiteSpace(_editRepoTagBranch))
+            // Always send a non-null release object on the edit (PUT) path so clearing both
+            // fields replaces (and removes) any existing release config. UpdateRepositoryAsync
+            // normalizes an empty object to null, effectively disabling release automation.
+            object release = new
             {
-                release = new { mergeTo = string.IsNullOrWhiteSpace(_editRepoMergeTo) ? null : _editRepoMergeTo, tagBranch = string.IsNullOrWhiteSpace(_editRepoTagBranch) ? null : _editRepoTagBranch };
-            }
+                mergeTo = string.IsNullOrWhiteSpace(_editRepoMergeTo) ? null : _editRepoMergeTo,
+                tagBranch = string.IsNullOrWhiteSpace(_editRepoTagBranch) ? null : _editRepoTagBranch
+            };
             var body = new StringContent(
                 System.Text.Json.JsonSerializer.Serialize(new { name = _editingRepoName, url = _editRepoUrl, defaultBranch = branch, release }),
                 System.Text.Encoding.UTF8, "application/json");
