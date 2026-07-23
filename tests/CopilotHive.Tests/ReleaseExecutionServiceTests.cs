@@ -947,3 +947,185 @@ public sealed class ReleaseStatusApiEndpointTests
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
     }
 }
+
+/// <summary>
+/// Integration tests for the GET /api/releases/{id}/validate endpoint, verifying HTTP status
+/// codes and response bodies for release validation. Uses <see cref="HiveTestFactory"/> with
+/// <c>WithWebHostBuilder</c> to register a <see cref="ReleaseExecutionService"/> and
+/// <see cref="HiveConfigFile"/> with a mock <see cref="IBrainRepoManager"/>.
+/// </summary>
+[Collection("HiveIntegration")]
+public sealed class ReleaseValidateApiEndpointTests
+{
+    private static readonly JsonSerializerOptions JsonOpts =
+        new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
+    private static string UniqueId() => "test-" + Guid.NewGuid().ToString("N")[..16];
+
+    private static HiveConfigFile CreateApiConfig() => new()
+    {
+        Repositories =
+        [
+            new RepositoryConfig
+            {
+                Name = "repo1", Url = "https://github.com/test/repo1", DefaultBranch = "main",
+                Release = new ReleaseRepoConfig { MergeTo = "main", TagBranch = "main" },
+            },
+        ],
+    };
+
+    /// <summary>
+    /// Creates a test factory that has <see cref="ReleaseExecutionService"/>,
+    /// <see cref="HiveConfigFile"/>, and a configurable fake
+    /// <see cref="IBrainRepoManager"/> registered.
+    /// </summary>
+    private static WebApplicationFactory<Program> CreateFactory(ConfigurableFakeRepoManager fake)
+    {
+        var config = CreateApiConfig();
+        var baseFactory = new HiveTestFactory { MockRepoManager = fake };
+        return baseFactory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                // Remove any existing HiveConfigFile (unlikely but safe).
+                var existingConfig = services.SingleOrDefault(d => d.ServiceType == typeof(HiveConfigFile));
+                if (existingConfig is not null)
+                    services.Remove(existingConfig);
+                services.AddSingleton(config);
+
+                // Register ReleaseExecutionService using the same config and the mock repo manager.
+                services.AddSingleton(sp => new ReleaseExecutionService(
+                    sp.GetRequiredService<IGoalStore>(),
+                    config,
+                    sp.GetRequiredService<IBrainRepoManager>(),
+                    sp.GetRequiredService<ILogger<ReleaseExecutionService>>()));
+            });
+        });
+    }
+
+    // ── Validate: valid release returns 200 with valid=true ───────────────
+
+    [Fact]
+    public async Task ValidateRelease_ValidRelease_Returns200WithValidTrue()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+        using var factory = CreateFactory(fake);
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId, Tag = "v1.0.0", RepositoryNames = ["repo1"],
+            }, ct);
+            await store.CreateGoalAsync(
+                new Goal { Id = UniqueId(), Description = "Test", ReleaseId = releaseId, Status = GoalStatus.Completed }, ct);
+        }
+
+        var response = await client.GetAsync($"/api/releases/{releaseId}/validate", ct);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var body = await response.Content.ReadAsStringAsync(ct);
+        using var doc = JsonDocument.Parse(body);
+        Assert.True(doc.RootElement.GetProperty("valid").GetBoolean());
+        var errors = doc.RootElement.GetProperty("errors");
+        Assert.Equal(JsonValueKind.Array, errors.ValueKind);
+        Assert.Equal(0, errors.GetArrayLength());
+    }
+
+    // ── Validate: incomplete goal returns 200 with valid=false ────────────
+
+    [Fact]
+    public async Task ValidateRelease_IncompleteGoal_Returns200WithValidFalse()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+        using var factory = CreateFactory(fake);
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId, Tag = "v1.0.0", RepositoryNames = ["repo1"],
+            }, ct);
+            await store.CreateGoalAsync(
+                new Goal { Id = UniqueId(), Description = "Test", ReleaseId = releaseId, Status = GoalStatus.InProgress }, ct);
+        }
+
+        var response = await client.GetAsync($"/api/releases/{releaseId}/validate", ct);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var body = await response.Content.ReadAsStringAsync(ct);
+        using var doc = JsonDocument.Parse(body);
+        Assert.False(doc.RootElement.GetProperty("valid").GetBoolean());
+        var errors = doc.RootElement.GetProperty("errors");
+        Assert.Equal(JsonValueKind.Array, errors.ValueKind);
+        Assert.NotEqual(0, errors.GetArrayLength());
+        // The error should mention the goal is not completed.
+        var errorText = errors.EnumerateArray().Select(e => e.GetString() ?? "").ToList();
+        Assert.Contains(errorText, e => e.Contains("not completed", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // ── Validate: nonexistent release returns 404 ──────────────────────────
+
+    [Fact]
+    public async Task ValidateRelease_NonexistentRelease_Returns404()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // A plain factory (no ReleaseExecutionService registered) — not needed for 404.
+        using var factory = new HiveTestFactory();
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/api/releases/nonexistent-release/validate", ct);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+
+        var body = await response.Content.ReadAsStringAsync(ct);
+        using var doc = JsonDocument.Parse(body);
+        var error = doc.RootElement.GetProperty("error").GetString();
+        Assert.False(string.IsNullOrWhiteSpace(error));
+        Assert.Contains("not found", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // ── Validate: service not registered returns valid=true ────────────────
+
+    [Fact]
+    public async Task ValidateRelease_ServiceNotRegistered_ReturnsValidTrue()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // A plain factory (no ReleaseExecutionService registered).
+        using var factory = new HiveTestFactory();
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId, Tag = "v1.0.0", RepositoryNames = ["repo1"],
+            }, ct);
+            await store.CreateGoalAsync(
+                new Goal { Id = UniqueId(), Description = "Test", ReleaseId = releaseId, Status = GoalStatus.Completed }, ct);
+        }
+
+        var response = await client.GetAsync($"/api/releases/{releaseId}/validate", ct);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var body = await response.Content.ReadAsStringAsync(ct);
+        using var doc = JsonDocument.Parse(body);
+        Assert.True(doc.RootElement.GetProperty("valid").GetBoolean());
+        var errors = doc.RootElement.GetProperty("errors");
+        Assert.Equal(JsonValueKind.Array, errors.ValueKind);
+        Assert.Equal(0, errors.GetArrayLength());
+    }
+}
