@@ -652,6 +652,13 @@ public sealed class ReleaseStatusApiEndpointTests
         using var doc = JsonDocument.Parse(body);
         Assert.Equal(ReleaseStatus.Released, ReadStatus(doc.RootElement.GetProperty("release")));
 
+        // The 200 envelope also carries the result member with execution outcome.
+        Assert.True(doc.RootElement.TryGetProperty("result", out var resultEl));
+        Assert.True(resultEl.GetProperty("success").GetBoolean());
+        var resultsArray = resultEl.GetProperty("results");
+        Assert.Equal(JsonValueKind.Array, resultsArray.ValueKind);
+        Assert.NotEqual(0, resultsArray.GetArrayLength());
+
         // The release is now Released with ExecutionState = Completed in the store (persisted).
         using (var scope = factory.Services.CreateScope())
         {
@@ -753,6 +760,13 @@ public sealed class ReleaseStatusApiEndpointTests
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         // No git operations should have run for a validation failure.
         Assert.Empty(fake.MergeCalls);
+
+        // The 400 body uses the { errors: string[] } format (not a single error string).
+        var body = await response.Content.ReadAsStringAsync(ct);
+        using var doc = JsonDocument.Parse(body);
+        Assert.True(doc.RootElement.TryGetProperty("errors", out var errorsEl));
+        Assert.Equal(JsonValueKind.Array, errorsEl.ValueKind);
+        Assert.NotEqual(0, errorsEl.GetArrayLength());
     }
 
     // ── API test: execution failure returns 500 ──────────────────────────
@@ -868,6 +882,12 @@ public sealed class ReleaseStatusApiEndpointTests
             $"/api/releases/{releaseId}/status", StatusJson("Released"), ct);
 
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+
+        // The 503 body uses ProblemDetails convention with a "detail" field.
+        var body = await response.Content.ReadAsStringAsync(ct);
+        using var doc = JsonDocument.Parse(body);
+        Assert.True(doc.RootElement.TryGetProperty("detail", out var detailEl));
+        Assert.False(string.IsNullOrWhiteSpace(detailEl.GetString()));
     }
 
     // ── API test 16: numeric status rejected with 400 ────────────────────
