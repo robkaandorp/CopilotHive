@@ -776,16 +776,158 @@ public sealed class BrainRepoManager : IBrainRepoManager
     }
 
     /// <summary>
-    /// Creates an annotated tag pointing at the given branch and pushes it.
-    /// Implemented in a subsequent round.
+    /// Creates an annotated tag pointing at the tip of the given branch and pushes it to origin.
     /// </summary>
-    public Task<bool> CreateTagAsync(string repoName, string tag, string branch, string message, CancellationToken ct = default) =>
-        throw new NotImplementedException();
+    /// <param name="repoName">Repository name (must have been cloned via <see cref="EnsureCloneAsync"/>).</param>
+    /// <param name="tag">The tag name to create.</param>
+    /// <param name="branch">The branch whose tip the tag should point at.</param>
+    /// <param name="message">The annotation message for the tag.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns><c>true</c> if the tag was created and pushed; <c>false</c> if the tag already exists on origin.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the clone is missing, the branch is absent, or git fails.</exception>
+    public async Task<bool> CreateTagAsync(string repoName, string tag, string branch, string message, CancellationToken ct = default)
+    {
+        ValidateRepoName(repoName);
+        ValidateBranchOrTagName(tag);
+        ValidateBranchOrTagName(branch);
+
+        if (string.IsNullOrWhiteSpace(message))
+            throw new ArgumentException("Tag message must not be null or whitespace.", nameof(message));
+        if (message.StartsWith('-'))
+            throw new ArgumentException($"Tag message '{message}' must not start with '-'.", nameof(message));
+
+        var semaphore = await AcquireRepoLockAsync(repoName, ct);
+        try
+        {
+            var clonePath = GetClonePath(repoName);
+            if (!Directory.Exists(Path.Combine(clonePath, ".git")))
+                throw new InvalidOperationException($"Repository '{repoName}' is not cloned.");
+
+            _logger.LogInformation("Creating tag {Tag} on {Branch} for {Repo}", tag, branch, repoName);
+
+            // Check whether the tag already exists on origin (no fetch needed).
+            var (lsExit, lsStdout, lsStderr) = await RunGitCaptureAsync(
+                clonePath, ["ls-remote", "--tags", "origin", $"refs/tags/{tag}"], ct);
+            if (lsExit != 0)
+                throw new InvalidOperationException(
+                    $"Failed to query remote tags for '{repoName}': {lsStderr}");
+            if (!string.IsNullOrWhiteSpace(lsStdout))
+            {
+                _logger.LogInformation("Tag {Tag} already exists on origin for {Repo} — skipping", tag, repoName);
+                return false;
+            }
+
+            // Fetch the branch (without tags) so we can point the tag at its tip.
+            await RunGitAsync(clonePath,
+                ["fetch", "--no-tags", "origin", $"+refs/heads/{branch}:refs/remotes/origin/{branch}"], ct);
+
+            if (!await RemoteBranchExistsAsync(clonePath, branch, ct))
+                throw new InvalidOperationException(
+                    $"Remote branch 'origin/{branch}' does not exist for '{repoName}'.");
+
+            await RunGitAsync(clonePath, ["checkout", "-B", branch, $"origin/{branch}"], ct);
+
+            // Delete any stale local tag with the same name before recreating it.
+            var localTag = await RunGitWithOutputAsync(clonePath, ["tag", "-l", tag], ct);
+            if (!string.IsNullOrWhiteSpace(localTag))
+                await RunGitAsync(clonePath, ["tag", "-d", tag], ct);
+
+            await RunGitAsync(clonePath, ["tag", "-a", tag, "-m", message], ct);
+            await RunGitAsync(clonePath, ["push", "origin", tag], ct);
+
+            _logger.LogInformation("Successfully created and pushed tag {Tag} for {Repo}", tag, repoName);
+            return true;
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    }
 
     /// <summary>
-    /// Deletes a tag from the remote (and local clone).
-    /// Implemented in a subsequent round.
+    /// Deletes a tag from the remote and the local clone.
     /// </summary>
-    public Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default) =>
-        throw new NotImplementedException();
+    /// <param name="repoName">Repository name (must have been cloned via <see cref="EnsureCloneAsync"/>).</param>
+    /// <param name="tag">The tag name to delete.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns><c>true</c> if the tag was deleted from at least one location; <c>false</c> if it did not exist anywhere.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the clone is missing, existence cannot be determined, or both deletions fail.</exception>
+    public async Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default)
+    {
+        ValidateRepoName(repoName);
+        ValidateBranchOrTagName(tag);
+
+        var semaphore = await AcquireRepoLockAsync(repoName, ct);
+        try
+        {
+            var clonePath = GetClonePath(repoName);
+            if (!Directory.Exists(Path.Combine(clonePath, ".git")))
+                throw new InvalidOperationException($"Repository '{repoName}' is not cloned.");
+
+            _logger.LogInformation("Deleting tag {Tag} for {Repo}", tag, repoName);
+
+            var (remoteExit, remoteStdout, remoteStderr) = await RunGitCaptureAsync(
+                clonePath, ["ls-remote", "--tags", "origin", $"refs/tags/{tag}"], ct);
+            if (remoteExit != 0)
+                throw new InvalidOperationException(
+                    $"Failed to query remote tags for '{repoName}': {remoteStderr}");
+
+            var (localExit, localStdout, localStderr) = await RunGitCaptureAsync(
+                clonePath, ["tag", "-l", tag], ct);
+            if (localExit != 0)
+                throw new InvalidOperationException(
+                    $"Failed to query local tags for '{repoName}': {localStderr}");
+
+            var remoteExists = !string.IsNullOrWhiteSpace(remoteStdout);
+            var localExists = !string.IsNullOrWhiteSpace(localStdout);
+
+            if (!remoteExists && !localExists)
+            {
+                _logger.LogInformation("Tag {Tag} does not exist locally or on origin for {Repo}", tag, repoName);
+                return false;
+            }
+
+            var anyDeleted = false;
+            string? localError = null;
+            string? remoteError = null;
+
+            if (localExists)
+            {
+                var (delExit, _, delStderr) = await RunGitCaptureAsync(clonePath, ["tag", "-d", tag], ct);
+                if (delExit == 0)
+                    anyDeleted = true;
+                else
+                    localError = delStderr;
+            }
+
+            if (remoteExists)
+            {
+                var (pushExit, _, pushStderr) = await RunGitCaptureAsync(
+                    clonePath, ["push", "origin", $":refs/tags/{tag}"], ct);
+                if (pushExit == 0)
+                    anyDeleted = true;
+                else
+                    remoteError = pushStderr;
+            }
+
+            if (anyDeleted)
+            {
+                if (localError is not null)
+                    _logger.LogWarning("Local tag delete failed for {Tag} in {Repo}: {Error}", tag, repoName, localError);
+                if (remoteError is not null)
+                    _logger.LogWarning("Remote tag delete failed for {Tag} in {Repo}: {Error}", tag, repoName, remoteError);
+
+                _logger.LogInformation("Successfully deleted tag {Tag} for {Repo}", tag, repoName);
+                return true;
+            }
+
+            // Neither side deleted successfully but at least one existed — genuine failure.
+            throw new InvalidOperationException(
+                $"Failed to delete tag '{tag}' for '{repoName}'. Local error: {localError}; Remote error: {remoteError}");
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    }
 }
