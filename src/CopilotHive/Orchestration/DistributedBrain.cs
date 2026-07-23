@@ -152,7 +152,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
         {
             SessionId = "brain-master",
-            SessionType = "Brain",
+            SessionType = LlmSessionType.Brain,
             Model = _modelOverride,
             Status = "idle",
             CurrentTokens = _masterSession.EstimatedContextTokens,
@@ -187,7 +187,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
             {
                 SessionId = "brain-master",
-                SessionType = "Brain",
+                SessionType = LlmSessionType.Brain,
                 Model = _modelOverride,
                 Status = "idle",
                 CurrentTokens = _masterSession.EstimatedContextTokens,
@@ -202,7 +202,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     _sessionRegistry.RegisterOrUpdate(new LlmSessionInfo
                     {
                         SessionId = $"brain-goal-{registeredGoalId}",
-                        SessionType = "BrainGoal",
+                        SessionType = LlmSessionType.BrainGoal,
                         GoalId = registeredGoalId,
                         Model = _modelOverride,
                         Status = "idle",
@@ -661,7 +661,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
         {
             SessionId = "brain-master",
-            SessionType = "Brain",
+            SessionType = LlmSessionType.Brain,
             Model = _modelOverride,
             Status = "idle",
             CurrentTokens = currentTokens ?? _masterSession.EstimatedContextTokens,
@@ -696,7 +696,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
         {
             SessionId = $"brain-goal-{goalId}",
-            SessionType = "BrainGoal",
+            SessionType = LlmSessionType.BrainGoal,
             GoalId = goalId,
             Model = _modelOverride,
             Status = "idle",
@@ -796,7 +796,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
             {
                 SessionId = $"brain-goal-{goalId}",
-                SessionType = "BrainGoal",
+                SessionType = LlmSessionType.BrainGoal,
                 GoalId = goalId,
                 Model = _modelOverride,
                 Status = "idle",
@@ -1213,7 +1213,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 _sessionRegistry.RegisterOrUpdate(new LlmSessionInfo
                 {
                     SessionId = $"brain-goal-{goalId}",
-                    SessionType = "BrainGoal",
+                    SessionType = LlmSessionType.BrainGoal,
                     GoalId = goalId,
                     Model = _modelOverride,
                     Status = status,
@@ -1268,7 +1268,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 _sessionRegistry.RegisterOrUpdate(new LlmSessionInfo
                 {
                     SessionId = $"brain-goal-{goalId}",
-                    SessionType = "BrainGoal",
+                    SessionType = LlmSessionType.BrainGoal,
                     GoalId = goalId,
                     Model = _modelOverride,
                     Status = "idle",

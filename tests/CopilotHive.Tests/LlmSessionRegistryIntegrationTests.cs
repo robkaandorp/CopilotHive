@@ -100,7 +100,7 @@ public sealed class LlmSessionRegistryIntegrationTests
 
             var master = FindSession(registry, "brain-master");
             Assert.NotNull(master);
-            Assert.Equal("Brain", master!.SessionType);
+            Assert.Equal(LlmSessionType.Brain, master!.SessionType);
             Assert.Equal("idle", master.Status);
         }
         finally
@@ -125,7 +125,7 @@ public sealed class LlmSessionRegistryIntegrationTests
             var master = FindSession(registry, "brain-master");
             Assert.NotNull(master);
             Assert.Equal("brain-master", master!.SessionId);
-            Assert.Equal("Brain", master.SessionType);
+            Assert.Equal(LlmSessionType.Brain, master.SessionType);
             Assert.Equal("copilot/test-model", master.Model);
             Assert.Equal("idle", master.Status);
             Assert.Equal(123_456, master.MaxTokens);
@@ -344,7 +344,7 @@ public sealed class LlmSessionRegistryIntegrationTests
 
             var goalSession = FindSession(registry, "brain-goal-goal-fork-1");
             Assert.NotNull(goalSession);
-            Assert.Equal("BrainGoal", goalSession!.SessionType);
+            Assert.Equal(LlmSessionType.BrainGoal, goalSession!.SessionType);
             Assert.Equal("goal-fork-1", goalSession.GoalId);
         }
         finally
@@ -431,7 +431,7 @@ public sealed class LlmSessionRegistryIntegrationTests
 
             var goalSession = FindSession(registry, "brain-goal-goal-existing-1");
             Assert.NotNull(goalSession);
-            Assert.Equal("BrainGoal", goalSession!.SessionType);
+            Assert.Equal(LlmSessionType.BrainGoal, goalSession!.SessionType);
             Assert.Equal("goal-existing-1", goalSession.GoalId);
         }
         finally
@@ -700,7 +700,7 @@ public sealed class LlmSessionRegistryIntegrationTests
 
             var session = FindSession(registry, "composer");
             Assert.NotNull(session);
-            Assert.Equal("Composer", session!.SessionType);
+            Assert.Equal(LlmSessionType.Composer, session!.SessionType);
             Assert.Equal("idle", session.Status);
         }
         finally
@@ -890,7 +890,7 @@ public sealed class LlmSessionRegistryIntegrationTests
             var entry = FindSession(registry, "composer");
             Assert.NotNull(entry);
             Assert.Equal("copilot/other-model", entry!.Model);
-            Assert.Equal("Composer", entry.SessionType);
+            Assert.Equal(LlmSessionType.Composer, entry.SessionType);
         }
         finally
         {
@@ -923,13 +923,13 @@ public sealed class LlmSessionRegistryIntegrationTests
 
             // The review session must have been registered during the call with a complete payload.
             var captured = Assert.Single(seenReviewSessions);
-            Assert.Equal("GoalReview", captured.SessionType);
+            Assert.Equal(LlmSessionType.GoalReview, captured.SessionType);
             Assert.Equal("goal-review-ok", captured.GoalId);
             Assert.Equal("reviewing", captured.Status);
             Assert.StartsWith("goal-review-goal-review-ok-", captured.SessionId);
 
             // After completion, the review session must be unregistered.
-            Assert.DoesNotContain(registry.GetAll(), s => s.SessionType == "GoalReview");
+            Assert.DoesNotContain(registry.GetAll(), s => s.SessionType == LlmSessionType.GoalReview);
         }
         finally
         {
@@ -958,7 +958,7 @@ public sealed class LlmSessionRegistryIntegrationTests
             Assert.Equal("NeedsChanges", result.Verdict);
 
             // Even on failure, the review session must be unregistered.
-            Assert.DoesNotContain(registry.GetAll(), s => s.SessionType == "GoalReview");
+            Assert.DoesNotContain(registry.GetAll(), s => s.SessionType == LlmSessionType.GoalReview);
         }
         finally
         {
@@ -994,13 +994,13 @@ public sealed class LlmSessionRegistryIntegrationTests
                 () => service.ReviewGoalAsync(secondGoal, TestContext.Current.CancellationToken));
 
             // Only ONE review session should have been registered (from the first, in-flight review).
-            Assert.Single(registry.GetAll(), s => s.SessionType == "GoalReview");
+            Assert.Single(registry.GetAll(), s => s.SessionType == LlmSessionType.GoalReview);
 
             // Release the first review so it completes cleanly and unregisters.
             tcs.SetResult("""{"verdict":"Approved","issues":[],"verified":[],"recommendation":"ok"}""");
             await first;
 
-            Assert.DoesNotContain(registry.GetAll(), s => s.SessionType == "GoalReview");
+            Assert.DoesNotContain(registry.GetAll(), s => s.SessionType == LlmSessionType.GoalReview);
         }
         finally
         {
@@ -1032,9 +1032,9 @@ public sealed class LlmSessionRegistryIntegrationTests
             await entered.Task;
 
             // Inspect the registry mid-review — the session must have a complete payload.
-            var captured = Assert.Single(registry.GetAll(), s => s.SessionType == "GoalReview");
+            var captured = Assert.Single(registry.GetAll(), s => s.SessionType == LlmSessionType.GoalReview);
             Assert.StartsWith("goal-review-goal-review-payload-", captured.SessionId);
-            Assert.Equal("GoalReview", captured.SessionType);
+            Assert.Equal(LlmSessionType.GoalReview, captured.SessionType);
             Assert.Equal("goal-review-payload", captured.GoalId);
             Assert.Equal(Constants.DefaultWorkerModel, captured.Model);
             Assert.Equal(0, captured.CurrentTokens);
@@ -1046,7 +1046,7 @@ public sealed class LlmSessionRegistryIntegrationTests
             tcs.SetResult("""{"verdict":"Approved","issues":[],"verified":[],"recommendation":"ok"}""");
             await reviewTask;
 
-            Assert.DoesNotContain(registry.GetAll(), s => s.SessionType == "GoalReview");
+            Assert.DoesNotContain(registry.GetAll(), s => s.SessionType == LlmSessionType.GoalReview);
         }
         finally
         {
@@ -1077,13 +1077,13 @@ public sealed class LlmSessionRegistryIntegrationTests
             var reviewTask = service.ReviewGoalAsync(goal, cts.Token);
             await entered.Task;
 
-            Assert.Single(registry.GetAll(), s => s.SessionType == "GoalReview");
+            Assert.Single(registry.GetAll(), s => s.SessionType == LlmSessionType.GoalReview);
 
             // Cancel the review — it must unregister the session and propagate cancellation.
             cts.Cancel();
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => reviewTask);
 
-            Assert.DoesNotContain(registry.GetAll(), s => s.SessionType == "GoalReview");
+            Assert.DoesNotContain(registry.GetAll(), s => s.SessionType == LlmSessionType.GoalReview);
         }
         finally
         {
@@ -1190,7 +1190,7 @@ public sealed class LlmSessionRegistryIntegrationTests
             // the EXISTING file's token count. If that else branch were deleted, no entry would exist.
             var restored = FindSession(registry, $"brain-goal-{goalId}");
             Assert.NotNull(restored);
-            Assert.Equal("BrainGoal", restored!.SessionType);
+            Assert.Equal(LlmSessionType.BrainGoal, restored!.SessionType);
             Assert.Equal(goalId, restored.GoalId);
             Assert.Equal("idle", restored.Status);
             // Reference-sensitive: tokens come from the existing file (RegisterExistingGoalSession),
@@ -1294,7 +1294,7 @@ file sealed class ReviewCapturingChatClient(string replyText, LlmSessionRegistry
         CancellationToken cancellationToken = default)
     {
         if (registry is not null && seen is not null)
-            seen.AddRange(registry.GetAll().Where(s => s.SessionType == "GoalReview"));
+            seen.AddRange(registry.GetAll().Where(s => s.SessionType == LlmSessionType.GoalReview));
 
         return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, replyText))
         {

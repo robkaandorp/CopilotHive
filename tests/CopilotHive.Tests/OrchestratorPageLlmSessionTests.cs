@@ -21,12 +21,12 @@ public sealed class OrchestratorPageLlmSessionTests
         _ => tokens.ToString(),
     };
 
-    private static string GetSessionTypeIcon(string type) => type switch
+    private static string GetSessionTypeIcon(LlmSessionType type) => type switch
     {
-        "BrainMaster" => "🧠",
-        "BrainGoal" => "🧠",
-        "Composer" => "🎵",
-        "GoalReview" => "🔍",
+        LlmSessionType.Brain => "🎵",
+        LlmSessionType.BrainGoal => "🎵",
+        LlmSessionType.Composer => "💬",
+        LlmSessionType.GoalReview => "🔍",
         _ => "💬"
     };
 
@@ -104,7 +104,7 @@ public sealed class OrchestratorPageLlmSessionTests
             new()
             {
                 SessionId = "brain-master",
-                SessionType = "BrainMaster",
+                SessionType = LlmSessionType.Brain,
                 Model = "copilot/brain-model",
                 Status = "idle",
                 GoalId = null,
@@ -115,7 +115,7 @@ public sealed class OrchestratorPageLlmSessionTests
             new()
             {
                 SessionId = "brain-goal-g1",
-                SessionType = "BrainGoal",
+                SessionType = LlmSessionType.BrainGoal,
                 Model = "copilot/goal-model",
                 Status = "active",
                 GoalId = "goal-1",
@@ -126,7 +126,7 @@ public sealed class OrchestratorPageLlmSessionTests
             new()
             {
                 SessionId = "goal-review-g2",
-                SessionType = "GoalReview",
+                SessionType = LlmSessionType.GoalReview,
                 Model = "copilot/review-model",
                 Status = "reviewing",
                 GoalId = "goal-2",
@@ -141,8 +141,8 @@ public sealed class OrchestratorPageLlmSessionTests
         Assert.Contains("LLM Sessions", html);
         Assert.Contains("<table", html);
         Assert.Contains("</table>", html);
-        Assert.Contains("🧠 BrainMaster", html);
-        Assert.Contains("🧠 BrainGoal", html);
+        Assert.Contains("🎵 Brain", html);
+        Assert.Contains("🎵 BrainGoal", html);
         Assert.Contains("🔍 GoalReview", html);
         Assert.Contains("copilot/brain-model", html);
         Assert.Contains("copilot/goal-model", html);
@@ -170,7 +170,7 @@ public sealed class OrchestratorPageLlmSessionTests
         var session = new LlmSessionInfo
         {
             SessionId = "composer",
-            SessionType = "Composer",
+            SessionType = LlmSessionType.Composer,
             Model = "copilot/composer-model",
             Status = "streaming",
             GoalId = "goal-3",
@@ -181,7 +181,7 @@ public sealed class OrchestratorPageLlmSessionTests
 
         var html = BuildSectionHtml([session]);
 
-        Assert.Contains("🎵 Composer", html);
+        Assert.Contains("💬 Composer", html);
         Assert.Contains("<a href=\"/goals/goal-3\" class=\"goal-link\">goal-3</a>", html);
         Assert.Contains("copilot/composer-model", html);
         Assert.Contains("streaming", html);
@@ -199,7 +199,7 @@ public sealed class OrchestratorPageLlmSessionTests
         var session = new LlmSessionInfo
         {
             SessionId = "brain-master",
-            SessionType = "BrainMaster",
+            SessionType = LlmSessionType.Brain,
             Model = "copilot/brain-model",
             Status = "idle",
             GoalId = null,
@@ -217,13 +217,11 @@ public sealed class OrchestratorPageLlmSessionTests
     // ── helper behavior ───────────────────────────────────────────────────────
 
     [Theory]
-    [InlineData("BrainMaster", "🧠")]
-    [InlineData("BrainGoal", "🧠")]
-    [InlineData("Composer", "🎵")]
-    [InlineData("GoalReview", "🔍")]
-    [InlineData("Unknown", "💬")]
-    [InlineData("worker", "💬")]
-    public void GetSessionTypeIcon_ReturnsExpectedEmoji(string type, string expected)
+    [InlineData(LlmSessionType.Brain, "🎵")]
+    [InlineData(LlmSessionType.BrainGoal, "🎵")]
+    [InlineData(LlmSessionType.Composer, "💬")]
+    [InlineData(LlmSessionType.GoalReview, "🔍")]
+    public void GetSessionTypeIcon_ReturnsExpectedEmoji(LlmSessionType type, string expected)
     {
         Assert.Equal(expected, GetSessionTypeIcon(type));
     }

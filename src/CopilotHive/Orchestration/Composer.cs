@@ -418,7 +418,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
         {
             SessionId = "composer",
-            SessionType = "Composer",
+            SessionType = LlmSessionType.Composer,
             Model = _model,
             Status = "idle",
             CurrentTokens = _session.EstimatedContextTokens,
@@ -568,7 +568,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
         {
             SessionId = "composer",
-            SessionType = "Composer",
+            SessionType = LlmSessionType.Composer,
             Model = _model,
             Status = status,
             CurrentTokens = currentTokens ?? _session.EstimatedContextTokens,

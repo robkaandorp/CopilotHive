@@ -327,12 +327,12 @@ else
         ? $"{(int)ts.TotalHours}h {ts.Minutes}m {ts.Seconds}s"
         : $"{ts.Minutes}m {ts.Seconds}s";
 
-    private static string GetSessionTypeIcon(string type) => type switch
+    private static string GetSessionTypeIcon(LlmSessionType type) => type switch
     {
-        "BrainMaster" => "🎵",
-        "BrainGoal" => "🎵",
-        "Composer" => "💬",
-        "GoalReview" => "🔍",
+        LlmSessionType.Brain => "🎵",
+        LlmSessionType.BrainGoal => "🎵",
+        LlmSessionType.Composer => "💬",
+        LlmSessionType.GoalReview => "🔍",
         _ => "💬"
     };
 

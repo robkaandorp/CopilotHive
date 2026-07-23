@@ -118,7 +118,7 @@ public class GoalReviewService
             _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
             {
                 SessionId = reviewSessionId,
-                SessionType = "GoalReview",
+                SessionType = LlmSessionType.GoalReview,
                 GoalId = goal.Id,
                 Model = reviewerModel,
                 CurrentTokens = 0,
