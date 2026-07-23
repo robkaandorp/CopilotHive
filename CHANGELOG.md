@@ -1,5 +1,21 @@
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-23
+
+### Added
+
+- **Pre-Execution Goal Review** — An optional pre-execution review process where a capable model reviews goal descriptions before dispatch. The reviewer has full access to the goal, linked knowledge documents, and the source code. Produces a verdict (Approved/NeedsChanges) and a review document in the knowledge graph. The Composer can trigger reviews via a `review_goal` tool and automatically acts on `NeedsChanges` feedback by reading the review document and updating the goal. Dashboard shows review status badge, "Review Goal" button, and a warning on the Approve button when changes are needed. (`copilothive-goal-review-status-field`, `copilothive-goal-review-execution`, `copilothive-composer-review-tool`, `copilothive-goal-review-dashboard`)
+
+- **LLM Session Dashboard** — A unified view of all active LLM sessions in the orchestrator container (Brain master, Brain per-goal, Composer, Goal Review) on the Orchestrator dashboard page. Shows session type, associated goal, model, context usage bar, status, and last activity time. Uses a thread-safe in-memory registry with `LlmSessionType` enum for type safety. (`copilothive-llm-session-registry`, `copilothive-llm-session-integration`, `copilothive-llm-sessions-dashboard`)
+
+- **Linked Documents Above Description** — Linked knowledge documents (progress documents, review documents) now appear above the goal description on the Goal Detail page. (`copilothive-move-linked-docs-above-description`)
+
+### Fixed
+
+- **STATE_DIR Environment Variable Races** — Fixed CI test failures caused by process-wide `STATE_DIR` races between test collections. `ProgressDocumentTests` added to `HiveIntegration` collection, all test factories save/restore previous `STATE_DIR` instead of clearing to `null`. (`copilothive-fix-state-dir-env-var-cleanup`)
+
+- **LLM Session Icons** — Fixed swapped Brain and Composer icons in the LLM Sessions table. Replaced stringly-typed `SessionType` with `LlmSessionType` enum for compile-time safety. (`copilothive-fix-llm-session-icons`, `copilothive-fix-brain-session-icon`)
+
 ## [0.14.0] - 2026-07-22
 
 ### Added
