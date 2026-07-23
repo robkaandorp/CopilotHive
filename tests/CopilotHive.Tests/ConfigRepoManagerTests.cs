@@ -423,6 +423,47 @@ public class ConfigRepoManagerTests : IDisposable
     }
 
     [Fact]
+    public void ParseConfig_ReleaseWithWhitespaceOnly_NormalizesToNull()
+    {
+        const string yaml = """
+            version: "1.0"
+            repositories:
+              - name: my-app
+                url: https://github.com/org/my-app.git
+                default_branch: main
+                release:
+                  merge_to: ""
+                  tag_branch: "  "
+            """;
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        var repo = Assert.Single(config.Repositories);
+        Assert.Null(repo.Release);
+    }
+
+    [Fact]
+    public void ParseConfig_ReleaseWithOnlyMergeTo_PreservesRelease()
+    {
+        const string yaml = """
+            version: "1.0"
+            repositories:
+              - name: my-app
+                url: https://github.com/org/my-app.git
+                default_branch: main
+                release:
+                  merge_to: main
+            """;
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        var repo = Assert.Single(config.Repositories);
+        Assert.NotNull(repo.Release);
+        Assert.Equal("main", repo.Release!.MergeTo);
+        Assert.Null(repo.Release!.TagBranch);
+    }
+
+    [Fact]
     public async Task WriteConfigAsync_SerializesReleaseWithSnakeCaseKeys()
     {
         var config = new HiveConfigFile
@@ -446,8 +487,8 @@ public class ConfigRepoManagerTests : IDisposable
         var yaml = await File.ReadAllTextAsync(
             Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
         Assert.Contains("release:", yaml);
-        Assert.Contains("merge_to:", yaml);
-        Assert.Contains("tag_branch:", yaml);
+        Assert.Contains("merge_to: main", yaml);
+        Assert.Contains("tag_branch: main", yaml);
     }
 
     [Fact]

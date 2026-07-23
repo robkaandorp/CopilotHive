@@ -500,6 +500,87 @@ public sealed class HiveConfigFileTests
         Assert.Equal("new-composer", receiver.Composer.Models[0]);
     }
 
+    // ── ReloadFrom Release deep-copy tests ───────────────────────────────────
+
+    [Fact]
+    public void ReloadFrom_WithRelease_DeepCopiesReleaseInstance()
+    {
+        var source = new HiveConfigFile
+        {
+            Version = "1.0",
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "my-repo",
+                    Url = "https://github.com/org/repo",
+                    DefaultBranch = "main",
+                    Release = new ReleaseRepoConfig { MergeTo = "main", TagBranch = "develop" }
+                }
+            ]
+        };
+        var receiver = new HiveConfigFile { Version = "1.0", Repositories = [], Workers = new Dictionary<string, WorkerConfig>() };
+
+        receiver.ReloadFrom(source);
+
+        Assert.NotNull(receiver.Repositories[0].Release);
+        Assert.NotSame(source.Repositories[0].Release, receiver.Repositories[0].Release);
+        Assert.Equal("main", receiver.Repositories[0].Release!.MergeTo);
+        Assert.Equal("develop", receiver.Repositories[0].Release!.TagBranch);
+    }
+
+    [Fact]
+    public void ReloadFrom_WithNullRelease_ReceiverReleaseIsNull()
+    {
+        var source = new HiveConfigFile
+        {
+            Version = "1.0",
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "my-repo",
+                    Url = "https://github.com/org/repo",
+                    DefaultBranch = "main",
+                    Release = null
+                }
+            ]
+        };
+        var receiver = new HiveConfigFile { Version = "1.0", Repositories = [], Workers = new Dictionary<string, WorkerConfig>() };
+
+        receiver.ReloadFrom(source);
+
+        Assert.Null(receiver.Repositories[0].Release);
+    }
+
+    [Fact]
+    public void ReloadFrom_DeepCopy_MutatingSourceReleaseDoesNotAffectReceiver()
+    {
+        var source = new HiveConfigFile
+        {
+            Version = "1.0",
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "my-repo",
+                    Url = "https://github.com/org/repo",
+                    DefaultBranch = "main",
+                    Release = new ReleaseRepoConfig { MergeTo = "main", TagBranch = "main" }
+                }
+            ]
+        };
+        var receiver = new HiveConfigFile { Version = "1.0", Repositories = [], Workers = new Dictionary<string, WorkerConfig>() };
+
+        receiver.ReloadFrom(source);
+
+        // Mutate the source after ReloadFrom
+        source.Repositories[0].Release!.MergeTo = "mutated";
+
+        // Receiver should be unaffected
+        Assert.Equal("main", receiver.Repositories[0].Release!.MergeTo);
+    }
+
     // ── GetComposerAvailableModels tests ──────────────────────────────────────
 
     /// <summary>

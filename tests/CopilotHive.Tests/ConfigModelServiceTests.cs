@@ -669,6 +669,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.Equal("my-repo", added.Name);
         Assert.Equal("https://github.com/org/repo.git", added.Url);
         Assert.Equal("main", added.DefaultBranch);
+        Assert.Null(added.Release);
     }
 
     [Fact]
@@ -699,6 +700,22 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         var added = Assert.Single(config.Repositories);
         Assert.Null(added.Release);
+    }
+
+    [Fact]
+    public async Task AddRepositoryAsync_WithOnlyMergeTo_PreservesRelease()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig(), Repositories = [] };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main",
+            new ReleaseRepoConfig { MergeTo = "main", TagBranch = null }, TestContext.Current.CancellationToken);
+
+        var added = Assert.Single(config.Repositories);
+        Assert.NotNull(added.Release);
+        Assert.Equal("main", added.Release!.MergeTo);
+        Assert.Null(added.Release!.TagBranch);
     }
 
     [Fact]
