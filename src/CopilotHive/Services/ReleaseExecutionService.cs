@@ -161,7 +161,7 @@ public sealed class ReleaseExecutionService
             if (!validation.IsValid)
             {
                 current.ExecutionState = ReleaseExecutionState.Failed;
-                await _goalStore.UpdateReleaseAsync(current, ct);
+                await _goalStore.UpdateReleaseAsync(current, CancellationToken.None);
                 return new ReleaseExecutionResult(
                     false, [], string.Join("; ", validation.Errors), ReleaseExecutionFailure.Validation);
             }
@@ -207,7 +207,7 @@ public sealed class ReleaseExecutionService
                     await RollbackTagsAsync(createdTags);
 
                     current.ExecutionState = ReleaseExecutionState.Failed;
-                    await _goalStore.UpdateReleaseAsync(current, ct);
+                    await _goalStore.UpdateReleaseAsync(current, CancellationToken.None);
 
                     return new ReleaseExecutionResult(
                         false,

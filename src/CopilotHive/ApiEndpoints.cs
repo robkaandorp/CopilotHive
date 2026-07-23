@@ -320,10 +320,14 @@ public static class ApiEndpoints
                 return Results.BadRequest(new { error = "Status is required." });
 
             if (int.TryParse(request.Status, out _))
-                return Results.BadRequest(new { error = $"Invalid status '{request.Status}'." });
+                return Results.BadRequest(new { error = $"Invalid status '{request.Status}'. Valid values: Planning, Released." });
 
-            if (!Enum.TryParse<ReleaseStatus>(request.Status, ignoreCase: true, out var newStatus))
-                return Results.BadRequest(new { error = $"Invalid status '{request.Status}'." });
+            if (!Enum.TryParse<ReleaseStatus>(request.Status, ignoreCase: true, out var newStatus) || !Enum.IsDefined(newStatus))
+                return Results.BadRequest(new { error = $"Invalid status '{request.Status}'. Valid values: Planning, Released." });
+
+            // Reject comma-combined inputs (e.g. "Released,Planning") that Enum.TryParse may accept via bitwise OR.
+            if (request.Status.Contains(','))
+                return Results.BadRequest(new { error = $"Invalid status '{request.Status}'. Valid values: Planning, Released." });
 
             if (existing.Status == ReleaseStatus.Released && newStatus == ReleaseStatus.Released)
                 return Results.Json(new { error = "Release is already in 'Released' status." }, statusCode: 409);

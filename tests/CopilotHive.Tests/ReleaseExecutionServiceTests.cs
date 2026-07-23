@@ -124,19 +124,30 @@ public sealed class ReleaseExecutionServiceTests : IDisposable
         await _store.CreateGoalAsync(
             new Goal { Id = "goal-a", Description = "Test", ReleaseId = "v1.0.0", Status = GoalStatus.Completed }, ct);
 
+        // Capture the release's persisted ExecutionState AT THE MOMENT the merge runs by re-reading
+        // from the store inside the merge callback. This proves the Executing write happens BEFORE
+        // git operations — if that write were removed or moved after git, the observed state would
+        // be None/Completed instead of Executing and the assertion below would fail.
+        ReleaseExecutionState? stateDuringMerge = null;
         var fake = new ConfigurableFakeRepoManager
         {
-            MergeCallback = (_, _, _) => throw new InvalidOperationException("boom"),
+            MergeCallback = (_, _, _) =>
+            {
+                stateDuringMerge = _store.GetReleaseAsync("v1.0.0", CancellationToken.None)
+                    .GetAwaiter().GetResult()!.ExecutionState;
+                return null;
+            },
         };
         var service = CreateService(CreateConfig(), fake);
 
         await service.ExecuteReleaseAsync(release, ct);
 
-        // After a failing execution the stored release should have transitioned through Executing
-        // to Failed. The fake records that MergeBranchAsync was invoked, proving execution started.
         Assert.True(fake.MergeCalled);
+        Assert.Equal(ReleaseExecutionState.Executing, stateDuringMerge);
+
+        // And the final state is Completed since the merge succeeded.
         var stored = await _store.GetReleaseAsync("v1.0.0", ct);
-        Assert.Equal(ReleaseExecutionState.Failed, stored!.ExecutionState);
+        Assert.Equal(ReleaseExecutionState.Completed, stored!.ExecutionState);
     }
 
     [Fact]
@@ -198,6 +209,41 @@ public sealed class ReleaseExecutionServiceTests : IDisposable
 
     [Fact]
     public async Task ExecuteReleaseAsync_CreateTagFalse_TreatedAsSuccessNotRolledBack()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // Two repos: repo1's CreateTagAsync returns false (tag already existed → NOT a new tag,
+        // must NOT be tracked for rollback), and repo2's merge fails to trigger a rollback pass.
+        // If false-returning tags were incorrectly pushed to the rollback stack, DeleteTagAsync
+        // would be called for repo1 and the assertion below would fail.
+        var release = new Release { Id = "v1.0.0", Tag = "v1.0.0", RepositoryNames = ["repo1", "repo2"] };
+        await _store.CreateReleaseAsync(release, ct);
+        await _store.CreateGoalAsync(
+            new Goal { Id = "goal-a", Description = "Test", ReleaseId = "v1.0.0", Status = GoalStatus.Completed }, ct);
+
+        var fake = new ConfigurableFakeRepoManager
+        {
+            // repo1 → CreateTagAsync returns false; repo2 never reaches CreateTag (merge fails first).
+            CreateTagCallback = repo => repo != "repo1",
+            MergeCallback = (repo, _, _) =>
+            {
+                if (repo == "repo2")
+                    throw new InvalidOperationException("merge failed on repo2");
+                return null;
+            },
+        };
+        var service = CreateService(CreateConfig(), fake);
+
+        var result = await service.ExecuteReleaseAsync(release, ct);
+
+        // The overall release fails because of repo2, and a rollback pass runs.
+        Assert.False(result.Success);
+        Assert.Equal(ReleaseExecutionFailure.Execution, result.Failure);
+        // repo1's false-returning tag must NOT have been rolled back — zero DeleteTagAsync calls.
+        Assert.Empty(fake.DeleteTagCalls);
+    }
+
+    [Fact]
+    public async Task ExecuteReleaseAsync_CreateTagFalse_SingleRepo_Succeeds()
     {
         var ct = TestContext.Current.CancellationToken;
         var release = new Release { Id = "v1.0.0", Tag = "v1.0.0", RepositoryNames = ["repo1"] };
@@ -354,6 +400,7 @@ internal sealed class ConfigurableFakeRepoManager : IBrainRepoManager
 {
     public bool CreateTagResult { get; set; } = true;
     public Func<string, string, string, string?>? MergeCallback { get; set; }
+    public Func<string, bool>? CreateTagCallback { get; set; }
 
     public bool MergeCalled { get; private set; }
     public List<(string Repo, string Source, string Target)> MergeCalls { get; } = [];
@@ -387,7 +434,7 @@ internal sealed class ConfigurableFakeRepoManager : IBrainRepoManager
     public Task<bool> CreateTagAsync(string repoName, string tag, string branch, string message, CancellationToken ct = default)
     {
         CreateTagCalls.Add((repoName, tag, branch));
-        return Task.FromResult(CreateTagResult);
+        return Task.FromResult(CreateTagCallback?.Invoke(repoName) ?? CreateTagResult);
     }
 
     public Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default)
@@ -483,14 +530,155 @@ public sealed class ReleaseStatusApiEndpointTests
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-        // Verify the release is now Released in the store (persisted).
+        // The response body reports the release as Released.
+        var body = await response.Content.ReadAsStringAsync(ct);
+        using var doc = JsonDocument.Parse(body);
+        Assert.Equal(ReleaseStatus.Released, ReadStatus(doc.RootElement));
+
+        // The release is now Released with ExecutionState = Completed in the store (persisted).
         using (var scope = factory.Services.CreateScope())
         {
             var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
             var stored = await store.GetReleaseAsync(releaseId, ct);
             Assert.NotNull(stored);
             Assert.Equal(ReleaseStatus.Released, stored!.Status);
+            Assert.Equal(ReleaseExecutionState.Completed, stored.ExecutionState);
         }
+
+        // The fake repo manager received the expected merge and tag calls.
+        // repo1 is configured with DefaultBranch=main, MergeTo=main, TagBranch=main.
+        Assert.Contains(fake.MergeCalls, c => c is { Repo: "repo1", Source: "main", Target: "main" });
+        Assert.Contains(fake.CreateTagCalls, c => c is { Repo: "repo1", Tag: "v1.0.0", Branch: "main" });
+    }
+
+    /// <summary>
+    /// Reads the <c>status</c> property from a release JSON element, tolerating both numeric
+    /// (default enum serialization) and string representations.
+    /// </summary>
+    private static ReleaseStatus ReadStatus(JsonElement release)
+    {
+        var status = release.GetProperty("status");
+        return status.ValueKind == JsonValueKind.Number
+            ? (ReleaseStatus)status.GetInt32()
+            : Enum.Parse<ReleaseStatus>(status.GetString()!, ignoreCase: true);
+    }
+
+    // ── API test: validation failure returns 400 ─────────────────────────
+
+    [Fact]
+    public async Task PatchReleaseStatus_ValidationFailure_Returns400()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+        using var factory = CreateFactory(fake);
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        // Seed a release with repos configured but an INCOMPLETE goal → validation fails.
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId, Tag = "v1.0.0", RepositoryNames = ["repo1"],
+            }, ct);
+            await store.CreateGoalAsync(
+                new Goal { Id = UniqueId(), Description = "Test", ReleaseId = releaseId, Status = GoalStatus.InProgress }, ct);
+        }
+
+        var response = await client.PatchAsync(
+            $"/api/releases/{releaseId}/status", StatusJson("Released"), ct);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        // No git operations should have run for a validation failure.
+        Assert.Empty(fake.MergeCalls);
+    }
+
+    // ── API test: execution failure returns 500 ──────────────────────────
+
+    [Fact]
+    public async Task PatchReleaseStatus_ExecutionFailure_Returns500()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager
+        {
+            MergeCallback = (_, _, _) => throw new InvalidOperationException("merge blew up"),
+        };
+        using var factory = CreateFactory(fake);
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        // Seed a release with repos configured and a completed goal → validation passes,
+        // but the merge throws → execution failure → 500.
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId, Tag = "v1.0.0", RepositoryNames = ["repo1"],
+            }, ct);
+            await store.CreateGoalAsync(
+                new Goal { Id = UniqueId(), Description = "Test", ReleaseId = releaseId, Status = GoalStatus.Completed }, ct);
+        }
+
+        var response = await client.PatchAsync(
+            $"/api/releases/{releaseId}/status", StatusJson("Released"), ct);
+
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+    }
+
+    // ── API test: comma-combined status rejected with 400 ────────────────
+
+    [Fact]
+    public async Task PatchReleaseStatus_CommaCombined_Returns400()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+        using var factory = CreateFactory(fake);
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release { Id = releaseId, Tag = "v1.0.0" }, ct);
+        }
+
+        var response = await client.PatchAsync(
+            $"/api/releases/{releaseId}/status", StatusJson("Released,Planning"), ct);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        // A comma-combined value must never trigger release git operations.
+        Assert.Empty(fake.MergeCalls);
+    }
+
+    // ── API test: service not registered returns 503 ─────────────────────
+
+    [Fact]
+    public async Task PatchReleaseStatus_ServiceNull_Returns503()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // A plain factory (booted without --config-repo) does NOT register ReleaseExecutionService,
+        // so services.GetService<ReleaseExecutionService>() returns null → the endpoint returns 503.
+        using var factory = new HiveTestFactory();
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId, Tag = "v1.0.0", RepositoryNames = ["repo1"],
+            }, ct);
+            await store.CreateGoalAsync(
+                new Goal { Id = UniqueId(), Description = "Test", ReleaseId = releaseId, Status = GoalStatus.Completed }, ct);
+        }
+
+        var response = await client.PatchAsync(
+            $"/api/releases/{releaseId}/status", StatusJson("Released"), ct);
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
     }
 
     // ── API test 16: numeric status rejected with 400 ────────────────────
