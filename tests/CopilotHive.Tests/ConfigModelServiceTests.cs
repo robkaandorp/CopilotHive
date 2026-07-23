@@ -663,12 +663,42 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", TestContext.Current.CancellationToken);
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", release: null, TestContext.Current.CancellationToken);
 
         var added = Assert.Single(config.Repositories);
         Assert.Equal("my-repo", added.Name);
         Assert.Equal("https://github.com/org/repo.git", added.Url);
         Assert.Equal("main", added.DefaultBranch);
+    }
+
+    [Fact]
+    public async Task AddRepositoryAsync_WithRelease_StoresRelease()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig(), Repositories = [] };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main",
+            new ReleaseRepoConfig { MergeTo = "main", TagBranch = "main" }, TestContext.Current.CancellationToken);
+
+        var added = Assert.Single(config.Repositories);
+        Assert.NotNull(added.Release);
+        Assert.Equal("main", added.Release!.MergeTo);
+        Assert.Equal("main", added.Release!.TagBranch);
+    }
+
+    [Fact]
+    public async Task AddRepositoryAsync_WithEmptyRelease_NormalizesToNull()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig(), Repositories = [] };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main",
+            new ReleaseRepoConfig(), TestContext.Current.CancellationToken);
+
+        var added = Assert.Single(config.Repositories);
+        Assert.Null(added.Release);
     }
 
     [Fact]
@@ -678,10 +708,10 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", TestContext.Current.CancellationToken);
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", release: null, TestContext.Current.CancellationToken);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            svc.AddRepositoryAsync("MY-REPO", "https://github.com/org/other.git", "develop", TestContext.Current.CancellationToken));
+            svc.AddRepositoryAsync("MY-REPO", "https://github.com/org/other.git", "develop", release: null, TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -691,7 +721,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "", TestContext.Current.CancellationToken);
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "", release: null, TestContext.Current.CancellationToken);
 
         var added = Assert.Single(config.Repositories);
         Assert.Equal("main", added.DefaultBranch);
@@ -704,7 +734,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", TestContext.Current.CancellationToken);
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", release: null, TestContext.Current.CancellationToken);
 
         Assert.Single(repo.Commits);
         Assert.Equal("hive-config.yaml", repo.Commits[0].File);
@@ -724,11 +754,93 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateRepositoryAsync("my-repo", "https://github.com/org/new.git", "develop", TestContext.Current.CancellationToken);
+        await svc.UpdateRepositoryAsync("my-repo", "https://github.com/org/new.git", "develop", release: null, TestContext.Current.CancellationToken);
 
         var updated = Assert.Single(config.Repositories);
         Assert.Equal("https://github.com/org/new.git", updated.Url);
         Assert.Equal("develop", updated.DefaultBranch);
+    }
+
+    [Fact]
+    public async Task UpdateRepositoryAsync_WithRelease_UpdatesRelease()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "my-repo",
+                    Url = "https://github.com/org/old.git",
+                    DefaultBranch = "main",
+                    Release = new ReleaseRepoConfig { MergeTo = "develop", TagBranch = "develop" }
+                }
+            ]
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateRepositoryAsync("my-repo", "https://github.com/org/new.git", "main",
+            new ReleaseRepoConfig { MergeTo = "main", TagBranch = "main" }, TestContext.Current.CancellationToken);
+
+        var updated = Assert.Single(config.Repositories);
+        Assert.Equal("main", updated.Release!.MergeTo);
+        Assert.Equal("main", updated.Release!.TagBranch);
+    }
+
+    [Fact]
+    public async Task UpdateRepositoryAsync_NullRelease_PreservesExistingRelease()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "my-repo",
+                    Url = "https://github.com/org/old.git",
+                    DefaultBranch = "main",
+                    Release = new ReleaseRepoConfig { MergeTo = "develop", TagBranch = "develop" }
+                }
+            ]
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateRepositoryAsync("my-repo", "https://github.com/org/new.git", "main", release: null, TestContext.Current.CancellationToken);
+
+        var updated = Assert.Single(config.Repositories);
+        Assert.Equal("develop", updated.Release!.MergeTo);
+        Assert.Equal("develop", updated.Release!.TagBranch);
+    }
+
+    [Fact]
+    public async Task UpdateRepositoryAsync_EmptyRelease_NormalizesToNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "my-repo",
+                    Url = "https://github.com/org/old.git",
+                    DefaultBranch = "main",
+                    Release = new ReleaseRepoConfig { MergeTo = "develop", TagBranch = "develop" }
+                }
+            ]
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateRepositoryAsync("my-repo", "https://github.com/org/new.git", "main",
+            new ReleaseRepoConfig(), TestContext.Current.CancellationToken);
+
+        var updated = Assert.Single(config.Repositories);
+        Assert.Null(updated.Release);
     }
 
     [Fact]
@@ -739,7 +851,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            svc.UpdateRepositoryAsync("missing", "https://github.com/org/new.git", "main", TestContext.Current.CancellationToken));
+            svc.UpdateRepositoryAsync("missing", "https://github.com/org/new.git", "main", release: null, TestContext.Current.CancellationToken));
     }
 
     // ── RemoveRepositoryAsync tests ──────────────────────────────────────────
@@ -995,7 +1107,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", TestContext.Current.CancellationToken);
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", release: null, TestContext.Current.CancellationToken);
 
         var yaml = await File.ReadAllTextAsync(Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
         Assert.Contains("my-repo", yaml);
@@ -1066,7 +1178,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repoManager = new FakeBrainRepoManager();
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, null, repoManager);
 
-        await svc.AddRepositoryAsync("test-repo", "https://github.com/org/repo.git", "main", TestContext.Current.CancellationToken);
+        await svc.AddRepositoryAsync("test-repo", "https://github.com/org/repo.git", "main", release: null, TestContext.Current.CancellationToken);
 
         var call = Assert.Single(repoManager.CloneCalls);
         Assert.Equal("test-repo", call.Name);
@@ -1086,7 +1198,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repoManager = new FakeBrainRepoManager();
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, null, repoManager);
 
-        await svc.UpdateRepositoryAsync("existing-repo", "https://new.com/repo.git", "develop", TestContext.Current.CancellationToken);
+        await svc.UpdateRepositoryAsync("existing-repo", "https://new.com/repo.git", "develop", release: null, TestContext.Current.CancellationToken);
 
         var call = Assert.Single(repoManager.CloneCalls);
         Assert.Equal("existing-repo", call.Name);
@@ -1104,7 +1216,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
-            svc.AddRepositoryAsync("../../etc", "https://github.com/org/repo.git", "main", TestContext.Current.CancellationToken));
+            svc.AddRepositoryAsync("../../etc", "https://github.com/org/repo.git", "main", release: null, TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -1115,7 +1227,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
-            svc.AddRepositoryAsync("test-repo", "", "main", TestContext.Current.CancellationToken));
+            svc.AddRepositoryAsync("test-repo", "", "main", release: null, TestContext.Current.CancellationToken));
     }
 }
 

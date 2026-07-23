@@ -190,7 +190,8 @@ public sealed class HiveConfigFile
             {
                 Name = r.Name,
                 Url = r.Url,
-                DefaultBranch = r.DefaultBranch
+                DefaultBranch = r.DefaultBranch,
+                Release = r.Release is null ? null : new ReleaseRepoConfig { MergeTo = r.Release.MergeTo, TagBranch = r.Release.TagBranch }
             }));
 
         Workers = new Dictionary<string, WorkerConfig>(

@@ -135,7 +135,17 @@ public class ConfigRepoManager
     /// </summary>
     internal static HiveConfigFile ParseConfig(string yaml)
     {
-        return YamlDeserializer.Deserialize<HiveConfigFile>(yaml) ?? new HiveConfigFile();
+        var config = YamlDeserializer.Deserialize<HiveConfigFile>(yaml) ?? new HiveConfigFile();
+        foreach (var repo in config.Repositories)
+        {
+            if (repo.Release is not null &&
+                string.IsNullOrWhiteSpace(repo.Release.MergeTo) &&
+                string.IsNullOrWhiteSpace(repo.Release.TagBranch))
+            {
+                repo.Release = null;
+            }
+        }
+        return config;
     }
 
     /// <summary>

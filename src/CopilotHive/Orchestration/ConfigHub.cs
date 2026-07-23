@@ -116,7 +116,7 @@ public static class ConfigHub
                 return Results.Problem("Config service is not configured.");
             try
             {
-                await svc.AddRepositoryAsync(req.Name, req.Url, req.DefaultBranch);
+                await svc.AddRepositoryAsync(req.Name, req.Url, req.DefaultBranch, req.Release);
                 return Results.Ok(new { saved = true });
             }
             catch (InvalidOperationException ex)
@@ -136,7 +136,7 @@ public static class ConfigHub
                 return Results.Problem("Config service is not configured.");
             try
             {
-                await svc.UpdateRepositoryAsync(name, req.Url, req.DefaultBranch);
+                await svc.UpdateRepositoryAsync(name, req.Url, req.DefaultBranch, req.Release);
                 return Results.Ok(new { saved = true });
             }
             catch (InvalidOperationException ex)

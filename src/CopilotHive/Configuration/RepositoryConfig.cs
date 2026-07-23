@@ -11,4 +11,7 @@ public sealed class RepositoryConfig
     public required string Url { get; set; }
     /// <summary>Default branch to use (e.g. "main").</summary>
     public string DefaultBranch { get; set; } = "main";
+
+    /// <summary>Optional release automation configuration for this repository.</summary>
+    public ReleaseRepoConfig? Release { get; set; }
 }
