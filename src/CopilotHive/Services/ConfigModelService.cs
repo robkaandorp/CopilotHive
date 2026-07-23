@@ -59,7 +59,8 @@ public sealed record OrchestratorSettingsUpdate(
 /// <param name="Name">Short name used to identify the repository.</param>
 /// <param name="Url">Remote clone URL of the repository.</param>
 /// <param name="DefaultBranch">Default branch to use (e.g. "main").</param>
-public sealed record RepositoryRequest(string Name, string Url, string DefaultBranch);
+/// <param name="Release">Optional release automation configuration.</param>
+public sealed record RepositoryRequest(string Name, string Url, string DefaultBranch, ReleaseRepoConfig? Release = null);
 
 /// <summary>
 /// Describes Composer setting changes to apply. Each field is applied only when non-null.
@@ -281,6 +282,19 @@ public sealed class ConfigModelService
     }
 
     /// <summary>
+    /// Normalizes a release configuration value. If both fields are null or whitespace,
+    /// the result is <c>null</c> so empty release sections do not persist in YAML.
+    /// </summary>
+    private static ReleaseRepoConfig? NormalizeRelease(ReleaseRepoConfig? release)
+    {
+        if (release is null)
+            return null;
+        if (string.IsNullOrWhiteSpace(release.MergeTo) && string.IsNullOrWhiteSpace(release.TagBranch))
+            return null;
+        return release;
+    }
+
+    /// <summary>
     /// Validates a repository name to prevent path traversal. The name is used as a
     /// filesystem path segment when cloning, so it must not contain path separators or "..".
     /// </summary>
@@ -303,8 +317,9 @@ public sealed class ConfigModelService
     /// <param name="name">Short repository name.</param>
     /// <param name="url">Remote clone URL.</param>
     /// <param name="defaultBranch">Default branch (falls back to "main" when empty).</param>
+    /// <param name="release">Optional release automation configuration.</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task AddRepositoryAsync(string name, string url, string defaultBranch, CancellationToken ct = default)
+    public async Task AddRepositoryAsync(string name, string url, string defaultBranch, ReleaseRepoConfig? release = null, CancellationToken ct = default)
     {
         ValidateRepositoryName(name);
         if (string.IsNullOrWhiteSpace(url))
@@ -318,7 +333,8 @@ public sealed class ConfigModelService
         {
             Name = name,
             Url = url,
-            DefaultBranch = branch
+            DefaultBranch = branch,
+            Release = NormalizeRelease(release)
         });
 
         var message = $"chore: add repository '{name}'";
@@ -332,14 +348,16 @@ public sealed class ConfigModelService
     }
 
     /// <summary>
-    /// Updates an existing repository's URL and default branch. Throws
-    /// <see cref="InvalidOperationException"/> if the repository is not found.
+    /// Updates an existing repository's URL, default branch, and optional release
+    /// configuration. Throws <see cref="InvalidOperationException"/> if the repository
+    /// is not found.
     /// </summary>
     /// <param name="name">Repository name to update.</param>
     /// <param name="url">New remote clone URL.</param>
     /// <param name="defaultBranch">New default branch.</param>
+    /// <param name="release">New release configuration, or <c>null</c> to leave unchanged.</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task UpdateRepositoryAsync(string name, string url, string defaultBranch, CancellationToken ct = default)
+    public async Task UpdateRepositoryAsync(string name, string url, string defaultBranch, ReleaseRepoConfig? release = null, CancellationToken ct = default)
     {
         ValidateRepositoryName(name);
         if (string.IsNullOrWhiteSpace(url))
@@ -352,6 +370,8 @@ public sealed class ConfigModelService
 
         repo.Url = url;
         repo.DefaultBranch = string.IsNullOrEmpty(defaultBranch) ? "main" : defaultBranch;
+        if (release is not null)
+            repo.Release = NormalizeRelease(release);
 
         var message = $"chore: update repository '{name}'";
         _logger.LogInformation("Updating repository: {Name} ({Url})", name, url);

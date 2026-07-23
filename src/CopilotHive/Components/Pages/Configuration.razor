@@ -509,6 +509,14 @@ else
                             <label style="color:var(--text-muted);font-size:0.9rem">Default Branch</label>
                             <input @bind="_newRepoDefaultBranch" placeholder="main"
                                    style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                            <label style="color:var(--text-muted);font-size:0.9rem">Release Merge Branch</label>
+                            <input @bind="_newRepoMergeTo" placeholder="main (optional)"
+                                   style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                            <label style="color:var(--text-muted);font-size:0.9rem">Release Tag Branch</label>
+                            <input @bind="_newRepoTagBranch" placeholder="main (optional)"
+                                   style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
                         </div>
                         <div style="margin-top:1rem;display:flex;gap:0.75rem">
                             <button class="approve-btn" disabled="@_repoSaving" @onclick="AddRepositoryAsync">@(_repoSaving ? "Saving…" : "💾 Save")</button>
@@ -533,6 +541,8 @@ else
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Name</th>
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">URL</th>
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Default Branch</th>
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Release Merge</th>
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Release Tag</th>
                                 <th style="text-align:right;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Actions</th>
                             </tr>
                         </thead>
@@ -551,6 +561,14 @@ else
                                             <input @bind="_editRepoDefaultBranch"
                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem" />
                                         </td>
+                                        <td style="padding:0.5rem">
+                                            <input @bind="_editRepoMergeTo"
+                                                   style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem" />
+                                        </td>
+                                        <td style="padding:0.5rem">
+                                            <input @bind="_editRepoTagBranch"
+                                                   style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem" />
+                                        </td>
                                         <td style="padding:0.5rem;text-align:right">
                                             <button class="approve-btn" disabled="@_repoSaving" @onclick="SaveEditRepoAsync">💾 Save</button>
                                             <button class="approve-btn" @onclick="CancelEditRepo">Cancel</button>
@@ -561,6 +579,8 @@ else
                                         <td style="padding:0.5rem;font-size:0.9rem">@r.Name</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@r.Url</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@r.DefaultBranch</td>
+                                        <td style="padding:0.5rem;font-size:0.9rem">@(r.Release?.MergeTo ?? "—")</td>
+                                        <td style="padding:0.5rem;font-size:0.9rem">@(r.Release?.TagBranch ?? "—")</td>
                                         <td style="padding:0.5rem;text-align:right">
                                             <button class="approve-btn" @onclick="() => StartEditRepo(r)">✏️ Edit</button>
                                             <button class="approve-btn" style="color:var(--red)" @onclick="() => RemoveRepositoryAsync(r.Name)">🗑️ Remove</button>
@@ -768,7 +788,12 @@ else
     private sealed record RepositoryDto(
         [property: JsonPropertyName("name")] string Name,
         [property: JsonPropertyName("url")] string Url,
-        [property: JsonPropertyName("defaultBranch")] string DefaultBranch);
+        [property: JsonPropertyName("defaultBranch")] string DefaultBranch,
+        [property: JsonPropertyName("release")] ReleaseDto? Release);
+
+    private sealed record ReleaseDto(
+        [property: JsonPropertyName("mergeTo")] string? MergeTo,
+        [property: JsonPropertyName("tagBranch")] string? TagBranch);
 
     private sealed record OrchestratorConfigResponse(
         [property: JsonPropertyName("model")] string? Model,
@@ -847,9 +872,13 @@ else
     private string _newRepoName = "";
     private string _newRepoUrl = "";
     private string _newRepoDefaultBranch = "main";
+    private string _newRepoMergeTo = "";
+    private string _newRepoTagBranch = "";
     private string? _editingRepoName;
     private string _editRepoUrl = "";
     private string _editRepoDefaultBranch = "main";
+    private string _editRepoMergeTo = "";
+    private string _editRepoTagBranch = "";
 
     // Orchestrator tab
     private OrchestratorConfigResponse? _orchestratorData;
@@ -1304,13 +1333,18 @@ else
         try
         {
             var branch = string.IsNullOrWhiteSpace(_newRepoDefaultBranch) ? "main" : _newRepoDefaultBranch;
+            object? release = null;
+            if (!string.IsNullOrWhiteSpace(_newRepoMergeTo) || !string.IsNullOrWhiteSpace(_newRepoTagBranch))
+            {
+                release = new { mergeTo = string.IsNullOrWhiteSpace(_newRepoMergeTo) ? null : _newRepoMergeTo, tagBranch = string.IsNullOrWhiteSpace(_newRepoTagBranch) ? null : _newRepoTagBranch };
+            }
             var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new { name = _newRepoName, url = _newRepoUrl, defaultBranch = branch }),
+                System.Text.Json.JsonSerializer.Serialize(new { name = _newRepoName, url = _newRepoUrl, defaultBranch = branch, release }),
                 System.Text.Encoding.UTF8, "application/json");
             var response = await HttpClient.PostAsync("/api/config/repositories", body);
             if (response.IsSuccessStatusCode)
             {
-                _newRepoName = ""; _newRepoUrl = ""; _newRepoDefaultBranch = "main";
+                _newRepoName = ""; _newRepoUrl = ""; _newRepoDefaultBranch = "main"; _newRepoMergeTo = ""; _newRepoTagBranch = "";
                 _showAddRepoForm = false;
                 await LoadRepositoriesAsync();
                 _repoSuccess = "✅ Repository added and cloned";
@@ -1335,6 +1369,8 @@ else
         _editingRepoName = repo.Name;
         _editRepoUrl = repo.Url;
         _editRepoDefaultBranch = repo.DefaultBranch;
+        _editRepoMergeTo = repo.Release?.MergeTo ?? "";
+        _editRepoTagBranch = repo.Release?.TagBranch ?? "";
         _repoError = null; _repoSuccess = null;
     }
 
@@ -1352,8 +1388,16 @@ else
         try
         {
             var branch = string.IsNullOrWhiteSpace(_editRepoDefaultBranch) ? "main" : _editRepoDefaultBranch;
+            // Always send a non-null release object on the edit (PUT) path so clearing both
+            // fields replaces (and removes) any existing release config. UpdateRepositoryAsync
+            // normalizes an empty object to null, effectively disabling release automation.
+            object release = new
+            {
+                mergeTo = string.IsNullOrWhiteSpace(_editRepoMergeTo) ? null : _editRepoMergeTo,
+                tagBranch = string.IsNullOrWhiteSpace(_editRepoTagBranch) ? null : _editRepoTagBranch
+            };
             var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new { name = _editingRepoName, url = _editRepoUrl, defaultBranch = branch }),
+                System.Text.Json.JsonSerializer.Serialize(new { name = _editingRepoName, url = _editRepoUrl, defaultBranch = branch, release }),
                 System.Text.Encoding.UTF8, "application/json");
             var response = await HttpClient.PutAsync($"/api/config/repositories/{Uri.EscapeDataString(_editingRepoName)}", body);
             if (response.IsSuccessStatusCode)

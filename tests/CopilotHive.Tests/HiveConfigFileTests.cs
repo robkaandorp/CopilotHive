@@ -379,7 +379,16 @@ public sealed class HiveConfigFileTests
         var receiver = new HiveConfigFile
         {
             Version = "1.0",
-            Repositories = [new RepositoryConfig { Name = "old-repo", Url = "https://github.com/org/old", DefaultBranch = "main" }],
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "old-repo",
+                    Url = "https://github.com/org/old",
+                    DefaultBranch = "main",
+                    Release = new ReleaseRepoConfig { MergeTo = "main", TagBranch = "main" }
+                }
+            ],
             Workers = new Dictionary<string, WorkerConfig>
             {
                 ["old-role"] = new WorkerConfig { Model = "old-model", PremiumModel = null, ContextWindow = 50000 }
@@ -407,7 +416,16 @@ public sealed class HiveConfigFileTests
         var source = new HiveConfigFile
         {
             Version = "2.0",
-            Repositories = [new RepositoryConfig { Name = "new-repo", Url = "https://github.com/org/new", DefaultBranch = "develop" }],
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "new-repo",
+                    Url = "https://github.com/org/new",
+                    DefaultBranch = "develop",
+                    Release = new ReleaseRepoConfig { MergeTo = "main", TagBranch = "main" }
+                }
+            ],
             Workers = new Dictionary<string, WorkerConfig>
             {
                 ["new-role"] = new WorkerConfig { Model = "new-model", PremiumModel = "new-premium", ContextWindow = 200000 }
@@ -444,6 +462,8 @@ public sealed class HiveConfigFileTests
         Assert.Equal("old-repo", oldRepositories[0].Name);
         Assert.Equal("https://github.com/org/old", oldRepositories[0].Url);
         Assert.Equal("main", oldRepositories[0].DefaultBranch);
+        Assert.Equal("main", oldRepositories[0].Release!.MergeTo);
+        Assert.Equal("main", oldRepositories[0].Release!.TagBranch);
 
         Assert.Single(oldWorkers);
         Assert.True(oldWorkers.ContainsKey("old-role"));
@@ -461,10 +481,15 @@ public sealed class HiveConfigFileTests
         Assert.NotSame(oldAvailableModels, receiver.Models!.AvailableModels);
         Assert.NotSame(oldComposerModels, receiver.Composer!.Models);
 
+        // Assert — release config is also deep-copied (not the same reference)
+        Assert.NotSame(source.Repositories[0].Release, receiver.Repositories[0].Release);
+
         // Assert — receiver's new data matches the source
         Assert.Equal("2.0", receiver.Version);
         Assert.Single(receiver.Repositories);
         Assert.Equal("new-repo", receiver.Repositories[0].Name);
+        Assert.Equal("main", receiver.Repositories[0].Release!.MergeTo);
+        Assert.Equal("main", receiver.Repositories[0].Release!.TagBranch);
         Assert.Single(receiver.Workers);
         Assert.Equal("new-model", receiver.Workers["new-role"].Model);
         Assert.Equal("new-orchestrator", receiver.Orchestrator.Model);
@@ -473,6 +498,87 @@ public sealed class HiveConfigFileTests
         Assert.Equal("new-model-entry", receiver.Models.AvailableModels[0].Name);
         Assert.Equal(2, receiver.Composer!.Models!.Count);
         Assert.Equal("new-composer", receiver.Composer.Models[0]);
+    }
+
+    // ── ReloadFrom Release deep-copy tests ───────────────────────────────────
+
+    [Fact]
+    public void ReloadFrom_WithRelease_DeepCopiesReleaseInstance()
+    {
+        var source = new HiveConfigFile
+        {
+            Version = "1.0",
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "my-repo",
+                    Url = "https://github.com/org/repo",
+                    DefaultBranch = "main",
+                    Release = new ReleaseRepoConfig { MergeTo = "main", TagBranch = "develop" }
+                }
+            ]
+        };
+        var receiver = new HiveConfigFile { Version = "1.0", Repositories = [], Workers = new Dictionary<string, WorkerConfig>() };
+
+        receiver.ReloadFrom(source);
+
+        Assert.NotNull(receiver.Repositories[0].Release);
+        Assert.NotSame(source.Repositories[0].Release, receiver.Repositories[0].Release);
+        Assert.Equal("main", receiver.Repositories[0].Release!.MergeTo);
+        Assert.Equal("develop", receiver.Repositories[0].Release!.TagBranch);
+    }
+
+    [Fact]
+    public void ReloadFrom_WithNullRelease_ReceiverReleaseIsNull()
+    {
+        var source = new HiveConfigFile
+        {
+            Version = "1.0",
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "my-repo",
+                    Url = "https://github.com/org/repo",
+                    DefaultBranch = "main",
+                    Release = null
+                }
+            ]
+        };
+        var receiver = new HiveConfigFile { Version = "1.0", Repositories = [], Workers = new Dictionary<string, WorkerConfig>() };
+
+        receiver.ReloadFrom(source);
+
+        Assert.Null(receiver.Repositories[0].Release);
+    }
+
+    [Fact]
+    public void ReloadFrom_DeepCopy_MutatingSourceReleaseDoesNotAffectReceiver()
+    {
+        var source = new HiveConfigFile
+        {
+            Version = "1.0",
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "my-repo",
+                    Url = "https://github.com/org/repo",
+                    DefaultBranch = "main",
+                    Release = new ReleaseRepoConfig { MergeTo = "main", TagBranch = "main" }
+                }
+            ]
+        };
+        var receiver = new HiveConfigFile { Version = "1.0", Repositories = [], Workers = new Dictionary<string, WorkerConfig>() };
+
+        receiver.ReloadFrom(source);
+
+        // Mutate the source after ReloadFrom
+        source.Repositories[0].Release!.MergeTo = "mutated";
+
+        // Receiver should be unaffected
+        Assert.Equal("main", receiver.Repositories[0].Release!.MergeTo);
     }
 
     // ── GetComposerAvailableModels tests ──────────────────────────────────────

@@ -9,6 +9,9 @@ repositories:
   - name: my-api
     url: https://github.com/org/my-api.git
     default_branch: main
+    # release:          # Optional: enable release automation for this repo
+    #   merge_to: main  # Branch to merge the feature branch into
+    #   tag_branch: main # Branch to tag releases from
 
 # Worker settings
 workers:

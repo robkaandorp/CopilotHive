@@ -363,6 +363,159 @@ public class ConfigRepoManagerTests : IDisposable
         Assert.Equal("updated-model", second.Orchestrator.Model);
     }
 
+    // ── Release config parsing ───────────────────────────────────────────────
+
+    [Fact]
+    public void ParseConfig_ReleaseSection_ParsesFields()
+    {
+        const string yaml = """
+            version: "1.0"
+            repositories:
+              - name: my-app
+                url: https://github.com/org/my-app.git
+                default_branch: main
+                release:
+                  merge_to: main
+                  tag_branch: main
+            """;
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        var repo = Assert.Single(config.Repositories);
+        Assert.NotNull(repo.Release);
+        Assert.Equal("main", repo.Release!.MergeTo);
+        Assert.Equal("main", repo.Release!.TagBranch);
+    }
+
+    [Fact]
+    public void ParseConfig_NoReleaseSection_ReleaseIsNull()
+    {
+        const string yaml = """
+            version: "1.0"
+            repositories:
+              - name: my-app
+                url: https://github.com/org/my-app.git
+                default_branch: main
+            """;
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        var repo = Assert.Single(config.Repositories);
+        Assert.Null(repo.Release);
+    }
+
+    [Fact]
+    public void ParseConfig_EmptyReleaseObject_NormalizesToNull()
+    {
+        const string yaml = """
+            version: "1.0"
+            repositories:
+              - name: my-app
+                url: https://github.com/org/my-app.git
+                default_branch: main
+                release: {}
+            """;
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        var repo = Assert.Single(config.Repositories);
+        Assert.Null(repo.Release);
+    }
+
+    [Fact]
+    public void ParseConfig_ReleaseWithWhitespaceOnly_NormalizesToNull()
+    {
+        const string yaml = """
+            version: "1.0"
+            repositories:
+              - name: my-app
+                url: https://github.com/org/my-app.git
+                default_branch: main
+                release:
+                  merge_to: ""
+                  tag_branch: "  "
+            """;
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        var repo = Assert.Single(config.Repositories);
+        Assert.Null(repo.Release);
+    }
+
+    [Fact]
+    public void ParseConfig_ReleaseWithOnlyMergeTo_PreservesRelease()
+    {
+        const string yaml = """
+            version: "1.0"
+            repositories:
+              - name: my-app
+                url: https://github.com/org/my-app.git
+                default_branch: main
+                release:
+                  merge_to: main
+            """;
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        var repo = Assert.Single(config.Repositories);
+        Assert.NotNull(repo.Release);
+        Assert.Equal("main", repo.Release!.MergeTo);
+        Assert.Null(repo.Release!.TagBranch);
+    }
+
+    [Fact]
+    public async Task WriteConfigAsync_SerializesReleaseWithSnakeCaseKeys()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "test-model" },
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "my-app",
+                    Url = "https://github.com/org/my-app.git",
+                    DefaultBranch = "main",
+                    Release = new ReleaseRepoConfig { MergeTo = "main", TagBranch = "main" }
+                }
+            ]
+        };
+        var manager = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+
+        await manager.WriteConfigAsync(config, TestContext.Current.CancellationToken);
+
+        var yaml = await File.ReadAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
+        Assert.Contains("release:", yaml);
+        Assert.Contains("merge_to: main", yaml);
+        Assert.Contains("tag_branch: main", yaml);
+    }
+
+    [Fact]
+    public async Task WriteConfigAsync_NullRelease_OmitsReleaseSection()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "test-model" },
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "my-app",
+                    Url = "https://github.com/org/my-app.git",
+                    DefaultBranch = "main"
+                }
+            ]
+        };
+        var manager = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+
+        await manager.WriteConfigAsync(config, TestContext.Current.CancellationToken);
+
+        var yaml = await File.ReadAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
+        Assert.DoesNotContain("release:", yaml);
+    }
+
     // ── Helper ───────────────────────────────────────────────────────────────
 
     private async Task<ConfigRepoManager> CreateManagerWithConfigAsync(string yaml)

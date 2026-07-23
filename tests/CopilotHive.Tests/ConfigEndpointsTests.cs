@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using CopilotHive.Services;
 
 namespace CopilotHive.Tests;
 
@@ -129,6 +130,74 @@ public class ConfigEndpointsTests
 
         Assert.NotEqual(HttpStatusCode.NotFound, response.StatusCode);
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+    }
+
+    // ── RepositoryRequest.Release JSON binding (System.Text.Json) ────────────────
+    // These tests deserialize JSON directly into RepositoryRequest to prove the
+    // Release field binds via camelCase property names. They FAIL if the Release
+    // parameter is removed from RepositoryRequest or if the JSON property names
+    // (release / mergeTo / tagBranch) no longer map — coverage the route-availability
+    // tests above cannot provide (those hit the null-service guard before binding).
+    // Uses JsonSerializerDefaults.Web to mirror the ASP.NET minimal-API binding pipeline
+    // (case-insensitive, camelCase) that actually deserializes RepositoryRequest at runtime.
+
+    private static readonly System.Text.Json.JsonSerializerOptions WebJsonOptions =
+        new(System.Text.Json.JsonSerializerDefaults.Web);
+
+    [Fact]
+    public void RepositoryRequest_DeserializesReleaseWithBothFields()
+    {
+        const string json =
+            "{\"name\":\"test\",\"url\":\"https://github.com/org/repo.git\",\"defaultBranch\":\"main\"," +
+            "\"release\":{\"mergeTo\":\"main\",\"tagBranch\":\"develop\"}}";
+
+        var req = System.Text.Json.JsonSerializer.Deserialize<RepositoryRequest>(json, WebJsonOptions);
+
+        Assert.NotNull(req);
+        Assert.Equal("test", req!.Name);
+        Assert.Equal("main", req.DefaultBranch);
+        Assert.NotNull(req.Release);
+        Assert.Equal("main", req.Release!.MergeTo);
+        Assert.Equal("develop", req.Release!.TagBranch);
+    }
+
+    [Fact]
+    public void RepositoryRequest_MissingReleaseField_DefaultsToNull()
+    {
+        const string json =
+            "{\"name\":\"test\",\"url\":\"https://github.com/org/repo.git\",\"defaultBranch\":\"main\"}";
+
+        var req = System.Text.Json.JsonSerializer.Deserialize<RepositoryRequest>(json, WebJsonOptions);
+
+        Assert.NotNull(req);
+        Assert.Null(req!.Release);
+    }
+
+    [Fact]
+    public void RepositoryRequest_ExplicitNullRelease_IsNull()
+    {
+        const string json =
+            "{\"name\":\"test\",\"url\":\"https://github.com/org/repo.git\",\"defaultBranch\":\"main\",\"release\":null}";
+
+        var req = System.Text.Json.JsonSerializer.Deserialize<RepositoryRequest>(json, WebJsonOptions);
+
+        Assert.NotNull(req);
+        Assert.Null(req!.Release);
+    }
+
+    [Fact]
+    public void RepositoryRequest_EmptyReleaseObject_HasNullFields()
+    {
+        const string json =
+            "{\"name\":\"test\",\"url\":\"https://github.com/org/repo.git\",\"defaultBranch\":\"main\"," +
+            "\"release\":{\"mergeTo\":null,\"tagBranch\":null}}";
+
+        var req = System.Text.Json.JsonSerializer.Deserialize<RepositoryRequest>(json, WebJsonOptions);
+
+        Assert.NotNull(req);
+        Assert.NotNull(req!.Release);
+        Assert.Null(req.Release!.MergeTo);
+        Assert.Null(req.Release!.TagBranch);
     }
 
     // ── GET /api/config/orchestrator ─────────────────────────────────────────────
