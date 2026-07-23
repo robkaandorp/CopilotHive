@@ -1331,4 +1331,10 @@ file sealed class FakeBrainRepoManager : IBrainRepoManager
     public string GetClonePath(string repoName) => $"/fake/work/{repoName}";
     public Task<string?> GetHeadShaAsync(string repoName, CancellationToken ct = default) =>
         Task.FromResult<string?>(null);
+    public Task<string?> MergeBranchAsync(string repoName, string sourceBranch, string targetBranch, CancellationToken ct = default) =>
+        Task.FromResult<string?>(null);
+    public Task<bool> CreateTagAsync(string repoName, string tag, string branch, string message, CancellationToken ct = default) =>
+        Task.FromResult(false);
+    public Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default) =>
+        Task.FromResult(false);
 }
