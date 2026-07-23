@@ -654,6 +654,64 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
     // fresh-token MERGE_HEAD abort in the finally block. Fully deterministic coverage would require
     // an injectable process factory to pause the merge; that refactor is out of scope here.
 
+    [Fact]
+    public async Task MergeBranchAsync_CanceledDuringMerge_KillsProcessAndCleansUp()
+    {
+        // Deterministically cancel WHILE the merge process is running by installing a
+        // prepare-commit-msg hook that sleeps. A non-conflicting merge succeeds tree resolution
+        // and enters the commit phase, which invokes the hook and keeps the git process alive long
+        // enough for the token to trip mid-merge. This exercises RunGitCaptureAsync's process-tree
+        // kill and the fresh-token MERGE_HEAD cleanup in MergeBranchAsync.
+        var (remoteDir, clonePath, manager) = SetupRepo("cancel-mid-repo");
+        // Diverge both branches (non-conflicting, different files) so the merge creates a real
+        // merge commit rather than fast-forwarding — a merge commit invokes prepare-commit-msg.
+        CreateBranchWithCommit(remoteDir, "main", "feature", "feature.txt", "content");
+
+        // Add a distinct commit directly on main via a throwaway staging clone.
+        var mainStaging = Path.Combine(_tempDir, "cancel-mid-main-staging");
+        Git(_tempDir, "clone", remoteDir, "cancel-mid-main-staging");
+        ConfigureIdentity(mainStaging);
+        File.WriteAllText(Path.Combine(mainStaging, "main-extra.txt"), "main content\n");
+        Git(mainStaging, "add", "main-extra.txt");
+        Git(mainStaging, "commit", "-m", "Add main-extra.txt");
+        Git(mainStaging, "push", "origin", "main");
+
+        var hooksDir = Path.Combine(clonePath, ".git", "hooks");
+        Directory.CreateDirectory(hooksDir);
+
+        if (OperatingSystem.IsWindows())
+        {
+            // Windows: a batch hook that waits ~10 seconds via ping.
+            var hookPath = Path.Combine(hooksDir, "prepare-commit-msg.bat");
+            File.WriteAllText(hookPath, "@echo off\r\nping -n 10 127.0.0.1 > nul\r\n");
+        }
+        else
+        {
+            var hookPath = Path.Combine(hooksDir, "prepare-commit-msg");
+            File.WriteAllText(hookPath, "#!/bin/sh\nsleep 10\n");
+            var chmodPsi = new ProcessStartInfo("chmod")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            chmodPsi.ArgumentList.Add("+x");
+            chmodPsi.ArgumentList.Add(hookPath);
+            using var chmod = Process.Start(chmodPsi)!;
+            chmod.WaitForExit();
+        }
+
+        // Cancel after 1 second — the merge process is still sleeping inside the hook.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            manager.MergeBranchAsync("cancel-mid-repo", "feature", "main", cts.Token));
+
+        // The merge process was killed and the finally-block cleanup aborted the MERGE state.
+        Assert.False(File.Exists(Path.Combine(clonePath, ".git", "MERGE_HEAD")),
+            "MERGE_HEAD should not exist after cancellation cleanup");
+    }
+
     // ---------- Helpers ----------
 
     /// <summary>

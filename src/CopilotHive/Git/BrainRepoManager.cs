@@ -630,16 +630,71 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
             var preMergeSha = (await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct)).Trim();
 
-            // Track whether the merge command was actually launched. This must NOT rely on the
-            // merge exit code: if the caller's token is canceled mid-merge, RunGitCaptureAsync
-            // throws before returning an exit code, so a boolean flag is the only reliable signal
-            // that a merge may have left the worktree in a MERGE state needing cleanup.
+            // The merge command is run with a directly-managed Process (NOT RunGitCaptureAsync) so
+            // that on cancellation we can Kill(entireProcessTree) and block until the process is
+            // confirmed dead BEFORE the finally-block cleanup runs `git merge --abort`. This avoids
+            // racing the cleanup against a still-live merge process. `mergeStarted` signals that a
+            // MERGE state may exist and must be aborted; it stays false on a clean success.
+            Process? mergeProcess = null;
             var mergeStarted = false;
             try
             {
                 mergeStarted = true;
-                var (exitCode, stdout, stderr) = await RunGitCaptureAsync(
-                    clonePath, ["merge", $"origin/{sourceBranch}", "--no-edit"], ct);
+                var mergePsi = new ProcessStartInfo("git")
+                {
+                    WorkingDirectory = clonePath,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                };
+                mergePsi.ArgumentList.Add("merge");
+                mergePsi.ArgumentList.Add($"origin/{sourceBranch}");
+                mergePsi.ArgumentList.Add("--no-edit");
+
+                mergeProcess = Process.Start(mergePsi)
+                    ?? throw new InvalidOperationException("Failed to start git merge process");
+
+                var stdoutTask = mergeProcess.StandardOutput.ReadToEndAsync(ct);
+                var stderrTask = mergeProcess.StandardError.ReadToEndAsync(ct);
+
+                int exitCode;
+                string stdout;
+                string stderr;
+                try
+                {
+                    await Task.WhenAll(stdoutTask, stderrTask);
+                    await mergeProcess.WaitForExitAsync(ct);
+                    exitCode = mergeProcess.ExitCode;
+                    stdout = stdoutTask.Result;
+                    stderr = stderrTask.Result;
+                }
+                catch (OperationCanceledException)
+                {
+                    // Terminate the merge process and BLOCK until it is confirmed dead before
+                    // rethrowing, so the finally-block cleanup cannot race a live merge process.
+                    try
+                    {
+                        if (!mergeProcess.HasExited)
+                            mergeProcess.Kill(entireProcessTree: true);
+                    }
+                    catch (InvalidOperationException) when (mergeProcess.HasExited)
+                    {
+                        // Process already exited between the HasExited check and Kill — safe.
+                    }
+                    catch (Exception)
+                    {
+                        // Kill failed for another reason; the WaitForExit below still bounds our wait.
+                    }
+
+                    // Block the calling thread until the process exits. A generous 30s timeout —
+                    // we MUST confirm process death before allowing cleanup to proceed. If it still
+                    // has not exited (extreme edge case: kill failed AND 30s elapsed), there is
+                    // nothing more we can do; cleanup will run best-effort.
+                    if (!mergeProcess.HasExited)
+                        mergeProcess.WaitForExit(30_000);
+
+                    throw; // Rethrow so the finally block runs cleanup.
+                }
 
                 if (exitCode != 0)
                 {
@@ -677,9 +732,12 @@ public sealed class BrainRepoManager : IBrainRepoManager
             }
             finally
             {
+                mergeProcess?.Dispose();
+
                 // Run cleanup whenever a merge was started but did not complete cleanly (conflict,
                 // other error, or caller cancellation). Use a fresh bounded token — NOT the caller's
-                // token, which may already be canceled — so abort always runs to completion.
+                // token, which may already be canceled — so abort always runs to completion. This is
+                // now safe because the merge process is confirmed dead (or we waited 30s for it).
                 if (mergeStarted)
                 {
                     using var cleanupCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
