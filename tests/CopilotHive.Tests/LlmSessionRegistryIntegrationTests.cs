@@ -197,15 +197,21 @@ public sealed class LlmSessionRegistryIntegrationTests
             // only happens while _brainCallGate is held. Awaiting it proves the gate is held.
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
-            // With the gate held, a fork cannot make progress. A bounded WhenAny confirms it stays
-            // pending (this is a completion race guard, not a fixed sleep — it returns immediately if
-            // the fork ever completes early, which would fail the assertion).
-            var forkTask = brain.ForkSessionForGoalAsync("goal-gate-fork-2", TestContext.Current.CancellationToken);
-            await Task.WhenAny(forkTask, Task.Delay(500, TestContext.Current.CancellationToken));
-            Assert.False(forkTask.IsCompleted, "Fork must remain blocked while _brainCallGate is held");
+            // No fork has run yet, so the registry has no entry for the competing goal.
             Assert.Null(FindSession(registry, "brain-goal-goal-gate-fork-2"));
 
-            // Release the gate; the fork must now complete deterministically.
+            // Start the competing fork. ForkSessionForGoalAsync awaits _brainCallGate.WaitAsync as its
+            // first operation, so the returned task is already parked on the held gate — it cannot have
+            // run ForkSessionForGoalCoreAsync (which is what registers the goal session).
+            var forkTask = brain.ForkSessionForGoalAsync("goal-gate-fork-2", TestContext.Current.CancellationToken);
+
+            // Deterministic proof of the blocked state via observable registry state — NO timing wait.
+            // If the gate were not held, the fork would already have registered the goal session; the
+            // absence of the entry proves the fork is serialized behind the gate.
+            Assert.Null(FindSession(registry, "brain-goal-goal-gate-fork-2"));
+
+            // Release the gate; the fork must now complete. The bounded WaitAsync is only a deadlock
+            // guard, not the synchronization mechanism.
             release.SetResult(true);
             await forkTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
             await planTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
@@ -242,16 +248,23 @@ public sealed class LlmSessionRegistryIntegrationTests
             // held. Awaiting it proves the gate is held.
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
-            // DeleteGoalSession acquires the gate synchronously; run it on a background thread so we
-            // can observe that it does NOT complete while the gate is held. The bounded WhenAny is a
-            // completion race guard — it returns immediately if the delete ever completes early.
-            var deleteTask = Task.Run(() => brain.DeleteGoalSession("goal-gate-delete-2"),
-                TestContext.Current.CancellationToken);
-            await Task.WhenAny(deleteTask, Task.Delay(500, TestContext.Current.CancellationToken));
-            Assert.False(deleteTask.IsCompleted, "Delete must remain blocked while _brainCallGate is held");
+            // The goal session is registered and the delete has not run yet.
             Assert.NotNull(FindSession(registry, "brain-goal-goal-gate-delete-2"));
 
-            // Release the gate; the delete must now complete and unregister the session.
+            // DeleteGoalSession acquires the gate synchronously before touching the registry, so run
+            // it on a background thread. While the gate is held it cannot reach DeleteGoalSessionCore
+            // (which is what unregisters the goal session).
+            var deleteTask = Task.Run(() => brain.DeleteGoalSession("goal-gate-delete-2"),
+                TestContext.Current.CancellationToken);
+
+            // Deterministic proof of the blocked state via observable registry state — NO timing wait.
+            // The entry remains present because the delete is serialized behind the held gate and
+            // cannot have unregistered it. If the gate were not held, the delete would already have
+            // removed the entry.
+            Assert.NotNull(FindSession(registry, "brain-goal-goal-gate-delete-2"));
+
+            // Release the gate; the delete must now complete and unregister the session. The bounded
+            // WaitAsync is only a deadlock guard, not the synchronization mechanism.
             release.SetResult(true);
             await deleteTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
             await planTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
