@@ -192,17 +192,23 @@ public sealed class LlmSessionRegistryIntegrationTests
             // Start a gated LLM operation that will hold _brainCallGate while blocked in the client.
             var pipeline = CreatePipeline("goal-gate-fork", "Gate fork goal");
             var planTask = brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
-            await entered.Task.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
 
-            // The gate is now held. A fork must not complete until the gate is released.
+            // Deterministic: the blocking client signals `entered` from inside the LLM call, which
+            // only happens while _brainCallGate is held. Awaiting it proves the gate is held.
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            // With the gate held, a fork cannot make progress. A bounded WhenAny confirms it stays
+            // pending (this is a completion race guard, not a fixed sleep — it returns immediately if
+            // the fork ever completes early, which would fail the assertion).
             var forkTask = brain.ForkSessionForGoalAsync("goal-gate-fork-2", TestContext.Current.CancellationToken);
-            var completedEarly = await Task.WhenAny(forkTask, Task.Delay(500, TestContext.Current.CancellationToken));
-            Assert.NotSame(forkTask, completedEarly);
+            await Task.WhenAny(forkTask, Task.Delay(500, TestContext.Current.CancellationToken));
+            Assert.False(forkTask.IsCompleted, "Fork must remain blocked while _brainCallGate is held");
+            Assert.Null(FindSession(registry, "brain-goal-goal-gate-fork-2"));
 
-            // Release the gate; the fork must now complete.
+            // Release the gate; the fork must now complete deterministically.
             release.SetResult(true);
-            await forkTask.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
-            await planTask.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+            await forkTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await planTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
             Assert.NotNull(FindSession(registry, "brain-goal-goal-gate-fork-2"));
         }
@@ -231,20 +237,24 @@ public sealed class LlmSessionRegistryIntegrationTests
             // Hold the gate via a blocked LLM call.
             var pipeline = CreatePipeline("goal-gate-delete", "Gate delete goal");
             var planTask = brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
-            await entered.Task.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+
+            // Deterministic: `entered` is signalled from inside the LLM call while _brainCallGate is
+            // held. Awaiting it proves the gate is held.
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
             // DeleteGoalSession acquires the gate synchronously; run it on a background thread so we
-            // can observe that it does NOT complete while the gate is held.
+            // can observe that it does NOT complete while the gate is held. The bounded WhenAny is a
+            // completion race guard — it returns immediately if the delete ever completes early.
             var deleteTask = Task.Run(() => brain.DeleteGoalSession("goal-gate-delete-2"),
                 TestContext.Current.CancellationToken);
-            var completedEarly = await Task.WhenAny(deleteTask, Task.Delay(500, TestContext.Current.CancellationToken));
-            Assert.NotSame(deleteTask, completedEarly);
+            await Task.WhenAny(deleteTask, Task.Delay(500, TestContext.Current.CancellationToken));
+            Assert.False(deleteTask.IsCompleted, "Delete must remain blocked while _brainCallGate is held");
             Assert.NotNull(FindSession(registry, "brain-goal-goal-gate-delete-2"));
 
             // Release the gate; the delete must now complete and unregister the session.
             release.SetResult(true);
-            await deleteTask.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
-            await planTask.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+            await deleteTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await planTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
             Assert.Null(FindSession(registry, "brain-goal-goal-gate-delete-2"));
         }
@@ -261,22 +271,42 @@ public sealed class LlmSessionRegistryIntegrationTests
         try
         {
             var registry = new LlmSessionRegistry();
-            var capturing = new StatusCapturingChatClient(registry, "brain-goal-goal-stable-1", reply: "planned");
+
+            // This chat client replaces the brain's private _session field DURING the LLM call
+            // (simulating overflow recovery). If the finally block read _session fresh, the idle
+            // restoration would report the REPLACEMENT session's token count. The production code
+            // captures a stable reference before the call, so the restored entry must report the
+            // ORIGINAL session's token count.
+            var replacing = new SessionReplacingChatClient("answered");
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: capturing, sessionRegistry: registry);
+                stateDir: tempDir, chatClient: replacing, sessionRegistry: registry);
+            replacing.Brain = brain;
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
             await brain.ForkSessionForGoalAsync("goal-stable-1", TestContext.Current.CancellationToken);
 
-            var pipeline = CreatePipeline("goal-stable-1", "Stable session goal");
-            await brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
+            // AskQuestionAsync issues exactly ONE ExecuteBrainAsync call (no tool-nudge retry loop),
+            // so _session is replaced exactly once during the call.
+            await brain.AskQuestionAsync("goal-stable-1", 1, "Coding", "coder", "Should I proceed?",
+                TestContext.Current.CancellationToken);
 
-            // The status was "planning" during the call; after the call the same goal session
-            // entry (identified by the stable session id) is restored to idle.
-            Assert.Equal("planning", capturing.CapturedStatusDuringCall);
+            Assert.NotNull(replacing.OriginalSession);
+
+            // The idle-status entry's tokens must match the STABLE (original) session reference — the
+            // same object captured before the call — evaluated after the call completed. The huge
+            // replacement session has a materially different token count and must NOT be used.
+            var stableTokens = replacing.OriginalSession!.EstimatedContextTokens;
+            Assert.True(replacing.ReplacementTokens > stableTokens,
+                $"Replacement tokens ({replacing.ReplacementTokens}) must exceed stable session tokens ({stableTokens})");
+
             var goalSession = FindSession(registry, "brain-goal-goal-stable-1");
             Assert.NotNull(goalSession);
             Assert.Equal("idle", goalSession!.Status);
             Assert.Equal("goal-stable-1", goalSession.GoalId);
+
+            // Reference-sensitive assertion: idle restoration must use the STABLE (original) session
+            // reference captured before the call — NOT the replacement _session installed mid-call.
+            Assert.Equal(stableTokens, goalSession.CurrentTokens);
+            Assert.NotEqual(replacing.ReplacementTokens, goalSession.CurrentTokens);
         }
         finally
         {
@@ -731,12 +761,19 @@ public sealed class LlmSessionRegistryIntegrationTests
             var streaming = new StatusCapturingStreamingChatClient(registry, "composer");
             InjectComposerChatClient(composer, streaming);
 
+            // Deterministic completion signal: OnStreamingUpdate fires in the streaming finally block
+            // (after _isStreaming is set to false and the idle status is refreshed). Complete the TCS
+            // once streaming has finished — no polling, no sleeps.
+            var finished = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            composer.OnStreamingUpdate += () =>
+            {
+                if (!GetComposerIsStreaming(composer))
+                    finished.TrySetResult(true);
+            };
+
             composer.SendMessage("hello");
 
-            // Wait for streaming to finish.
-            var deadline = DateTime.UtcNow.AddSeconds(10);
-            while (GetComposerIsStreaming(composer) && DateTime.UtcNow < deadline)
-                await Task.Delay(20, TestContext.Current.CancellationToken);
+            await finished.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
             Assert.False(GetComposerIsStreaming(composer), "Streaming should have finished");
 
@@ -1070,47 +1107,88 @@ public sealed class LlmSessionRegistryIntegrationTests
     // ── DispatcherMaintenance ─────────────────────────────────────────────────
 
     [Fact]
-    public async Task DispatcherMaintenance_DoesNotForkSession_WhenSessionAlreadyExists()
+    public async Task DispatcherMaintenance_RegistersExistingGoalSession_WhenSessionFileExists()
     {
-        // A store-backed pipeline manager with one active pipeline to restore.
-        using var dbContext = CopilotHiveDbContext.CreateInMemory();
-        var store = new PipelineStore(dbContext, NullLogger<PipelineStore>.Instance);
-        var pipelineManager = new GoalPipelineManager(store);
+        var tempDir = CreateTempDir();
+        try
+        {
+            // A real DistributedBrain is required: DispatcherMaintenance casts IDistributedBrain to
+            // the concrete DistributedBrain before calling RegisterExistingGoalSession, so a fake
+            // implementing only the interface can never exercise that branch.
+            var registry = new LlmSessionRegistry();
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient(), sessionRegistry: registry);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
-        var goal = new Goal { Id = "goal-restore-1", Description = "Restore goal", RepositoryNames = ["test-repo"] };
-        var pipeline = pipelineManager.CreatePipeline(goal);
-        pipeline.AdvanceTo(GoalPhase.Coding);
-        pipeline.SetActiveTask("task-1", "feature/goal-restore-1");
-        pipelineManager.PersistFull(pipeline);
+            const string goalId = "goal-restore-existing";
 
-        // A fresh manager (empty in-memory state) that restores from the same store.
-        var restoreManager = new GoalPipelineManager(store);
+            // Fork to create the on-disk goal session file, then enrich it with extra messages so
+            // it has a distinctly non-zero token count. A fresh fork from the (empty) master session
+            // would have zero tokens — so a non-zero CurrentTokens after restoration proves the
+            // EXISTING file was read via RegisterExistingGoalSession, not re-forked from master.
+            await brain.ForkSessionForGoalAsync(goalId, TestContext.Current.CancellationToken);
+            var goalSessionFile = Path.Combine(tempDir, $"brain-goal-{goalId}.json");
+            var goalSession = await AgentSession.LoadAsync(goalSessionFile, TestContext.Current.CancellationToken);
+            for (var i = 0; i < 6; i++)
+            {
+                goalSession.MessageHistory.Add(new ChatMessage(
+                    i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                    $"Persisted conversation message {i} with enough text to accrue tokens."));
+            }
+            await goalSession.SaveAsync(goalSessionFile, TestContext.Current.CancellationToken);
+            var expectedTokens = goalSession.EstimatedContextTokens;
+            Assert.True(expectedTokens > 0, "Enriched goal session must have non-zero tokens");
 
-        // Session already exists → the restore logic must take the "register existing" branch and
-        // must NOT fork a new session. RegisterExistingGoalSession is invoked only for a concrete
-        // DistributedBrain (guarded by a cast in production), so the observable interface effect for
-        // a fake is that ForkSessionForGoalAsync is never called.
-        var brain = new RegisterTrackingBrain(sessionExists: true);
-        var maintenance = new DispatcherMaintenance(
-            restoreManager,
-            new GoalManager(),
-            new TaskQueue(),
-            new GrpcWorkerGateway(new WorkerPool()),
-            brain: brain,
-            agentsManager: null,
-            configRepo: null,
-            dispatchedGoals: new ConcurrentDictionary<string, bool>(),
-            redispatchQueue: new ConcurrentQueue<string>(),
-            logger: NullLogger.Instance,
-            knowledgeGraph: null,
-            goalStore: null,
-            repoManager: null,
-            config: null);
+            // Simulate a restart: only the on-disk session file remains; the registry entry is gone.
+            registry.Unregister($"brain-goal-{goalId}");
+            Assert.Null(FindSession(registry, $"brain-goal-{goalId}"));
 
-        await maintenance.RestoreActivePipelinesAsync(TestContext.Current.CancellationToken);
+            // A store-backed pipeline manager with one active pipeline to restore for this goal.
+            using var dbContext = CopilotHiveDbContext.CreateInMemory();
+            var store = new PipelineStore(dbContext, NullLogger<PipelineStore>.Instance);
+            var seedManager = new GoalPipelineManager(store);
+            var goal = new Goal { Id = goalId, Description = "Restore existing goal", RepositoryNames = ["test-repo"] };
+            var pipeline = seedManager.CreatePipeline(goal);
+            pipeline.AdvanceTo(GoalPhase.Coding);
+            pipeline.SetActiveTask("task-1", $"feature/{goalId}");
+            seedManager.PersistFull(pipeline);
 
-        Assert.True(brain.GoalSessionExistsCalled, "GoalSessionExists should have been queried");
-        Assert.DoesNotContain("goal-restore-1", brain.ForkCalls);
+            var restoreManager = new GoalPipelineManager(store);
+            var maintenance = new DispatcherMaintenance(
+                restoreManager,
+                new GoalManager(),
+                new TaskQueue(),
+                new GrpcWorkerGateway(new WorkerPool()),
+                brain: brain,
+                agentsManager: null,
+                configRepo: null,
+                dispatchedGoals: new ConcurrentDictionary<string, bool>(),
+                redispatchQueue: new ConcurrentQueue<string>(),
+                logger: NullLogger.Instance,
+                knowledgeGraph: null,
+                goalStore: null,
+                repoManager: null,
+                config: null);
+
+            await maintenance.RestoreActivePipelinesAsync(TestContext.Current.CancellationToken);
+
+            // The session file existed, so the restore logic must take the else branch and call
+            // RegisterExistingGoalSession. This re-registers the goal session in the registry using
+            // the EXISTING file's token count. If that else branch were deleted, no entry would exist.
+            var restored = FindSession(registry, $"brain-goal-{goalId}");
+            Assert.NotNull(restored);
+            Assert.Equal("BrainGoal", restored!.SessionType);
+            Assert.Equal(goalId, restored.GoalId);
+            Assert.Equal("idle", restored.Status);
+            // Reference-sensitive: tokens come from the existing file (RegisterExistingGoalSession),
+            // NOT from a fresh zero-token master fork.
+            Assert.Equal(expectedTokens, restored.CurrentTokens);
+            Assert.True(restored.CurrentTokens > 0);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tempDir);
+        }
     }
 
     [Fact]
@@ -1397,6 +1475,68 @@ file sealed class BlockingBrainChatClient(Task<bool> release, TaskCompletionSour
         {
             FinishReason = ChatFinishReason.Stop,
         };
+    }
+
+    public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException("Streaming not used in this fake client.");
+
+    public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+    public void Dispose() { }
+}
+
+/// <summary>
+/// A chat client that, during its LLM call, replaces the brain's private <c>_session</c> field
+/// with a NEW, larger session (simulating overflow recovery). Used to prove that idle-status
+/// restoration in <c>ExecuteBrainAsync</c>'s finally block uses the STABLE session reference
+/// captured before the call — not the replacement session.
+/// </summary>
+file sealed class SessionReplacingChatClient(string reply) : IChatClient
+{
+    private static readonly System.Reflection.FieldInfo SessionField =
+        typeof(DistributedBrain).GetField("_session",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+        ?? throw new InvalidOperationException("_session field not found on DistributedBrain");
+
+    public DistributedBrain? Brain { get; set; }
+
+    /// <summary>The original session object captured at the moment of the call.</summary>
+    public AgentSession? OriginalSession { get; private set; }
+
+    /// <summary>Token count of the replacement session installed during the call.</summary>
+    public long ReplacementTokens { get; private set; }
+
+    public ChatClientMetadata Metadata => new("session-replacing", null, "replacing-model");
+
+    public Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        var brain = Brain ?? throw new InvalidOperationException("Brain must be assigned before use");
+
+        // Capture the original session object, then replace _session with a distinctly LARGER one.
+        // The replacement is made deliberately huge so its token count cannot collide with the
+        // original session's post-execution token count.
+        OriginalSession = (AgentSession)SessionField.GetValue(brain)!;
+
+        var replacement = AgentSession.Create("brain-goal-replacement");
+        for (var i = 0; i < 400; i++)
+        {
+            replacement.MessageHistory.Add(new ChatMessage(
+                i % 2 == 0 ? ChatRole.User : ChatRole.Assistant,
+                $"Replacement session message {i} carrying substantial additional token weight to guarantee a much larger context than the original session ever reaches."));
+        }
+        ReplacementTokens = replacement.EstimatedContextTokens;
+        SessionField.SetValue(brain, replacement);
+
+        return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, reply))
+        {
+            FinishReason = ChatFinishReason.Stop,
+        });
     }
 
     public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
