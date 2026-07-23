@@ -1,5 +1,6 @@
 using CopilotHive.Agents;
 using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
@@ -12,6 +13,7 @@ using Microsoft.Extensions.AI;
 
 using SharpCoder;
 
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Text.Json;
 
@@ -40,6 +42,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly KnowledgeGraph? _knowledgeGraph;
     private readonly Func<string, IChatClient> _chatClientFactory;
     private readonly HiveConfigFile? _hiveConfig;
+    private readonly LlmSessionRegistry? _sessionRegistry;
+    private readonly ConcurrentDictionary<string, byte> _registeredGoalSessions = new();
 
     /// <summary>
     /// Directory used for persistent Brain state (session files).
@@ -79,7 +83,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         string? compactionModel = null,
         KnowledgeGraph? knowledgeGraph = null,
         Func<string, IChatClient>? chatClientFactory = null,
-        HiveConfigFile? hiveConfig = null)
+        HiveConfigFile? hiveConfig = null,
+        LlmSessionRegistry? sessionRegistry = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -95,6 +100,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _knowledgeGraph = knowledgeGraph;
         _chatClientFactory = chatClientFactory ?? ChatClientFactory.Create;
         _hiveConfig = hiveConfig;
+        _sessionRegistry = sessionRegistry;
         _masterSession = AgentSession.Create("brain");
         _session = _masterSession;
 
@@ -143,6 +149,16 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         RecreateAgent();
 
+        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+        {
+            SessionId = "brain-master",
+            SessionType = "Brain",
+            Model = _modelOverride,
+            Status = "idle",
+            CurrentTokens = _masterSession.EstimatedContextTokens,
+            MaxTokens = _maxContextTokens,
+        });
+
         _logger.LogInformation("Brain connected via CodingAgent (model={Model}, contextWindow={ContextWindow})",
             _modelOverride, _maxContextTokens);
     }
@@ -166,6 +182,35 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _reasoningEffort = reasoning;
 
             RecreateAgent();
+
+            // Refresh the master session registry entry with the new model and context window.
+            _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+            {
+                SessionId = "brain-master",
+                SessionType = "Brain",
+                Model = _modelOverride,
+                Status = "idle",
+                CurrentTokens = _masterSession.EstimatedContextTokens,
+                MaxTokens = _maxContextTokens,
+            });
+
+            // Refresh every registered goal session entry with the new model and context window.
+            if (_sessionRegistry is not null)
+            {
+                foreach (var registeredGoalId in _registeredGoalSessions.Keys)
+                {
+                    _sessionRegistry.RegisterOrUpdate(new LlmSessionInfo
+                    {
+                        SessionId = $"brain-goal-{registeredGoalId}",
+                        SessionType = "BrainGoal",
+                        GoalId = registeredGoalId,
+                        Model = _modelOverride,
+                        Status = "idle",
+                        CurrentTokens = 0,
+                        MaxTokens = _maxContextTokens,
+                    });
+                }
+            }
 
             _logger.LogInformation(
                 "Brain model updated to '{Model}' with context window {ContextWindow}",
@@ -610,15 +655,55 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <summary>Returns the file path for the master Brain session.</summary>
     private string GetMasterSessionFilePath() => Path.Combine(_stateDir, "brain-master.json");
 
+    /// <summary>Refreshes the <c>brain-master</c> registry entry with the current master session tokens.</summary>
+    private void RefreshMasterSessionRegistry(long? currentTokens = null)
+    {
+        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+        {
+            SessionId = "brain-master",
+            SessionType = "Brain",
+            Model = _modelOverride,
+            Status = "idle",
+            CurrentTokens = currentTokens ?? _masterSession.EstimatedContextTokens,
+            MaxTokens = _maxContextTokens,
+        });
+    }
+
     /// <summary>Forks the master session for a goal and persists it to disk.</summary>
     /// <inheritdoc />
     public async Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default)
+    {
+        await _brainCallGate.WaitAsync(ct);
+        try
+        {
+            await ForkSessionForGoalCoreAsync(goalId, ct);
+        }
+        finally
+        {
+            _brainCallGate.Release();
+        }
+    }
+
+    /// <summary>Core fork logic. Callers must hold <see cref="_brainCallGate"/>.</summary>
+    private async Task ForkSessionForGoalCoreAsync(string goalId, CancellationToken ct)
     {
         var goalSession = _masterSession.Fork($"brain-goal-{goalId}");
         var goalSessionFile = GetGoalSessionFilePath(goalId);
         await goalSession.SaveAsync(goalSessionFile, ct);
         _logger.LogInformation("Forked master session for goal '{GoalId}' ({Messages} messages)",
             goalId, goalSession.MessageHistory.Count);
+
+        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+        {
+            SessionId = $"brain-goal-{goalId}",
+            SessionType = "BrainGoal",
+            GoalId = goalId,
+            Model = _modelOverride,
+            Status = "idle",
+            CurrentTokens = goalSession.EstimatedContextTokens,
+            MaxTokens = _maxContextTokens,
+        });
+        _registeredGoalSessions[goalId] = 0;
     }
 
     /// <summary>Loads the goal-specific session, saving the current session first if switching goals.</summary>
@@ -653,6 +738,20 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <inheritdoc />
     public void DeleteGoalSession(string goalId)
     {
+        _brainCallGate.Wait();
+        try
+        {
+            DeleteGoalSessionCore(goalId);
+        }
+        finally
+        {
+            _brainCallGate.Release();
+        }
+    }
+
+    /// <summary>Core delete logic. Callers must hold <see cref="_brainCallGate"/>.</summary>
+    private void DeleteGoalSessionCore(string goalId)
+    {
         var goalSessionFile = GetGoalSessionFilePath(goalId);
         if (File.Exists(goalSessionFile))
         {
@@ -666,6 +765,49 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _session = _masterSession;
             RecreateAgent();
             _logger.LogInformation("Cleared active goal session for '{GoalId}'", goalId);
+        }
+
+        _sessionRegistry?.Unregister($"brain-goal-{goalId}");
+        _registeredGoalSessions.TryRemove(goalId, out _);
+    }
+
+    /// <inheritdoc />
+    public void RegisterExistingGoalSession(string goalId)
+    {
+        _brainCallGate.Wait();
+        try
+        {
+            long currentTokens = 0;
+            var goalSessionFile = GetGoalSessionFilePath(goalId);
+            if (File.Exists(goalSessionFile))
+            {
+                try
+                {
+                    var session = AgentSession.LoadAsync(goalSessionFile).GetAwaiter().GetResult();
+                    currentTokens = session.EstimatedContextTokens;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "Failed to load existing goal session for '{GoalId}' — registering with zero tokens", goalId);
+                }
+            }
+
+            _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+            {
+                SessionId = $"brain-goal-{goalId}",
+                SessionType = "BrainGoal",
+                GoalId = goalId,
+                Model = _modelOverride,
+                Status = "idle",
+                CurrentTokens = currentTokens,
+                MaxTokens = _maxContextTokens,
+            });
+            _registeredGoalSessions[goalId] = 0;
+        }
+        finally
+        {
+            _brainCallGate.Release();
         }
     }
 
@@ -696,6 +838,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             "Acknowledged. I have noted the plan adjustment and will craft prompts for all phases in the final plan."));
 
         _logger.LogInformation("Injected plan adjustment note for goal {GoalId}: {Note}", pipeline.GoalId, note);
+
+        // Refresh the master session registry entry with current tokens.
+        RefreshMasterSessionRegistry();
+
         return Task.CompletedTask;
     }
 
@@ -738,7 +884,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             for (int attempt = 1; attempt <= maxToolAttempts; attempt++)
             {
                 var (response, toolCall) = await Shared.CopilotRetryPolicy.ExecuteAsync(
-                    () => ExecuteBrainAsync(currentPrompt, pipeline.GoalId, ct),
+                    () => ExecuteBrainAsync(currentPrompt, pipeline.GoalId, ct, status: "planning"),
                     onRetry: (retryAttempt, delay, ex) =>
                     {
                         _logger.LogWarning(
@@ -832,8 +978,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.Assistant, summary));
             await SaveSessionAsync(ct);
 
-            // Clean up goal session
-            DeleteGoalSession(pipeline.GoalId);
+            // Refresh the master session registry entry with current tokens.
+            RefreshMasterSessionRegistry();
+
+            // Clean up goal session. Use the core method (not the gated public DeleteGoalSession)
+            // because this method already holds _brainCallGate — calling the gated public method
+            // would deadlock.
+            DeleteGoalSessionCore(pipeline.GoalId);
             _activeGoalId = null;
 
             _logger.LogInformation("Merged summary for goal '{GoalId}' into master session: {Summary}",
@@ -865,7 +1016,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             await Shared.CopilotRetryPolicy.ExecuteAsync(
                 async () =>
                 {
-                    var (response, _) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct);
+                    var (response, _) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct, status: "generating-commit-message");
 
                     if (!string.IsNullOrWhiteSpace(response))
                         message = response.Trim();
@@ -921,7 +1072,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     _logger.LogDebug("Brain craft-prompt request for {GoalId} (phase={Phase}):\n{Prompt}",
                         pipeline.GoalId, phase, BrainPromptBuilder.Truncate(prompt, Constants.TruncationVerbose));
 
-                    var (response, toolCall) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct);
+                    var (response, toolCall) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct, status: "crafting-prompt");
 
                     _logger.LogDebug("Brain craft-prompt response for {GoalId}:\n{Response}",
                         pipeline.GoalId, BrainPromptBuilder.Truncate(response, Constants.TruncationVerbose));
@@ -997,7 +1148,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         try
         {
             var (response, toolCall) = await Shared.CopilotRetryPolicy.ExecuteAsync(
-                () => ExecuteBrainAsync(prompt, goalId, ct),
+                () => ExecuteBrainAsync(prompt, goalId, ct, status: "answering-question"),
                 onRetry: (attempt, delay, ex) =>
                 {
                     _logger.LogWarning(
@@ -1034,11 +1185,15 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     private async Task<(string Text, BrainToolCallResult? ToolCall)> ExecuteBrainAsync(
         string prompt, string? goalId, CancellationToken ct,
+        string status = "idle",
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         EnsureConnected();
 
         await _brainCallGate.WaitAsync(ct);
+        // Stable reference to the session so idle restoration in the finally block uses the
+        // same session even if overflow recovery replaces _session during the LLM call.
+        AgentSession? sessionForStatus = null;
         try
         {
             _lastToolCallResult = null;
@@ -1046,6 +1201,26 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             // Load the goal session for this call if a goalId is provided
             if (!string.IsNullOrEmpty(goalId))
                 await LoadGoalSessionAsync(goalId, ct);
+
+            // Capture a stable reference to the session so idle restoration in the finally
+            // block uses the same session even if overflow recovery replaces _session.
+            sessionForStatus = _session;
+
+            // Register/update the session status BEFORE the LLM call so the dashboard reflects
+            // the active work in progress.
+            if (goalId is not null && _sessionRegistry is not null)
+            {
+                _sessionRegistry.RegisterOrUpdate(new LlmSessionInfo
+                {
+                    SessionId = $"brain-goal-{goalId}",
+                    SessionType = "BrainGoal",
+                    GoalId = goalId,
+                    Model = _modelOverride,
+                    Status = status,
+                    CurrentTokens = sessionForStatus.EstimatedContextTokens,
+                    MaxTokens = _maxContextTokens,
+                });
+            }
 
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromMinutes(Constants.TaskTimeoutMinutes));
@@ -1086,6 +1261,22 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         }
         finally
         {
+            // Restore idle status using the SAME stable session reference even if overflow
+            // recovery changed _session during the call.
+            if (sessionForStatus is not null && _sessionRegistry is not null && goalId is not null)
+            {
+                _sessionRegistry.RegisterOrUpdate(new LlmSessionInfo
+                {
+                    SessionId = $"brain-goal-{goalId}",
+                    SessionType = "BrainGoal",
+                    GoalId = goalId,
+                    Model = _modelOverride,
+                    Status = "idle",
+                    CurrentTokens = sessionForStatus.EstimatedContextTokens,
+                    MaxTokens = _maxContextTokens,
+                });
+            }
+
             _brainCallGate.Release();
         }
     }
@@ -1131,6 +1322,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _session = _masterSession;
             _activeGoalId = null;
             RecreateAgent();
+
+            // Refresh the master session registry entry with zero tokens after reset.
+            RefreshMasterSessionRegistry(currentTokens: 0);
 
             var sessionFile = GetMasterSessionFilePath();
             if (File.Exists(sessionFile))

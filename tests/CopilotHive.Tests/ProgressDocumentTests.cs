@@ -1063,6 +1063,8 @@ file class ProgressFakeBrain : IDistributedBrain
 
     public void DeleteGoalSession(string goalId) { }
 
+    public void RegisterExistingGoalSession(string goalId) { }
+
     public bool GoalSessionExists(string goalId) => false;
 
     public virtual Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
@@ -1114,6 +1116,8 @@ file sealed class ProgressFakeBrainCapturingPrompts(bool planWithImprove = false
     public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
     public void DeleteGoalSession(string goalId) { }
+
+    public void RegisterExistingGoalSession(string goalId) { }
 
     public bool GoalSessionExists(string goalId) => false;
 

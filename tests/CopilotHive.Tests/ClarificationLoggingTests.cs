@@ -730,6 +730,7 @@ public sealed class ClarificationLoggingTests
         public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
         public void DeleteGoalSession(string goalId) { }
+        public void RegisterExistingGoalSession(string goalId) { }
 
     public bool GoalSessionExists(string goalId) => false;
 

@@ -1171,6 +1171,8 @@ file sealed class FakeDistributedBrain : IDistributedBrain
 
     public void DeleteGoalSession(string goalId) { }
 
+    public void RegisterExistingGoalSession(string goalId) { }
+
     public bool GoalSessionExists(string goalId) => false;
 
     public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>

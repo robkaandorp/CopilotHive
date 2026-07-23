@@ -138,7 +138,8 @@ public sealed class Program
                         sp.GetRequiredService<IGoalStore>(),
                         compactionModel: config?.Models?.CompactionModel,
                         knowledgeGraph: sp.GetService<KnowledgeGraph>(),
-                        hiveConfig: config);
+                        hiveConfig: config,
+                        sessionRegistry: sp.GetService<LlmSessionRegistry>());
                 });
             }
 
@@ -273,7 +274,8 @@ public sealed class Program
                     availableModels,
                     compactionModel: config?.Models?.CompactionModel,
                     knowledgeGraph: sp.GetService<KnowledgeGraph>(),
-                    goalReviewService: sp.GetService<GoalReviewService>());
+                    goalReviewService: sp.GetService<GoalReviewService>(),
+                    sessionRegistry: sp.GetService<LlmSessionRegistry>());
             });
             builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 
@@ -287,7 +289,8 @@ public sealed class Program
                 sp.GetService<IGoalStore>(),
                 sp.GetService<IBrainRepoManager>(),
                 stateDir,
-                sp.GetRequiredService<ILogger<GoalReviewService>>()));
+                sp.GetRequiredService<ILogger<GoalReviewService>>(),
+                sessionRegistry: sp.GetService<LlmSessionRegistry>()));
 
             // Dashboard: log capture (registered early so logger provider can reference it)
             var dashboardLogSink = new DashboardLogSink();

@@ -191,6 +191,14 @@ public interface IDistributedBrain
     void DeleteGoalSession(string goalId);
 
     /// <summary>
+    /// Registers a goal session entry in the LLM session registry for a goal whose
+    /// session file already exists on disk. Used during pipeline restoration to
+    /// re-register sessions for goals that were forked before an orchestrator restart.
+    /// </summary>
+    /// <param name="goalId">The goal identifier whose existing session to register.</param>
+    void RegisterExistingGoalSession(string goalId);
+
+    /// <summary>
     /// Returns true if a persisted goal session file exists for the given goal.
     /// Used by GoalDispatcher during pipeline restoration to determine whether
     /// a session needs to be forked from the master session.

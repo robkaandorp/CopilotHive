@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
@@ -46,6 +47,9 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly GoalReviewService? _goalReviewService;
     private readonly Func<string, IChatClient>? _chatClientFactory;
     private readonly IReadOnlyList<string> _startupAvailableModels;
+
+    // Clarification sessions are out of scope for registry tracking — they are short-lived and ephemeral.
+    private readonly LlmSessionRegistry? _sessionRegistry;
 
     /// <summary>Models the Composer can switch between at runtime.</summary>
     public IReadOnlyList<string> AvailableModels =>
@@ -251,7 +255,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         Func<string, IChatClient>? chatClientFactory = null,
         string? compactionModel = null,
         KnowledgeGraph? knowledgeGraph = null,
-        GoalReviewService? goalReviewService = null)
+        GoalReviewService? goalReviewService = null,
+        LlmSessionRegistry? sessionRegistry = null)
     {
         _model = model;
         _maxContextTokens = maxContextTokens;
@@ -269,6 +274,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _goalReviewService = goalReviewService;
         _chatClientFactory = chatClientFactory;
         _compactionModel = compactionModel;
+        _sessionRegistry = sessionRegistry;
         _session = AgentSession.Create("composer");
 
         _startupAvailableModels = (availableModels?.ToList() ?? [model]).AsReadOnly();
@@ -377,6 +383,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         // Rebuild agent — session is preserved
         RecreateAgent();
 
+        RefreshComposerRegistry();
+
         _logger.LogInformation("Composer switched to model '{Model}'", _model);
     }
 
@@ -406,6 +414,16 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         }
 
         RecreateAgent();
+
+        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+        {
+            SessionId = "composer",
+            SessionType = "Composer",
+            Model = _model,
+            Status = "idle",
+            CurrentTokens = _session.EstimatedContextTokens,
+            MaxTokens = _maxContextTokens,
+        });
 
         _logger.LogInformation("Composer connected (model={Model}, contextWindow={ContextWindow})",
             _model, _maxContextTokens);
@@ -438,6 +456,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
         try
         {
+            RefreshComposerRegistry(status: "streaming");
+
             await foreach (var update in _agent!.ExecuteStreamingAsync(_session, userMessage, ct))
             {
                 switch (update.Kind)
@@ -481,6 +501,10 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             _isStreaming = false;
             _streamCts?.Dispose();
             _streamCts = null;
+
+            // Use current _session (not a captured ref) because overflow recovery may replace _session during streaming. If a reset/model-change runs while streaming, finally may overwrite — acceptable for monitoring view.
+            RefreshComposerRegistry(status: "idle");
+
             OnStreamingUpdate?.Invoke();
         }
     }
@@ -529,11 +553,28 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         }
 
         _logger.LogInformation("Composer session reset");
+
+        RefreshComposerRegistry(status: "idle", currentTokens: 0);
+
         await Task.CompletedTask; // keep async signature for future use
     }
 
     /// <summary>Returns the file path for persisting the Composer session.</summary>
     private string GetSessionFilePath() => Path.Combine(_stateDir, "composer-session.json");
+
+    /// <summary>Refreshes the <c>composer</c> registry entry with the current session tokens and status.</summary>
+    private void RefreshComposerRegistry(string status = "idle", long? currentTokens = null)
+    {
+        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+        {
+            SessionId = "composer",
+            SessionType = "Composer",
+            Model = _model,
+            Status = status,
+            CurrentTokens = currentTokens ?? _session.EstimatedContextTokens,
+            MaxTokens = _maxContextTokens,
+        });
+    }
 
     /// <summary>Persists the current Composer session to disk.</summary>
     internal async Task SaveSessionAsync(CancellationToken ct = default)
@@ -567,6 +608,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             if (result)
             {
                 await SaveSessionAsync(ct);
+                RefreshComposerRegistry();
                 _logger.LogInformation(
                     "Composer session manually compacted ({Count} messages remaining)",
                     _session.MessageHistory.Count);
@@ -611,6 +653,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             if (result)
             {
                 await SaveSessionAsync(ct);
+                RefreshComposerRegistry();
                 _logger.LogInformation("Composer session partially compacted ({Percent}% oldest, {Count} messages remaining)",
                     percent, _session.MessageHistory.Count);
             }
