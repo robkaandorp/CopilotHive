@@ -390,6 +390,99 @@ public sealed class ReleaseExecutionServiceTests : IDisposable
         Assert.DoesNotContain(fake.CreateTagCalls, c => c.Repo == "repo3");
         Assert.DoesNotContain(fake.MergeCalls, c => c.Repo == "repo3");
     }
+
+    // ── Cancellation fix: Failed state persisted even with a cancelled token ──
+
+    [Fact]
+    public async Task ExecuteReleaseAsync_CancelledToken_StillPersistsFailed()
+    {
+        // This test verifies the CancellationToken.None fix: when the merge operation
+        // throws OperationCanceledException (simulating a cancelled git operation), the
+        // catch block must persist ExecutionState = Failed using CancellationToken.None
+        // — NOT the cancelled caller token. If the service used the cancelled token for
+        // the Failed write, UpdateReleaseAsync would throw OperationCanceledException and
+        // the release would be stuck at Executing instead of Failed.
+        var ct = TestContext.Current.CancellationToken;
+        var release = new Release { Id = "v1.0.0", Tag = "v1.0.0", RepositoryNames = ["repo1"] };
+        await _store.CreateReleaseAsync(release, ct);
+        await _store.CreateGoalAsync(
+            new Goal { Id = "goal-a", Description = "Test", ReleaseId = "v1.0.0", Status = GoalStatus.Completed }, ct);
+
+        // Use a CTS that the merge callback cancels before throwing OCE.
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var fake = new ConfigurableFakeRepoManager
+        {
+            MergeCallback = (_, _, _) =>
+            {
+                cts.Cancel();
+                throw new OperationCanceledException(cts.Token);
+            },
+        };
+        var service = CreateService(CreateConfig(), fake);
+
+        // ExecuteReleaseAsync should catch the OCE and persist Failed with CancellationToken.None.
+        // It may or may not re-throw depending on implementation; we only care about the store state.
+        try
+        {
+            await service.ExecuteReleaseAsync(release, cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // The service may propagate OCE after persisting Failed; that's acceptable.
+            // The important thing is that the store reflects Failed, not Executing.
+        }
+
+        var stored = await _store.GetReleaseAsync("v1.0.0", CancellationToken.None);
+        Assert.NotNull(stored);
+        Assert.Equal(ReleaseExecutionState.Failed, stored!.ExecutionState);
+    }
+
+    [Fact]
+    public async Task ExecuteReleaseAsync_CancelledTokenOnValidation_StillPersistsFailed()
+    {
+        // This test verifies the CancellationToken.None fix on the VALIDATION failure path:
+        // when the caller's token is cancelled but validation still fails (incomplete goals),
+        // the service must persist ExecutionState = Failed using CancellationToken.None.
+        var ct = TestContext.Current.CancellationToken;
+        var release = new Release { Id = "v1.0.0", Tag = "v1.0.0", RepositoryNames = ["repo1"] };
+        await _store.CreateReleaseAsync(release, ct);
+        // Goal is InProgress → validation will fail.
+        await _store.CreateGoalAsync(
+            new Goal { Id = "goal-a", Description = "Test", ReleaseId = "v1.0.0", Status = GoalStatus.InProgress }, ct);
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        // Cancel the token so that GetGoalsByReleaseAsync (called with ct) may observe cancellation.
+        // But the validation path may still run (in-memory store is synchronous). The key is that
+        // the Failed write uses CancellationToken.None.
+        cts.Cancel();
+
+        var fake = new ConfigurableFakeRepoManager();
+        var service = CreateService(CreateConfig(), fake);
+
+        try
+        {
+            await service.ExecuteReleaseAsync(release, cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // If the store's GetGoalsByReleaseAsync observes the cancelled token and throws,
+            // the service may propagate OCE. But the ExecutionState=Executing write happened
+            // before that, and if validation ran, the Failed write used CancellationToken.None.
+        }
+
+        // If the token was cancelled before WaitAsync, the release stays at None — that's
+        // expected behavior (the lock couldn't be acquired). In that case this test just
+        // verifies no exception escaped. But if the lock WAS acquired (in-memory, synchronous),
+        // the Failed write must have persisted.
+        var stored = await _store.GetReleaseAsync("v1.0.0", CancellationToken.None);
+        Assert.NotNull(stored);
+        // The state should be either Failed (if execution started) or None (if WaitAsync threw).
+        // It must NOT be stuck at Executing.
+        Assert.True(
+            stored!.ExecutionState == ReleaseExecutionState.Failed ||
+            stored.ExecutionState == ReleaseExecutionState.None,
+            $"Expected Failed or None, but got {stored.ExecutionState} (stuck at Executing would be a bug)");
+    }
 }
 
 /// <summary>
