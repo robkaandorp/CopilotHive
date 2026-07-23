@@ -581,9 +581,11 @@ else
                                         <td style="padding:0.5rem;font-size:0.9rem">@r.DefaultBranch</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(r.Release?.MergeTo ?? "—")</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(r.Release?.TagBranch ?? "—")</td>
-                                        <td style="padding:0.5rem;text-align:right">
-                                            <button class="approve-btn" @onclick="() => StartEditRepo(r)">✏️ Edit</button>
-                                            <button class="approve-btn" style="color:var(--red)" @onclick="() => RemoveRepositoryAsync(r.Name)">🗑️ Remove</button>
+                                        <td style="padding:0.5rem">
+                                            <div style="display:flex;gap:0.5rem;justify-content:flex-end">
+                                                <button class="approve-btn" @onclick="() => StartEditRepo(r)">✏️ Edit</button>
+                                                <button class="approve-btn" style="color:var(--red)" @onclick="() => RemoveRepositoryAsync(r.Name)">🗑️ Remove</button>
+                                            </div>
                                         </td>
                                     }
                                 </tr>
