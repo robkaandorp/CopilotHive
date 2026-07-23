@@ -384,6 +384,208 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
         Assert.True(File.Exists(Path.Combine(check, "b.txt")));
     }
 
+    // ---------- Existing-method repoName validation ----------
+
+    [Fact]
+    public async Task EnsureCloneAsync_InvalidRepoName_ThrowsArgumentException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.EnsureCloneAsync("../evil", "https://example.com/repo.git", "main", ct));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.EnsureCloneAsync("a/b", "https://example.com/repo.git", "main", ct));
+    }
+
+    [Fact]
+    public async Task MergeFeatureBranchAsync_InvalidRepoName_ThrowsArgumentException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeFeatureBranchAsync("../evil", "feature", "main", "msg", ct));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeFeatureBranchAsync("a/b", "feature", "main", "msg", ct));
+    }
+
+    [Fact]
+    public async Task DeleteRemoteBranchAsync_InvalidRepoName_ThrowsArgumentException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.DeleteRemoteBranchAsync("../evil", "feature", ct));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.DeleteRemoteBranchAsync("a/b", "feature", ct));
+    }
+
+    // ---------- DeleteTagAsync single-side deletion failure ----------
+
+    [Fact]
+    public async Task DeleteTagAsync_TagExistsOnlyLocally_DeletionFails_ThrowsInvalidOperationException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (remoteDir, clonePath, manager) = SetupRepo("del-local-fail");
+
+        // Create a local-only tag (not pushed).
+        Git(clonePath, "tag", "v1.0.0");
+        Assert.DoesNotContain("v1.0.0", GitOutput(remoteDir, "tag", "-l"));
+
+        // Pack the tag ref and hold a packed-refs.lock so `git tag -d` cannot rewrite packed-refs.
+        Git(clonePath, "pack-refs", "--all");
+        File.WriteAllText(Path.Combine(clonePath, ".git", "packed-refs.lock"), "");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            manager.DeleteTagAsync("del-local-fail", "v1.0.0", ct));
+    }
+
+    [Fact]
+    public async Task DeleteTagAsync_TagExistsOnlyRemotely_DeletionFails_ThrowsInvalidOperationException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (remoteDir, clonePath, manager) = SetupRepo("del-remote-fail");
+
+        // Create the tag on remote only via a staging clone.
+        var staging = Path.Combine(_tempDir, "staging-del-remote-fail");
+        Git(_tempDir, "clone", remoteDir, "staging-del-remote-fail");
+        ConfigureIdentity(staging);
+        Git(staging, "tag", "v1.0.0");
+        Git(staging, "push", "origin", "v1.0.0");
+
+        // The manager clone sees the remote tag (via ls-remote) but does not have it locally.
+        Assert.DoesNotContain("v1.0.0", GitOutput(clonePath, "tag", "-l"));
+
+        // Make the bare remote reject ref deletion by packing refs and holding a packed-refs.lock,
+        // so `git push origin :refs/tags/v1.0.0` fails on the remote side.
+        Git(remoteDir, "pack-refs", "--all");
+        File.WriteAllText(Path.Combine(remoteDir, "packed-refs.lock"), "");
+
+        try
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                manager.DeleteTagAsync("del-remote-fail", "v1.0.0", ct));
+        }
+        finally
+        {
+            // Remove the lock so the remote is usable/cleanable.
+            var lockPath = Path.Combine(remoteDir, "packed-refs.lock");
+            if (File.Exists(lockPath))
+                File.Delete(lockPath);
+        }
+    }
+
+    // ---------- Branch/tag ref-format validation ----------
+
+    [Fact]
+    public async Task ValidateBranchOrTagName_RejectsDoubleDot()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeBranchAsync("repo", "foo..bar", "main", ct));
+    }
+
+    [Fact]
+    public async Task ValidateBranchOrTagName_RejectsLeadingDot()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeBranchAsync("repo", ".hidden", "main", ct));
+    }
+
+    [Fact]
+    public async Task ValidateBranchOrTagName_RejectsTrailingDot()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeBranchAsync("repo", "foo.", "main", ct));
+    }
+
+    [Fact]
+    public async Task ValidateBranchOrTagName_RejectsAtBrace()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeBranchAsync("repo", "foo@{bar", "main", ct));
+    }
+
+    [Fact]
+    public async Task ValidateBranchOrTagName_RejectsLoneAt()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeBranchAsync("repo", "@", "main", ct));
+    }
+
+    [Fact]
+    public async Task ValidateBranchOrTagName_RejectsControlChars()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeBranchAsync("repo", "foo\nbar", "main", ct));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeBranchAsync("repo", "foo\0bar", "main", ct));
+    }
+
+    [Fact]
+    public async Task ValidateBranchOrTagName_RejectsDoubleSlash()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeBranchAsync("repo", "foo//bar", "main", ct));
+    }
+
+    // ---------- Symlink containment ----------
+
+    [Fact]
+    public async Task ValidateRepoName_SymlinkEscape_ThrowsArgumentException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+
+        // Create a directory outside the work directory as the symlink target.
+        var outsideDir = Path.Combine(_tempDir, "outside-target");
+        Directory.CreateDirectory(outsideDir);
+        // Put a fake .git inside so the clone-existence check would otherwise pass.
+        Directory.CreateDirectory(Path.Combine(outsideDir, ".git"));
+
+        var reposDir = manager.WorkDirectory;
+        Directory.CreateDirectory(reposDir);
+        var linkPath = Path.Combine(reposDir, "evil-repo");
+
+        try
+        {
+            Directory.CreateSymbolicLink(linkPath, outsideDir);
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
+        {
+            // Symlink creation is not permitted on this platform (e.g., Windows without admin) —
+            // skip the assertion. The lexical checks still guard the common cases.
+            return;
+        }
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeBranchAsync("evil-repo", "feature", "main", ct));
+    }
+
+    // ---------- Cancellation cleanup ----------
+    //
+    // Deterministically racing a real `git merge` against caller-token cancellation is timing
+    // dependent and flaky in CI (the merge may complete before cancellation is observed). The
+    // production code guards the path via a `mergeStarted` flag plus process-tree kill in
+    // RunGitCaptureAsync and a fresh bounded token for MERGE_HEAD abort; these are exercised
+    // indirectly by MergeBranchAsync_MergeConflict_ThrowsMergeConflictException (which leaves and
+    // then aborts a MERGE state). A dedicated timing test is intentionally omitted to avoid flakiness.
+
     // ---------- Helpers ----------
 
     /// <summary>

@@ -165,6 +165,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
     public async Task<string> EnsureCloneAsync(
         string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default)
     {
+        ValidateRepoName(repoName);
         var semaphore = await AcquireRepoLockAsync(repoName, ct);
         try
         {
@@ -258,6 +259,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
         string repoName, string featureBranch, string defaultBranch, string commitMessage,
         CancellationToken ct = default)
     {
+        ValidateRepoName(repoName);
         var semaphore = await AcquireRepoLockAsync(repoName, ct);
         try
         {
@@ -421,6 +423,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// <param name="ct">Cancellation token.</param>
     public async Task<BranchDeleteResult> DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default)
     {
+        ValidateRepoName(repoName);
         var semaphore = await AcquireRepoLockAsync(repoName, ct);
         try
         {
@@ -627,12 +630,16 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
             var preMergeSha = (await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct)).Trim();
 
-            var mergeExitCode = 0;
+            // Track whether the merge command was actually launched. This must NOT rely on the
+            // merge exit code: if the caller's token is canceled mid-merge, RunGitCaptureAsync
+            // throws before returning an exit code, so a boolean flag is the only reliable signal
+            // that a merge may have left the worktree in a MERGE state needing cleanup.
+            var mergeStarted = false;
             try
             {
+                mergeStarted = true;
                 var (exitCode, stdout, stderr) = await RunGitCaptureAsync(
                     clonePath, ["merge", $"origin/{sourceBranch}", "--no-edit"], ct);
-                mergeExitCode = exitCode;
 
                 if (exitCode != 0)
                 {
@@ -648,6 +655,9 @@ public sealed class BrainRepoManager : IBrainRepoManager
                     throw new InvalidOperationException(
                         $"git merge origin/{sourceBranch} failed (exit {exitCode}): {stderr}");
                 }
+
+                // Merge succeeded cleanly — no MERGE state remains, so cleanup is not needed.
+                mergeStarted = false;
 
                 var postMergeSha = (await RunGitWithOutputAsync(clonePath, ["rev-parse", "HEAD"], ct)).Trim();
                 if (postMergeSha == preMergeSha)
@@ -667,9 +677,10 @@ public sealed class BrainRepoManager : IBrainRepoManager
             }
             finally
             {
-                // If the merge command failed, ensure we are not left in a merge state.
-                // Use a fresh token so cleanup runs even if the caller's token is canceled.
-                if (mergeExitCode != 0)
+                // Run cleanup whenever a merge was started but did not complete cleanly (conflict,
+                // other error, or caller cancellation). Use a fresh bounded token — NOT the caller's
+                // token, which may already be canceled — so abort always runs to completion.
+                if (mergeStarted)
                 {
                     using var cleanupCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                     try
@@ -704,6 +715,16 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
     /// <summary>
     /// Validates that a repository name is a safe single path segment directly under <see cref="WorkDirectory"/>.
+    /// <para>
+    /// Containment is enforced in two stages: first both <see cref="WorkDirectory"/> and the clone path
+    /// are resolved via <see cref="Path.GetFullPath(string)"/> (which only performs <em>lexical</em>
+    /// normalization of <c>.</c> and <c>..</c> segments — it does NOT resolve filesystem symlinks or
+    /// junctions), and the canonical parent of the clone path must equal the resolved work directory.
+    /// Second, if the clone path exists and is a symlink/junction, its real target is resolved via
+    /// <see cref="Directory.ResolveLinkTarget(string, bool)"/> and the target's parent must also equal
+    /// the resolved work directory. This second check defeats symlink-based path traversal where a link
+    /// inside the work directory points to an external location.
+    /// </para>
     /// </summary>
     private void ValidateRepoName(string repoName)
     {
@@ -717,16 +738,35 @@ public sealed class BrainRepoManager : IBrainRepoManager
             throw new ArgumentException(
                 $"Repository name '{repoName}' must be a single path segment (no '/', '\\', or '..').", nameof(repoName));
 
+        // Stage 1 — lexical containment: Path.GetFullPath only resolves '.'/'..' textually, not symlinks.
         var workDirFull = Path.GetFullPath(WorkDirectory);
         var resolved = Path.GetFullPath(Path.Combine(workDirFull, repoName));
         var parent = Path.GetDirectoryName(resolved);
         if (!string.Equals(parent, workDirFull, StringComparison.Ordinal))
             throw new ArgumentException(
                 $"Repository name '{repoName}' does not resolve to a direct child of the work directory.", nameof(repoName));
+
+        // Stage 2 — symlink-safe containment: if the clone path exists and is an actual filesystem
+        // symlink/junction, resolve its real target and ensure the target also stays directly under
+        // the work directory. This prevents a link like {WorkDirectory}/evil -> /etc from escaping.
+        // Directory.ResolveLinkTarget throws if the path does not exist, so guard on existence first.
+        if (Directory.Exists(resolved) || File.Exists(resolved))
+        {
+            var linkTarget = Directory.ResolveLinkTarget(resolved, returnFinalTarget: true);
+            if (linkTarget is not null)
+            {
+                var targetFull = Path.GetFullPath(linkTarget.FullName);
+                var targetParent = Path.GetDirectoryName(targetFull);
+                if (!string.Equals(targetParent, workDirFull, StringComparison.Ordinal))
+                    throw new ArgumentException(
+                        $"Repository name '{repoName}' resolves through a symlink that escapes the work directory.", nameof(repoName));
+            }
+        }
     }
 
     /// <summary>
-    /// Validates that a branch or tag name does not contain option-injection or unsafe characters.
+    /// Validates that a branch or tag name is safe to pass to git as an argument: it must not
+    /// enable option injection and must satisfy git's <c>check-ref-format</c> rules.
     /// </summary>
     private static void ValidateBranchOrTagName(string name)
     {
@@ -736,10 +776,34 @@ public sealed class BrainRepoManager : IBrainRepoManager
         if (name.StartsWith('-'))
             throw new ArgumentException($"Branch or tag name '{name}' must not start with '-'.", nameof(name));
 
+        // Reject control characters (anything below 0x20) and DEL.
+        foreach (var c in name)
+        {
+            if (c < 0x20 || c == 0x7f)
+                throw new ArgumentException(
+                    $"Branch or tag name '{name}' contains control characters.", nameof(name));
+        }
+
         char[] forbidden = [' ', '~', '^', ':', '?', '*', '[', '\\'];
         if (name.IndexOfAny(forbidden) >= 0)
             throw new ArgumentException(
                 $"Branch or tag name '{name}' contains forbidden characters.", nameof(name));
+
+        // git check-ref-format rules that the character list above does not cover.
+        if (name.Contains(".."))
+            throw new ArgumentException($"Branch or tag name '{name}' must not contain '..'.", nameof(name));
+        if (name.Contains("@{"))
+            throw new ArgumentException($"Branch or tag name '{name}' must not contain '@{{'.", nameof(name));
+        if (name.Contains("//"))
+            throw new ArgumentException($"Branch or tag name '{name}' must not contain '//'.", nameof(name));
+        if (name == "@")
+            throw new ArgumentException("Branch or tag name must not be a lone '@'.", nameof(name));
+        if (name.StartsWith('.') || name.EndsWith('.'))
+            throw new ArgumentException($"Branch or tag name '{name}' must not begin or end with '.'.", nameof(name));
+        if (name.StartsWith('/') || name.EndsWith('/'))
+            throw new ArgumentException($"Branch or tag name '{name}' must not begin or end with '/'.", nameof(name));
+        if (name.EndsWith(".lock", StringComparison.Ordinal))
+            throw new ArgumentException($"Branch or tag name '{name}' must not end with '.lock'.", nameof(name));
     }
 
     /// <summary>
@@ -769,8 +833,31 @@ public sealed class BrainRepoManager : IBrainRepoManager
         var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
         var stderrTask = process.StandardError.ReadToEndAsync(ct);
 
-        await Task.WhenAll(stdoutTask, stderrTask);
-        await process.WaitForExitAsync(ct);
+        try
+        {
+            await Task.WhenAll(stdoutTask, stderrTask);
+            await process.WaitForExitAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // The caller's token was canceled while the git process was still running.
+            // WaitForExitAsync/ReadToEndAsync do NOT terminate the child process, so kill the
+            // whole process tree and wait (bounded) for it to actually exit before returning.
+            // This guarantees the process is dead before any post-cancellation cleanup runs.
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                    process.WaitForExit(TimeSpan.FromSeconds(5));
+                }
+            }
+            catch
+            {
+                // Best-effort — the process may have already exited.
+            }
+            throw;
+        }
 
         return (process.ExitCode, stdoutTask.Result, stderrTask.Result);
     }
@@ -891,6 +978,8 @@ public sealed class BrainRepoManager : IBrainRepoManager
             string? localError = null;
             string? remoteError = null;
 
+            // OperationCanceledException from RunGitCaptureAsync propagates out of this method
+            // (it is not caught here), rather than being recorded as a partial deletion error.
             if (localExists)
             {
                 var (delExit, _, delStderr) = await RunGitCaptureAsync(clonePath, ["tag", "-d", tag], ct);
@@ -912,6 +1001,8 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
             if (anyDeleted)
             {
+                // At least one side was deleted. Any failure on the other side is logged but
+                // does not fail the operation.
                 if (localError is not null)
                     _logger.LogWarning("Local tag delete failed for {Tag} in {Repo}: {Error}", tag, repoName, localError);
                 if (remoteError is not null)
@@ -921,9 +1012,11 @@ public sealed class BrainRepoManager : IBrainRepoManager
                 return true;
             }
 
-            // Neither side deleted successfully but at least one existed — genuine failure.
+            // At least one location had the tag (checked above) but ZERO deletions succeeded —
+            // this covers both "existed on both, both failed" and "existed on one side, that
+            // sole deletion failed". Surface a genuine failure.
             throw new InvalidOperationException(
-                $"Failed to delete tag '{tag}' for '{repoName}'. Local error: {localError}; Remote error: {remoteError}");
+                $"Failed to delete tag '{tag}' for '{repoName}'. Local error: {localError ?? "(n/a)"}; Remote error: {remoteError ?? "(n/a)"}");
         }
         finally
         {
