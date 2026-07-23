@@ -221,6 +221,10 @@ internal sealed class DispatcherMaintenance
                 {
                     await _brain.ForkSessionForGoalAsync(pipeline.GoalId, ct);
                 }
+                else
+                {
+                    (_brain as DistributedBrain)?.RegisterExistingGoalSession(pipeline.GoalId);
+                }
             }
 
             if (pipeline.Phase is GoalPhase.Done or GoalPhase.Failed)

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
@@ -36,6 +37,7 @@ public class GoalReviewService
     private readonly IBrainRepoManager? _brainRepoManager;
     private readonly string _stateDir;
     private readonly ILogger<GoalReviewService> _logger;
+    private readonly LlmSessionRegistry? _sessionRegistry;
 
     // Test seam: factory that produces the chat client used by the review agent.
     private readonly Func<string, IChatClient> _chatClientFactory;
@@ -56,7 +58,8 @@ public class GoalReviewService
         IBrainRepoManager? brainRepoManager,
         string stateDir,
         ILogger<GoalReviewService> logger,
-        Func<string, IChatClient>? chatClientFactory = null)
+        Func<string, IChatClient>? chatClientFactory = null,
+        LlmSessionRegistry? sessionRegistry = null)
     {
         _knowledgeGraph = knowledgeGraph;
         _configRepo = configRepo;
@@ -66,6 +69,7 @@ public class GoalReviewService
         _stateDir = stateDir;
         _logger = logger;
         _chatClientFactory = chatClientFactory ?? (model => ChatClientFactory.Create(model));
+        _sessionRegistry = sessionRegistry;
     }
 
     /// <summary>
@@ -84,6 +88,10 @@ public class GoalReviewService
         if (!_reviewsInProgress.TryAdd(goal.Id, 0))
             throw new InvalidOperationException($"A review is already in progress for goal {goal.Id}");
 
+        // Nullable so that if TryAdd had failed (throwing before this point), no unregister is
+        // attempted in the outer finally. Only set once a review session has been registered.
+        string? reviewSessionId = null;
+
         try
         {
             // In-memory guard: the passed-in instance already shows a review in progress.
@@ -98,6 +106,26 @@ public class GoalReviewService
                 if (persisted is not null && persisted.ReviewStatus == ReviewStatus.Pending)
                     throw new InvalidOperationException($"A review is already in progress for goal {goal.Id}");
             }
+
+            // Resolve the reviewer model and context window before registering the review session.
+            var reviewerModel = _config?.GetModelForRole(WorkerRole.Reviewer) ?? Constants.DefaultWorkerModel;
+            var maxContextTokens = _config?.TryGetContextWindowForModel(reviewerModel) ?? Constants.DefaultBrainContextWindow;
+
+            // Register the review session now that the concurrency guards have passed. Rejected
+            // concurrent reviews (which throw above) never reach this point, so no registration
+            // happens for them.
+            reviewSessionId = $"goal-review-{goal.Id}-{Guid.NewGuid():N}";
+            _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+            {
+                SessionId = reviewSessionId,
+                SessionType = "GoalReview",
+                GoalId = goal.Id,
+                Model = reviewerModel,
+                CurrentTokens = 0,
+                MaxTokens = maxContextTokens,
+                Status = "reviewing",
+                LastActivity = DateTime.UtcNow,
+            });
 
             // Everything after setting Pending is wrapped so any failure — including the initial
             // Pending persistence (database error, concurrency conflict, or caller cancellation
@@ -130,9 +158,8 @@ public class GoalReviewService
                     }
                 }
 
-                // Build the review prompt and resolve the reviewer model.
+                // Build the review prompt.
                 var reviewPrompt = BuildReviewPrompt(goal, knowledgeContext);
-                var reviewerModel = _config?.GetModelForRole(WorkerRole.Reviewer) ?? Constants.DefaultWorkerModel;
 
                 // Create the chat client (may throw if the provider/model is misconfigured).
                 chatClient = _chatClientFactory(reviewerModel);
@@ -145,7 +172,7 @@ public class GoalReviewService
                     EnableFileOps = true,
                     EnableSkills = false,
                     AutoLoadWorkspaceInstructions = false,
-                    MaxContextTokens = _config?.TryGetContextWindowForModel(reviewerModel) ?? Constants.DefaultBrainContextWindow,
+                    MaxContextTokens = maxContextTokens,
                     SystemPrompt = BuildReviewerSystemPrompt(),
                 };
 
@@ -233,6 +260,8 @@ public class GoalReviewService
         finally
         {
             _reviewsInProgress.TryRemove(goal.Id, out _);
+            if (reviewSessionId is not null)
+                _sessionRegistry?.Unregister(reviewSessionId);
         }
     }
 
