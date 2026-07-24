@@ -729,8 +729,8 @@ public sealed class ClarificationLoggingTests
             Task.CompletedTask;
         public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
-        public void DeleteGoalSession(string goalId) { }
-        public void RegisterExistingGoalSession(string goalId) { }
+        public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+        public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
     public bool GoalSessionExists(string goalId) => false;
 

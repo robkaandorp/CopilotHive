@@ -278,14 +278,14 @@ public sealed class InjectSystemNoteAsyncTests
     [Fact]
     public async Task InjectSystemNoteAsync_AlsoAddsToSessionMessageHistory()
     {
-        // The note must be injected into the Brain's live _session so that the Brain
-        // includes it when crafting the next prompt.
+        // The note must be injected into the Brain's master session so that the Brain
+        // includes it when crafting the next prompt (goal contexts fork from the master).
         var pipeline = CreatePipeline();
         var brain = CreateBrain();
 
-        // Get baseline message count from the Brain session via reflection
+        // Get baseline message count from the Brain master session via reflection
         var sessionField = typeof(DistributedBrain).GetField(
-            "_session", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            "_masterSession", BindingFlags.NonPublic | BindingFlags.Instance)!;
         var session = sessionField.GetValue(brain)!;
         var messageHistoryProp = session.GetType().GetProperty("MessageHistory")!;
         var messagesBefore = ((System.Collections.IList)messageHistoryProp.GetValue(session)!).Count;
@@ -307,7 +307,7 @@ public sealed class InjectSystemNoteAsyncTests
         var note = "Testing was inserted after Coding (required for code-change plans)";
 
         var sessionField = typeof(DistributedBrain).GetField(
-            "_session", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            "_masterSession", BindingFlags.NonPublic | BindingFlags.Instance)!;
         var session = sessionField.GetValue(brain)!;
         var messageHistoryProp = session.GetType().GetProperty("MessageHistory")!;
 
@@ -652,9 +652,9 @@ public sealed class PlanAdjustmentInjectionTests
 
         public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
-        public void DeleteGoalSession(string goalId) { }
+        public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
-        public void RegisterExistingGoalSession(string goalId) { }
+        public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
     public bool GoalSessionExists(string goalId) => false;
 

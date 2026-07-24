@@ -1061,9 +1061,9 @@ file class ProgressFakeBrain : IDistributedBrain
 
     public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
-    public void DeleteGoalSession(string goalId) { }
+    public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
-    public void RegisterExistingGoalSession(string goalId) { }
+    public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
     public bool GoalSessionExists(string goalId) => false;
 
@@ -1115,9 +1115,9 @@ file sealed class ProgressFakeBrainCapturingPrompts(bool planWithImprove = false
 
     public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
-    public void DeleteGoalSession(string goalId) { }
+    public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
-    public void RegisterExistingGoalSession(string goalId) { }
+    public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
     public bool GoalSessionExists(string goalId) => false;
 

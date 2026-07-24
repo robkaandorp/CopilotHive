@@ -540,7 +540,7 @@ public sealed class GoalDispatcherSessionCleanupTests
     /// </summary>
     private sealed class SessionTrackingBrain : IDistributedBrain
     {
-        public List<string> DeletedSessionGoalIds { get; } = [];
+        public System.Collections.Concurrent.ConcurrentBag<string> DeletedSessionGoalIds { get; } = [];
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
@@ -573,12 +573,13 @@ public sealed class GoalDispatcherSessionCleanupTests
 
         public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
-        public void DeleteGoalSession(string goalId)
+        public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default)
         {
             DeletedSessionGoalIds.Add(goalId);
+            return Task.CompletedTask;
         }
 
-        public void RegisterExistingGoalSession(string goalId) { }
+        public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
         public bool GoalSessionExists(string goalId) => false;
 
@@ -682,6 +683,12 @@ public sealed class GoalDispatcherSessionCleanupTests
             brain);
 
         dispatcher.ClearGoalRetryState(goal.Id);
+
+        // ClearGoalRetryState deletes the goal session on a background task (fire-and-forget), so
+        // poll for the observable effect with a tight deadline rather than asserting immediately.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (!brain.DeletedSessionGoalIds.Contains(goal.Id) && DateTime.UtcNow < deadline)
+            await Task.Delay(25, TestContext.Current.CancellationToken);
 
         Assert.Contains(goal.Id, brain.DeletedSessionGoalIds);
     }

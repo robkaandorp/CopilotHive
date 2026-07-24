@@ -194,6 +194,23 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 CurrentTokens = _masterSession.EstimatedContextTokens,
                 MaxTokens = _maxContextTokens,
             });
+
+            // Refresh each registered goal session entry so the registry reflects the new model
+            // and context window for goals already in flight.
+            foreach (var kvp in _goalContexts)
+            {
+                var goalContext = kvp.Value;
+                _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+                {
+                    SessionId = $"brain-goal-{kvp.Key}",
+                    SessionType = LlmSessionType.BrainGoal,
+                    GoalId = kvp.Key,
+                    Model = _modelOverride,
+                    Status = "idle",
+                    CurrentTokens = goalContext.Session.EstimatedContextTokens,
+                    MaxTokens = _maxContextTokens,
+                });
+            }
         }
         finally { _sessionLock.Release(); }
 
@@ -1245,6 +1262,11 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         try
         {
             await context.Gate.WaitAsync(ct);
+            // Capture a STABLE reference to the goal session before the call. Idle-status
+            // restoration in the finally block must use this reference — not context.Session read
+            // fresh — so a mid-call session replacement (e.g. overflow recovery) cannot corrupt the
+            // restored token count.
+            var session = context.Session;
             try
             {
                 _currentContext.Value = context;
@@ -1259,11 +1281,11 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     GoalId = goalId,
                     Model = context.Model,
                     Status = status,
-                    CurrentTokens = context.Session.EstimatedContextTokens,
+                    CurrentTokens = session.EstimatedContextTokens,
                     MaxTokens = context.MaxContextTokens,
                 });
 
-                var result = await context.Agent.ExecuteAsync(context.Session, prompt, context.ActiveCallCts.Token);
+                var result = await context.Agent.ExecuteAsync(session, prompt, context.ActiveCallCts.Token);
                 var responseText = result.Message;
 
                 // Log usage
@@ -1276,26 +1298,26 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 }
 
                 // Log context size (compaction is logged via OnCompacted callback)
-                var estimatedTokens = context.Session.EstimatedContextTokens;
+                var estimatedTokens = session.EstimatedContextTokens;
                 var usagePct = context.MaxContextTokens > 0 ? (int)(estimatedTokens * 100.0 / context.MaxContextTokens) : 0;
                 _logger.LogInformation(
                     "Brain context: messages={Messages} ~tokens={EstTokens}/{Limit} ({Pct}%) cumIn={CumIn} cumOut={CumOut}",
-                    context.Session.MessageHistory.Count, estimatedTokens, context.MaxContextTokens,
-                    usagePct, context.Session.InputTokensUsed, context.Session.OutputTokensUsed);
+                    session.MessageHistory.Count, estimatedTokens, context.MaxContextTokens,
+                    usagePct, session.InputTokensUsed, session.OutputTokensUsed);
 
-                var contextTokens = context.Session.LastKnownContextTokens > 0
-                    ? context.Session.LastKnownContextTokens
-                    : context.Session.EstimatedContextTokens;
+                var contextTokens = session.LastKnownContextTokens > 0
+                    ? session.LastKnownContextTokens
+                    : session.EstimatedContextTokens;
                 _logger.LogInformation("{Message}", FormatContextUsageMessage(contextTokens, context.MaxContextTokens, callerName));
 
                 _logger.LogDebug("Brain response ({Length} chars), tool={Tool}",
                     responseText?.Length ?? 0, context.LastToolCallResult?.ToolName ?? "none");
 
                 // Auto-save session after each Brain call
-                try { await context.Session.SaveAsync(GetGoalSessionFilePath(goalId), ct); }
+                try { await session.SaveAsync(GetGoalSessionFilePath(goalId), ct); }
                 catch (Exception ex) { _logger.LogWarning(ex, "Failed to save Brain session"); }
 
-                return (responseText, context.LastToolCallResult);
+                return (responseText ?? string.Empty, context.LastToolCallResult);
             }
             finally
             {
@@ -1309,7 +1331,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     GoalId = goalId,
                     Model = context.Model,
                     Status = "idle",
-                    CurrentTokens = context.Session.EstimatedContextTokens,
+                    CurrentTokens = session.EstimatedContextTokens,
                     MaxTokens = context.MaxContextTokens,
                 });
                 context.Gate.Release();

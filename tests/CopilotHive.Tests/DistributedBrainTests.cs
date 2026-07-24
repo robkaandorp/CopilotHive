@@ -467,12 +467,10 @@ public sealed class DistributedBrainTests
             // Update the orchestrator instructions on disk (simulating a change during the session)
             File.WriteAllText(orchestratorFile, "UPDATED_FRESH_INSTRUCTIONS_FROM_DISK");
 
-            // ResetSessionAsync should reload from disk and update _systemPrompt
-            // before calling RecreateAgent. The InvalidOperationException is thrown by
-            // RecreateAgent because there's no real chat client — but _systemPrompt
-            // must already have been updated at that point.
-            await Assert.ThrowsAsync<InvalidOperationException>(
-                () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
+            // ResetSessionAsync reloads the orchestrator instructions from disk and updates
+            // _systemPrompt. With per-goal contexts there is no shared agent to recreate, so reset
+            // completes without throwing — but _systemPrompt must reflect the fresh on-disk content.
+            await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
 
             // Verify _systemPrompt now contains the NEW content, not the original.
             // This test fails with the buggy implementation (stale _systemPrompt from construction)
@@ -491,18 +489,23 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task ResetSessionAsync_WithoutAgentsManager_ThrowsWhenNotConnected()
+    public async Task ResetSessionAsync_WithoutAgentsManager_UsesDefaultSystemPrompt()
     {
         var tempStateDir = Path.Combine(Path.GetTempPath(), $"brain-reset-noagents-{Guid.NewGuid():N}");
         try
         {
-            // No agentsManager provided — reset should still try to rebuild and call RecreateAgent
+            // No agentsManager provided. With per-goal contexts there is no shared agent to recreate,
+            // so reset completes without throwing even when the Brain was never connected. Without an
+            // agents manager, the reloaded system prompt falls back to the default.
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
                 stateDir: tempStateDir);
 
-            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-                () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
-            Assert.Contains("Call ConnectAsync first", ex.Message);
+            await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+            var systemPromptField = typeof(DistributedBrain)
+                .GetField("_systemPrompt", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var prompt = (string)systemPromptField.GetValue(brain)!;
+            Assert.False(string.IsNullOrWhiteSpace(prompt), "System prompt must fall back to a non-empty default");
         }
         finally
         {
@@ -526,12 +529,9 @@ public sealed class DistributedBrainTests
                 .GetField("_systemPrompt", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
             var masterSessionField = typeof(DistributedBrain)
                 .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            var agentField = typeof(DistributedBrain)
-                .GetField("_agent", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
 
             var initialPrompt = (string)systemPromptField.GetValue(brain)!;
             var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-            var agentBefore = agentField.GetValue(brain);
             var messageCountBefore = masterSession.MessageHistory.Count;
 
             // Act: inject new orchestrator instructions
@@ -541,11 +541,6 @@ public sealed class DistributedBrainTests
             var updatedPrompt = (string)systemPromptField.GetValue(brain)!;
             Assert.Contains("NEW_ORCHESTRATOR_RULES", updatedPrompt);
             Assert.Contains(BrainPromptBuilder.DefaultSystemPrompt, updatedPrompt);
-
-            // Assert: RecreateAgent() was effectively called — the _agent field is a new object
-            var agentAfter = agentField.GetValue(brain);
-            Assert.NotSame(agentBefore, agentAfter);
-            Assert.NotNull(agentAfter);
 
             // Assert: master session history is preserved (no injected User/Assistant turns)
             Assert.Equal(messageCountBefore, masterSession.MessageHistory.Count);
@@ -974,6 +969,7 @@ public sealed class DistributedBrainTests
                 chatClient: stubClient);
 
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
+            await brain.ForkSessionForGoalAsync("goal-test-42", TestContext.Current.CancellationToken);
 
             // Act
             var response = await brain.AskQuestionAsync(
@@ -2317,7 +2313,7 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task LoadGoalSessionAsync_LoadsCorrectGoalSession()
+    public async Task ForkSessionForGoal_CreatesSeparateGoalContextSessions()
     {
         // Arrange
         var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
@@ -2333,7 +2329,7 @@ public sealed class DistributedBrainTests
                 .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
             var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
 
-            // Fork and save goal-A session with unique marker
+            // Fork goal-A with unique marker
             masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User, "MARKER_GOAL_A_UNIQUE"));
             await brain.ForkSessionForGoalAsync("goal-A", TestContext.Current.CancellationToken);
 
@@ -2345,22 +2341,23 @@ public sealed class DistributedBrainTests
             // Reset master session
             masterSession.MessageHistory.RemoveAt(masterSession.MessageHistory.Count - 1);
 
-            // Get private LoadGoalSessionAsync method via reflection
-            var loadSessionMethod = typeof(DistributedBrain)
-                .GetMethod("LoadGoalSessionAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            // Access _goalContexts via reflection and read each context's Session.
+            var goalContextsField = typeof(DistributedBrain)
+                .GetField("_goalContexts", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var goalContexts = (System.Collections.IDictionary)goalContextsField.GetValue(brain)!;
 
-            // Get _session field
-            var sessionField = typeof(DistributedBrain)
-                .GetField("_session", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var contextB = goalContexts["goal-B"]!;
+            var sessionProp = contextB.GetType().GetProperty("Session")!;
+            var sessionB = (AgentSession)sessionProp.GetValue(contextB)!;
 
-            // Act: load goal-B session
-            await (Task)loadSessionMethod.Invoke(brain, ["goal-B", TestContext.Current.CancellationToken])!;
+            // Assert: goal-B's context session contains only goal-B's marker.
+            Assert.Contains(sessionB.MessageHistory, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_GOAL_B_UNIQUE")));
+            Assert.DoesNotContain(sessionB.MessageHistory, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_GOAL_A_UNIQUE")));
 
-            // Assert: _session contains goal-B's history
-            var session = (AgentSession)sessionField.GetValue(brain)!;
-            var sessionHistory = session.MessageHistory;
-            Assert.Contains(sessionHistory, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_GOAL_B_UNIQUE")));
-            Assert.DoesNotContain(sessionHistory, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_GOAL_A_UNIQUE")));
+            var contextA = goalContexts["goal-A"]!;
+            var sessionA = (AgentSession)sessionProp.GetValue(contextA)!;
+            Assert.Contains(sessionA.MessageHistory, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_GOAL_A_UNIQUE")));
+            Assert.DoesNotContain(sessionA.MessageHistory, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_GOAL_B_UNIQUE")));
         }
         finally
         {
@@ -2390,7 +2387,7 @@ public sealed class DistributedBrainTests
             Assert.True(File.Exists(sessionFile), "Session file should exist before deletion");
 
             // Act
-            brain.DeleteGoalSession("goal-delete-test");
+            await brain.DeleteGoalSessionAsync("goal-delete-test", TestContext.Current.CancellationToken);
 
             // Assert: file no longer exists
             Assert.False(File.Exists(sessionFile), "Session file should not exist after deletion");
@@ -2403,7 +2400,7 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task DeleteGoalSession_ClearsActiveGoalAndResetsSession()
+    public async Task DeleteGoalSession_RemovesGoalContext()
     {
         // Arrange
         var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
@@ -2414,50 +2411,28 @@ public sealed class DistributedBrainTests
                 stateDir: tempDir, chatClient: new FakeChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
-            // Get fields via reflection
-            var masterSessionField = typeof(DistributedBrain)
-                .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            var sessionField = typeof(DistributedBrain)
-                .GetField("_session", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            var activeGoalIdField = typeof(DistributedBrain)
-                .GetField("_activeGoalId", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-
-            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-
-            // Add a unique marker to master session
-            masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User, "MASTER_SESSION_MARKER"));
-
-            // Fork and load goal session
+            // Fork a goal session — this creates a per-goal Brain context.
             await brain.ForkSessionForGoalAsync("active-goal-test", TestContext.Current.CancellationToken);
 
-            // Load goal session via reflection (simulating what ExecuteBrainAsync would do)
-            var loadSessionMethod = typeof(DistributedBrain)
-                .GetMethod("LoadGoalSessionAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            await (Task)loadSessionMethod.Invoke(brain, ["active-goal-test", TestContext.Current.CancellationToken])!;
+            // Access _goalContexts via reflection.
+            var goalContextsField = typeof(DistributedBrain)
+                .GetField("_goalContexts", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var goalContexts = (System.Collections.IDictionary)goalContextsField.GetValue(brain)!;
 
-            // Verify session is now the goal session (different from master)
-            var currentSession = (AgentSession)sessionField.GetValue(brain)!;
-            var activeGoalId = (string?)activeGoalIdField.GetValue(brain)!;
-            Assert.Equal("active-goal-test", activeGoalId);
-            Assert.NotSame(masterSession, currentSession);
+            // Assert: the context exists before deletion.
+            Assert.True(goalContexts.Contains("active-goal-test"), "Goal context should exist after fork");
 
-            // Verify file exists
             var sessionFile = Path.Combine(tempDir, "brain-goal-active-goal-test.json");
             Assert.True(File.Exists(sessionFile), "Session file should exist");
 
-            // Act: delete the active goal session
-            brain.DeleteGoalSession("active-goal-test");
+            // Act: delete the goal session.
+            await brain.DeleteGoalSessionAsync("active-goal-test", TestContext.Current.CancellationToken);
 
-            // Assert: file deleted
+            // Assert: file deleted.
             Assert.False(File.Exists(sessionFile), "Session file should not exist after deletion");
 
-            // Assert: activeGoalId cleared
-            activeGoalId = (string?)activeGoalIdField.GetValue(brain)!;
-            Assert.Null(activeGoalId);
-
-            // Assert: _session reset to _masterSession
-            currentSession = (AgentSession)sessionField.GetValue(brain)!;
-            Assert.Same(masterSession, currentSession);
+            // Assert: the goal context was removed.
+            Assert.False(goalContexts.Contains("active-goal-test"), "Goal context should be removed after deletion");
         }
         finally
         {
@@ -2576,13 +2551,21 @@ public sealed class DistributedBrainTests
             await brain.ForkSessionForGoalAsync("goal-A", TestContext.Current.CancellationToken);
             await brain.ForkSessionForGoalAsync("goal-B", TestContext.Current.CancellationToken);
 
-            // Inject unique markers into each goal's session file
+            // Inject unique markers into each goal's session. goal-A is exercised by
+            // PlanIterationAsync, which persists its in-memory context session after the call — so
+            // goal-A's marker must be written into the live context session (a file-only marker would
+            // be overwritten). goal-B is never exercised, so its on-disk marker persists as-is.
             var sessionFileA = Path.Combine(tempDir, "brain-goal-goal-A.json");
             var sessionFileB = Path.Combine(tempDir, "brain-goal-goal-B.json");
 
-            var sessionA = await AgentSession.LoadAsync(sessionFileA, TestContext.Current.CancellationToken);
-            sessionA.MessageHistory.Add(new ChatMessage(ChatRole.User, "MARKER_UNIQUE_TO_GOAL_A"));
-            await sessionA.SaveAsync(sessionFileA, TestContext.Current.CancellationToken);
+            var goalContextsField = typeof(DistributedBrain)
+                .GetField("_goalContexts", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var goalContexts = (System.Collections.IDictionary)goalContextsField.GetValue(brain)!;
+            var contextA = goalContexts["goal-A"]!;
+            var sessionPropA = contextA.GetType().GetProperty("Session",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public)!;
+            var contextSessionA = (AgentSession)sessionPropA.GetValue(contextA)!;
+            contextSessionA.MessageHistory.Add(new ChatMessage(ChatRole.User, "MARKER_UNIQUE_TO_GOAL_A"));
 
             var sessionB = await AgentSession.LoadAsync(sessionFileB, TestContext.Current.CancellationToken);
             sessionB.MessageHistory.Add(new ChatMessage(ChatRole.User, "MARKER_UNIQUE_TO_GOAL_B"));
@@ -2619,10 +2602,10 @@ public sealed class DistributedBrainTests
     [Fact]
     public async Task ExecuteBrainAsync_ConcurrentCalls_UseSeparateSessions()
     {
-        // Verify that two Brain calls for different goals each use their own session,
-        // with no cross-contamination. The _brainCallGate serializes access (capacity=1)
-        // to protect _session/_activeGoalId/_agent — both calls go through it one at a time.
-        // After each call completes, we verify its session was not contaminated by the other.
+        // Verify that two Brain calls for different goals each use their own per-goal context
+        // and session, with no cross-contamination. Each goal context has its own gate, so the
+        // two calls can proceed independently. After each call completes, we verify its session
+        // was not contaminated by the other.
         var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
         try
@@ -2642,19 +2625,30 @@ public sealed class DistributedBrainTests
             await brain.ForkSessionForGoalAsync("goal-A", TestContext.Current.CancellationToken);
             await brain.ForkSessionForGoalAsync("goal-B", TestContext.Current.CancellationToken);
 
-            // Inject unique markers into each goal's session file
+            // Inject unique markers into each goal's in-memory context session. The per-goal context
+            // holds the live session in memory and persists it after each Brain call, so markers must
+            // be written into the context sessions (not just the on-disk files, which would be
+            // overwritten by the in-memory session on the next save).
+            var goalContextsField = typeof(DistributedBrain)
+                .GetField("_goalContexts", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var goalContexts = (System.Collections.IDictionary)goalContextsField.GetValue(brain)!;
+
+            static AgentSession GetContextSession(object context)
+            {
+                var sessionProp = context.GetType().GetProperty("Session",
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public)!;
+                return (AgentSession)sessionProp.GetValue(context)!;
+            }
+
+            var contextA = goalContexts["goal-A"]!;
+            var contextB = goalContexts["goal-B"]!;
+            GetContextSession(contextA).MessageHistory.Add(new ChatMessage(ChatRole.User, "UNIQUE_MARKER_A_FOR_CONCURRENCY_TEST"));
+            GetContextSession(contextB).MessageHistory.Add(new ChatMessage(ChatRole.User, "UNIQUE_MARKER_B_FOR_CONCURRENCY_TEST"));
+
             var sessionFileA = Path.Combine(tempDir, "brain-goal-goal-A.json");
             var sessionFileB = Path.Combine(tempDir, "brain-goal-goal-B.json");
 
-            var sessionA = await AgentSession.LoadAsync(sessionFileA, TestContext.Current.CancellationToken);
-            sessionA.MessageHistory.Add(new ChatMessage(ChatRole.User, "UNIQUE_MARKER_A_FOR_CONCURRENCY_TEST"));
-            await sessionA.SaveAsync(sessionFileA, TestContext.Current.CancellationToken);
-
-            var sessionB = await AgentSession.LoadAsync(sessionFileB, TestContext.Current.CancellationToken);
-            sessionB.MessageHistory.Add(new ChatMessage(ChatRole.User, "UNIQUE_MARKER_B_FOR_CONCURRENCY_TEST"));
-            await sessionB.SaveAsync(sessionFileB, TestContext.Current.CancellationToken);
-
-            // Act: start two PlanIterationAsync calls — they serialize through _brainCallGate (capacity=1)
+            // Act: start two PlanIterationAsync calls — each goal has its own per-context gate
             var pipelineA = CreatePipeline("goal-A", "Goal A for concurrency test");
             var pipelineB = CreatePipeline("goal-B", "Goal B for concurrency test");
 
@@ -2670,7 +2664,7 @@ public sealed class DistributedBrainTests
                 return (GoalId: "goal-B", Result: result);
             }, TestContext.Current.CancellationToken);
 
-            // Wait for both to complete — _brainCallGate serializes them; one finishes, then the other
+            // Wait for both to complete — each goal runs on its own per-context gate
             var results = await Task.WhenAll(taskA, taskB);
 
             // Assert: both calls completed successfully
@@ -2693,14 +2687,9 @@ public sealed class DistributedBrainTests
             Assert.Contains(historyB, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("UNIQUE_MARKER_B_FOR_CONCURRENCY_TEST")));
             Assert.DoesNotContain(historyB, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("UNIQUE_MARKER_A_FOR_CONCURRENCY_TEST")));
 
-            // Assert: _activeGoalId is cleared after both calls complete (due to serialization via gate)
-            var activeGoalIdField = typeof(DistributedBrain)
-                .GetField("_activeGoalId", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            var activeGoalId = (string?)activeGoalIdField.GetValue(brain)!;
-            // The last call wins, so activeGoalId should be either null or the last processed goal
-            // Since they're serialized by the gate, this is expected behavior
-            Assert.True(activeGoalId is null or "goal-A" or "goal-B",
-                $"Expected _activeGoalId to be null, 'goal-A', or 'goal-B', but was '{activeGoalId}'");
+            // Assert: both goal contexts still exist after both calls complete
+            Assert.True(goalContexts.Contains("goal-A"), "goal-A context should still exist");
+            Assert.True(goalContexts.Contains("goal-B"), "goal-B context should still exist");
         }
         finally
         {
@@ -2733,8 +2722,6 @@ public sealed class DistributedBrainTests
             // Get fields via reflection
             var masterSessionField = typeof(DistributedBrain)
                 .GetField("_masterSession", BindingFlags.NonPublic | BindingFlags.Instance)!;
-            var activeGoalIdField = typeof(DistributedBrain)
-                .GetField("_activeGoalId", BindingFlags.NonPublic | BindingFlags.Instance)!;
 
             var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
             var initialMasterMessageCount = masterSession.MessageHistory.Count;
@@ -2766,9 +2753,11 @@ public sealed class DistributedBrainTests
             // Assert: goal session file is deleted
             Assert.False(File.Exists(goalSessionFile), "Goal session file should be deleted after merge");
 
-            // Assert: _activeGoalId is cleared
-            var activeGoalId = (string?)activeGoalIdField.GetValue(brain)!;
-            Assert.Null(activeGoalId);
+            // Assert: the goal context was removed after the merge
+            var goalContextsField = typeof(DistributedBrain)
+                .GetField("_goalContexts", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var goalContexts = (System.Collections.IDictionary)goalContextsField.GetValue(brain)!;
+            Assert.False(goalContexts.Contains(goalId), "Goal context should be removed after merge");
         }
         finally
         {
@@ -2807,7 +2796,7 @@ public sealed class DistributedBrainTests
 
             // Act: delete goal session directly (as GoalDispatcher does for failed goals)
             // without calling SummarizeAndMergeAsync
-            brain.DeleteGoalSession(goalId);
+            await brain.DeleteGoalSessionAsync(goalId, TestContext.Current.CancellationToken);
 
             // Assert: goal session file is deleted
             Assert.False(File.Exists(goalSessionFile), "Goal session file should be deleted");
@@ -2858,7 +2847,7 @@ public sealed class DistributedBrainTests
             cts.Cancel();
 
             // Act: the method should throw TaskCanceledException due to the cancelled token
-            // The _brainCallGate.WaitAsync(ct) should throw immediately
+            // The context.Gate.WaitAsync(ct) should throw immediately
             await Assert.ThrowsAsync<TaskCanceledException>(
                 () => brain.SummarizeAndMergeAsync(pipeline, cts.Token));
 
@@ -2868,7 +2857,7 @@ public sealed class DistributedBrainTests
                 "Goal session file should still exist when exception is thrown before deletion");
 
             // Cleanup: simulate what GoalDispatcher does on exception
-            brain.DeleteGoalSession(goalId);
+            await brain.DeleteGoalSessionAsync(goalId, TestContext.Current.CancellationToken);
             Assert.False(File.Exists(goalSessionFile), "Goal session file should be deleted after explicit cleanup");
         }
         finally
@@ -3087,7 +3076,7 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task UpdateModelAsync_DisposesOldChatClient_AndCreatesNewOne()
+    public async Task UpdateModelAsync_DoesNotDisposeInjectedChatClient()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
@@ -3099,21 +3088,23 @@ public sealed class DistributedBrainTests
                 chatClientFactory: _ => new FakeChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
-            var clientField = typeof(DistributedBrain)
-                .GetField("_chatClient", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-
-            var originalClient = clientField.GetValue(brain);
-            Assert.Same(disposableClient, originalClient);
+            // The injected chat client is owned by the Brain and disposed only at Brain disposal —
+            // NOT on model update. With per-goal contexts there is no single shared chat client to
+            // swap; each goal context creates its own client lazily when forked.
+            var injectedField = typeof(DistributedBrain)
+                .GetField("_injectedChatClient", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            Assert.Same(disposableClient, injectedField.GetValue(brain));
             Assert.Equal(0, disposableClient.DisposeCount);
 
             await brain.UpdateModelAsync("copilot/other-model", null, TestContext.Current.CancellationToken);
 
-            // The old chat client should have been disposed
-            Assert.Equal(1, disposableClient.DisposeCount);
+            // The injected client must NOT be disposed by a model update.
+            Assert.Equal(0, disposableClient.DisposeCount);
 
-            var newClient = clientField.GetValue(brain);
-            Assert.NotSame(originalClient, newClient);
-            Assert.NotNull(newClient);
+            // The model override was updated.
+            var modelField = typeof(DistributedBrain)
+                .GetField("_modelOverride", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            Assert.Equal("copilot/other-model", modelField.GetValue(brain));
         }
         finally
         {
@@ -3205,9 +3196,9 @@ file sealed class FakeDistributedBrain : IDistributedBrain
 
     public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
-    public void DeleteGoalSession(string goalId) { }
+    public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
-    public void RegisterExistingGoalSession(string goalId) { }
+    public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
     public bool GoalSessionExists(string goalId) => false;
 
