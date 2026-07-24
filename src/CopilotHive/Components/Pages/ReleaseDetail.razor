@@ -30,6 +30,10 @@
             <button class="approve-btn" @onclick="MarkAsReleased" disabled="@(!_isValid || _isReleasing)">
                 ✅ Mark as Released
             </button>
+            @if (!_isValid && _validationErrors.Count == 0 && !_isValidating && !_isReleasing)
+            {
+                <span style="color:var(--text-muted);font-size:0.8rem">↑ Click Validate first</span>
+            }
             @if (_isReleasing)
             {
                 <span style="color:var(--text-muted);font-size:0.85rem">Releasing...</span>
