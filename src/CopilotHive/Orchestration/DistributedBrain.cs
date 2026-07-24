@@ -43,18 +43,29 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly Func<string, IChatClient> _chatClientFactory;
     private readonly HiveConfigFile? _hiveConfig;
     private readonly LlmSessionRegistry? _sessionRegistry;
-    private readonly ConcurrentDictionary<string, byte> _registeredGoalSessions = new();
 
     /// <summary>
     /// Directory used for persistent Brain state (session files).
     /// </summary>
     public string StateDirectory => _stateDir;
 
-    private IChatClient? _chatClient;
-    private CodingAgent? _agent;
     private AgentSession _masterSession;
-    private AgentSession _session;
-    private string? _activeGoalId;
+
+    /// <summary>Per-goal Brain contexts, each with its own gate, chat client, coding agent, and session.</summary>
+    private readonly ConcurrentDictionary<string, GoalBrainContext> _goalContexts = new();
+
+    /// <summary>Goal IDs currently being deleted, guarded so no new context is created during teardown.</summary>
+    private readonly ConcurrentDictionary<string, bool> _deletingGoals = new();
+
+    private bool _disposing;
+    private bool _resetting;
+    private bool _connected;
+
+    /// <summary>An externally-injected chat client shared across contexts (never owned/disposed by a context).</summary>
+    private readonly IChatClient? _injectedChatClient;
+
+    /// <summary>Flows the current goal's Brain context across async calls within a single Brain operation.</summary>
+    private readonly AsyncLocal<GoalBrainContext?> _currentContext = new();
 
     private string _systemPrompt;
     private readonly List<AITool> _brainTools;
@@ -63,14 +74,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <summary>Active pipeline snapshots keyed by goal ID, used by the <c>get_goal</c> tool.</summary>
     private Dictionary<string, GoalPipeline>? _activePipelines;
 
-    /// <summary>Serialises all Brain LLM calls so <see cref="_lastToolCallResult"/> is never overwritten concurrently.</summary>
-    private readonly SemaphoreSlim _brainCallGate = new(1, 1);
-
     /// <summary>Serialises session-state mutations (master session, model settings, registered goals, session files).</summary>
     private readonly SemaphoreSlim _sessionLock = new(1, 1);
-
-    /// <summary>Last tool call result captured by Brain tool lambdas. Serialised by <see cref="_brainCallGate"/>.</summary>
-    private volatile BrainToolCallResult? _lastToolCallResult;
 
     private const string DefaultSystemPrompt = BrainPromptBuilder.DefaultSystemPrompt;
 
@@ -97,7 +102,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _repoManager = repoManager;
         _agentsManager = agentsManager;
         _goalStore = goalStore;
-        _chatClient = chatClient;
+        _injectedChatClient = chatClient;
         _stateDir = stateDir ?? "/app/state";
         _compactionModel = compactionModel;
         _knowledgeGraph = knowledgeGraph;
@@ -105,7 +110,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _hiveConfig = hiveConfig;
         _sessionRegistry = sessionRegistry;
         _masterSession = AgentSession.Create("brain");
-        _session = _masterSession;
 
         var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(modelOverride);
         _reasoningEffort = reasoning;
@@ -118,51 +122,52 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             : $"{DefaultSystemPrompt}\n\n{orchestratorInstructions}";
     }
 
-    /// <summary>Creates the IChatClient and CodingAgent. Also loads a previously saved session.</summary>
+    /// <summary>Loads or creates the master Brain session. Idempotent. Per-goal agents and
+    /// chat clients are created lazily via <see cref="CreateGoalBrainContextAsync"/>.</summary>
     public async Task ConnectAsync(CancellationToken ct = default)
     {
         _logger.LogInformation("Brain connecting with model '{Model}'…", _modelOverride);
 
-        _chatClient ??= _chatClientFactory(_modelOverride);
+        await _sessionLock.WaitAsync(ct);
+        try
+        {
+            if (_connected)
+                return;
 
-        // Try to load a persisted master session from a previous run.
-        // Migrate legacy brain-session.json to brain-master.json if needed.
-        var masterFile = GetMasterSessionFilePath();
-        var oldFile = Path.Combine(_stateDir, "brain-session.json");
-        if (File.Exists(oldFile) && !File.Exists(masterFile))
-        {
-            File.Move(oldFile, masterFile);
-            _logger.LogInformation("Migrated brain-session.json to brain-master.json");
-        }
-        if (File.Exists(masterFile))
-        {
-            try
+            // Try to load a persisted master session from a previous run.
+            // Migrate legacy brain-session.json to brain-master.json if needed.
+            var masterFile = GetMasterSessionFilePath();
+            var oldFile = Path.Combine(_stateDir, "brain-session.json");
+            if (File.Exists(oldFile) && !File.Exists(masterFile))
             {
-                _masterSession = await AgentSession.LoadAsync(masterFile, ct);
-                _logger.LogInformation("Loaded Brain master session with {Count} messages from {File}",
-                    _masterSession.MessageHistory.Count, masterFile);
+                File.Move(oldFile, masterFile);
+                _logger.LogInformation("Migrated brain-session.json to brain-master.json");
             }
-            catch (Exception ex)
+            if (File.Exists(masterFile))
             {
-                _logger.LogWarning(ex, "Failed to load Brain master session from {File} — starting fresh", masterFile);
-                _masterSession = AgentSession.Create("brain");
+                try
+                {
+                    _masterSession = await AgentSession.LoadAsync(masterFile, ct);
+                    _logger.LogInformation("Loaded Brain master session with {Count} messages from {File}",
+                        _masterSession.MessageHistory.Count, masterFile);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to load Brain master session from {File} — starting fresh", masterFile);
+                    _masterSession = AgentSession.Create("brain");
+                }
             }
+
+            RefreshMasterSessionRegistry();
+
+            _connected = true;
         }
-        _session = _masterSession;
-
-        RecreateAgent();
-
-        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+        finally
         {
-            SessionId = "brain-master",
-            SessionType = LlmSessionType.Brain,
-            Model = _modelOverride,
-            Status = "idle",
-            CurrentTokens = _masterSession.EstimatedContextTokens,
-            MaxTokens = _maxContextTokens,
-        });
+            _sessionLock.Release();
+        }
 
-        _logger.LogInformation("Brain connected via CodingAgent (model={Model}, contextWindow={ContextWindow})",
+        _logger.LogInformation("Brain connected (model={Model}, contextWindow={ContextWindow})",
             _modelOverride, _maxContextTokens);
     }
 
@@ -624,45 +629,76 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         string? ModelTiers)
         : BrainToolCallResult("report_iteration_plan");
 
-    /// <summary>Creates a CodingAgent with current configuration.</summary>
-    private void RecreateAgent()
+    /// <summary>Creates all per-goal Brain resources (chat client, compaction client, coding
+    /// agent) and persists the goal session. Callers must hold <see cref="_sessionLock"/>.</summary>
+    private async Task<GoalBrainContext> CreateGoalBrainContextAsync(string goalId, AgentSession session, CancellationToken ct)
     {
-        if (_chatClient is null)
-            throw new InvalidOperationException("Brain not connected. Call ConnectAsync first.");
+        var model = _modelOverride;
+        var maxTokens = _maxContextTokens;
+        var reasoning = _reasoningEffort;
+        var systemPrompt = _systemPrompt;
 
-        var workDir = _repoManager?.WorkDirectory ?? _stateDir;
+        IChatClient chatClient;
+        bool ownsClient;
+        if (_injectedChatClient is not null) { chatClient = _injectedChatClient; ownsClient = false; }
+        else { chatClient = _chatClientFactory(model); ownsClient = true; }
 
-        _agent = new CodingAgent(_chatClient, new AgentOptions
+        IChatClient? compactionClient = null;
+        try
         {
-            WorkDirectory = workDir,
-            MaxSteps = _maxSteps,
-            EnableBash = false,
-            EnableFileOps = _repoManager is not null,
-            EnableFileWrites = false,
-            EnableSkills = false,
-            SystemPrompt = _systemPrompt,
-            CustomTools = _brainTools,
-            MaxContextTokens = _maxContextTokens,
-            EnableAutoCompaction = true,
-            AutoLoadWorkspaceInstructions = false,
-            ReasoningEffort = _reasoningEffort,
-            Logger = _logger,
-            CompactionClient = !string.IsNullOrEmpty(_compactionModel)
-                ? ChatClientFactory.Create(_compactionModel)
-                : null,
-            CompactionMaxTokens = !string.IsNullOrEmpty(_compactionModel)
-                ? _hiveConfig?.TryGetContextWindowForModel(_compactionModel)
-                : null,
-            OnCompacted = r =>
-            {
-                _logger.LogInformation(
-                    "Brain context compaction: {TokensBefore} \u2192 {TokensAfter} tokens ({ReductionPercent}% reduction), {MessagesBefore} \u2192 {MessagesAfter} messages",
-                    r.TokensBefore, r.TokensAfter, r.ReductionPercent, r.MessagesBefore, r.MessagesAfter);
-            },
-        });
+            compactionClient = !string.IsNullOrEmpty(_compactionModel)
+                ? ChatClientFactory.Create(_compactionModel) : null;
 
-        _logger.LogDebug("CodingAgent created with WorkDirectory={WorkDir}, FileOps={FileOps}",
-            workDir, _repoManager is not null);
+            var workDir = _repoManager?.WorkDirectory ?? _stateDir;
+            var agent = new CodingAgent(chatClient, new AgentOptions
+            {
+                WorkDirectory = workDir,
+                MaxSteps = _maxSteps,
+                EnableBash = false,
+                EnableFileOps = _repoManager is not null,
+                EnableFileWrites = false,
+                EnableSkills = false,
+                SystemPrompt = systemPrompt,
+                CustomTools = _brainTools,
+                MaxContextTokens = maxTokens,
+                EnableAutoCompaction = true,
+                AutoLoadWorkspaceInstructions = false,
+                ReasoningEffort = reasoning,
+                Logger = _logger,
+                CompactionClient = compactionClient,
+                CompactionMaxTokens = !string.IsNullOrEmpty(_compactionModel)
+                    ? _hiveConfig?.TryGetContextWindowForModel(_compactionModel)
+                    : null,
+                OnCompacted = r =>
+                {
+                    _logger.LogInformation(
+                        "Brain context compaction: {TokensBefore} \u2192 {TokensAfter} tokens ({ReductionPercent}% reduction), {MessagesBefore} \u2192 {MessagesAfter} messages",
+                        r.TokensBefore, r.TokensAfter, r.ReductionPercent, r.MessagesBefore, r.MessagesAfter);
+                },
+            });
+
+            await session.SaveAsync(GetGoalSessionFilePath(goalId), ct);
+
+            _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+            {
+                SessionId = $"brain-goal-{goalId}",
+                SessionType = LlmSessionType.BrainGoal,
+                GoalId = goalId,
+                Model = model,
+                Status = "idle",
+                CurrentTokens = session.EstimatedContextTokens,
+                MaxTokens = maxTokens,
+            });
+
+            return new GoalBrainContext(goalId, chatClient, ownsClient, compactionClient, agent, session, model, maxTokens, reasoning, systemPrompt);
+        }
+        catch
+        {
+            // Dispose partial resources on failure. CodingAgent is not IDisposable.
+            try { compactionClient?.Dispose(); } catch { }
+            if (ownsClient) { try { chatClient.Dispose(); } catch { } }
+            throw;
+        }
     }
 
     /// <summary>Returns the file path for a goal-specific forked session.</summary>
@@ -686,14 +722,30 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         });
     }
 
-    /// <summary>Forks the master session for a goal and persists it to disk.</summary>
+    /// <summary>Forks the master session for a goal and creates a dedicated Brain context.</summary>
     /// <inheritdoc />
     public async Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default)
     {
         await _sessionLock.WaitAsync(ct);
         try
         {
-            await ForkSessionForGoalCoreAsync(goalId, ct);
+            if (_disposing)
+                throw new InvalidOperationException("Brain is being disposed.");
+            if (_resetting)
+                throw new InvalidOperationException("Brain is being reset.");
+            if (_deletingGoals.ContainsKey(goalId))
+                throw new InvalidOperationException($"Goal '{goalId}' is being deleted.");
+
+            // Idempotent: already have a context for this goal.
+            if (_goalContexts.ContainsKey(goalId))
+                return;
+
+            var goalSession = _masterSession.Fork($"brain-goal-{goalId}");
+            var context = await CreateGoalBrainContextAsync(goalId, goalSession, ct);
+            _goalContexts[goalId] = context;
+
+            _logger.LogInformation("Forked master session for goal '{GoalId}' ({Messages} messages)",
+                goalId, goalSession.MessageHistory.Count);
         }
         finally
         {
@@ -701,35 +753,49 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         }
     }
 
-    /// <summary>Core fork logic. Callers must hold <see cref="_sessionLock"/>.</summary>
-    private async Task ForkSessionForGoalCoreAsync(string goalId, CancellationToken ct)
-    {
-        var goalSession = _masterSession.Fork($"brain-goal-{goalId}");
-        var goalSessionFile = GetGoalSessionFilePath(goalId);
-        await goalSession.SaveAsync(goalSessionFile, ct);
-        _logger.LogInformation("Forked master session for goal '{GoalId}' ({Messages} messages)",
-            goalId, goalSession.MessageHistory.Count);
-
-        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
-        {
-            SessionId = $"brain-goal-{goalId}",
-            SessionType = LlmSessionType.BrainGoal,
-            GoalId = goalId,
-            Model = _modelOverride,
-            Status = "idle",
-            CurrentTokens = goalSession.EstimatedContextTokens,
-            MaxTokens = _maxContextTokens,
-        });
-        _registeredGoalSessions[goalId] = 0;
-    }
-
-    /// <summary>Loads the goal-specific session, saving the current session first if switching goals.</summary>
-    private async Task LoadGoalSessionAsync(string goalId, CancellationToken ct)
+    /// <summary>Loads (or forks) an existing goal session from disk and creates its Brain context.</summary>
+    /// <inheritdoc />
+    public async Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default)
     {
         await _sessionLock.WaitAsync(ct);
         try
         {
-            await LoadGoalSessionCoreAsync(goalId, ct);
+            if (_disposing)
+                throw new InvalidOperationException("Brain is being disposed.");
+            if (_resetting)
+                throw new InvalidOperationException("Brain is being reset.");
+            if (_deletingGoals.ContainsKey(goalId))
+                throw new InvalidOperationException($"Goal '{goalId}' is being deleted.");
+
+            // Idempotent: already have a context for this goal.
+            if (_goalContexts.ContainsKey(goalId))
+                return;
+
+            var goalSessionFile = GetGoalSessionFilePath(goalId);
+            AgentSession session;
+            if (File.Exists(goalSessionFile))
+            {
+                try
+                {
+                    session = await AgentSession.LoadAsync(goalSessionFile, ct);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "Failed to load existing goal session for '{GoalId}' — forking from master", goalId);
+                    session = _masterSession.Fork($"brain-goal-{goalId}");
+                }
+            }
+            else
+            {
+                session = _masterSession.Fork($"brain-goal-{goalId}");
+            }
+
+            var context = await CreateGoalBrainContextAsync(goalId, session, ct);
+            _goalContexts[goalId] = context;
+
+            _logger.LogInformation("Registered existing Brain context for goal '{GoalId}' ({Messages} messages)",
+                goalId, session.MessageHistory.Count);
         }
         finally
         {
@@ -737,137 +803,44 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         }
     }
 
-    /// <summary>Core load logic. Callers must hold <see cref="_sessionLock"/>.</summary>
-    private async Task LoadGoalSessionCoreAsync(string goalId, CancellationToken ct)
-    {
-        // Idempotent: already loaded for this goal
-        if (_activeGoalId == goalId && _session != null)
-            return;
-
-        if (_activeGoalId != null && _activeGoalId != goalId)
-            await SaveCurrentSessionCoreAsync(ct);
-
-        var goalSessionFile = GetGoalSessionFilePath(goalId);
-        if (File.Exists(goalSessionFile))
-            _session = await AgentSession.LoadAsync(goalSessionFile, ct);
-        else
-            _session = _masterSession.Fork($"brain-goal-{goalId}");
-
-        _activeGoalId = goalId;
-        RecreateAgent();
-    }
-
-    /// <summary>Persists the currently active goal session to disk. No-op if no goal is active.</summary>
-    private async Task SaveCurrentSessionAsync(CancellationToken ct)
+    /// <summary>Deletes the persisted goal session file and disposes the goal's Brain context.</summary>
+    /// <inheritdoc />
+    public async Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default)
     {
         await _sessionLock.WaitAsync(ct);
+        GoalBrainContext? context;
         try
         {
-            await SaveCurrentSessionCoreAsync(ct);
+            _deletingGoals[goalId] = true;
+            _goalContexts.TryRemove(goalId, out context);
         }
-        finally
-        {
-            _sessionLock.Release();
-        }
-    }
+        finally { _sessionLock.Release(); }
 
-    /// <summary>Core save-current-session logic. Callers must hold <see cref="_sessionLock"/>.</summary>
-    private async Task SaveCurrentSessionCoreAsync(CancellationToken ct)
-    {
-        if (_activeGoalId == null) return;
-        var goalSessionFile = GetGoalSessionFilePath(_activeGoalId);
-        await _session.SaveAsync(goalSessionFile, ct);
-    }
-
-    /// <summary>Deletes the persisted goal session file after goal completion or failure.</summary>
-    /// <inheritdoc />
-    public void DeleteGoalSession(string goalId)
-    {
-        _brainCallGate.Wait();
         try
         {
-            _sessionLock.Wait();
-            try
+            if (context is not null)
             {
-                DeleteGoalSessionCore(goalId);
+                context.Release(); // release dictionary reference
+                await context.WaitForDrainAsync(); // non-cancelable — must drain
+                try { context.ActiveCallCts?.Cancel(); } catch { }
             }
-            finally
+
+            var file = GetGoalSessionFilePath(goalId);
+            try { if (File.Exists(file)) File.Delete(file); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete session file for {GoalId}", goalId); }
+
+            _sessionRegistry?.Unregister($"brain-goal-{goalId}");
+
+            if (context is not null)
             {
-                _sessionLock.Release();
+                try { await context.DisposeAsync(); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to dispose context for {GoalId}", goalId); }
             }
         }
         finally
         {
-            _brainCallGate.Release();
+            _deletingGoals.TryRemove(goalId, out _);
         }
-    }
-
-    /// <summary>Core delete logic. Callers must hold both <see cref="_brainCallGate"/> and <see cref="_sessionLock"/>.</summary>
-    private void DeleteGoalSessionCore(string goalId)
-    {
-        var goalSessionFile = GetGoalSessionFilePath(goalId);
-        if (File.Exists(goalSessionFile))
-        {
-            File.Delete(goalSessionFile);
-            _logger.LogInformation("Deleted goal session for '{GoalId}'", goalId);
-        }
-        // Clear active state if this was the currently-loaded goal
-        if (_activeGoalId == goalId)
-        {
-            _activeGoalId = null;
-            _session = _masterSession;
-            RecreateAgent();
-            _logger.LogInformation("Cleared active goal session for '{GoalId}'", goalId);
-        }
-
-        _sessionRegistry?.Unregister($"brain-goal-{goalId}");
-        _registeredGoalSessions.TryRemove(goalId, out _);
-    }
-
-    /// <inheritdoc />
-    public void RegisterExistingGoalSession(string goalId)
-    {
-        _sessionLock.Wait();
-        try
-        {
-            RegisterExistingGoalSessionCore(goalId);
-        }
-        finally
-        {
-            _sessionLock.Release();
-        }
-    }
-
-    /// <summary>Core register-existing logic. Callers must hold <see cref="_sessionLock"/>.</summary>
-    private void RegisterExistingGoalSessionCore(string goalId)
-    {
-        long currentTokens = 0;
-        var goalSessionFile = GetGoalSessionFilePath(goalId);
-        if (File.Exists(goalSessionFile))
-        {
-            try
-            {
-                var session = AgentSession.LoadAsync(goalSessionFile).GetAwaiter().GetResult();
-                currentTokens = session.EstimatedContextTokens;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex,
-                    "Failed to load existing goal session for '{GoalId}' — registering with zero tokens", goalId);
-            }
-        }
-
-        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
-        {
-            SessionId = $"brain-goal-{goalId}",
-            SessionType = LlmSessionType.BrainGoal,
-            GoalId = goalId,
-            Model = _modelOverride,
-            Status = "idle",
-            CurrentTokens = currentTokens,
-            MaxTokens = _maxContextTokens,
-        });
-        _registeredGoalSessions[goalId] = 0;
     }
 
     /// <inheritdoc />
@@ -876,17 +849,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _sessionLock.Wait();
         try
         {
-            return GoalSessionExistsCore(goalId);
+            return File.Exists(GetGoalSessionFilePath(goalId));
         }
         finally
         {
             _sessionLock.Release();
         }
     }
-
-    /// <summary>Core session-exists check. Callers must hold <see cref="_sessionLock"/>.</summary>
-    private bool GoalSessionExistsCore(string goalId) =>
-        File.Exists(GetGoalSessionFilePath(goalId));
 
     /// <summary>Persists the master Brain session to disk.</summary>
     internal async Task SaveSessionAsync(CancellationToken ct = default)
@@ -1533,5 +1502,70 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _chatClient?.Dispose();
         _brainCallGate.Dispose();
         _sessionLock.Dispose();
+    }
+
+    /// <summary>Per-goal Brain execution context. Owns a dedicated gate, chat client, compaction
+    /// client, coding agent, and forked session so goals can execute in parallel without sharing
+    /// mutable state. Reference-counted so in-flight calls drain before disposal.</summary>
+    private sealed class GoalBrainContext : IAsyncDisposable
+    {
+        public string GoalId { get; }
+        public IChatClient? ChatClient { get; }
+        public bool OwnsChatClient { get; }
+        public IChatClient? CompactionClient { get; }
+        public CodingAgent Agent { get; }
+        public AgentSession Session { get; set; }
+        public BrainToolCallResult? LastToolCallResult { get; set; }
+        public string Model { get; }
+        public int MaxContextTokens { get; }
+        public ReasoningEffort? ReasoningEffort { get; }
+        public string SystemPrompt { get; }
+        public SemaphoreSlim Gate { get; } = new(1, 1);
+        public CancellationTokenSource? ActiveCallCts { get; set; }
+        private int _refCount = 1;
+        private readonly TaskCompletionSource _drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public GoalBrainContext(string goalId, IChatClient? chatClient, bool ownsChatClient,
+            IChatClient? compactionClient, CodingAgent agent, AgentSession session,
+            string model, int maxContextTokens, ReasoningEffort? reasoningEffort, string systemPrompt)
+        {
+            GoalId = goalId;
+            ChatClient = chatClient;
+            OwnsChatClient = ownsChatClient;
+            CompactionClient = compactionClient;
+            Agent = agent;
+            Session = session;
+            Model = model;
+            MaxContextTokens = maxContextTokens;
+            ReasoningEffort = reasoningEffort;
+            SystemPrompt = systemPrompt;
+        }
+
+        public bool TryAcquire()
+        {
+            while (true)
+            {
+                var current = Volatile.Read(ref _refCount);
+                if (current == 0) return false;
+                if (Interlocked.CompareExchange(ref _refCount, current + 1, current) == current)
+                    return true;
+            }
+        }
+
+        public void Release()
+        {
+            if (Interlocked.Decrement(ref _refCount) == 0)
+                _drained.TrySetResult();
+        }
+
+        public Task WaitForDrainAsync() => _drained.Task;
+
+        public async ValueTask DisposeAsync()
+        {
+            try { CompactionClient?.Dispose(); } catch { }
+            if (OwnsChatClient) { try { ChatClient?.Dispose(); } catch { } }
+            Gate.Dispose();
+            await ValueTask.CompletedTask;
+        }
     }
 }
