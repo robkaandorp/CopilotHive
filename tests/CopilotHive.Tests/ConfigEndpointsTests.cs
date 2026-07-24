@@ -301,6 +301,29 @@ public class ConfigEndpointsTests
         Assert.Contains("Failed to list branches for this repository.", body);
     }
 
+    [Fact]
+    public async Task GetRepositoryBranches_InvalidName_Returns400()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeBranchRepoManager([]) { ValidateNames = true };
+        using var factory = CreateBranchFactory(fake);
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/api/config/repositories/..%2Fescape/branches", ct);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(ct);
+        Assert.Contains("error", body);
+    }
+
+    // The 503 (no IBrainRepoManager registered) path is structurally unreachable via
+    // WebApplicationFactory: IBrainRepoManager is always registered in Program.cs, and
+    // other endpoints (goals API in ApiEndpoints.cs) also depend on it via inferred
+    // parameters. Removing it from DI causes those endpoints to fail at startup with
+    // "Failure to infer one or more parameters" before the branches endpoint can be
+    // reached. The 503 path exists as a defensive coding measure for future scenarios
+    // where the service might not be registered.
+
     private static WebApplicationFactory<Program> CreateBranchFactory(ConfigurableFakeBranchRepoManager fake)
     {
         var config = new HiveConfigFile

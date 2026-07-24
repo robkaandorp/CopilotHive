@@ -491,6 +491,10 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
             manager.ListRemoteBranchesAsync("../evil", ct));
         await Assert.ThrowsAsync<ArgumentException>(() =>
             manager.ListRemoteBranchesAsync("a/b", ct));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.ListRemoteBranchesAsync("", ct));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.ListRemoteBranchesAsync("   ", ct));
     }
 
     // ---------- ListRemoteBranchesAsync ----------
@@ -525,6 +529,24 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
 
         Assert.DoesNotContain("HEAD", branches);
         Assert.Contains("HEAD-fix", branches);
+    }
+
+    [Fact]
+    public async Task ListRemoteBranchesAsync_ReturnsBranchesSortedAlphabetically()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (remoteDir, _, manager) = SetupRepo("sorted-branches-repo");
+
+        // Create branches in non-alphabetical order.
+        CreateBranchWithCommit(remoteDir, "main", "zebra", "z.txt", "zebra content");
+        CreateBranchWithCommit(remoteDir, "main", "apple", "a.txt", "apple content");
+        CreateBranchWithCommit(remoteDir, "main", "mango", "m.txt", "mango content");
+
+        var branches = await manager.ListRemoteBranchesAsync("sorted-branches-repo", ct);
+
+        // Expect sorted order: apple, main, mango, zebra
+        var expected = new List<string> { "apple", "main", "mango", "zebra" };
+        Assert.Equal(expected, branches);
     }
 
     [Fact]
