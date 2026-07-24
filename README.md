@@ -179,7 +179,7 @@ goals:
 | `src/CopilotHive/` | Main orchestrator — Brain, GoalDispatcher, persistence, metrics |
 | `src/CopilotHive.Shared/` | Shared protobuf definitions and DTOs |
 | `src/CopilotHive.Worker/` | Worker process (runs inside Docker containers) |
-| `tests/` | 2440+ xUnit tests |
+| `tests/` | 2700+ xUnit tests |
 | `agents/` | Default agent templates (overridden by config repo at runtime) |
 | `docker/` | Dockerfiles and container configuration |
 
@@ -213,6 +213,8 @@ goals:
 - **Goal Progress Narratives** — Workers write reflective narratives (what they tried, what worked, what they struggled with) via a `report_narrative` tool call. These are appended to a living progress document in the knowledge graph, alongside the Brain's iteration plan and summary. The progress document is linked to the goal and visible on the goal detail page. The Composer can read it to answer questions about goal execution. The Brain reads it before planning new iterations for richer context
 - **Pre-Execution Goal Review** — An optional review process where a capable model verifies goal descriptions before dispatch. The reviewer checks file references, code references, scope, acceptance criteria, and dependencies against the actual codebase. Produces a verdict and review document in the knowledge graph. The Composer can trigger reviews and automatically refine goals based on feedback
 - **LLM Session Dashboard** — A unified view of all active LLM sessions in the orchestrator container on the Orchestrator dashboard page. Shows Brain master, Brain per-goal, Composer, and Goal Review sessions with model, context usage, status, and last activity
+- **Release Automation** — When a release is marked as Released, CopilotHive can automatically merge the working branch (e.g. `develop`) to a configurable target branch (e.g. `main`) and create a version tag, triggering CI. Per-repository configuration controls which branch to merge to and which branch to tag. Pre-release validation ensures all goals are completed and repositories are configured before execution. Rollback support deletes created tags on failure (merges are not reverted)
+- **Repository Branch Dropdowns** — Repository configuration uses dropdowns populated from actual remote branches instead of manual text entry, making it easier to configure release automation correctly
 - **`get_current_time` Tool** — The Brain and Composer can query the current UTC date and time on demand via a `get_current_time` tool call, eliminating the need for the human to provide the date for changelog entries and release notes
 - **Goals REST API** — `GET/POST/PATCH/DELETE /api/goals`, `GET /api/goals/{id}`, `GET /api/goals/search?q=…&status=…`, `POST /api/goals/{id}/cancel`
 - **Releases REST API** — `GET/POST/PATCH/DELETE /api/releases`, `GET /api/releases/{id}`; release statuses follow the lifecycle **Planning → In Progress → Released**; goals can be assigned to a release via the API or the Composer
