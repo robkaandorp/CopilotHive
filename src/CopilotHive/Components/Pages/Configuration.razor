@@ -559,8 +559,28 @@ else
                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:100%" />
                                         </td>
                                         <td style="padding:0.5rem">
-                                            <input @bind="_editRepoDefaultBranch"
-                                                   style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem" />
+                                            <select @bind="_editRepoDefaultBranch" title="Default working branch for this repository"
+                                                    disabled="@(_loadingBranches || _branchLoadError)"
+                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem">
+                                                @if (_loadingBranches)
+                                                {
+                                                    <option value="">Loading…</option>
+                                                }
+                                                else if (_branchLoadError)
+                                                {
+                                                    <option value="">⚠️ Failed to load</option>
+                                                }
+                                                else
+                                                {
+                                                    @if (_repoBranches is not null)
+                                                    {
+                                                        @foreach (var branch in _repoBranches)
+                                                        {
+                                                            <option value="@branch">@branch</option>
+                                                        }
+                                                    }
+                                                }
+                                            </select>
                                         </td>
                                         <td style="padding:0.5rem">
                                             <select @bind="_editRepoMergeTo" title="Branch to merge the default branch into on release"
