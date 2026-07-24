@@ -2878,6 +2878,93 @@ public sealed class DistributedBrainTests
         }
     }
 
+    [Fact]
+    public async Task SummarizeAndMergeAsync_ResetsLastKnownContextTokens_AfterAppendingSummary()
+    {
+        // Arrange
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var stubClient = new IterationPlanStubClient(
+                callId: "call-summary-token-reset",
+                phases: ["coding", "testing"],
+                reason: "Test summary");
+
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: stubClient);
+
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var masterSessionField = typeof(DistributedBrain)
+                .GetField("_masterSession", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+
+            // Seed a stale last-known token count on the master session.
+            masterSession.LastKnownContextTokens = 99999;
+
+            var goalId = "goal-summary-token-reset";
+            await brain.ForkSessionForGoalAsync(goalId, TestContext.Current.CancellationToken);
+            var pipeline = CreatePipeline(goalId, "Test goal");
+
+            // Act
+            await brain.SummarizeAndMergeAsync(pipeline, TestContext.Current.CancellationToken);
+
+            // Assert
+            masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+            Assert.Equal(0, masterSession!.LastKnownContextTokens);
+            var stats = brain.GetStats();
+            Assert.NotNull(stats);
+            Assert.Equal(masterSession.EstimatedContextTokens, stats.ContextTokens);
+            Assert.NotEqual(99999, stats.ContextTokens);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task InjectSystemNoteAsync_ResetsLastKnownContextTokens_AfterAppendingNote()
+    {
+        // Arrange
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient());
+
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var masterSessionField = typeof(DistributedBrain)
+                .GetField("_masterSession", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+
+            // Seed a stale last-known token count on the master session.
+            masterSession.LastKnownContextTokens = 99999;
+
+            var pipeline = CreatePipeline("goal-note-token-reset", "Test goal");
+
+            // Act
+            await brain.InjectSystemNoteAsync(pipeline, "Test plan adjustment note", TestContext.Current.CancellationToken);
+
+            // Assert
+            masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+            Assert.Equal(0, masterSession!.LastKnownContextTokens);
+            var stats = brain.GetStats();
+            Assert.NotNull(stats);
+            Assert.Equal(masterSession.EstimatedContextTokens, stats.ContextTokens);
+            Assert.NotEqual(99999, stats.ContextTokens);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
     // ── Compaction Model Tests ─────────────────────────────────────────────────
 
     /// <summary>
