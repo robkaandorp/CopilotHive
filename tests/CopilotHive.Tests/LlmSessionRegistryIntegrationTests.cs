@@ -174,49 +174,160 @@ public sealed class LlmSessionRegistryIntegrationTests
     // ── DistributedBrain: gated operations acquire _brainCallGate ──────────────
 
     [Fact]
-    public async Task ForkSessionForGoalAsync_AcquiresBrainCallGate_SerializesWithGatedOperation()
+    public async Task ForkSessionForGoalAsync_DoesNotBlockOnBrainCallGate()
     {
         var tempDir = CreateTempDir();
         try
         {
             var registry = new LlmSessionRegistry();
-            // A chat client that blocks the first LLM call so the gate is held while we attempt to fork.
+            // A chat client that blocks the first LLM call so _brainCallGate is held while we fork.
             var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             var blocking = new BlockingBrainChatClient(release.Task, entered, "planning done");
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
                 stateDir: tempDir, chatClient: blocking, sessionRegistry: registry);
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
-            await brain.ForkSessionForGoalAsync("goal-gate-fork", TestContext.Current.CancellationToken);
+            await brain.ForkSessionForGoalAsync("goal-nogate-a", TestContext.Current.CancellationToken);
 
-            // Start a gated LLM operation that will hold _brainCallGate while blocked in the client.
-            var pipeline = CreatePipeline("goal-gate-fork", "Gate fork goal");
+            // Hold _brainCallGate via a blocked LLM call for goal A.
+            var pipeline = CreatePipeline("goal-nogate-a", "No-gate fork goal A");
             var planTask = brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
 
             // Deterministic: the blocking client signals `entered` from inside the LLM call, which
             // only happens while _brainCallGate is held. Awaiting it proves the gate is held.
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
-            // No fork has run yet, so the registry has no entry for the competing goal.
-            Assert.Null(FindSession(registry, "brain-goal-goal-gate-fork-2"));
+            // Fork a DIFFERENT goal. Because ForkSessionForGoalAsync now uses _sessionLock (NOT
+            // _brainCallGate), it must complete even while the gate is held by the blocked LLM call.
+            // The bounded WaitAsync is only a deadlock guard — success proves fork does not wait
+            // on _brainCallGate.
+            await brain.ForkSessionForGoalAsync("goal-nogate-b", TestContext.Current.CancellationToken)
+                .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
-            // Start the competing fork. ForkSessionForGoalAsync awaits _brainCallGate.WaitAsync as its
-            // first operation, so the returned task is already parked on the held gate — it cannot have
-            // run ForkSessionForGoalCoreAsync (which is what registers the goal session).
-            var forkTask = brain.ForkSessionForGoalAsync("goal-gate-fork-2", TestContext.Current.CancellationToken);
+            // The fork registered the goal session while the gate was still held.
+            Assert.NotNull(FindSession(registry, "brain-goal-goal-nogate-b"));
 
-            // Deterministic proof of the blocked state via observable registry state — NO timing wait.
-            // If the gate were not held, the fork would already have registered the goal session; the
-            // absence of the entry proves the fork is serialized behind the gate.
-            Assert.Null(FindSession(registry, "brain-goal-goal-gate-fork-2"));
-
-            // Release the gate; the fork must now complete. The bounded WaitAsync is only a deadlock
-            // guard, not the synchronization mechanism.
+            // Release the gate and let the plan call finish.
             release.SetResult(true);
-            await forkTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
             await planTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tempDir);
+        }
+    }
 
-            Assert.NotNull(FindSession(registry, "brain-goal-goal-gate-fork-2"));
+    [Fact]
+    public async Task ForkSessionForGoalAsync_SerializedBySessionLock()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var registry = new LlmSessionRegistry();
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient(), sessionRegistry: registry);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            // Reach into the private _sessionLock and hold it, proving that ForkSessionForGoalAsync
+            // is serialized behind it (i.e. it acquires _sessionLock as its first operation).
+            var sessionLockField = typeof(DistributedBrain).GetField("_sessionLock",
+                BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new InvalidOperationException("_sessionLock field not found on DistributedBrain");
+            var sessionLock = (SemaphoreSlim)sessionLockField.GetValue(brain)!;
+
+            await sessionLock.WaitAsync(TestContext.Current.CancellationToken);
+            try
+            {
+                // Start a fork while _sessionLock is held — it must park on the lock and NOT register.
+                var forkTask = brain.ForkSessionForGoalAsync("goal-serialized-1", TestContext.Current.CancellationToken);
+
+                // Deterministic proof via observable registry state — the fork cannot have run its
+                // core logic because _sessionLock is held.
+                Assert.Null(FindSession(registry, "brain-goal-goal-serialized-1"));
+                Assert.False(forkTask.IsCompleted);
+
+                // Release _sessionLock; the fork must now complete.
+                sessionLock.Release();
+                await forkTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+                Assert.NotNull(FindSession(registry, "brain-goal-goal-serialized-1"));
+            }
+            catch
+            {
+                // Ensure the lock is released even if an assertion fails mid-test.
+                if (sessionLock.CurrentCount == 0)
+                    sessionLock.Release();
+                throw;
+            }
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteGoalSession_AcquiresBothLocks_InOrder()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var registry = new LlmSessionRegistry();
+            var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var blocking = new BlockingBrainChatClient(release.Task, entered, "planning done");
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: blocking, sessionRegistry: registry);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+            await brain.ForkSessionForGoalAsync("goal-both-a", TestContext.Current.CancellationToken);
+            await brain.ForkSessionForGoalAsync("goal-both-b", TestContext.Current.CancellationToken);
+
+            // Part 1: prove delete blocks on _brainCallGate.
+            var pipeline = CreatePipeline("goal-both-a", "Both-locks goal A");
+            var planTask = brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            Assert.NotNull(FindSession(registry, "brain-goal-goal-both-b"));
+            var deleteTask = Task.Run(() => brain.DeleteGoalSession("goal-both-b"),
+                TestContext.Current.CancellationToken);
+
+            // The gate is held, so the delete cannot have unregistered the session.
+            Assert.NotNull(FindSession(registry, "brain-goal-goal-both-b"));
+
+            release.SetResult(true);
+            await deleteTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await planTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            Assert.Null(FindSession(registry, "brain-goal-goal-both-b"));
+
+            // Part 2: with _brainCallGate free, prove delete also blocks on _sessionLock.
+            var sessionLockField = typeof(DistributedBrain).GetField("_sessionLock",
+                BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new InvalidOperationException("_sessionLock field not found on DistributedBrain");
+            var sessionLock = (SemaphoreSlim)sessionLockField.GetValue(brain)!;
+
+            await sessionLock.WaitAsync(TestContext.Current.CancellationToken);
+            var lockHeld = true;
+            try
+            {
+                Assert.NotNull(FindSession(registry, "brain-goal-goal-both-a"));
+                var deleteTask2 = Task.Run(() => brain.DeleteGoalSession("goal-both-a"),
+                    TestContext.Current.CancellationToken);
+
+                // _sessionLock is held, so the delete cannot reach DeleteGoalSessionCore.
+                Assert.NotNull(FindSession(registry, "brain-goal-goal-both-a"));
+                Assert.False(deleteTask2.IsCompleted);
+
+                sessionLock.Release();
+                lockHeld = false;
+                await deleteTask2.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+                Assert.Null(FindSession(registry, "brain-goal-goal-both-a"));
+            }
+            catch
+            {
+                if (lockHeld && sessionLock.CurrentCount == 0)
+                    sessionLock.Release();
+                throw;
+            }
         }
         finally
         {
