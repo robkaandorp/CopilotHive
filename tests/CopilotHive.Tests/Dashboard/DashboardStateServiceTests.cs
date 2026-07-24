@@ -1,3 +1,4 @@
+using System.Reflection;
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Goals;
@@ -2798,6 +2799,55 @@ public sealed class DashboardStateServiceTests : IDisposable
             logSink, progressLog, goalStore: null, knowledgeGraph: knowledgeGraph);
 
         Assert.Equal(0, service.GetKnowledgeDocumentCount());
+    }
+
+    /// <summary>
+    /// Regression test: DB goals with InProgress status must overwrite cached Pending goals.
+    /// Before the fix, <c>TryAdd</c> was used for DB goals, so a cached Pending goal would
+    /// remain even when the DB had the goal as InProgress. After the fix, <c>goalsById[g.Id] = g</c>
+    /// ensures the DB status wins.
+    /// </summary>
+    [Fact]
+    public async Task GetSnapshot_DBGoalInProgress_OverwritesCachedPendingGoal()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Arrange: create a goal as Pending in the store
+        var goalId = $"goal-stale-{Guid.NewGuid():N}";
+        var goal = new Goal
+        {
+            Id = goalId,
+            Description = "Goal that transitions from Pending to InProgress",
+            Status = GoalStatus.Pending,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store);
+
+        // Simulate the timer having cached the goal as Pending
+        var cachedField = typeof(DashboardStateService)
+            .GetField("_cachedPendingGoals", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        cachedField.SetValue(service, new List<Goal> { new Goal { Id = goalId, Description = goal.Description, Status = GoalStatus.Pending } });
+
+        // Now update the goal to InProgress in the store (simulates dispatcher marking it)
+        await _store.UpdateGoalStatusAsync(goalId, GoalStatus.InProgress,
+            new GoalUpdateMetadata { StartedAt = DateTime.UtcNow }, ct);
+
+        // Act: get snapshot — DB goal (InProgress) should overwrite cached Pending goal
+        var snapshot = await service.GetSnapshot();
+
+        // Assert: the goal should show InProgress, not Pending
+        var snapshotGoal = Assert.Single(snapshot.Goals, g => g.Id == goalId);
+        Assert.Equal(GoalStatus.InProgress, snapshotGoal.Status);
     }
 }
 

@@ -586,7 +586,7 @@ public sealed class PlanAdjustmentInjectionTests
     private static Task InvokeDispatchNextGoalAsync(GoalDispatcher dispatcher, CancellationToken ct)
     {
         var method = typeof(GoalDispatcher).GetMethod(
-            "DispatchNextGoalAsync",
+            "DispatchNextGoalAsyncSync",
             BindingFlags.NonPublic | BindingFlags.Instance)!;
         return (Task)method.Invoke(dispatcher, [ct])!;
     }

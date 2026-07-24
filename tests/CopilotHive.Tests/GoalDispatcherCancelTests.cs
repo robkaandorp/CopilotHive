@@ -1,3 +1,4 @@
+using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
@@ -328,18 +329,31 @@ public sealed class GoalDispatcherClearRetryStateTests
     {
         // This test proves that ClearGoalRetryState actually clears _dispatchedGoals.
         // _dispatchedGoals is only populated inside the private DispatchNextGoalAsync method,
-        // so we must run the background service loop to populate it, then verify that
+        // so we must run the dispatch to populate it, then verify that
         // after ClearGoalRetryState the same dispatcher can dispatch the goal again.
         //
-        // Without clearing _dispatchedGoals, the second dispatch loop would silently return
+        // Without clearing _dispatchedGoals, the second dispatch would silently return
         // early at the TryAdd guard in DispatchNextGoalAsync, and no second pipeline would form.
         var logger = new RetryStateCollectingLogger<GoalDispatcher>();
-        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Retry goal", Status = GoalStatus.Pending };
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Retry goal", Status = GoalStatus.Pending, RepositoryNames = ["test-repo"] };
         var goalSource = new CancelFakeGoalSource(goal);
         var goalManager = new GoalManager();
         goalManager.AddSource(goalSource);
 
         var pipelineManager = new GoalPipelineManager();
+
+        var config = new HiveConfigFile
+        {
+            Repositories =
+            {
+                new CopilotHive.Configuration.RepositoryConfig
+                {
+                    Name = "test-repo",
+                    Url = "https://example.com/test-repo.git",
+                    DefaultBranch = "develop",
+                },
+            },
+        };
 
         var dispatcher = new GoalDispatcher(
             goalManager,
@@ -349,20 +363,18 @@ public sealed class GoalDispatcherClearRetryStateTests
             new TaskCompletionNotifier(),
             logger,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            config: config,
             startupDelay: TimeSpan.Zero);
 
-        // Act 1: Run the background service so DispatchNextGoalAsync executes and
-        // populates _dispatchedGoals[goalId]. The goal becomes InProgress after dispatch.
-        using var cts1 = new CancellationTokenSource();
-        using var linked1 = CancellationTokenSource.CreateLinkedTokenSource(
-            cts1.Token, TestContext.Current.CancellationToken);
-        var task1 = dispatcher.StartAsync(linked1.Token);
-        await Task.Delay(200, TestContext.Current.CancellationToken);
-        cts1.Cancel();
-        await Task.WhenAny(task1, Task.Delay(1000, TestContext.Current.CancellationToken));
+        var ct = TestContext.Current.CancellationToken;
+
+        // Act 1: Dispatch the goal directly via the synchronous test wrapper.
+        // This reserves the goal (adds to _dispatchedGoals), marks it InProgress,
+        // launches DispatchGoalAsync on Task.Run, and awaits the background task.
+        await InvokeDispatchNextGoalAsyncSync(dispatcher, ct);
 
         // Assert: pipeline was created — this proves _dispatchedGoals was populated by
-        // DispatchNextGoalAsync (the TryAdd guard at line 1439 ran and succeeded).
+        // DispatchNextGoalAsync (the TryAdd guard ran and succeeded).
         var pipelineAfterFirstDispatch = pipelineManager.GetByGoalId(goal.Id);
         Assert.NotNull(pipelineAfterFirstDispatch);
         var firstDispatchLogs = logger.Logs.Count(l => l.Message.Contains($"Dispatching goal '{goal.Id}'"));
@@ -375,20 +387,26 @@ public sealed class GoalDispatcherClearRetryStateTests
         // Assert: pipeline was removed by ClearGoalRetryState.
         Assert.Null(pipelineManager.GetByGoalId(goal.Id));
 
-        // Act 3: Run the SAME dispatcher instance again. Because _dispatchedGoals was cleared,
+        // Act 3: Dispatch again. Because _dispatchedGoals was cleared,
         // TryAdd in DispatchNextGoalAsync succeeds and the goal is dispatched a second time.
         // Without ClearGoalRetryState, TryAdd would fail and no second dispatch log would appear.
-        using var cts2 = new CancellationTokenSource();
-        using var linked2 = CancellationTokenSource.CreateLinkedTokenSource(
-            cts2.Token, TestContext.Current.CancellationToken);
-        var task2 = dispatcher.StartAsync(linked2.Token);
-        await Task.Delay(200, TestContext.Current.CancellationToken);
-        cts2.Cancel();
-        await Task.WhenAny(task2, Task.Delay(1000, TestContext.Current.CancellationToken));
+        await InvokeDispatchNextGoalAsyncSync(dispatcher, ct);
 
         // Assert: goal was dispatched a second time — proving _dispatchedGoals was cleared.
         var totalDispatchLogs = logger.Logs.Count(l => l.Message.Contains($"Dispatching goal '{goal.Id}'"));
         Assert.Equal(2, totalDispatchLogs);
+    }
+
+    /// <summary>
+    /// Invokes the internal <c>DispatchNextGoalAsyncSync</c> method via reflection.
+    /// This runs the full dispatch workflow inline (reserves, launches Task.Run, awaits it).
+    /// </summary>
+    private static Task InvokeDispatchNextGoalAsyncSync(GoalDispatcher dispatcher, CancellationToken ct)
+    {
+        var method = typeof(GoalDispatcher).GetMethod(
+            "DispatchNextGoalAsyncSync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        return (Task)method.Invoke(dispatcher, [ct])!;
     }
 }
 

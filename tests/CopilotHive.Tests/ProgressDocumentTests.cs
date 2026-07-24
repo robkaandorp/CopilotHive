@@ -977,7 +977,7 @@ public sealed class ProgressDocumentTests
     private static Task InvokeDispatchNextGoalAsync(GoalDispatcher dispatcher, CancellationToken ct)
     {
         var method = typeof(GoalDispatcher).GetMethod(
-            "DispatchNextGoalAsync",
+            "DispatchNextGoalAsyncSync",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
         return (Task)method.Invoke(dispatcher, [ct])!;
     }

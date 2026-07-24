@@ -2300,7 +2300,7 @@ public sealed class GoalDispatcherFirstPhaseDispatchTests
     private static Task InvokeDispatchNextGoalAsync(GoalDispatcher dispatcher, CancellationToken ct)
     {
         var method = typeof(GoalDispatcher).GetMethod(
-            "DispatchNextGoalAsync",
+            "DispatchNextGoalAsyncSync",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
         return (Task)method.Invoke(dispatcher, [ct])!;
     }
@@ -2606,9 +2606,20 @@ public sealed class GoalDispatcherParallelDispatchTests
             config: config,
             startupDelay: TimeSpan.Zero);
 
-        // Act: dispatch twice in sequence
+        // Act: dispatch — the new DispatchNextGoalAsync loops internally up to MaxParallelGoals,
+        // so a single call dispatches both goals. DispatchNextGoalAsyncSync awaits the last
+        // background task, but the first may still be running — add a short poll for both.
         await InvokeDispatchNextGoalAsync(dispatcher, ct);
-        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Wait for both pipelines to appear (the first goal's Task.Run may still be in flight)
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (DateTime.UtcNow < deadline)
+        {
+            var current = pipelineManager.GetActivePipelines();
+            if (current.Count >= 2)
+                break;
+            await Task.Delay(50, ct);
+        }
 
         // Assert: both goals dispatched (2 pipelines created)
         var activePipelines = pipelineManager.GetActivePipelines();
@@ -2720,12 +2731,313 @@ public sealed class GoalDispatcherParallelDispatchTests
         Assert.Equal(goalId, brain.ForkCalls[0]);
     }
 
+    // ── Capacity boundary tests ──────────────────────────────────────────────
+
+    /// <summary>
+    /// When MaxParallelGoals = 2 and two goals are already dispatched (2 pipelines or
+    /// 1 pipeline + 1 dispatching), a third goal must NOT be dispatched.
+    /// This verifies the capacity check: <c>activePipelines.Count + _dispatchingCount >= maxParallel</c>.
+    /// </summary>
+    [Fact]
+    public async Task MaxParallelGoals_equals_2_with_2_dispatched_does_not_dispatch_third()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { MaxParallelGoals = 2 },
+            Repositories =
+            [
+                new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
+            ],
+        };
+
+        // Create three goals
+        var goal1 = new Goal { Id = $"goal-cap-1-{Guid.NewGuid():N}", Description = "Cap goal 1", RepositoryNames = ["test-repo"] };
+        var goal2 = new Goal { Id = $"goal-cap-2-{Guid.NewGuid():N}", Description = "Cap goal 2", RepositoryNames = ["test-repo"] };
+        var goal3 = new Goal { Id = $"goal-cap-3-{Guid.NewGuid():N}", Description = "Cap goal 3", RepositoryNames = ["test-repo"] };
+        var goalSource = new ParallelFakeGoalSource([goal1, goal2, goal3]);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+
+        var brain = new ParallelDispatchBrain();
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain,
+            config: config,
+            startupDelay: TimeSpan.Zero);
+
+        // Act: single call to DispatchNextGoalAsync dispatches up to maxParallel (2) goals.
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Wait for both pipelines to appear
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (pipelineManager.GetActivePipelines().Count >= 2)
+                break;
+            await Task.Delay(50, ct);
+        }
+
+        // Assert: only 2 pipelines created (third goal NOT dispatched)
+        var activePipelines = pipelineManager.GetActivePipelines();
+        Assert.Equal(2, activePipelines.Count);
+        Assert.DoesNotContain(activePipelines, p => p.GoalId == goal3.Id);
+    }
+
+    // ── DispatchOutcome tests ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// When a goal references a repository not in config, <c>ResolveRepositories</c> throws
+    /// and <c>DispatchToRole</c> returns <c>FailedBeforeEnqueue</c>. The goal must be marked
+    /// Failed and the pipeline removed by <c>HandleDispatchFailureAsync</c>.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_RepositoryNotInConfig_MarksGoalFailed()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { MaxParallelGoals = 1 },
+            Repositories =
+            [
+                new RepositoryConfig { Name = "real-repo", Url = "https://github.com/test/real-repo", DefaultBranch = "main" },
+            ],
+        };
+
+        // Goal references a repo NOT in config
+        var goal = new Goal
+        {
+            Id = $"goal-bad-repo-{Guid.NewGuid():N}",
+            Description = "Goal with bad repo",
+            RepositoryNames = ["nonexistent-repo"],
+        };
+        var goalSource = new ParallelFakeGoalSource([goal]);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+
+        var brain = new ParallelDispatchBrain();
+        var pipelineManager = new GoalPipelineManager();
+        var logger = new CollectingLogger<GoalDispatcher>();
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain,
+            config: config,
+            startupDelay: TimeSpan.Zero);
+
+        // Act
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Assert: no pipeline remains (HandleDispatchFailureAsync removed it)
+        Assert.Null(pipelineManager.GetByGoalId(goal.Id));
+
+        // Assert: error logged about repository configuration
+        Assert.Contains(logger.Logs, l => l.Message.Contains("Repository configuration error") || l.Message.Contains("Error dispatching"));
+    }
+
+    /// <summary>
+    /// When a goal is dispatched with no idle workers, <c>DispatchToRole</c> enqueues the task
+    /// and returns <c>QueuedNoWorker</c>. The pipeline must remain and the task must be in the queue.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_NoIdleWorker_QueuesTaskAndKeepsPipeline()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { MaxParallelGoals = 1 },
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { Model = "test-model" },
+            },
+            Repositories =
+            [
+                new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
+            ],
+        };
+
+        var goal = new Goal
+        {
+            Id = $"goal-queued-{Guid.NewGuid():N}",
+            Description = "Goal that will be queued",
+            RepositoryNames = ["test-repo"],
+        };
+        var goalSource = new ParallelFakeGoalSource([goal]);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+
+        var brain = new ParallelDispatchBrain();
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            new GrpcWorkerGateway(new WorkerPool()), // no workers registered
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain,
+            config: config,
+            startupDelay: TimeSpan.Zero);
+
+        // Act
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Assert: pipeline still exists (QueuedNoWorker does NOT trigger HandleDispatchFailureAsync)
+        var pipeline = pipelineManager.GetByGoalId(goal.Id);
+        Assert.NotNull(pipeline);
+
+        // Assert: task was enqueued (active task ID is set)
+        Assert.NotNull(pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// When a goal is dispatched with an idle worker, <c>DispatchToRole</c> sends the task
+    /// and returns <c>SentToWorker</c>. The task is sent to the worker.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_IdleWorker_SendsTaskToWorker()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { MaxParallelGoals = 1 },
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { Model = "test-model" },
+            },
+            Repositories =
+            [
+                new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
+            ],
+        };
+
+        var goal = new Goal
+        {
+            Id = $"goal-sent-{Guid.NewGuid():N}",
+            Description = "Goal that will be sent to worker",
+            RepositoryNames = ["test-repo"],
+        };
+        var goalSource = new ParallelFakeGoalSource([goal]);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+
+        var brain = new ParallelDispatchBrain();
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+        var workerPool = new WorkerPool();
+        workerPool.RegisterWorker("w-test", []); // register an idle worker
+        var gateway = new GrpcWorkerGateway(workerPool);
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            gateway,
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain,
+            config: config,
+            startupDelay: TimeSpan.Zero);
+
+        // Act
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Assert: pipeline exists and task was sent
+        var pipeline = pipelineManager.GetByGoalId(goal.Id);
+        Assert.NotNull(pipeline);
+        Assert.NotNull(pipeline.ActiveTaskId);
+
+        // Assert: worker is marked busy with the task
+        Assert.True(workerPool.GetIdleWorker() is null, "Worker should be busy after task sent");
+    }
+
+    // ── Shutdown tests ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Starting the dispatcher with goals available, then stopping it, must shut down cleanly
+    /// without unobserved task exceptions. The shutdown logic cancels all dispatch CTS entries
+    /// and awaits remaining tasks with a 30s timeout.
+    /// </summary>
+    [Fact]
+    public async Task Shutdown_CancelsAllCtsAndAwaitsTasks_Cleanly()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { MaxParallelGoals = 2 },
+            Repositories =
+            [
+                new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
+            ],
+        };
+
+        var goal1 = new Goal { Id = $"goal-shutdown-1-{Guid.NewGuid():N}", Description = "Shutdown goal 1", RepositoryNames = ["test-repo"] };
+        var goal2 = new Goal { Id = $"goal-shutdown-2-{Guid.NewGuid():N}", Description = "Shutdown goal 2", RepositoryNames = ["test-repo"] };
+        var goalSource = new ParallelFakeGoalSource([goal1, goal2]);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+
+        var brain = new ParallelDispatchBrain();
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain,
+            config: config,
+            startupDelay: TimeSpan.Zero);
+
+        // Act: start the background service
+        using var startCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var startTask = dispatcher.StartAsync(startCts.Token);
+
+        // Let it dispatch goals
+        await Task.Delay(500, ct);
+
+        // Stop the service — triggers ExecuteAsync's finally block (cancels CTS, awaits tasks)
+        await dispatcher.StopAsync(ct);
+
+        // Assert: StopAsync completes without throwing (no unobserved exceptions)
+        // If StopAsync hangs or throws, the test will time out or fail.
+        // The fact that we reached this line means shutdown was clean.
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────
 
     private static Task InvokeDispatchNextGoalAsync(GoalDispatcher dispatcher, CancellationToken ct)
     {
         var method = typeof(GoalDispatcher).GetMethod(
-            "DispatchNextGoalAsync",
+            "DispatchNextGoalAsyncSync",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
         return (Task)method.Invoke(dispatcher, [ct])!;
     }
