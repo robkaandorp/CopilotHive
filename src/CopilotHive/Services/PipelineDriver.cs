@@ -30,7 +30,7 @@ internal sealed class PipelineDriver
     private readonly ConfigRepoManager? _configRepo;
 
     // Callbacks into GoalDispatcher
-    private readonly Func<GoalPipeline, WorkerRole, string?, CancellationToken, Task> _dispatchToRole;
+    private readonly Func<GoalPipeline, WorkerRole, string?, CancellationToken, Task<GoalDispatcher.DispatchOutcome>> _dispatchToRole;
     private readonly Func<GoalPipeline, GoalPhase, string?, CancellationToken, Task<string>> _resolvePrompt;
     private readonly Func<GoalPipeline, string?, CancellationToken, Task<IterationPlan>> _resolvePlan;
     private readonly Func<Goal, List<TargetRepository>> _resolveRepositories;
@@ -45,7 +45,7 @@ internal sealed class PipelineDriver
         ImprovementAnalyzer? improvementAnalyzer,
         AgentsManager? agentsManager,
         MetricsTracker? metricsTracker,
-        Func<GoalPipeline, WorkerRole, string?, CancellationToken, Task> dispatchToRole,
+        Func<GoalPipeline, WorkerRole, string?, CancellationToken, Task<GoalDispatcher.DispatchOutcome>> dispatchToRole,
         Func<GoalPipeline, GoalPhase, string?, CancellationToken, Task<string>> resolvePrompt,
         Func<GoalPipeline, string?, CancellationToken, Task<IterationPlan>> resolvePlan,
         Func<Goal, List<TargetRepository>> resolveRepositories,
