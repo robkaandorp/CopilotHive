@@ -1,5 +1,25 @@
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-24
+
+### Added
+
+- **Release Automation** — Per-repository release configuration with automatic merge of the working branch to a configurable target branch (e.g. `main`) and version tagging when a release is marked as Released. Pre-release validation ensures all goals are completed and repositories are configured. Rollback support deletes created tags on failure (merges are not reverted). Dashboard shows a "Validate" button with validation feedback, per-repository merge/tag results, and disables the "Unrelease" button since git operations are irreversible. (`copilothive-release-config`, `copilothive-release-git-ops`, `copilothive-release-execution`, `copilothive-release-dashboard`)
+
+- **Repository Branch Dropdowns** — The repository configuration edit form now uses dropdowns populated from actual remote branches instead of text inputs for default branch, release merge target, and release tag branch. Branches are fetched on-demand when the edit form opens. (`copilothive-repo-branch-dropdown`, `copilothive-default-branch-dropdown`)
+
+### Fixed
+
+- **Parallel Goal Execution Regression** — Fixed a regression where session management operations unnecessarily held the Brain's LLM call gate (`_brainCallGate`), blocking the dispatch loop and preventing parallel goal execution. `ForkSessionForGoalAsync` and `RegisterExistingGoalSession` were moved to a separate lightweight `_sessionLock` that doesn't block Brain LLM calls. `DeleteGoalSession` still acquires `_brainCallGate` (since it mutates active session state) followed by `_sessionLock`, but this doesn't block parallelism since it's called during goal completion, not during dispatch. (`copilothive-fix-parallel-execution-regression`)
+
+- **Nothing-to-Commit Error** — Fixed "Update failed: git exited with code 1: nothing to commit, working tree clean" error when saving a repository edit without making changes. `CommitFileAsync`, `CommitAllChangesAsync`, and `DeleteFileAsync` now check for staged changes before committing. (`copilothive-fix-nothing-to-commit`)
+
+- **Validation Feedback** — Added visible "✅ Validation passed — ready to release" message when release validation succeeds. (`copilothive-fix-validation-feedback`)
+
+- **Validation List Indentation** — Fixed validation error bullet list touching the red card border on the Release Detail page. (`copilothive-fix-validation-list-indent`)
+
+- **Repository Action Buttons** — Fixed Edit and Remove buttons in the repository configuration table stacking vertically; now horizontal with gap. (`copilothive-fix-repo-action-buttons`)
+
 ## [0.15.0] - 2026-07-23
 
 ### Added
