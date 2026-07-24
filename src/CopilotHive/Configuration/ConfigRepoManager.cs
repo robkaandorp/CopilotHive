@@ -199,6 +199,9 @@ public class ConfigRepoManager
         try
         {
             await RunGitAsync(_localPath, ["add", filePath], ct);
+            var exitCode = await RunGitOptionalAsync(_localPath, ["diff", "--cached", "--quiet"], ct);
+            if (exitCode == 0)
+                return;
             await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
             await PushWithConflictRecoveryAsync(ct);
         }
@@ -220,6 +223,9 @@ public class ConfigRepoManager
         try
         {
             await RunGitAsync(_localPath, ["rm", "--cached", filePath], ct);
+            var exitCode = await RunGitOptionalAsync(_localPath, ["diff", "--cached", "--quiet"], ct);
+            if (exitCode == 0)
+                return;
             await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
             await PushWithConflictRecoveryAsync(ct);
         }
@@ -241,6 +247,9 @@ public class ConfigRepoManager
         try
         {
             await RunGitAsync(_localPath, ["add", "--all"], ct);
+            var exitCode = await RunGitOptionalAsync(_localPath, ["diff", "--cached", "--quiet"], ct);
+            if (exitCode == 0)
+                return;
             await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
             await PushWithConflictRecoveryAsync(ct);
         }
@@ -304,6 +313,38 @@ public class ConfigRepoManager
     private static string NormalizeUrl(string url)
     {
         return url.Trim().TrimEnd('/').ToLowerInvariant();
+    }
+
+    private static async Task<int> RunGitOptionalAsync(string workingDir, string[] args, CancellationToken ct)
+    {
+        var psi = new ProcessStartInfo("git")
+        {
+            WorkingDirectory = workingDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
+
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to start git process");
+
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
+        var stderrTask = process.StandardError.ReadToEndAsync(ct);
+
+        await Task.WhenAll(stdoutTask, stderrTask);
+        await process.WaitForExitAsync(ct);
+
+        var stdout = stdoutTask.Result;
+        var stderr = stderrTask.Result;
+
+        if (process.ExitCode > 1)
+            throw new InvalidOperationException(
+                $"git exited with code {process.ExitCode}: {stdout}\n{stderr}".Trim());
+
+        return process.ExitCode;
     }
 
     private static async Task<string> RunGitAsync(string workingDir, string[] args, CancellationToken ct)
