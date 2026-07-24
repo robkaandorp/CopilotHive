@@ -1,3 +1,4 @@
+using System.Reflection;
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Goals;
@@ -2672,6 +2673,111 @@ public sealed class DashboardStateServiceTests : IDisposable
         var review = iteration.Phases.First(p => p.Name == "Review");
         Assert.Equal("Review output", review.WorkerOutput);
         Assert.Equal("approve", review.ReviewVerdict);
+    }
+
+    // ── Stale cached Pending goal → InProgress in DB ───────────────────────
+
+    /// <summary>
+    /// Verifies that a goal cached as <see cref="GoalStatus.Pending"/> in
+    /// <c>_cachedPendingGoals</c> is shown as <see cref="GoalStatus.InProgress"/>
+    /// in the dashboard snapshot after its status is updated to InProgress in the
+    /// goal store. The database is the source of truth and must overwrite the stale
+    /// cached Pending entry.
+    /// </summary>
+    [Fact]
+    public async Task GetSnapshot_StaleCachedPendingGoal_UpdatedToInProgress_ShowsInProgress()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Arrange: create a goal with Pending status in the store
+        var goalId = "stale-pending-goal";
+        var goal = new Goal
+        {
+            Id = goalId,
+            Description = "Goal that starts as Pending and transitions to InProgress",
+            Status = GoalStatus.Pending,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        // Build the service with the in-memory store
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store);
+
+        // Simulate the timer having cached this goal as Pending (stale cache)
+        var cachedField = typeof(DashboardStateService)
+            .GetField("_cachedPendingGoals", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var staleGoal = new Goal
+        {
+            Id = goalId,
+            Description = goal.Description,
+            Status = GoalStatus.Pending,
+        };
+        cachedField.SetValue(service, new List<Goal> { staleGoal });
+
+        // Act: update the goal's status to InProgress in the store (simulating dispatch)
+        await _store.UpdateGoalStatusAsync(goalId, GoalStatus.InProgress, ct: ct);
+
+        // Assert: GetSnapshot must reflect the DB status (InProgress), not the stale cache (Pending)
+        var snapshot = await service.GetSnapshot();
+        var snapshotGoal = snapshot.Goals.Single(g => g.Id == goalId);
+        Assert.Equal(GoalStatus.InProgress, snapshotGoal.Status);
+
+        // The pending/active counters must also reflect the correct status
+        Assert.Equal(0, snapshot.PendingGoals);
+        Assert.Equal(1, snapshot.ActiveGoals);
+    }
+
+    /// <summary>
+    /// Verifies that a goal cached as <see cref="GoalStatus.Pending"/> remains Pending
+    /// in the snapshot when no pipeline exists and the DB status is still Pending.
+    /// This is the non-regression baseline for the stale-cache fix.
+    /// </summary>
+    [Fact]
+    public async Task GetSnapshot_CachedPendingGoal_StillPendingInDb_ShowsPending()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Arrange: create a goal with Pending status in the store
+        var goalId = "still-pending-goal";
+        var goal = new Goal
+        {
+            Id = goalId,
+            Description = "Goal that remains Pending",
+            Status = GoalStatus.Pending,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store);
+
+        // Simulate the timer having cached this goal as Pending
+        var cachedField = typeof(DashboardStateService)
+            .GetField("_cachedPendingGoals", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        cachedField.SetValue(service, new List<Goal> { goal });
+
+        // Act: do NOT update the status — it stays Pending in the DB
+        var snapshot = await service.GetSnapshot();
+
+        // Assert: goal should still show Pending
+        var snapshotGoal = snapshot.Goals.Single(g => g.Id == goalId);
+        Assert.Equal(GoalStatus.Pending, snapshotGoal.Status);
+        Assert.Equal(1, snapshot.PendingGoals);
     }
 
     private DashboardStateService CreateService()
