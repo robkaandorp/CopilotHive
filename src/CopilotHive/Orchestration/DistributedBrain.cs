@@ -940,6 +940,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
             "Acknowledged. I have noted the plan adjustment and will craft prompts for all phases in the final plan."));
 
+        // Reset the last-known token count so GetStats() uses the freshly computed estimate
+        // instead of a stale value from the previous direct LLM call on the master session.
+        _masterSession.LastKnownContextTokens = 0;
+
         // Refresh the master session registry entry with current tokens.
         RefreshMasterSessionRegistry();
     }
@@ -1127,6 +1131,11 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User,
             $"[Goal completed: {pipeline.GoalId}] Summarize what was done."));
         _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.Assistant, summary));
+
+        // Reset the last-known token count so GetStats() uses the freshly computed estimate
+        // instead of a stale value from the previous direct LLM call on the master session.
+        _masterSession.LastKnownContextTokens = 0;
+
         await SaveSessionCoreAsync(ct);
 
         // Refresh the master session registry entry with current tokens.
