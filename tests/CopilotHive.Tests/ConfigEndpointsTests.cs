@@ -316,13 +316,47 @@ public class ConfigEndpointsTests
         Assert.Contains("error", body);
     }
 
-    // The 503 (no IBrainRepoManager registered) path is structurally unreachable via
-    // WebApplicationFactory: IBrainRepoManager is always registered in Program.cs, and
-    // other endpoints (goals API in ApiEndpoints.cs) also depend on it via inferred
-    // parameters. Removing it from DI causes those endpoints to fail at startup with
-    // "Failure to infer one or more parameters" before the branches endpoint can be
-    // reached. The 503 path exists as a defensive coding measure for future scenarios
-    // where the service might not be registered.
+    [Fact]
+    public async Task GetRepositoryBranches_NoRepoManager_Returns503()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // The endpoint parameter is [FromServices] IBrainRepoManager? — nullable. When the
+        // service is not registered, ASP.NET passes null and the endpoint returns 503. To reach
+        // this path we remove IBrainRepoManager plus every service that requires it during
+        // startup (GoalDispatcher singleton + its hosted-service registration), so the host can
+        // still boot. StaleWorkerCleanupService (which does not depend on IBrainRepoManager) is
+        // re-added so the app retains a hosted service.
+        using var factory = new HiveTestFactory().WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                // Remove IBrainRepoManager so the endpoint receives null → 503.
+                var repoMgr = services.SingleOrDefault(d => d.ServiceType == typeof(IBrainRepoManager));
+                if (repoMgr is not null)
+                    services.Remove(repoMgr);
+
+                // Remove GoalDispatcher singleton (constructor requires IBrainRepoManager).
+                var dispatcher = services.SingleOrDefault(d => d.ServiceType == typeof(GoalDispatcher));
+                if (dispatcher is not null)
+                    services.Remove(dispatcher);
+
+                // Remove all IHostedService registrations (GoalDispatcher's factory resolves
+                // GoalDispatcher which is now gone) and re-add the one that is independent.
+                var hostedServices = services
+                    .Where(d => d.ServiceType == typeof(Microsoft.Extensions.Hosting.IHostedService))
+                    .ToList();
+                foreach (var hs in hostedServices)
+                    services.Remove(hs);
+                services.AddHostedService<StaleWorkerCleanupService>();
+            });
+        });
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/api/config/repositories/test-repo/branches", ct);
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+    }
 
     private static WebApplicationFactory<Program> CreateBranchFactory(ConfigurableFakeBranchRepoManager fake)
     {

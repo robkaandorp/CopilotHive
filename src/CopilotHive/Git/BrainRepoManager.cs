@@ -401,21 +401,33 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// <returns>The standard output of the git command.</returns>
     private static async Task<string> RunGitWithOutputAsync(string workingDir, string[] args, CancellationToken ct)
     {
-        var psi = new System.Diagnostics.ProcessStartInfo("git", string.Join(" ", args))
+        var psi = new ProcessStartInfo("git")
         {
             WorkingDirectory = workingDir,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
         };
-        using var process = System.Diagnostics.Process.Start(psi)!;
+
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
+
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to start git process");
+
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
+        var stderrTask = process.StandardError.ReadToEndAsync(ct);
+
+        await Task.WhenAll(stdoutTask, stderrTask);
         await process.WaitForExitAsync(ct);
+
         if (process.ExitCode != 0)
         {
-            var stderr = await process.StandardError.ReadToEndAsync(ct);
-            throw new InvalidOperationException($"git {string.Join(' ', args)} failed: {stderr}");
+            throw new InvalidOperationException(
+                $"git {string.Join(' ', args)} failed (exit {process.ExitCode}): {stderrTask.Result}");
         }
-        return await process.StandardOutput.ReadToEndAsync(ct);
+
+        return stdoutTask.Result;
     }
 
     /// <summary>

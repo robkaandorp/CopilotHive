@@ -110,7 +110,7 @@ public static class ApiEndpoints
         });
 
         goalsApi.MapPatch("/{id}/status", async (string id, GoalStatusUpdate update, IGoalStore store,
-            IBrainRepoManager? repoManager, GoalDispatcher? dispatcher, ILogger<Program> endpointLogger) =>
+            [FromServices] IBrainRepoManager? repoManager, [FromServices] GoalDispatcher? dispatcher, ILogger<Program> endpointLogger) =>
         {
             try
             {
@@ -162,7 +162,7 @@ public static class ApiEndpoints
             }
         });
 
-        goalsApi.MapDelete("/{id}", async (string id, IGoalStore store, IBrainRepoManager? repoManager, ILogger<Program> logger) =>
+        goalsApi.MapDelete("/{id}", async (string id, IGoalStore store, [FromServices] IBrainRepoManager? repoManager, ILogger<Program> logger) =>
         {
             var goal = await store.GetGoalAsync(id);
             if (goal is null)

@@ -1427,6 +1427,7 @@ else
         _loadingBranches = true;
         _branchLoadError = false;
         _branchFetchCts?.Cancel();
+        _branchFetchCts?.Dispose();
         _branchFetchCts = new CancellationTokenSource();
         var token = _branchFetchCts.Token;
         var generation = ++_branchFetchGeneration;
@@ -1455,6 +1456,8 @@ else
     private void CancelEditRepo()
     {
         _branchFetchCts?.Cancel();
+        _branchFetchCts?.Dispose();
+        _branchFetchCts = null;
         _editingRepoName = null;
     }
 
