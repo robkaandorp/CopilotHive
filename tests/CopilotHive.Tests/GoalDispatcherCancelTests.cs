@@ -764,11 +764,17 @@ public sealed class GoalDispatcherSessionCleanupTests
             // Create a new pipeline manager that will restore from the store
             var restoredPipelineManager = new GoalPipelineManager(pipelineStore);
 
-            // Create a GoalDispatcher with a real DistributedBrain using the temp directory
+            // Create a GoalDispatcher with a real DistributedBrain using the temp directory.
+            // Inject a fake chat client (and factory) so the Brain never touches the process-global
+            // ChatClientFactory token provider — that provider can be disposed by a sibling test,
+            // causing intermittent ObjectDisposedException failures. Isolating it makes this
+            // restoration test deterministic.
             var brain = new DistributedBrain(
                 "copilot/claude-sonnet-4",
                 NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir);
+                stateDir: tempDir,
+                chatClient: new FakeChatClient(),
+                chatClientFactory: _ => new FakeChatClient());
 
             // RestoreActivePipelinesAsync calls RegisterExistingGoalSessionAsync, which requires a
             // connected Brain (EnsureConnected). Connect before invoking the restore path.

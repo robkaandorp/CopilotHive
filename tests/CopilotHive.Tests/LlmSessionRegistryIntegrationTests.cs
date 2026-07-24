@@ -841,13 +841,28 @@ public sealed class LlmSessionRegistryIntegrationTests
             Assert.Equal("copilot/new-model", master!.Model);
             Assert.Equal(99999, master.MaxTokens);
 
-            // Snapshot semantics: an EXISTING goal context keeps its original model/maxTokens.
-            // UpdateModelAsync only updates config for NEW contexts and the master entry — it must
-            // NOT rewrite the registry entry of a context created before the model change.
-            var goalSession = FindSession(registry, "brain-goal-goal-model-1");
-            Assert.NotNull(goalSession);
-            Assert.Equal("copilot/test-model", goalSession!.Model);
-            Assert.NotEqual(99999, goalSession.MaxTokens);
+            // Snapshot semantics: an EXISTING goal context keeps its ORIGINAL model/maxTokens.
+            // UpdateModelAsync must NOT rewrite the registry entry of a context created before the
+            // model change — the goal keeps the model and window it was forked with.
+            var existingGoal = FindSession(registry, "brain-goal-goal-model-1");
+            Assert.NotNull(existingGoal);
+            Assert.Equal("copilot/test-model", existingGoal!.Model);
+            Assert.NotEqual(99999, existingGoal.MaxTokens);
+
+            // The other half of snapshot semantics: a NEW goal forked AFTER the model change picks up
+            // the NEW config. This proves UpdateModelAsync updated _modelOverride/_maxContextTokens for
+            // future contexts while leaving existing ones untouched.
+            await brain.ForkSessionForGoalAsync("goal-model-2", TestContext.Current.CancellationToken);
+            var newGoal = FindSession(registry, "brain-goal-goal-model-2");
+            Assert.NotNull(newGoal);
+            Assert.Equal("copilot/new-model", newGoal!.Model);
+            Assert.Equal(99999, newGoal.MaxTokens);
+
+            // The pre-existing goal STILL keeps its original snapshot after the new fork.
+            var existingGoalAfter = FindSession(registry, "brain-goal-goal-model-1");
+            Assert.NotNull(existingGoalAfter);
+            Assert.Equal("copilot/test-model", existingGoalAfter!.Model);
+            Assert.NotEqual(99999, existingGoalAfter.MaxTokens);
         }
         finally
         {
@@ -864,30 +879,54 @@ public sealed class LlmSessionRegistryIntegrationTests
         try
         {
             var registry = new LlmSessionRegistry();
-            var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var blocking = new BlockingBrainChatClient(release.Task, entered, "answered");
+
+            // Two DISTINCT entered/release signals — one per LLM call — so we can prove the SECOND
+            // call does not enter its LLM call until the FIRST is released. The per-context gate is
+            // the only thing that can hold the second call back. If the gate were removed, both
+            // calls would enter immediately and enteredSecond would fire before firstRelease.
+            var enteredFirst = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var enteredSecond = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseFirst = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseSecond = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var blocking = new PerCallBlockingChatClient(
+                [enteredFirst, enteredSecond], [releaseFirst.Task, releaseSecond.Task], "answered");
+
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
                 stateDir: tempDir, chatClient: blocking, sessionRegistry: registry);
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
             await brain.ForkSessionForGoalAsync("goal-serial", TestContext.Current.CancellationToken);
 
-            // First AskQuestionAsync for the goal enters the LLM call and holds the per-context gate.
+            // First AskQuestionAsync for the goal enters its LLM call and holds the per-context gate.
             var first = brain.AskQuestionAsync("goal-serial", 1, "Coding", "coder", "Q1?",
                 TestContext.Current.CancellationToken);
-            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await enteredFirst.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
-            // Second call for the SAME goal must block on that goal's per-context gate — it cannot
-            // enter its own LLM call while the first holds the gate. A tight 500ms window proves it.
+            // Second call for the SAME goal. It must block on that goal's per-context gate and MUST
+            // NOT enter its own LLM call while the first holds the gate.
             var second = brain.AskQuestionAsync("goal-serial", 2, "Coding", "coder", "Q2?",
                 TestContext.Current.CancellationToken);
-            await Task.Delay(500, TestContext.Current.CancellationToken);
-            Assert.False(second.IsCompleted,
-                "Second same-goal Brain call must serialize behind the per-context gate held by the first");
 
-            // Release the first; both calls complete once the gate is free.
-            release.SetResult(true);
+            // Deterministic proof of serialization: within a bounded window the second call must NOT
+            // enter its LLM call. We wait for whichever happens first — enteredSecond firing (would be
+            // a bug) or a short timeout (expected). The timeout winning proves the gate blocks it.
+            var timeout = Task.Delay(TimeSpan.FromMilliseconds(300), TestContext.Current.CancellationToken);
+            var winner = await Task.WhenAny(enteredSecond.Task, timeout);
+            Assert.Same(timeout, winner);
+            Assert.False(enteredSecond.Task.IsCompleted,
+                "Second same-goal call must NOT enter its LLM call while the first holds the per-context gate");
+            Assert.False(second.IsCompleted, "Second same-goal call must remain blocked on the gate");
+
+            // Release the first call. Now the gate frees and the second call enters its LLM call.
+            releaseFirst.SetResult(true);
             await first.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            // Deterministic proof the second proceeded ONLY after the first released the gate.
+            await enteredSecond.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            Assert.True(enteredSecond.Task.IsCompleted,
+                "Second same-goal call must enter its LLM call after the first releases the gate");
+
+            // Release the second call and let it finish.
+            releaseSecond.SetResult(true);
             await second.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         }
         finally
@@ -903,9 +942,11 @@ public sealed class LlmSessionRegistryIntegrationTests
         try
         {
             var registry = new LlmSessionRegistry();
-            // A single blocking client whose LLM call signals `entered` and blocks on `release`.
-            // Because per-goal contexts have independent gates, two DIFFERENT goals must both be
-            // able to enter their LLM calls concurrently even though neither has been released.
+            // A single blocking client whose LLM call signals a per-goal `entered` and blocks on a
+            // shared `release`. Because per-goal contexts have INDEPENDENT gates, two DIFFERENT goals
+            // must both enter their LLM calls concurrently even though neither has been released. If
+            // all calls shared one global gate, only one could enter and the other `entered` would
+            // never fire before the first is released — this test would then time out.
             var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             var enteredA = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             var enteredB = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -922,13 +963,18 @@ public sealed class LlmSessionRegistryIntegrationTests
             var callB = brain.AskQuestionAsync("goal-par-b", 1, "Coding", "coder", "Qb?",
                 TestContext.Current.CancellationToken);
 
-            // Both LLM calls must be entered concurrently — neither has been released. If the two
-            // goals shared a single gate, only one could enter and the other `entered` would never
-            // complete. Awaiting BOTH proves genuine parallelism.
+            // Both LLM calls must be entered concurrently BEFORE either is released. Awaiting BOTH
+            // entered signals (with a deadlock-guard timeout) proves genuine parallelism.
             await enteredA.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
             await enteredB.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            // Strict proof: both entered while neither the shared release nor either call has completed.
+            Assert.True(enteredA.Task.IsCompleted, "Goal A must have entered its LLM call");
+            Assert.True(enteredB.Task.IsCompleted, "Goal B must have entered its LLM call");
             Assert.False(release.Task.IsCompleted,
                 "Both different-goal Brain calls entered their LLM calls before any release — proving parallelism");
+            Assert.False(callA.IsCompleted, "Goal A call must still be blocked on its release");
+            Assert.False(callB.IsCompleted, "Goal B call must still be blocked on its release");
 
             release.SetResult(true);
             await callA.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
@@ -960,19 +1006,24 @@ public sealed class LlmSessionRegistryIntegrationTests
                 TestContext.Current.CancellationToken);
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
-            // Start the delete — it removes the context and adds the goal to _deletingGoals, then
-            // blocks on WaitForDrainAsync because the LLM call still holds the lease.
-            var deleteTask = Task.Run(() => brain.DeleteGoalSessionAsync("goal-race"),
-                TestContext.Current.CancellationToken);
+            // Start the delete WITHOUT Task.Run. Because the method is async and _sessionLock is
+            // uncontended, DeleteGoalSessionAsync runs SYNCHRONOUSLY through its critical section —
+            // adding the goal to _deletingGoals and removing it from _goalContexts — and only yields
+            // at the first genuinely-incomplete await (WaitForDrainAsync, blocked by the held lease).
+            // Therefore, the moment this call returns an incomplete task, the _deletingGoals marker is
+            // deterministically set. No polling or Task.Delay is needed to observe the drain state.
+            var deleteTask = brain.DeleteGoalSessionAsync("goal-race", TestContext.Current.CancellationToken);
+            Assert.False(deleteTask.IsCompleted,
+                "Delete must be draining (marker set, context removed) while the LLM call holds the lease");
+            Assert.False(GoalContextExists(brain, "goal-race"),
+                "Context must already be removed from _goalContexts once the delete has reached drain");
 
-            // Poll until the delete has entered its drain phase (goal marked as deleting). Bounded loop.
-            for (var i = 0; i < 50 && GoalContextExists(brain, "goal-race"); i++)
-                await Task.Delay(20, TestContext.Current.CancellationToken);
-            Assert.False(deleteTask.IsCompleted, "Delete must be draining while the LLM call holds the lease");
-
-            // A fork for the SAME goal while it is being deleted must throw — _deletingGoals blocks it.
-            await Assert.ThrowsAsync<InvalidOperationException>(
+            // A fork for the SAME goal while it is being deleted MUST throw — the _deletingGoals marker
+            // blocks recreation during the drain. If the marker-clearing race were present, this Fork
+            // would instead succeed and create a context the draining delete would later corrupt.
+            var forkEx = await Assert.ThrowsAsync<InvalidOperationException>(
                 () => brain.ForkSessionForGoalAsync("goal-race", TestContext.Current.CancellationToken));
+            Assert.Contains("goal-race", forkEx.Message);
 
             // Release the LLM call; the ask completes, the lease drops, the delete drains and finishes.
             release.SetResult(true);
@@ -983,6 +1034,7 @@ public sealed class LlmSessionRegistryIntegrationTests
             // After deletion completes, the goal is no longer in _deletingGoals — a fresh fork succeeds.
             await brain.ForkSessionForGoalAsync("goal-race", TestContext.Current.CancellationToken);
             Assert.NotNull(FindSession(registry, "brain-goal-goal-race"));
+            Assert.True(GoalContextExists(brain, "goal-race"));
         }
         finally
         {
@@ -991,7 +1043,7 @@ public sealed class LlmSessionRegistryIntegrationTests
     }
 
     [Fact]
-    public async Task DeleteGoalSessionAsync_DuplicateConcurrent_SecondReturnsEarly_NoError()
+    public async Task DeleteGoalSessionAsync_DuplicateConcurrent_SecondReturnsEarly_MarkerStillBlocksFork()
     {
         var tempDir = CreateTempDir();
         try
@@ -1005,34 +1057,44 @@ public sealed class LlmSessionRegistryIntegrationTests
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
             await brain.ForkSessionForGoalAsync("goal-dupdel", TestContext.Current.CancellationToken);
 
-            // Hold the context via a blocked LLM call so the first delete parks on drain, giving the
-            // second concurrent delete a window to observe the _deletingGoals marker and return early.
+            // Hold the context via a blocked LLM call so the first delete parks on drain.
             var askTask = brain.AskQuestionAsync("goal-dupdel", 1, "Coding", "coder", "Proceed?",
                 TestContext.Current.CancellationToken);
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
-            var delete1 = Task.Run(() => brain.DeleteGoalSessionAsync("goal-dupdel"),
-                TestContext.Current.CancellationToken);
+            // First delete runs synchronously to its drain await (see explanation above), so the
+            // _deletingGoals marker is deterministically set the moment it returns an incomplete task.
+            var delete1 = brain.DeleteGoalSessionAsync("goal-dupdel", TestContext.Current.CancellationToken);
+            Assert.False(delete1.IsCompleted, "First delete must be draining with the marker set");
+            Assert.False(GoalContextExists(brain, "goal-dupdel"));
 
-            // Wait until the first delete has removed the context and marked it deleting.
-            for (var i = 0; i < 50 && GoalContextExists(brain, "goal-dupdel"); i++)
-                await Task.Delay(20, TestContext.Current.CancellationToken);
-
-            // The SECOND delete must return early (marker present) without throwing and without
-            // touching the still-draining first delete's cleanup.
+            // The SECOND delete must return early because the marker is present. It acquires the
+            // (now-free) _sessionLock, sees _deletingGoals contains the goal, and returns — WITHOUT
+            // clearing the marker (the marker-removal finally is only reached by the OWNING delete).
+            // This completes promptly; a tight timeout guards against a regression that blocks.
             await brain.DeleteGoalSessionAsync("goal-dupdel", TestContext.Current.CancellationToken)
-                .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+                .WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+
+            // The critical proof the marker was NOT cleared by the second delete: a Fork during the
+            // still-draining first delete MUST still throw. With the old marker-clearing race, the
+            // second delete would have removed the marker and this Fork would succeed.
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => brain.ForkSessionForGoalAsync("goal-dupdel", TestContext.Current.CancellationToken));
 
             Assert.False(delete1.IsCompleted,
-                "First delete must still be draining after the second returns early");
+                "First delete must still be draining after the second returned early");
 
-            // Release the LLM call; the first delete drains and completes cleanly.
+            // Release the LLM call; the first (owning) delete drains and completes cleanly.
             release.SetResult(true);
             await askTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
             await delete1.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
             Assert.Null(FindSession(registry, "brain-goal-goal-dupdel"));
             Assert.False(GoalContextExists(brain, "goal-dupdel"));
+
+            // Marker cleared by the owning delete's finally — a fresh fork now succeeds.
+            await brain.ForkSessionForGoalAsync("goal-dupdel", TestContext.Current.CancellationToken);
+            Assert.NotNull(FindSession(registry, "brain-goal-goal-dupdel"));
         }
         finally
         {
@@ -1065,6 +1127,16 @@ public sealed class LlmSessionRegistryIntegrationTests
                 () => brain.DeleteGoalSessionAsync("goal-preconnect", TestContext.Current.CancellationToken));
             await Assert.ThrowsAsync<InvalidOperationException>(
                 () => brain.RegisterExistingGoalSessionAsync("goal-preconnect", TestContext.Current.CancellationToken));
+
+            // The remaining EnsureConnected-guarded public operations must also throw pre-connect.
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => brain.UpdateModelAsync("copilot/other-model", null, TestContext.Current.CancellationToken));
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => brain.InjectSystemNoteAsync(pipeline, "note", TestContext.Current.CancellationToken));
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => brain.InjectOrchestratorInstructionsAsync("instructions", TestContext.Current.CancellationToken));
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => brain.SummarizeAndMergeAsync(pipeline, TestContext.Current.CancellationToken));
         }
         finally
         {
@@ -1126,19 +1198,29 @@ public sealed class LlmSessionRegistryIntegrationTests
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
             await brain.ForkSessionForGoalAsync("goal-dispose", TestContext.Current.CancellationToken);
 
-            // Hold the goal's lease via a blocked LLM call.
+            // Hold the goal's lease via a blocked LLM call. Awaiting `entered` proves the call is
+            // inside the LLM request and the context's ref-count is > 0 (lease held).
             var askTask = brain.AskQuestionAsync("goal-dispose", 1, "Coding", "coder", "Proceed?",
                 TestContext.Current.CancellationToken);
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
-            // DisposeAsync must drain the active call before completing.
+            // Start DisposeAsync but do NOT await it. It must reach WaitForDrainAsync for the goal's
+            // context and block, because the active LLM call still holds the lease.
             var disposeTask = brain.DisposeAsync();
 
-            await Task.Delay(300, TestContext.Current.CancellationToken);
+            // Bounded negative check: within a short window DisposeAsync must NOT complete. Here
+            // Task.Delay is used only as a timeout to assert that something does NOT happen — the
+            // reviewer-approved use. If dispose ignored the active lease it would complete promptly.
+            var timeout = Task.Delay(TimeSpan.FromMilliseconds(300), TestContext.Current.CancellationToken);
+            var winner = await Task.WhenAny(disposeTask.AsTask(), timeout);
+            Assert.Same(timeout, winner);
             Assert.False(disposeTask.IsCompleted,
                 "DisposeAsync must wait for the active LLM call to drain before completing");
 
-            // Release the LLM call; the ask completes and dispose drains and finishes.
+            // The blocked LLM call is still holding the lease — proof dispose is parked on the drain.
+            Assert.False(release.Task.IsCompleted);
+
+            // Release the LLM call; the ask completes, the lease drops, dispose drains and finishes.
             release.SetResult(true);
             await askTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
             await disposeTask.AsTask().WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
@@ -1947,6 +2029,62 @@ file sealed class CannedReplyChatClient(string reply) : IChatClient
         {
             FinishReason = ChatFinishReason.Stop,
         });
+
+    public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException("Streaming not used in this fake client.");
+
+    public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+    public void Dispose() { }
+}
+
+/// <summary>
+/// A chat client that signals a DISTINCT <c>entered</c> TaskCompletionSource for each LLM call,
+/// in the order the calls enter, and blocks each call on its own <c>release</c> signal. This lets
+/// a test prove that a second call for the SAME goal does NOT enter its LLM call until the first
+/// is released — i.e. the per-context gate serializes same-goal calls. If the gate were removed,
+/// both calls would enter immediately and BOTH entered signals would fire before any release.
+/// </summary>
+file sealed class PerCallBlockingChatClient : IChatClient
+{
+    private readonly TaskCompletionSource<bool>[] _entered;
+    private readonly Task<bool>[] _release;
+    private readonly string _reply;
+    private int _callIndex = -1;
+
+    public PerCallBlockingChatClient(
+        TaskCompletionSource<bool>[] entered, Task<bool>[] release, string reply)
+    {
+        if (entered.Length != release.Length)
+            throw new ArgumentException("entered and release arrays must have equal length");
+        _entered = entered;
+        _release = release;
+        _reply = reply;
+    }
+
+    public ChatClientMetadata Metadata => new("per-call-blocking", null, "blocking-model");
+
+    public async Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        // Atomically claim the next call slot so concurrent calls take distinct signals in
+        // entry order. This is the mechanism that lets the test distinguish "first" from "second".
+        var index = Interlocked.Increment(ref _callIndex);
+        if (index >= _entered.Length)
+            throw new InvalidOperationException($"Unexpected extra LLM call at index {index}");
+
+        _entered[index].TrySetResult(true);
+        await _release[index].WaitAsync(cancellationToken);
+        return new ChatResponse(new ChatMessage(ChatRole.Assistant, _reply))
+        {
+            FinishReason = ChatFinishReason.Stop,
+        };
+    }
 
     public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
         IEnumerable<ChatMessage> messages,
