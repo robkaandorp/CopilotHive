@@ -386,41 +386,7 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
 
     // ---------- Existing-method repoName validation ----------
 
-    [Fact]
-    public async Task EnsureCloneAsync_InvalidRepoName_ThrowsArgumentException()
-    {
-        var ct = TestContext.Current.CancellationToken;
-        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
 
-        await Assert.ThrowsAsync<ArgumentException>(() =>
-            manager.EnsureCloneAsync("../evil", "https://example.com/repo.git", "main", ct));
-        await Assert.ThrowsAsync<ArgumentException>(() =>
-            manager.EnsureCloneAsync("a/b", "https://example.com/repo.git", "main", ct));
-    }
-
-    [Fact]
-    public async Task MergeFeatureBranchAsync_InvalidRepoName_ThrowsArgumentException()
-    {
-        var ct = TestContext.Current.CancellationToken;
-        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
-
-        await Assert.ThrowsAsync<ArgumentException>(() =>
-            manager.MergeFeatureBranchAsync("../evil", "feature", "main", "msg", ct));
-        await Assert.ThrowsAsync<ArgumentException>(() =>
-            manager.MergeFeatureBranchAsync("a/b", "feature", "main", "msg", ct));
-    }
-
-    [Fact]
-    public async Task DeleteRemoteBranchAsync_InvalidRepoName_ThrowsArgumentException()
-    {
-        var ct = TestContext.Current.CancellationToken;
-        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
-
-        await Assert.ThrowsAsync<ArgumentException>(() =>
-            manager.DeleteRemoteBranchAsync("../evil", "feature", ct));
-        await Assert.ThrowsAsync<ArgumentException>(() =>
-            manager.DeleteRemoteBranchAsync("a/b", "feature", ct));
-    }
 
     // ---------- DeleteTagAsync single-side deletion failure ----------
 
@@ -475,6 +441,124 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
             if (File.Exists(lockPath))
                 File.Delete(lockPath);
         }
+    }
+
+    // ---------- Existing-method repoName validation ----------
+
+    [Fact]
+    public async Task EnsureCloneAsync_InvalidRepoName_ThrowsArgumentException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.EnsureCloneAsync("../evil", "https://example.com/repo.git", "main", ct));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.EnsureCloneAsync("a/b", "https://example.com/repo.git", "main", ct));
+    }
+
+    [Fact]
+    public async Task MergeFeatureBranchAsync_InvalidRepoName_ThrowsArgumentException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeFeatureBranchAsync("../evil", "feature", "main", "msg", ct));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.MergeFeatureBranchAsync("a/b", "feature", "main", "msg", ct));
+    }
+
+    [Fact]
+    public async Task DeleteRemoteBranchAsync_InvalidRepoName_ThrowsArgumentException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.DeleteRemoteBranchAsync("../evil", "feature", ct));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.DeleteRemoteBranchAsync("a/b", "feature", ct));
+    }
+
+    [Fact]
+    public async Task ListRemoteBranchesAsync_InvalidRepoName_ThrowsArgumentException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.ListRemoteBranchesAsync("../evil", ct));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.ListRemoteBranchesAsync("a/b", ct));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.ListRemoteBranchesAsync("", ct));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            manager.ListRemoteBranchesAsync("   ", ct));
+    }
+
+    // ---------- ListRemoteBranchesAsync ----------
+
+    [Fact]
+    public async Task ListRemoteBranchesAsync_ReturnsBranchesWithoutOriginPrefix()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (remoteDir, _, manager) = SetupRepo("list-branches-repo");
+
+        // Create two feature branches on the remote.
+        CreateBranchWithCommit(remoteDir, "main", "alpha", "a.txt", "alpha content");
+        CreateBranchWithCommit(remoteDir, "main", "beta", "b.txt", "beta content");
+
+        var branches = await manager.ListRemoteBranchesAsync("list-branches-repo", ct);
+
+        // main + alpha + beta, sorted alphabetically (case-insensitive).
+        Assert.Equal(["alpha", "beta", "main"], branches);
+    }
+
+    [Fact]
+    public async Task ListRemoteBranchesAsync_FiltersSymbolicHeadButKeepsHeadFix()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (remoteDir, _, manager) = SetupRepo("head-filter-repo");
+
+        // Create branches named HEAD-fix and zz so we can verify HEAD is filtered but HEAD-fix stays.
+        CreateBranchWithCommit(remoteDir, "main", "HEAD-fix", "hf.txt", "head fix content");
+        CreateBranchWithCommit(remoteDir, "main", "zz", "z.txt", "zz content");
+
+        var branches = await manager.ListRemoteBranchesAsync("head-filter-repo", ct);
+
+        Assert.DoesNotContain("HEAD", branches);
+        Assert.Contains("HEAD-fix", branches);
+    }
+
+    [Fact]
+    public async Task ListRemoteBranchesAsync_ReturnsBranchesSortedAlphabetically()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (remoteDir, _, manager) = SetupRepo("sorted-branches-repo");
+
+        // Create branches in non-alphabetical order.
+        CreateBranchWithCommit(remoteDir, "main", "zebra", "z.txt", "zebra content");
+        CreateBranchWithCommit(remoteDir, "main", "apple", "a.txt", "apple content");
+        CreateBranchWithCommit(remoteDir, "main", "mango", "m.txt", "mango content");
+
+        var branches = await manager.ListRemoteBranchesAsync("sorted-branches-repo", ct);
+
+        // Expect sorted order: apple, main, mango, zebra
+        var expected = new List<string> { "apple", "main", "mango", "zebra" };
+        Assert.Equal(expected, branches);
+    }
+
+    [Fact]
+    public async Task ListRemoteBranchesAsync_MissingClone_ThrowsInvalidOperationException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            manager.ListRemoteBranchesAsync("not-cloned-repo", ct));
+
+        Assert.Contains("is not cloned", ex.Message);
     }
 
     // ---------- Branch/tag ref-format validation ----------

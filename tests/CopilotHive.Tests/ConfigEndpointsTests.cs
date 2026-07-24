@@ -1,6 +1,11 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
+using CopilotHive.Configuration;
+using CopilotHive.Git;
 using CopilotHive.Services;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace CopilotHive.Tests;
 
@@ -242,6 +247,182 @@ public class ConfigEndpointsTests
 
         Assert.NotEqual(HttpStatusCode.NotFound, response.StatusCode);
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+    }
+
+    // ── GET /api/config/repositories/{name}/branches ──────────────────────────────
+
+    [Fact]
+    public async Task GetRepositoryBranches_ClonedRepo_ReturnsBranches()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeBranchRepoManager(["main", "develop"]);
+        using var factory = CreateBranchFactory(fake);
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/api/config/repositories/test-repo/branches", ct);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var branches = await response.Content.ReadFromJsonAsync<List<string>>(JsonSerializerOptions.Web, ct);
+        Assert.NotNull(branches);
+        Assert.Equal(["main", "develop"], branches!);
+    }
+
+    [Fact]
+    public async Task GetRepositoryBranches_NotCloned_Returns404WithSafeMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeBranchRepoManager([]) { ThrowOnList = new InvalidOperationException("Repository 'test-repo' is not cloned.") };
+        using var factory = CreateBranchFactory(fake);
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/api/config/repositories/test-repo/branches", ct);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(ct);
+        Assert.Contains("is not cloned", body);
+    }
+
+
+
+    [Fact]
+    public async Task GetRepositoryBranches_GitFailure_Returns500WithoutRawUrl()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var sensitive = "https://user:token@github.com/org/repo.git";
+        var fake = new ConfigurableFakeBranchRepoManager([]) { ThrowOnList = new InvalidOperationException($"fatal: {sensitive}") };
+        using var factory = CreateBranchFactory(fake);
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/api/config/repositories/test-repo/branches", ct);
+
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(ct);
+        Assert.DoesNotContain(sensitive, body);
+        Assert.Contains("Failed to list branches for this repository.", body);
+    }
+
+    [Fact]
+    public async Task GetRepositoryBranches_InvalidName_Returns400()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeBranchRepoManager([]) { ValidateNames = true };
+        using var factory = CreateBranchFactory(fake);
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/api/config/repositories/..%2Fescape/branches", ct);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(ct);
+        Assert.Contains("error", body);
+    }
+
+    [Fact]
+    public async Task GetRepositoryBranches_NoRepoManager_Returns503()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // The endpoint parameter is [FromServices] IBrainRepoManager? — nullable. When the
+        // service is not registered, ASP.NET passes null and the endpoint returns 503. To reach
+        // this path we remove IBrainRepoManager plus every service that requires it during
+        // startup (GoalDispatcher singleton + its hosted-service registration), so the host can
+        // still boot. StaleWorkerCleanupService (which does not depend on IBrainRepoManager) is
+        // re-added so the app retains a hosted service.
+        using var factory = new HiveTestFactory().WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                // Remove IBrainRepoManager so the endpoint receives null → 503.
+                var repoMgr = services.SingleOrDefault(d => d.ServiceType == typeof(IBrainRepoManager));
+                if (repoMgr is not null)
+                    services.Remove(repoMgr);
+
+                // Remove GoalDispatcher singleton (constructor requires IBrainRepoManager).
+                var dispatcher = services.SingleOrDefault(d => d.ServiceType == typeof(GoalDispatcher));
+                if (dispatcher is not null)
+                    services.Remove(dispatcher);
+
+                // Remove all IHostedService registrations (GoalDispatcher's factory resolves
+                // GoalDispatcher which is now gone) and re-add the one that is independent.
+                var hostedServices = services
+                    .Where(d => d.ServiceType == typeof(Microsoft.Extensions.Hosting.IHostedService))
+                    .ToList();
+                foreach (var hs in hostedServices)
+                    services.Remove(hs);
+                services.AddHostedService<StaleWorkerCleanupService>();
+            });
+        });
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/api/config/repositories/test-repo/branches", ct);
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+    }
+
+    private static WebApplicationFactory<Program> CreateBranchFactory(ConfigurableFakeBranchRepoManager fake)
+    {
+        var config = new HiveConfigFile
+        {
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "test-repo",
+                    Url = "https://github.com/org/repo.git",
+                    DefaultBranch = "main",
+                },
+            ],
+        };
+        var baseFactory = new HiveTestFactory { MockRepoManager = fake };
+        return baseFactory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                var existingConfig = services.SingleOrDefault(d => d.ServiceType == typeof(HiveConfigFile));
+                if (existingConfig is not null)
+                    services.Remove(existingConfig);
+                services.AddSingleton(config);
+            });
+        });
+    }
+
+    internal sealed class ConfigurableFakeBranchRepoManager : IBrainRepoManager
+    {
+        private readonly List<string> _branches;
+
+        public ConfigurableFakeBranchRepoManager(List<string> branches)
+        {
+            _branches = branches;
+        }
+
+        public Exception? ThrowOnList { get; set; }
+        public bool ValidateNames { get; set; }
+
+        public string WorkDirectory => "/fake/work";
+
+        public Task<List<string>> ListRemoteBranchesAsync(string repoName, CancellationToken ct = default)
+        {
+            if (ValidateNames && (string.IsNullOrWhiteSpace(repoName) || repoName.Contains('/') || repoName.Contains("\\") || repoName.Contains("..")))
+                return Task.FromException<List<string>>(new ArgumentException($"Repository name '{repoName}' is invalid."));
+            if (ThrowOnList is not null)
+                return Task.FromException<List<string>>(ThrowOnList);
+            return Task.FromResult(_branches);
+        }
+
+        public Task<string> EnsureCloneAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+            Task.FromResult($"/fake/work/{repoName}");
+        public Task<string> MergeFeatureBranchAsync(string repoName, string featureBranch, string defaultBranch, string commitMessage, CancellationToken ct = default) =>
+            Task.FromResult("fake-sha");
+        public Task<BranchDeleteResult> DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default) =>
+            Task.FromResult(BranchDeleteResult.Success);
+        public string GetClonePath(string repoName) => $"/fake/work/{repoName}";
+        public Task<string?> GetHeadShaAsync(string repoName, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+        public Task<string?> MergeBranchAsync(string repoName, string sourceBranch, string targetBranch, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+        public Task<bool> CreateTagAsync(string repoName, string tag, string branch, string message, CancellationToken ct = default) =>
+            Task.FromResult(false);
+        public Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default) =>
+            Task.FromResult(false);
     }
 
     // ── GET /api/config/composer ────────────────────────────────────────────────

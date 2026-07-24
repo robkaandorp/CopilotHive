@@ -510,13 +510,14 @@ else
                             <input @bind="_newRepoDefaultBranch" placeholder="main"
                                    style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
 
-                            <label style="color:var(--text-muted);font-size:0.9rem">Release Merge Branch</label>
+                            <label style="color:var(--text-muted);font-size:0.9rem">Merge to branch on release (e.g. main)</label>
                             <input @bind="_newRepoMergeTo" placeholder="main (optional)"
                                    style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
 
-                            <label style="color:var(--text-muted);font-size:0.9rem">Release Tag Branch</label>
+                            <label style="color:var(--text-muted);font-size:0.9rem">Tag branch on release (e.g. main)</label>
                             <input @bind="_newRepoTagBranch" placeholder="main (optional)"
                                    style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+                            <div style="grid-column:2;color:var(--text-muted);font-size:0.8rem">Branch dropdowns are available when editing an existing repository.</div>
                         </div>
                         <div style="margin-top:1rem;display:flex;gap:0.75rem">
                             <button class="approve-btn" disabled="@_repoSaving" @onclick="AddRepositoryAsync">@(_repoSaving ? "Saving…" : "💾 Save")</button>
@@ -541,8 +542,8 @@ else
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Name</th>
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">URL</th>
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Default Branch</th>
-                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Release Merge</th>
-                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Release Tag</th>
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Merge To</th>
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Tag Branch</th>
                                 <th style="text-align:right;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Actions</th>
                             </tr>
                         </thead>
@@ -562,12 +563,54 @@ else
                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem" />
                                         </td>
                                         <td style="padding:0.5rem">
-                                            <input @bind="_editRepoMergeTo"
-                                                   style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem" />
+                                            <select @bind="_editRepoMergeTo" title="Branch to merge the default branch into on release"
+                                                    disabled="@(_loadingBranches || _branchLoadError)"
+                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem">
+                                                @if (_loadingBranches)
+                                                {
+                                                    <option value="">Loading…</option>
+                                                }
+                                                else if (_branchLoadError)
+                                                {
+                                                    <option value="">⚠️ Failed to load</option>
+                                                }
+                                                else
+                                                {
+                                                    <option value="">— none —</option>
+                                                    @if (_repoBranches is not null)
+                                                    {
+                                                        @foreach (var branch in _repoBranches)
+                                                        {
+                                                            <option value="@branch">@branch</option>
+                                                        }
+                                                    }
+                                                }
+                                            </select>
                                         </td>
                                         <td style="padding:0.5rem">
-                                            <input @bind="_editRepoTagBranch"
-                                                   style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem" />
+                                            <select @bind="_editRepoTagBranch" title="Branch to tag on release"
+                                                    disabled="@(_loadingBranches || _branchLoadError)"
+                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem">
+                                                @if (_loadingBranches)
+                                                {
+                                                    <option value="">Loading…</option>
+                                                }
+                                                else if (_branchLoadError)
+                                                {
+                                                    <option value="">⚠️ Failed to load</option>
+                                                }
+                                                else
+                                                {
+                                                    <option value="">— none —</option>
+                                                    @if (_repoBranches is not null)
+                                                    {
+                                                        @foreach (var branch in _repoBranches)
+                                                        {
+                                                            <option value="@branch">@branch</option>
+                                                        }
+                                                    }
+                                                }
+                                            </select>
                                         </td>
                                         <td style="padding:0.5rem;text-align:right">
                                             <button class="approve-btn" disabled="@_repoSaving" @onclick="SaveEditRepoAsync">💾 Save</button>
@@ -881,6 +924,11 @@ else
     private string _editRepoDefaultBranch = "main";
     private string _editRepoMergeTo = "";
     private string _editRepoTagBranch = "";
+    private List<string>? _repoBranches;
+    private bool _loadingBranches;
+    private bool _branchLoadError;
+    private CancellationTokenSource? _branchFetchCts;
+    private int _branchFetchGeneration;
 
     // Orchestrator tab
     private OrchestratorConfigResponse? _orchestratorData;
@@ -1366,7 +1414,7 @@ else
         finally { _repoSaving = false; StateHasChanged(); }
     }
 
-    private void StartEditRepo(RepositoryDto repo)
+    private async Task StartEditRepo(RepositoryDto repo)
     {
         _editingRepoName = repo.Name;
         _editRepoUrl = repo.Url;
@@ -1374,10 +1422,42 @@ else
         _editRepoMergeTo = repo.Release?.MergeTo ?? "";
         _editRepoTagBranch = repo.Release?.TagBranch ?? "";
         _repoError = null; _repoSuccess = null;
+
+        _repoBranches = null;
+        _loadingBranches = true;
+        _branchLoadError = false;
+        _branchFetchCts?.Cancel();
+        _branchFetchCts?.Dispose();
+        _branchFetchCts = new CancellationTokenSource();
+        var token = _branchFetchCts.Token;
+        var generation = ++_branchFetchGeneration;
+        try
+        {
+            var branches = await HttpClient.GetFromJsonAsync<List<string>>(
+                $"/api/config/repositories/{Uri.EscapeDataString(repo.Name)}/branches", token);
+            if (generation == _branchFetchGeneration)
+            {
+                _repoBranches = branches;
+            }
+        }
+        catch (OperationCanceledException) { /* stale request */ }
+        catch
+        {
+            if (generation == _branchFetchGeneration)
+                _branchLoadError = true;
+        }
+        finally
+        {
+            if (generation == _branchFetchGeneration)
+                _loadingBranches = false;
+        }
     }
 
     private void CancelEditRepo()
     {
+        _branchFetchCts?.Cancel();
+        _branchFetchCts?.Dispose();
+        _branchFetchCts = null;
         _editingRepoName = null;
     }
 
@@ -1698,5 +1778,9 @@ else
         return content;
     }
 
-    public void Dispose() { }
+    public void Dispose()
+    {
+        _branchFetchCts?.Cancel();
+        _branchFetchCts?.Dispose();
+    }
 }
