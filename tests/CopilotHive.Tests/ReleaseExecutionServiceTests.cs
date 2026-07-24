@@ -559,6 +559,9 @@ internal sealed class ConfigurableFakeRepoManager : IBrainRepoManager
         DeleteTagTokens.Add(ct);
         return Task.FromResult(true);
     }
+
+    public Task<List<string>> ListRemoteBranchesAsync(string repoName, CancellationToken ct = default) =>
+        Task.FromResult(new List<string>());
 }
 
 /// <summary>

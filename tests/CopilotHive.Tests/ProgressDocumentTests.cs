@@ -1161,6 +1161,9 @@ file sealed class ProgressFakeBrainRepoManager : IBrainRepoManager
 
     public Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default) =>
         Task.FromResult(false);
+
+    public Task<List<string>> ListRemoteBranchesAsync(string repoName, CancellationToken ct = default) =>
+        Task.FromResult(new List<string>());
 }
 
 /// <summary>Brain repo manager stub whose merge always throws, forcing a merge-conflict retry.</summary>
@@ -1190,6 +1193,9 @@ file sealed class FailingMergeBrainRepoManager : IBrainRepoManager
 
     public Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default) =>
         Task.FromResult(false);
+
+    public Task<List<string>> ListRemoteBranchesAsync(string repoName, CancellationToken ct = default) =>
+        Task.FromResult(new List<string>());
 }
 
 /// <summary>In-memory goal store for progress-document tests.</summary>

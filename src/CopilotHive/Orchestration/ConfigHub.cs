@@ -154,6 +154,35 @@ public static class ConfigHub
             return removed ? Results.Ok(new { removed = true }) : Results.NotFound(new { error = $"Repository '{name}' not found." });
         });
 
+        // List remote branches for a repository
+        app.MapGet("/api/config/repositories/{name}/branches", async (
+            string name,
+            [FromServices] IBrainRepoManager? repoManager,
+            ILogger<Program> logger,
+            CancellationToken ct) =>
+        {
+            if (repoManager is null)
+                return Results.Problem("Repository manager is not available.", statusCode: 503);
+            try
+            {
+                var branches = await repoManager.ListRemoteBranchesAsync(name, ct);
+                return Results.Ok(branches);
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("is not cloned"))
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to list branches for repository '{Name}'", name);
+                return Results.Problem("Failed to list branches for this repository.", statusCode: 500);
+            }
+        });
+
         // ── Orchestrator settings ───────────────────────────────────────────
 
         // Get orchestrator settings

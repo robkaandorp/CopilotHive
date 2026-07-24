@@ -113,6 +113,14 @@ public interface IBrainRepoManager
     /// <param name="ct">Cancellation token.</param>
     /// <returns><c>true</c> if the tag was deleted; <c>false</c> otherwise.</returns>
     Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default);
+
+    /// <summary>
+    /// Lists all remote branches from the repository's origin, excluding the symbolic <c>HEAD</c> ref.
+    /// </summary>
+    /// <param name="repoName">Short name of the repository (must have been cloned via <see cref="EnsureCloneAsync"/>).</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>A sorted list of branch names (without the <c>origin/</c> prefix).</returns>
+    Task<List<string>> ListRemoteBranchesAsync(string repoName, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -405,7 +413,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
         if (process.ExitCode != 0)
         {
             var stderr = await process.StandardError.ReadToEndAsync(ct);
-            throw new InvalidOperationException($"git rev-parse HEAD failed: {stderr}");
+            throw new InvalidOperationException($"git {string.Join(' ', args)} failed: {stderr}");
         }
         return await process.StandardOutput.ReadToEndAsync(ct);
     }
@@ -1019,6 +1027,51 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
             _logger.LogInformation("Successfully created and pushed tag {Tag} for {Repo}", tag, repoName);
             return true;
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    }
+
+    /// <summary>
+    /// Lists all remote branches from the repository's origin, excluding the symbolic <c>HEAD</c> ref.
+    /// </summary>
+    /// <param name="repoName">Short name of the repository (must have been cloned via <see cref="EnsureCloneAsync"/>).</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>A sorted list of branch names (without the <c>origin/</c> prefix).</returns>
+    public async Task<List<string>> ListRemoteBranchesAsync(string repoName, CancellationToken ct = default)
+    {
+        ValidateRepoName(repoName);
+
+        var semaphore = await AcquireRepoLockAsync(repoName, ct);
+        try
+        {
+            var clonePath = GetClonePath(repoName);
+            if (!Directory.Exists(Path.Combine(clonePath, ".git")))
+                throw new InvalidOperationException($"Repository '{repoName}' is not cloned.");
+
+            await RunGitAsync(clonePath, ["fetch", "--prune", "origin"], ct);
+            var output = await RunGitWithOutputAsync(clonePath, ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/"], ct);
+
+            var branches = new List<string>();
+            foreach (var line in output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
+            {
+                var name = line.Trim();
+                if (!name.StartsWith("origin/", StringComparison.Ordinal))
+                    continue;
+
+                name = name["origin/".Length..];
+                if (string.IsNullOrWhiteSpace(name))
+                    continue;
+                if (name == "HEAD")
+                    continue;
+
+                branches.Add(name);
+            }
+
+            branches.Sort(StringComparer.OrdinalIgnoreCase);
+            return branches;
         }
         finally
         {
