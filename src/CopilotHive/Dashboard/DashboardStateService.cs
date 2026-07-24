@@ -108,7 +108,7 @@ public sealed class DashboardStateService : IDisposable
         {
             var allGoals = await _goalStore.GetAllGoalsAsync();
             foreach (var g in allGoals)
-                goalsById.TryAdd(g.Id, g);
+                goalsById[g.Id] = g;
         }
 
         // Merge pipeline goals and derive status from pipeline phase
