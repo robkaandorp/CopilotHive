@@ -186,17 +186,19 @@ public interface IDistributedBrain
     /// <param name="ct">Cancellation token.</param>
     Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default);
 
-    /// <summary>Delete the goal session after completion or failure.</summary>
+    /// <summary>Delete the goal session and dispose its Brain context after completion or failure.</summary>
     /// <param name="goalId">The goal identifier whose session to delete.</param>
-    void DeleteGoalSession(string goalId);
+    /// <param name="ct">Cancellation token.</param>
+    Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default);
 
     /// <summary>
-    /// Registers a goal session entry in the LLM session registry for a goal whose
-    /// session file already exists on disk. Used during pipeline restoration to
-    /// re-register sessions for goals that were forked before an orchestrator restart.
+    /// Loads (or forks) an existing goal session from disk and creates its Brain context.
+    /// Used during pipeline restoration to re-create contexts for goals that were forked
+    /// before an orchestrator restart.
     /// </summary>
     /// <param name="goalId">The goal identifier whose existing session to register.</param>
-    void RegisterExistingGoalSession(string goalId);
+    /// <param name="ct">Cancellation token.</param>
+    Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default);
 
     /// <summary>
     /// Returns true if a persisted goal session file exists for the given goal.

@@ -150,7 +150,7 @@ internal sealed class GoalLifecycleService
 
         // Delete goal session on failure (no summary to merge)
         if (status == GoalStatus.Failed && _brain is not null)
-            _brain.DeleteGoalSession(pipeline.GoalId);
+            await _brain.DeleteGoalSessionAsync(pipeline.GoalId, ct);
 
         if (status == GoalStatus.Completed)
         {

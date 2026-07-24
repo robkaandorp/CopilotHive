@@ -707,7 +707,7 @@ internal sealed class PipelineDriver
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Failed to summarize goal '{GoalId}' — deleting goal session without merge", pipeline.GoalId);
-                    _brain.DeleteGoalSession(pipeline.GoalId);
+                    await _brain.DeleteGoalSessionAsync(pipeline.GoalId, ct);
                 }
             }
 

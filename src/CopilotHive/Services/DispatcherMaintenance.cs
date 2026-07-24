@@ -223,7 +223,7 @@ internal sealed class DispatcherMaintenance
                 }
                 else
                 {
-                    (_brain as DistributedBrain)?.RegisterExistingGoalSession(pipeline.GoalId);
+                    await _brain.RegisterExistingGoalSessionAsync(pipeline.GoalId, ct);
                 }
             }
 

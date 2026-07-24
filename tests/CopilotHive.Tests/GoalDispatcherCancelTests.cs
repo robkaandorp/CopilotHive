@@ -540,7 +540,7 @@ public sealed class GoalDispatcherSessionCleanupTests
     /// </summary>
     private sealed class SessionTrackingBrain : IDistributedBrain
     {
-        public List<string> DeletedSessionGoalIds { get; } = [];
+        public System.Collections.Concurrent.ConcurrentBag<string> DeletedSessionGoalIds { get; } = [];
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
@@ -573,12 +573,13 @@ public sealed class GoalDispatcherSessionCleanupTests
 
         public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
-        public void DeleteGoalSession(string goalId)
+        public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default)
         {
             DeletedSessionGoalIds.Add(goalId);
+            return Task.CompletedTask;
         }
 
-        public void RegisterExistingGoalSession(string goalId) { }
+        public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
 
         public bool GoalSessionExists(string goalId) => false;
 
@@ -683,6 +684,12 @@ public sealed class GoalDispatcherSessionCleanupTests
 
         dispatcher.ClearGoalRetryState(goal.Id);
 
+        // ClearGoalRetryState deletes the goal session on a background task (fire-and-forget), so
+        // poll for the observable effect with a tight deadline rather than asserting immediately.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (!brain.DeletedSessionGoalIds.Contains(goal.Id) && DateTime.UtcNow < deadline)
+            await Task.Delay(25, TestContext.Current.CancellationToken);
+
         Assert.Contains(goal.Id, brain.DeletedSessionGoalIds);
     }
 
@@ -757,11 +764,21 @@ public sealed class GoalDispatcherSessionCleanupTests
             // Create a new pipeline manager that will restore from the store
             var restoredPipelineManager = new GoalPipelineManager(pipelineStore);
 
-            // Create a GoalDispatcher with a real DistributedBrain using the temp directory
+            // Create a GoalDispatcher with a real DistributedBrain using the temp directory.
+            // Inject a fake chat client (and factory) so the Brain never touches the process-global
+            // ChatClientFactory token provider — that provider can be disposed by a sibling test,
+            // causing intermittent ObjectDisposedException failures. Isolating it makes this
+            // restoration test deterministic.
             var brain = new DistributedBrain(
                 "copilot/claude-sonnet-4",
                 NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir);
+                stateDir: tempDir,
+                chatClient: new FakeChatClient(),
+                chatClientFactory: _ => new FakeChatClient());
+
+            // RestoreActivePipelinesAsync calls RegisterExistingGoalSessionAsync, which requires a
+            // connected Brain (EnsureConnected). Connect before invoking the restore path.
+            await brain.ConnectAsync(ct);
 
             var dispatcher = new GoalDispatcher(
                 goalManager,

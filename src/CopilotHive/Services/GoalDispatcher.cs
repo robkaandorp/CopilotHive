@@ -173,7 +173,7 @@ public sealed class GoalDispatcher : BackgroundService
             _dispatchedGoals.TryRemove(goalId, out _);
             _logger.LogInformation("Goal {GoalId} cancelled (was InProgress, phase={Phase})", goalId, pipeline.Phase);
             if (_brain is not null)
-                _brain.DeleteGoalSession(goalId);
+                await _brain.DeleteGoalSessionAsync(goalId);
             return true;
         }
 
@@ -190,7 +190,7 @@ public sealed class GoalDispatcher : BackgroundService
         _dispatchedGoals.TryRemove(goalId, out _);
         _logger.LogInformation("Goal {GoalId} cancelled (was {Status})", goalId, goal.Status);
         if (_brain is not null)
-            _brain.DeleteGoalSession(goalId);
+            await _brain.DeleteGoalSessionAsync(goalId);
         return true;
     }
 
@@ -214,7 +214,13 @@ public sealed class GoalDispatcher : BackgroundService
     public void ClearGoalRetryState(string goalId)
     {
         if (_brain is not null)
-            _brain.DeleteGoalSession(goalId);
+        {
+            _ = Task.Run(async () =>
+            {
+                try { await _brain.DeleteGoalSessionAsync(goalId); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete goal session for {GoalId}", goalId); }
+            });
+        }
         _dispatchedGoals.TryRemove(goalId, out _);
         _pipelineManager.RemovePipeline(goalId);
         _logger.LogInformation("Cleared dispatcher retry state for goal {GoalId}", goalId);
@@ -590,8 +596,7 @@ public sealed class GoalDispatcher : BackgroundService
     private async Task DispatchNextGoalAsync(CancellationToken ct)
     {
         // Parallelism gate: allow multiple goals to run concurrently when MaxParallelGoals > 1.
-        // Each goal has its own Brain session, so the Brain's per-call gate (_brainCallGate)
-        // still serializes individual Brain calls — parallelism is in worker execution.
+        // Each goal has its own Brain context with its own gate, so Brain LLM calls for different goals run in parallel.
         var maxParallel = _config?.Orchestrator?.MaxParallelGoals ?? 1;
         var activePipelines = _pipelineManager.GetActivePipelines();
         if (activePipelines.Count >= maxParallel)
