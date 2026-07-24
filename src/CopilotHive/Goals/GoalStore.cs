@@ -210,7 +210,15 @@ public sealed class GoalStore : IGoalStore
                     goal.MergeCommitHash = metadata.MergeCommitHash;
 
                 if (metadata.IterationSummary is { } summary)
+                {
+                    // INSERT OR REPLACE semantics — same pattern as AddIterationAsync
+                    var existing = await db.IterationSummaries
+                        .Where(i => i.GoalId == goalId && i.Iteration == summary.Iteration)
+                        .ToListAsync(ct);
+                    if (existing.Count > 0)
+                        db.IterationSummaries.RemoveRange(existing);
                     db.Add(ToEntity(goalId, summary));
+                }
             }
 
             await db.SaveChangesAsync(ct);
