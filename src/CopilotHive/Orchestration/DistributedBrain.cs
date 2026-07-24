@@ -72,7 +72,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly AgentsManager? _agentsManager;
 
     /// <summary>Active pipeline snapshots keyed by goal ID, used by the <c>get_goal</c> tool.</summary>
-    private Dictionary<string, GoalPipeline>? _activePipelines;
+    private readonly ConcurrentDictionary<string, GoalPipeline> _activePipelines = new();
 
     /// <summary>Serialises session-state mutations (master session, model settings, registered goals, session files).</summary>
     private readonly SemaphoreSlim _sessionLock = new(1, 1);
@@ -174,6 +174,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <inheritdoc />
     public async Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default)
     {
+        EnsureConnected();
+
         await _sessionLock.WaitAsync(ct);
         try
         {
@@ -184,7 +186,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
             _reasoningEffort = reasoning;
 
-            // Refresh the master session registry entry
+            // Refresh the master session registry entry. Existing goal contexts keep their original
+            // model/maxContextTokens snapshot (captured at fork time) — only NEW contexts created
+            // after this update will use the new config.
             _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
             {
                 SessionId = "brain-master",
@@ -194,23 +198,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 CurrentTokens = _masterSession.EstimatedContextTokens,
                 MaxTokens = _maxContextTokens,
             });
-
-            // Refresh each registered goal session entry so the registry reflects the new model
-            // and context window for goals already in flight.
-            foreach (var kvp in _goalContexts)
-            {
-                var goalContext = kvp.Value;
-                _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
-                {
-                    SessionId = $"brain-goal-{kvp.Key}",
-                    SessionType = LlmSessionType.BrainGoal,
-                    GoalId = kvp.Key,
-                    Model = _modelOverride,
-                    Status = "idle",
-                    CurrentTokens = goalContext.Session.EstimatedContextTokens,
-                    MaxTokens = _maxContextTokens,
-                });
-            }
         }
         finally { _sessionLock.Release(); }
 
@@ -236,14 +223,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <param name="pipeline">The active goal pipeline.</param>
     public void RegisterActivePipeline(GoalPipeline pipeline)
     {
-        _activePipelines ??= [];
         _activePipelines[pipeline.GoalId] = pipeline;
     }
 
     /// <summary>Removes a pipeline from the active-pipeline registry once a goal completes or fails.</summary>
     public void DeregisterActivePipeline(string goalId)
     {
-        _activePipelines?.Remove(goalId);
+        _activePipelines.TryRemove(goalId, out _);
     }
 
     /// <summary>Builds the AIFunction tools that the Brain LLM can call.</summary>
@@ -283,7 +269,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     if (goal is null)
                         return $"Goal '{goal_id}' not found.";
 
-                    var pipeline = _activePipelines?.GetValueOrDefault(goal_id);
+                    var pipeline = _activePipelines.TryGetValue(goal_id, out var activePipeline) ? activePipeline : null;
                     var iterationInfo = pipeline is not null
                         ? $"Current iteration: {pipeline.Iteration}, Phase: {pipeline.Phase}"
                         : "Pipeline not active.";
@@ -712,6 +698,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <inheritdoc />
     public async Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default)
     {
+        EnsureConnected();
+
         await _sessionLock.WaitAsync(ct);
         try
         {
@@ -743,6 +731,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <inheritdoc />
     public async Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default)
     {
+        EnsureConnected();
+
         await _sessionLock.WaitAsync(ct);
         try
         {
@@ -793,10 +783,18 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <inheritdoc />
     public async Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default)
     {
+        EnsureConnected();
+
         await _sessionLock.WaitAsync(ct);
         GoalBrainContext? context;
         try
         {
+            // Single-owner deletion: if another call is already deleting this goal, return early.
+            // Only the owning delete adds the marker and removes it in the finally block, so a
+            // concurrent duplicate delete cannot clear the marker while the owner is still draining.
+            if (_deletingGoals.ContainsKey(goalId))
+                return;
+
             _deletingGoals[goalId] = true;
             _goalContexts.TryRemove(goalId, out context);
         }
@@ -869,6 +867,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <inheritdoc/>
     public async Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct)
     {
+        EnsureConnected();
+
         pipeline.Conversation.Add(new ConversationEntry("system", note, pipeline.Iteration, "plan-adjustment"));
 
         await _sessionLock.WaitAsync(ct);
@@ -889,6 +889,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <inheritdoc/>
     public async Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default)
     {
+        EnsureConnected();
+
         if (string.IsNullOrWhiteSpace(instructions)) return;
 
         await _sessionLock.WaitAsync(ct);
@@ -905,13 +907,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <summary>Asks the Brain to plan which phases should run during the current iteration.</summary>
     public async Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
     {
-        var prompt = BrainPromptBuilder.BuildPlanningPrompt(pipeline, additionalContext);
+        EnsureConnected();
 
-        if (!_connected)
-        {
-            _logger.LogWarning("Brain not connected — using default iteration plan for goal {GoalId}", pipeline.GoalId);
-            return PlanResult.Success(IterationPlan.Default());
-        }
+        var prompt = BrainPromptBuilder.BuildPlanningPrompt(pipeline, additionalContext);
 
         try
         {
@@ -1119,16 +1117,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     public async Task<PromptResult> CraftPromptAsync(
         GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
     {
-        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, phase, additionalContext);
+        EnsureConnected();
 
-        if (!_connected)
-        {
-            _logger.LogWarning("Brain not connected — using fallback prompt for {GoalId} phase {Phase}",
-                pipeline.GoalId, phase);
-            return phase == GoalPhase.Review
-                ? PromptResult.Success(BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline, additionalContext))
-                : PromptResult.Success($"Work on: {pipeline.Description}");
-        }
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, phase, additionalContext);
 
         try
         {
@@ -1202,12 +1193,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     public async Task<BrainResponse> AskQuestionAsync(
         string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default)
     {
-        if (!_connected)
-        {
-            _logger.LogWarning(
-                "Brain not connected — returning direct fallback answer for question in goal {GoalId}", goalId);
-            return BrainResponse.Answer("Brain is not available. Please proceed with your best judgment.");
-        }
+        EnsureConnected();
 
         var prompt = BrainPromptBuilder.BuildAskQuestionPrompt(goalId, iteration, phase, workerRole, question);
 
@@ -1384,6 +1370,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <inheritdoc />
     public async Task ResetSessionAsync(CancellationToken ct = default)
     {
+        // NOTE: ResetSessionAsync intentionally does NOT call EnsureConnected(). With per-goal
+        // contexts there is no shared agent to recreate, so a reset just drains any existing
+        // goal contexts (none if never connected) and rebuilds the master session + reloads
+        // orchestrator instructions from disk. This matches the design spec and lets callers
+        // reset a Brain that was constructed but never connected.
+
         // Phase 1: Mark resetting and snapshot contexts
         List<GoalBrainContext> contextsToDrain;
         await _sessionLock.WaitAsync(ct);

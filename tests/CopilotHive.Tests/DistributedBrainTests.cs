@@ -134,13 +134,15 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task CraftPromptAsync_WithoutConnect_ReturnsFallback()
+    public async Task CraftPromptAsync_WithoutConnect_Throws()
     {
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-4", "Some goal");
 
-        var promptResult = await brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken);
-        Assert.Contains("Some goal", promptResult.Prompt);
+        // With per-goal contexts, methods require a connected Brain and no longer return a
+        // pre-connect fallback — they must throw InvalidOperationException instead.
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken));
     }
 
     // -- FakeDistributedBrain (IDistributedBrain stub) --
@@ -430,16 +432,15 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task PlanIterationAsync_WithoutConnect_ReturnsDefaultPlan()
+    public async Task PlanIterationAsync_WithoutConnect_Throws()
     {
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-plan", "Test plan");
 
-        var planResult = await brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
-
-        Assert.NotNull(planResult);
-        Assert.False(planResult.IsEscalation);
-        Assert.NotEmpty(planResult.Plan!.Phases);
+        // With per-goal contexts, methods require a connected Brain and no longer return a
+        // pre-connect default plan — they must throw InvalidOperationException instead.
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -904,32 +905,29 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task CraftPromptAsync_NullAgent_ReviewPhase_ContainsTesterOutput()
+    public async Task CraftPromptAsync_NotConnected_ReviewPhase_Throws()
     {
-        // When agent is null, Review phase must still get tester output and guidance
+        // The inline null-agent fallback was removed; the review fallback now lives in
+        // ClarificationHandler (covered by BuildReviewFallbackPrompt tests). CraftPromptAsync
+        // now requires a connected Brain and throws when called before Connect.
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-fb-craft-1", "Fix authentication bug");
         pipeline.RecordTestOutput(WorkerRole.Tester, 1, "FALLBACK_TESTER_RESULTS_42");
 
-        var promptResult = await brain.CraftPromptAsync(pipeline, GoalPhase.Review, null, TestContext.Current.CancellationToken);
-
-        Assert.False(promptResult.IsEscalation);
-        Assert.Contains("FALLBACK_TESTER_RESULTS_42", promptResult.Prompt);
-        Assert.Contains("=== Tester output (iteration 1) ===", promptResult.Prompt);
-        Assert.Contains("do NOT reject because you cannot run tests yourself", promptResult.Prompt);
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => brain.CraftPromptAsync(pipeline, GoalPhase.Review, null, TestContext.Current.CancellationToken));
     }
 
     [Fact]
-    public async Task CraftPromptAsync_NullAgent_CodingPhase_ReturnsGenericFallback()
+    public async Task CraftPromptAsync_NotConnected_CodingPhase_Throws()
     {
-        // Non-review phases should still get the generic fallback
+        // Non-review phases also require a connected Brain now; the generic inline fallback
+        // was removed in favour of EnsureConnected.
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-fb-craft-2", "Implement caching layer");
 
-        var promptResult = await brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken);
-
-        Assert.False(promptResult.IsEscalation);
-        Assert.Equal("Work on: Implement caching layer", promptResult.Prompt);
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken));
     }
 
     // ── AskQuestionAsync — escalate_to_composer tool call ─────────────────
@@ -993,26 +991,6 @@ public sealed class DistributedBrainTests
         }
     }
 
-    /// <summary>
-    /// Uses reflection to inject a fake <see cref="IChatClient"/> into a
-    /// <see cref="DistributedBrain"/> and call <c>RecreateAgent()</c> so the
-    /// internal <c>CodingAgent</c> is built without a real LLM endpoint.
-    /// </summary>
-    private static void InjectFakeChatClient(DistributedBrain brain, IChatClient fakeClient)
-    {
-        var brainType = typeof(DistributedBrain);
-
-        var chatClientField = brainType.GetField("_chatClient",
-            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("_chatClient field not found on DistributedBrain");
-        chatClientField.SetValue(brain, fakeClient);
-
-        var recreateAgent = brainType.GetMethod("RecreateAgent",
-            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("RecreateAgent method not found on DistributedBrain");
-        recreateAgent.Invoke(brain, null);
-    }
-
     // -- get_goal Tool Tests --
 
     [Fact]
@@ -1040,7 +1018,7 @@ public sealed class DistributedBrainTests
         // Assert - pipeline is stored (verify via reflection since it's private)
         var activePipelinesField = typeof(DistributedBrain)
             .GetField("_activePipelines", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var activePipelines = (Dictionary<string, GoalPipeline>?)activePipelinesField.GetValue(brain);
+        var activePipelines = (System.Collections.Concurrent.ConcurrentDictionary<string, GoalPipeline>?)activePipelinesField.GetValue(brain);
         Assert.NotNull(activePipelines);
         Assert.True(activePipelines.ContainsKey("goal-register-1"));
         Assert.Same(pipeline, activePipelines["goal-register-1"]);
@@ -1061,7 +1039,7 @@ public sealed class DistributedBrainTests
         // Assert
         var activePipelinesField = typeof(DistributedBrain)
             .GetField("_activePipelines", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var activePipelines = (Dictionary<string, GoalPipeline>?)activePipelinesField.GetValue(brain);
+        var activePipelines = (System.Collections.Concurrent.ConcurrentDictionary<string, GoalPipeline>?)activePipelinesField.GetValue(brain);
         Assert.NotNull(activePipelines);
         Assert.Single(activePipelines);
         Assert.Same(pipeline2, activePipelines["goal-overwrite"]);
@@ -1081,7 +1059,7 @@ public sealed class DistributedBrainTests
         // Assert
         var activePipelinesField = typeof(DistributedBrain)
             .GetField("_activePipelines", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var activePipelines = (Dictionary<string, GoalPipeline>?)activePipelinesField.GetValue(brain);
+        var activePipelines = (System.Collections.Concurrent.ConcurrentDictionary<string, GoalPipeline>?)activePipelinesField.GetValue(brain);
         Assert.NotNull(activePipelines);
         Assert.False(activePipelines.ContainsKey("goal-deregister"));
     }
@@ -2959,7 +2937,7 @@ public sealed class DistributedBrainTests
     /// <summary>
     /// <see cref="DistributedBrain"/> must store the <c>compactionModel</c> constructor
     /// parameter in its private <c>_compactionModel</c> field so that
-    /// <c>RecreateAgent()</c> can use it to create a separate compaction client.
+    /// per-goal context creation can use it to create a separate compaction client.
     /// </summary>
     [Fact]
     public void Constructor_CompactionModel_StoresValue()

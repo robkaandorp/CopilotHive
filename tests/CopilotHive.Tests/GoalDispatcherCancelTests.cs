@@ -770,6 +770,10 @@ public sealed class GoalDispatcherSessionCleanupTests
                 NullLogger<DistributedBrain>.Instance,
                 stateDir: tempDir);
 
+            // RestoreActivePipelinesAsync calls RegisterExistingGoalSessionAsync, which requires a
+            // connected Brain (EnsureConnected). Connect before invoking the restore path.
+            await brain.ConnectAsync(ct);
+
             var dispatcher = new GoalDispatcher(
                 goalManager,
                 restoredPipelineManager,

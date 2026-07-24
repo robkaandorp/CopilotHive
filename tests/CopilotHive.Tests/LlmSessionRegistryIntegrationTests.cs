@@ -48,6 +48,30 @@ public sealed class LlmSessionRegistryIntegrationTests
     private static GoalPipeline CreatePipeline(string goalId, string description) =>
         new(new Goal { Id = goalId, Description = description });
 
+    /// <summary>Reads the number of live goal contexts from the private <c>_goalContexts</c> dictionary.</summary>
+    private static int GetGoalContextCount(DistributedBrain brain)
+    {
+        var field = typeof(DistributedBrain).GetField("_goalContexts",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("_goalContexts field not found on DistributedBrain");
+        var dict = field.GetValue(brain)!;
+        var countProp = dict.GetType().GetProperty("Count")
+            ?? throw new InvalidOperationException("_goalContexts has no Count property");
+        return (int)countProp.GetValue(dict)!;
+    }
+
+    /// <summary>Checks whether the private <c>_goalContexts</c> dictionary contains a goal.</summary>
+    private static bool GoalContextExists(DistributedBrain brain, string goalId)
+    {
+        var field = typeof(DistributedBrain).GetField("_goalContexts",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("_goalContexts field not found on DistributedBrain");
+        var dict = field.GetValue(brain)!;
+        var containsKey = dict.GetType().GetMethod("ContainsKey")
+            ?? throw new InvalidOperationException("_goalContexts has no ContainsKey method");
+        return (bool)containsKey.Invoke(dict, [goalId])!;
+    }
+
     /// <summary>Injects a fake chat client into a Composer and rebuilds its internal agent.</summary>
     private static void InjectComposerChatClient(Composer composer, IChatClient fakeClient)
     {
@@ -559,8 +583,9 @@ public sealed class LlmSessionRegistryIntegrationTests
             await brain.ForkSessionForGoalAsync("goal-merge-1", TestContext.Current.CancellationToken);
             Assert.NotNull(FindSession(registry, "brain-goal-goal-merge-1"));
 
-            // If SummarizeAndMergeAsync called the gated public DeleteGoalSession while holding
-            // _brainCallGate, this would deadlock. A 30s timeout guards against a hang.
+            // SummarizeAndMergeAsync acquires the goal's per-context lease/gate and then deletes the
+            // goal session. If it invoked the public DeleteGoalSessionAsync while holding _sessionLock
+            // (or its own gate), this would deadlock. A 30s timeout guards against a hang.
             var summary = await brain.SummarizeAndMergeAsync(pipeline, TestContext.Current.CancellationToken)
                 .WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
 
@@ -796,7 +821,7 @@ public sealed class LlmSessionRegistryIntegrationTests
     // ── DistributedBrain: UpdateModelAsync refreshes master and goal entries ──
 
     [Fact]
-    public async Task UpdateModelAsync_RefreshesMasterAndRegisteredGoalEntries()
+    public async Task UpdateModelAsync_RefreshesMaster_KeepsGoalSnapshot()
     {
         var tempDir = CreateTempDir();
         try
@@ -810,15 +835,315 @@ public sealed class LlmSessionRegistryIntegrationTests
 
             await brain.UpdateModelAsync("copilot/new-model", 99999, TestContext.Current.CancellationToken);
 
+            // Master session registry entry reflects the new model/context window.
             var master = FindSession(registry, "brain-master");
             Assert.NotNull(master);
             Assert.Equal("copilot/new-model", master!.Model);
             Assert.Equal(99999, master.MaxTokens);
 
+            // Snapshot semantics: an EXISTING goal context keeps its original model/maxTokens.
+            // UpdateModelAsync only updates config for NEW contexts and the master entry — it must
+            // NOT rewrite the registry entry of a context created before the model change.
             var goalSession = FindSession(registry, "brain-goal-goal-model-1");
             Assert.NotNull(goalSession);
-            Assert.Equal("copilot/new-model", goalSession!.Model);
-            Assert.Equal(99999, goalSession.MaxTokens);
+            Assert.Equal("copilot/test-model", goalSession!.Model);
+            Assert.NotEqual(99999, goalSession.MaxTokens);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    // ── Issue 4: deterministic concurrency / lifecycle / pre-connect tests ───
+
+    [Fact]
+    public async Task ExecuteBrainAsync_SameGoal_SerializedByPerContextGate()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var registry = new LlmSessionRegistry();
+            var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var blocking = new BlockingBrainChatClient(release.Task, entered, "answered");
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: blocking, sessionRegistry: registry);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+            await brain.ForkSessionForGoalAsync("goal-serial", TestContext.Current.CancellationToken);
+
+            // First AskQuestionAsync for the goal enters the LLM call and holds the per-context gate.
+            var first = brain.AskQuestionAsync("goal-serial", 1, "Coding", "coder", "Q1?",
+                TestContext.Current.CancellationToken);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            // Second call for the SAME goal must block on that goal's per-context gate — it cannot
+            // enter its own LLM call while the first holds the gate. A tight 500ms window proves it.
+            var second = brain.AskQuestionAsync("goal-serial", 2, "Coding", "coder", "Q2?",
+                TestContext.Current.CancellationToken);
+            await Task.Delay(500, TestContext.Current.CancellationToken);
+            Assert.False(second.IsCompleted,
+                "Second same-goal Brain call must serialize behind the per-context gate held by the first");
+
+            // Release the first; both calls complete once the gate is free.
+            release.SetResult(true);
+            await first.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await second.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteBrainAsync_DifferentGoals_RunInParallel()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var registry = new LlmSessionRegistry();
+            // A single blocking client whose LLM call signals `entered` and blocks on `release`.
+            // Because per-goal contexts have independent gates, two DIFFERENT goals must both be
+            // able to enter their LLM calls concurrently even though neither has been released.
+            var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var enteredA = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var enteredB = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var blocking = new TwoGoalBlockingChatClient(release.Task, enteredA, enteredB,
+                "goal-par-a", "goal-par-b", "answered");
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: blocking, sessionRegistry: registry);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+            await brain.ForkSessionForGoalAsync("goal-par-a", TestContext.Current.CancellationToken);
+            await brain.ForkSessionForGoalAsync("goal-par-b", TestContext.Current.CancellationToken);
+
+            var callA = brain.AskQuestionAsync("goal-par-a", 1, "Coding", "coder", "Qa?",
+                TestContext.Current.CancellationToken);
+            var callB = brain.AskQuestionAsync("goal-par-b", 1, "Coding", "coder", "Qb?",
+                TestContext.Current.CancellationToken);
+
+            // Both LLM calls must be entered concurrently — neither has been released. If the two
+            // goals shared a single gate, only one could enter and the other `entered` would never
+            // complete. Awaiting BOTH proves genuine parallelism.
+            await enteredA.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await enteredB.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            Assert.False(release.Task.IsCompleted,
+                "Both different-goal Brain calls entered their LLM calls before any release — proving parallelism");
+
+            release.SetResult(true);
+            await callA.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await callB.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task ForkSessionForGoalAsync_DuringDeletion_ThrowsThenSucceedsAfterDrain()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var registry = new LlmSessionRegistry();
+            var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var blocking = new BlockingBrainChatClient(release.Task, entered, "answered");
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: blocking, sessionRegistry: registry);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+            await brain.ForkSessionForGoalAsync("goal-race", TestContext.Current.CancellationToken);
+
+            // Hold the goal's context via a blocked LLM call so DeleteGoalSessionAsync parks on drain.
+            var askTask = brain.AskQuestionAsync("goal-race", 1, "Coding", "coder", "Proceed?",
+                TestContext.Current.CancellationToken);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            // Start the delete — it removes the context and adds the goal to _deletingGoals, then
+            // blocks on WaitForDrainAsync because the LLM call still holds the lease.
+            var deleteTask = Task.Run(() => brain.DeleteGoalSessionAsync("goal-race"),
+                TestContext.Current.CancellationToken);
+
+            // Poll until the delete has entered its drain phase (goal marked as deleting). Bounded loop.
+            for (var i = 0; i < 50 && GoalContextExists(brain, "goal-race"); i++)
+                await Task.Delay(20, TestContext.Current.CancellationToken);
+            Assert.False(deleteTask.IsCompleted, "Delete must be draining while the LLM call holds the lease");
+
+            // A fork for the SAME goal while it is being deleted must throw — _deletingGoals blocks it.
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => brain.ForkSessionForGoalAsync("goal-race", TestContext.Current.CancellationToken));
+
+            // Release the LLM call; the ask completes, the lease drops, the delete drains and finishes.
+            release.SetResult(true);
+            await askTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await deleteTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            Assert.Null(FindSession(registry, "brain-goal-goal-race"));
+
+            // After deletion completes, the goal is no longer in _deletingGoals — a fresh fork succeeds.
+            await brain.ForkSessionForGoalAsync("goal-race", TestContext.Current.CancellationToken);
+            Assert.NotNull(FindSession(registry, "brain-goal-goal-race"));
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteGoalSessionAsync_DuplicateConcurrent_SecondReturnsEarly_NoError()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var registry = new LlmSessionRegistry();
+            var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var blocking = new BlockingBrainChatClient(release.Task, entered, "answered");
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: blocking, sessionRegistry: registry);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+            await brain.ForkSessionForGoalAsync("goal-dupdel", TestContext.Current.CancellationToken);
+
+            // Hold the context via a blocked LLM call so the first delete parks on drain, giving the
+            // second concurrent delete a window to observe the _deletingGoals marker and return early.
+            var askTask = brain.AskQuestionAsync("goal-dupdel", 1, "Coding", "coder", "Proceed?",
+                TestContext.Current.CancellationToken);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            var delete1 = Task.Run(() => brain.DeleteGoalSessionAsync("goal-dupdel"),
+                TestContext.Current.CancellationToken);
+
+            // Wait until the first delete has removed the context and marked it deleting.
+            for (var i = 0; i < 50 && GoalContextExists(brain, "goal-dupdel"); i++)
+                await Task.Delay(20, TestContext.Current.CancellationToken);
+
+            // The SECOND delete must return early (marker present) without throwing and without
+            // touching the still-draining first delete's cleanup.
+            await brain.DeleteGoalSessionAsync("goal-dupdel", TestContext.Current.CancellationToken)
+                .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            Assert.False(delete1.IsCompleted,
+                "First delete must still be draining after the second returns early");
+
+            // Release the LLM call; the first delete drains and completes cleanly.
+            release.SetResult(true);
+            await askTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await delete1.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            Assert.Null(FindSession(registry, "brain-goal-goal-dupdel"));
+            Assert.False(GoalContextExists(brain, "goal-dupdel"));
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task PublicMethods_BeforeConnect_ThrowInvalidOperationException()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            // A fresh Brain that has NOT been connected. Every public operation must call
+            // EnsureConnected and throw InvalidOperationException before doing any work.
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient());
+            var pipeline = CreatePipeline("goal-preconnect", "Pre-connect goal");
+
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken));
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken));
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => brain.AskQuestionAsync("goal-preconnect", 1, "Coding", "coder", "Q?",
+                    TestContext.Current.CancellationToken));
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => brain.ForkSessionForGoalAsync("goal-preconnect", TestContext.Current.CancellationToken));
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => brain.DeleteGoalSessionAsync("goal-preconnect", TestContext.Current.CancellationToken));
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => brain.RegisterExistingGoalSessionAsync("goal-preconnect", TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_ClearsAllGoalContextsAndUnregistersSessions()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var registry = new LlmSessionRegistry();
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient(), sessionRegistry: registry,
+                chatClientFactory: _ => new FakeChatClient());
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+            await brain.ForkSessionForGoalAsync("goal-reset-1", TestContext.Current.CancellationToken);
+            await brain.ForkSessionForGoalAsync("goal-reset-2", TestContext.Current.CancellationToken);
+            await brain.ForkSessionForGoalAsync("goal-reset-3", TestContext.Current.CancellationToken);
+
+            Assert.Equal(3, GetGoalContextCount(brain));
+            Assert.NotNull(FindSession(registry, "brain-goal-goal-reset-1"));
+            Assert.NotNull(FindSession(registry, "brain-goal-goal-reset-2"));
+            Assert.NotNull(FindSession(registry, "brain-goal-goal-reset-3"));
+
+            await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+            // All goal contexts removed and every goal session unregistered from the registry.
+            Assert.Equal(0, GetGoalContextCount(brain));
+            Assert.Null(FindSession(registry, "brain-goal-goal-reset-1"));
+            Assert.Null(FindSession(registry, "brain-goal-goal-reset-2"));
+            Assert.Null(FindSession(registry, "brain-goal-goal-reset-3"));
+
+            // The master session was rebuilt fresh and re-registered with zero tokens.
+            var master = FindSession(registry, "brain-master");
+            Assert.NotNull(master);
+            Assert.Equal(0, master!.CurrentTokens);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task DisposeAsync_WaitsForActiveLlmCallToDrain()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var registry = new LlmSessionRegistry();
+            var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var blocking = new BlockingBrainChatClient(release.Task, entered, "answered");
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: blocking, sessionRegistry: registry);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+            await brain.ForkSessionForGoalAsync("goal-dispose", TestContext.Current.CancellationToken);
+
+            // Hold the goal's lease via a blocked LLM call.
+            var askTask = brain.AskQuestionAsync("goal-dispose", 1, "Coding", "coder", "Proceed?",
+                TestContext.Current.CancellationToken);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            // DisposeAsync must drain the active call before completing.
+            var disposeTask = brain.DisposeAsync();
+
+            await Task.Delay(300, TestContext.Current.CancellationToken);
+            Assert.False(disposeTask.IsCompleted,
+                "DisposeAsync must wait for the active LLM call to drain before completing");
+
+            // Release the LLM call; the ask completes and dispose drains and finishes.
+            release.SetResult(true);
+            await askTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await disposeTask.AsTask().WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            Assert.Null(FindSession(registry, "brain-goal-goal-dispose"));
         }
         finally
         {
@@ -1636,7 +1961,8 @@ file sealed class CannedReplyChatClient(string reply) : IChatClient
 
 /// <summary>
 /// A chat client that signals when its LLM call is entered, then blocks until released.
-/// Used to prove that <c>_brainCallGate</c> serializes gated Brain operations.
+/// Used to prove that a goal's per-context gate serializes that goal's Brain operations while
+/// letting different goals run in parallel.
 /// </summary>
 file sealed class BlockingBrainChatClient(Task<bool> release, TaskCompletionSource<bool> entered, string reply) : IChatClient
 {
@@ -1648,6 +1974,52 @@ file sealed class BlockingBrainChatClient(Task<bool> release, TaskCompletionSour
         CancellationToken cancellationToken = default)
     {
         entered.TrySetResult(true);
+        await release.WaitAsync(cancellationToken);
+        return new ChatResponse(new ChatMessage(ChatRole.Assistant, reply))
+        {
+            FinishReason = ChatFinishReason.Stop,
+        };
+    }
+
+    public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException("Streaming not used in this fake client.");
+
+    public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+    public void Dispose() { }
+}
+
+/// <summary>
+/// A chat client that distinguishes two goals by inspecting the goal id embedded in the prompt.
+/// Each goal's LLM call signals its own <c>entered</c> TCS, then all calls block on a shared
+/// <c>release</c>. Used to prove that two DIFFERENT goals enter their LLM calls concurrently
+/// (independent per-context gates), rather than serializing through a single shared gate.
+/// </summary>
+file sealed class TwoGoalBlockingChatClient(
+    Task<bool> release,
+    TaskCompletionSource<bool> enteredA,
+    TaskCompletionSource<bool> enteredB,
+    string goalIdA,
+    string goalIdB,
+    string reply) : IChatClient
+{
+    public ChatClientMetadata Metadata => new("two-goal-blocking", null, "blocking-model");
+
+    public async Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        // Identify which goal this call belongs to by scanning the prompt text for the goal id.
+        var text = string.Join("\n", messages.Select(m => m.Text));
+        if (text.Contains(goalIdA, StringComparison.Ordinal))
+            enteredA.TrySetResult(true);
+        else if (text.Contains(goalIdB, StringComparison.Ordinal))
+            enteredB.TrySetResult(true);
+
         await release.WaitAsync(cancellationToken);
         return new ChatResponse(new ChatMessage(ChatRole.Assistant, reply))
         {

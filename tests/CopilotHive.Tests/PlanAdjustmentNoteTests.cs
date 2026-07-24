@@ -194,16 +194,22 @@ public sealed class InjectSystemNoteAsyncTests
         return pipeline;
     }
 
-    private static DistributedBrain CreateBrain() =>
-        new DistributedBrain(
+    private static async Task<DistributedBrain> CreateBrainAsync()
+    {
+        // InjectSystemNoteAsync (like all public Brain operations) requires a connected Brain,
+        // so tests must connect before invoking it.
+        var brain = new DistributedBrain(
             "test-model",
             NullLogger<DistributedBrain>.Instance);
+        await brain.ConnectAsync(TestContext.Current.CancellationToken);
+        return brain;
+    }
 
     [Fact]
     public async Task InjectSystemNoteAsync_AddsEntryToConversation()
     {
         var pipeline = CreatePipeline();
-        var brain = CreateBrain();
+        var brain = await CreateBrainAsync();
         var initialCount = pipeline.Conversation.Count;
 
         await brain.InjectSystemNoteAsync(pipeline, "Plan was adjusted.", TestContext.Current.CancellationToken);
@@ -215,7 +221,7 @@ public sealed class InjectSystemNoteAsyncTests
     public async Task InjectSystemNoteAsync_EntryHasSystemRole()
     {
         var pipeline = CreatePipeline();
-        var brain = CreateBrain();
+        var brain = await CreateBrainAsync();
 
         await brain.InjectSystemNoteAsync(pipeline, "Plan was adjusted.", TestContext.Current.CancellationToken);
 
@@ -227,7 +233,7 @@ public sealed class InjectSystemNoteAsyncTests
     public async Task InjectSystemNoteAsync_EntryContentMatchesNote()
     {
         var pipeline = CreatePipeline();
-        var brain = CreateBrain();
+        var brain = await CreateBrainAsync();
         var note = "Your iteration plan was adjusted.";
 
         await brain.InjectSystemNoteAsync(pipeline, note, TestContext.Current.CancellationToken);
@@ -240,7 +246,7 @@ public sealed class InjectSystemNoteAsyncTests
     public async Task InjectSystemNoteAsync_EntryHasPlanAdjustmentPurpose()
     {
         var pipeline = CreatePipeline();
-        var brain = CreateBrain();
+        var brain = await CreateBrainAsync();
 
         await brain.InjectSystemNoteAsync(pipeline, "Plan adjusted.", TestContext.Current.CancellationToken);
 
@@ -252,7 +258,7 @@ public sealed class InjectSystemNoteAsyncTests
     public async Task InjectSystemNoteAsync_EntryIterationMatchesPipelineIteration()
     {
         var pipeline = CreatePipeline(iteration: 3);
-        var brain = CreateBrain();
+        var brain = await CreateBrainAsync();
 
         await brain.InjectSystemNoteAsync(pipeline, "Note.", TestContext.Current.CancellationToken);
 
@@ -265,7 +271,7 @@ public sealed class InjectSystemNoteAsyncTests
     {
         // Simulate caller only calling InjectSystemNoteAsync when plan changed
         var pipeline = CreatePipeline();
-        var brain = CreateBrain();
+        var brain = await CreateBrainAsync();
         var initialCount = pipeline.Conversation.Count;
 
         // Do NOT inject — plan was unchanged
@@ -281,7 +287,7 @@ public sealed class InjectSystemNoteAsyncTests
         // The note must be injected into the Brain's master session so that the Brain
         // includes it when crafting the next prompt (goal contexts fork from the master).
         var pipeline = CreatePipeline();
-        var brain = CreateBrain();
+        var brain = await CreateBrainAsync();
 
         // Get baseline message count from the Brain master session via reflection
         var sessionField = typeof(DistributedBrain).GetField(
@@ -303,7 +309,7 @@ public sealed class InjectSystemNoteAsyncTests
     {
         // The injected session message must contain the note text so the Brain can read it.
         var pipeline = CreatePipeline();
-        var brain = CreateBrain();
+        var brain = await CreateBrainAsync();
         var note = "Testing was inserted after Coding (required for code-change plans)";
 
         var sessionField = typeof(DistributedBrain).GetField(
