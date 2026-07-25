@@ -72,6 +72,7 @@ internal static class GoalDetailViewBuilder
             MergeCommitHash = pipeline?.MergeCommitHash ?? effectiveGoal.MergeCommitHash,
             RepositoryUrl = ResolveRepositoryUrl(effectiveGoal, config),
             RepositoryNames = effectiveGoal.RepositoryNames,
+            FailureReason = effectiveGoal.FailureReason,
         };
     }
 

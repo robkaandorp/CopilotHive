@@ -1006,6 +1006,101 @@ public class GoalsApiEndpointTests
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
     }
 
+    // ── POST /api/goals/{id}/extend-iterations ────────────────────────────
+
+    [Fact]
+    public async Task ExtendIterations_ValidRequest_Returns200OK()
+    {
+        var id = UniqueId();
+        await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+
+        // Set goal to Failed with iteration exhaustion and create an exhausted pipeline
+        // using the same singleton GoalPipelineManager that the live GoalDispatcher uses.
+        using var scope = _factory.Services.CreateScope();
+        var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+        var pipelineManager = scope.ServiceProvider.GetRequiredService<GoalPipelineManager>();
+        var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.Failed;
+        goal.FailureReason = "Exceeded max iterations";
+        await store.UpdateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3, maxIterations: 3);
+        while (pipeline.IterationBudget.TryConsume()) { }
+        pipeline.AdvanceTo(GoalPhase.Failed);
+        pipelineManager.PersistFull(pipeline);
+
+        var reloadedGoal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+        Assert.NotNull(reloadedGoal);
+        Assert.Equal(GoalStatus.Failed, reloadedGoal!.Status);
+        Assert.Contains("max iterations", reloadedGoal.FailureReason);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        Assert.NotNull(pipelineManager.GetByGoalId(id));
+
+        var response = await _client.PostAsync(
+            $"/api/goals/{id}/extend-iterations",
+            new StringContent(JsonSerializer.Serialize(new { additionalIterations = 5 }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.Contains("Extended iteration budget by 5", body);
+    }
+
+    [Fact]
+    public async Task ExtendIterations_ZeroIterations_Returns400BadRequest()
+    {
+        var id = UniqueId();
+        var response = await _client.PostAsync(
+            $"/api/goals/{id}/extend-iterations",
+            new StringContent(JsonSerializer.Serialize(new { additionalIterations = 0 }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.Contains("between 1 and 100", body);
+    }
+
+    [Fact]
+    public async Task ExtendIterations_NegativeIterations_Returns400BadRequest()
+    {
+        var id = UniqueId();
+        var response = await _client.PostAsync(
+            $"/api/goals/{id}/extend-iterations",
+            new StringContent(JsonSerializer.Serialize(new { additionalIterations = -5 }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task ExtendIterations_Above100_Returns400BadRequest()
+    {
+        var id = UniqueId();
+        var response = await _client.PostAsync(
+            $"/api/goals/{id}/extend-iterations",
+            new StringContent(JsonSerializer.Serialize(new { additionalIterations = 101 }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task ExtendIterations_NonExistentGoal_Returns404NotFound()
+    {
+        var response = await _client.PostAsync(
+            "/api/goals/nonexistent-goal-xyz/extend-iterations",
+            new StringContent(JsonSerializer.Serialize(new { additionalIterations = 5 }, JsonOpts),
+                Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
     // ── GET /api/goals/{id} reflects review status badge value ───────────
 
     /// <summary>

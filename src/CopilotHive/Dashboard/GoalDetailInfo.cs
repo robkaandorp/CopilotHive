@@ -47,4 +47,6 @@ public sealed class GoalDetailInfo
     public string? RepositoryUrl { get; init; }
     /// <summary>Repository names associated with this goal.</summary>
     public List<string> RepositoryNames { get; init; } = [];
+    /// <summary>Reason the goal failed, if applicable.</summary>
+    public string? FailureReason { get; init; }
 }

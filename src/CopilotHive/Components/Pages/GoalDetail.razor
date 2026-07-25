@@ -811,6 +811,20 @@
                         <span class="error-msg">@_deleteError</span>
                     }
                 }
+
+                @* Extend Iterations — Failed with iteration exhaustion *@
+                @if ((_detail?.FailureReason?.Contains("iteration", StringComparison.OrdinalIgnoreCase) == true
+                    || _storedGoal?.FailureReason?.Contains("iteration", StringComparison.OrdinalIgnoreCase) == true)
+                    && (_detail?.Status == GoalStatus.Failed || _storedGoal?.Status == GoalStatus.Failed))
+                {
+                    <button class="approve-btn" @onclick="ExtendIterationsAsync" disabled="@_extendingIterations">
+                        @(_extendingIterations ? "Extending..." : "➕ Extend Iterations (+5)")
+                    </button>
+                    @if (_extendError is not null)
+                    {
+                        <span style="color:var(--red);font-size:0.8rem">@_extendError</span>
+                    }
+                }
             }
         </div>
     </div>
@@ -837,6 +851,8 @@ else
     private string? _revertError;
     private string? _cancelError;
     private string? _deleteError;
+    private bool _extendingIterations;
+    private string? _extendError;
     private Dictionary<string, GoalStatus> _dependencyStatuses = new();
     private List<Release> _planningReleases = [];
     private string _selectedReleaseId = "";
@@ -1240,6 +1256,45 @@ else
             var errorContent = await response.Content.ReadAsStringAsync();
             _deleteError = $"Error {(int)response.StatusCode}: {errorContent}";
             StateHasChanged();
+        }
+    }
+
+    private async Task ExtendIterationsAsync()
+    {
+        _extendError = null;
+        _extendingIterations = true;
+        try
+        {
+            var body = new StringContent(
+                System.Text.Json.JsonSerializer.Serialize(new { additionalIterations = 5 }),
+                System.Text.Encoding.UTF8,
+                "application/json");
+            var response = await HttpClient.PostAsync($"/api/goals/{GoalId}/extend-iterations", body);
+            if (response.IsSuccessStatusCode)
+            {
+                await RefreshAsync();
+                StateHasChanged();
+            }
+            else if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                _extendError = "Goal or pipeline not found";
+                StateHasChanged();
+            }
+            else
+            {
+                var errorContent = await response.Content.ReadAsStringAsync();
+                _extendError = $"Error {(int)response.StatusCode}: {errorContent}";
+                StateHasChanged();
+            }
+        }
+        catch (Exception ex)
+        {
+            _extendError = ex.Message;
+            StateHasChanged();
+        }
+        finally
+        {
+            _extendingIterations = false;
         }
     }
 

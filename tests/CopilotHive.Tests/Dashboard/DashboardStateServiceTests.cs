@@ -1694,6 +1694,94 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Equal(ReviewStatus.Pending, detail!.ReviewStatus);
     }
 
+    /// <summary>
+    /// Verifies that <see cref="GoalDetailInfo.FailureReason"/> is populated from the underlying <see cref="Goal"/>.
+    /// </summary>
+    [Fact]
+    public void GoalDetailInfo_FailureReason_ReflectsGoalFailureReason()
+    {
+        var detail = new GoalDetailInfo
+        {
+            GoalId = "failed-goal",
+            Description = "A failed goal",
+            Status = GoalStatus.Failed,
+            Priority = GoalPriority.Normal,
+            Scope = GoalScope.Feature,
+            FailureReason = "Exceeded max iterations",
+        };
+
+        Assert.Equal("Exceeded max iterations", detail.FailureReason);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetGoalDetail"/> populates
+    /// <see cref="GoalDetailInfo.FailureReason"/> from a stored failed goal.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_GoalWithFailureReason_PopulatesFailureReason()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "iteration-exhausted-goal",
+            Description = "Goal that exhausted iterations",
+            Status = GoalStatus.Failed,
+            FailureReason = "Exceeded max iterations",
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store);
+
+        var detail = await service.GetGoalDetail("iteration-exhausted-goal");
+
+        Assert.NotNull(detail);
+        Assert.Equal("Exceeded max iterations", detail!.FailureReason);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetGoalDetail"/> leaves
+    /// <see cref="GoalDetailInfo.FailureReason"/> null for a non-failed goal.
+    /// </summary>
+    [Fact]
+    public async Task GetGoalDetail_NonFailedGoal_FailureReasonIsNull()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "completed-goal",
+            Description = "Goal that completed",
+            Status = GoalStatus.Completed,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(_store);
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, goalManager,
+            logSink, progressLog, goalStore: _store);
+
+        var detail = await service.GetGoalDetail("completed-goal");
+
+        Assert.NotNull(detail);
+        Assert.Null(detail!.FailureReason);
+    }
+
     // ── Release methods ───────────────────────────────────────────────
 
     /// <summary>

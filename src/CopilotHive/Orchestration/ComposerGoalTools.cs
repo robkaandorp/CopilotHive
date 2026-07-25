@@ -196,6 +196,28 @@ public sealed partial class Composer
         return $"✅ Goal '{id}' has been cancelled.";
     }
 
+    [Description("Extend the iteration budget for a goal that has exhausted or is close to exhausting its max iterations.")]
+    internal async Task<string> ExtendGoalIterationsAsync(
+        [Description("Goal ID to extend")] string id,
+        [Description("Number of additional iterations to grant (1-100, default 5)")] int additionalIterations = 5)
+    {
+        var error = Shared.ToolValidation.Check(
+            (!string.IsNullOrWhiteSpace(id), "id is required"),
+            (additionalIterations > 0 && additionalIterations <= 100, "additionalIterations must be between 1 and 100"));
+        if (error is not null) return error;
+
+        var goalDispatcher = _serviceProvider?.GetService<GoalDispatcher>();
+        if (goalDispatcher is null)
+            return "❌ Goal dispatcher is not available — cannot extend iterations.";
+
+        var success = await goalDispatcher.ResumeGoalAsync(id, additionalIterations);
+        if (!success)
+            return $"❌ Goal '{id}' or its pipeline not found, or goal is not eligible for iteration extension.";
+
+        _logger.LogInformation("Composer extended iteration budget for goal '{GoalId}' by {AdditionalIterations}", id, additionalIterations);
+        return $"✅ Extended iteration budget for goal '{id}' by {additionalIterations}.";
+    }
+
     [Description("Trigger a pre-execution review on a Draft goal. Returns the review verdict, issues, and recommendations.")]
     internal async Task<string> ReviewGoalAsync(
         [Description("Goal ID to review")] string goal_id)

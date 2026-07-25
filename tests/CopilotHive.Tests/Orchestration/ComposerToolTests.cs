@@ -1308,6 +1308,162 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("not found", result);
     }
 
+    // ── extend_goal_iterations ──
+
+    [Fact]
+    public async Task ExtendGoalIterations_ValidInput_ReturnsSuccessMessage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            // Create failed goal with iteration exhaustion
+            await _composer.CreateGoalAsync("extend-iterations", "Goal to extend");
+            var goal = await _store.GetGoalAsync("extend-iterations", ct);
+            Assert.NotNull(goal);
+            goal!.Status = GoalStatus.Failed;
+            goal.FailureReason = "Exceeded max iterations";
+            await _store.UpdateGoalAsync(goal, ct);
+
+            // Use a shared PipelineStore so the dispatcher can restore the persisted Failed pipeline.
+            await using var pipelineStore = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var goalManager = new GoalManager();
+            goalManager.AddSource(new FakeGoalSource(goal, _store));
+            var pipelineManager = new GoalPipelineManager(pipelineStore);
+            var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3, maxIterations: 3);
+            while (pipeline.IterationBudget.TryConsume()) { }
+            pipeline.AdvanceTo(GoalPhase.Failed);
+            pipelineManager.PersistFull(pipeline);
+
+            var dispatcher = new GoalDispatcher(
+                goalManager,
+                pipelineManager,
+                new TaskQueue(),
+                new GrpcWorkerGateway(new WorkerPool()),
+                new TaskCompletionNotifier(),
+                NullLogger<GoalDispatcher>.Instance,
+                repoManager,
+                goalStore: _store);
+
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir,
+                serviceProvider: BuildServiceProvider(dispatcher));
+
+            var result = await composer.ExtendGoalIterationsAsync("extend-iterations", 5);
+
+            Assert.Contains("✅", result);
+            Assert.Contains("Extended", result);
+            Assert.Contains("extend-iterations", result);
+            Assert.Contains("5", result);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExtendGoalIterations_InvalidIterationsZero_ReturnsErrorMessage()
+    {
+        var result = await _composer.ExtendGoalIterationsAsync("extend-iterations-zero", additionalIterations: 0);
+
+        Assert.Contains("ERROR", result);
+        Assert.Contains("between 1 and 100", result);
+    }
+
+    [Fact]
+    public async Task ExtendGoalIterations_InvalidIterationsAbove100_ReturnsErrorMessage()
+    {
+        var result = await _composer.ExtendGoalIterationsAsync("extend-iterations-above", additionalIterations: 101);
+
+        Assert.Contains("ERROR", result);
+        Assert.Contains("between 1 and 100", result);
+    }
+
+    [Fact]
+    public async Task ExtendGoalIterations_NullServiceProvider_ReturnsDispatcherNotAvailable()
+    {
+        // _composer is constructed without a serviceProvider
+        var result = await _composer.ExtendGoalIterationsAsync("extend-iterations-null", additionalIterations: 5);
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not available", result);
+    }
+
+    [Fact]
+    public async Task ExtendGoalIterations_NonExistentGoal_ReturnsNotFoundMessage()
+    {
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var goalManager = new GoalManager();
+            var pipelineManager = new GoalPipelineManager();
+            var dispatcher = new GoalDispatcher(
+                goalManager,
+                pipelineManager,
+                new TaskQueue(),
+                new GrpcWorkerGateway(new WorkerPool()),
+                new TaskCompletionNotifier(),
+                NullLogger<GoalDispatcher>.Instance,
+                repoManager);
+
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir,
+                serviceProvider: BuildServiceProvider(dispatcher));
+
+            var result = await composer.ExtendGoalIterationsAsync("nonexistent-goal", additionalIterations: 5);
+
+            Assert.Contains("❌", result);
+            Assert.Contains("not found", result);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExtendGoalIterations_BlankId_ReturnsValidationError()
+    {
+        var result = await _composer.ExtendGoalIterationsAsync("   ", additionalIterations: 5);
+
+        Assert.Contains("ERROR", result);
+        Assert.Contains("id is required", result);
+    }
+
+    [Fact]
+    public async Task ExtendGoalIterations_DefaultIterations_IsFive()
+    {
+        // The default value for additionalIterations is 5; with a null serviceProvider
+        // we can't reach the dispatcher, but we can verify the default doesn't trigger
+        // the bounds error (i.e. 5 is within 1–100).
+        var result = await _composer.ExtendGoalIterationsAsync("some-goal");
+
+        // Should NOT contain bounds error — should reach the dispatcher-not-available path.
+        Assert.DoesNotContain("between 1 and 100", result);
+        Assert.Contains("not available", result);
+    }
+
+    [Fact]
+    public void BuildComposerTools_IncludesExtendGoalIterations()
+    {
+        var tools = _composer.BuildComposerTools();
+        var names = tools.Select(t => t.Name).ToList();
+        Assert.Contains("extend_goal_iterations", names);
+    }
+
     // ── get_goal — iteration detail format ──
 
     [Fact]

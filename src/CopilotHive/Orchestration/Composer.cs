@@ -109,6 +109,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - Update existing goals (update_goal) — description, priority, scope, repositories, depends_on, and documents can only be changed on Draft goals; status and release can be changed on any goal
         - Delete draft or failed goals (delete_goal)
         - Cancel InProgress or Pending goals (cancel_goal)
+        - Extend the iteration budget for failed goals that exhausted their max iterations (extend_goal_iterations)
         - Inspect repository history (git_log, git_diff, git_show, git_branch, git_blame, git_fetch)
         - Fetch remote branches (git_fetch(repository, remote?, branch?) — default: origin. Use to access remote feature branches.)
         - List configured repositories (list_repositories)
@@ -748,6 +749,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 "Permanently delete a goal. Only Draft or Failed goals can be deleted."),
             AIFunctionFactory.Create(CancelGoalAsync, "cancel_goal",
                 "Cancel an InProgress or Pending goal, stopping its execution."),
+            AIFunctionFactory.Create(ExtendGoalIterationsAsync, "extend_goal_iterations",
+                "Extend the iteration budget for a goal that has exhausted or is close to exhausting its max iterations."),
             AIFunctionFactory.Create(GitLogAsync, "git_log",
                 "View commit history for a repository branch or path."),
             AIFunctionFactory.Create(GitDiffAsync, "git_diff",

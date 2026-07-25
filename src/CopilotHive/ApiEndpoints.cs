@@ -206,6 +206,21 @@ public static class ApiEndpoints
                 : Results.BadRequest(new { error = $"Goal '{id}' could not be cancelled (it may have already completed or failed)." });
         });
 
+        goalsApi.MapPost("/{id}/extend-iterations", async (string id, ExtendIterationsRequest request, [FromServices] GoalDispatcher? dispatcher, CancellationToken ct) =>
+        {
+            if (dispatcher is null)
+                return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+
+            if (request.AdditionalIterations <= 0 || request.AdditionalIterations > 100)
+                return Results.BadRequest(new { error = "additionalIterations must be between 1 and 100." });
+
+            var success = await dispatcher.ResumeGoalAsync(id, request.AdditionalIterations, ct);
+            if (!success)
+                return Results.NotFound(new { error = $"Goal '{id}' or its pipeline not found." });
+
+            return Results.Ok(new { message = $"Extended iteration budget by {request.AdditionalIterations}." });
+        });
+
         goalsApi.MapGet("/search", async (string q, string? status, IGoalStore store) =>
         {
             GoalStatus? statusFilter = null;
@@ -593,6 +608,10 @@ public record UpdateReleaseRepositoriesRequest(List<string>? Repositories);
 /// <summary>Request body for assigning a goal to a release via the HTTP API.</summary>
 /// <param name="ReleaseId">The release ID to assign this goal to.</param>
 public record AssignGoalReleaseRequest(string ReleaseId);
+
+/// <summary>Request body for extending the iteration budget of a goal via the HTTP API.</summary>
+/// <param name="AdditionalIterations">Number of additional iterations to grant (1-100).</param>
+public record ExtendIterationsRequest(int AdditionalIterations);
 
 /// <summary>Request body for submitting an answer to a clarification request via the HTTP API.</summary>
 /// <param name="Answer">The answer text to submit.</param>
