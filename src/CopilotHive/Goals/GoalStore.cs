@@ -172,38 +172,8 @@ public sealed class GoalStore : IGoalStore
         };
     }
 
-    /// <summary>
-    /// Inserts the iteration summary, or updates the existing row when one already exists for
-    /// (<paramref name="goalId"/>, iteration). The pair is protected by a UNIQUE index, so a blind
-    /// insert would throw and abort the whole status update — which previously wedged a pipeline
-    /// permanently when an iteration was re-persisted (e.g. after a pipeline restore and re-dispatch).
-    /// </summary>
-    private static async Task UpsertIterationSummaryAsync(
-        CopilotHiveDbContext db, string goalId, IterationSummary summary, CancellationToken ct)
-    {
-        var incoming = ToEntity(goalId, summary);
-
-        var existing = await db.IterationSummaries
-            .FirstOrDefaultAsync(e => e.GoalId == goalId && e.Iteration == summary.Iteration, ct);
-
-        if (existing is null)
-        {
-            db.Add(incoming);
-            return;
-        }
-
-        existing.PhasesJson = incoming.PhasesJson;
-        existing.TestTotal = incoming.TestTotal;
-        existing.TestPassed = incoming.TestPassed;
-        existing.TestFailed = incoming.TestFailed;
-        existing.ReviewVerdict = incoming.ReviewVerdict;
-        existing.NotesJson = incoming.NotesJson;
-        existing.PhaseOutputsJson = incoming.PhaseOutputsJson;
-        existing.ClarificationsJson = incoming.ClarificationsJson;
-        existing.BuildSuccess = incoming.BuildSuccess;
-    }
-
     // ── IGoalSource ──────────────────────────────────────────────────────
+
     /// <inheritdoc />
     public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default)
         => GetGoalsByStatusAsync(GoalStatus.Pending, ct);
@@ -240,7 +210,15 @@ public sealed class GoalStore : IGoalStore
                     goal.MergeCommitHash = metadata.MergeCommitHash;
 
                 if (metadata.IterationSummary is { } summary)
-                    await UpsertIterationSummaryAsync(db, goalId, summary, ct);
+                {
+                    // INSERT OR REPLACE semantics — same pattern as AddIterationAsync
+                    var existing = await db.IterationSummaries
+                        .Where(i => i.GoalId == goalId && i.Iteration == summary.Iteration)
+                        .ToListAsync(ct);
+                    if (existing.Count > 0)
+                        db.IterationSummaries.RemoveRange(existing);
+                    db.Add(ToEntity(goalId, summary));
+                }
             }
 
             await db.SaveChangesAsync(ct);

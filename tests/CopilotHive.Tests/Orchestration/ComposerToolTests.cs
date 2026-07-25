@@ -3100,6 +3100,848 @@ public sealed class ComposerToolTests : IDisposable
         }
     }
 
+    // ── git_fetch ──
+
+    /// <summary>
+    /// Creates a bare clone of the test-repo at <paramref name="barePath"/> and adds it as
+    /// the "origin" remote of the test-repo. Returns after configuration completes.
+    /// </summary>
+    private static void SetupOriginRemote(string tmpDir, string barePath)
+    {
+        var repoDir = Path.Combine(tmpDir, "repos", "test-repo");
+
+        static void Git(string workDir, params string[] args)
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("git")
+            {
+                WorkingDirectory = workDir,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            foreach (var a in args) psi.ArgumentList.Add(a);
+            using var p = System.Diagnostics.Process.Start(psi)!;
+            p.WaitForExit();
+        }
+
+        Git(repoDir, "clone", "--bare", repoDir, barePath);
+        Git(repoDir, "remote", "add", "origin", barePath);
+    }
+
+    /// <summary>
+    /// Resolves the absolute path to the real git binary via <c>which git</c>, falling back to
+    /// well-known locations. Used so a fake git wrapper can delegate non-intercepted commands.
+    /// </summary>
+    private static string ResolveRealGitPath()
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("which", "git")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var p = System.Diagnostics.Process.Start(psi)!;
+            var output = p.StandardOutput.ReadToEnd().Trim();
+            p.WaitForExit();
+            if (p.ExitCode == 0 && !string.IsNullOrWhiteSpace(output) && File.Exists(output))
+                return output;
+        }
+        catch
+        {
+            // Fall through to well-known locations.
+        }
+
+        foreach (var candidate in new[] { "/usr/bin/git", "/usr/local/bin/git", "/bin/git" })
+        {
+            if (File.Exists(candidate))
+                return candidate;
+        }
+
+        // Last resort — assume it is on PATH by bare name.
+        return "git";
+    }
+
+    /// <summary>Marks a file as executable (chmod +x) on Unix-like systems.</summary>
+    private static void MakeExecutable(string filePath)
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var psi = new System.Diagnostics.ProcessStartInfo("chmod")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("+x");
+        psi.ArgumentList.Add(filePath);
+        using var p = System.Diagnostics.Process.Start(psi)!;
+        p.WaitForExit();
+    }
+
+    [Fact]
+    public async Task GitFetch_NoRepoManager_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.GitFetchAsync("any-repo", cancellationToken: ct);
+        Assert.Contains("not available", result);
+    }
+
+    [Fact]
+    public void BuildComposerTools_IncludesGitFetch()
+    {
+        var tools = _composer.BuildComposerTools();
+        var toolNames = tools.OfType<AIFunction>().Select(t => t.Name).ToList();
+        Assert.Contains("git_fetch", toolNames);
+    }
+
+    [Fact]
+    public void SystemPrompt_ContainsGitFetch()
+    {
+        var prompt = _composer.GetSystemPrompt();
+        Assert.Contains("git_fetch", prompt);
+    }
+
+    [Fact]
+    public async Task GitFetch_DefaultOrigin_FetchesAll()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", cancellationToken: ct);
+
+            Assert.DoesNotContain("❌", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_WithBranch_CreatesRemoteTrackingRef()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var fetchResult = await composer.GitFetchAsync("test-repo", branch: "main", cancellationToken: ct);
+            Assert.DoesNotContain("❌", fetchResult);
+
+            var branches = await composer.GitBranchAsync("test-repo", remote: true, cancellationToken: ct);
+            Assert.Contains("origin/main", branches);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_WithBranch_ForceUpdatesTrackingRefOnNonFastForward()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            var repoDir = Path.Combine(tmpDir, "repos", "test-repo");
+
+            static void Git(string workDir, params string[] args)
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo("git")
+                {
+                    WorkingDirectory = workDir,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                };
+                foreach (var a in args) psi.ArgumentList.Add(a);
+                using var p = System.Diagnostics.Process.Start(psi)!;
+                p.WaitForExit();
+            }
+
+            static string GitCapture(string workDir, params string[] args)
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo("git")
+                {
+                    WorkingDirectory = workDir,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                };
+                foreach (var a in args) psi.ArgumentList.Add(a);
+                using var p = System.Diagnostics.Process.Start(psi)!;
+                var output = p.StandardOutput.ReadToEnd().Trim();
+                p.WaitForExit();
+                return output;
+            }
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            // Capture the original (root) commit on the remote before advancing it.
+            var firstCommitSha = GitCapture(barePath, "rev-list", "--max-parents=0", "HEAD");
+            Assert.False(string.IsNullOrWhiteSpace(firstCommitSha));
+
+            // Phase 1: initial fetch — creates origin/main pointing at the first commit.
+            var fetch1 = await composer.GitFetchAsync("test-repo", branch: "main", cancellationToken: ct);
+            Assert.DoesNotContain("❌", fetch1);
+
+            // Advance the remote: add a second commit locally and push it to the bare remote.
+            Git(repoDir, "commit", "--allow-empty", "-m", "Second commit");
+            Git(repoDir, "push", "origin", "main");
+
+            // Phase 2: fast-forward fetch — succeeds with or without the '+' prefix.
+            var fetch2 = await composer.GitFetchAsync("test-repo", branch: "main", cancellationToken: ct);
+            Assert.DoesNotContain("❌", fetch2);
+
+            // Rewind the remote's main back to the first commit — a NON-fast-forward change.
+            Git(barePath, "update-ref", "refs/heads/main", firstCommitSha);
+
+            // Phase 3: non-fast-forward fetch. WITH the leading '+' in the refspec, git forcibly
+            // updates the tracking ref and succeeds. WITHOUT the '+', git rejects the update as a
+            // non-fast-forward and the result contains a failure — making this test removal-proof
+            // for the force-update prefix.
+            var fetch3 = await composer.GitFetchAsync("test-repo", branch: "main", cancellationToken: ct);
+            Assert.DoesNotContain("❌", fetch3);
+            Assert.DoesNotContain("failed", fetch3);
+
+            // The tracking ref must now point back at the first (rewound) commit.
+            var show = await composer.GitShowAsync("test-repo", "origin/main", cancellationToken: ct);
+            Assert.Contains("Initial commit", show);
+            Assert.DoesNotContain("Second commit", show);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_URLRemote_Rejected()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", remote: "https://evil.com/x", cancellationToken: ct);
+
+            Assert.Contains("❌", result);
+            Assert.Contains("URL", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_OptionInjectionRemote_Rejected()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", remote: "--upload-pack=evil", cancellationToken: ct);
+
+            Assert.Contains("❌", result);
+            Assert.Contains("cannot start with '-'", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_RefspecLikeRemote_Rejected()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", remote: "origin:evil", cancellationToken: ct);
+
+            Assert.Contains("❌", result);
+            Assert.Contains("':' or '+'", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_TransportHelperRemote_Rejected()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", remote: "ext::evil", cancellationToken: ct);
+
+            Assert.Contains("❌", result);
+            Assert.Contains("::", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_UnconfiguredRemote_Rejected()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", remote: "nonexistent", cancellationToken: ct);
+
+            Assert.Contains("❌", result);
+            Assert.Contains("not configured", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_AtSymbolRejection()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", branch: "@{-1}", cancellationToken: ct);
+
+            Assert.Contains("❌", result);
+            Assert.Contains("@{", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_InvalidBranchName_Rejected()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", branch: "..", cancellationToken: ct);
+
+            Assert.Contains("❌", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_CheckRefFormatOutputEquality()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+
+        // Locate the real git binary so the fake wrapper can delegate non-intercepted commands.
+        var realGit = ResolveRealGitPath();
+
+        var originalPath = Environment.GetEnvironmentVariable("PATH");
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            // Deterministic test seam: a fake "git" that intercepts `check-ref-format --branch`
+            // and echoes a NORMALIZED value that differs from the supplied branch (exit 0), while
+            // delegating every other git command to the real binary. This forces the
+            // stdout-equality guard in GitFetchAsync down the rejection path regardless of the
+            // host git version. If that equality guard is removed, the fetch proceeds and the
+            // assertions below fail — making this test removal-proof.
+            var fakeGitDir = Path.Combine(tmpDir, "fakegit");
+            Directory.CreateDirectory(fakeGitDir);
+            var fakeGitPath = Path.Combine(fakeGitDir, "git");
+            File.WriteAllText(fakeGitPath,
+                "#!/bin/bash\n" +
+                $"REAL_GIT={realGit}\n" +
+                "if [ \"$1\" = \"check-ref-format\" ] && [ \"$2\" = \"--branch\" ]; then\n" +
+                "    # Echo a normalized value that differs from the supplied branch.\n" +
+                "    echo \"normalized-$3\"\n" +
+                "    exit 0\n" +
+                "else\n" +
+                "    exec \"$REAL_GIT\" \"$@\"\n" +
+                "fi\n");
+            MakeExecutable(fakeGitPath);
+
+            // Prepend the fake git dir so TryRunGitAsync / RunGitAsync (which spawn "git" via PATH)
+            // pick it up. Child processes inherit this environment.
+            Environment.SetEnvironmentVariable("PATH", fakeGitDir + Path.PathSeparator + originalPath);
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            // The fake git turns `check-ref-format --branch main` into stdout "normalized-main",
+            // which differs from the input "main". The equality guard MUST reject it.
+            var result = await composer.GitFetchAsync("test-repo", branch: "main", cancellationToken: ct);
+
+            Assert.Contains("❌", result);
+            Assert.Contains("normalized", result);
+
+            // And no tracking ref should have been created (fetch was never invoked).
+            var branches = await composer.GitBranchAsync("test-repo", remote: true, cancellationToken: ct);
+            Assert.DoesNotContain("origin/main", branches);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("PATH", originalPath);
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_RepositoryNameValidation()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var dotDot = await composer.GitFetchAsync("../etc", cancellationToken: ct);
+            Assert.Contains("❌", dotDot);
+            Assert.Contains("..", dotDot);
+
+            var slash = await composer.GitFetchAsync("with/slash", cancellationToken: ct);
+            Assert.Contains("❌", slash);
+            Assert.Contains("separator", slash);
+
+            var flag = await composer.GitFetchAsync("-flag", cancellationToken: ct);
+            Assert.Contains("❌", flag);
+            Assert.Contains("cannot start with '-'", flag);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_BlankBranch_TreatedAsOmitted()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", branch: "   ", cancellationToken: ct);
+
+            Assert.DoesNotContain("❌", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_CancellationToken_Respected()
+    {
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                async () => await composer.GitFetchAsync("test-repo", cancellationToken: cts.Token));
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_SshUrlRemote_Rejected()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", remote: "ssh://evil.com/x", cancellationToken: ct);
+
+            Assert.Contains("❌", result);
+            Assert.Contains("URL", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_GitAtUrlRemote_Rejected()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", remote: "git@evil.com:org/repo.git", cancellationToken: ct);
+
+            Assert.Contains("❌", result);
+            Assert.Contains("URL", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_DefaultOrigin_VerifiesFetchSucceeded()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", cancellationToken: ct);
+
+            Assert.DoesNotContain("❌", result);
+
+            // Verify the fetch actually succeeded by listing remote tracking branches.
+            var branches = await composer.GitBranchAsync("test-repo", remote: true, cancellationToken: ct);
+            Assert.Contains("origin/main", branches);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_WithBranch_GitShowCanReferenceFetchedCommit()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            // Fetch the branch.
+            var fetchResult = await composer.GitFetchAsync("test-repo", branch: "main", cancellationToken: ct);
+            Assert.DoesNotContain("❌", fetchResult);
+
+            // After fetching, git_show should be able to reference the fetched commit via origin/main.
+            var showResult = await composer.GitShowAsync("test-repo", "origin/main", stat_only: true, cancellationToken: ct);
+            Assert.DoesNotContain("❌", showResult);
+            Assert.DoesNotContain("failed", showResult, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("README.md", showResult);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_WithBranch_GitDiffCanReferenceFetchedCommit()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            // Fetch the branch.
+            var fetchResult = await composer.GitFetchAsync("test-repo", branch: "main", cancellationToken: ct);
+            Assert.DoesNotContain("❌", fetchResult);
+
+            // After fetching, git_diff should be able to diff against the fetched ref.
+            var diffResult = await composer.GitDiffAsync("test-repo", "origin/main", cancellationToken: ct);
+            Assert.DoesNotContain("❌", diffResult);
+            // An empty diff is valid (HEAD == origin/main), but it must not be an error.
+            Assert.DoesNotContain("failed", diffResult, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_PlusInRemote_Rejected()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", remote: "origin+evil", cancellationToken: ct);
+
+            Assert.Contains("❌", result);
+            Assert.Contains("':' or '+'", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_EmptyRepositoryName_Rejected()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("", cancellationToken: ct);
+            Assert.Contains("❌", result);
+            Assert.Contains("required", result, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_WhitespaceRepositoryName_Rejected()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("   ", cancellationToken: ct);
+            Assert.Contains("❌", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
     // ── system prompt — repo injection ──
 
     [Fact]

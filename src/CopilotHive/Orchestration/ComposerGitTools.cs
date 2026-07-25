@@ -82,6 +82,36 @@ public sealed partial class Composer
         return truncated + $"\n... (truncated, {lines.Length} lines total)";
     }
 
+    /// <summary>
+    /// Runs a git command in <paramref name="workDir"/> and returns the raw result without
+    /// throwing for non-zero exit codes. Used for internal validation queries.
+    /// </summary>
+    private static async Task<(int ExitCode, string Stdout, string Stderr)> TryRunGitAsync(
+        string workDir, string[] args, CancellationToken ct)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo("git")
+        {
+            WorkingDirectory = workDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
+
+        using var process = System.Diagnostics.Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to start git process");
+
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
+        var stderrTask = process.StandardError.ReadToEndAsync(ct);
+
+        await Task.WhenAll(stdoutTask, stderrTask);
+        await process.WaitForExitAsync(ct);
+
+        return (process.ExitCode, stdoutTask.Result, stderrTask.Result);
+    }
+
     [Description("View commit history for a repository.")]
     internal async Task<string> GitLogAsync(
         [Description("Repository name")] string repository,
@@ -262,5 +292,85 @@ public sealed partial class Composer
         args.Add(path);
 
         return await RunGitAsync(repository, [.. args], ct: cancellationToken);
+    }
+
+    [Description("Fetch from a remote repository so remote branches and commits are available for inspection.")]
+    internal async Task<string> GitFetchAsync(
+        [Description("Repository name")] string repository,
+        [Description("Remote name. Default: origin")] string? remote = null,
+        [Description("Specific branch to fetch. If omitted, fetches all branches.")] string? branch = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_repoManager is null)
+            return "Git tools are not available — no repository manager configured.";
+
+        // SECURITY: Validate repository name to prevent path traversal / option injection.
+        if (string.IsNullOrWhiteSpace(repository))
+            return "❌ repository is required.";
+        if (repository.Contains('/') || repository.Contains('\\'))
+            return $"❌ Invalid repository name '{repository}': repository names cannot contain path separators.";
+        if (repository.Contains(".."))
+            return $"❌ Invalid repository name '{repository}': repository names cannot contain '..'.";
+        if (repository.StartsWith('-'))
+            return $"❌ Invalid repository name '{repository}': repository names cannot start with '-'.";
+
+        // Default the remote to origin when not specified.
+        if (string.IsNullOrWhiteSpace(remote))
+            remote = "origin";
+
+        // SECURITY: Validate remote to prevent option injection, URL/transport abuse, and refspec injection.
+        if (remote.StartsWith('-'))
+            return $"❌ Invalid remote '{remote}': remote names cannot start with '-'.";
+        if (remote.Contains("://") || remote.StartsWith("git@") || remote.StartsWith("ssh://"))
+            return $"❌ Invalid remote '{remote}': remote must be a configured remote name, not a URL.";
+        if (remote.Contains("::"))
+            return $"❌ Invalid remote '{remote}': remote names cannot contain '::'.";
+        if (remote.Contains(':') || remote.Contains('+'))
+            return $"❌ Invalid remote '{remote}': remote names cannot contain ':' or '+'.";
+
+        var clonePath = _repoManager.GetClonePath(repository);
+
+        // Verify the remote is actually configured for this repository.
+        var (remoteExit, remoteStdout, remoteStderr) = await TryRunGitAsync(clonePath, ["remote"], cancellationToken);
+        if (remoteExit != 0)
+            return $"git remote failed (exit {remoteExit}): {remoteStderr}";
+
+        var configuredRemotes = remoteStdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(r => r.Trim())
+            .ToList();
+        if (!configuredRemotes.Contains(remote))
+            return $"❌ Remote '{remote}' is not configured for repository '{repository}'.";
+
+        // Validate branch (if specified) to prevent option injection and refspec abuse.
+        if (!string.IsNullOrWhiteSpace(branch))
+        {
+            if (branch.Contains("@{"))
+                return $"❌ Invalid branch '{branch}': branch names cannot contain '@{{'.";
+
+            var (refExit, refStdout, refStderr) = await TryRunGitAsync(
+                clonePath, ["check-ref-format", "--branch", branch], cancellationToken);
+            if (refExit != 0)
+                return $"❌ Invalid branch '{branch}': {refStderr.Trim()}";
+
+            var normalizedBranch = refStdout.Trim();
+            if (!string.Equals(normalizedBranch, branch, StringComparison.Ordinal))
+                return $"❌ Invalid branch '{branch}': branch name was normalized to '{normalizedBranch}' — use the exact branch name.";
+        }
+
+        string[] args = !string.IsNullOrWhiteSpace(branch)
+            ? ["fetch", remote, $"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"]
+            : ["fetch", remote];
+
+        var result = await RunGitAsync(repository, [.. args], ct: cancellationToken);
+
+        // RunGitAsync prefixes error messages with "git " on non-zero exit.
+        if (result.StartsWith("git ", StringComparison.Ordinal))
+            return result;
+
+        if (string.IsNullOrWhiteSpace(result))
+            return $"Fetched from {remote}. Use git_branch or git_show to inspect fetched refs.";
+
+        return result;
     }
 }

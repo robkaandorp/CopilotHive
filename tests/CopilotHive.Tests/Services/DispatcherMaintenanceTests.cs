@@ -7,6 +7,7 @@ using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -24,9 +25,12 @@ public sealed class DispatcherMaintenanceTests
     private static DispatcherMaintenance CreateMaintenance(
         IGoalStore? goalStore = null,
         IBrainRepoManager? repoManager = null,
-        HiveConfigFile? config = null)
+        HiveConfigFile? config = null,
+        GoalPipelineManager? pipelineManager = null,
+        ConcurrentDictionary<string, bool>? dispatchedGoals = null)
     {
-        var pipelineManager = new GoalPipelineManager();
+        pipelineManager ??= new GoalPipelineManager();
+        dispatchedGoals ??= new ConcurrentDictionary<string, bool>();
         var goalManager = new GoalManager();
         var taskQueue = new TaskQueue();
         var workerGateway = new GrpcWorkerGateway(new WorkerPool());
@@ -39,7 +43,7 @@ public sealed class DispatcherMaintenanceTests
             brain: null,
             agentsManager: null,
             configRepo: null,
-            dispatchedGoals: new ConcurrentDictionary<string, bool>(),
+            dispatchedGoals: dispatchedGoals,
             redispatchQueue: new ConcurrentQueue<string>(),
             logger: NullLogger.Instance,
             knowledgeGraph: null,
@@ -443,6 +447,103 @@ public sealed class DispatcherMaintenanceTests
 
         Assert.False(goal.BranchCleanedUp, "BranchCleanedUp must not be set when any repo deletion failed");
         goalStore.Verify(s => s.UpdateGoalAsync(It.IsAny<Goal>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // RestoreActivePipelinesAsync tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public async Task RestoreActivePipelinesAsync_StaleFailedGoal_CleansUpPipelineAndDispatchedGoal()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        await using var pipelineStore = new PipelineStore(db, NullLogger<PipelineStore>.Instance);
+
+        var goal = new Goal { Id = "stale-failed-goal", Description = "Stale failed", Status = GoalStatus.Failed };
+        var originalManager = new GoalPipelineManager(pipelineStore);
+        var pipeline = originalManager.CreatePipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        originalManager.PersistState(pipeline);
+
+        var freshManager = new GoalPipelineManager(pipelineStore);
+        var dispatchedGoals = new ConcurrentDictionary<string, bool>();
+        dispatchedGoals.TryAdd(goal.Id, true);
+
+        var goalStore = new Mock<IGoalStore>();
+        goalStore.Setup(s => s.GetGoalAsync(goal.Id, It.IsAny<CancellationToken>())).ReturnsAsync(goal);
+
+        var maintenance = CreateMaintenance(
+            goalStore: goalStore.Object,
+            pipelineManager: freshManager,
+            dispatchedGoals: dispatchedGoals);
+
+        await maintenance.RestoreActivePipelinesAsync(CancellationToken.None);
+
+        Assert.Null(freshManager.GetByGoalId(goal.Id));
+        Assert.False(dispatchedGoals.ContainsKey(goal.Id));
+    }
+
+    [Fact]
+    public async Task RestoreActivePipelinesAsync_NullGoalStore_ProcessesWithoutCrashing()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        await using var pipelineStore = new PipelineStore(db, NullLogger<PipelineStore>.Instance);
+
+        var goal = new Goal { Id = "null-store-goal", Description = "Null store", Status = GoalStatus.InProgress };
+        var originalManager = new GoalPipelineManager(pipelineStore);
+        var pipeline = originalManager.CreatePipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        originalManager.PersistFull(pipeline);
+
+        var freshManager = new GoalPipelineManager(pipelineStore);
+        var dispatchedGoals = new ConcurrentDictionary<string, bool>();
+
+        var maintenance = CreateMaintenance(
+            goalStore: null,
+            pipelineManager: freshManager,
+            dispatchedGoals: dispatchedGoals);
+
+        var ex = await Record.ExceptionAsync(() => maintenance.RestoreActivePipelinesAsync(CancellationToken.None));
+
+        // No crash even though a pipeline was restored and _goalStore is null (guard skips reconciliation).
+        Assert.Null(ex);
+        // The pipeline survives because the null goalStore guard prevents any reconciliation cleanup.
+        Assert.NotNull(freshManager.GetByGoalId(goal.Id));
+        // The pipeline was still processed — the TryAdd at the top of the loop ran.
+        Assert.True(dispatchedGoals.ContainsKey(goal.Id));
+    }
+
+    [Fact]
+    public async Task RestoreActivePipelinesAsync_MissingGoalInDb_DoesNotRemovePipeline()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        await using var pipelineStore = new PipelineStore(db, NullLogger<PipelineStore>.Instance);
+
+        var goal = new Goal { Id = "missing-db-goal", Description = "Missing in DB", Status = GoalStatus.InProgress };
+        var originalManager = new GoalPipelineManager(pipelineStore);
+        var pipeline = originalManager.CreatePipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        originalManager.PersistFull(pipeline);
+
+        var freshManager = new GoalPipelineManager(pipelineStore);
+        var dispatchedGoals = new ConcurrentDictionary<string, bool>();
+
+        var goalStore = new Mock<IGoalStore>();
+        goalStore.Setup(s => s.GetGoalAsync(goal.Id, It.IsAny<CancellationToken>())).ReturnsAsync((Goal?)null);
+
+        var maintenance = CreateMaintenance(
+            goalStore: goalStore.Object,
+            pipelineManager: freshManager,
+            dispatchedGoals: dispatchedGoals);
+
+        await maintenance.RestoreActivePipelinesAsync(CancellationToken.None);
+
+        // Reconciliation path was reached — the DB lookup was performed for the restored goal.
+        goalStore.Verify(s => s.GetGoalAsync(goal.Id, It.IsAny<CancellationToken>()), Times.Once);
+        // Missing goal in DB → warned and fall through: pipeline is NOT removed.
+        Assert.NotNull(freshManager.GetByGoalId(goal.Id));
+        // The pipeline was still processed and remains dispatched.
+        Assert.True(dispatchedGoals.ContainsKey(goal.Id));
     }
 }
 

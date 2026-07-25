@@ -230,6 +230,26 @@ internal sealed class DispatcherMaintenance
             if (pipeline.Phase is GoalPhase.Done or GoalPhase.Failed)
                 continue;
 
+            // Reconcile with DB status — a goal may have been marked Failed/Completed
+            // in the DB while its pipeline record still shows an active phase.
+            if (_goalStore is not null)
+            {
+                var goal = await _goalStore.GetGoalAsync(pipeline.GoalId, ct);
+                if (goal is not null && goal.Status is (GoalStatus.Completed or GoalStatus.Failed))
+                {
+                    _logger.LogInformation("Pipeline {GoalId} has stale phase {Phase} but goal is {Status} — cleaning up",
+                        pipeline.GoalId, pipeline.Phase, goal.Status);
+                    _pipelineManager.RemovePipeline(pipeline.GoalId);
+                    _dispatchedGoals.TryRemove(pipeline.GoalId, out _);
+                    (_brain as DistributedBrain)?.DeregisterActivePipeline(pipeline.GoalId);
+                    continue;
+                }
+                if (goal is null)
+                {
+                    _logger.LogWarning("Pipeline {GoalId} has no matching goal in DB — skipping reconciliation", pipeline.GoalId);
+                }
+            }
+
             // If the pipeline was mid-planning (no ActiveTaskId and at Planning/Merging phase),
             // discard it and reset the goal so DispatchNextGoalAsync picks it up fresh.
             if (pipeline.ActiveTaskId is null && pipeline.Phase is GoalPhase.Planning or GoalPhase.Merging)

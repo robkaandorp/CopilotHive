@@ -109,7 +109,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - Update existing goals (update_goal) — description, priority, scope, repositories, depends_on, and documents can only be changed on Draft goals; status and release can be changed on any goal
         - Delete draft or failed goals (delete_goal)
         - Cancel InProgress or Pending goals (cancel_goal)
-        - Inspect repository history (git_log, git_diff, git_show, git_branch, git_blame)
+        - Inspect repository history (git_log, git_diff, git_show, git_branch, git_blame, git_fetch)
+        - Fetch remote branches (git_fetch(repository, remote?, branch?) — default: origin. Use to access remote feature branches.)
         - List configured repositories (list_repositories)
         - Create and manage releases (create_release, list_releases, update_release)
         - Manage knowledge documents in the knowledge graph (create_document, read_document, update_document, delete_document, search_knowledge, link_document, unlink_document, list_documents, traverse_graph)
@@ -757,6 +758,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 "List local or remote branches in a repository."),
             AIFunctionFactory.Create(GitBlameAsync, "git_blame",
                 "Show line-by-line authorship information for a file."),
+            AIFunctionFactory.Create(GitFetchAsync, "git_fetch",
+                "Fetch from a remote repository so remote branches and commits are available for inspection."),
             AIFunctionFactory.Create(ListRepositoriesAsync, "list_repositories",
                 "List all configured repositories with their names, URLs, and default branches."),
             AIFunctionFactory.Create(CreateReleaseAsync, "create_release",

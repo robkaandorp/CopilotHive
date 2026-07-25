@@ -385,6 +385,47 @@ public sealed class GoalStoreIntegrationTests
     }
 
     [Fact]
+    public async Task UpdateGoalStatusAsync_ReplaceExistingIterationSummary_DoesNotThrowAndUpdatesValues()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var goal = new Goal { Id = "update-iter-replace", Description = "Update replace test" };
+        await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var original = new IterationSummary
+        {
+            Iteration = 1,
+            BuildSuccess = false,
+            ReviewVerdict = "reject",
+        };
+        await store.AddIterationAsync("update-iter-replace", original, TestContext.Current.CancellationToken);
+
+        var replacement = new IterationSummary
+        {
+            Iteration = 1,
+            BuildSuccess = true,
+            ReviewVerdict = "approve",
+        };
+
+        await store.UpdateGoalStatusAsync(
+            "update-iter-replace",
+            GoalStatus.Failed,
+            new GoalUpdateMetadata { Iterations = 1, IterationSummary = replacement },
+            TestContext.Current.CancellationToken);
+
+        var iterations = await store.GetIterationsAsync("update-iter-replace", TestContext.Current.CancellationToken);
+        Assert.Single(iterations);
+        Assert.Equal(1, iterations[0].Iteration);
+        Assert.True(iterations[0].BuildSuccess);
+        Assert.Equal("approve", iterations[0].ReviewVerdict);
+
+        var updatedGoal = await store.GetGoalAsync("update-iter-replace", TestContext.Current.CancellationToken);
+        Assert.NotNull(updatedGoal);
+        Assert.Equal(GoalStatus.Failed, updatedGoal!.Status);
+    }
+
+    [Fact]
     public async Task GetIterationsAsync_GoalWithNoIterations_ReturnsEmptyList()
     {
         using var db = CopilotHiveDbContext.CreateInMemory();
