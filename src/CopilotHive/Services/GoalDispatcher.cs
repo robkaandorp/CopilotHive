@@ -790,6 +790,43 @@ public sealed class GoalDispatcher : BackgroundService
         _logger.LogInformation("Dispatching goal '{GoalId}': {Description} (Priority={Priority})",
             goal.Id, goal.Description, goal.Priority);
 
+        // Mark goal as in_progress IMMEDIATELY after selection, before any subsequent async work
+        var startedMeta = new GoalUpdateMetadata { StartedAt = DateTime.UtcNow };
+        _logger.LogInformation("Dispatcher: updating goal '{GoalId}' status to InProgress", goal.Id);
+        try
+        {
+            await _goalManager.UpdateGoalStatusAsync(goal.Id, GoalStatus.InProgress, startedMeta, ct);
+            _logger.LogInformation("Dispatcher: successfully updated goal '{GoalId}' status to InProgress", goal.Id);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw; // propagate cancellation
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Dispatcher: failed to update goal '{GoalId}' status to InProgress — continuing dispatch", goal.Id);
+        }
+
+        // Best-effort verification: re-read the goal to check if the status was persisted
+        try
+        {
+            var verifyGoal = await _goalManager.GetGoalAsync(goal.Id, ct);
+            if (verifyGoal is null)
+                _logger.LogWarning("Dispatcher: verification returned null — goal '{GoalId}' not found after status update", goal.Id);
+            else if (verifyGoal.Status != GoalStatus.InProgress)
+                _logger.LogError("Dispatcher: VERIFICATION FAILED — goal '{GoalId}' DB status is {Status} after UpdateGoalStatusAsync(InProgress)", goal.Id, verifyGoal.Status);
+            else
+                _logger.LogInformation("Dispatcher: verified goal '{GoalId}' DB status is InProgress", goal.Id);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Dispatcher: failed to verify goal '{GoalId}' status (non-critical)", goal.Id);
+        }
+
         // Ensure Brain repo clones are up-to-date before planning
         if (_brain is not null)
         {
@@ -804,9 +841,7 @@ public sealed class GoalDispatcher : BackgroundService
             }
         }
 
-        // Mark goal as in_progress with started_at timestamp
-        var startedMeta = new GoalUpdateMetadata { StartedAt = DateTime.UtcNow };
-        await _goalManager.UpdateGoalStatusAsync(goal.Id, GoalStatus.InProgress, startedMeta, ct);
+        // Commit to config repo (already best-effort internally)
         await _lifecycleService.CommitGoalsToConfigRepoAsync($"Goal '{goal.Id}' started", ct);
 
         // Create a pipeline for this goal

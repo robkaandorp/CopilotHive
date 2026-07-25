@@ -3392,3 +3392,483 @@ file sealed class ThrowingSendWorkerGateway : IWorkerGateway
 
     public void MarkBusy(string workerId, string taskId) { }
 }
+
+/// <summary>
+/// Tests for the diagnostic logging added to <c>GoalDispatcher.DispatchNextGoalAsync</c>
+/// to identify why goals show as <see cref="GoalStatus.Pending"/> when they are actively running.
+/// </summary>
+public sealed class GoalDispatcherDiagnosticLoggingTests
+{
+    private static Task InvokeDispatchNextGoalAsync(GoalDispatcher dispatcher, CancellationToken ct)
+    {
+        var method = typeof(GoalDispatcher).GetMethod(
+            "DispatchNextGoalAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        return (Task)method.Invoke(dispatcher, [ct])!;
+    }
+
+    private static HiveConfigFile ConfigWithRepo() =>
+        new()
+        {
+            Repositories =
+            [
+                new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
+            ],
+        };
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Status update must happen BEFORE the Brain repo ensure, so the goal is marked
+    /// in_progress as early as possible in the dispatch flow.
+    /// </summary>
+    [Fact]
+    public async Task DispatchNextGoalAsync_StatusUpdateHappensBeforeRepoEnsure()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var logger = new CollectingLogger<GoalDispatcher>();
+        var trackingStore = new DiagnosticTrackingGoalStore();
+        var goal = new Goal { Id = "goal-order-test", Description = "Ordering test", RepositoryNames = ["test-repo"] };
+        await trackingStore.CreateGoalAsync(goal, ct);
+
+        var brain = new TrackingEnsureBrain();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(trackingStore);
+        await goalManager.GetNextGoalAsync(ct); // populate internal goal→source map
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            new GoalPipelineManager(),
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain,
+            config: ConfigWithRepo(),
+            startupDelay: TimeSpan.Zero);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Assert — UpdateGoalStatusAsync was called at least once
+        Assert.NotEmpty(trackingStore.StatusUpdateCalls);
+
+        // Assert — EnsureBrainRepoAsync was called at least once (goal has a repo)
+        Assert.NotEmpty(brain.EnsureRepoCalls);
+
+        // Assert — the first status update happened before the first repo ensure
+        var firstStatusUpdate = trackingStore.StatusUpdateCalls[0];
+        var firstRepoEnsure = brain.EnsureRepoCalls[0];
+        Assert.True(
+            firstStatusUpdate.Timestamp < firstRepoEnsure.Timestamp,
+            $"Expected status update ({firstStatusUpdate.Timestamp:O}) before repo ensure ({firstRepoEnsure.Timestamp:O})");
+
+        // Assert — log order: "Dispatcher: updating goal" appears before any repo-related log
+        var updatingLogIdx = logger.Logs.FindIndex(l => l.Message.Contains("Dispatcher: updating goal"));
+        var repoEnsureLogIdx = logger.Logs.FindIndex(l => l.Message.Contains("Failed to ensure Brain repo"));
+        // repo ensure may not produce a warning log if it succeeds, so only check ordering if both exist
+        if (repoEnsureLogIdx >= 0)
+        {
+            Assert.True(
+                updatingLogIdx < repoEnsureLogIdx,
+                $"Expected 'updating goal' log (idx={updatingLogIdx}) before repo ensure log (idx={repoEnsureLogIdx})");
+        }
+        Assert.True(updatingLogIdx >= 0, "Expected 'Dispatcher: updating goal' log message");
+    }
+
+    /// <summary>
+    /// When <see cref="GoalManager.UpdateGoalStatusAsync"/> throws a non-cancellation exception,
+    /// dispatch must continue — the pipeline should still be created.
+    /// </summary>
+    [Fact]
+    public async Task DispatchNextGoalAsync_NonCancellationException_ContinuesDispatch()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var logger = new CollectingLogger<GoalDispatcher>();
+        var trackingStore = new DiagnosticTrackingGoalStore
+        {
+            ThrowOnUpdateGoalStatus = new InvalidOperationException("test failure"),
+        };
+        var goal = new Goal { Id = "goal-noncancel-test", Description = "Non-cancel exception test", RepositoryNames = ["test-repo"] };
+        await trackingStore.CreateGoalAsync(goal, ct);
+
+        var brain = new TrackingEnsureBrain();
+        var goalManager = new GoalManager();
+        goalManager.AddSource(trackingStore);
+        await goalManager.GetNextGoalAsync(ct);
+
+        var pipelineManager = new GoalPipelineManager();
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain,
+            config: ConfigWithRepo(),
+            startupDelay: TimeSpan.Zero);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Assert — pipeline was created despite the status update failure
+        var activePipelines = pipelineManager.GetActivePipelines();
+        Assert.Contains(activePipelines, p => p.GoalId == goal.Id);
+
+        // Assert — the error was logged with both "failed to update goal" and "continuing dispatch"
+        var errorLog = logger.Logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Error &&
+            l.Message.Contains("failed to update goal") &&
+            l.Message.Contains("continuing dispatch"));
+        Assert.True(errorLog != default,
+            $"Expected 'failed to update goal ... continuing dispatch' log. Logs: {string.Join("\n", logger.Logs.Select(l => $"[{l.Level}] {l.Message}"))}");
+    }
+
+    /// <summary>
+    /// When the cancellation token is already cancelled and <see cref="GoalManager.UpdateGoalStatusAsync"/>
+    /// throws <see cref="OperationCanceledException"/>, the exception must propagate (not be swallowed).
+    /// </summary>
+    [Fact]
+    public async Task DispatchNextGoalAsync_CancellationIsRethrown()
+    {
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        var trackingStore = new DiagnosticTrackingGoalStore
+        {
+            ThrowOnUpdateGoalStatus = new OperationCanceledException(cts.Token),
+        };
+        var goal = new Goal { Id = "goal-cancel-test", Description = "Cancellation re-throw test", RepositoryNames = ["test-repo"] };
+        await trackingStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var goalManager = new GoalManager();
+        goalManager.AddSource(trackingStore);
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            new GoalPipelineManager(),
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            new CollectingLogger<GoalDispatcher>(),
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            new TrackingEnsureBrain(),
+            config: ConfigWithRepo(),
+            startupDelay: TimeSpan.Zero);
+
+        // Act & Assert — OperationCanceledException (or TaskCanceledException) is thrown
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => InvokeDispatchNextGoalAsync(dispatcher, cts.Token));
+    }
+
+    /// <summary>
+    /// When <see cref="GoalManager.GetGoalAsync"/> returns null (source does not implement
+    /// <see cref="IGoalStore"/> or goal not found), a warning is logged.
+    /// </summary>
+    [Fact]
+    public async Task DispatchNextGoalAsync_VerificationNullResult_LogsWarning()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var logger = new CollectingLogger<GoalDispatcher>();
+
+        // FakeGoalSource does NOT implement IGoalStore, so GetGoalAsync returns null
+        var goal = new Goal { Id = "goal-verify-null-test", Description = "Verify null test", RepositoryNames = ["test-repo"] };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        await goalManager.GetNextGoalAsync(ct);
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            new GoalPipelineManager(),
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            new TrackingEnsureBrain(),
+            config: ConfigWithRepo(),
+            startupDelay: TimeSpan.Zero);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Assert — a warning log contains "verification returned null"
+        var nullWarning = logger.Logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Warning &&
+            l.Message.Contains("verification returned null"));
+        Assert.True(nullWarning != default,
+            $"Expected 'verification returned null' warning log. Logs: {string.Join("\n", logger.Logs.Select(l => $"[{l.Level}] {l.Message}"))}");
+    }
+
+    /// <summary>
+    /// When <see cref="GoalManager.GetGoalAsync"/> returns a goal with a status other than
+    /// InProgress, a VERIFICATION FAILED error is logged with the goal ID.
+    /// </summary>
+    [Fact]
+    public async Task DispatchNextGoalAsync_VerificationMismatch_LogsVerificationFailed()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var logger = new CollectingLogger<GoalDispatcher>();
+        var trackingStore = new DiagnosticTrackingGoalStore
+        {
+            // GetGoalAsync returns a goal still in Pending (mismatch with expected InProgress)
+            VerifyGoalStatus = GoalStatus.Pending,
+        };
+        var goal = new Goal { Id = "goal-verify-mismatch", Description = "Verify mismatch test", RepositoryNames = ["test-repo"] };
+        await trackingStore.CreateGoalAsync(goal, ct);
+
+        var goalManager = new GoalManager();
+        goalManager.AddSource(trackingStore);
+        await goalManager.GetNextGoalAsync(ct);
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            new GoalPipelineManager(),
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            new TrackingEnsureBrain(),
+            config: ConfigWithRepo(),
+            startupDelay: TimeSpan.Zero);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Assert — an error log contains "VERIFICATION FAILED" and the goal ID
+        var verifyError = logger.Logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Error &&
+            l.Message.Contains("VERIFICATION FAILED") &&
+            l.Message.Contains(goal.Id));
+        Assert.True(verifyError != default,
+            $"Expected 'VERIFICATION FAILED' error log for goal '{goal.Id}'. Logs: {string.Join("\n", logger.Logs.Select(l => $"[{l.Level}] {l.Message}"))}");
+    }
+
+    /// <summary>
+    /// When <see cref="GoalManager.GetGoalAsync"/> returns a goal with <see cref="GoalStatus.InProgress"/>,
+    /// a verification success info log is emitted.
+    /// </summary>
+    [Fact]
+    public async Task DispatchNextGoalAsync_VerificationSuccess_LogsVerifiedGoal()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var logger = new CollectingLogger<GoalDispatcher>();
+        var trackingStore = new DiagnosticTrackingGoalStore
+        {
+            VerifyGoalStatus = GoalStatus.InProgress,
+        };
+        var goal = new Goal { Id = "goal-verify-success", Description = "Verify success test", RepositoryNames = ["test-repo"] };
+        await trackingStore.CreateGoalAsync(goal, ct);
+
+        var goalManager = new GoalManager();
+        goalManager.AddSource(trackingStore);
+        await goalManager.GetNextGoalAsync(ct);
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            new GoalPipelineManager(),
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            new TrackingEnsureBrain(),
+            config: ConfigWithRepo(),
+            startupDelay: TimeSpan.Zero);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // Assert — an info log contains "verified goal" and "InProgress"
+        var verifyLog = logger.Logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Information &&
+            l.Message.Contains("verified goal") &&
+            l.Message.Contains("InProgress"));
+        Assert.True(verifyLog != default,
+            $"Expected 'verified goal ... InProgress' info log. Logs: {string.Join("\n", logger.Logs.Select(l => $"[{l.Level}] {l.Message}"))}");
+    }
+
+}
+
+/// <summary>
+/// <see cref="IGoalStore"/> implementation that tracks <see cref="UpdateGoalStatusAsync"/>
+/// calls (with timestamps) and allows controlling <see cref="GetGoalAsync"/> return value.
+/// Used by <see cref="GoalDispatcherDiagnosticLoggingTests"/>.
+/// </summary>
+file sealed class DiagnosticTrackingGoalStore : IGoalStore
+{
+    private readonly Dictionary<string, Goal> _goals = new();
+
+    /// <summary>Records every <see cref="UpdateGoalStatusAsync"/> call with a timestamp.</summary>
+    public List<(string GoalId, GoalStatus Status, DateTime Timestamp)> StatusUpdateCalls { get; } = [];
+
+    /// <summary>When set, <see cref="UpdateGoalStatusAsync"/> throws this exception.</summary>
+    public Exception? ThrowOnUpdateGoalStatus { get; set; }
+
+    /// <summary>
+    /// Status to return from <see cref="GetGoalAsync"/>. When null, returns the stored goal
+    /// with its current status. When set, returns a clone with this status.
+    /// </summary>
+    public GoalStatus? VerifyGoalStatus { get; set; }
+
+    public string Name => "DiagnosticTrackingGoalStore";
+
+    public Task<IReadOnlyList<Goal>> GetAllGoalsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(_goals.Values.ToList().AsReadOnly());
+
+    public Task<Goal?> GetGoalAsync(string goalId, CancellationToken ct = default)
+    {
+        if (!_goals.TryGetValue(goalId, out var goal))
+            return Task.FromResult<Goal?>(null);
+
+        // Return a clone with the controlled status if set
+        if (VerifyGoalStatus is { } overrideStatus)
+        {
+            return Task.FromResult<Goal?>(new Goal
+            {
+                Id = goal.Id,
+                Description = goal.Description,
+                Status = overrideStatus,
+                RepositoryNames = [.. goal.RepositoryNames],
+            });
+        }
+
+        return Task.FromResult<Goal?>(goal);
+    }
+
+    public Task<Goal> CreateGoalAsync(Goal goal, CancellationToken ct = default)
+    {
+        _goals[goal.Id] = goal;
+        return Task.FromResult(goal);
+    }
+
+    public Task UpdateGoalAsync(Goal goal, CancellationToken ct = default)
+    {
+        _goals[goal.Id] = goal;
+        return Task.CompletedTask;
+    }
+
+    public Task<bool> DeleteGoalAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult(_goals.Remove(goalId));
+
+    public Task<IReadOnlyList<Goal>> SearchGoalsAsync(string query, GoalStatus? statusFilter = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(Array.Empty<Goal>());
+
+    public Task<IReadOnlyList<Goal>> GetGoalsByStatusAsync(GoalStatus status, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(Array.Empty<Goal>());
+
+    public Task AddIterationAsync(string goalId, IterationSummary summary, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<IterationSummary>>(Array.Empty<IterationSummary>());
+
+    public Task<int> ImportGoalsAsync(IEnumerable<Goal> goals, CancellationToken ct = default) =>
+        Task.FromResult(0);
+
+    public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(_goals.Values.ToList().AsReadOnly());
+
+    public Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
+    {
+        StatusUpdateCalls.Add((goalId, status, DateTime.UtcNow));
+        if (ThrowOnUpdateGoalStatus is not null)
+            throw ThrowOnUpdateGoalStatus;
+
+        if (_goals.TryGetValue(goalId, out var goal))
+            goal.Status = status;
+
+        return Task.CompletedTask;
+    }
+
+    public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default) =>
+        Task.FromResult(release);
+
+    public Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default) =>
+        Task.FromResult<Release?>(null);
+
+    public Task<IReadOnlyList<Release>> GetReleasesAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Release>>(Array.Empty<Release>());
+
+    public Task UpdateReleaseAsync(Release release, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default) =>
+        Task.FromResult(false);
+
+    public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(Array.Empty<Goal>());
+
+    public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ConversationEntry>>(Array.Empty<ConversationEntry>());
+
+    public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(int? limit = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>>(Array.Empty<(string, PersistedClarification)>());
+}
+
+/// <summary>
+/// Brain stub that records every <see cref="EnsureBrainRepoAsync"/> call with a timestamp.
+/// Used by <see cref="GoalDispatcherDiagnosticLoggingTests"/>.
+/// </summary>
+file sealed class TrackingEnsureBrain : IDistributedBrain
+{
+    public List<(string RepoName, DateTime Timestamp)> EnsureRepoCalls { get; } = [];
+
+    public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
+        Task.FromResult(PlanResult.Success(IterationPlan.Default()));
+
+    public Task<PromptResult> CraftPromptAsync(
+        GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
+        Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+
+    public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult<string?>(null);
+
+    public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default)
+    {
+        EnsureRepoCalls.Add((repoName, DateTime.UtcNow));
+        return Task.CompletedTask;
+    }
+
+    public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct) =>
+        Task.CompletedTask;
+
+    public Task<BrainResponse> AskQuestionAsync(
+        string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+        Task.FromResult(BrainResponse.Answer("proceed"));
+
+    public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public bool GoalSessionExists(string goalId) => false;
+
+    public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
+
+    public BrainStats? GetStats() => null;
+}

@@ -188,6 +188,9 @@ public sealed class GoalStore : IGoalStore
             if (goal is null)
                 throw new KeyNotFoundException($"Goal '{goalId}' not found in SQLite store.");
 
+            var oldStatus = goal.Status;
+            _logger.LogInformation("GoalStore: updating goal '{GoalId}' status from {OldStatus} to {NewStatus}", goalId, oldStatus, status);
+
             goal.Status = status;
 
             if (metadata is not null)
@@ -222,6 +225,12 @@ public sealed class GoalStore : IGoalStore
             }
 
             await db.SaveChangesAsync(ct);
+            _logger.LogInformation("GoalStore: saved goal '{GoalId}' status to {NewStatus} successfully", goalId, status);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            _logger.LogError(ex, "GoalStore: failed to update goal '{GoalId}' status to {NewStatus}", goalId, status);
+            throw;
         }
         finally
         {
