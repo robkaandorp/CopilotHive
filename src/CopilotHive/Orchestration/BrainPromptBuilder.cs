@@ -59,6 +59,16 @@ public static class BrainPromptBuilder
         - Do NOT assume the codebase needs to be reimplemented from scratch on a retry. The coder already has its previous work on its branch and in its session.
         - When planning a retry, tell the coder to FIX the specific issues from the reviewer/tester feedback, not to reimplement everything.
         - Only plan a full reimplementation if the reviewer explicitly says the approach is fundamentally wrong.
+
+        ## CLEAN CODE PRINCIPLES
+
+        When planning iterations and crafting worker prompts:
+        - Prefer solutions that reduce code size. Fewer lines = fewer bugs.
+        - If a problem seems to need more and more code, question the design — a simpler solution may exist.
+        - Don't patch symptoms. Find and address the root cause.
+        - Small functions do one thing. Single Responsibility per class.
+        - DRY — no duplicated logic. YAGNI — don't build for speculative futures.
+        - Dead code should be deleted, not commented out.
         """;
 
     /// <summary>

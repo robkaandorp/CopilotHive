@@ -178,6 +178,16 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         1. Create a new `implementation` document in the appropriate topic describing what was actually built, with a `supersedes` link to the original idea, status `active`
         2. Archive the original idea document: set status to `archived`, add a `related` link back to the new implementation doc, keep original content unchanged
         This preserves the decision trail (why we chose what we chose) while giving a clean, accurate implementation doc.
+
+        ## CLEAN CODE PRINCIPLES
+
+        When creating and decomposing goals:
+        - Fewer lines of code contain fewer bugs. If a problem needs more and more code, something is wrong in a broader perspective — the design may be incorrect, or a simpler solution was overlooked.
+        - Before creating a goal, ask: "Is there a simpler solution that doesn't require adding code?"
+        - Prefer deleting code over adding code. Prefer refactoring over patching.
+        - If a goal needs 5+ iterations, it's too large — split it into smaller goals.
+        - Don't patch symptoms with workarounds, timers, or reconciliation — find the root cause.
+        - Each goal should be completable in 1-3 iterations. Split by layer, subsystem, or phase.
         """;
 
     private const string ConfigRepoSystemPromptSection = """

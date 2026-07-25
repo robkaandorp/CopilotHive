@@ -303,6 +303,9 @@ public class GoalReviewService
         7. Contradictions — Any internal contradictions?
         8. Missing context — Is there information the worker would need but isn't provided?
         9. Risk — Any risks (breaking changes, security, data loss)?
+        10. Complexity — Is the goal too complex? Could a simpler solution work with less code? If the goal adds more code than the problem warrants, flag it.
+        11. Goal size — Should this goal be split into smaller goals? Signs: 5+ production files, interface changes affecting 10+ fakes, description longer than ~200 lines.
+        12. Root cause — Is the goal patching a symptom instead of fixing the root cause? Workarounds, timers, and reconciliation are red flags.
 
         ## Output Format
         Respond with a JSON object:
