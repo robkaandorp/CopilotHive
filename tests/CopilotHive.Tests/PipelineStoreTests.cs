@@ -395,6 +395,71 @@ public sealed class PipelineStoreTests : IAsyncDisposable
 
     #endregion
 
+    #region LoadPipeline / DeleteTaskMapping
+
+    [Fact]
+    public void LoadPipeline_LoadsFailedPipeline()
+    {
+        var pipeline = CreatePipeline("g-failed", "Failed goal");
+        _store.SavePipeline(pipeline);
+        pipeline.AdvanceTo(GoalPhase.Failed);
+        _store.SavePipelineState(pipeline);
+
+        var snap = _store.LoadPipeline("g-failed");
+
+        Assert.NotNull(snap);
+        Assert.Equal(GoalPhase.Failed, snap!.Phase);
+    }
+
+    [Fact]
+    public void LoadPipeline_NonexistentGoal_ReturnsNull()
+    {
+        var snap = _store.LoadPipeline("nonexistent");
+
+        Assert.Null(snap);
+    }
+
+    [Fact]
+    public void LoadPipeline_IncludesConversationAndTaskMappings()
+    {
+        var pipeline = CreatePipeline("g-full", "Full load");
+        pipeline.Conversation.Add(new ConversationEntry("user", "Hello"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "Hi"));
+        _store.SavePipeline(pipeline);
+        _store.SaveTaskMapping("task-x", "g-full");
+
+        var snap = _store.LoadPipeline("g-full");
+
+        Assert.NotNull(snap);
+        Assert.Equal(2, snap!.Conversation.Count);
+        Assert.Equal("Hello", snap.Conversation[0].Content);
+        Assert.Contains(("task-x", "g-full"), snap.TaskMappings);
+    }
+
+    [Fact]
+    public void DeleteTaskMapping_RemovesMapping()
+    {
+        var pipeline = CreatePipeline("g-del", "Delete mapping");
+        _store.SavePipeline(pipeline);
+        _store.SaveTaskMapping("task-del", "g-del");
+
+        _store.DeleteTaskMapping("task-del");
+
+        var snap = _store.LoadPipeline("g-del");
+        Assert.NotNull(snap);
+        Assert.Empty(snap!.TaskMappings);
+    }
+
+    [Fact]
+    public void DeleteTaskMapping_NonexistentTask_DoesNotThrow()
+    {
+        var ex = Record.Exception(() => _store.DeleteTaskMapping("nonexistent-task"));
+
+        Assert.Null(ex);
+    }
+
+    #endregion
+
     #region GetConversation — Per-goal conversation retrieval
 
     [Fact]

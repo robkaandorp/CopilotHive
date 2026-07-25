@@ -10,7 +10,9 @@ namespace CopilotHive.Services;
 public sealed class RetryBudget
 {
     private int _remaining;
-    private readonly int _initial;
+    private int _initial;
+
+    private const int MaxCap = int.MaxValue - 1;
 
     /// <summary>
     /// Creates a new <see cref="RetryBudget"/> with the given allowance.
@@ -20,8 +22,16 @@ public sealed class RetryBudget
     public RetryBudget(int allowed)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(allowed);
-        _initial = allowed;
-        _remaining = allowed;
+        if (allowed > MaxCap)
+        {
+            _initial = MaxCap;
+            _remaining = MaxCap;
+        }
+        else
+        {
+            _initial = allowed;
+            _remaining = allowed;
+        }
     }
 
     /// <summary>Number of times <see cref="TryConsume"/> has succeeded.</summary>
@@ -47,5 +57,43 @@ public sealed class RetryBudget
     {
         var prev = Interlocked.Decrement(ref _remaining);
         return prev >= 0;
+    }
+
+    /// <summary>
+    /// Atomically increases the budget by <paramref name="additional"/> units.
+    /// Both <see cref="Allowed"/> and <see cref="Remaining"/> are updated via CAS loops
+    /// with saturating arithmetic (capped at <see cref="MaxCap"/>).
+    /// </summary>
+    /// <param name="additional">Units to add. Must be between 1 and 1000 (inclusive).</param>
+    /// <exception cref="ArgumentOutOfRangeException">When <paramref name="additional"/> is not in [1, 1000].</exception>
+    /// <remarks>
+    /// When the saturation cap is reached, the guarantee that exactly <see cref="Allowed"/>
+    /// consume operations will succeed no longer holds — <c>MaxCap</c> is effectively infinite.
+    /// If <see cref="Remaining"/> is negative (from a racing <see cref="TryConsume"/> call),
+    /// it is normalized to zero before the addition.
+    /// </remarks>
+    public void TopUp(int additional)
+    {
+        if (additional <= 0 || additional > 1000)
+            throw new ArgumentOutOfRangeException(nameof(additional), "Must be positive and <= 1000.");
+
+        // Saturating add to _initial (cap at MaxCap)
+        while (true)
+        {
+            var current = Volatile.Read(ref _initial);
+            var newValue = current >= MaxCap - additional ? MaxCap : current + additional;
+            if (Interlocked.CompareExchange(ref _initial, newValue, current) == current)
+                break;
+        }
+
+        // Normalize negative remaining to 0, then saturating add (cap at MaxCap)
+        while (true)
+        {
+            var current = Volatile.Read(ref _remaining);
+            var normalized = current < 0 ? 0 : current;
+            var newValue = normalized >= MaxCap - additional ? MaxCap : normalized + additional;
+            if (Interlocked.CompareExchange(ref _remaining, newValue, current) == current)
+                break;
+        }
     }
 }

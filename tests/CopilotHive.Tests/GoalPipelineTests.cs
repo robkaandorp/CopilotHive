@@ -1,7 +1,10 @@
 using CopilotHive.Goals;
+using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 
 #pragma warning disable CS0618 // Obsolete members tested for backward compatibility
@@ -847,6 +850,202 @@ public sealed class GoalPipelineManagerTests
 
     #endregion
 
+    #region RestorePipeline / UnregisterTask
+
+    [Fact]
+    public void RestorePipeline_AlreadyInMemory_ReturnsExisting()
+    {
+        var manager = new GoalPipelineManager();
+        var pipeline = manager.CreatePipeline(CreateGoal("g1", "In memory"));
+
+        var restored = manager.RestorePipeline("g1");
+
+        Assert.Same(pipeline, restored);
+    }
+
+    [Fact]
+    public async Task RestorePipeline_FromStore_LoadsFailedPipeline()
+    {
+        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        var pipeline = manager.CreatePipeline(CreateGoal("g-failed", "Failed goal"));
+        pipeline.AdvanceTo(GoalPhase.Failed);
+        manager.PersistState(pipeline);
+
+        // Fresh manager with the same store
+        var freshManager = new GoalPipelineManager(store);
+        var restored = freshManager.RestorePipeline("g-failed");
+
+        Assert.NotNull(restored);
+        Assert.Equal(GoalPhase.Failed, restored!.Phase);
+        Assert.Same(restored, freshManager.GetByGoalId("g-failed"));
+    }
+
+    [Fact]
+    public async Task RestorePipeline_NotInStore_ReturnsNull()
+    {
+        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        var restored = manager.RestorePipeline("nonexistent");
+
+        Assert.Null(restored);
+    }
+
+    [Fact]
+    public void RestorePipeline_NoStore_ReturnsNull()
+    {
+        var manager = new GoalPipelineManager();
+
+        var restored = manager.RestorePipeline("any");
+
+        Assert.Null(restored);
+    }
+
+    [Fact]
+    public async Task UnregisterTask_RemovesFromMemoryAndStore()
+    {
+        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        manager.CreatePipeline(CreateGoal("g1", "desc"));
+        manager.RegisterTask("task-1", "g1");
+
+        manager.UnregisterTask("task-1");
+
+        Assert.Null(manager.GetByTaskId("task-1"));
+
+        var snap = store.LoadPipeline("g1");
+        Assert.NotNull(snap);
+        Assert.Empty(snap!.TaskMappings);
+    }
+
+    [Fact]
+    public void UnregisterTask_NoStore_OnlyRemovesFromMemory()
+    {
+        var manager = new GoalPipelineManager();
+        manager.CreatePipeline(CreateGoal("g1", "desc"));
+        manager.RegisterTask("task-1", "g1");
+
+        manager.UnregisterTask("task-1");
+
+        Assert.Null(manager.GetByTaskId("task-1"));
+    }
+
+    [Fact]
+    public async Task RestorePipeline_FailedPipeline_RoundTripsThroughStore()
+    {
+        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        var pipeline = manager.CreatePipeline(CreateGoal("g-rt", "Round-trip goal"));
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipeline.IterationBudget.TryConsume();
+        pipeline.Conversation.Add(new ConversationEntry("user", "Planning message"));
+        pipeline.AdvanceTo(GoalPhase.Failed);
+        manager.PersistFull(pipeline);
+
+        // Fresh manager with the same store
+        var freshManager = new GoalPipelineManager(store);
+        var restored = freshManager.RestorePipeline("g-rt");
+
+        Assert.NotNull(restored);
+        Assert.Equal(GoalPhase.Failed, restored!.Phase);
+        Assert.Equal(2, restored.Iteration);
+        Assert.Single(restored.Conversation);
+        Assert.Equal("Planning message", restored.Conversation[0].Content);
+        Assert.Same(restored, freshManager.GetByGoalId("g-rt"));
+    }
+
+    [Fact]
+    public async Task RestorePipeline_AlreadyInMemory_DoesNotDuplicate()
+    {
+        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        var pipeline = manager.CreatePipeline(CreateGoal("g-dup", "Duplicate check"));
+        var countBefore = manager.GetAllPipelines().Count;
+
+        var restored = manager.RestorePipeline("g-dup");
+
+        Assert.Same(pipeline, restored);
+        Assert.Equal(countBefore, manager.GetAllPipelines().Count);
+    }
+
+    [Fact]
+    public async Task UnregisterTask_PersistedMappingDeleted()
+    {
+        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        manager.CreatePipeline(CreateGoal("g-unreg", "Unregister test"));
+        manager.RegisterTask("task-unreg", "g-unreg");
+
+        manager.UnregisterTask("task-unreg");
+
+        // Fresh manager with the same store
+        var freshManager = new GoalPipelineManager(store);
+        var restored = freshManager.RestorePipeline("g-unreg");
+
+        Assert.NotNull(restored);
+
+        // Verify the persisted snapshot no longer contains the mapping
+        var snap = store.LoadPipeline("g-unreg");
+        Assert.NotNull(snap);
+        Assert.DoesNotContain(("task-unreg", "g-unreg"), snap!.TaskMappings);
+    }
+
+    [Fact]
+    public async Task RestorePipeline_ConcurrentCalls_ReturnSameInstance()
+    {
+        // Use a shared-connection factory so each RestorePipeline call creates
+        // its own short-lived DbContext (the direct-context test constructor
+        // is not thread-safe for concurrent reads).
+        var factory = new SharedInMemoryDbContextFactory(
+            new DbContextOptionsBuilder<CopilotHiveDbContext>().Options);
+        await using var store = new PipelineStore(factory, NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        var pipeline = manager.CreatePipeline(CreateGoal("g-concurrent", "Concurrent restore"));
+        pipeline.AdvanceTo(GoalPhase.Failed);
+        manager.PersistFull(pipeline);
+
+        // Fresh manager so RestorePipeline must load from store
+        var freshManager = new GoalPipelineManager(store);
+
+        var barrier = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var results = new GoalPipeline?[10];
+        var index = 0;
+        var lockObj = new object();
+        async Task RestoreWithIndex()
+        {
+            await barrier.Task;
+            var idx = 0;
+            lock (lockObj) { idx = index++; }
+            var r = freshManager.RestorePipeline("g-concurrent");
+            results[idx] = r;
+        }
+
+        var tasks = new List<Task>();
+        for (var i = 0; i < 10; i++)
+            tasks.Add(RestoreWithIndex());
+
+        barrier.SetResult();
+        await Task.WhenAll(tasks);
+
+        // All calls return the same instance
+        var first = results[0];
+        Assert.NotNull(first);
+        foreach (var r in results)
+            Assert.Same(first, r);
+
+        // Only one pipeline exists in the manager
+        Assert.Single(freshManager.GetAllPipelines());
+    }
+
+    #endregion
+
     #region GoalPipeline — GoalStartedAt
 
     [Fact]
@@ -1028,5 +1227,40 @@ public sealed class GoalPipelineManagerTests
     }
 
     #endregion
+}
+
+/// <summary>
+/// An <see cref="IDbContextFactory{TContext}"/> that creates fresh contexts over a single
+/// shared, open SQLite in-memory connection. Disposing a created context does not destroy
+/// the database because the underlying connection stays open for the lifetime of the factory.
+/// </summary>
+file sealed class SharedInMemoryDbContextFactory : IDbContextFactory<CopilotHiveDbContext>, IDisposable
+{
+    private readonly string _dbPath;
+    private bool _disposed;
+
+    public SharedInMemoryDbContextFactory(DbContextOptions<CopilotHiveDbContext> options)
+    {
+        // Use a temp file-based SQLite DB so concurrent contexts each get their own
+        // connection (in-memory SQLite connections are not thread-safe for concurrent use).
+        _dbPath = Path.Combine(Path.GetTempPath(), $"copilothive_test_{Guid.NewGuid():N}.db");
+        using var ctx = CreateDbContext();
+        ctx.Database.EnsureCreated();
+    }
+
+    public CopilotHiveDbContext CreateDbContext()
+    {
+        var opts = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+            .UseSqlite($"Data Source={_dbPath}")
+            .Options;
+        return new CopilotHiveDbContext(opts);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        try { File.Delete(_dbPath); } catch { /* best-effort cleanup */ }
+    }
 }
 

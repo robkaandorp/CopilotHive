@@ -40,6 +40,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly TaskBuilder _taskBuilder = new(new BranchCoordinator());
     private readonly ConcurrentDictionary<string, bool> _dispatchedGoals = new();
     private readonly ConcurrentQueue<string> _redispatchQueue = new();
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _resumeLocks = new();
     private readonly TimeSpan _startupDelay;
     private readonly IClarificationRouter? _clarificationRouter;
     private readonly ClarificationQueueService? _clarificationQueue;
@@ -202,6 +203,183 @@ public sealed class GoalDispatcher : BackgroundService
     public void EnqueueRedispatch(string goalId)
     {
         _redispatchQueue.Enqueue(goalId);
+    }
+
+    /// <summary>
+    /// Determines whether a goal failed specifically due to iteration-budget exhaustion,
+    /// making it eligible for resumption via <see cref="ResumeGoalAsync"/>.
+    /// Matches the failure reasons produced by <see cref="PipelineDriver"/>:
+    /// "Exceeded max iterations" and "Exceeded max iterations during merge conflict resolution".
+    /// </summary>
+    private static bool IsIterationExhaustionFailure(Goal goal)
+    {
+        if (goal.Status != GoalStatus.Failed)
+            return false;
+        if (string.IsNullOrEmpty(goal.FailureReason))
+            return false;
+        var reason = goal.FailureReason;
+        return reason.Contains("Exceeded max iterations", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("max iterations", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Resumes a goal that failed due to iteration exhaustion by extending its iteration budget
+    /// and dispatching a new iteration. Serialized per-goal via <see cref="_resumeLocks"/>.
+    /// </summary>
+    /// <param name="goalId">The goal to resume.</param>
+    /// <param name="additionalIterations">Number of additional iterations to grant (1-1000).</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>True if the goal was resumed; false if the goal is not eligible or the goal store is unavailable.</returns>
+    public async Task<bool> ResumeGoalAsync(string goalId, int additionalIterations, CancellationToken ct = default)
+    {
+        // Resolve goal store — mandatory for resume
+        var goalStore = _goalStore;
+        if (goalStore is null)
+            return false;
+
+        // Check goal eligibility BEFORE acquiring lock
+        var goal = await goalStore.GetGoalAsync(goalId, ct);
+        if (goal is null || !IsIterationExhaustionFailure(goal))
+            return false;
+
+        var lockObj = _resumeLocks.GetOrAdd(goalId, _ => new SemaphoreSlim(1, 1));
+        await lockObj.WaitAsync(ct);
+        try
+        {
+            // Re-check FULL eligibility inside lock (could have changed)
+            goal = await goalStore.GetGoalAsync(goalId, ct);
+            if (goal is null || !IsIterationExhaustionFailure(goal))
+                return false;
+
+            // Load pipeline
+            var pipeline = _pipelineManager.GetByGoalId(goalId);
+            if (pipeline is null)
+            {
+                pipeline = _pipelineManager.RestorePipeline(goalId);
+                if (pipeline is null)
+                    return false;
+            }
+
+            // Require pipeline in Failed phase
+            if (pipeline.Phase != GoalPhase.Failed)
+                return false;
+
+            // Extend budget
+            pipeline.ExtendIterations(additionalIterations);
+
+            // Consume one iteration for the resumed iteration
+            if (!pipeline.IterationBudget.TryConsume())
+                return false; // shouldn't happen after TopUp
+
+            // Capture stale task ID before clearing
+            var staleTaskId = pipeline.ActiveTaskId;
+            if (staleTaskId is not null)
+            {
+                _pipelineManager.UnregisterTask(staleTaskId);
+                pipeline.ClearActiveTask();
+            }
+
+            // Clear terminal state
+            pipeline.ClearCompletedAt();
+            pipeline.StateMachine.ResetToPlanning();
+            pipeline.AdvanceTo(GoalPhase.Planning);
+            pipeline.SetPlan(IterationPlan.Default());
+            pipeline.Metrics.ResetForNewIteration(pipeline.Iteration);
+
+            // Update goal status FIRST (DB is source of truth)
+            // If this throws, goal stays Failed — no pipeline mutation has been persisted
+            goal.Status = GoalStatus.InProgress;
+            goal.FailureReason = null;
+            goal.CompletedAt = null;
+            await goalStore.UpdateGoalAsync(goal, ct);
+
+            // Persist pipeline at recovery boundary
+            _pipelineManager.PersistFull(pipeline);
+
+            // Re-register with Brain and fork session (best-effort)
+            try
+            {
+                (_brain as DistributedBrain)?.RegisterActivePipeline(pipeline);
+                if (_brain is not null)
+                    await _brain.ForkSessionForGoalAsync(goalId, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to re-register/fork Brain session for resumed goal '{GoalId}'", goalId);
+            }
+
+            // Plan a new iteration (best-effort)
+            IterationPlan validatedPlan;
+            try
+            {
+                var rawPlan = await ResolvePlanAsync(pipeline, null, ct);
+                validatedPlan = IterationPlanValidator.ValidatePlan(rawPlan);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Brain failed to plan resumed iteration for {GoalId} — using default plan", goalId);
+                validatedPlan = IterationPlan.Default();
+            }
+
+            pipeline.SetPlan(validatedPlan);
+            pipeline.StateMachine.StartIteration(validatedPlan.Phases);
+            var firstPhase = validatedPlan.Phases[0];
+            pipeline.AdvanceTo(firstPhase);
+            pipeline.PhaseLog.Add(PhaseResult.Create(firstPhase, pipeline.Iteration, 1));
+
+            // Craft prompt (best-effort)
+            string prompt;
+            try
+            {
+                prompt = _brain is not null
+                    ? await ResolvePromptAsync(pipeline, firstPhase, null, ct)
+                    : BuildCoderPrompt(pipeline.Goal);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Brain failed to craft prompt for resumed {GoalId} — using fallback", goalId);
+                prompt = BuildCoderPrompt(pipeline.Goal);
+            }
+
+            // Dispatch (best-effort — if this fails, goal is InProgress and dispatch loop handles it)
+            try
+            {
+                await DispatchToRole(pipeline, firstPhase.ToWorkerRole(), prompt, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to dispatch resumed goal '{GoalId}' — enqueuing for redispatch", goalId);
+                // CRITICAL: Clear ActiveTaskId before enqueuing — DrainRedispatchQueueAsync
+                // skips pipelines with non-null ActiveTaskId.
+                pipeline.ClearActiveTask();
+                _redispatchQueue.Enqueue(goalId);
+            }
+
+            _pipelineManager.PersistFull(pipeline);
+            return true;
+        }
+        finally
+        {
+            lockObj.Release();
+            // Do NOT remove/dispose the semaphore — another thread may be waiting.
+            // Accept bounded leak of one SemaphoreSlim per unique goal ID for the process lifetime.
+        }
     }
 
     /// <summary>

@@ -371,6 +371,84 @@ public class PipelineStateMachineTests
         }
     }
 
+    // ---- ResetToPlanning ----
+
+    [Fact]
+    public void ResetToPlanning_SetsPhaseToPlanning()
+    {
+        var sm = CreateStarted();
+
+        sm.ResetToPlanning();
+
+        Assert.Equal(GoalPhase.Planning, sm.Phase);
+        Assert.Empty(sm.CompletedPhases);
+        Assert.Empty(sm.RemainingPhases);
+    }
+
+    [Fact]
+    public void ResetToPlanning_AfterFail_ResetsToPlanning()
+    {
+        var sm = CreateStarted();
+        sm.Fail();
+
+        sm.ResetToPlanning();
+
+        Assert.Equal(GoalPhase.Planning, sm.Phase);
+        Assert.Empty(sm.CompletedPhases);
+        Assert.Empty(sm.RemainingPhases);
+    }
+
+    [Fact]
+    public void ResetToPlanning_ThenStartIteration_WorksCorrectly()
+    {
+        var sm = CreateStarted();
+        sm.Transition(PhaseInput.Succeeded); // → Testing
+        sm.Fail();
+
+        sm.ResetToPlanning();
+
+        // Start a new iteration with a new plan
+        var newPlan = new List<GoalPhase>
+        {
+            GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging
+        };
+        sm.StartIteration(newPlan);
+
+        Assert.Equal(GoalPhase.Coding, sm.Phase);
+        Assert.Empty(sm.CompletedPhases);
+
+        // Transition through the new plan succeeds
+        var r1 = sm.Transition(PhaseInput.Succeeded);
+        Assert.Equal(GoalPhase.Testing, r1.NextPhase);
+        Assert.Equal(TransitionEffect.Continue, r1.Effect);
+
+        var r2 = sm.Transition(PhaseInput.Succeeded);
+        Assert.Equal(GoalPhase.Review, r2.NextPhase);
+
+        var r3 = sm.Transition(PhaseInput.Succeeded);
+        Assert.Equal(GoalPhase.Merging, r3.NextPhase);
+
+        var r4 = sm.Transition(PhaseInput.Succeeded);
+        Assert.Equal(GoalPhase.Done, r4.NextPhase);
+        Assert.Equal(TransitionEffect.Completed, r4.Effect);
+    }
+
+    [Fact]
+    public void ResetToPlanning_ClearsCompletedPhases()
+    {
+        var sm = CreateStarted();
+        sm.Transition(PhaseInput.Succeeded); // → Testing (Coding completed)
+        sm.Transition(PhaseInput.Succeeded); // → DocWriting (Testing completed)
+        Assert.Equal(2, sm.CompletedPhases.Count);
+        Assert.NotEmpty(sm.RemainingPhases);
+
+        sm.ResetToPlanning();
+
+        Assert.Equal(GoalPhase.Planning, sm.Phase);
+        Assert.Empty(sm.CompletedPhases);
+        Assert.Empty(sm.RemainingPhases);
+    }
+
     // ---- Invalid transitions ----
 
     [Fact]

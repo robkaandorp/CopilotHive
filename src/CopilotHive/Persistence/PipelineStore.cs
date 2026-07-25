@@ -288,6 +288,53 @@ public sealed class PipelineStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Load a single pipeline by goal ID regardless of phase (including Done/Failed).
+    /// Returns null if no pipeline is found.
+    /// </summary>
+    public PipelineSnapshot? LoadPipeline(string goalId)
+    {
+        var (db, ownsContext) = ResolveDbContext();
+        try
+        {
+            var entity = db.Pipelines.Find(goalId);
+            if (entity is null)
+                return null;
+
+            var snapshot = ToSnapshot(entity);
+            snapshot.Conversation = LoadConversationCore(db, goalId);
+            snapshot.TaskMappings = LoadTaskMappingsCore(db, goalId);
+            return snapshot;
+        }
+        finally
+        {
+            if (ownsContext)
+                db.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Delete a single task mapping by task ID from the persisted store.
+    /// </summary>
+    public void DeleteTaskMapping(string taskId)
+    {
+        var (db, ownsContext) = ResolveDbContext();
+        try
+        {
+            var mapping = db.TaskMappings.Find(taskId);
+            if (mapping is not null)
+            {
+                db.TaskMappings.Remove(mapping);
+                db.SaveChanges();
+            }
+        }
+        finally
+        {
+            if (ownsContext)
+                db.Dispose();
+        }
+    }
+
     /// <summary>Loads the conversation entries for a specific goal from the store.</summary>
     /// <param name="goalId">The goal ID whose conversation entries to retrieve.</param>
     /// <returns>The conversation entries, or an empty list if no entries exist.</returns>

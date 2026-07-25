@@ -2855,3 +2855,540 @@ public sealed class GoalDispatcherParallelDispatchTests
         public BrainStats? GetStats() => null;
     }
 }
+
+/// <summary>
+/// Tests for <see cref="GoalDispatcher.ResumeGoalAsync"/> — resuming iteration-exhausted goals.
+/// </summary>
+public sealed class GoalDispatcherResumeTests
+{
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    private static GoalDispatcher CreateResumeDispatcher(
+        IGoalStore? goalStore,
+        GoalPipelineManager pipelineManager,
+        IDistributedBrain? brain = null,
+        HiveConfigFile? config = null,
+        IWorkerGateway? workerGateway = null)
+    {
+        var goalManager = new GoalManager();
+        return new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            workerGateway ?? new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain,
+            config: config,
+            goalStore: goalStore);
+    }
+
+    private static HiveConfigFile ConfigWithRepo() =>
+        new()
+        {
+            Repositories =
+            [
+                new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/repo.git", DefaultBranch = "main" },
+            ],
+        };
+
+    private static Goal CreateFailedGoal(
+        string id,
+        string reason = "Exceeded max iterations",
+        GoalStatus status = GoalStatus.Failed,
+        bool withRepo = true) =>
+        new()
+        {
+            Id = id,
+            Description = "Resume test goal",
+            Status = status,
+            FailureReason = status == GoalStatus.Failed ? reason : null,
+            RepositoryNames = withRepo ? ["test-repo"] : [],
+        };
+
+    /// <summary>
+    /// Creates a pipeline, exhausts its iteration budget, and advances it to the Failed phase
+    /// to simulate iteration exhaustion. Persists to the store if the manager is store-backed.
+    /// </summary>
+    private static GoalPipeline CreateFailedPipeline(GoalPipelineManager manager, Goal goal, int maxIterations = 3)
+    {
+        var pipeline = manager.CreatePipeline(goal, maxRetries: 3, maxIterations: maxIterations);
+        // Exhaust the iteration budget so Remaining is 0 before resume.
+        while (pipeline.IterationBudget.TryConsume()) { }
+        pipeline.AdvanceTo(GoalPhase.Failed);
+        manager.PersistFull(pipeline);
+        return pipeline;
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task ResumeGoalAsync_FailedGoal_ResumesExecution()
+    {
+        var goalStore = new ResumeFakeGoalStore();
+        var goal = CreateFailedGoal("resume-1");
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var manager = new GoalPipelineManager();
+        var pipeline = CreateFailedPipeline(manager, goal);
+
+        var dispatcher = CreateResumeDispatcher(goalStore, manager, config: ConfigWithRepo());
+
+        var result = await dispatcher.ResumeGoalAsync("resume-1", 5, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+
+        var updated = await goalStore.GetGoalAsync("resume-1", TestContext.Current.CancellationToken);
+        Assert.NotNull(updated);
+        Assert.Equal(GoalStatus.InProgress, updated!.Status);
+        Assert.Null(updated.FailureReason);
+
+        Assert.NotEqual(GoalPhase.Failed, pipeline.Phase);
+        // 5 added to an exhausted (0) budget, 1 consumed for the resumed iteration → 4 remaining.
+        Assert.Equal(4, pipeline.IterationBudget.Remaining);
+    }
+
+    [Fact]
+    public async Task ResumeGoalAsync_MaxIterationsPersists_AfterExtension()
+    {
+        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        var goalStore = new ResumeFakeGoalStore();
+        var goal = CreateFailedGoal("resume-max");
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var pipeline = CreateFailedPipeline(manager, goal, maxIterations: 3);
+        var originalMax = pipeline.MaxIterations; // 3
+
+        var dispatcher = CreateResumeDispatcher(goalStore, manager, config: ConfigWithRepo());
+
+        await dispatcher.ResumeGoalAsync("resume-max", 5, TestContext.Current.CancellationToken);
+
+        // Restore via a fresh manager backed by the same store.
+        var freshManager = new GoalPipelineManager(store);
+        var restored = freshManager.RestorePipeline("resume-max");
+
+        Assert.NotNull(restored);
+        Assert.Equal(originalMax + 5, restored!.MaxIterations);
+    }
+
+    [Fact]
+    public async Task ResumeGoalAsync_ConcurrentCalls_Serialized()
+    {
+        // A controllable store whose UpdateGoalAsync blocks INSIDE the resume critical section.
+        // GetGoalAsync returns a *clone* of the stored goal, so a caller mutating its own copy to
+        // InProgress does NOT change the persisted status until UpdateGoalAsync actually writes.
+        // This lets us hold the first call inside the lock while the store still reports Failed,
+        // so the second call's eligibility check passes and it MUST block on the semaphore.
+        var goalStore = new ControllableResumeGoalStore();
+        var goal = CreateFailedGoal("resume-concurrent");
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var manager = new GoalPipelineManager();
+        CreateFailedPipeline(manager, goal);
+
+        var dispatcher = CreateResumeDispatcher(goalStore, manager, config: ConfigWithRepo());
+
+        // Arm the gate: the first call to reach UpdateGoalAsync will block until we release it,
+        // while still holding the resume lock.
+        goalStore.UpdateGoalGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // Start the first call. It runs through the critical section and parks in UpdateGoalAsync,
+        // holding the lock and having signalled UpdateGoalEntered.
+        var t1 = dispatcher.ResumeGoalAsync("resume-concurrent", 5, TestContext.Current.CancellationToken);
+        await goalStore.UpdateGoalEntered.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        // The store still reports Failed (first call has not written yet), so the second call
+        // passes the pre-lock eligibility read and can only be held back by the semaphore.
+        var t2 = dispatcher.ResumeGoalAsync("resume-concurrent", 5, TestContext.Current.CancellationToken);
+
+        // PROVING ASSERTION: the second call must NOT complete while the first holds the lock.
+        // If the semaphore/WaitAsync were removed, the second call would proceed concurrently.
+        var winner = await Task.WhenAny(t2, Task.Delay(500, TestContext.Current.CancellationToken));
+        Assert.NotSame(t2, winner); // t2 is still blocked → the delay won
+
+        // Release the first call. It finishes, writes InProgress, and releases the lock.
+        goalStore.UpdateGoalGate.SetResult();
+
+        var results = await Task.WhenAll(t1, t2);
+
+        // Exactly one succeeds: the first (Failed → InProgress). The second, once it finally
+        // acquires the lock, re-checks eligibility, sees InProgress, and returns false.
+        Assert.Equal(1, results.Count(r => r));
+        Assert.Equal(1, results.Count(r => !r));
+        Assert.True(results[0]);
+        Assert.False(results[1]);
+    }
+
+    [Fact]
+    public async Task ResumeGoalAsync_RejectsNonIterationFailure()
+    {
+        var goalStore = new ResumeFakeGoalStore();
+        var goal = CreateFailedGoal("resume-other", reason: "Some other error");
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var manager = new GoalPipelineManager();
+        CreateFailedPipeline(manager, goal);
+
+        var dispatcher = CreateResumeDispatcher(goalStore, manager, config: ConfigWithRepo());
+
+        var result = await dispatcher.ResumeGoalAsync("resume-other", 5, TestContext.Current.CancellationToken);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task ResumeGoalAsync_RejectsDonePipeline()
+    {
+        var goalStore = new ResumeFakeGoalStore();
+        var goal = CreateFailedGoal("resume-done");
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var manager = new GoalPipelineManager();
+        var pipeline = manager.CreatePipeline(goal, maxRetries: 3, maxIterations: 3);
+        pipeline.AdvanceTo(GoalPhase.Done);
+
+        var dispatcher = CreateResumeDispatcher(goalStore, manager, config: ConfigWithRepo());
+
+        var result = await dispatcher.ResumeGoalAsync("resume-done", 5, TestContext.Current.CancellationToken);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task ResumeGoalAsync_RejectsInProgressGoal()
+    {
+        var goalStore = new ResumeFakeGoalStore();
+        var goal = CreateFailedGoal("resume-inprogress", status: GoalStatus.InProgress);
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var manager = new GoalPipelineManager();
+        var dispatcher = CreateResumeDispatcher(goalStore, manager, config: ConfigWithRepo());
+
+        var result = await dispatcher.ResumeGoalAsync("resume-inprogress", 5, TestContext.Current.CancellationToken);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task ResumeGoalAsync_RejectsPendingGoal()
+    {
+        var goalStore = new ResumeFakeGoalStore();
+        var goal = CreateFailedGoal("resume-pending", status: GoalStatus.Pending);
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var manager = new GoalPipelineManager();
+        var dispatcher = CreateResumeDispatcher(goalStore, manager, config: ConfigWithRepo());
+
+        var result = await dispatcher.ResumeGoalAsync("resume-pending", 5, TestContext.Current.CancellationToken);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task ResumeGoalAsync_NullGoalStore_ReturnsFalse()
+    {
+        var manager = new GoalPipelineManager();
+        var dispatcher = CreateResumeDispatcher(goalStore: null, manager, config: ConfigWithRepo());
+
+        var result = await dispatcher.ResumeGoalAsync("any-goal", 5, TestContext.Current.CancellationToken);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task ResumeGoalAsync_StaleTaskMapping_RemovedFromStore()
+    {
+        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        var goalStore = new ResumeFakeGoalStore();
+        // No repo configured → dispatch throws (no new task mapping registered), leaving only
+        // the stale mapping, which resume must remove from the store.
+        var goal = CreateFailedGoal("resume-stale", withRepo: false);
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var pipeline = manager.CreatePipeline(goal, maxRetries: 3, maxIterations: 3);
+        while (pipeline.IterationBudget.TryConsume()) { }
+        const string staleTaskId = "stale-task-1";
+        pipeline.SetActiveTask(staleTaskId);
+        manager.RegisterTask(staleTaskId, "resume-stale");
+        pipeline.AdvanceTo(GoalPhase.Failed);
+        manager.PersistFull(pipeline);
+
+        var dispatcher = CreateResumeDispatcher(goalStore, manager);
+
+        var result = await dispatcher.ResumeGoalAsync("resume-stale", 5, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+
+        // Verify the stale mapping is gone from the persisted store.
+        var snapshot = store.LoadPipeline("resume-stale");
+        Assert.NotNull(snapshot);
+        Assert.DoesNotContain(snapshot!.TaskMappings, m => m.TaskId == staleTaskId);
+    }
+
+    [Fact]
+    public async Task ResumeGoalAsync_DispatchFailure_ClearsActiveTaskAndEnqueues()
+    {
+        var goalStore = new ResumeFakeGoalStore();
+        // Repo IS configured so ResolveRepositories and TaskBuilder.Build succeed and
+        // DispatchToRole reaches pipeline.SetActiveTask(...) → ActiveTaskId becomes non-null.
+        // The failure is injected LATER, at the worker-send step, via a gateway that hands back
+        // an idle worker but throws on SendTaskAsync. This proves the catch block's
+        // pipeline.ClearActiveTask() actually runs on a non-null ActiveTaskId — removing it
+        // would leave ActiveTaskId set and fail this test.
+        var goal = CreateFailedGoal("resume-dispatch-fail");
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var manager = new GoalPipelineManager();
+        var pipeline = CreateFailedPipeline(manager, goal);
+
+        var gateway = new ThrowingSendWorkerGateway();
+        var dispatcher = CreateResumeDispatcher(goalStore, manager, config: ConfigWithRepo(), workerGateway: gateway);
+
+        var result = await dispatcher.ResumeGoalAsync("resume-dispatch-fail", 5, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+
+        // The gateway must have been asked to send (proving we got past SetActiveTask, which
+        // happens just before the send) and then thrown.
+        Assert.True(gateway.SendAttempted);
+
+        // ActiveTaskId must be cleared so DrainRedispatchQueueAsync will pick the pipeline up.
+        Assert.Null(pipeline.ActiveTaskId);
+        Assert.NotEqual(GoalPhase.Done, pipeline.Phase);
+        Assert.NotEqual(GoalPhase.Failed, pipeline.Phase);
+
+        // The goal must be enqueued for redispatch.
+        var queueField = typeof(GoalDispatcher).GetField(
+            "_redispatchQueue",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var queue = (System.Collections.Concurrent.ConcurrentQueue<string>)queueField.GetValue(dispatcher)!;
+        Assert.Contains("resume-dispatch-fail", queue);
+    }
+}
+
+/// <summary>In-memory goal store for GoalDispatcher resume tests.</summary>
+file sealed class ResumeFakeGoalStore : IGoalStore
+{
+    private readonly Dictionary<string, Goal> _goals = new();
+
+    public string Name => "ResumeFakeGoalStore";
+
+    public Task<IReadOnlyList<Goal>> GetAllGoalsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(_goals.Values.ToList().AsReadOnly());
+
+    public Task<Goal?> GetGoalAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult(_goals.TryGetValue(goalId, out var goal) ? goal : null);
+
+    public Task<Goal> CreateGoalAsync(Goal goal, CancellationToken ct = default)
+    {
+        _goals[goal.Id] = goal;
+        return Task.FromResult(goal);
+    }
+
+    public Task UpdateGoalAsync(Goal goal, CancellationToken ct = default)
+    {
+        _goals[goal.Id] = goal;
+        return Task.CompletedTask;
+    }
+
+    public Task<bool> DeleteGoalAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult(_goals.Remove(goalId));
+
+    public Task<IReadOnlyList<Goal>> SearchGoalsAsync(string query, GoalStatus? statusFilter = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(Array.Empty<Goal>());
+
+    public Task<IReadOnlyList<Goal>> GetGoalsByStatusAsync(GoalStatus status, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(Array.Empty<Goal>());
+
+    public Task AddIterationAsync(string goalId, IterationSummary summary, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<IterationSummary>>(Array.Empty<IterationSummary>());
+
+    public Task<int> ImportGoalsAsync(IEnumerable<Goal> goals, CancellationToken ct = default) =>
+        Task.FromResult(0);
+
+    public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(Array.Empty<Goal>());
+
+    public Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default) =>
+        Task.FromResult(release);
+
+    public Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default) =>
+        Task.FromResult<Release?>(null);
+
+    public Task<IReadOnlyList<Release>> GetReleasesAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Release>>(Array.Empty<Release>());
+
+    public Task UpdateReleaseAsync(Release release, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default) =>
+        Task.FromResult(false);
+
+    public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(Array.Empty<Goal>());
+
+    public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ConversationEntry>>(Array.Empty<ConversationEntry>());
+
+    public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(int? limit = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>>(Array.Empty<(string, PersistedClarification)>());
+}
+
+/// <summary>
+/// In-memory goal store that can pause <see cref="UpdateGoalAsync"/> inside the resume critical
+/// section. <see cref="GetGoalAsync"/> returns a fresh clone so callers mutating their own copy do
+/// not change the persisted status until <see cref="UpdateGoalAsync"/> actually writes.
+/// </summary>
+file sealed class ControllableResumeGoalStore : IGoalStore
+{
+    private readonly Dictionary<string, Goal> _goals = new();
+
+    /// <summary>When set, <see cref="UpdateGoalAsync"/> awaits this before writing to the store.</summary>
+    public TaskCompletionSource? UpdateGoalGate { get; set; }
+
+    /// <summary>Completes when <see cref="UpdateGoalAsync"/> is first entered while gated.</summary>
+    public TaskCompletionSource UpdateGoalEntered { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public string Name => "ControllableResumeGoalStore";
+
+    private static Goal Clone(Goal g) => new()
+    {
+        Id = g.Id,
+        Description = g.Description,
+        Status = g.Status,
+        FailureReason = g.FailureReason,
+        CompletedAt = g.CompletedAt,
+        RepositoryNames = [.. g.RepositoryNames],
+    };
+
+    public Task<IReadOnlyList<Goal>> GetAllGoalsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(_goals.Values.Select(Clone).ToList().AsReadOnly());
+
+    public Task<Goal?> GetGoalAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult(_goals.TryGetValue(goalId, out var goal) ? Clone(goal) : null);
+
+    public Task<Goal> CreateGoalAsync(Goal goal, CancellationToken ct = default)
+    {
+        _goals[goal.Id] = Clone(goal);
+        return Task.FromResult(goal);
+    }
+
+    public async Task UpdateGoalAsync(Goal goal, CancellationToken ct = default)
+    {
+        var gate = UpdateGoalGate;
+        if (gate is not null)
+        {
+            UpdateGoalEntered.TrySetResult();
+            await gate.Task.WaitAsync(ct);
+        }
+        _goals[goal.Id] = Clone(goal);
+    }
+
+    public Task<bool> DeleteGoalAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult(_goals.Remove(goalId));
+
+    public Task<IReadOnlyList<Goal>> SearchGoalsAsync(string query, GoalStatus? statusFilter = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(Array.Empty<Goal>());
+
+    public Task<IReadOnlyList<Goal>> GetGoalsByStatusAsync(GoalStatus status, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(Array.Empty<Goal>());
+
+    public Task AddIterationAsync(string goalId, IterationSummary summary, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<IterationSummary>>(Array.Empty<IterationSummary>());
+
+    public Task<int> ImportGoalsAsync(IEnumerable<Goal> goals, CancellationToken ct = default) =>
+        Task.FromResult(0);
+
+    public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(Array.Empty<Goal>());
+
+    public Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default) =>
+        Task.FromResult(release);
+
+    public Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default) =>
+        Task.FromResult<Release?>(null);
+
+    public Task<IReadOnlyList<Release>> GetReleasesAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Release>>(Array.Empty<Release>());
+
+    public Task UpdateReleaseAsync(Release release, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default) =>
+        Task.FromResult(false);
+
+    public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>(Array.Empty<Goal>());
+
+    public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ConversationEntry>>(Array.Empty<ConversationEntry>());
+
+    public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(int? limit = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>>(Array.Empty<(string, PersistedClarification)>());
+}
+
+/// <summary>
+/// Worker gateway that always reports one idle worker but throws when a task is sent to it.
+/// This forces <c>DispatchToRole</c> to fail AFTER <c>pipeline.SetActiveTask(...)</c>, exercising
+/// the dispatch-failure catch that clears the active task and enqueues for redispatch.
+/// </summary>
+file sealed class ThrowingSendWorkerGateway : IWorkerGateway
+{
+    private readonly ConnectedWorker _worker = new()
+    {
+        Id = "throwing-worker",
+        Role = CopilotHive.Workers.WorkerRole.Unspecified,
+        Capabilities = [],
+    };
+
+    /// <summary>True once <see cref="SendTaskAsync"/> has been invoked.</summary>
+    public bool SendAttempted { get; private set; }
+
+    public Task SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default)
+    {
+        SendAttempted = true;
+        throw new InvalidOperationException("Simulated worker send failure after SetActiveTask.");
+    }
+
+    public Task SendCancelAsync(string workerId, string taskId, string reason, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task SendAgentsUpdateAsync(string workerId, string role, string content, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public ConnectedWorker? GetIdleWorker() => _worker;
+
+    public IReadOnlyList<ConnectedWorker> GetAllWorkers() => [_worker];
+
+    public void MarkBusy(string workerId, string taskId) { }
+}

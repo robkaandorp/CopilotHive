@@ -183,6 +183,17 @@ public sealed class PipelineStateMachine
         _remainingPhases.Clear();
     }
 
+    /// <summary>
+    /// Resets the state machine to the Planning phase with empty phase queues.
+    /// Used when resuming a failed goal so a fresh iteration plan can be set.
+    /// </summary>
+    public void ResetToPlanning()
+    {
+        Phase = GoalPhase.Planning;
+        _remainingPhases.Clear();
+        _completedPhases.Clear();
+    }
+
     private TransitionResult AdvanceToNext()
     {
         _completedPhases.Add(Phase);

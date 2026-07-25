@@ -49,6 +49,48 @@ public sealed class GoalPipelineManager
         _store?.SaveTaskMapping(taskId, goalId);
     }
 
+    /// <summary>
+    /// Restore a single pipeline from the persistent store by goal ID, regardless of phase.
+    /// If the pipeline is already in memory, returns the existing instance.
+    /// Returns null if the store is unavailable or no pipeline is found.
+    /// </summary>
+    public GoalPipeline? RestorePipeline(string goalId)
+    {
+        // If already in memory, return existing
+        if (_pipelines.TryGetValue(goalId, out var existing))
+            return existing;
+
+        if (_store is null)
+            return null;
+
+        var snapshot = _store.LoadPipeline(goalId);
+        if (snapshot is null)
+            return null;
+
+        var pipeline = new GoalPipeline(snapshot);
+        if (_pipelines.TryAdd(goalId, pipeline))
+        {
+            foreach (var (taskId, gid) in snapshot.TaskMappings)
+                _taskToGoal[taskId] = gid;
+        }
+        else
+        {
+            // Another thread added it — return their instance
+            return _pipelines[goalId];
+        }
+
+        return pipeline;
+    }
+
+    /// <summary>
+    /// Remove a task mapping from both the in-memory dictionary and the persistent store.
+    /// </summary>
+    public void UnregisterTask(string taskId)
+    {
+        _taskToGoal.TryRemove(taskId, out _);
+        _store?.DeleteTaskMapping(taskId);
+    }
+
     /// <summary>Persist the current state of a pipeline (call after state mutations).</summary>
     public void PersistState(GoalPipeline pipeline) => _store?.SavePipelineState(pipeline);
 

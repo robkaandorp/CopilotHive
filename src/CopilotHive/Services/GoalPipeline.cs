@@ -236,6 +236,21 @@ public sealed class GoalPipeline
         }
     }
 
+    /// <summary>Extend the iteration budget by the given number of additional iterations.</summary>
+    public void ExtendIterations(int additional)
+    {
+        IterationBudget.TopUp(additional);
+    }
+
+    /// <summary>Clear the completed timestamp (used when resuming a failed goal).</summary>
+    public void ClearCompletedAt()
+    {
+        lock (_lock)
+        {
+            CompletedAt = null;
+        }
+    }
+
     /// <summary>Set the iteration plan from the Brain.</summary>
     public void SetPlan(IterationPlan plan)
     {
