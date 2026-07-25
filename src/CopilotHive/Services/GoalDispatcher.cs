@@ -796,6 +796,9 @@ public sealed class GoalDispatcher : BackgroundService
         try
         {
             await _goalManager.UpdateGoalStatusAsync(goal.Id, GoalStatus.InProgress, startedMeta, ct);
+            goal.Status = GoalStatus.InProgress;
+            if (startedMeta.StartedAt.HasValue)
+                goal.StartedAt = startedMeta.StartedAt.Value;
             _logger.LogInformation("Dispatcher: successfully updated goal '{GoalId}' status to InProgress", goal.Id);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)

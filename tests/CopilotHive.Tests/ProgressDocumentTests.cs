@@ -49,6 +49,22 @@ public sealed class ProgressDocumentTests
     }
 
     [Fact]
+    public async Task DispatchNextGoal_GoalStatusStaysInProgressAfterProgressDocumentCreation()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+        var goal = new Goal { Id = $"goal-progress-{Guid.NewGuid():N}", Description = "Implement feature X", RepositoryNames = ["test-repo"] };
+        var dispatcher = CreateDispatcher(goal, graph, out _, out var goalStore);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        var storedGoal = await goalStore.GetGoalAsync(goal.Id, ct);
+        Assert.NotNull(storedGoal);
+        Assert.Equal(GoalStatus.InProgress, storedGoal!.Status);
+        Assert.NotNull(storedGoal.StartedAt);
+    }
+
+    [Fact]
     public async Task DispatchNextGoal_AppendsBrainPlan_WithPhaseNames()
     {
         var ct = TestContext.Current.CancellationToken;
