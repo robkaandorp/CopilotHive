@@ -118,6 +118,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - Ask the user questions for clarification (ask_user)
         - Get the current date and time (get_current_time)
         - Review draft goals before dispatch (review_goal) — triggers an automated pre-execution review that checks for issues
+        - Retrieve recent application log entries for debugging (get_recent_logs) — filters by level, category, or message text
         - When review_goal returns NeedsChanges, read the review document (read_document "review-{goal-id}") and update the goal to address the feedback, then re-review
 
         Guidelines for goal creation:
@@ -787,6 +788,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 "Get the current date and time in UTC. Use when you need to know the current date for changelog entries, release notes, or other date-sensitive content."),
             AIFunctionFactory.Create(ReviewGoalAsync, "review_goal",
                 "Trigger a pre-execution review on a Draft goal. Returns the review verdict, issues, and recommendations."),
+            AIFunctionFactory.Create(GetRecentLogsAsync, "get_recent_logs",
+                "Retrieve recent application log entries. Useful for debugging issues, checking error messages, and monitoring goal dispatch status."),
         };
 
         if (_ollamaApiKey is not null)
