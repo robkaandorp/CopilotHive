@@ -28,4 +28,11 @@ public sealed class OrchestratorConfig
     /// Default: 48 hours. Set to 0 for immediate cleanup.
     /// </summary>
     public int BranchCleanupDelayHours { get; set; } = 48;
+
+    /// <summary>
+    /// Maximum wall-clock minutes a single worker task may run before the orchestrator
+    /// reclaims it and re-dispatches the phase. Guards against workers that keep
+    /// heartbeating while their LLM call hangs. Set to 0 to disable.
+    /// </summary>
+    public int WorkerTaskTimeoutMinutes { get; set; } = Services.CleanupDefaults.WorkerTaskTimeoutMinutes;
 }

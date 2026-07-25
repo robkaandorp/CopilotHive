@@ -119,6 +119,7 @@ public sealed class WorkerPool : IWorkerPool
         {
             worker.IsBusy = true;
             worker.CurrentTaskId = taskId;
+            worker.CurrentTaskStartedAt = DateTime.UtcNow;
         }
     }
 
@@ -132,6 +133,7 @@ public sealed class WorkerPool : IWorkerPool
         {
             worker.IsBusy = false;
             worker.CurrentTaskId = null;
+            worker.CurrentTaskStartedAt = null;
             worker.Role = WorkerRole.Unspecified;
         }
     }
@@ -146,6 +148,25 @@ public sealed class WorkerPool : IWorkerPool
         var now = DateTime.UtcNow;
         return _workers.Values
             .Where(w => now - w.LastHeartbeat > timeout)
+            .ToList()
+            .AsReadOnly();
+    }
+
+    /// <summary>
+    /// Returns workers that are busy with a task that started longer ago than <paramref name="timeout"/>.
+    /// Such workers are still heartbeating, so <see cref="GetStaleWorkers"/> will not report them,
+    /// but their task has hung and would otherwise hold its pipeline slot forever.
+    /// </summary>
+    /// <param name="timeout">Maximum wall-clock duration allowed for a single task.</param>
+    /// <returns>A read-only list of <see cref="ConnectedWorker"/> instances with over-running tasks.</returns>
+    public IReadOnlyList<ConnectedWorker> GetWorkersWithTimedOutTasks(TimeSpan timeout)
+    {
+        var now = DateTime.UtcNow;
+        return _workers.Values
+            .Where(w => w.IsBusy
+                && w.CurrentTaskId is not null
+                && w.CurrentTaskStartedAt.HasValue
+                && now - w.CurrentTaskStartedAt.Value > timeout)
             .ToList()
             .AsReadOnly();
     }

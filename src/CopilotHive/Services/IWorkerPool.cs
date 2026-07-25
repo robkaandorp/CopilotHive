@@ -20,6 +20,15 @@ public interface IWorkerPool
     IReadOnlyList<ConnectedWorker> GetStaleWorkers(TimeSpan timeout);
 
     /// <summary>
+    /// Returns workers that are busy with a task that started longer ago than <paramref name="timeout"/>.
+    /// These workers are still heartbeating — so they are not "stale" — but their task has hung
+    /// (e.g. an LLM call that never returns) and would otherwise occupy a parallel-goal slot forever.
+    /// </summary>
+    /// <param name="timeout">Maximum wall-clock duration allowed for a single task.</param>
+    /// <returns>A read-only list of <see cref="ConnectedWorker"/> instances with over-running tasks.</returns>
+    IReadOnlyList<ConnectedWorker> GetWorkersWithTimedOutTasks(TimeSpan timeout);
+
+    /// <summary>
     /// Removes a worker from the pool.
     /// </summary>
     /// <param name="id">Identifier of the worker to remove.</param>

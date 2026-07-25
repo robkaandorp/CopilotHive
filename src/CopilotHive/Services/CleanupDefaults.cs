@@ -14,4 +14,11 @@ public static class CleanupDefaults
     /// The timeout, in minutes, after which a worker is considered stale.
     /// </summary>
     public const int StaleTimeoutMinutes = 2;
+
+    /// <summary>
+    /// Default maximum wall-clock minutes a single worker task may run before it is
+    /// reclaimed. Observed healthy phases complete well inside 10 minutes, so 60 leaves
+    /// generous headroom while still bounding a hung task.
+    /// </summary>
+    public const int WorkerTaskTimeoutMinutes = 60;
 }

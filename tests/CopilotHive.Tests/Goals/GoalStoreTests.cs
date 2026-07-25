@@ -297,9 +297,54 @@ public sealed class GoalStoreTests : IDisposable
         Assert.Equal(10, goal.IterationSummaries[0].TestCounts!.Total);
     }
 
+    /// <summary>
+    /// Persisting a summary for an iteration that already has a row must overwrite it rather than
+    /// throw. goal_iterations has a UNIQUE index on (goal_id, iteration); a blind insert threw a
+    /// DbUpdateException that aborted the whole status update and permanently wedged the pipeline
+    /// (it kept its ActiveTaskId and occupied a parallel-goal slot forever).
+    /// </summary>
     [Fact]
-    public async Task UpdateGoalStatus_GoalNotFound_Throws()
+    public async Task UpdateGoalStatus_SameIterationTwice_UpdatesInPlaceWithoutThrowing()
     {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateGoalAsync(MakeGoal(), ct);
+
+        var first = new IterationSummary
+        {
+            Iteration = 5,
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 10 }],
+            TestCounts = new TestCounts { Total = 5, Passed = 5, Failed = 0 },
+            ReviewVerdict = "approve",
+        };
+
+        await _store.UpdateGoalStatusAsync("test-goal", GoalStatus.InProgress,
+            new GoalUpdateMetadata { IterationSummary = first }, ct);
+
+        var second = new IterationSummary
+        {
+            Iteration = 5,
+            Phases = [new PhaseResult { Name = GoalPhase.Review, Result = PhaseOutcome.Fail, DurationSeconds = 20 }],
+            TestCounts = new TestCounts { Total = 8, Passed = 7, Failed = 1 },
+            ReviewVerdict = "request_changes",
+            Notes = ["reviewer requested changes"],
+        };
+
+        await _store.UpdateGoalStatusAsync("test-goal", GoalStatus.InProgress,
+            new GoalUpdateMetadata { IterationSummary = second }, ct);
+
+        var goal = await _store.GetGoalAsync("test-goal", ct);
+        Assert.NotNull(goal);
+
+        // Exactly one row for iteration 5, carrying the latest values.
+        var iteration5 = Assert.Single(goal.IterationSummaries, s => s.Iteration == 5);
+        Assert.Equal("request_changes", iteration5.ReviewVerdict);
+        Assert.Equal(8, iteration5.TestCounts!.Total);
+        Assert.Equal(1, iteration5.TestCounts!.Failed);
+        Assert.Contains("reviewer requested changes", iteration5.Notes);
+    }
+
+    [Fact]
+    public async Task UpdateGoalStatus_GoalNotFound_Throws()    {
         await Assert.ThrowsAsync<KeyNotFoundException>(() =>
             _store.UpdateGoalStatusAsync("ghost", GoalStatus.Failed, ct: TestContext.Current.CancellationToken));
     }

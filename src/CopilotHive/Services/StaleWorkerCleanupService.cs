@@ -8,6 +8,8 @@ namespace CopilotHive.Services;
 /// (workers whose heartbeat has not been received within <see cref="CleanupDefaults.StaleTimeoutMinutes"/>
 /// minutes) and removes them. When a stale worker had an active task, the task is
 /// re-enqueued for reassignment to another worker.
+/// It also reclaims tasks that exceed <see cref="Configuration.OrchestratorConfig.WorkerTaskTimeoutMinutes"/>
+/// even while the worker keeps heartbeating, which covers hung LLM calls.
 /// </summary>
 public sealed class StaleWorkerCleanupService : BackgroundService
 {
@@ -15,6 +17,7 @@ public sealed class StaleWorkerCleanupService : BackgroundService
     private readonly TaskQueue _taskQueue;
     private readonly GoalPipelineManager _pipelineManager;
     private readonly GoalDispatcher? _goalDispatcher;
+    private readonly Configuration.HiveConfigFile? _config;
     private readonly ILogger<StaleWorkerCleanupService> _logger;
 
     /// <summary>
@@ -31,13 +34,15 @@ public sealed class StaleWorkerCleanupService : BackgroundService
         TaskQueue taskQueue,
         GoalPipelineManager pipelineManager,
         ILogger<StaleWorkerCleanupService> logger,
-        GoalDispatcher? goalDispatcher = null)
+        GoalDispatcher? goalDispatcher = null,
+        Configuration.HiveConfigFile? config = null)
     {
         _workerPool = workerPool;
         _taskQueue = taskQueue;
         _pipelineManager = pipelineManager;
         _logger = logger;
         _goalDispatcher = goalDispatcher;
+        _config = config;
     }
 
     /// <summary>
@@ -89,7 +94,38 @@ public sealed class StaleWorkerCleanupService : BackgroundService
             }
         }
 
+        ReclaimTimedOutTasks();
+
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Reclaims tasks that have exceeded the configured wall-clock limit. These workers are still
+    /// heartbeating (so <see cref="IWorkerPool.PurgeStaleWorkers"/> ignores them) but their task has
+    /// hung — typically an LLM call that never returns. Without this the pipeline keeps its
+    /// ActiveTaskId forever and permanently consumes a parallel-goal slot.
+    /// </summary>
+    private void ReclaimTimedOutTasks()
+    {
+        var timeoutMinutes = _config?.Orchestrator?.WorkerTaskTimeoutMinutes
+            ?? CleanupDefaults.WorkerTaskTimeoutMinutes;
+
+        if (timeoutMinutes <= 0)
+            return;
+
+        var timedOut = _workerPool.GetWorkersWithTimedOutTasks(TimeSpan.FromMinutes(timeoutMinutes));
+
+        foreach (var worker in timedOut)
+        {
+            _logger.LogWarning(
+                "Worker {WorkerId} task {TaskId} exceeded {TimeoutMinutes} min (started {StartedAt}) — reclaiming",
+                worker.Id, worker.CurrentTaskId, timeoutMinutes, worker.CurrentTaskStartedAt);
+
+            // Drop the hung worker so it cannot report a late completion for a re-dispatched task.
+            _workerPool.RemoveWorker(worker.Id);
+
+            RescheduleAbandonedTask(worker.Id, worker.CurrentTaskId!);
+        }
     }
 
     private void RescheduleAbandonedTask(string workerId, string taskId)
