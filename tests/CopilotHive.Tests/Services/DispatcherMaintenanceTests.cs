@@ -27,11 +27,12 @@ public sealed class DispatcherMaintenanceTests
         IBrainRepoManager? repoManager = null,
         HiveConfigFile? config = null,
         GoalPipelineManager? pipelineManager = null,
-        ConcurrentDictionary<string, bool>? dispatchedGoals = null)
+        ConcurrentDictionary<string, bool>? dispatchedGoals = null,
+        GoalManager? goalManager = null)
     {
         pipelineManager ??= new GoalPipelineManager();
         dispatchedGoals ??= new ConcurrentDictionary<string, bool>();
-        var goalManager = new GoalManager();
+        goalManager ??= new GoalManager();
         var taskQueue = new TaskQueue();
         var workerGateway = new GrpcWorkerGateway(new WorkerPool());
 
@@ -544,6 +545,87 @@ public sealed class DispatcherMaintenanceTests
         Assert.NotNull(freshManager.GetByGoalId(goal.Id));
         // The pipeline was still processed and remains dispatched.
         Assert.True(dispatchedGoals.ContainsKey(goal.Id));
+    }
+
+    [Fact]
+    public async Task RestoreActivePipelinesAsync_ActivePipelineButPendingGoal_PersistsInProgress()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        await using var pipelineStore = new PipelineStore(db, NullLogger<PipelineStore>.Instance);
+
+        // Goal status drifted to Pending while its pipeline is genuinely mid-task.
+        var goal = new Goal { Id = "stale-pending-goal", Description = "Stale pending", Status = GoalStatus.Pending };
+        var originalManager = new GoalPipelineManager(pipelineStore);
+        var pipeline = originalManager.CreatePipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipeline.SetActiveTask("stale-pending-goal-coder-001");
+        originalManager.PersistFull(pipeline);
+
+        var freshManager = new GoalPipelineManager(pipelineStore);
+
+        var goalStore = new Mock<IGoalStore>();
+        goalStore.Setup(s => s.GetGoalAsync(goal.Id, It.IsAny<CancellationToken>())).ReturnsAsync(goal);
+
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalStore.Object);
+
+        var maintenance = CreateMaintenance(
+            goalStore: goalStore.Object,
+            pipelineManager: freshManager,
+            goalManager: goalManager);
+
+        await maintenance.RestoreActivePipelinesAsync(CancellationToken.None);
+
+        goalStore.Verify(
+            s => s.UpdateGoalStatusAsync(
+                goal.Id,
+                GoalStatus.InProgress,
+                It.Is<GoalUpdateMetadata?>(m => m != null && m.StartedAt != null),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task RestoreActivePipelinesAsync_ActivePipelineAlreadyInProgress_DoesNotRewriteStatus()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        await using var pipelineStore = new PipelineStore(db, NullLogger<PipelineStore>.Instance);
+
+        var goal = new Goal
+        {
+            Id = "healthy-goal",
+            Description = "Healthy",
+            Status = GoalStatus.InProgress,
+            StartedAt = DateTime.UtcNow.AddMinutes(-5),
+        };
+        var originalManager = new GoalPipelineManager(pipelineStore);
+        var pipeline = originalManager.CreatePipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipeline.SetActiveTask("healthy-goal-coder-001");
+        originalManager.PersistFull(pipeline);
+
+        var freshManager = new GoalPipelineManager(pipelineStore);
+
+        var goalStore = new Mock<IGoalStore>();
+        goalStore.Setup(s => s.GetGoalAsync(goal.Id, It.IsAny<CancellationToken>())).ReturnsAsync(goal);
+
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalStore.Object);
+
+        var maintenance = CreateMaintenance(
+            goalStore: goalStore.Object,
+            pipelineManager: freshManager,
+            goalManager: goalManager);
+
+        await maintenance.RestoreActivePipelinesAsync(CancellationToken.None);
+
+        goalStore.Verify(
+            s => s.UpdateGoalStatusAsync(
+                It.IsAny<string>(),
+                It.IsAny<GoalStatus>(),
+                It.IsAny<GoalUpdateMetadata?>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
     }
 }
 

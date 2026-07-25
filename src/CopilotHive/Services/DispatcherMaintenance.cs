@@ -232,9 +232,10 @@ internal sealed class DispatcherMaintenance
 
             // Reconcile with DB status — a goal may have been marked Failed/Completed
             // in the DB while its pipeline record still shows an active phase.
+            Goal? goal = null;
             if (_goalStore is not null)
             {
-                var goal = await _goalStore.GetGoalAsync(pipeline.GoalId, ct);
+                goal = await _goalStore.GetGoalAsync(pipeline.GoalId, ct);
                 if (goal is not null && goal.Status is (GoalStatus.Completed or GoalStatus.Failed))
                 {
                     _logger.LogInformation("Pipeline {GoalId} has stale phase {Phase} but goal is {Status} — cleaning up",
@@ -263,6 +264,22 @@ internal sealed class DispatcherMaintenance
                 (_brain as DistributedBrain)?.DeregisterActivePipeline(pipeline.GoalId);
                 await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Pending, null, ct);
                 continue;
+            }
+
+            // An active pipeline means the goal is running. Persist that, otherwise a goal
+            // restored mid-task keeps whatever status it had before the restart (often
+            // Pending) — the re-dispatch path never sets InProgress, so the stale status
+            // would stick forever and the API would disagree with the dashboard.
+            if (goal is not null && goal.Status is not GoalStatus.InProgress)
+            {
+                _logger.LogInformation(
+                    "Pipeline {GoalId} is active in phase {Phase} but goal status is {Status} — restoring to InProgress",
+                    pipeline.GoalId, pipeline.Phase, goal.Status);
+
+                var startedMeta = goal.StartedAt is null
+                    ? new GoalUpdateMetadata { StartedAt = pipeline.GoalStartedAt ?? pipeline.CreatedAt }
+                    : null;
+                await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.InProgress, startedMeta, ct);
             }
 
             // If the pipeline was mid-task (has ActiveTaskId), the old worker is gone
