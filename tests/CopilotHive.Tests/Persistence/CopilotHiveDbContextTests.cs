@@ -5,6 +5,7 @@ using CopilotHive.Persistence.Entities;
 
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests.Persistence;
@@ -1001,5 +1002,66 @@ public sealed class CopilotHiveDbContextTests
         while (reader.Read())
             indexNames.Add(reader.GetString(0));
         return indexNames;
+    }
+
+    // ── 10. In-place collection mutation detection via ValueComparer ──────
+
+    /// <summary>
+    /// Verifies that the EF Core <see cref="ValueComparer"/> configured via
+    /// <c>HasJsonConversion</c> correctly detects in-place mutations of JSON-converted
+    /// collection properties (<see cref="Goal.Notes"/> and <see cref="Goal.Metadata"/>).
+    /// Without a <see cref="ValueComparer"/>, EF Core would not detect that the same
+    /// collection reference was mutated and would skip persisting the change.
+    /// </summary>
+    [Fact]
+    public void DbContext_DetectsInPlaceCollectionMutations_WithJsonComparer()
+    {
+        // CreateInMemory creates the schema; we reuse its connection so the fresh
+        // context reads from the same in-memory SQLite database.
+        using var ctx = CopilotHiveDbContext.CreateInMemory();
+        var conn = GetSqliteConnection(ctx);
+
+        var goal = new Goal
+        {
+            Id = "goal-mutate-1",
+            Description = "Mutation test goal",
+            Status = GoalStatus.Pending,
+            Priority = GoalPriority.Normal,
+            Scope = GoalScope.Patch,
+            Notes = ["original-note"],
+            Metadata = new() { ["env"] = "test" },
+            CreatedAt = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+        };
+
+        ctx.Goals.Add(goal);
+        ctx.SaveChanges();
+
+        // Retrieve the tracked entity (same instance, already tracked by ctx).
+        var tracked = ctx.Goals.Find("goal-mutate-1");
+        Assert.NotNull(tracked);
+
+        // Mutate the JSON-converted collections **in place** — the ValueComparer
+        // must detect that the serialized representation changed.
+        tracked!.Notes.Add("added-note");
+        tracked.Metadata["new-key"] = "new-value";
+
+        ctx.SaveChanges();
+
+        // Fresh context over the same database to bypass the first context's
+        // change tracker and confirm the mutations were actually persisted.
+        var freshOptions = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+            .UseSqlite(conn)
+            .Options;
+
+        using var ctx2 = new CopilotHiveDbContext(freshOptions);
+
+        var reloaded = ctx2.Goals.Find("goal-mutate-1");
+
+        Assert.NotNull(reloaded);
+        Assert.Contains("original-note", reloaded!.Notes);
+        Assert.Contains("added-note", reloaded.Notes);
+        Assert.Equal(2, reloaded.Notes.Count);
+        Assert.Equal("test", reloaded.Metadata["env"]);
+        Assert.Equal("new-value", reloaded.Metadata["new-key"]);
     }
 }

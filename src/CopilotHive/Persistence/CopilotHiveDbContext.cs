@@ -6,6 +6,7 @@ using CopilotHive.Persistence.Entities;
 
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
@@ -22,7 +23,7 @@ namespace CopilotHive.Persistence;
 // The Microsoft.EntityFrameworkCore.Design package is referenced in the test project for tooling.
 public sealed class CopilotHiveDbContext : DbContext
 {
-    private static readonly JsonSerializerOptions JsonOptions = new()
+    internal static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         WriteIndented = false,
@@ -252,11 +253,19 @@ public sealed class CopilotHiveDbContext : DbContext
         entity.HasIndex(e => new { e.GoalId, e.Seq }).HasDatabaseName("idx_conversation_goal");
     }
 
-    private static ValueConverter<T, string?> JsonConverter<T>()
+    internal static ValueConverter<T, string?> JsonConverter<T>()
     {
         return new ValueConverter<T, string?>(
             v => ReferenceEquals(v, null) ? null : JsonSerializer.Serialize(v, JsonOptions),
             s => string.IsNullOrEmpty(s) ? default! : JsonSerializer.Deserialize<T>(s, JsonOptions)!);
+    }
+
+    internal static ValueComparer<T> JsonComparer<T>()
+    {
+        return new ValueComparer<T>(
+            (a, b) => JsonSerializer.Serialize(a, JsonOptions) == JsonSerializer.Serialize(b, JsonOptions),
+            v => JsonSerializer.Serialize(v, JsonOptions).GetHashCode(),
+            v => JsonSerializer.Deserialize<T>(JsonSerializer.Serialize(v, JsonOptions), JsonOptions)!);
     }
 
     private static ValueConverter LowercaseEnumConverter<TEnum>()
@@ -279,21 +288,8 @@ file static class ConversionExtensions
 {
     public static PropertyBuilder<TProperty> HasJsonConversion<TProperty>(this PropertyBuilder<TProperty> propertyBuilder)
     {
-        var converter = typeof(CopilotHiveDbContext)
-            .GetMethod("JsonConverter", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)
-            ?.MakeGenericMethod(typeof(TProperty))
-            .Invoke(null, null);
-
-        if (converter is null)
-            throw new InvalidOperationException($"Unable to create JSON converter for {typeof(TProperty).Name}");
-
-        // Use reflection to call HasConversion with the untyped converter instance.
-        var hasConversion = typeof(PropertyBuilder<>)
-            .MakeGenericType(typeof(TProperty))
-            .GetMethods()
-            .First(m => m.Name == "HasConversion" && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(ValueConverter));
-
-        hasConversion.Invoke(propertyBuilder, [converter]);
-        return propertyBuilder;
+        var converter = CopilotHiveDbContext.JsonConverter<TProperty>();
+        var comparer = CopilotHiveDbContext.JsonComparer<TProperty>();
+        return propertyBuilder.HasConversion(converter, comparer);
     }
 }
