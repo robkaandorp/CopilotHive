@@ -1,5 +1,22 @@
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-25
+
+### Added
+
+- **Per-goal Brain contexts** — `DistributedBrain` now uses independent `GoalBrainContext` instances per goal with dedicated `CodingAgent`, `IChatClient`, and `AgentSession`. Different goals' Brain LLM calls run truly in parallel without a global gate.
+- **Extend iterations** — Goals that fail due to iteration exhaustion can be resumed with additional iterations via API endpoint, Composer tool, or dashboard button.
+- **`git_fetch` Composer tool** — Fetch remote branches and inspect commits not available locally, with input validation and option-injection protection.
+- **`get_recent_logs` Composer tool** — Read recent application log entries directly from the dashboard log sink, with filtering by level, category, and message text.
+
+### Fixed
+
+- **Stale Pending goal status** — Goals showing as Pending on the dashboard after dispatch (cache `TryAdd` → direct DB assignment).
+- **Stuck InProgress goals** — UNIQUE constraint violation in `UpdateGoalStatusAsync` prevented `MarkGoalFailedAsync` from completing; stale pipelines not reconciled on restart.
+- **Premature context compaction** — SharpCoder 0.12.0 fixes inflated `LastKnownContextTokens` that caused compaction at 19% real context usage.
+- **EF Core value-comparer warnings** — Collection properties with JSON value converters now have proper `ValueComparer` for change tracking.
+- **Diagnostic logging for status updates** — Goal status update path now logs before/after with verification re-read.
+
 ## [0.16.0] - 2026-07-24
 
 ### Added
