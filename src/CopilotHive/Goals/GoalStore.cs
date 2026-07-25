@@ -319,12 +319,19 @@ public sealed class GoalStore : IGoalStore
     /// <inheritdoc />
     public async Task UpdateGoalAsync(Goal goal, CancellationToken ct = default)
     {
+        var callStack = Environment.StackTrace;
         var (db, ownsContext) = ResolveDbContext();
         try
         {
             var existing = await db.Goals.FirstOrDefaultAsync(g => g.Id == goal.Id, ct);
             if (existing is null)
                 throw new KeyNotFoundException($"Goal '{goal.Id}' not found in SQLite store.");
+
+            var oldStatus = existing.Status;
+            if (oldStatus != goal.Status)
+            {
+                _logger.LogWarning("GoalStore: UpdateGoalAsync overwriting goal '{GoalId}' status from {OldStatus} to {NewStatus}. Call stack: {StackTrace}", goal.Id, oldStatus, goal.Status, callStack);
+            }
 
             existing.Description = goal.Description;
             existing.Status = goal.Status;
