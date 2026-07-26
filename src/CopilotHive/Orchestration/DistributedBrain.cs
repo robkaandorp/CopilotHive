@@ -219,6 +219,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             Volatile.Write(ref _brainActor, actor);
             actor = null;
+            _logger.LogInformation("BrainActor shadow started (state dir: {Dir})", actorStateDir);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
