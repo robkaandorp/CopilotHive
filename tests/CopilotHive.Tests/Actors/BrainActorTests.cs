@@ -1,0 +1,640 @@
+using System.Reflection;
+
+using CopilotHive.Actors;
+using CopilotHive.Goals;
+using CopilotHive.Services;
+
+using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging.Abstractions;
+
+using SharpCoder;
+
+using Xunit;
+
+namespace CopilotHive.Tests.Actors;
+
+public class BrainActorTests
+{
+    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(5);
+
+    private static async Task<T> AwaitReplyAsync<T>(TaskCompletionSource<T> reply)
+    {
+        await Task.WhenAny(reply.Task, Task.Delay(Timeout));
+        Assert.True(reply.Task.IsCompletedSuccessfully, "Reply did not complete successfully in time.");
+        return reply.Task.Result;
+    }
+
+    private static async Task AwaitSettledAsync<T>(TaskCompletionSource<T> reply)
+    {
+        await Task.WhenAny(reply.Task, Task.Delay(Timeout));
+        Assert.True(reply.Task.IsCompleted, "Reply did not settle in time.");
+    }
+
+    /// <summary>Runs on a dedicated thread so barrier-synchronized producers cannot starve the thread pool.</summary>
+    private static Task StartProducer(Action action) =>
+        Task.Factory.StartNew(action, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+    private static async Task AwaitCompletionAsync(BrainActor actor)
+    {
+        await Task.WhenAny(actor.Completion, Task.Delay(Timeout));
+        Assert.True(actor.IsCompleted, "Actor did not stop in time.");
+    }
+
+    private static string CreateTempDir()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    private static void DeleteTempPath(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                Directory.Delete(path, recursive: true);
+            }
+            else if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch (IOException)
+        {
+            // Best-effort cleanup.
+        }
+    }
+
+    private static BrainActor CreateActor(string stateDir, string model = "test-model", int maxContextTokens = 100_000) =>
+        new(model, maxContextTokens, stateDir, NullLogger<BrainActor>.Instance);
+
+    private static GoalPipeline CreatePipeline(string goalId) =>
+        new(new Goal { Id = goalId, Description = $"Description for {goalId}" });
+
+    private static AgentSession GetMasterSession(BrainActor actor)
+    {
+        var field = typeof(BrainActor).GetField("_masterSession", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        return (AgentSession)field.GetValue(actor)!;
+    }
+
+    private static async Task<bool> ConnectAsync(BrainActor actor)
+    {
+        var connect = BrainActorMessages.CreateConnectMessage();
+        Assert.True(actor.Tell(connect));
+        return await AwaitReplyAsync(connect.Reply);
+    }
+
+    [Fact]
+    public async Task Connect_ThenGetStats_ReportsConnectedState()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+
+            Assert.True(await ConnectAsync(actor));
+
+            var stats = BrainActorMessages.CreateGetStatsMessage();
+            Assert.True(actor.Tell(stats));
+            var result = await AwaitReplyAsync(stats.Reply);
+
+            Assert.NotNull(result);
+            Assert.True(result!.IsConnected);
+            Assert.Equal(0, result.MessageCount);
+            Assert.Equal("test-model", result.Model);
+            Assert.Equal(100_000, result.MaxContextTokens);
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task ForkSession_ThenExists_ThenDelete_RemovesFile()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+            await ConnectAsync(actor);
+
+            var fork = BrainActorMessages.CreateForkSessionMessage("goal-1");
+            actor.Tell(fork);
+            Assert.True(await AwaitReplyAsync(fork.Reply));
+
+            var exists = BrainActorMessages.CreateGoalSessionExistsMessage("goal-1");
+            actor.Tell(exists);
+            Assert.True(await AwaitReplyAsync(exists.Reply));
+
+            var delete = BrainActorMessages.CreateDeleteSessionMessage("goal-1");
+            actor.Tell(delete);
+            Assert.True(await AwaitReplyAsync(delete.Reply));
+
+            var existsAfter = BrainActorMessages.CreateGoalSessionExistsMessage("goal-1");
+            actor.Tell(existsAfter);
+            Assert.False(await AwaitReplyAsync(existsAfter.Reply));
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task ForkSession_CalledTwice_IsIdempotent()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+            await ConnectAsync(actor);
+
+            var first = BrainActorMessages.CreateForkSessionMessage("goal-1");
+            actor.Tell(first);
+            Assert.True(await AwaitReplyAsync(first.Reply));
+
+            var sessionFile = Path.Combine(dir, "brain-goal-goal-1.json");
+            var contentAfterFirstFork = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
+
+            // Mutate the master session so a non-idempotent second fork would produce different content.
+            var merge = BrainActorMessages.CreateMergeSummaryMessage("other-goal", "master session mutation");
+            actor.Tell(merge);
+            Assert.True(await AwaitReplyAsync(merge.Reply));
+
+            var second = BrainActorMessages.CreateForkSessionMessage("goal-1");
+            actor.Tell(second);
+            Assert.True(await AwaitReplyAsync(second.Reply));
+
+            var contentAfterSecondFork = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
+            Assert.Equal(contentAfterFirstFork, contentAfterSecondFork);
+            Assert.DoesNotContain("master session mutation", contentAfterSecondFork, StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task MergeSummary_AppendsUserAndAssistantMessages()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+            await ConnectAsync(actor);
+
+            // Seed a non-zero token count so the reset in MergeSummary is observable.
+            GetMasterSession(actor).LastKnownContextTokens = 4242;
+
+            var merge = BrainActorMessages.CreateMergeSummaryMessage("goal-1", "Test summary content");
+            actor.Tell(merge);
+            Assert.True(await AwaitReplyAsync(merge.Reply));
+
+            var stats = BrainActorMessages.CreateGetStatsMessage();
+            actor.Tell(stats);
+            var result = await AwaitReplyAsync(stats.Reply);
+
+            Assert.NotNull(result);
+            Assert.Equal(2, result!.MessageCount);
+
+            var masterSession = GetMasterSession(actor);
+            var history = masterSession.MessageHistory;
+            var userMessage = history[^2];
+            var assistantMessage = history[^1];
+
+            Assert.Equal(ChatRole.User, userMessage.Role);
+            Assert.Contains("[Goal completed: goal-1] Summarize what was done.", userMessage.Text, StringComparison.Ordinal);
+            Assert.Equal(ChatRole.Assistant, assistantMessage.Role);
+            Assert.Contains("Test summary content", assistantMessage.Text, StringComparison.Ordinal);
+            Assert.Equal(0, masterSession.LastKnownContextTokens);
+            Assert.True(File.Exists(Path.Combine(dir, "brain-master.json")), "Master session was not persisted.");
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task Pipeline_RegisterGetDeregister_RoundTrips()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+
+            var pipeline = CreatePipeline("goal-1");
+            actor.Tell(new RegisterPipelineMessage("goal-1", pipeline));
+
+            var get = BrainActorMessages.CreateGetPipelineMessage("goal-1");
+            actor.Tell(get);
+            Assert.Same(pipeline, await AwaitReplyAsync(get.Reply));
+
+            actor.Tell(new DeregisterPipelineMessage("goal-1"));
+
+            var getAfter = BrainActorMessages.CreateGetPipelineMessage("goal-1");
+            actor.Tell(getAfter);
+            Assert.Null(await AwaitReplyAsync(getAfter.Reply));
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task UpdateModel_ChangesModelAndMaxContextTokens()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+            await ConnectAsync(actor);
+
+            var update = BrainActorMessages.CreateUpdateModelMessage("new-model", 50_000);
+            actor.Tell(update);
+            Assert.True(await AwaitReplyAsync(update.Reply));
+
+            var stats = BrainActorMessages.CreateGetStatsMessage();
+            actor.Tell(stats);
+            var result = await AwaitReplyAsync(stats.Reply);
+
+            Assert.NotNull(result);
+            Assert.Equal("new-model", result!.Model);
+            Assert.Equal(50_000, result.MaxContextTokens);
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task ForkSession_BeforeConnect_Faults()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+
+            var fork = BrainActorMessages.CreateForkSessionMessage("goal-1");
+            actor.Tell(fork);
+            await AwaitSettledAsync(fork.Reply);
+
+            Assert.True(fork.Reply.Task.IsFaulted);
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task GetStats_BeforeConnect_ReturnsNull()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+
+            var stats = BrainActorMessages.CreateGetStatsMessage();
+            actor.Tell(stats);
+
+            Assert.Null(await AwaitReplyAsync(stats.Reply));
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteSession_BeforeConnect_Succeeds()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+
+            var delete = BrainActorMessages.CreateDeleteSessionMessage("goal-1");
+            actor.Tell(delete);
+
+            Assert.True(await AwaitReplyAsync(delete.Reply));
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task ConcurrentRegisterPipeline_AllPipelinesVisible()
+    {
+        const int producerCount = 50;
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+
+            using var barrier = new Barrier(producerCount);
+            var producers = new List<Task>(producerCount);
+            for (var i = 0; i < producerCount; i++)
+            {
+                var goalId = $"goal-{i}";
+                producers.Add(StartProducer(() =>
+                {
+                    barrier.SignalAndWait();
+                    Assert.True(actor.Tell(new RegisterPipelineMessage(goalId, CreatePipeline(goalId))));
+                }));
+            }
+
+            await Task.WhenAll(producers);
+
+            for (var i = 0; i < producerCount; i++)
+            {
+                var get = BrainActorMessages.CreateGetPipelineMessage($"goal-{i}");
+                actor.Tell(get);
+                var pipeline = await AwaitReplyAsync(get.Reply);
+                Assert.NotNull(pipeline);
+                Assert.Equal($"goal-{i}", pipeline!.GoalId);
+            }
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task DisposeAsyncBeforeStart_CancelsQueuedReplies()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var actor = CreateActor(dir);
+            var stats = BrainActorMessages.CreateGetStatsMessage();
+            Assert.True(actor.Tell(stats));
+
+            await actor.DisposeAsync();
+
+            Assert.True(actor.IsCompleted);
+            Assert.True(stats.Reply.Task.IsCanceled);
+            Assert.False(actor.IsStarted);
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task HandlerException_FaultsReply_AndLoopContinues()
+    {
+        // A file (not a directory) as the state dir makes session persistence fail with an I/O error.
+        var filePath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".tmp");
+        await File.WriteAllTextAsync(filePath, "not-a-directory", TestContext.Current.CancellationToken);
+        try
+        {
+            await using var actor = CreateActor(filePath);
+            actor.Start();
+
+            Assert.True(await ConnectAsync(actor));
+
+            var fork = BrainActorMessages.CreateForkSessionMessage("goal-1");
+            actor.Tell(fork);
+            await AwaitSettledAsync(fork.Reply);
+            Assert.True(fork.Reply.Task.IsFaulted);
+            Assert.False(fork.Reply.Task.IsCanceled);
+
+            var stats = BrainActorMessages.CreateGetStatsMessage();
+            actor.Tell(stats);
+            var result = await AwaitReplyAsync(stats.Reply);
+            Assert.NotNull(result);
+            Assert.True(result!.IsConnected);
+        }
+        finally
+        {
+            DeleteTempPath(filePath);
+        }
+    }
+
+    [Fact]
+    public async Task ForkSession_TraversalGoalId_Faults()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+            await ConnectAsync(actor);
+
+            var fork = BrainActorMessages.CreateForkSessionMessage("../../etc/passwd");
+            actor.Tell(fork);
+            await AwaitSettledAsync(fork.Reply);
+
+            Assert.True(fork.Reply.Task.IsFaulted);
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    /// <summary>
+    /// A raw <c>..</c> goal id contains no path separators, so only the explicit <c>..</c> check
+    /// in ValidateGoalPath can reject it. Removing that check makes this test fail.
+    /// </summary>
+    [Fact]
+    public async Task ForkSession_RawDoubleDotGoalId_Faults_AndActorKeepsProcessing()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+            await ConnectAsync(actor);
+
+            var traversal = BrainActorMessages.CreateForkSessionMessage("..");
+            actor.Tell(traversal);
+            await AwaitSettledAsync(traversal.Reply);
+
+            Assert.True(traversal.Reply.Task.IsFaulted, "Raw '..' goal id was not rejected.");
+            Assert.False(File.Exists(Path.Combine(dir, "brain-goal-...json")));
+
+            var legitimate = BrainActorMessages.CreateForkSessionMessage("normal-goal");
+            actor.Tell(legitimate);
+            Assert.True(await AwaitReplyAsync(legitimate.Reply));
+            Assert.True(File.Exists(Path.Combine(dir, "brain-goal-normal-goal.json")));
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task ConcurrentStartAndDispose_DoesNotHang()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var actor = CreateActor(dir);
+            using var barrier = new Barrier(2);
+
+            var starter = StartProducer(() =>
+            {
+                barrier.SignalAndWait();
+                actor.Start();
+            });
+
+            var disposer = StartProducer(() =>
+            {
+                barrier.SignalAndWait();
+                actor.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            });
+
+            var raceTask = Task.WhenAll(starter, disposer);
+            await Task.WhenAny(raceTask, Task.Delay(Timeout, TestContext.Current.CancellationToken));
+            Assert.True(raceTask.IsCompletedSuccessfully, "Start/Dispose race did not settle in time.");
+            await AwaitCompletionAsync(actor);
+            Assert.True(actor.IsCompleted);
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task DisposeAsyncTwice_SecondReturnsImmediately()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var actor = CreateActor(dir);
+            actor.Start();
+
+            await actor.DisposeAsync();
+            await actor.DisposeAsync();
+
+            Assert.True(actor.IsCompleted);
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    // ── Additional integration tests for coverage gaps ──
+
+    [Fact]
+    public async Task ConcurrentForkSession_SameGoalId_AllIdempotent()
+    {
+        const int producerCount = 20;
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+            await ConnectAsync(actor);
+
+            using var barrier = new Barrier(producerCount);
+            var forkMsgs = new ForkSessionMessage[producerCount];
+            var producers = new List<Task>(producerCount);
+            for (var i = 0; i < producerCount; i++)
+            {
+                var idx = i;
+                producers.Add(StartProducer(() =>
+                {
+                    barrier.SignalAndWait();
+                    forkMsgs[idx] = BrainActorMessages.CreateForkSessionMessage("goal-shared");
+                    actor.Tell(forkMsgs[idx]);
+                }));
+            }
+
+            await Task.WhenAll(producers);
+
+            // Every fork must have replied true (idempotent — first creates, rest are no-ops)
+            foreach (var msg in forkMsgs)
+            {
+                Assert.True(await AwaitReplyAsync(msg.Reply), "Concurrent fork did not reply true.");
+            }
+
+            // Exactly one file should exist on disk
+            var exists = BrainActorMessages.CreateGoalSessionExistsMessage("goal-shared");
+            actor.Tell(exists);
+            Assert.True(await AwaitReplyAsync(exists.Reply));
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteSession_NonExistentGoalId_RepliesTrue()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+
+            // No prior ForkSession — the goal ID has no file and no dict entry
+            var delete = BrainActorMessages.CreateDeleteSessionMessage("never-existed");
+            actor.Tell(delete);
+
+            Assert.True(await AwaitReplyAsync(delete.Reply));
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Theory]
+    [InlineData("foo/../bar")]
+    [InlineData("..")]
+    [InlineData("a/../../b")]
+    [InlineData("goal%2e%2e")]
+    [InlineData("....//")]
+    public async Task GoalSessionExists_TraversalAttempt_RepliesFalseOrFaults(string goalId)
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+
+            var exists = BrainActorMessages.CreateGoalSessionExistsMessage(goalId);
+            actor.Tell(exists);
+            await AwaitSettledAsync(exists.Reply);
+
+            // Path traversal should either fault (invalid characters) or reply false (no file).
+            // It must never reply true (which would mean a file was found outside the state dir).
+            if (exists.Reply.Task.IsCompletedSuccessfully)
+            {
+                var result = await exists.Reply.Task;
+                Assert.False(result,
+                    "GoalSessionExists must not return true for a traversal attempt.");
+            }
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+}
