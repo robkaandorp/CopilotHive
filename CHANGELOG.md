@@ -1,5 +1,24 @@
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-26
+
+### Added
+
+- **Clean Code principles in system prompts** — Goal reviewer, Brain, and Composer prompts now include targeted guidance: the reviewer checks complexity, function length, SRP, and symptom-patching; the Brain prefers simpler plans and questions design; the Composer splits large goals and prefers deleting over adding code.
+- **Actor architecture prototypes** — `Actor<TMessage>` base class using `System.Threading.Channels` as a single-reader mailbox, with `GoalActor`, `BrainActor`, and `GoalBrainActor` prototypes. Sequential message processing eliminates explicit synchronization (locks, CAS loops, `AsyncLocal`, tombstones) from actor-owned state — the mailbox serializes access. The base class uses one `_lifecycleLock` for Start/Dispose mutual exclusion only.
+- **BrainActor shadow** — When `use_brain_actors: true` in config, a shadow `BrainActor` runs alongside `DistributedBrain` with an isolated state directory (`actors/`). Lifecycle operations (fork, register-existing, delete, merge, model update, instructions) are mirrored via awaited best-effort `MirrorAsync` with bounded timeouts. Pipeline registration/deregistration, LLM execution, and note injection are mirrored fire-and-forget via non-blocking routing. Reset disposes the old actor, deletes shadow state files, and starts a fresh actor. Shadow failures are logged and never affect the authoritative path.
+- **Shadow execution logging** — Shadow LLM and note injection lifecycle events (fired, completed, canceled) logged at Information level; failures remain at Warning level.
+- **BrainActor startup log** — Shadow actor startup now logs a success message with the state directory path.
+- **Diagnostic logging** — `UpdateGoalAsync` now logs with call stack when goal status changes, revealing stale-state overwrites.
+
+### Fixed
+
+- **Stale goal object status** — `CreateProgressDocumentAsync` passed a stale `Goal` object (still Pending) to `UpdateGoalAsync`, overwriting InProgress back to Pending in the DB. Root cause: in-memory `goal` object not synced after `UpdateGoalStatusAsync`. Fix: sync `goal.Status` and `goal.StartedAt` after the DB update succeeds.
+
+### Changed
+
+- **Version bumped** from 0.17.0 to 0.18.0.
+
 ## [0.17.0] - 2026-07-25
 
 ### Added
