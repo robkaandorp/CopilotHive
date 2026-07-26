@@ -3361,6 +3361,432 @@ public sealed class DistributedBrainTests
         }
         finally { DeleteDir(dir); }
     }
+
+    // -- BrainActor mirror lifecycle tests --
+
+    private static void SetMirrorDelay(DistributedBrain brain, TimeSpan? delay) =>
+        typeof(DistributedBrain).GetField("_mirrorDelay", NonPublicInstance)!.SetValue(brain, delay);
+
+    private static DistributedBrain NewActorBrain(string dir, bool enabled, ILogger<DistributedBrain>? logger = null) =>
+        new("copilot/test-model", logger ?? NullLogger<DistributedBrain>.Instance,
+            stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(enabled));
+
+    private static string ActorGoalFile(string dir, string goalId) =>
+        Path.Combine(dir, "actors", $"brain-goal-{goalId}.json");
+
+    [Fact]
+    public async Task Mirror_FlagOff_ForkAndDelete_NoActorFilesCreated()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewActorBrain(dir, enabled: false);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("g1", TestContext.Current.CancellationToken);
+
+                Assert.Null(GetBrainActor(brain));
+                Assert.True(File.Exists(Path.Combine(dir, "brain-goal-g1.json")));
+                Assert.False(Directory.Exists(Path.Combine(dir, "actors")));
+
+                await brain.DeleteGoalSessionAsync("g1", TestContext.Current.CancellationToken);
+                Assert.False(File.Exists(Path.Combine(dir, "brain-goal-g1.json")));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task Mirror_FlagOff_UpdateModelAndInstructions_Succeed()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewActorBrain(dir, enabled: false);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.UpdateModelAsync("copilot/other-model", 1234, TestContext.Current.CancellationToken);
+                await brain.InjectOrchestratorInstructionsAsync("be nice", TestContext.Current.CancellationToken);
+
+                var stats = brain.GetStats();
+                Assert.NotNull(stats);
+                Assert.Equal("copilot/other-model", stats!.Model);
+                Assert.Null(GetBrainActor(brain));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task Mirror_ForkSession_CreatesActorSessionFile()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewActorBrain(dir, enabled: true);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("g1", TestContext.Current.CancellationToken);
+
+                Assert.True(File.Exists(ActorGoalFile(dir, "g1")), "Actor session file must exist after mirrored fork");
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task Mirror_ForkSession_IdempotentSecondCall_StillMirrors()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewActorBrain(dir, enabled: true);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                // First fork happens while the actor is detached, so no mirror reaches it.
+                var actor = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
+                typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!.SetValue(brain, null);
+                await brain.ForkSessionForGoalAsync("g1", TestContext.Current.CancellationToken);
+                Assert.False(File.Exists(ActorGoalFile(dir, "g1")));
+
+                // Reattach: the second (idempotent) call must still mirror.
+                typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!.SetValue(brain, actor);
+                await brain.ForkSessionForGoalAsync("g1", TestContext.Current.CancellationToken);
+
+                Assert.True(File.Exists(ActorGoalFile(dir, "g1")),
+                    "Idempotent fork must still mirror to the shadow actor");
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task Mirror_RegisterExistingSession_IdempotentSecondCall_StillMirrors()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewActorBrain(dir, enabled: true);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                var actor = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
+                typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!.SetValue(brain, null);
+                await brain.RegisterExistingGoalSessionAsync("g2", TestContext.Current.CancellationToken);
+                Assert.False(File.Exists(ActorGoalFile(dir, "g2")));
+
+                typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!.SetValue(brain, actor);
+                await brain.RegisterExistingGoalSessionAsync("g2", TestContext.Current.CancellationToken);
+
+                Assert.True(File.Exists(ActorGoalFile(dir, "g2")),
+                    "Idempotent register must still mirror to the shadow actor");
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task Mirror_DeleteSession_RemovesActorSessionFile()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewActorBrain(dir, enabled: true);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("g1", TestContext.Current.CancellationToken);
+                Assert.True(File.Exists(ActorGoalFile(dir, "g1")));
+
+                await brain.DeleteGoalSessionAsync("g1", TestContext.Current.CancellationToken);
+
+                Assert.False(File.Exists(ActorGoalFile(dir, "g1")),
+                    "Actor session file must be removed by the mirrored delete");
+                Assert.False(File.Exists(Path.Combine(dir, "brain-goal-g1.json")));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task Mirror_SummarizeAndMerge_UpdatesActorMasterAndDeletesActorGoalFile()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var stub = new IterationPlanStubClient("call-mirror-1", ["coding"], "mirror summary");
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: dir, chatClient: stub, hiveConfig: ActorConfig(true));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("g3", TestContext.Current.CancellationToken);
+                Assert.True(File.Exists(ActorGoalFile(dir, "g3")));
+
+                var pipeline = CreatePipeline("g3", "mirror merge goal");
+                var summary = await brain.SummarizeAndMergeAsync(pipeline, TestContext.Current.CancellationToken);
+                Assert.False(string.IsNullOrWhiteSpace(summary));
+
+                var actorMaster = Path.Combine(dir, "actors", "brain-master.json");
+                Assert.True(File.Exists(actorMaster), "actors/brain-master.json should exist after merge mirror");
+                var masterContent = await File.ReadAllTextAsync(actorMaster, TestContext.Current.CancellationToken);
+                Assert.Contains("[Goal completed: g3]", masterContent);
+                Assert.Contains(summary, masterContent);
+
+                Assert.False(File.Exists(ActorGoalFile(dir, "g3")),
+                    "Merge must be followed by the mirrored delete");
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task Mirror_UpdateModel_UpdatesActorStats()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewActorBrain(dir, enabled: true);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.UpdateModelAsync("copilot/mirrored-model", 4242, TestContext.Current.CancellationToken);
+
+                var actor = (CopilotHive.Actors.BrainActor)GetBrainActor(brain)!;
+                var msg = CopilotHive.Actors.BrainActorMessages.CreateGetStatsMessage();
+                Assert.True(actor.Tell(msg));
+                var stats = await msg.Reply.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+                Assert.NotNull(stats);
+                Assert.Equal("copilot/mirrored-model", stats!.Model);
+                Assert.Equal(4242, stats.MaxContextTokens);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task Mirror_InjectOrchestratorInstructions_SendsSystemPrompt_EvenWhenBlank()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewActorBrain(dir, enabled: true);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.InjectOrchestratorInstructionsAsync("custom orchestrator rules", TestContext.Current.CancellationToken);
+
+                var actor = (CopilotHive.Actors.BrainActor)GetBrainActor(brain)!;
+                var instructionsField = typeof(CopilotHive.Actors.BrainActor)
+                    .GetField("_orchestratorInstructions", NonPublicInstance)!;
+                Assert.Contains("custom orchestrator rules", (string)instructionsField.GetValue(actor)!);
+
+                // Blank input: existing logic is skipped but the mirror still runs with _systemPrompt.
+                instructionsField.SetValue(actor, "SENTINEL");
+                await brain.InjectOrchestratorInstructionsAsync("   ", TestContext.Current.CancellationToken);
+                var after = (string)instructionsField.GetValue(actor)!;
+                Assert.NotEqual("SENTINEL", after);
+                Assert.Contains("custom orchestrator rules", after);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task Mirror_PipelineRegisterAndDeregister_ReachActor()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewActorBrain(dir, enabled: true);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                var actor = (CopilotHive.Actors.BrainActor)GetBrainActor(brain)!;
+
+                var pipeline = CreatePipeline("g4", "pipeline mirror goal");
+                brain.RegisterActivePipeline(pipeline);
+
+                var get = CopilotHive.Actors.BrainActorMessages.CreateGetPipelineMessage("g4");
+                Assert.True(actor.Tell(get));
+                Assert.Same(pipeline, await get.Reply.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+
+                brain.DeregisterActivePipeline("g4");
+
+                var get2 = CopilotHive.Actors.BrainActorMessages.CreateGetPipelineMessage("g4");
+                Assert.True(actor.Tell(get2));
+                Assert.Null(await get2.Reply.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task Mirror_FireAndForget_ClosedMailbox_LogsWarning()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var logger = new TestLogger<DistributedBrain>();
+            var brain = NewActorBrain(dir, enabled: true, logger);
+
+            var actor = new CopilotHive.Actors.BrainActor("m", 1000, Path.Combine(dir, "actors"), logger);
+            actor.Start();
+            await actor.DisposeAsync();
+            typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!.SetValue(brain, actor);
+
+            brain.DeregisterActivePipeline("nope");
+
+            Assert.Contains(logger.LogEntries, e =>
+                e.LogLevel == LogLevel.Warning
+                && e.Message.Contains("Tell failed for DeregisterPipelineMessage", StringComparison.Ordinal));
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task Mirror_DelayExceedsTimeout_LogsWarning_AndOperationStillSucceeds()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var logger = new TestLogger<DistributedBrain>();
+            var brain = NewActorBrain(dir, enabled: true, logger);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                // 4s artificial delay vs. the 3s mirror timeout: the CTS cancels before Tell.
+                SetMirrorDelay(brain, TimeSpan.FromSeconds(4));
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                await brain.ForkSessionForGoalAsync("g5", TestContext.Current.CancellationToken);
+                sw.Stop();
+
+                // The 3s timeout must have elapsed (proves the CTS cancelled the 4s delay).
+                Assert.True(sw.Elapsed >= TimeSpan.FromSeconds(2.5),
+                    $"Elapsed {sw.Elapsed} should be >= 2.5s");
+                Assert.True(sw.Elapsed < TimeSpan.FromSeconds(4.0),
+                    $"Elapsed {sw.Elapsed} should be < 4.0s — proves 3s timeout cancelled the 4s delay before it completed");
+
+                // Authoritative state is unaffected.
+                Assert.True(File.Exists(Path.Combine(dir, "brain-goal-g5.json")));
+                // Mirror never reached the actor.
+                Assert.False(File.Exists(ActorGoalFile(dir, "g5")),
+                    "No actor session file should exist — Tell was never called due to timeout-before-Tell");
+                Assert.Contains(logger.LogEntries, e =>
+                    e.LogLevel == LogLevel.Warning
+                    && e.Message.Contains("BrainActor mirror: reply timed out or faulted", StringComparison.Ordinal));
+
+                SetMirrorDelay(brain, null);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task Mirror_ClosedMailbox_LogsWarning_AndDoesNotThrow()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var logger = new TestLogger<DistributedBrain>();
+            var brain = NewActorBrain(dir, enabled: true, logger);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                var actor = (CopilotHive.Actors.BrainActor)GetBrainActor(brain)!;
+                await actor.DisposeAsync();
+
+                await brain.ForkSessionForGoalAsync("g6", TestContext.Current.CancellationToken);
+
+                Assert.True(File.Exists(Path.Combine(dir, "brain-goal-g6.json")));
+                Assert.Contains(logger.LogEntries, e =>
+                    e.LogLevel == LogLevel.Warning
+                    && e.Message.Contains("BrainActor mirror: Tell failed (mailbox closed)", StringComparison.Ordinal));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_Connected_RecreatesShadowActorAndClearsActorState()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewActorBrain(dir, enabled: true);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("g7", TestContext.Current.CancellationToken);
+
+                var original = GetBrainActor(brain);
+                Assert.NotNull(original);
+                Assert.True(File.Exists(ActorGoalFile(dir, "g7")));
+
+                var originalActor = (CopilotHive.Actors.BrainActor)original!;
+
+                await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+                var recreated = GetBrainActor(brain);
+                Assert.NotNull(recreated);
+                Assert.NotSame(original, recreated);
+
+                // The old actor was disposed — its mailbox loop is completed.
+                Assert.True(originalActor.IsCompleted, "Old actor must be disposed during reset");
+
+                // All actor state files (including brain-master.json) were deleted during reset.
+                // The new actor creates an in-memory master session on connect but only persists
+                // it to disk on the next merge — so brain-master.json should not exist yet.
+                Assert.False(File.Exists(ActorGoalFile(dir, "g7")),
+                    "Actor goal session files must be deleted during reset");
+                Assert.False(File.Exists(Path.Combine(dir, "actors", "brain-master.json")),
+                    "brain-master.json must be deleted during reset (not yet recreated by new actor)");
+
+                // The recreated shadow is live and connected.
+                var stats = CopilotHive.Actors.BrainActorMessages.CreateGetStatsMessage();
+                Assert.True(((CopilotHive.Actors.BrainActor)recreated!).Tell(stats));
+                var reply = await stats.Reply.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+                Assert.NotNull(reply);
+                Assert.True(reply!.IsConnected);
+
+                // The recreated actor can fork a new goal session (proves it works end-to-end).
+                await brain.ForkSessionForGoalAsync("g8", TestContext.Current.CancellationToken);
+                Assert.True(File.Exists(ActorGoalFile(dir, "g8")),
+                    "Recreated actor must handle new fork operations");
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_NotConnected_DoesNotCreateShadowActor()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewActorBrain(dir, enabled: true);
+            await using (brain)
+            {
+                Assert.False(IsConnected(brain));
+
+                await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+                Assert.Null(GetBrainActor(brain));
+                Assert.False(Directory.Exists(Path.Combine(dir, "actors")));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
 }
 
 /// <summary>
