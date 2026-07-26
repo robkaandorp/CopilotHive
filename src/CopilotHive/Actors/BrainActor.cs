@@ -313,12 +313,12 @@ internal sealed class BrainActor : Actor<IBrainMessage>
             var options = new AgentOptions
             {
                 EnableBash = false,
-                EnableFileOps = false,
+                EnableFileOps = _workDirectory is not null,
                 EnableFileWrites = false,
                 EnableSkills = false,
                 AutoLoadWorkspaceInstructions = false,
                 MaxSteps = _maxSteps,
-                SystemPrompt = _systemPrompt,
+                SystemPrompt = !string.IsNullOrWhiteSpace(_orchestratorInstructions) ? _orchestratorInstructions : _systemPrompt,
                 MaxContextTokens = _maxContextTokens,
                 EnableAutoCompaction = true,
                 ReasoningEffort = _reasoningEffort,

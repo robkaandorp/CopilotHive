@@ -61,6 +61,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private volatile bool _disposing;
     private bool _resetting;
     private bool _connected;
+    private bool _skipSessionMigration;
 
     /// <summary>Shadow brain actor, created on connect when <c>UseBrainActors</c> is enabled.</summary>
     private BrainActor? _brainActor;
@@ -217,6 +218,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             var actorStateDir = Path.Combine(_stateDir, "actors");
             Directory.CreateDirectory(actorStateDir);
+
+            MigrateSessionFiles(actorStateDir);
+
             actor = _actorFactory?.Invoke(actorStateDir)
                 ?? new BrainActor(
                     _modelOverride, _maxContextTokens, actorStateDir, _logger,
@@ -227,7 +231,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     maxSteps: _maxSteps,
                     systemPrompt: _systemPrompt,
                     reasoningEffort: _reasoningEffort,
-                    workDirectory: _repoManager?.WorkDirectory ?? _stateDir,
+                    workDirectory: _repoManager?.WorkDirectory,
                     goalStore: _goalStore,
                     knowledgeGraph: _knowledgeGraph);
             actor.Start();
@@ -262,6 +266,49 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             return;
 
         try { await actor.DisposeAsync(); } catch { }
+    }
+
+    /// <summary>
+    /// Migrates legacy session files from the state directory into the actor state directory.
+    /// Files are only copied if they do not already exist in the actor directory.
+    /// </summary>
+    private void MigrateSessionFiles(string actorStateDir)
+    {
+        if (_resetting || _skipSessionMigration)
+            return;
+
+        var legacyMasterFile = Path.Combine(_stateDir, "brain-master.json");
+        var actorMasterFile = Path.Combine(actorStateDir, "brain-master.json");
+        if (File.Exists(legacyMasterFile) && !File.Exists(actorMasterFile))
+        {
+            try
+            {
+                File.Copy(legacyMasterFile, actorMasterFile);
+                _logger.LogInformation("Migrated legacy master session to actor directory");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to migrate legacy master session to actor directory");
+            }
+        }
+
+        foreach (var legacyGoalFile in Directory.GetFiles(_stateDir, "brain-goal-*.json"))
+        {
+            var fileName = Path.GetFileName(legacyGoalFile);
+            var actorGoalFile = Path.Combine(actorStateDir, fileName);
+            if (!File.Exists(actorGoalFile))
+            {
+                try
+                {
+                    File.Copy(legacyGoalFile, actorGoalFile);
+                    _logger.LogInformation("Migrated legacy goal session {File} to actor directory", fileName);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to migrate legacy goal session {File} to actor directory", fileName);
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -1350,7 +1397,15 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             return;
 
         DeleteActorStateFiles();
-        await StartShadowActorAsync(CancellationToken.None);
+        _skipSessionMigration = true;
+        try
+        {
+            await StartShadowActorAsync(CancellationToken.None);
+        }
+        finally
+        {
+            _skipSessionMigration = false;
+        }
     }
 
     /// <summary>Deletes persisted shadow-actor session files so a new shadow starts fresh.</summary>

@@ -706,7 +706,7 @@ public class DistributedBrainShadowTests
     }
 
     [Fact]
-    public async Task StartShadowActorAsync_NoRepoManager_WorkDirectoryIsStateDir()
+    public async Task StartShadowActorAsync_NoRepoManager_WorkDirectoryIsNull()
     {
         var dir = NewTempDir();
         try
@@ -725,9 +725,163 @@ public class DistributedBrainShadowTests
                 Assert.NotNull(actor);
 
                 var actorWorkDir = GetField<string?>(actor!, "_workDirectory");
-                // Without a repo manager, workDirectory should be _stateDir (the actors subdir is passed as stateDir).
-                // The BrainActor's stateDir is Path.Combine(_stateDir, "actors"), so workDirectory should be _stateDir.
-                Assert.Equal(dir, actorWorkDir);
+                // Without a repo manager, workDirectory should be null (not a fallback to _stateDir).
+                Assert.Null(actorWorkDir);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task StartShadowActorAsync_MigratesLegacyMasterSession_WhenActorMasterMissing()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var legacyMaster = AgentSession.Create("brain");
+            legacyMaster.MessageHistory.Add(new ChatMessage(ChatRole.User, "LEGACY_MASTER_MARKER"));
+            await legacyMaster.SaveAsync(Path.Combine(dir, "brain-master.json"), TestContext.Current.CancellationToken);
+
+            var brain = new DistributedBrain(
+                "copilot/test-model",
+                NullLogger<DistributedBrain>.Instance,
+                stateDir: dir,
+                chatClient: new TrackingChatClient(),
+                hiveConfig: ActorConfig(true));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                var actorMasterPath = Path.Combine(dir, "actors", "brain-master.json");
+                Assert.True(File.Exists(actorMasterPath), "Actor master session should be migrated.");
+
+                var actorMaster = await AgentSession.LoadAsync(actorMasterPath, TestContext.Current.CancellationToken);
+                Assert.Contains(actorMaster.MessageHistory,
+                    m => m.Text.Contains("LEGACY_MASTER_MARKER", StringComparison.Ordinal));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task StartShadowActorAsync_DoesNotOverwriteExistingActorMasterSession()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var legacyMaster = AgentSession.Create("brain");
+            legacyMaster.MessageHistory.Add(new ChatMessage(ChatRole.User, "LEGACY_MASTER_MARKER"));
+            await legacyMaster.SaveAsync(Path.Combine(dir, "brain-master.json"), TestContext.Current.CancellationToken);
+
+            Directory.CreateDirectory(Path.Combine(dir, "actors"));
+            var existingMaster = AgentSession.Create("brain");
+            existingMaster.MessageHistory.Add(new ChatMessage(ChatRole.User, "EXISTING_ACTOR_MASTER_MARKER"));
+            var actorMasterPath = Path.Combine(dir, "actors", "brain-master.json");
+            await existingMaster.SaveAsync(actorMasterPath, TestContext.Current.CancellationToken);
+
+            var brain = new DistributedBrain(
+                "copilot/test-model",
+                NullLogger<DistributedBrain>.Instance,
+                stateDir: dir,
+                chatClient: new TrackingChatClient(),
+                hiveConfig: ActorConfig(true));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                var actorMaster = await AgentSession.LoadAsync(actorMasterPath, TestContext.Current.CancellationToken);
+                Assert.DoesNotContain(actorMaster.MessageHistory,
+                    m => m.Text.Contains("LEGACY_MASTER_MARKER", StringComparison.Ordinal));
+                Assert.Contains(actorMaster.MessageHistory,
+                    m => m.Text.Contains("EXISTING_ACTOR_MASTER_MARKER", StringComparison.Ordinal));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task StartShadowActorAsync_MigratesLegacyGoalSessions_WhenActorGoalSessionsMissing()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            for (int i = 1; i <= 2; i++)
+            {
+                var goalId = $"goal-{i}";
+                var session = AgentSession.Create($"brain-goal-{goalId}");
+                session.MessageHistory.Add(new ChatMessage(ChatRole.User, $"LEGACY_GOAL_{i}_MARKER"));
+                await session.SaveAsync(Path.Combine(dir, $"brain-goal-{goalId}.json"), TestContext.Current.CancellationToken);
+            }
+
+            var brain = new DistributedBrain(
+                "copilot/test-model",
+                NullLogger<DistributedBrain>.Instance,
+                stateDir: dir,
+                chatClient: new TrackingChatClient(),
+                hiveConfig: ActorConfig(true));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                for (int i = 1; i <= 2; i++)
+                {
+                    var goalId = $"goal-{i}";
+                    var actorGoalPath = Path.Combine(dir, "actors", $"brain-goal-{goalId}.json");
+                    Assert.True(File.Exists(actorGoalPath), $"Actor goal session for {goalId} should be migrated.");
+
+                    var actorGoalSession = await AgentSession.LoadAsync(actorGoalPath, TestContext.Current.CancellationToken);
+                    Assert.Contains(actorGoalSession.MessageHistory,
+                        m => m.Text.Contains($"LEGACY_GOAL_{i}_MARKER", StringComparison.Ordinal));
+                }
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task StartShadowActorAsync_DoesNotOverwriteExistingActorGoalSessions()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            for (int i = 1; i <= 2; i++)
+            {
+                var goalId = $"goal-{i}";
+                var legacySession = AgentSession.Create($"brain-goal-{goalId}");
+                legacySession.MessageHistory.Add(new ChatMessage(ChatRole.User, $"LEGACY_GOAL_{i}_MARKER"));
+                await legacySession.SaveAsync(Path.Combine(dir, $"brain-goal-{goalId}.json"), TestContext.Current.CancellationToken);
+            }
+
+            Directory.CreateDirectory(Path.Combine(dir, "actors"));
+            for (int i = 1; i <= 2; i++)
+            {
+                var goalId = $"goal-{i}";
+                var existingSession = AgentSession.Create($"brain-goal-{goalId}");
+                existingSession.MessageHistory.Add(new ChatMessage(ChatRole.User, $"EXISTING_ACTOR_GOAL_{i}_MARKER"));
+                await existingSession.SaveAsync(Path.Combine(dir, "actors", $"brain-goal-{goalId}.json"), TestContext.Current.CancellationToken);
+            }
+
+            var brain = new DistributedBrain(
+                "copilot/test-model",
+                NullLogger<DistributedBrain>.Instance,
+                stateDir: dir,
+                chatClient: new TrackingChatClient(),
+                hiveConfig: ActorConfig(true));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                for (int i = 1; i <= 2; i++)
+                {
+                    var goalId = $"goal-{i}";
+                    var actorGoalPath = Path.Combine(dir, "actors", $"brain-goal-{goalId}.json");
+                    var actorGoalSession = await AgentSession.LoadAsync(actorGoalPath, TestContext.Current.CancellationToken);
+
+                    Assert.DoesNotContain(actorGoalSession.MessageHistory,
+                        m => m.Text.Contains($"LEGACY_GOAL_{i}_MARKER", StringComparison.Ordinal));
+                    Assert.Contains(actorGoalSession.MessageHistory,
+                        m => m.Text.Contains($"EXISTING_ACTOR_GOAL_{i}_MARKER", StringComparison.Ordinal));
+                }
             }
         }
         finally { DeleteDir(dir); }

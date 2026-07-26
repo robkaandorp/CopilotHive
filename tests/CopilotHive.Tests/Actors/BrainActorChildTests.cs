@@ -119,13 +119,15 @@ public class BrainActorChildTests
         string? compactionModel = null,
         string model = "copilot/test-model",
         ReasoningEffort? reasoningEffort = null,
-        string? workDirectory = null) =>
+        string? workDirectory = null,
+        string? systemPrompt = null) =>
         new(model, 100_000, stateDir, NullLogger.Instance,
             chatClientFactory: chatClientFactory,
             injectedChatClient: injectedChatClient,
             compactionModel: compactionModel,
             reasoningEffort: reasoningEffort,
-            workDirectory: workDirectory);
+            workDirectory: workDirectory,
+            systemPrompt: systemPrompt);
 
     private static async Task<bool> ConnectAsync(BrainActor actor)
     {
@@ -385,6 +387,104 @@ public class BrainActorChildTests
             Assert.False(options.EnableFileWrites, "EnableFileWrites must be false.");
             Assert.False(options.EnableSkills, "EnableSkills must be false.");
             Assert.False(options.AutoLoadWorkspaceInstructions, "AutoLoadWorkspaceInstructions must be false.");
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task ForkSession_WithWorkDirectory_ChildAgentOptions_EnableFileOpsTrue()
+    {
+        var dir = CreateTempDir();
+        var workDir = Path.Combine(dir, "work");
+        Directory.CreateDirectory(workDir);
+        try
+        {
+            var client = new FakeChatClient();
+            await using var actor = CreateActor(dir, FakeFactory(client), workDirectory: workDir);
+            actor.Start();
+            await ConnectAsync(actor);
+            await ForkAsync(actor, "goal-1");
+
+            var children = GetChildActors(actor);
+            var child = children["goal-1"];
+            var options = GetConfiguredOptions(child);
+
+            Assert.True(options.EnableFileOps, "EnableFileOps must be true when workDirectory is not null.");
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task ForkSession_WithNullWorkDirectory_ChildAgentOptions_EnableFileOpsFalse()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var client = new FakeChatClient();
+            await using var actor = CreateActor(dir, FakeFactory(client), workDirectory: null);
+            actor.Start();
+            await ConnectAsync(actor);
+            await ForkAsync(actor, "goal-1");
+
+            var children = GetChildActors(actor);
+            var child = children["goal-1"];
+            var options = GetConfiguredOptions(child);
+
+            Assert.False(options.EnableFileOps, "EnableFileOps must be false when workDirectory is null.");
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task ForkSession_InjectOrchestratorInstructions_ChildSystemPromptMatchesInstructions()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var client = new FakeChatClient();
+            await using var actor = CreateActor(dir, FakeFactory(client), systemPrompt: "DEFAULT_SYSTEM_PROMPT");
+            actor.Start();
+            await ConnectAsync(actor);
+
+            var instructions = "ORCHESTRATOR_INSTRUCTIONS_MARKER";
+            var inject = BrainActorMessages.CreateInjectOrchestratorInstructionsMessage(instructions);
+            Assert.True(actor.Tell(inject));
+            Assert.True(await AwaitReplyAsync(inject.Reply));
+
+            await ForkAsync(actor, "goal-1");
+
+            var children = GetChildActors(actor);
+            var child = children["goal-1"];
+            var options = GetConfiguredOptions(child);
+
+            Assert.Equal(instructions, options.SystemPrompt);
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task ForkSession_InjectOrchestratorInstructionsWhitespace_ChildSystemPromptFallsBackToDefault()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var defaultPrompt = "DEFAULT_SYSTEM_PROMPT";
+            var client = new FakeChatClient();
+            await using var actor = CreateActor(dir, FakeFactory(client), systemPrompt: defaultPrompt);
+            actor.Start();
+            await ConnectAsync(actor);
+
+            var inject = BrainActorMessages.CreateInjectOrchestratorInstructionsMessage("   ");
+            Assert.True(actor.Tell(inject));
+            Assert.True(await AwaitReplyAsync(inject.Reply));
+
+            await ForkAsync(actor, "goal-1");
+
+            var children = GetChildActors(actor);
+            var child = children["goal-1"];
+            var options = GetConfiguredOptions(child);
+
+            Assert.Equal(defaultPrompt, options.SystemPrompt);
         }
         finally { DeleteTempPath(dir); }
     }
