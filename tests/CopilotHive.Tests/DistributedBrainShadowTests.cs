@@ -310,14 +310,23 @@ public class DistributedBrainShadowTests
         catch (IOException) { }
     }
 
-    private static HiveConfigFile ActorConfig(bool enabled) =>
-        new() { Orchestrator = new OrchestratorConfig { UseBrainActors = enabled } };
+    private static HiveConfigFile ActorConfig() =>
+        new() { Orchestrator = new OrchestratorConfig() };
 
     private static object? GetBrainActor(DistributedBrain brain) =>
         typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!.GetValue(brain);
 
     private static void SetActorFactory(DistributedBrain brain, Func<string, BrainActor> factory) =>
         typeof(DistributedBrain).GetField("_actorFactory", NonPublicInstance)!.SetValue(brain, factory);
+
+    private static LlmSessionInfo? FindSession(LlmSessionRegistry registry, string sessionId) =>
+        registry.GetAll().FirstOrDefault(s => s.SessionId == sessionId);
+
+    private static bool IsResetting(DistributedBrain brain) =>
+        (bool)typeof(DistributedBrain).GetField("_resetting", NonPublicInstance)!.GetValue(brain)!;
+
+    private static void SetResetting(DistributedBrain brain, bool value) =>
+        typeof(DistributedBrain).GetField("_resetting", NonPublicInstance)!.SetValue(brain, value);
 
     private static bool IsConnected(DistributedBrain brain) =>
         (bool)typeof(DistributedBrain).GetField("_connected", NonPublicInstance)!.GetValue(brain)!;
@@ -332,10 +341,6 @@ public class DistributedBrainShadowTests
 
     private static Dictionary<string, string> GetActiveGoalSessions(BrainActor actor) =>
         GetField<Dictionary<string, string>>(actor, "_activeGoalSessions");
-
-    /// <summary>Sets the internal <c>_mirrorDelay</c> test seam that parks each MirrorAsync call.</summary>
-    private static void SetMirrorDelay(DistributedBrain brain, TimeSpan? delay) =>
-        typeof(DistributedBrain).GetField("_mirrorDelay", NonPublicInstance)!.SetValue(brain, delay);
 
     /// <summary>True when the session history contains a message with the given text.</summary>
     private static bool ContainsSummary(AgentSession session, string text)
@@ -365,10 +370,10 @@ public class DistributedBrainShadowTests
 
     /// <summary>Invokes the private ExecuteBrainAsync via reflection and returns its tuple result.</summary>
     private static async Task<(string Text, DistributedBrain.BrainToolCallResult? ToolCall)> InvokeExecuteBrainAsync(
-        DistributedBrain brain, string prompt, string goalId, CancellationToken ct, string status = "test")
+        DistributedBrain brain, string prompt, string goalId, CancellationToken ct)
     {
         var method = typeof(DistributedBrain).GetMethod("ExecuteBrainAsync", NonPublicInstance)!;
-        var task = (Task)method.Invoke(brain, [prompt, goalId, ct, status, "TestMethod"])!;
+        var task = (Task)method.Invoke(brain, [prompt, goalId, ct, "TestMethod"])!;
         await task;
         var result = task.GetType().GetProperty("Result")!.GetValue(task)!;
         return ((string, DistributedBrain.BrainToolCallResult?))result;
@@ -378,8 +383,8 @@ public class DistributedBrainShadowTests
         new(new Goal { Id = goalId, Description = description });
 
     /// <summary>
-    /// Creates a DistributedBrain with UseBrainActors=true, using a fake chat client and a fake
-    /// chatClientFactory injected via _actorFactory so the shadow actor's child creation uses fakes.
+    /// Creates a DistributedBrain with a fake chat client and a fake chatClientFactory injected
+    /// via _actorFactory so the BrainActor's child creation uses fakes.
     /// </summary>
     private static DistributedBrain NewShadowBrain(
         string dir,
@@ -391,7 +396,8 @@ public class DistributedBrainShadowTests
         int maxSteps = 50,
         string? systemPrompt = null,
         ReasoningEffort? reasoningEffort = null,
-        ILogger<DistributedBrain>? logger = null)
+        ILogger<DistributedBrain>? logger = null,
+        LlmSessionRegistry? sessionRegistry = null)
     {
         var client = chatClient ?? new TrackingChatClient();
         var brain = new DistributedBrain(
@@ -402,7 +408,8 @@ public class DistributedBrainShadowTests
             stateDir: dir,
             chatClient: client,
             compactionModel: compactionModel,
-            hiveConfig: hiveConfig ?? ActorConfig(true));
+            hiveConfig: hiveConfig ?? ActorConfig(),
+            sessionRegistry: sessionRegistry);
 
         // Inject a fake actor factory so the shadow BrainActor uses fake chat clients for children.
         var childFactory = factoryChatClientFactory ?? (_ => new TrackingChatClient());
@@ -411,7 +418,7 @@ public class DistributedBrainShadowTests
                 "copilot/test-model", 100_000, stateDir, NullLogger.Instance,
                 chatClientFactory: childFactory,
                 compactionModel: compactionModel,
-                hiveConfig: hiveConfig ?? ActorConfig(true),
+                hiveConfig: hiveConfig ?? ActorConfig(),
                 maxSteps: maxSteps,
                 systemPrompt: systemPrompt,
                 reasoningEffort: reasoningEffort,
@@ -536,7 +543,7 @@ public class DistributedBrainShadowTests
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
-                // Do NOT fork a session for this goal. With UseBrainActors=true the routing
+                // Do NOT fork a session for this goal. The actor-only routing
                 // method goes to the actor, which has no child for the goal and replies with
                 // KeyNotFoundException.
                 await Assert.ThrowsAsync<KeyNotFoundException>(() =>
@@ -598,37 +605,12 @@ public class DistributedBrainShadowTests
         finally { DeleteDir(dir); }
     }
 
-    [Fact]
-    public async Task InjectSystemNoteAsync_FlagOff_DoesNotFireShadow()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = new DistributedBrain(
-                "copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: dir, chatClient: new TrackingChatClient(), hiveConfig: ActorConfig(false));
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-                await brain.ForkSessionForGoalAsync("goal-off", TestContext.Current.CancellationToken);
-
-                var pipeline = CreatePipeline("goal-off");
-                await brain.InjectSystemNoteAsync(pipeline, "NOTE_NO_SHADOW", TestContext.Current.CancellationToken);
-
-                // No brain actor should exist.
-                Assert.Null(GetBrainActor(brain));
-                Assert.False(Directory.Exists(Path.Combine(dir, "actors")));
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
     // ════════════════════════════════════════════════════════════════════════
-    // Criterion 14: StartShadowActorAsync passes all deps
+    // Criterion 14: StartBrainActorAsync passes all deps
     // ════════════════════════════════════════════════════════════════════════
 
     [Fact]
-    public async Task StartShadowActorAsync_PassesAllDepsToBrainActor()
+    public async Task StartBrainActorAsync_PassesAllDepsToBrainActor()
     {
         var dir = NewTempDir();
         var repoDir = Path.Combine(dir, "repos");
@@ -637,7 +619,7 @@ public class DistributedBrainShadowTests
         {
             var injectedClient = new TrackingChatClient();
             Func<string, IChatClient> chatClientFactory = _ => new TrackingChatClient();
-            var hiveConfig = ActorConfig(true);
+            var hiveConfig = ActorConfig();
             var repoManager = new FakeRepoManager(repoDir);
             var goalStore = new InMemoryGoalStore();
             var knowledgeGraph = new CopilotHive.Knowledge.KnowledgeGraph();
@@ -711,7 +693,7 @@ public class DistributedBrainShadowTests
     }
 
     [Fact]
-    public async Task StartShadowActorAsync_NoRepoManager_WorkDirectoryIsNull()
+    public async Task StartBrainActorAsync_NoRepoManager_WorkDirectoryIsNull()
     {
         var dir = NewTempDir();
         try
@@ -721,7 +703,7 @@ public class DistributedBrainShadowTests
                 NullLogger<DistributedBrain>.Instance,
                 stateDir: dir,
                 chatClient: new TrackingChatClient(),
-                hiveConfig: ActorConfig(true));
+                hiveConfig: ActorConfig());
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
@@ -738,7 +720,7 @@ public class DistributedBrainShadowTests
     }
 
     [Fact]
-    public async Task StartShadowActorAsync_MigratesLegacyMasterSession_WhenActorMasterMissing()
+    public async Task StartBrainActorAsync_MigratesLegacyMasterSession_WhenActorMasterMissing()
     {
         var dir = NewTempDir();
         try
@@ -752,7 +734,7 @@ public class DistributedBrainShadowTests
                 NullLogger<DistributedBrain>.Instance,
                 stateDir: dir,
                 chatClient: new TrackingChatClient(),
-                hiveConfig: ActorConfig(true));
+                hiveConfig: ActorConfig());
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
@@ -770,7 +752,7 @@ public class DistributedBrainShadowTests
     }
 
     [Fact]
-    public async Task StartShadowActorAsync_DoesNotOverwriteExistingActorMasterSession()
+    public async Task StartBrainActorAsync_DoesNotOverwriteExistingActorMasterSession()
     {
         var dir = NewTempDir();
         try
@@ -790,7 +772,7 @@ public class DistributedBrainShadowTests
                 NullLogger<DistributedBrain>.Instance,
                 stateDir: dir,
                 chatClient: new TrackingChatClient(),
-                hiveConfig: ActorConfig(true));
+                hiveConfig: ActorConfig());
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
@@ -808,7 +790,7 @@ public class DistributedBrainShadowTests
     }
 
     [Fact]
-    public async Task StartShadowActorAsync_MigratesLegacyGoalSessions_WhenActorGoalSessionsMissing()
+    public async Task StartBrainActorAsync_MigratesLegacyGoalSessions_WhenActorGoalSessionsMissing()
     {
         var dir = NewTempDir();
         try
@@ -826,7 +808,7 @@ public class DistributedBrainShadowTests
                 NullLogger<DistributedBrain>.Instance,
                 stateDir: dir,
                 chatClient: new TrackingChatClient(),
-                hiveConfig: ActorConfig(true));
+                hiveConfig: ActorConfig());
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
@@ -849,7 +831,7 @@ public class DistributedBrainShadowTests
     }
 
     [Fact]
-    public async Task StartShadowActorAsync_DoesNotOverwriteExistingActorGoalSessions()
+    public async Task StartBrainActorAsync_DoesNotOverwriteExistingActorGoalSessions()
     {
         var dir = NewTempDir();
         try
@@ -876,7 +858,7 @@ public class DistributedBrainShadowTests
                 NullLogger<DistributedBrain>.Instance,
                 stateDir: dir,
                 chatClient: new TrackingChatClient(),
-                hiveConfig: ActorConfig(true));
+                hiveConfig: ActorConfig());
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
@@ -904,7 +886,7 @@ public class DistributedBrainShadowTests
     // ════════════════════════════════════════════════════════════════════════
 
     [Fact]
-    public async Task StartShadowActorAsync_Migration_CreatesMigratedMarker()
+    public async Task StartBrainActorAsync_Migration_CreatesMigratedMarker()
     {
         var dir = NewTempDir();
         try
@@ -922,7 +904,7 @@ public class DistributedBrainShadowTests
                 NullLogger<DistributedBrain>.Instance,
                 stateDir: dir,
                 chatClient: new TrackingChatClient(),
-                hiveConfig: ActorConfig(true));
+                hiveConfig: ActorConfig());
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
@@ -938,7 +920,7 @@ public class DistributedBrainShadowTests
     }
 
     [Fact]
-    public async Task StartShadowActorAsync_Migration_DoesNotReRunWhenMarkerExists()
+    public async Task StartBrainActorAsync_Migration_DoesNotReRunWhenMarkerExists()
     {
         var dir = NewTempDir();
         try
@@ -952,7 +934,7 @@ public class DistributedBrainShadowTests
                 NullLogger<DistributedBrain>.Instance,
                 stateDir: dir,
                 chatClient: new TrackingChatClient(),
-                hiveConfig: ActorConfig(true));
+                hiveConfig: ActorConfig());
             await using (brain1)
             {
                 await brain1.ConnectAsync(TestContext.Current.CancellationToken);
@@ -969,7 +951,7 @@ public class DistributedBrainShadowTests
                 NullLogger<DistributedBrain>.Instance,
                 stateDir: dir,
                 chatClient: new TrackingChatClient(),
-                hiveConfig: ActorConfig(true));
+                hiveConfig: ActorConfig());
             brain2._fileCopier = (src, dst) =>
             {
                 copyInvoked = true;
@@ -994,7 +976,7 @@ public class DistributedBrainShadowTests
     }
 
     [Fact]
-    public async Task StartShadowActorAsync_Migration_FailedCopy_CreatesMarker_RetainsSource()
+    public async Task StartBrainActorAsync_Migration_FailedCopy_CreatesMarker_RetainsSource()
     {
         var dir = NewTempDir();
         try
@@ -1009,7 +991,7 @@ public class DistributedBrainShadowTests
                 NullLogger<DistributedBrain>.Instance,
                 stateDir: dir,
                 chatClient: new TrackingChatClient(),
-                hiveConfig: ActorConfig(true));
+                hiveConfig: ActorConfig());
             brain._fileCopier = (src, dst) => false;
 
             await using (brain)
@@ -1030,7 +1012,7 @@ public class DistributedBrainShadowTests
     }
 
     [Fact]
-    public async Task StartShadowActorAsync_Migration_Conflict_KeepsActorAndLegacy()
+    public async Task StartBrainActorAsync_Migration_Conflict_KeepsActorAndLegacy()
     {
         var dir = NewTempDir();
         try
@@ -1050,7 +1032,7 @@ public class DistributedBrainShadowTests
                 NullLogger<DistributedBrain>.Instance,
                 stateDir: dir,
                 chatClient: new TrackingChatClient(),
-                hiveConfig: ActorConfig(true));
+                hiveConfig: ActorConfig());
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
@@ -1086,7 +1068,11 @@ public class DistributedBrainShadowTests
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
                 await brain.ForkSessionForGoalAsync("reset-goal", TestContext.Current.CancellationToken);
-                await brain.SaveSessionAsync(TestContext.Current.CancellationToken);
+
+                // Simulate leftover legacy state-dir session files from a pre-actor run: reset must
+                // clear those too, not just the actor's own files.
+                File.WriteAllText(Path.Combine(dir, "brain-master.json"), "{}");
+                File.WriteAllText(Path.Combine(dir, "brain-goal-reset-goal.json"), "{}");
 
                 Assert.True(File.Exists(Path.Combine(dir, "brain-master.json")));
                 Assert.True(File.Exists(Path.Combine(dir, "brain-goal-reset-goal.json")));
@@ -1151,7 +1137,9 @@ public class DistributedBrainShadowTests
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
                 await brain.ForkSessionForGoalAsync("state-fail", TestContext.Current.CancellationToken);
-                await brain.SaveSessionAsync(TestContext.Current.CancellationToken);
+
+                // Leftover legacy state-dir master file whose deletion will be made to fail.
+                File.WriteAllText(Path.Combine(dir, "brain-master.json"), "{}");
 
                 brain._fileDeleter = path =>
                 {
@@ -1220,16 +1208,122 @@ public class DistributedBrainShadowTests
                 await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
 
                 Assert.True(markerDeleted, "Reset must delete the .migrated marker via _fileDeleter.");
-                // The new actor's startup migration recreates the marker.
-                Assert.True(File.Exists(markerPath),
-                    "Marker should be recreated by the new actor's startup migration.");
+                // MigrateSessionFiles is suppressed while _resetting is set, so the restarting actor
+                // must NOT re-import the legacy session files the reset just deleted — and therefore
+                // must not recreate the marker either.
+                Assert.False(File.Exists(markerPath),
+                    "Marker must not be recreated: migration is suppressed during a reset.");
             }
         }
         finally { DeleteDir(dir); }
     }
 
     [Fact]
-    public async Task ResetSessionAsync_RestartFailure_ThrowsAndLeavesDegraded()
+    public async Task ResetSessionAsync_RestartFailure_RollsbackAndRecovers()
+    {
+        var dir = NewTempDir();
+        var registry = new LlmSessionRegistry();
+        try
+        {
+            var brain = NewShadowBrain(dir, sessionRegistry: registry);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                Assert.NotNull(FindSession(registry, "brain-master"));
+
+                SetActorFactory(brain, _ => throw new InvalidOperationException("restart factory boom"));
+
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
+                Assert.Contains("restart factory boom", ex.Message, StringComparison.Ordinal);
+
+                // The actor is the only execution path, so a failed restart must leave the brain
+                // fully rolled back: disconnected, unregistered, and no longer flagged as resetting.
+                Assert.False(IsConnected(brain), "Brain must not report itself connected without an actor.");
+                Assert.Null(GetBrainActor(brain));
+                Assert.Null(FindSession(registry, "brain-master"));
+                Assert.False(IsResetting(brain), "_resetting must be cleared in the finally block.");
+
+                // Recovery: a working factory plus ConnectAsync restores a usable brain.
+                SetActorFactory(brain, stateDir =>
+                    new BrainActor("copilot/test-model", 100_000, stateDir, NullLogger.Instance,
+                        chatClientFactory: _ => new TrackingChatClient(),
+                        workDirectory: dir));
+
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                Assert.True(IsConnected(brain));
+                Assert.NotNull(GetBrainActor(brain));
+                Assert.NotNull(FindSession(registry, "brain-master"));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Criteria 22/23/26: concurrency contracts around reset and dispose
+    // ════════════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public async Task ForkSessionForGoalAsync_DuringActiveReset_Throws()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir);
+
+            // The first factory call satisfies ConnectAsync; the second (the reset's restart) blocks
+            // until the test releases it, so the reset genuinely stays in-flight while we fork.
+            var restartEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseRestart = new ManualResetEventSlim(false);
+            var firstCall = true;
+            SetActorFactory(brain, stateDir =>
+            {
+                if (firstCall)
+                {
+                    firstCall = false;
+                    return new BrainActor("copilot/test-model", 100_000, stateDir, NullLogger.Instance,
+                        chatClientFactory: _ => new TrackingChatClient(),
+                        workDirectory: dir);
+                }
+
+                restartEntered.TrySetResult(true);
+                releaseRestart.Wait(TimeSpan.FromSeconds(30));
+                throw new InvalidOperationException("restart fails");
+            });
+
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                // Reset runs on a background thread. It flips _resetting, detaches the old actor and
+                // then parks inside the restart factory while still holding _sessionLock.
+                var resetTask = Task.Run(
+                    () => brain.ResetSessionAsync(TestContext.Current.CancellationToken),
+                    TestContext.Current.CancellationToken);
+                await restartEntered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+                // A fork issued while that reset is genuinely in flight must fail fast. This only
+                // passes because ForkSessionForGoalAsync checks _resetting BEFORE touching the
+                // actor — a lock-first implementation would deadlock behind the reset instead.
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => brain.ForkSessionForGoalAsync("g1", TestContext.Current.CancellationToken)
+                        .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+                Assert.Contains("reset", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+                releaseRestart.Set();
+                await Assert.ThrowsAsync<InvalidOperationException>(() => resetTask);
+
+                // The failed reset rolled the brain back rather than leaving it half-reset.
+                Assert.False(IsResetting(brain), "_resetting must be cleared once the reset unwinds.");
+                Assert.False(IsConnected(brain));
+                Assert.Null(GetBrainActor(brain));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task GetStats_WhenActorDetached_ReturnsNull()
     {
         var dir = NewTempDir();
         try
@@ -1238,16 +1332,102 @@ public class DistributedBrainShadowTests
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                Assert.NotNull(brain.GetStats());
 
-                SetActorFactory(brain, _ => throw new InvalidOperationException("actor factory failure"));
+                // A reset detaches the actor. GetStats must report null because the actor is gone,
+                // NOT because it inspects the _resetting flag (which it deliberately never reads).
+                var actor = (BrainActor?)GetBrainActor(brain);
+                typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!.SetValue(brain, null);
+                if (actor is not null)
+                    await actor.DisposeAsync();
 
-                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-                    () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
-                Assert.Contains("actor factory failure", ex.Message);
+                Assert.Null(brain.GetStats());
 
-                Assert.True(IsConnected(brain), "Brain should remain connected in degraded state.");
-                Assert.Null(GetBrainActor(brain));
+                // Proof that _resetting plays no part: with the actor detached the answer is null
+                // regardless of the flag's value.
+                SetResetting(brain, true);
+                try { Assert.Null(brain.GetStats()); }
+                finally { SetResetting(brain, false); }
             }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task DisposeAsync_DisposesInjectedChatClientAfterActor()
+    {
+        var dir = NewTempDir();
+        var injectedClient = new TrackingChatClient();
+        try
+        {
+            var brain = NewShadowBrain(dir, chatClient: injectedClient);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                var actor = (BrainActor?)GetBrainActor(brain);
+                Assert.NotNull(actor);
+                Assert.True(actor!.IsStarted);
+
+                // While the actor is alive the borrowed client must remain usable: child actors
+                // receive it with ownsClient=false, so an early dispose would break them.
+                Assert.False(injectedClient.WasDisposed);
+            }
+
+            // Disposal order matters — the actor (and every child that borrows the client) is torn
+            // down first, and only then is the injected client released, exactly once.
+            Assert.True(injectedClient.WasDisposed,
+                "Injected chat client must be disposed after brain disposal.");
+            Assert.Equal(1, injectedClient.DisposeCallCount);
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task ConnectAsync_ConcurrentDispose_RacesAndThrowsObjectDisposed()
+    {
+        var dir = NewTempDir();
+        var registry = new LlmSessionRegistry();
+        try
+        {
+            var brain = NewShadowBrain(dir, sessionRegistry: registry);
+
+            // The factory stalls inside StartBrainActorAsync while ConnectAsync holds _sessionLock,
+            // opening a real window for a concurrent DisposeAsync — no reflection required.
+            var factoryEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseFactory = new ManualResetEventSlim(false);
+            SetActorFactory(brain, stateDir =>
+            {
+                factoryEntered.TrySetResult(true);
+                releaseFactory.Wait(TimeSpan.FromSeconds(30));
+                return new BrainActor("copilot/test-model", 100_000, stateDir, NullLogger.Instance,
+                    chatClientFactory: _ => new TrackingChatClient(),
+                    workDirectory: dir);
+            });
+
+            // Started on a background thread: the factory blocks its caller synchronously, and
+            // ConnectAsync runs inline up to that point, so calling it directly would stall the test.
+            var connectTask = Task.Run(
+                () => brain.ConnectAsync(TestContext.Current.CancellationToken),
+                TestContext.Current.CancellationToken);
+            await factoryEntered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            // A genuine DisposeAsync: it sets _disposing under _lifecycleLock and then blocks on
+            // _sessionLock, which ConnectAsync still holds.
+            var disposeTask = brain.DisposeAsync().AsTask();
+            await Task.Delay(100, TestContext.Current.CancellationToken);
+            Assert.False(disposeTask.IsCompleted, "Dispose must be parked on _sessionLock held by Connect.");
+
+            releaseFactory.Set();
+
+            // ConnectAsync's second _disposing check now observes the concurrent dispose and rolls
+            // back the actor it just published rather than handing back a doomed brain.
+            await Assert.ThrowsAsync<ObjectDisposedException>(async () => await connectTask);
+            Assert.False(IsConnected(brain));
+            Assert.Null(GetBrainActor(brain));
+            Assert.Null(FindSession(registry, "brain-master"));
+
+            await disposeTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         }
         finally { DeleteDir(dir); }
     }
@@ -1267,7 +1447,7 @@ public class DistributedBrainShadowTests
                 NullLogger<DistributedBrain>.Instance,
                 stateDir: dir,
                 chatClient: new TrackingChatClient(),
-                hiveConfig: ActorConfig(true));
+                hiveConfig: ActorConfig());
 
             Assert.False(Directory.Exists(Path.Combine(dir, "actors")));
 
@@ -1284,100 +1464,9 @@ public class DistributedBrainShadowTests
     // Criterion 15: DisposeAsyncCore — actor disposed BEFORE injected client
     // ════════════════════════════════════════════════════════════════════════
 
-    [Fact]
-    public async Task DisposeAsyncCore_ActorDisposedBeforeInjectedClient()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var innerClient = new TrackingChatClient();
-            var injectedClient = new OrderingChatClient(innerClient);
-
-            // Track whether the actor is alive when the client is disposed.
-            BrainActor? capturedActor = null;
-            injectedClient.OnDispose = () =>
-            {
-                // When the injected client's Dispose is called, check if the actor is still alive.
-                // If the actor was disposed first, its IsCompleted should be true.
-                if (capturedActor is { } a)
-                    Assert.True(a.IsCompleted,
-                        "BrainActor must be disposed BEFORE the injected chat client.");
-            };
-
-            var brain = new DistributedBrain(
-                "copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: dir, chatClient: injectedClient, hiveConfig: ActorConfig(true));
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-                capturedActor = (BrainActor?)GetBrainActor(brain);
-                Assert.NotNull(capturedActor);
-            }
-
-            // After `await using` disposes the brain, the injected client should have been disposed.
-            Assert.True(innerClient.WasDisposed, "Injected client should be disposed.");
-        }
-        finally { DeleteDir(dir); }
-    }
-
     // ════════════════════════════════════════════════════════════════════════
-    // Criterion 16: UseBrainActors=false — no mirroring
+    // Criterion 20: Fork failure — compaction client creation fails
     // ════════════════════════════════════════════════════════════════════════
-
-    [Fact]
-    public async Task UseBrainActorsFalse_NoActorCreated_NoActorsDirectory()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var stub = new PlanStubClient("call-off", ["coding"], "flag off test");
-            var brain = new DistributedBrain(
-                "copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: dir, chatClient: stub, hiveConfig: ActorConfig(false));
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-                await brain.ForkSessionForGoalAsync("goal-off", TestContext.Current.CancellationToken);
-
-                // Execute a prompt — should work without any shadow.
-                var pipeline = CreatePipeline("goal-off", "flag off goal");
-                var result = await brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
-                Assert.NotNull(result);
-
-                // No brain actor should exist.
-                Assert.Null(GetBrainActor(brain));
-
-                // No actors/ directory should be created.
-                Assert.False(Directory.Exists(Path.Combine(dir, "actors")),
-                    "actors/ directory should not be created when UseBrainActors=false.");
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task UseBrainActorsFalse_InjectSystemNote_NoShadow()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = new DistributedBrain(
-                "copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: dir, chatClient: new TrackingChatClient(), hiveConfig: ActorConfig(false));
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-                await brain.ForkSessionForGoalAsync("goal-off2", TestContext.Current.CancellationToken);
-
-                var pipeline = CreatePipeline("goal-off2");
-                await brain.InjectSystemNoteAsync(pipeline, "NOTE_NO_SHADOW", TestContext.Current.CancellationToken);
-
-                Assert.Null(GetBrainActor(brain));
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
 
     // ════════════════════════════════════════════════════════════════════════
     // Criterion 20: Fork failure — compaction client creation fails
@@ -1405,7 +1494,7 @@ public class DistributedBrainShadowTests
                     "copilot/test-model", NullLogger<DistributedBrain>.Instance,
                     stateDir: dir, chatClient: new TrackingChatClient(),
                     compactionModel: null,  // No compaction on the authoritative path
-                    hiveConfig: ActorConfig(true));
+                    hiveConfig: ActorConfig());
 
                 SetActorFactory(brain, stateDir =>
                     new BrainActor(
@@ -1417,27 +1506,24 @@ public class DistributedBrainShadowTests
                 {
                     await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
-                    // ForkSessionForGoalAsync should succeed on the authoritative path.
-                    // The shadow actor's ForkSessionAsync should fail (compaction client creation throws),
-                    // but the failure is logged as a warning and does NOT propagate.
-                    await brain.ForkSessionForGoalAsync("goal-fail", TestContext.Current.CancellationToken);
+                    // The actor is authoritative, so its fork failure (compaction client creation
+                    // throws) now propagates out of ForkSessionForGoalAsync.
+                    await Assert.ThrowsAsync<InvalidOperationException>(
+                        () => brain.ForkSessionForGoalAsync("goal-fail", TestContext.Current.CancellationToken));
 
-                    // Give the mirror a moment to process.
-                    await Task.Delay(500, TestContext.Current.CancellationToken);
-
-                    // Verify the shadow actor's state — no child should be registered.
+                    // Verify the actor's state — no child should be registered.
                     var actor = (BrainActor?)GetBrainActor(brain);
                     Assert.NotNull(actor);
                     var children = GetChildActors(actor!);
                     Assert.False(children.ContainsKey("goal-fail"),
-                        "Shadow actor should not have a child for goal-fail (compaction creation failed).");
+                        "Actor should not have a child for goal-fail (compaction creation failed).");
                     var sessions = GetActiveGoalSessions(actor!);
                     Assert.False(sessions.ContainsKey("goal-fail"),
-                        "Shadow actor should not have a session entry for goal-fail.");
+                        "Actor should not have a session entry for goal-fail.");
 
                     // The raw chat client should have been disposed (parent owned it, pre-constructor failure).
                     Assert.True(shadowClient.WasDisposed,
-                        "Raw chat client should be disposed after pre-constructor failure in shadow fork.");
+                        "Raw chat client should be disposed after pre-constructor failure in the fork.");
                 }
             }
             finally
@@ -1464,9 +1550,9 @@ public class DistributedBrainShadowTests
             var brain = new DistributedBrain(
                 "copilot/test-model", NullLogger<DistributedBrain>.Instance,
                 stateDir: dir, chatClient: new TrackingChatClient(),
-                hiveConfig: ActorConfig(true));
+                hiveConfig: ActorConfig());
 
-            // The shadow actor gets a VALID state directory so ConnectAsync succeeds and
+            // The actor gets a VALID state directory so ConnectAsync succeeds and
             // _brainActor is set. The fork failure is induced afterwards.
             string? actorStateDir = null;
             SetActorFactory(brain, stateDir =>
@@ -1492,19 +1578,16 @@ public class DistributedBrainShadowTests
                 var blockedGoalSessionPath = Path.Combine(actorStateDir!, "brain-goal-goal-postfail.json");
                 Directory.CreateDirectory(blockedGoalSessionPath);
 
-                // The authoritative path succeeds; the shadow fork faults and MirrorAsync
-                // swallows and logs the failure, so this call must not throw.
-                await brain.ForkSessionForGoalAsync("goal-postfail", TestContext.Current.CancellationToken);
-
-                // Let the actor mailbox settle after the faulted fork.
-                await Task.Delay(200, TestContext.Current.CancellationToken);
+                // The actor is authoritative, so the faulted fork now propagates to the caller.
+                await Assert.ThrowsAnyAsync<Exception>(
+                    () => brain.ForkSessionForGoalAsync("goal-postfail", TestContext.Current.CancellationToken));
 
                 // ForkSessionAsync assigns both dictionaries only AFTER the save succeeds, so a
                 // failing save must leave no child and no session entry behind.
                 Assert.False(GetChildActors(actor!).ContainsKey("goal-postfail"),
-                    "Shadow actor must not track a child for goal-postfail when the session save fails.");
+                    "Actor must not track a child for goal-postfail when the session save fails.");
                 Assert.False(GetActiveGoalSessions(actor!).ContainsKey("goal-postfail"),
-                    "Shadow actor must not track a session entry for goal-postfail when the session save fails.");
+                    "Actor must not track a session entry for goal-postfail when the session save fails.");
             }
         }
         finally
@@ -1547,7 +1630,7 @@ public class DistributedBrainShadowTests
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // Additional: Verify that ForkSessionForGoalAsync with UseBrainActors=true
+    // Additional: Verify that ForkSessionForGoalAsync
     // creates the child actor in the shadow (integration test for criterion 19)
     // ════════════════════════════════════════════════════════════════════════
 
@@ -1625,7 +1708,7 @@ public class DistributedBrainShadowTests
 
     // Criterion 14: flag on — ExecuteBrainAsync routes to the actor and returns the tool call.
     [Fact]
-    public async Task ExecuteBrainAsync_FlagOn_RoutesToActor_ReturnsResultWithToolCall()
+    public async Task ExecuteBrainAsync_RoutesToActor_ReturnsResultWithToolCall()
     {
         var dir = NewTempDir();
         try
@@ -1653,7 +1736,7 @@ public class DistributedBrainShadowTests
 
     // Criterion 15: flag on but actor is null — falls back to the context path.
     [Fact]
-    public async Task ExecuteBrainAsync_FlagOn_ActorNull_FallsBackToContextPath()
+    public async Task ExecuteBrainAsync_ActorNull_Throws()
     {
         var dir = NewTempDir();
         try
@@ -1664,30 +1747,27 @@ public class DistributedBrainShadowTests
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-15", TestContext.Current.CancellationToken);
 
-                // Drop the actor so routing must fall back to the context path.
+                // Drop the actor. There is no context fallback any more, so every subsequent
+                // Brain operation must fail loudly rather than silently using a local path.
                 var actorField = typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!;
                 var actor = (BrainActor?)actorField.GetValue(brain);
                 actorField.SetValue(brain, null);
                 if (actor is not null)
                     await actor.DisposeAsync();
 
-                await brain.ForkSessionForGoalAsync("goal-15", TestContext.Current.CancellationToken);
-
-                var result = await brain.PlanIterationAsync(
-                    CreatePipeline("goal-15"), null, TestContext.Current.CancellationToken);
-
-                Assert.NotNull(result);
-                Assert.False(result.IsEscalation);
-                Assert.Equal("context plan", result.Plan!.Reason);
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                    InvokeExecuteBrainAsync(brain, "prompt", "goal-15", CancellationToken.None));
+                Assert.Contains("BrainActor not available", ex.Message, StringComparison.Ordinal);
             }
         }
         finally { DeleteDir(dir); }
     }
 
-    // Criterion 16: flag on — Tell returns false (mailbox closed) → InvalidOperationException.
+    // Criterion 16: Tell returns false (mailbox closed) → InvalidOperationException.
     [Fact]
-    public async Task ExecuteBrainAsync_FlagOn_TellFalse_Throws()
+    public async Task ExecuteBrainAsync_TellFalse_Throws()
     {
         var dir = NewTempDir();
         try
@@ -1713,7 +1793,7 @@ public class DistributedBrainShadowTests
 
     // Criterion 17: flag on — no child actor for the goal → KeyNotFoundException.
     [Fact]
-    public async Task ExecuteBrainAsync_FlagOn_ChildNotFound_Throws()
+    public async Task ExecuteBrainAsync_ChildNotFound_Throws()
     {
         var dir = NewTempDir();
         try
@@ -1734,7 +1814,7 @@ public class DistributedBrainShadowTests
 
     // Criterion 18: flag on — empty text is a successful completion, not an error.
     [Fact]
-    public async Task ExecuteBrainAsync_FlagOn_EmptyText_SuccessfulCompletion()
+    public async Task ExecuteBrainAsync_EmptyText_SuccessfulCompletion()
     {
         var dir = NewTempDir();
         try
@@ -1757,7 +1837,7 @@ public class DistributedBrainShadowTests
 
     // Criterion 19: flag on — EscalateToolResult is mapped to DistributedBrain.EscalateResult.
     [Fact]
-    public async Task ExecuteBrainAsync_FlagOn_EscalateToolResult_MappedToEscalateResult()
+    public async Task ExecuteBrainAsync_EscalateToolResult_MappedToEscalateResult()
     {
         var dir = NewTempDir();
         try
@@ -1782,7 +1862,7 @@ public class DistributedBrainShadowTests
 
     // Criterion 20: flag on — PlanToolResult is mapped to DistributedBrain.IterationPlanResult.
     [Fact]
-    public async Task ExecuteBrainAsync_FlagOn_PlanToolResult_MappedToIterationPlanResult()
+    public async Task ExecuteBrainAsync_PlanToolResult_MappedToIterationPlanResult()
     {
         var dir = NewTempDir();
         try
@@ -1809,7 +1889,7 @@ public class DistributedBrainShadowTests
 
     // Criterion 21: flag on — an invalid plan from the actor makes PlanIterationAsync fall back to default.
     [Fact]
-    public async Task ExecuteBrainAsync_FlagOn_InvalidPlan_PlanIterationReturnsDefault()
+    public async Task ExecuteBrainAsync_InvalidPlan_PlanIterationReturnsDefault()
     {
         var dir = NewTempDir();
         try
@@ -1832,15 +1912,15 @@ public class DistributedBrainShadowTests
         finally { DeleteDir(dir); }
     }
 
-    // Criterion 22: flag on — SummarizeAndMergeAsync routes the summary LLM call via the actor.
+    // Criterion 22: SummarizeAndMergeAsync routes the summary LLM call via the actor.
     [Fact]
-    public async Task SummarizeAndMergeAsync_FlagOn_RoutesSummaryViaActor()
+    public async Task SummarizeAndMergeAsync_RoutesSummaryViaActor()
     {
         var dir = NewTempDir();
         try
         {
             var brain = NewShadowBrain(dir,
-                chatClient: new ThrowingChatClient(),  // context path would produce no text
+                chatClient: new ThrowingChatClient(),  // must never be used — the actor owns execution
                 factoryChatClientFactory: _ => new TextStubClient("Summary from actor"));
             await using (brain)
             {
@@ -1852,19 +1932,21 @@ public class DistributedBrainShadowTests
 
                 Assert.Equal("Summary from actor", summary);
 
-                var master = GetField<AgentSession>(brain, "_masterSession");
+                // The summary is merged into the actor's master session, not any local state.
+                var actor = (BrainActor)GetBrainActor(brain)!;
+                var master = GetField<AgentSession>(actor, "_masterSession");
                 Assert.Contains(master.MessageHistory, m => m.Text.Contains("Summary from actor", StringComparison.Ordinal));
 
-                var contexts = GetField<System.Collections.IDictionary>(brain, "_goalContexts");
-                Assert.False(contexts.Contains("goal-22"), "Goal context should be deleted after summarize+merge.");
+                Assert.False(SafeContainsChild(GetChildActors(actor), "goal-22"),
+                    "Goal child actor should be deleted after summarize+merge.");
             }
         }
         finally { DeleteDir(dir); }
     }
 
-    // Criterion 23: flag on — empty/whitespace summary text falls back to the canned summary.
+    // Criterion 23: empty/whitespace summary text falls back to the canned summary.
     [Fact]
-    public async Task SummarizeAndMergeAsync_FlagOn_EmptySummary_UsesFallback()
+    public async Task SummarizeAndMergeAsync_EmptySummary_UsesFallback()
     {
         var dir = NewTempDir();
         try
@@ -1884,134 +1966,9 @@ public class DistributedBrainShadowTests
         finally { DeleteDir(dir); }
     }
 
-    // Criterion 24: flag on — ordering: local merge → actor merge mirror → local delete → actor delete mirror.
-    //
-    // Removal-proof design. `_mirrorDelay` parks the START of every MirrorAsync call, BEFORE the
-    // message reaches the actor, so each mirror costs a known `MirrorGate` (1.5s) while the two
-    // local steps are effectively instantaneous. A background poller timestamps the first moment
-    // each of the four effects becomes observable:
-    //   local-merge  → the brain's own master session gains the summary
-    //   actor-merge  → the ACTOR's master session gains the summary
-    //   local-delete → the goal leaves _goalContexts
-    //   actor-delete → the child actor leaves the actor's _childActors
-    //
-    // The correct production sequence therefore produces this timing fingerprint:
-    //   t≈0.0  local-merge   (no gate yet)
-    //   t≈1.5  actor-merge   (after the merge mirror's gate)
-    //   t≈1.5  local-delete  (immediately after, no gate)
-    //   t≈3.0  actor-delete  (after the delete mirror's gate)
-    //
-    // Asserting BOTH the sequence and the gate positions makes every reordering detectable:
-    //   • local-delete before local-merge / before the merge mirror → sequence assertions fail
-    //   • actor-delete before actor-merge                          → sequence assertions fail
-    //   • local-delete moved AFTER the delete mirror (swapping steps 5 and 6) → the sequence still
-    //     looks right (both land at t≈3.0) but local-delete now sits on the FAR side of the second
-    //     gate, so the "local-delete follows actor-merge without a gate" assertion fails.
-    [Fact]
-    public async Task SummarizeAndMergeAsync_FlagOn_Ordering_LocalMergeBeforeActorDelete()
-    {
-        const string Goal = "goal-24";
-        const string Text = "Ordered summary";
-        var mirrorGate = TimeSpan.FromMilliseconds(1500);
-
-        var dir = NewTempDir();
-        try
-        {
-            var brain = NewShadowBrain(dir, factoryChatClientFactory: _ => new TextStubClient(Text));
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-                await brain.ForkSessionForGoalAsync(Goal, TestContext.Current.CancellationToken);
-
-                var actor = (BrainActor?)GetBrainActor(brain);
-                Assert.NotNull(actor);
-                var actorMaster = GetField<AgentSession?>(actor!, "_masterSession");
-                Assert.NotNull(actorMaster);
-
-                var localMaster = GetField<AgentSession>(brain, "_masterSession");
-                var contexts = GetField<System.Collections.IDictionary>(brain, "_goalContexts");
-                var children = GetChildActors(actor!);
-
-                // Preconditions: nothing has happened yet.
-                Assert.True(children.ContainsKey(Goal));
-                Assert.True(contexts.Contains(Goal));
-                Assert.False(ContainsSummary(localMaster, Text));
-                Assert.False(ContainsSummary(actorMaster!, Text));
-
-                // Gate every MirrorAsync (its reply timeout is 3s, so messages are still delivered).
-                SetMirrorDelay(brain, mirrorGate);
-
-                var events = new List<(string Name, TimeSpan At)>();
-                using var pollerCts = new CancellationTokenSource();
-                var clock = System.Diagnostics.Stopwatch.StartNew();
-
-                var poller = PollAsync();
-                async Task PollAsync()
-                {
-                    await Task.Yield();
-                    while (!pollerCts.IsCancellationRequested)
-                    {
-                        Record(events, clock, "local-merge", () => ContainsSummary(localMaster, Text));
-                        Record(events, clock, "actor-merge", () => ContainsSummary(actorMaster!, Text));
-                        Record(events, clock, "local-delete", () => !contexts.Contains(Goal));
-                        Record(events, clock, "actor-delete", () => !SafeContainsChild(children, Goal));
-                        if (events.Count == 4) return;
-                        try { await Task.Delay(1, pollerCts.Token); }
-                        catch (OperationCanceledException) { return; }
-                    }
-                }
-
-                var summary = await brain.SummarizeAndMergeAsync(
-                    CreatePipeline(Goal), TestContext.Current.CancellationToken);
-                Assert.Equal(Text, summary);
-
-                // Let the poller observe an effect that landed on the very last instruction.
-                await Task.Delay(250, TestContext.Current.CancellationToken);
-                await pollerCts.CancelAsync();
-                await poller;
-
-                SetMirrorDelay(brain, null);
-
-                var trace = string.Join(", ", events.Select(e => $"{e.Name}@{e.At.TotalMilliseconds:F0}ms"));
-
-                // Every step must have been observed exactly once, in the mandated sequence.
-                Assert.Equal(4, events.Count);
-                Assert.Equal(
-                    ["local-merge", "actor-merge", "local-delete", "actor-delete"],
-                    events.Select(e => e.Name));
-
-                var localMerge = events[0].At;
-                var actorMerge = events[1].At;
-                var localDelete = events[2].At;
-                var actorDelete = events[3].At;
-
-                // The merge mirror's gate sits BETWEEN the local merge and the actor merge —
-                // proving the local merge ran first and was not merely observed first.
-                Assert.True(actorMerge - localMerge >= mirrorGate * 0.6,
-                    $"Expected the merge mirror's gate between local-merge and actor-merge. Trace: {trace}");
-
-                // No gate between the actor merge and the local delete: the local delete must run
-                // immediately after the merge mirror, NOT after the delete mirror. This is what
-                // catches a swap of step 5 (local delete) and step 6 (actor delete mirror).
-                Assert.True(localDelete - actorMerge < mirrorGate * 0.6,
-                    $"Local delete must run right after the merge mirror, before the delete mirror's gate. Trace: {trace}");
-
-                // The delete mirror's gate sits between the local delete and the actor delete.
-                Assert.True(actorDelete - localDelete >= mirrorGate * 0.6,
-                    $"Expected the delete mirror's gate between local-delete and actor-delete. Trace: {trace}");
-
-                // The merge survived the delete on both sides.
-                Assert.True(ContainsSummary(localMaster, Text));
-                Assert.True(ContainsSummary(actorMaster!, Text));
-                Assert.False(GetActiveGoalSessions(actor!).ContainsKey(Goal));
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
     // Criterion 25: flag on — caller cancellation propagates out of ExecuteBrainViaActorAsync.
     [Fact]
-    public async Task ExecuteBrainAsync_FlagOn_CallerCancellation_Propagates()
+    public async Task ExecuteBrainAsync_CallerCancellation_Propagates()
     {
         var dir = NewTempDir();
         try

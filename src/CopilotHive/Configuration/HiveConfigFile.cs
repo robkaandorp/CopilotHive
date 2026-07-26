@@ -213,8 +213,7 @@ public sealed class HiveConfigFile
             AlwaysImprove = source.Orchestrator.AlwaysImprove,
             VerboseLogging = source.Orchestrator.VerboseLogging,
             BrainMaxSteps = source.Orchestrator.BrainMaxSteps,
-            BranchCleanupDelayHours = source.Orchestrator.BranchCleanupDelayHours,
-            UseBrainActors = source.Orchestrator.UseBrainActors
+            BranchCleanupDelayHours = source.Orchestrator.BranchCleanupDelayHours
         };
 
         if (source.Models is not null)

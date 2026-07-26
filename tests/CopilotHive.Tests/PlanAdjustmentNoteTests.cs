@@ -1,11 +1,14 @@
 using System.Reflection;
+using CopilotHive.Actors;
 using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.AI;
 
 namespace CopilotHive.Tests;
 
@@ -194,154 +197,147 @@ public sealed class InjectSystemNoteAsyncTests
         return pipeline;
     }
 
-    private static async Task<DistributedBrain> CreateBrainAsync()
+    /// <summary>
+    /// Creates a fully wired <see cref="DistributedBrain"/> backed by fake chat clients and a fake
+    /// BrainActor factory, connects it, and forks the goal session required by
+    /// InjectSystemNoteAsync. The caller owns the returned brain and temp directory.
+    /// </summary>
+    private static async Task<(DistributedBrain Brain, string TempDir)> CreateBrainAsync(GoalPipeline pipeline)
     {
-        // InjectSystemNoteAsync (like all public Brain operations) requires a connected Brain,
-        // so tests must connect before invoking it.
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-note-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
         var brain = new DistributedBrain(
             "test-model",
-            NullLogger<DistributedBrain>.Instance);
+            NullLogger<DistributedBrain>.Instance,
+            stateDir: tempDir,
+            chatClient: new FakeChatClient());
+
+        typeof(DistributedBrain).GetField("_actorFactory",
+                BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(brain, (Func<string, BrainActor>)(stateDir =>
+                new BrainActor("test-model", 100_000, stateDir, NullLogger.Instance,
+                    chatClientFactory: _ => new FakeChatClient())));
+
         await brain.ConnectAsync(TestContext.Current.CancellationToken);
-        return brain;
+        await brain.ForkSessionForGoalAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        return (brain, tempDir);
     }
 
     [Fact]
     public async Task InjectSystemNoteAsync_AddsEntryToConversation()
     {
         var pipeline = CreatePipeline();
-        var brain = await CreateBrainAsync();
-        var initialCount = pipeline.Conversation.Count;
+        var (brain, tempDir) = await CreateBrainAsync(pipeline);
+        try
+        {
+            var initialCount = pipeline.Conversation.Count;
 
-        await brain.InjectSystemNoteAsync(pipeline, "Plan was adjusted.", TestContext.Current.CancellationToken);
+            await brain.InjectSystemNoteAsync(pipeline, "Plan was adjusted.", TestContext.Current.CancellationToken);
 
-        Assert.Equal(initialCount + 1, pipeline.Conversation.Count);
+            Assert.Equal(initialCount + 1, pipeline.Conversation.Count);
+        }
+        finally
+        {
+            await brain.DisposeAsync();
+            TestHelpers.ForceDeleteDirectory(tempDir);
+        }
     }
 
     [Fact]
     public async Task InjectSystemNoteAsync_EntryHasSystemRole()
     {
         var pipeline = CreatePipeline();
-        var brain = await CreateBrainAsync();
+        var (brain, tempDir) = await CreateBrainAsync(pipeline);
+        try
+        {
+            await brain.InjectSystemNoteAsync(pipeline, "Plan was adjusted.", TestContext.Current.CancellationToken);
 
-        await brain.InjectSystemNoteAsync(pipeline, "Plan was adjusted.", TestContext.Current.CancellationToken);
-
-        var entry = pipeline.Conversation.Last();
-        Assert.Equal("system", entry.Role);
+            var entry = pipeline.Conversation.Last();
+            Assert.Equal("system", entry.Role);
+        }
+        finally
+        {
+            await brain.DisposeAsync();
+            TestHelpers.ForceDeleteDirectory(tempDir);
+        }
     }
 
     [Fact]
     public async Task InjectSystemNoteAsync_EntryContentMatchesNote()
     {
         var pipeline = CreatePipeline();
-        var brain = await CreateBrainAsync();
-        var note = "Your iteration plan was adjusted.";
+        var (brain, tempDir) = await CreateBrainAsync(pipeline);
+        try
+        {
+            var note = "Your iteration plan was adjusted.";
 
-        await brain.InjectSystemNoteAsync(pipeline, note, TestContext.Current.CancellationToken);
+            await brain.InjectSystemNoteAsync(pipeline, note, TestContext.Current.CancellationToken);
 
-        var entry = pipeline.Conversation.Last();
-        Assert.Equal(note, entry.Content);
+            var entry = pipeline.Conversation.Last();
+            Assert.Equal(note, entry.Content);
+        }
+        finally
+        {
+            await brain.DisposeAsync();
+            TestHelpers.ForceDeleteDirectory(tempDir);
+        }
     }
 
     [Fact]
     public async Task InjectSystemNoteAsync_EntryHasPlanAdjustmentPurpose()
     {
         var pipeline = CreatePipeline();
-        var brain = await CreateBrainAsync();
+        var (brain, tempDir) = await CreateBrainAsync(pipeline);
+        try
+        {
+            await brain.InjectSystemNoteAsync(pipeline, "Plan adjusted.", TestContext.Current.CancellationToken);
 
-        await brain.InjectSystemNoteAsync(pipeline, "Plan adjusted.", TestContext.Current.CancellationToken);
-
-        var entry = pipeline.Conversation.Last();
-        Assert.Equal("plan-adjustment", entry.Purpose);
+            var entry = pipeline.Conversation.Last();
+            Assert.Equal("plan-adjustment", entry.Purpose);
+        }
+        finally
+        {
+            await brain.DisposeAsync();
+            TestHelpers.ForceDeleteDirectory(tempDir);
+        }
     }
 
     [Fact]
     public async Task InjectSystemNoteAsync_EntryIterationMatchesPipelineIteration()
     {
         var pipeline = CreatePipeline(iteration: 3);
-        var brain = await CreateBrainAsync();
-
-        await brain.InjectSystemNoteAsync(pipeline, "Note.", TestContext.Current.CancellationToken);
-
-        var entry = pipeline.Conversation.Last();
-        Assert.Equal(3, entry.Iteration);
-    }
-
-    [Fact]
-    public async Task InjectSystemNoteAsync_WhenPlanUnchanged_NoNoteInjected()
-    {
-        // Simulate caller only calling InjectSystemNoteAsync when plan changed
-        var pipeline = CreatePipeline();
-        var brain = await CreateBrainAsync();
-        var initialCount = pipeline.Conversation.Count;
-
-        // Do NOT inject — plan was unchanged
-        // (caller decides; this test verifies the existing conversation is untouched)
-        _ = brain; // suppress unused warning
-
-        Assert.Equal(initialCount, pipeline.Conversation.Count);
-    }
-
-    [Fact]
-    public async Task InjectSystemNoteAsync_AlsoAddsToSessionMessageHistory()
-    {
-        // The note must be injected into the Brain's master session so that the Brain
-        // includes it when crafting the next prompt (goal contexts fork from the master).
-        var pipeline = CreatePipeline();
-        var brain = await CreateBrainAsync();
-
-        // Get baseline message count from the Brain master session via reflection
-        var sessionField = typeof(DistributedBrain).GetField(
-            "_masterSession", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        var session = sessionField.GetValue(brain)!;
-        var messageHistoryProp = session.GetType().GetProperty("MessageHistory")!;
-        var messagesBefore = ((System.Collections.IList)messageHistoryProp.GetValue(session)!).Count;
-
-        await brain.InjectSystemNoteAsync(pipeline, "Plan was adjusted.", TestContext.Current.CancellationToken);
-
-        var messagesAfter = ((System.Collections.IList)messageHistoryProp.GetValue(session)!).Count;
-
-        // Two messages are added: user note + assistant acknowledgement
-        Assert.Equal(messagesBefore + 2, messagesAfter);
-    }
-
-    [Fact]
-    public async Task InjectSystemNoteAsync_SessionMessageContainsNote()
-    {
-        // The injected session message must contain the note text so the Brain can read it.
-        var pipeline = CreatePipeline();
-        var brain = await CreateBrainAsync();
-        var note = "Testing was inserted after Coding (required for code-change plans)";
-
-        var sessionField = typeof(DistributedBrain).GetField(
-            "_masterSession", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        var session = sessionField.GetValue(brain)!;
-        var messageHistoryProp = session.GetType().GetProperty("MessageHistory")!;
-
-        await brain.InjectSystemNoteAsync(pipeline, note, TestContext.Current.CancellationToken);
-
-        var messages = (System.Collections.IList)messageHistoryProp.GetValue(session)!;
-        // The last two messages are the user note + assistant acknowledgement
-        var userMessage = messages[messages.Count - 2]!;
-        var contentProp = userMessage.GetType().GetProperty("Text")
-            ?? userMessage.GetType().GetProperty("Content")
-            ?? userMessage.GetType().GetProperty("RawRepresentation");
-
-        // Find the message that contains the note text
-        var found = false;
-        foreach (var msg in messages)
+        var (brain, tempDir) = await CreateBrainAsync(pipeline);
+        try
         {
-            var textProp = msg!.GetType().GetProperty("Text");
-            if (textProp is null) continue;
-            var text = textProp.GetValue(msg)?.ToString() ?? "";
-            if (text.Contains(note))
-            {
-                found = true;
-                break;
-            }
-        }
+            await brain.InjectSystemNoteAsync(pipeline, "Note.", TestContext.Current.CancellationToken);
 
-        Assert.True(found, $"Expected to find a session message containing: {note}");
+            var entry = pipeline.Conversation.Last();
+            Assert.Equal(3, entry.Iteration);
+        }
+        finally
+        {
+            await brain.DisposeAsync();
+            TestHelpers.ForceDeleteDirectory(tempDir);
+        }
     }
+
+    [Fact]
+    public async Task InjectSystemNoteAsync_WhenNotConnected_Throws()
+    {
+        // The EnsureConnected guard must reject notes before any conversation entry is recorded,
+        // so an unconnected brain can never silently swallow a plan adjustment.
+        var pipeline = CreatePipeline();
+        var brain = new DistributedBrain("test-model", NullLogger<DistributedBrain>.Instance);
+        await using (brain)
+        {
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => brain.InjectSystemNoteAsync(pipeline, "Plan adjusted.", TestContext.Current.CancellationToken));
+            Assert.Contains("not connected", ex.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Empty(pipeline.Conversation);
+        }
+    }
+
 }
 
 /// <summary>

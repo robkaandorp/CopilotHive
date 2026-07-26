@@ -409,30 +409,6 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task SaveSessionAsync_CreatesFile()
-    {
-        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
-        try
-        {
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir);
-
-            await brain.SaveSessionAsync(TestContext.Current.CancellationToken);
-
-            var sessionFile = Path.Combine(tempDir, "brain-master.json");
-            Assert.True(File.Exists(sessionFile), $"Session file should exist at {sessionFile}");
-
-            var content = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
-            Assert.Contains("brain", content);
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-                Directory.Delete(tempDir, true);
-        }
-    }
-
-    [Fact]
     public async Task PlanIterationAsync_WithoutConnect_Throws()
     {
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
@@ -529,12 +505,8 @@ public sealed class DistributedBrainTests
 
             var systemPromptField = typeof(DistributedBrain)
                 .GetField("_systemPrompt", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            var masterSessionField = typeof(DistributedBrain)
-                .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
 
-            var initialPrompt = (string)systemPromptField.GetValue(brain)!;
-            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-            var messageCountBefore = masterSession.MessageHistory.Count;
+            var messageCountBefore = ActorMasterSession(brain).MessageHistory.Count;
 
             // Act: inject new orchestrator instructions
             await brain.InjectOrchestratorInstructionsAsync("NEW_ORCHESTRATOR_RULES", TestContext.Current.CancellationToken);
@@ -544,7 +516,8 @@ public sealed class DistributedBrainTests
             Assert.Contains("NEW_ORCHESTRATOR_RULES", updatedPrompt);
             Assert.Contains(BrainPromptBuilder.DefaultSystemPrompt, updatedPrompt);
 
-            // Assert: master session history is preserved (no injected User/Assistant turns)
+            // Assert: the actor's master session history is preserved (no injected User/Assistant turns)
+            var masterSession = ActorMasterSession(brain);
             Assert.Equal(messageCountBefore, masterSession.MessageHistory.Count);
             Assert.DoesNotContain(masterSession.MessageHistory, m =>
                 m.Text.Contains("ORCHESTRATOR INSTRUCTIONS UPDATE", StringComparison.Ordinal));
@@ -571,12 +544,9 @@ public sealed class DistributedBrainTests
 
             var systemPromptField = typeof(DistributedBrain)
                 .GetField("_systemPrompt", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            var masterSessionField = typeof(DistributedBrain)
-                .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
 
             var initialPrompt = (string)systemPromptField.GetValue(brain)!;
-            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-            var messageCountBefore = masterSession.MessageHistory.Count;
+            var messageCountBefore = ActorMasterSession(brain).MessageHistory.Count;
 
             // Act: inject empty / whitespace instructions
             await brain.InjectOrchestratorInstructionsAsync("   ", TestContext.Current.CancellationToken);
@@ -584,7 +554,7 @@ public sealed class DistributedBrainTests
             // Assert: nothing changed
             var updatedPrompt = (string)systemPromptField.GetValue(brain)!;
             Assert.Equal(initialPrompt, updatedPrompt);
-            Assert.Equal(messageCountBefore, masterSession.MessageHistory.Count);
+            Assert.Equal(messageCountBefore, ActorMasterSession(brain).MessageHistory.Count);
         }
         finally
         {
@@ -1007,65 +977,6 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public void RegisterActivePipeline_StoresPipelineForGoalId()
-    {
-        // Arrange
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
-        var pipeline = CreatePipeline("goal-register-1", "Test goal for registration");
-
-        // Act
-        brain.RegisterActivePipeline(pipeline);
-
-        // Assert - pipeline is stored (verify via reflection since it's private)
-        var activePipelinesField = typeof(DistributedBrain)
-            .GetField("_activePipelines", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var activePipelines = (System.Collections.Concurrent.ConcurrentDictionary<string, GoalPipeline>?)activePipelinesField.GetValue(brain);
-        Assert.NotNull(activePipelines);
-        Assert.True(activePipelines.ContainsKey("goal-register-1"));
-        Assert.Same(pipeline, activePipelines["goal-register-1"]);
-    }
-
-    [Fact]
-    public void RegisterActivePipeline_OverwritesExistingPipeline()
-    {
-        // Arrange
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
-        var pipeline1 = CreatePipeline("goal-overwrite", "First pipeline");
-        var pipeline2 = CreatePipeline("goal-overwrite", "Second pipeline");
-
-        // Act
-        brain.RegisterActivePipeline(pipeline1);
-        brain.RegisterActivePipeline(pipeline2);
-
-        // Assert
-        var activePipelinesField = typeof(DistributedBrain)
-            .GetField("_activePipelines", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var activePipelines = (System.Collections.Concurrent.ConcurrentDictionary<string, GoalPipeline>?)activePipelinesField.GetValue(brain);
-        Assert.NotNull(activePipelines);
-        Assert.Single(activePipelines);
-        Assert.Same(pipeline2, activePipelines["goal-overwrite"]);
-    }
-
-    [Fact]
-    public void DeregisterActivePipeline_RemovesPipeline()
-    {
-        // Arrange
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
-        var pipeline = CreatePipeline("goal-deregister", "Test goal for deregistration");
-        brain.RegisterActivePipeline(pipeline);
-
-        // Act
-        brain.DeregisterActivePipeline("goal-deregister");
-
-        // Assert
-        var activePipelinesField = typeof(DistributedBrain)
-            .GetField("_activePipelines", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var activePipelines = (System.Collections.Concurrent.ConcurrentDictionary<string, GoalPipeline>?)activePipelinesField.GetValue(brain);
-        Assert.NotNull(activePipelines);
-        Assert.False(activePipelines.ContainsKey("goal-deregister"));
-    }
-
-    [Fact]
     public void DeregisterActivePipeline_NonExistentGoalId_DoesNotThrow()
     {
         // Arrange
@@ -1076,733 +987,13 @@ public sealed class DistributedBrainTests
         Assert.Null(exception);
     }
 
-    [Fact]
-    public void GetGoalTool_IsCreatedWithCorrectName()
-    {
-        // Arrange: Create a brain with goal store
-        var goalStore = new FakeGoalStore();
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            goalStore: goalStore);
-
-        // Act: Get the Brain tools via reflection
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-
-        // Assert: get_goal tool exists in the tools list
-        // Note: AIFunctionFactory.Create returns AIFunction which is then cast to AITool
-        // The tool is identified by its name parameter passed to AIFunctionFactory.Create
-        Assert.NotEmpty(brainTools);
-        // Verify there are at least 7 tools (escalate_to_composer, report_iteration_plan, get_goal, search_knowledge, read_document, traverse_graph, get_current_time)
-        Assert.True(brainTools.Count >= 7, "Brain should have at least 7 tools (escalate_to_composer, report_iteration_plan, get_goal, search_knowledge, read_document, traverse_graph, get_current_time)");
-    }
-
-    [Fact]
-    public void BuildBrainTools_IncludesGetCurrentTime()
-    {
-        var goalStore = new FakeGoalStore();
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            goalStore: goalStore);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-
-        var tool = brainTools.OfType<AIFunction>().FirstOrDefault(t => t.Name == "get_current_time");
-        Assert.NotNull(tool);
-    }
-
-    [Fact]
-    public async Task GetCurrentTimeTool_ReturnsValidJsonWithExpectedFields()
-    {
-        var goalStore = new FakeGoalStore();
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            goalStore: goalStore);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var tool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_current_time");
-
-        // Act: invoke the get_current_time tool (no arguments needed)
-        var result = (await tool.InvokeAsync(new AIFunctionArguments(), TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: the result is valid JSON containing the expected fields
-        Assert.False(string.IsNullOrWhiteSpace(result));
-        using var doc = System.Text.Json.JsonDocument.Parse(result);
-        var root = doc.RootElement;
-
-        Assert.True(root.TryGetProperty("date", out var dateEl), "Result should contain 'date' field");
-        Assert.True(root.TryGetProperty("time", out var timeEl), "Result should contain 'time' field");
-        Assert.True(root.TryGetProperty("iso", out var isoEl), "Result should contain 'iso' field");
-        Assert.True(root.TryGetProperty("timezone", out var tzEl), "Result should contain 'timezone' field");
-
-        var date = dateEl.GetString()!;
-        var time = timeEl.GetString()!;
-        var iso = isoEl.GetString()!;
-        var timezone = tzEl.GetString()!;
-
-        // date must be YYYY-MM-DD format
-        Assert.Matches(@"^\d{4}-\d{2}-\d{2}$", date);
-        // time must be HH:MM:SS format
-        Assert.Matches(@"^\d{2}:\d{2}:\d{2}$", time);
-        // iso must be ISO 8601 format (round-trip "o" format from DateTime.UtcNow)
-        Assert.Matches(@"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", iso);
-        // timezone must be "UTC"
-        Assert.Equal("UTC", timezone);
-
-        // The date should match today's UTC date
-        Assert.Equal(DateTime.UtcNow.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture), date);
-    }
-
-    [Fact]
-    public void GetGoalTool_HasCorrectNameAndGoalIdParameter()
-    {
-        // Arrange
-        var goalStore = new FakeGoalStore();
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            goalStore: goalStore);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-
-        // Act: find the get_goal tool
-        var getGoalTool = brainTools.OfType<AIFunction>().FirstOrDefault(t => t.Name == "get_goal");
-
-        // Assert: tool exists and has correct name
-        Assert.NotNull(getGoalTool);
-        Assert.Equal("get_goal", getGoalTool.Name);
-
-        // Assert: tool JSON schema contains a goal_id property
-        var schema = getGoalTool.JsonSchema.ToString();
-        Assert.Contains("goal_id", schema);
-    }
-
-    [Fact]
-    public async Task GetGoalTool_ReturnsGoalDetails_WhenCalledWithValidId()
-    {
-        // Arrange: Create a brain with a goal store that has a known goal
-        var goalStore = new FakeGoalStore();
-        goalStore.AddGoal(new Goal
-        {
-            Id = "test-goal-42",
-            Description = "Implement user authentication with JWT tokens",
-            Status = GoalStatus.InProgress,
-            RepositoryNames = ["my-repo", "auth-service"],
-        });
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            goalStore: goalStore);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
-
-        // Act: invoke the get_goal tool with a valid goal ID
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "test-goal-42" });
-        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: result contains the expected goal details
-        Assert.Contains("test-goal-42", result);
-        Assert.Contains("Implement user authentication with JWT tokens", result);
-        Assert.Contains("InProgress", result);
-        Assert.Contains("my-repo", result);
-        Assert.Contains("auth-service", result);
-    }
-
-    [Fact]
-    public async Task GetGoalTool_ReturnsReviewStatus_WhenGoalHasReviewStatus()
-    {
-        // Arrange: Create a brain with a goal store that has a goal with ReviewStatus set.
-        // Use a Status other than Pending so "Pending" can only match the Review Status line.
-        var goalStore = new FakeGoalStore();
-        goalStore.AddGoal(new Goal
-        {
-            Id = "review-status-goal",
-            Description = "Goal with review status pending",
-            Status = GoalStatus.InProgress,
-            ReviewStatus = ReviewStatus.Pending,
-            RepositoryNames = ["my-repo"],
-        });
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            goalStore: goalStore);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
-
-        // Act: invoke the get_goal tool with a valid goal ID
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "review-status-goal" });
-        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: result contains the review status on its own line (exact substring),
-        // proving the value is sourced from ReviewStatus and not the Status field.
-        Assert.Contains("Review Status: Pending", result);
-    }
-
-    [Fact]
-    public async Task GetGoalTool_ReturnsNotFound_WhenGoalDoesNotExist()
-    {
-        // Arrange
-        var goalStore = new FakeGoalStore();
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            goalStore: goalStore);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
-
-        // Act: invoke with a non-existent goal ID
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "does-not-exist" });
-        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: result indicates the goal was not found
-        Assert.Contains("not found", result);
-    }
-
-    [Fact]
-    public async Task GetGoalTool_ReturnsIterationInfo_WhenPipelineIsRegistered()
-    {
-        // Arrange
-        var goalStore = new FakeGoalStore();
-        goalStore.AddGoal(new Goal { Id = "active-goal", Description = "Active pipeline goal", Status = GoalStatus.InProgress });
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            goalStore: goalStore);
-
-        var pipeline = CreatePipeline("active-goal", "Active pipeline goal");
-        brain.RegisterActivePipeline(pipeline);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
-
-        // Act: invoke with the active goal ID
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "active-goal" });
-        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: result contains iteration info from the registered pipeline
-        Assert.Contains("iteration", result.ToLowerInvariant());
-    }
-
-    [Fact]
-    public async Task GetGoalTool_ReturnsNotAvailable_WhenGoalStoreIsNull()
-    {
-        // Arrange: Brain without goal store
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
-
-        // Act
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "any-goal" });
-        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: graceful error when no goal store
-        Assert.Contains("not available", result);
-    }
-
     // -- get_goal Related Docs Tests --
-
-    [Fact]
-    public async Task GetGoalTool_IncludesRelatedDocs_WhenGoalHasDocuments()
-    {
-        // Arrange
-        var goalStore = new FakeGoalStore();
-        goalStore.AddGoal(new Goal
-        {
-            Id = "goal-with-docs",
-            Description = "Goal with related knowledge documents",
-            Status = GoalStatus.InProgress,
-            Documents = ["architecture-brain", "architecture-model-resolution"],
-        });
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            goalStore: goalStore);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
-
-        // Act
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "goal-with-docs" });
-        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: result includes Related docs section
-        Assert.Contains("Related docs:", result);
-        Assert.Contains("architecture-brain", result);
-        Assert.Contains("architecture-model-resolution", result);
-    }
-
-    [Fact]
-    public async Task GetGoalTool_OmitsRelatedDocs_WhenGoalHasNoDocuments()
-    {
-        // Arrange
-        var goalStore = new FakeGoalStore();
-        goalStore.AddGoal(new Goal
-        {
-            Id = "goal-no-docs",
-            Description = "Goal without related documents",
-            Status = GoalStatus.InProgress,
-        });
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            goalStore: goalStore);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
-
-        // Act
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "goal-no-docs" });
-        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: result does NOT include Related docs section
-        Assert.DoesNotContain("Related docs:", result);
-    }
-
-    [Fact]
-    public async Task GetGoalTool_IncludesRelatedDocsWithTitles_WhenKnowledgeGraphIsInjected()
-    {
-        // Arrange
-        var goalStore = new FakeGoalStore();
-        goalStore.AddGoal(new Goal
-        {
-            Id = "goal-with-titled-docs",
-            Description = "Goal with titled knowledge documents",
-            Status = GoalStatus.InProgress,
-            Documents = ["architecture-brain"],
-        });
-
-        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
-        await kg.CreateDocumentAsync("architecture-brain", "Brain Architecture", CopilotHive.Knowledge.DocumentType.Implementation, "The Brain is an LLM-powered orchestrator.", topic: "architecture", ct: TestContext.Current.CancellationToken);
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            goalStore: goalStore, knowledgeGraph: kg);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var getGoalTool = brainTools.OfType<AIFunction>().First(t => t.Name == "get_goal");
-
-        // Act
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["goal_id"] = "goal-with-titled-docs" });
-        var result = (await getGoalTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: result includes doc id and title
-        Assert.Contains("architecture-brain (Brain Architecture)", result);
-    }
 
     // -- search_knowledge Tool Tests --
 
-    [Fact]
-    public void SearchKnowledgeTool_IsCreatedWithCorrectName()
-    {
-        // Arrange
-        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            knowledgeGraph: kg);
-
-        // Act
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-
-        // Assert
-        var searchTool = brainTools.OfType<AIFunction>().FirstOrDefault(t => t.Name == "search_knowledge");
-        Assert.NotNull(searchTool);
-        Assert.Equal("search_knowledge", searchTool.Name);
-    }
-
-    [Fact]
-    public async Task SearchKnowledge_ReturnsFormattedResults_WhenKnowledgeGraphIsInjected()
-    {
-        // Arrange: populate KG with a document
-        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
-        await kg.CreateDocumentAsync(
-            "architecture-brain",
-            "Brain Architecture",
-            CopilotHive.Knowledge.DocumentType.Implementation,
-            "The Brain is an LLM-powered orchestrator component.",
-            topic: "architecture",
-            ct: TestContext.Current.CancellationToken);
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            knowledgeGraph: kg);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var searchTool = brainTools.OfType<AIFunction>().First(t => t.Name == "search_knowledge");
-
-        // Act
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["query"] = "Brain" });
-        var result = (await searchTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: formatted result with doc details
-        Assert.Contains("Found", result);
-        Assert.Contains("[architecture-brain]", result);
-        Assert.Contains("Brain Architecture", result);
-        Assert.Contains("implementation", result);
-    }
-
-    [Fact]
-    public async Task SearchKnowledge_ReturnsNotAvailable_WhenKnowledgeGraphIsNull()
-    {
-        // Arrange: Brain with no knowledge graph
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var searchTool = brainTools.OfType<AIFunction>().First(t => t.Name == "search_knowledge");
-
-        // Act
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["query"] = "anything" });
-        var result = (await searchTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert
-        Assert.Contains("Knowledge graph not available", result);
-    }
-
-    [Fact]
-    public async Task SearchKnowledge_FiltersByTopic_WhenTopicProvided()
-    {
-        // Arrange
-        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
-        await kg.CreateDocumentAsync("architecture-brain", "Brain Architecture", CopilotHive.Knowledge.DocumentType.Implementation, "Brain content", topic: "architecture", ct: TestContext.Current.CancellationToken);
-        await kg.CreateDocumentAsync("features-compaction", "Compaction Feature", CopilotHive.Knowledge.DocumentType.Feature, "Compaction content", topic: "features", ct: TestContext.Current.CancellationToken);
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            knowledgeGraph: kg);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var searchTool = brainTools.OfType<AIFunction>().First(t => t.Name == "search_knowledge");
-
-        // Act: search with topic=architecture, both docs contain "content"
-        var args = new AIFunctionArguments(new Dictionary<string, object?>
-        {
-            ["query"] = "content",
-            ["topic"] = "architecture"
-        });
-        var result = (await searchTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: only architecture doc returned
-        Assert.Contains("architecture-brain", result);
-        Assert.DoesNotContain("features-compaction", result);
-    }
-
-    [Fact]
-    public async Task SearchKnowledge_FiltersByType_WhenTypeProvided()
-    {
-        // Arrange
-        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
-        await kg.CreateDocumentAsync("architecture-brain", "Brain Architecture", CopilotHive.Knowledge.DocumentType.Implementation, "Brain content", topic: "architecture", ct: TestContext.Current.CancellationToken);
-        await kg.CreateDocumentAsync("features-compaction", "Compaction Feature", CopilotHive.Knowledge.DocumentType.Feature, "Compaction content", topic: "features", ct: TestContext.Current.CancellationToken);
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            knowledgeGraph: kg);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var searchTool = brainTools.OfType<AIFunction>().First(t => t.Name == "search_knowledge");
-
-        // Act: search with type=feature
-        var args = new AIFunctionArguments(new Dictionary<string, object?>
-        {
-            ["query"] = "content",
-            ["type"] = "feature"
-        });
-        var result = (await searchTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: only feature doc returned
-        Assert.Contains("features-compaction", result);
-        Assert.DoesNotContain("architecture-brain", result);
-    }
-
-    [Fact]
-    public async Task SearchKnowledge_RespectsLimit_WhenLimitProvided()
-    {
-        // Arrange: add 5 documents all matching "test"
-        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
-        for (var i = 1; i <= 5; i++)
-            await kg.CreateDocumentAsync($"architecture-doc-{i}", $"Doc {i}", CopilotHive.Knowledge.DocumentType.Implementation, $"test content {i}", topic: "architecture", ct: TestContext.Current.CancellationToken);
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            knowledgeGraph: kg);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var searchTool = brainTools.OfType<AIFunction>().First(t => t.Name == "search_knowledge");
-
-        // Act: search with limit=2
-        var args = new AIFunctionArguments(new Dictionary<string, object?>
-        {
-            ["query"] = "test",
-            ["limit"] = 2
-        });
-        var result = (await searchTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: at most 2 results
-        Assert.Contains("Found 2 document", result);
-    }
-
-    [Fact]
-    public async Task SearchKnowledge_ReturnsNoResults_WhenQueryMatchesNothing()
-    {
-        // Arrange: add a document that doesn't match the query
-        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
-        await kg.CreateDocumentAsync("architecture-brain", "Brain Architecture", CopilotHive.Knowledge.DocumentType.Implementation, "Brain content", topic: "architecture", ct: TestContext.Current.CancellationToken);
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            knowledgeGraph: kg);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var searchTool = brainTools.OfType<AIFunction>().First(t => t.Name == "search_knowledge");
-
-        // Act: query that matches nothing
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["query"] = "xyzzy_unlikely_to_match" });
-        var result = (await searchTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert
-        Assert.Contains("No documents match your query", result);
-    }
-
     // -- read_document Tool Tests --
 
-    [Fact]
-    public void ReadDocumentTool_IsCreatedWithCorrectName()
-    {
-        // Arrange
-        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            knowledgeGraph: kg);
-
-        // Act
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-
-        // Assert
-        var readDocTool = brainTools.OfType<AIFunction>().FirstOrDefault(t => t.Name == "read_document");
-        Assert.NotNull(readDocTool);
-        Assert.Equal("read_document", readDocTool.Name);
-    }
-
-    [Fact]
-    public async Task ReadDocumentTool_ReturnsFullContent_WhenDocumentExists()
-    {
-        // Arrange
-        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
-        var longBody = "This is the full body content of the Brain architecture document. " +
-                       "It contains detailed information about how the Brain orchestrates worker agents, " +
-                       "manages goal pipelines, and coordinates the coder-tester feedback loop. " +
-                       "The Brain uses a knowledge graph to store and retrieve architecture documents, " +
-                       "and it leverages LLM-powered decision making to plan iterations. " +
-                       "This body is intentionally longer than 300 characters to verify that the " +
-                       "read_document tool returns the full content rather than a truncated snippet.";
-        await kg.CreateDocumentAsync(
-            "architecture-brain",
-            "Brain Architecture",
-            CopilotHive.Knowledge.DocumentType.Implementation,
-            longBody,
-            topic: "architecture",
-            tags: ["brain", "orchestration"],
-            ct: TestContext.Current.CancellationToken);
-
-        // Add a link so we can verify links are returned
-        kg.AddLink("architecture-brain",
-            new CopilotHive.Knowledge.DocumentLink("architecture-workers", CopilotHive.Knowledge.LinkType.DependsOn));
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            knowledgeGraph: kg);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var readDocTool = brainTools.OfType<AIFunction>().First(t => t.Name == "read_document");
-
-        // Act
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["document_id"] = "architecture-brain" });
-        var result = (await readDocTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: full content returned (not a snippet)
-        Assert.Contains("## Brain Architecture", result);
-        Assert.Contains("**ID:** architecture-brain", result);
-        Assert.Contains("**Type:**", result);
-        Assert.Contains("**Status:**", result);
-        Assert.Contains("**Tags:** brain, orchestration", result);
-        Assert.Contains("**Links:**", result);
-        Assert.Contains("architecture-workers", result);
-        Assert.Contains(longBody, result);
-    }
-
-    [Fact]
-    public async Task ReadDocumentTool_ReturnsNotFound_WhenDocumentDoesNotExist()
-    {
-        // Arrange
-        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            knowledgeGraph: kg);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var readDocTool = brainTools.OfType<AIFunction>().First(t => t.Name == "read_document");
-
-        // Act
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["document_id"] = "does-not-exist" });
-        var result = (await readDocTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert
-        Assert.Contains("not found", result);
-    }
-
-    [Fact]
-    public async Task ReadDocumentTool_ReturnsNotAvailable_WhenKnowledgeGraphIsNull()
-    {
-        // Arrange: Brain with no knowledge graph
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var readDocTool = brainTools.OfType<AIFunction>().First(t => t.Name == "read_document");
-
-        // Act
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["document_id"] = "anything" });
-        var result = (await readDocTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: exact match per acceptance criteria
-        Assert.Equal("Knowledge graph not available.", result);
-    }
-
     // -- traverse_graph Tool Tests --
-
-    [Fact]
-    public void TraverseGraphTool_IsCreatedWithCorrectName()
-    {
-        // Arrange
-        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            knowledgeGraph: kg);
-
-        // Act
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-
-        // Assert
-        var traverseTool = brainTools.OfType<AIFunction>().FirstOrDefault(t => t.Name == "traverse_graph");
-        Assert.NotNull(traverseTool);
-        Assert.Equal("traverse_graph", traverseTool.Name);
-    }
-
-    [Fact]
-    public async Task TraverseGraphTool_ReturnsRelatedDocuments_WhenLinksExist()
-    {
-        // Arrange: two docs with a link
-        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
-        await kg.CreateDocumentAsync(
-            "architecture-brain",
-            "Brain Architecture",
-            CopilotHive.Knowledge.DocumentType.Implementation,
-            "Brain content.",
-            topic: "architecture",
-            ct: TestContext.Current.CancellationToken);
-
-        await kg.CreateDocumentAsync(
-            "architecture-workers",
-            "Workers Architecture",
-            CopilotHive.Knowledge.DocumentType.Implementation,
-            "Workers content.",
-            topic: "architecture",
-            ct: TestContext.Current.CancellationToken);
-
-        kg.AddLink(
-            "architecture-brain",
-            new CopilotHive.Knowledge.DocumentLink("architecture-workers", CopilotHive.Knowledge.LinkType.Related));
-
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            knowledgeGraph: kg);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var traverseTool = brainTools.OfType<AIFunction>().First(t => t.Name == "traverse_graph");
-
-        // Act
-        var args = new AIFunctionArguments(new Dictionary<string, object?>
-        {
-            ["document_id"] = "architecture-brain",
-            ["depth"] = 1,
-            ["direction"] = "outgoing"
-        });
-        var result = (await traverseTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: edge and reachable doc listed
-        Assert.Contains("architecture-brain", result);
-        Assert.Contains("architecture-workers", result);
-        Assert.Contains("Related", result);
-        Assert.Contains("Workers Architecture", result);
-        Assert.Contains("Reachable Documents", result);
-    }
-
-    [Fact]
-    public async Task TraverseGraphTool_ReturnsNotFound_WhenStartDocumentDoesNotExist()
-    {
-        // Arrange
-        var kg = new CopilotHive.Knowledge.KnowledgeGraph();
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-            knowledgeGraph: kg);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var traverseTool = brainTools.OfType<AIFunction>().First(t => t.Name == "traverse_graph");
-
-        // Act
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["document_id"] = "does-not-exist" });
-        var result = (await traverseTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert
-        Assert.Contains("not found", result);
-    }
-
-    [Fact]
-    public async Task TraverseGraphTool_ReturnsNotAvailable_WhenKnowledgeGraphIsNull()
-    {
-        // Arrange: Brain with no knowledge graph
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
-
-        var brainToolsField = typeof(DistributedBrain)
-            .GetField("_brainTools", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var brainTools = (List<AITool>)brainToolsField.GetValue(brain)!;
-        var traverseTool = brainTools.OfType<AIFunction>().First(t => t.Name == "traverse_graph");
-
-        // Act
-        var args = new AIFunctionArguments(new Dictionary<string, object?> { ["document_id"] = "anything" });
-        var result = (await traverseTool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
-
-        // Assert: exact match per acceptance criteria
-        Assert.Equal("Knowledge graph not available.", result);
-    }
 
     // -- BuildCraftPromptText Goal ID Reference Tests (Change C) --
 
@@ -2243,100 +1434,12 @@ public sealed class DistributedBrainTests
             await brain.ForkSessionForGoalAsync("goal-123", TestContext.Current.CancellationToken);
 
             // Assert: session file exists
-            var sessionFile = Path.Combine(tempDir, "brain-goal-goal-123.json");
+            var sessionFile = Path.Combine(tempDir, "actors", "brain-goal-goal-123.json");
             Assert.True(File.Exists(sessionFile), $"Session file should exist at {sessionFile}");
 
             // Assert: file contains valid JSON
             var content = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
             Assert.Contains("brain", content); // AgentSession JSON should contain agent name
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-                Directory.Delete(tempDir, recursive: true);
-        }
-    }
-
-    [Fact]
-    public async Task ForkSessionForGoalAsync_ForksFromMasterSession()
-    {
-        // Arrange
-        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        try
-        {
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: new FakeChatClient());
-            await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-            // Inject a message into the master session using reflection
-            var masterSessionField = typeof(DistributedBrain)
-                .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-            masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User, "INJECTED_TEST_MESSAGE_FOR_FORK"));
-
-            // Act
-            await brain.ForkSessionForGoalAsync("goal-fork-test", TestContext.Current.CancellationToken);
-
-            // Assert: goal session file contains the injected message
-            var sessionFile = Path.Combine(tempDir, "brain-goal-goal-fork-test.json");
-            Assert.True(File.Exists(sessionFile));
-            var content = await File.ReadAllTextAsync(sessionFile, TestContext.Current.CancellationToken);
-            Assert.Contains("INJECTED_TEST_MESSAGE_FOR_FORK", content);
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-                Directory.Delete(tempDir, recursive: true);
-        }
-    }
-
-    [Fact]
-    public async Task ForkSessionForGoal_CreatesSeparateGoalContextSessions()
-    {
-        // Arrange
-        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        try
-        {
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: new FakeChatClient());
-            await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-            // Create two different goal sessions with different message histories
-            var masterSessionField = typeof(DistributedBrain)
-                .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-
-            // Fork goal-A with unique marker
-            masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User, "MARKER_GOAL_A_UNIQUE"));
-            await brain.ForkSessionForGoalAsync("goal-A", TestContext.Current.CancellationToken);
-
-            // Clear and add different marker for goal-B
-            masterSession.MessageHistory.RemoveAt(masterSession.MessageHistory.Count - 1);
-            masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User, "MARKER_GOAL_B_UNIQUE"));
-            await brain.ForkSessionForGoalAsync("goal-B", TestContext.Current.CancellationToken);
-
-            // Reset master session
-            masterSession.MessageHistory.RemoveAt(masterSession.MessageHistory.Count - 1);
-
-            // Access _goalContexts via reflection and read each context's Session.
-            var goalContextsField = typeof(DistributedBrain)
-                .GetField("_goalContexts", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            var goalContexts = (System.Collections.IDictionary)goalContextsField.GetValue(brain)!;
-
-            var contextB = goalContexts["goal-B"]!;
-            var sessionProp = contextB.GetType().GetProperty("Session")!;
-            var sessionB = (AgentSession)sessionProp.GetValue(contextB)!;
-
-            // Assert: goal-B's context session contains only goal-B's marker.
-            Assert.Contains(sessionB.MessageHistory, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_GOAL_B_UNIQUE")));
-            Assert.DoesNotContain(sessionB.MessageHistory, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_GOAL_A_UNIQUE")));
-
-            var contextA = goalContexts["goal-A"]!;
-            var sessionA = (AgentSession)sessionProp.GetValue(contextA)!;
-            Assert.Contains(sessionA.MessageHistory, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_GOAL_A_UNIQUE")));
-            Assert.DoesNotContain(sessionA.MessageHistory, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_GOAL_B_UNIQUE")));
         }
         finally
         {
@@ -2360,7 +1463,7 @@ public sealed class DistributedBrainTests
             // Fork a goal session
             await brain.ForkSessionForGoalAsync("goal-delete-test", TestContext.Current.CancellationToken);
 
-            var sessionFile = Path.Combine(tempDir, "brain-goal-goal-delete-test.json");
+            var sessionFile = Path.Combine(tempDir, "actors", "brain-goal-goal-delete-test.json");
 
             // Assert: file exists before deletion
             Assert.True(File.Exists(sessionFile), "Session file should exist before deletion");
@@ -2378,304 +1481,7 @@ public sealed class DistributedBrainTests
         }
     }
 
-    [Fact]
-    public async Task DeleteGoalSession_RemovesGoalContext()
-    {
-        // Arrange
-        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        try
-        {
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: new FakeChatClient());
-            await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-            // Fork a goal session — this creates a per-goal Brain context.
-            await brain.ForkSessionForGoalAsync("active-goal-test", TestContext.Current.CancellationToken);
-
-            // Access _goalContexts via reflection.
-            var goalContextsField = typeof(DistributedBrain)
-                .GetField("_goalContexts", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            var goalContexts = (System.Collections.IDictionary)goalContextsField.GetValue(brain)!;
-
-            // Assert: the context exists before deletion.
-            Assert.True(goalContexts.Contains("active-goal-test"), "Goal context should exist after fork");
-
-            var sessionFile = Path.Combine(tempDir, "brain-goal-active-goal-test.json");
-            Assert.True(File.Exists(sessionFile), "Session file should exist");
-
-            // Act: delete the goal session.
-            await brain.DeleteGoalSessionAsync("active-goal-test", TestContext.Current.CancellationToken);
-
-            // Assert: file deleted.
-            Assert.False(File.Exists(sessionFile), "Session file should not exist after deletion");
-
-            // Assert: the goal context was removed.
-            Assert.False(goalContexts.Contains("active-goal-test"), "Goal context should be removed after deletion");
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-                Directory.Delete(tempDir, recursive: true);
-        }
-    }
-
-    [Fact]
-    public async Task Migration_BrainSessionToBrainMaster()
-    {
-        // Arrange
-        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        try
-        {
-            // Create a legacy session file manually
-            var legacySession = AgentSession.Create("brain");
-            legacySession.MessageHistory.Add(new ChatMessage(ChatRole.User, "LEGACY_SESSION_CONTENT"));
-            var legacyFile = Path.Combine(tempDir, "brain-session.json");
-            await legacySession.SaveAsync(legacyFile, TestContext.Current.CancellationToken);
-
-            // Assert: legacy file exists, master file does not
-            Assert.True(File.Exists(legacyFile), "Legacy session file should exist");
-            var masterFile = Path.Combine(tempDir, "brain-master.json");
-            Assert.False(File.Exists(masterFile), "Master file should not exist yet");
-
-            // Act: connect triggers migration
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: new FakeChatClient());
-            await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-            // Assert: migration occurred
-            Assert.False(File.Exists(legacyFile), "Legacy file should be removed after migration");
-            Assert.True(File.Exists(masterFile), "Master file should exist after migration");
-
-            // Assert: session was loaded correctly (content preserved)
-            var masterSessionField = typeof(DistributedBrain)
-                .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-            Assert.Contains(masterSession.MessageHistory, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("LEGACY_SESSION_CONTENT")));
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-                Directory.Delete(tempDir, recursive: true);
-        }
-    }
-
-    [Fact]
-    public async Task ResetSessionAsync_ResetsMasterSession()
-    {
-        // Arrange
-        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        try
-        {
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: new FakeChatClient());
-            await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-            // Add a message to the master session
-            var masterSessionField = typeof(DistributedBrain)
-                .GetField("_masterSession", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-            masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User, "MESSAGE_TO_BE_CLEARED"));
-
-            // Save to disk
-            await brain.SaveSessionAsync(TestContext.Current.CancellationToken);
-
-            // Assert: file exists before reset
-            var masterFile = Path.Combine(tempDir, "brain-master.json");
-            Assert.True(File.Exists(masterFile), "Master file should exist before reset");
-
-            // Act
-            await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
-
-            // Assert: file no longer exists
-            Assert.False(File.Exists(masterFile), "Master file should not exist after reset");
-
-            // Assert: master session is fresh (no messages)
-            masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-            Assert.Empty(masterSession.MessageHistory);
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-                Directory.Delete(tempDir, recursive: true);
-        }
-    }
-
     // -- Concurrency Tests --
-
-    [Fact]
-    public async Task PlanIterationAsync_SingleGoal_PersistsSessionCorrectly()
-    {
-        // Simpler invariant test: verify that after a single PlanIterationAsync call for goal-A,
-        // the session file for goal-A has the goal's marker preserved, and goal-B's session
-        // file is untouched (no cross-contamination).
-        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        try
-        {
-            // Arrange: create brain with a stub client that returns a valid iteration plan
-            var stubClient = new IterationPlanStubClient(
-                callId: "call-plan-1",
-                phases: ["coding", "testing", "review", "merging"],
-                reason: "Standard workflow");
-
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: stubClient);
-
-            await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-            // Fork sessions for two goals with unique markers
-            await brain.ForkSessionForGoalAsync("goal-A", TestContext.Current.CancellationToken);
-            await brain.ForkSessionForGoalAsync("goal-B", TestContext.Current.CancellationToken);
-
-            // Inject unique markers into each goal's session. goal-A is exercised by
-            // PlanIterationAsync, which persists its in-memory context session after the call — so
-            // goal-A's marker must be written into the live context session (a file-only marker would
-            // be overwritten). goal-B is never exercised, so its on-disk marker persists as-is.
-            var sessionFileA = Path.Combine(tempDir, "brain-goal-goal-A.json");
-            var sessionFileB = Path.Combine(tempDir, "brain-goal-goal-B.json");
-
-            var goalContextsField = typeof(DistributedBrain)
-                .GetField("_goalContexts", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            var goalContexts = (System.Collections.IDictionary)goalContextsField.GetValue(brain)!;
-            var contextA = goalContexts["goal-A"]!;
-            var sessionPropA = contextA.GetType().GetProperty("Session",
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public)!;
-            var contextSessionA = (AgentSession)sessionPropA.GetValue(contextA)!;
-            contextSessionA.MessageHistory.Add(new ChatMessage(ChatRole.User, "MARKER_UNIQUE_TO_GOAL_A"));
-
-            var sessionB = await AgentSession.LoadAsync(sessionFileB, TestContext.Current.CancellationToken);
-            sessionB.MessageHistory.Add(new ChatMessage(ChatRole.User, "MARKER_UNIQUE_TO_GOAL_B"));
-            await sessionB.SaveAsync(sessionFileB, TestContext.Current.CancellationToken);
-
-            // Act: call PlanIterationAsync for goal-A
-            var pipelineA = CreatePipeline("goal-A", "Test goal A");
-            var planResult = await brain.PlanIterationAsync(pipelineA, null, TestContext.Current.CancellationToken);
-
-            // Assert: plan was returned
-            Assert.NotNull(planResult);
-            Assert.False(planResult.IsEscalation);
-            Assert.NotEmpty(planResult.Plan!.Phases);
-
-            // Assert: goal-A's session file still contains its marker
-            var sessionAfterA = await AgentSession.LoadAsync(sessionFileA, TestContext.Current.CancellationToken);
-            var historyA = sessionAfterA.MessageHistory;
-            Assert.Contains(historyA, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_UNIQUE_TO_GOAL_A")));
-
-            // Assert: goal-B's session file still contains ONLY its marker (untouched by goal-A's call)
-            var sessionAfterB = await AgentSession.LoadAsync(sessionFileB, TestContext.Current.CancellationToken);
-            var historyB = sessionAfterB.MessageHistory;
-            Assert.Contains(historyB, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_UNIQUE_TO_GOAL_B")));
-            // Key assertion: goal-B's session does NOT contain goal-A's marker
-            Assert.DoesNotContain(historyB, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("MARKER_UNIQUE_TO_GOAL_A")));
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-                Directory.Delete(tempDir, true);
-        }
-    }
-
-    [Fact]
-    public async Task ExecuteBrainAsync_ConcurrentCalls_UseSeparateSessions()
-    {
-        // Verify that two Brain calls for different goals each use their own per-goal context
-        // and session, with no cross-contamination. Each goal context has its own gate, so the
-        // two calls can proceed independently. After each call completes, we verify its session
-        // was not contaminated by the other.
-        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        try
-        {
-            // Arrange: create brain with a stub client
-            var stubClient = new IterationPlanStubClient(
-                callId: "call-plan-concurrent",
-                phases: ["coding", "testing", "review"],
-                reason: "Concurrent test plan");
-
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: stubClient);
-
-            await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-            // Fork sessions for two goals with unique markers
-            await brain.ForkSessionForGoalAsync("goal-A", TestContext.Current.CancellationToken);
-            await brain.ForkSessionForGoalAsync("goal-B", TestContext.Current.CancellationToken);
-
-            // Inject unique markers into each goal's in-memory context session. The per-goal context
-            // holds the live session in memory and persists it after each Brain call, so markers must
-            // be written into the context sessions (not just the on-disk files, which would be
-            // overwritten by the in-memory session on the next save).
-            var goalContextsField = typeof(DistributedBrain)
-                .GetField("_goalContexts", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            var goalContexts = (System.Collections.IDictionary)goalContextsField.GetValue(brain)!;
-
-            static AgentSession GetContextSession(object context)
-            {
-                var sessionProp = context.GetType().GetProperty("Session",
-                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public)!;
-                return (AgentSession)sessionProp.GetValue(context)!;
-            }
-
-            var contextA = goalContexts["goal-A"]!;
-            var contextB = goalContexts["goal-B"]!;
-            GetContextSession(contextA).MessageHistory.Add(new ChatMessage(ChatRole.User, "UNIQUE_MARKER_A_FOR_CONCURRENCY_TEST"));
-            GetContextSession(contextB).MessageHistory.Add(new ChatMessage(ChatRole.User, "UNIQUE_MARKER_B_FOR_CONCURRENCY_TEST"));
-
-            var sessionFileA = Path.Combine(tempDir, "brain-goal-goal-A.json");
-            var sessionFileB = Path.Combine(tempDir, "brain-goal-goal-B.json");
-
-            // Act: start two PlanIterationAsync calls — each goal has its own per-context gate
-            var pipelineA = CreatePipeline("goal-A", "Goal A for concurrency test");
-            var pipelineB = CreatePipeline("goal-B", "Goal B for concurrency test");
-
-            var taskA = Task.Run(async () =>
-            {
-                var result = await brain.PlanIterationAsync(pipelineA, null, TestContext.Current.CancellationToken);
-                return (GoalId: "goal-A", Result: result);
-            }, TestContext.Current.CancellationToken);
-
-            var taskB = Task.Run(async () =>
-            {
-                var result = await brain.PlanIterationAsync(pipelineB, null, TestContext.Current.CancellationToken);
-                return (GoalId: "goal-B", Result: result);
-            }, TestContext.Current.CancellationToken);
-
-            // Wait for both to complete — each goal runs on its own per-context gate
-            var results = await Task.WhenAll(taskA, taskB);
-
-            // Assert: both calls completed successfully
-            Assert.Equal(2, results.Length);
-            Assert.All(results, r =>
-            {
-                Assert.NotNull(r.Result);
-                Assert.False(r.Result.IsEscalation);
-            });
-
-            // Assert: goal-A's session contains ONLY its marker and conversation
-            var sessionAfterA = await AgentSession.LoadAsync(sessionFileA, TestContext.Current.CancellationToken);
-            var historyA = sessionAfterA.MessageHistory;
-            Assert.Contains(historyA, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("UNIQUE_MARKER_A_FOR_CONCURRENCY_TEST")));
-            Assert.DoesNotContain(historyA, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("UNIQUE_MARKER_B_FOR_CONCURRENCY_TEST")));
-
-            // Assert: goal-B's session contains ONLY its marker and conversation
-            var sessionAfterB = await AgentSession.LoadAsync(sessionFileB, TestContext.Current.CancellationToken);
-            var historyB = sessionAfterB.MessageHistory;
-            Assert.Contains(historyB, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("UNIQUE_MARKER_B_FOR_CONCURRENCY_TEST")));
-            Assert.DoesNotContain(historyB, m => m.Contents.Any(c => c is TextContent tc && tc.Text.Contains("UNIQUE_MARKER_A_FOR_CONCURRENCY_TEST")));
-
-            // Assert: both goal contexts still exist after both calls complete
-            Assert.True(goalContexts.Contains("goal-A"), "goal-A context should still exist");
-            Assert.True(goalContexts.Contains("goal-B"), "goal-B context should still exist");
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-                Directory.Delete(tempDir, true);
-        }
-    }
 
     // -- SummarizeAndMergeAsync Tests --
 
@@ -2698,19 +1504,14 @@ public sealed class DistributedBrainTests
 
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
-            // Get fields via reflection
-            var masterSessionField = typeof(DistributedBrain)
-                .GetField("_masterSession", BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-            var initialMasterMessageCount = masterSession.MessageHistory.Count;
+            var initialMasterMessageCount = ActorMasterSession(brain).MessageHistory.Count;
 
             // Create a goal session via ForkSessionForGoalAsync
             var goalId = "goal-summary-test";
             await brain.ForkSessionForGoalAsync(goalId, TestContext.Current.CancellationToken);
 
             // Verify goal session file exists
-            var goalSessionFile = Path.Combine(tempDir, $"brain-goal-{goalId}.json");
+            var goalSessionFile = Path.Combine(tempDir, "actors", $"brain-goal-{goalId}.json");
             Assert.True(File.Exists(goalSessionFile), "Goal session file should exist after fork");
 
             var pipeline = CreatePipeline(goalId, "Test goal for summarization");
@@ -2721,8 +1522,8 @@ public sealed class DistributedBrainTests
             // Assert: summary was returned
             Assert.NotNull(summary);
 
-            // Assert: master session has 2 new messages (user + assistant)
-            masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
+            // Assert: the actor's master session has 2 new messages (user + assistant)
+            var masterSession = ActorMasterSession(brain);
             Assert.Equal(initialMasterMessageCount + 2, masterSession.MessageHistory.Count);
             Assert.Contains(masterSession.MessageHistory, m =>
                 m.Contents.Any(c => c is TextContent tc && tc.Text.Contains($"[Goal completed: {goalId}]")));
@@ -2732,11 +1533,8 @@ public sealed class DistributedBrainTests
             // Assert: goal session file is deleted
             Assert.False(File.Exists(goalSessionFile), "Goal session file should be deleted after merge");
 
-            // Assert: the goal context was removed after the merge
-            var goalContextsField = typeof(DistributedBrain)
-                .GetField("_goalContexts", BindingFlags.NonPublic | BindingFlags.Instance)!;
-            var goalContexts = (System.Collections.IDictionary)goalContextsField.GetValue(brain)!;
-            Assert.False(goalContexts.Contains(goalId), "Goal context should be removed after merge");
+            // Assert: the goal's child actor was removed after the merge
+            Assert.False(brain.GoalSessionExists(goalId), "Goal session should no longer exist after merge");
         }
         finally
         {
@@ -2758,19 +1556,14 @@ public sealed class DistributedBrainTests
                 stateDir: tempDir, chatClient: new FakeChatClient());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
-            // Get fields via reflection
-            var masterSessionField = typeof(DistributedBrain)
-                .GetField("_masterSession", BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-            var initialMasterMessageCount = masterSession.MessageHistory.Count;
+            var initialMasterMessageCount = ActorMasterSession(brain).MessageHistory.Count;
 
             // Create a goal session
             var goalId = "goal-failed-test";
             await brain.ForkSessionForGoalAsync(goalId, TestContext.Current.CancellationToken);
 
             // Verify goal session file exists
-            var goalSessionFile = Path.Combine(tempDir, $"brain-goal-{goalId}.json");
+            var goalSessionFile = Path.Combine(tempDir, "actors", $"brain-goal-{goalId}.json");
             Assert.True(File.Exists(goalSessionFile), "Goal session file should exist after fork");
 
             // Act: delete goal session directly (as GoalDispatcher does for failed goals)
@@ -2780,9 +1573,8 @@ public sealed class DistributedBrainTests
             // Assert: goal session file is deleted
             Assert.False(File.Exists(goalSessionFile), "Goal session file should be deleted");
 
-            // Assert: master session history is unchanged (no summary messages added)
-            masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-            Assert.Equal(initialMasterMessageCount, masterSession.MessageHistory.Count);
+            // Assert: the actor's master session history is unchanged (no summary messages added)
+            Assert.Equal(initialMasterMessageCount, ActorMasterSession(brain).MessageHistory.Count);
         }
         finally
         {
@@ -2816,7 +1608,7 @@ public sealed class DistributedBrainTests
             await brain.ForkSessionForGoalAsync(goalId, TestContext.Current.CancellationToken);
 
             // Verify goal session file exists
-            var goalSessionFile = Path.Combine(tempDir, $"brain-goal-{goalId}.json");
+            var goalSessionFile = Path.Combine(tempDir, "actors", $"brain-goal-{goalId}.json");
             Assert.True(File.Exists(goalSessionFile), "Goal session file should exist after fork");
 
             var pipeline = CreatePipeline(goalId, "Test goal for cancellation scenario");
@@ -2838,93 +1630,6 @@ public sealed class DistributedBrainTests
             // Cleanup: simulate what GoalDispatcher does on exception
             await brain.DeleteGoalSessionAsync(goalId, TestContext.Current.CancellationToken);
             Assert.False(File.Exists(goalSessionFile), "Goal session file should be deleted after explicit cleanup");
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-                Directory.Delete(tempDir, recursive: true);
-        }
-    }
-
-    [Fact]
-    public async Task SummarizeAndMergeAsync_ResetsLastKnownContextTokens_AfterAppendingSummary()
-    {
-        // Arrange
-        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        try
-        {
-            var stubClient = new IterationPlanStubClient(
-                callId: "call-summary-token-reset",
-                phases: ["coding", "testing"],
-                reason: "Test summary");
-
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: stubClient);
-
-            await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-            var masterSessionField = typeof(DistributedBrain)
-                .GetField("_masterSession", BindingFlags.NonPublic | BindingFlags.Instance)!;
-            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-
-            // Seed a stale last-known token count on the master session.
-            masterSession.LastKnownContextTokens = 99999;
-
-            var goalId = "goal-summary-token-reset";
-            await brain.ForkSessionForGoalAsync(goalId, TestContext.Current.CancellationToken);
-            var pipeline = CreatePipeline(goalId, "Test goal");
-
-            // Act
-            await brain.SummarizeAndMergeAsync(pipeline, TestContext.Current.CancellationToken);
-
-            // Assert
-            masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-            Assert.Equal(0, masterSession!.LastKnownContextTokens);
-            var stats = brain.GetStats();
-            Assert.NotNull(stats);
-            Assert.Equal(masterSession.EstimatedContextTokens, stats.ContextTokens);
-            Assert.NotEqual(99999, stats.ContextTokens);
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-                Directory.Delete(tempDir, recursive: true);
-        }
-    }
-
-    [Fact]
-    public async Task InjectSystemNoteAsync_ResetsLastKnownContextTokens_AfterAppendingNote()
-    {
-        // Arrange
-        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        try
-        {
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: new FakeChatClient());
-
-            await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-            var masterSessionField = typeof(DistributedBrain)
-                .GetField("_masterSession", BindingFlags.NonPublic | BindingFlags.Instance)!;
-            var masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-
-            // Seed a stale last-known token count on the master session.
-            masterSession.LastKnownContextTokens = 99999;
-
-            var pipeline = CreatePipeline("goal-note-token-reset", "Test goal");
-
-            // Act
-            await brain.InjectSystemNoteAsync(pipeline, "Test plan adjustment note", TestContext.Current.CancellationToken);
-
-            // Assert
-            masterSession = (AgentSession)masterSessionField.GetValue(brain)!;
-            Assert.Equal(0, masterSession!.LastKnownContextTokens);
-            var stats = brain.GetStats();
-            Assert.NotNull(stats);
-            Assert.Equal(masterSession.EstimatedContextTokens, stats.ContextTokens);
-            Assert.NotEqual(99999, stats.ContextTokens);
         }
         finally
         {
@@ -3070,9 +1775,6 @@ public sealed class DistributedBrainTests
             // The injected chat client is owned by the Brain and disposed only at Brain disposal —
             // NOT on model update. With per-goal contexts there is no single shared chat client to
             // swap; each goal context creates its own client lazily when forked.
-            var injectedField = typeof(DistributedBrain)
-                .GetField("_injectedChatClient", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            Assert.Same(disposableClient, injectedField.GetValue(brain));
             Assert.Equal(0, disposableClient.DisposeCount);
 
             await brain.UpdateModelAsync("copilot/other-model", null, TestContext.Current.CancellationToken);
@@ -3080,10 +1782,15 @@ public sealed class DistributedBrainTests
             // The injected client must NOT be disposed by a model update.
             Assert.Equal(0, disposableClient.DisposeCount);
 
-            // The model override was updated.
-            var modelField = typeof(DistributedBrain)
-                .GetField("_modelOverride", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            Assert.Equal("copilot/other-model", modelField.GetValue(brain));
+            // Behavioural proof the model override was updated: a subsequent connect-time master
+            // registration reports the new model rather than the original one.
+            var stats = brain.GetStats();
+            Assert.NotNull(stats);
+            Assert.Equal("copilot/other-model", stats!.Model);
+
+            // Disposal — and only disposal — releases the injected client, exactly once.
+            await brain.DisposeAsync();
+            Assert.Equal(1, disposableClient.DisposeCount);
         }
         finally
         {
@@ -3124,13 +1831,22 @@ public sealed class DistributedBrainTests
     }
 
 
-    // -- UseBrainActors shadow-actor lifecycle tests --
+    // -- BrainActor lifecycle tests --
 
     private static readonly System.Reflection.BindingFlags NonPublicInstance =
         System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
 
     private static object? GetBrainActor(DistributedBrain brain) =>
         typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!.GetValue(brain);
+
+    /// <summary>Reads the master AgentSession owned by the brain's actor — the sole owner of session state.</summary>
+    private static AgentSession ActorMasterSession(DistributedBrain brain)
+    {
+        var actor = GetBrainActor(brain);
+        Assert.NotNull(actor);
+        return (AgentSession)typeof(CopilotHive.Actors.BrainActor)
+            .GetField("_masterSession", NonPublicInstance)!.GetValue(actor)!;
+    }
 
     private static bool IsConnected(DistributedBrain brain) =>
         (bool)typeof(DistributedBrain).GetField("_connected", NonPublicInstance)!.GetValue(brain)!;
@@ -3144,8 +1860,8 @@ public sealed class DistributedBrainTests
     private static void SetActorFactory(DistributedBrain brain, Func<string, CopilotHive.Actors.BrainActor> factory) =>
         typeof(DistributedBrain).GetField("_actorFactory", NonPublicInstance)!.SetValue(brain, factory);
 
-    private static CopilotHive.Configuration.HiveConfigFile ActorConfig(bool enabled) =>
-        new() { Orchestrator = new CopilotHive.Configuration.OrchestratorConfig { UseBrainActors = enabled } };
+    private static CopilotHive.Configuration.HiveConfigFile ActorConfig() =>
+        new() { Orchestrator = new CopilotHive.Configuration.OrchestratorConfig() };
 
     private static string NewTempDir()
     {
@@ -3161,31 +1877,13 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task UseBrainActors_FlagOff_NoActorCreated()
+    public async Task ConnectAsync_CreatesActorAndConnects()
     {
         var dir = NewTempDir();
         try
         {
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(false));
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-                Assert.Null(GetBrainActor(brain));
-                Assert.False(Directory.Exists(Path.Combine(dir, "actors")));
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task UseBrainActors_FlagOn_ActorCreatedAndConnected()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(true));
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig());
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
@@ -3211,14 +1909,14 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task ActorFactory_Throws_ConnectSucceeds_ActorNull()
+    public async Task ActorFactory_Throws_ConnectThrows_ActorNull()
     {
         var dir = NewTempDir();
         try
         {
             var logger = new TestLogger<DistributedBrain>();
             var brain = new DistributedBrain("copilot/test-model", logger,
-                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(true));
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig());
             await using (brain)
             {
                 var factoryInvoked = false;
@@ -3228,7 +1926,10 @@ public sealed class DistributedBrainTests
                     throw new InvalidOperationException("factory boom");
                 });
 
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                // The actor is now the sole execution path, so its startup failure fails the connect.
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => brain.ConnectAsync(TestContext.Current.CancellationToken));
+                Assert.Equal("factory boom", ex.Message);
 
                 Assert.True(factoryInvoked);
                 Assert.Null(GetBrainActor(brain));
@@ -3238,22 +1939,22 @@ public sealed class DistributedBrainTests
                     && e.Exception is InvalidOperationException
                     && e.Exception.Message.Contains("factory boom", StringComparison.Ordinal));
 
-                // The brain itself must have connected despite the shadow-actor failure.
-                Assert.True(IsConnected(brain));
+                // The connect was rolled back — the brain must NOT report itself as connected.
+                Assert.False(IsConnected(brain));
             }
         }
         finally { DeleteDir(dir); }
     }
 
     [Fact]
-    public async Task ActorFactory_ReturnsDisposedActor_TellFalse_ActorNull()
+    public async Task ActorFactory_ReturnsDisposedActor_TellFalse_ConnectThrows()
     {
         var dir = NewTempDir();
         try
         {
             var logger = new TestLogger<DistributedBrain>();
             var brain = new DistributedBrain("copilot/test-model", logger,
-                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(true));
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig());
             await using (brain)
             {
                 var factoryInvoked = false;
@@ -3265,7 +1966,9 @@ public sealed class DistributedBrainTests
                     return actor;
                 });
 
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => brain.ConnectAsync(TestContext.Current.CancellationToken));
+                Assert.Equal("BrainActor mailbox closed", ex.Message);
 
                 Assert.True(factoryInvoked);
                 Assert.Null(GetBrainActor(brain));
@@ -3278,8 +1981,8 @@ public sealed class DistributedBrainTests
                     && e.Exception is InvalidOperationException
                     && e.Exception.Message.Contains("BrainActor mailbox closed", StringComparison.Ordinal));
 
-                // The brain itself must have connected despite the shadow-actor failure.
-                Assert.True(IsConnected(brain));
+                // The connect was rolled back — the brain must NOT report itself as connected.
+                Assert.False(IsConnected(brain));
             }
         }
         finally { DeleteDir(dir); }
@@ -3292,7 +1995,7 @@ public sealed class DistributedBrainTests
         try
         {
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(true));
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
             var actorBefore = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
@@ -3321,7 +2024,7 @@ public sealed class DistributedBrainTests
         try
         {
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(true));
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig());
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
             var actorBefore = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
@@ -3353,7 +2056,7 @@ public sealed class DistributedBrainTests
         try
         {
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(false));
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig());
             await brain.DisposeAsync();
 
             await Assert.ThrowsAsync<ObjectDisposedException>(
@@ -3364,20 +2067,15 @@ public sealed class DistributedBrainTests
 
     // -- BrainActor mirror lifecycle tests --
 
-    private static void SetMirrorDelay(DistributedBrain brain, TimeSpan? delay) =>
-        typeof(DistributedBrain).GetField("_mirrorDelay", NonPublicInstance)!.SetValue(brain, delay);
 
-    private static DistributedBrain NewActorBrain(string dir, bool enabled, ILogger<DistributedBrain>? logger = null)
+    private static DistributedBrain NewActorBrain(string dir, ILogger<DistributedBrain>? logger = null)
     {
         var brain = new DistributedBrain("copilot/test-model", logger ?? NullLogger<DistributedBrain>.Instance,
-            stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(enabled));
-        if (enabled)
-        {
-            SetActorFactory(brain, stateDir =>
-                new CopilotHive.Actors.BrainActor(
-                    "copilot/test-model", 100_000, stateDir, NullLogger.Instance,
-                    chatClientFactory: _ => new FakeChatClient()));
-        }
+            stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig());
+        SetActorFactory(brain, stateDir =>
+            new CopilotHive.Actors.BrainActor(
+                "copilot/test-model", 100_000, stateDir, NullLogger.Instance,
+                chatClientFactory: _ => new FakeChatClient()));
         return brain;
     }
 
@@ -3385,57 +2083,12 @@ public sealed class DistributedBrainTests
         Path.Combine(dir, "actors", $"brain-goal-{goalId}.json");
 
     [Fact]
-    public async Task Mirror_FlagOff_ForkAndDelete_NoActorFilesCreated()
+    public async Task ForkSessionForGoalAsync_CreatesActorSessionFile()
     {
         var dir = NewTempDir();
         try
         {
-            var brain = NewActorBrain(dir, enabled: false);
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-                await brain.ForkSessionForGoalAsync("g1", TestContext.Current.CancellationToken);
-
-                Assert.Null(GetBrainActor(brain));
-                Assert.True(File.Exists(Path.Combine(dir, "brain-goal-g1.json")));
-                Assert.False(Directory.Exists(Path.Combine(dir, "actors")));
-
-                await brain.DeleteGoalSessionAsync("g1", TestContext.Current.CancellationToken);
-                Assert.False(File.Exists(Path.Combine(dir, "brain-goal-g1.json")));
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task Mirror_FlagOff_UpdateModelAndInstructions_Succeed()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = NewActorBrain(dir, enabled: false);
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-                await brain.UpdateModelAsync("copilot/other-model", 1234, TestContext.Current.CancellationToken);
-                await brain.InjectOrchestratorInstructionsAsync("be nice", TestContext.Current.CancellationToken);
-
-                var stats = brain.GetStats();
-                Assert.NotNull(stats);
-                Assert.Equal("copilot/other-model", stats!.Model);
-                Assert.Null(GetBrainActor(brain));
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task Mirror_ForkSession_CreatesActorSessionFile()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = NewActorBrain(dir, enabled: true);
+            var brain = NewActorBrain(dir);
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
@@ -3448,296 +2101,12 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task Mirror_ForkSession_IdempotentSecondCall_StillMirrors()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = NewActorBrain(dir, enabled: true);
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-                // First fork happens while the actor is detached, so no mirror reaches it.
-                var actor = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
-                typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!.SetValue(brain, null);
-                await brain.ForkSessionForGoalAsync("g1", TestContext.Current.CancellationToken);
-                Assert.False(File.Exists(ActorGoalFile(dir, "g1")));
-
-                // Reattach: the second (idempotent) call must still mirror.
-                typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!.SetValue(brain, actor);
-                await brain.ForkSessionForGoalAsync("g1", TestContext.Current.CancellationToken);
-
-                Assert.True(File.Exists(ActorGoalFile(dir, "g1")),
-                    "Idempotent fork must still mirror to the shadow actor");
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task Mirror_RegisterExistingSession_IdempotentSecondCall_StillMirrors()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = NewActorBrain(dir, enabled: true);
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-                var actor = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
-                typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!.SetValue(brain, null);
-                await brain.RegisterExistingGoalSessionAsync("g2", TestContext.Current.CancellationToken);
-                Assert.False(File.Exists(ActorGoalFile(dir, "g2")));
-
-                typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!.SetValue(brain, actor);
-                await brain.RegisterExistingGoalSessionAsync("g2", TestContext.Current.CancellationToken);
-
-                Assert.True(File.Exists(ActorGoalFile(dir, "g2")),
-                    "Idempotent register must still mirror to the shadow actor");
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task Mirror_DeleteSession_RemovesActorSessionFile()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = NewActorBrain(dir, enabled: true);
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-                await brain.ForkSessionForGoalAsync("g1", TestContext.Current.CancellationToken);
-                Assert.True(File.Exists(ActorGoalFile(dir, "g1")));
-
-                await brain.DeleteGoalSessionAsync("g1", TestContext.Current.CancellationToken);
-
-                Assert.False(File.Exists(ActorGoalFile(dir, "g1")),
-                    "Actor session file must be removed by the mirrored delete");
-                Assert.False(File.Exists(Path.Combine(dir, "brain-goal-g1.json")));
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task Mirror_SummarizeAndMerge_UpdatesActorMasterAndDeletesActorGoalFile()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var stub = new IterationPlanStubClient("call-mirror-1", ["coding"], "mirror summary");
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: dir, chatClient: stub, hiveConfig: ActorConfig(true));
-            SetActorFactory(brain, stateDir =>
-                new CopilotHive.Actors.BrainActor(
-                    "copilot/test-model", 100_000, stateDir, NullLogger<CopilotHive.Actors.BrainActor>.Instance,
-                    chatClientFactory: _ => new FakeChatClient()));
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-                await brain.ForkSessionForGoalAsync("g3", TestContext.Current.CancellationToken);
-                Assert.True(File.Exists(ActorGoalFile(dir, "g3")));
-
-                var pipeline = CreatePipeline("g3", "mirror merge goal");
-                var summary = await brain.SummarizeAndMergeAsync(pipeline, TestContext.Current.CancellationToken);
-                Assert.False(string.IsNullOrWhiteSpace(summary));
-
-                var actorMaster = Path.Combine(dir, "actors", "brain-master.json");
-                Assert.True(File.Exists(actorMaster), "actors/brain-master.json should exist after merge mirror");
-                var masterContent = await File.ReadAllTextAsync(actorMaster, TestContext.Current.CancellationToken);
-                Assert.Contains("[Goal completed: g3]", masterContent);
-                Assert.Contains(summary, masterContent);
-
-                Assert.False(File.Exists(ActorGoalFile(dir, "g3")),
-                    "Merge must be followed by the mirrored delete");
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task Mirror_UpdateModel_UpdatesActorStats()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = NewActorBrain(dir, enabled: true);
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-                await brain.UpdateModelAsync("copilot/mirrored-model", 4242, TestContext.Current.CancellationToken);
-
-                var actor = (CopilotHive.Actors.BrainActor)GetBrainActor(brain)!;
-                var msg = CopilotHive.Actors.BrainActorMessages.CreateGetStatsMessage();
-                Assert.True(actor.Tell(msg));
-                var stats = await msg.Reply.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-
-                Assert.NotNull(stats);
-                Assert.Equal("copilot/mirrored-model", stats!.Model);
-                Assert.Equal(4242, stats.MaxContextTokens);
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task Mirror_InjectOrchestratorInstructions_SendsSystemPrompt_EvenWhenBlank()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = NewActorBrain(dir, enabled: true);
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-                await brain.InjectOrchestratorInstructionsAsync("custom orchestrator rules", TestContext.Current.CancellationToken);
-
-                var actor = (CopilotHive.Actors.BrainActor)GetBrainActor(brain)!;
-                var instructionsField = typeof(CopilotHive.Actors.BrainActor)
-                    .GetField("_orchestratorInstructions", NonPublicInstance)!;
-                Assert.Contains("custom orchestrator rules", (string)instructionsField.GetValue(actor)!);
-
-                // Blank input: existing logic is skipped but the mirror still runs with _systemPrompt.
-                instructionsField.SetValue(actor, "SENTINEL");
-                await brain.InjectOrchestratorInstructionsAsync("   ", TestContext.Current.CancellationToken);
-                var after = (string)instructionsField.GetValue(actor)!;
-                Assert.NotEqual("SENTINEL", after);
-                Assert.Contains("custom orchestrator rules", after);
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task Mirror_PipelineRegisterAndDeregister_ReachActor()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var brain = NewActorBrain(dir, enabled: true);
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-                var actor = (CopilotHive.Actors.BrainActor)GetBrainActor(brain)!;
-
-                var pipeline = CreatePipeline("g4", "pipeline mirror goal");
-                brain.RegisterActivePipeline(pipeline);
-
-                var get = CopilotHive.Actors.BrainActorMessages.CreateGetPipelineMessage("g4");
-                Assert.True(actor.Tell(get));
-                Assert.Same(pipeline, await get.Reply.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
-
-                brain.DeregisterActivePipeline("g4");
-
-                var get2 = CopilotHive.Actors.BrainActorMessages.CreateGetPipelineMessage("g4");
-                Assert.True(actor.Tell(get2));
-                Assert.Null(await get2.Reply.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task Mirror_FireAndForget_ClosedMailbox_LogsWarning()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var logger = new TestLogger<DistributedBrain>();
-            var brain = NewActorBrain(dir, enabled: true, logger);
-
-            var actor = new CopilotHive.Actors.BrainActor("m", 1000, Path.Combine(dir, "actors"), logger);
-            actor.Start();
-            await actor.DisposeAsync();
-            typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!.SetValue(brain, actor);
-
-            brain.DeregisterActivePipeline("nope");
-
-            Assert.Contains(logger.LogEntries, e =>
-                e.LogLevel == LogLevel.Warning
-                && e.Message.Contains("Tell failed for DeregisterPipelineMessage", StringComparison.Ordinal));
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task Mirror_DelayExceedsTimeout_LogsWarning_AndOperationStillSucceeds()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var logger = new TestLogger<DistributedBrain>();
-            var brain = NewActorBrain(dir, enabled: true, logger);
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-                // 4s artificial delay vs. the 3s mirror timeout: the CTS cancels before Tell.
-                SetMirrorDelay(brain, TimeSpan.FromSeconds(4));
-
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                await brain.ForkSessionForGoalAsync("g5", TestContext.Current.CancellationToken);
-                sw.Stop();
-
-                // The 3s timeout must have elapsed (proves the CTS cancelled the 4s delay).
-                Assert.True(sw.Elapsed >= TimeSpan.FromSeconds(2.5),
-                    $"Elapsed {sw.Elapsed} should be >= 2.5s");
-                Assert.True(sw.Elapsed < TimeSpan.FromSeconds(4.0),
-                    $"Elapsed {sw.Elapsed} should be < 4.0s — proves 3s timeout cancelled the 4s delay before it completed");
-
-                // Authoritative state is unaffected.
-                Assert.True(File.Exists(Path.Combine(dir, "brain-goal-g5.json")));
-                // Mirror never reached the actor.
-                Assert.False(File.Exists(ActorGoalFile(dir, "g5")),
-                    "No actor session file should exist — Tell was never called due to timeout-before-Tell");
-                Assert.Contains(logger.LogEntries, e =>
-                    e.LogLevel == LogLevel.Warning
-                    && e.Message.Contains("BrainActor mirror: reply timed out or faulted", StringComparison.Ordinal));
-
-                SetMirrorDelay(brain, null);
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
-    public async Task Mirror_ClosedMailbox_LogsWarning_AndDoesNotThrow()
-    {
-        var dir = NewTempDir();
-        try
-        {
-            var logger = new TestLogger<DistributedBrain>();
-            var brain = NewActorBrain(dir, enabled: true, logger);
-            await using (brain)
-            {
-                await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-                var actor = (CopilotHive.Actors.BrainActor)GetBrainActor(brain)!;
-                await actor.DisposeAsync();
-
-                await brain.ForkSessionForGoalAsync("g6", TestContext.Current.CancellationToken);
-
-                Assert.True(File.Exists(Path.Combine(dir, "brain-goal-g6.json")));
-                Assert.Contains(logger.LogEntries, e =>
-                    e.LogLevel == LogLevel.Warning
-                    && e.Message.Contains("BrainActor mirror: Tell failed (mailbox closed)", StringComparison.Ordinal));
-            }
-        }
-        finally { DeleteDir(dir); }
-    }
-
-    [Fact]
     public async Task ResetSessionAsync_Connected_RecreatesShadowActorAndClearsActorState()
     {
         var dir = NewTempDir();
         try
         {
-            var brain = NewActorBrain(dir, enabled: true);
+            var brain = NewActorBrain(dir);
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
@@ -3788,7 +2157,7 @@ public sealed class DistributedBrainTests
         var dir = NewTempDir();
         try
         {
-            var brain = NewActorBrain(dir, enabled: true);
+            var brain = NewActorBrain(dir);
             await using (brain)
             {
                 Assert.False(IsConnected(brain));

@@ -14,19 +14,15 @@ using Microsoft.Extensions.AI;
 
 using SharpCoder;
 
-using System.Collections.Concurrent;
-using System.ComponentModel;
-using System.Text.Json;
 
 namespace CopilotHive.Orchestration;
 
 /// <summary>
 /// LLM-powered brain that runs inside the orchestrator container.
 /// The Brain has two jobs: plan iteration phases and craft worker prompts.
-/// Maintains a master AgentSession with shared context (system notes,
-/// orchestrator instructions) and forks per-goal sessions from it to
-/// isolate each goal's conversation. File tools give the Brain read-only
-/// access to target repositories via BrainRepoManager clones.
+/// All session state (master session, per-goal forked sessions) and LLM
+/// execution live in the <see cref="BrainActor"/>; this class is a thin,
+/// message-passing facade over it.
 /// </summary>
 public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 {
@@ -50,32 +46,15 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// </summary>
     public string StateDirectory => _stateDir;
 
-    private AgentSession _masterSession;
-
-    /// <summary>Per-goal Brain contexts, each with its own gate, chat client, coding agent, and session.</summary>
-    private readonly ConcurrentDictionary<string, GoalBrainContext> _goalContexts = new();
-
-    /// <summary>Goal IDs currently being deleted, guarded so no new context is created during teardown.</summary>
-    private readonly ConcurrentDictionary<string, bool> _deletingGoals = new();
-
     private volatile bool _disposing;
     private bool _resetting;
     private bool _connected;
 
-    /// <summary>Shadow brain actor, created on connect when <c>UseBrainActors</c> is enabled.</summary>
+    /// <summary>The brain actor — the sole execution path for Brain LLM calls and session state.</summary>
     private BrainActor? _brainActor;
 
-    /// <summary>
-    /// Connect-time snapshot of <c>UseBrainActors</c>. Captured once in <see cref="ConnectAsync"/>
-    /// so runtime config reloads cannot toggle the shadow-actor behaviour.
-    /// </summary>
-    private bool _useBrainActors;
-
-    /// <summary>Test seam for constructing the shadow actor from a state directory.</summary>
+    /// <summary>Test seam for constructing the actor from a state directory.</summary>
     internal Func<string, BrainActor>? _actorFactory;
-
-    /// <summary>Test seam: artificial delay applied before mirroring a message to the shadow actor.</summary>
-    internal TimeSpan? _mirrorDelay;
 
     /// <summary>Test seam: deletes a file during reset. Default is File.Delete.</summary>
     internal Action<string> _fileDeleter = File.Delete;
@@ -87,20 +66,13 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly object _lifecycleLock = new();
     private Task? _disposeTask;
 
-    /// <summary>An externally-injected chat client shared across contexts (never owned/disposed by a context).</summary>
+    /// <summary>An externally-injected chat client passed to the actor (never owned/disposed here).</summary>
     private readonly IChatClient? _injectedChatClient;
 
-    /// <summary>Flows the current goal's Brain context across async calls within a single Brain operation.</summary>
-    private readonly AsyncLocal<GoalBrainContext?> _currentContext = new();
-
     private string _systemPrompt;
-    private readonly List<AITool> _brainTools;
     private readonly AgentsManager? _agentsManager;
 
-    /// <summary>Active pipeline snapshots keyed by goal ID, used by the <c>get_goal</c> tool.</summary>
-    private readonly ConcurrentDictionary<string, GoalPipeline> _activePipelines = new();
-
-    /// <summary>Serialises session-state mutations (master session, model settings, registered goals, session files).</summary>
+    /// <summary>Serialises brain lifecycle transitions (connect, reset, dispose).</summary>
     private readonly SemaphoreSlim _sessionLock = new(1, 1);
 
     private const string DefaultSystemPrompt = BrainPromptBuilder.DefaultSystemPrompt;
@@ -135,12 +107,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _chatClientFactory = chatClientFactory ?? ChatClientFactory.Create;
         _hiveConfig = hiveConfig;
         _sessionRegistry = sessionRegistry;
-        _masterSession = AgentSession.Create("brain");
 
         var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(modelOverride);
         _reasoningEffort = reasoning;
-
-        _brainTools = BuildBrainTools();
 
         var orchestratorInstructions = agentsManager?.GetAgentsMd(WorkerRole.Orchestrator) ?? "";
         _systemPrompt = string.IsNullOrWhiteSpace(orchestratorInstructions)
@@ -148,8 +117,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             : $"{DefaultSystemPrompt}\n\n{orchestratorInstructions}";
     }
 
-    /// <summary>Loads or creates the master Brain session. Idempotent. Per-goal agents and
-    /// chat clients are created lazily via <see cref="CreateGoalBrainContextAsync"/>.</summary>
+    /// <summary>Starts the brain actor, which owns the master session and all per-goal sessions. Idempotent.</summary>
     public async Task ConnectAsync(CancellationToken ct = default)
     {
         _logger.LogInformation("Brain connecting with model '{Model}'…", _modelOverride);
@@ -163,42 +131,30 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             if (_connected)
                 return;
 
-            // Try to load a persisted master session from a previous run.
-            // Migrate legacy brain-session.json to brain-master.json if needed.
-            var masterFile = GetMasterSessionFilePath();
-            var oldFile = Path.Combine(_stateDir, "brain-session.json");
-            if (File.Exists(oldFile) && !File.Exists(masterFile))
-            {
-                File.Move(oldFile, masterFile);
-                _logger.LogInformation("Migrated brain-session.json to brain-master.json");
-            }
-            if (File.Exists(masterFile))
-            {
-                try
-                {
-                    _masterSession = await AgentSession.LoadAsync(masterFile, ct);
-                    _logger.LogInformation("Loaded Brain master session with {Count} messages from {File}",
-                        _masterSession.MessageHistory.Count, masterFile);
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to load Brain master session from {File} — starting fresh", masterFile);
-                    _masterSession = AgentSession.Create("brain");
-                }
-            }
-
-            RefreshMasterSessionRegistry();
-
             _connected = true;
 
-            // Capture the flag once — runtime config reloads must not toggle the shadow.
-            _useBrainActors = _hiveConfig?.Orchestrator?.UseBrainActors == true;
+            try
+            {
+                await StartBrainActorAsync(ct, throwOnFailure: true);
+            }
+            catch
+            {
+                _connected = false;
+                _sessionRegistry?.Unregister("brain-master");
+                throw;
+            }
 
-            await StartShadowActorAsync(ct);
+            RegisterMasterSessionFromActor();
+
+            if (_disposing)
+            {
+                var actor = Interlocked.Exchange(ref _brainActor, null);
+                if (actor is not null)
+                    await actor.DisposeAsync();
+                _connected = false;
+                _sessionRegistry?.Unregister("brain-master");
+                throw new ObjectDisposedException(nameof(DistributedBrain));
+            }
         }
         finally
         {
@@ -210,14 +166,56 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
-    /// Starts the shadow <see cref="BrainActor"/> when enabled. Startup failures are logged and
-    /// leave the brain fully functional without a shadow; caller cancellation propagates.
+    /// Registers the <c>brain-master</c> session entry using stats queried from the actor,
+    /// falling back to locally-configured values when the actor cannot answer in time.
     /// </summary>
-    private async Task StartShadowActorAsync(CancellationToken ct, bool throwOnFailure = false)
+    private void RegisterMasterSessionFromActor()
     {
-        if (!_useBrainActors)
-            return;
+        var info = new LlmSessionInfo
+        {
+            SessionId = "brain-master",
+            SessionType = LlmSessionType.Brain,
+            Model = _modelOverride,
+            Status = "idle",
+            CurrentTokens = 0,
+            MaxTokens = _maxContextTokens,
+        };
 
+        try
+        {
+            if (Volatile.Read(ref _brainActor) is { } actor)
+            {
+                var statsMsg = BrainActorMessages.CreateGetStatsMessage();
+                if (actor.Tell(statsMsg))
+                {
+                    using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                    var stats = statsMsg.Reply.Task.WaitAsync(timeoutCts.Token).GetAwaiter().GetResult();
+                    if (stats is not null)
+                    {
+                        info = info with
+                        {
+                            Model = stats.Model,
+                            CurrentTokens = stats.ContextTokens,
+                            MaxTokens = stats.MaxContextTokens,
+                        };
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to query BrainActor stats on connect — registering fallback values");
+        }
+
+        _sessionRegistry?.RegisterOrUpdate(info);
+    }
+
+    /// <summary>
+    /// Starts the <see cref="BrainActor"/>. Startup failures are logged; when
+    /// <paramref name="throwOnFailure"/> is set they are rethrown. Caller cancellation propagates.
+    /// </summary>
+    private async Task StartBrainActorAsync(CancellationToken ct, bool throwOnFailure = false)
+    {
         BrainActor? actor = null;
         try
         {
@@ -252,7 +250,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             Volatile.Write(ref _brainActor, actor);
             actor = null;
-            _logger.LogInformation("BrainActor shadow started (state dir: {Dir})", actorStateDir);
+            _logger.LogInformation("BrainActor started (state dir: {Dir})", actorStateDir);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -261,7 +259,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "BrainActor startup failed — shadow disabled");
+            _logger.LogWarning(ex, "BrainActor startup failed");
             await DisposeActorSafelyAsync(actor);
             if (throwOnFailure) throw;
         }
@@ -283,7 +281,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// </summary>
     private void MigrateSessionFiles(string actorStateDir)
     {
-        if (_resetting)
+        if (Volatile.Read(ref _resetting))
             return;
 
         var markerPath = Path.Combine(actorStateDir, ".migrated");
@@ -332,124 +330,72 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
-    /// Mirrors a lifecycle message to the shadow actor and awaits its reply. The shadow is
-    /// non-authoritative: a missing actor, a closed mailbox, a timeout or a fault is logged
-    /// as a warning and never propagated to the caller.
+    /// Sends a message to the actor and awaits its reply. Errors are never swallowed:
+    /// a missing actor or closed mailbox throws <see cref="InvalidOperationException"/>,
+    /// an elapsed <paramref name="timeout"/> throws <see cref="TimeoutException"/>,
+    /// caller cancellation surfaces as <see cref="OperationCanceledException"/>, and a faulted
+    /// reply propagates its own exception.
     /// </summary>
-    private async Task MirrorAsync<T>(IBrainMessage message, TaskCompletionSource<T> reply, TimeSpan timeout)
+    private async Task<T> AskActorAsync<T>(IBrainMessage message, TaskCompletionSource<T> reply,
+        CancellationToken ct, TimeSpan timeout)
     {
-        if (Volatile.Read(ref _brainActor) is not { } actor)
-            return;
-
-        using var cts = new CancellationTokenSource(timeout);
-
-        if (_mirrorDelay is { } delay)
-        {
-            try { await Task.Delay(delay, cts.Token); }
-            catch (OperationCanceledException) { /* timeout elapsed before Tell */ }
-
-            if (cts.IsCancellationRequested)
-            {
-                _logger.LogWarning("BrainActor mirror: reply timed out or faulted");
-                return;
-            }
-        }
+        var actor = Volatile.Read(ref _brainActor)
+            ?? throw new InvalidOperationException("BrainActor not available.");
 
         if (!actor.Tell(message))
-        {
-            _logger.LogWarning("BrainActor mirror: Tell failed (mailbox closed)");
-            return;
-        }
+            throw new InvalidOperationException("BrainActor mailbox closed.");
+
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(timeout);
 
         try
         {
-            await reply.Task.WaitAsync(cts.Token);
+            return await reply.Task.WaitAsync(timeoutCts.Token);
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeoutCts.IsCancellationRequested)
         {
-            _logger.LogWarning(ex, "BrainActor mirror: reply timed out or faulted");
+            throw new TimeoutException(
+                $"BrainActor did not respond to {message.GetType().Name} within {timeout.TotalSeconds}s.");
         }
     }
 
-    /// <summary>Mirrors a fire-and-forget message to the shadow actor, logging a closed mailbox.</summary>
-    private void MirrorFireAndForget(IBrainMessage message)
+    /// <summary>Throws when the brain is currently being reset.</summary>
+    private void EnsureNotResetting()
     {
-        if (Volatile.Read(ref _brainActor) is not { } actor)
-            return;
-
-        if (!actor.Tell(message))
-            _logger.LogWarning("BrainActor mirror: Tell failed for {Type} (mailbox closed)", message.GetType().Name);
-    }
-
-    /// <summary>
-    /// Fires a note injection to the shadow BrainActor for a goal session.
-    /// Fire-and-forget: never blocks the caller, never propagates exceptions.
-    /// </summary>
-    private void FireShadowNote(string goalId, string note)
-    {
-        if (!_useBrainActors)
-            return;
-
-        if (Volatile.Read(ref _brainActor) is not { } actor)
-            return;
-
-        var msg = BrainActorMessages.CreateInjectNoteOnChildMessage(goalId, note);
-        if (!actor.Tell(msg))
-        {
-            _logger.LogWarning("FireShadowNote: Tell failed for goal {GoalId} (mailbox closed)", goalId);
-            return;
-        }
-
-        _logger.LogInformation("Shadow note injection fired for goal {GoalId}", goalId);
-
-        msg.Reply.Task.ContinueWith(
-            t =>
-            {
-                if (t.IsCompletedSuccessfully)
-                    _logger.LogInformation("Shadow note injection completed for goal {GoalId}", goalId);
-                else if (t.IsFaulted)
-                    _logger.LogWarning(t.Exception, "FireShadowNote: shadow faulted for goal {GoalId}", goalId);
-                else if (t.IsCanceled)
-                    _logger.LogInformation("Shadow note injection canceled for goal {GoalId}", goalId);
-            },
-            TaskContinuationOptions.ExecuteSynchronously);
+        if (Volatile.Read(ref _resetting))
+            throw new InvalidOperationException("Brain is being reset.");
     }
 
     /// <inheritdoc />
     public async Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default)
     {
         EnsureConnected();
+        EnsureNotResetting();
 
-        await _sessionLock.WaitAsync(ct);
-        try
+        // The actor is the source of truth: its update must succeed before any local or registry
+        // state is published, otherwise a failed update would leave the two permanently divergent.
+        var updateMsg = BrainActorMessages.CreateUpdateModelMessage(model, maxContextTokens);
+        await AskActorAsync(updateMsg, updateMsg.Reply, ct, TimeSpan.FromSeconds(3));
+
+        _modelOverride = model;
+        if (maxContextTokens.HasValue)
+            _maxContextTokens = maxContextTokens.Value;
+
+        var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
+        _reasoningEffort = reasoning;
+
+        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
         {
-            _modelOverride = model;
-            if (maxContextTokens.HasValue)
-                _maxContextTokens = maxContextTokens.Value;
-
-            var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
-            _reasoningEffort = reasoning;
-
-            // Refresh the master session registry entry. Existing goal contexts keep their original
-            // model/maxContextTokens snapshot (captured at fork time) — only NEW contexts created
-            // after this update will use the new config.
-            _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
-            {
-                SessionId = "brain-master",
-                SessionType = LlmSessionType.Brain,
-                Model = _modelOverride,
-                Status = "idle",
-                CurrentTokens = _masterSession.EstimatedContextTokens,
-                MaxTokens = _maxContextTokens,
-            });
-        }
-        finally { _sessionLock.Release(); }
+            SessionId = "brain-master",
+            SessionType = LlmSessionType.Brain,
+            Model = _modelOverride,
+            Status = "idle",
+            CurrentTokens = 0,
+            MaxTokens = _maxContextTokens,
+        });
 
         _logger.LogInformation("Brain model updated to '{Model}' with context window {ContextWindow}",
             model, _maxContextTokens);
-
-        var updateMsg = BrainActorMessages.CreateUpdateModelMessage(model, maxContextTokens);
-        await MirrorAsync(updateMsg, updateMsg.Reply, TimeSpan.FromSeconds(3));
     }
 
     /// <inheritdoc />
@@ -470,63 +416,17 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <param name="pipeline">The active goal pipeline.</param>
     public void RegisterActivePipeline(GoalPipeline pipeline)
     {
-        _activePipelines[pipeline.GoalId] = pipeline;
-        MirrorFireAndForget(new RegisterPipelineMessage(pipeline.GoalId, pipeline));
+        var actor = Volatile.Read(ref _brainActor);
+        if (actor is not null && !actor.Tell(new RegisterPipelineMessage(pipeline.GoalId, pipeline)))
+            _logger.LogWarning("RegisterPipeline: Tell failed for goal {GoalId} (mailbox closed)", pipeline.GoalId);
     }
 
     /// <summary>Removes a pipeline from the active-pipeline registry once a goal completes or fails.</summary>
     public void DeregisterActivePipeline(string goalId)
     {
-        _activePipelines.TryRemove(goalId, out _);
-        MirrorFireAndForget(new DeregisterPipelineMessage(goalId));
-    }
-
-    /// <summary>Builds the AIFunction tools that the Brain LLM can call.</summary>
-    private List<AITool> BuildBrainTools()
-    {
-        var pipelineResolver = (Func<string, Task<GoalPipeline?>>)(goalId =>
-            Task.FromResult(_activePipelines.TryGetValue(goalId, out var p) ? p : null));
-
-        return
-        [
-            AIFunctionFactory.Create(
-                ([Description("The question to forward to the Composer for resolution.")] string question,
-                 [Description("The reason why the Brain cannot answer this question from the codebase.")] string reason) =>
-                {
-                    var ctx = _currentContext.Value;
-                    if (ctx is null)
-                    {
-                        _logger.LogWarning("Tool call with no active context");
-                        return "Tool call with no active context.";
-                    }
-                    ctx.LastToolCallResult = new EscalateResult(question, reason);
-                    return "Escalation recorded.";
-                },
-                "escalate_to_composer",
-                "Escalate a question to the Composer when the Brain cannot answer from the codebase alone."),
-            AIFunctionFactory.Create(
-                ([Description("Ordered phase names, e.g. [\"coding\",\"testing\",\"docwriting\",\"review\",\"merging\"]")] string[] phases,
-                 [Description("JSON object with per-phase instructions.\n  Single-round: {\"coding\": \"...\", \"review\": \"...\"}\n  Multi-round:  {\"coding-1\": \"step 1: revert...\", \"coding-2\": \"step 2: restructure...\", \"review\": \"...\"}")] string phase_instructions,
-                 [Description("Why you chose this iteration plan")] string reason,
-                 [Description("Optional JSON-encoded dict of phase name to model tier, e.g. {\"coding\":\"premium\"}. Valid phases: coding, testing, docwriting, review, improve. Valid tiers: standard, premium. Omitted phases use the default tier.")] string? model_tiers = null) =>
-                {
-                    var (valid, validationError) = BrainTools.ValidateIterationPlan(
-                        phases ?? [], phase_instructions, reason, model_tiers);
-                    if (!valid) return validationError!;
-
-                    var ctx = _currentContext.Value;
-                    if (ctx is null)
-                    {
-                        _logger.LogWarning("Tool call with no active context");
-                        return "Tool call with no active context.";
-                    }
-                    ctx.LastToolCallResult = new IterationPlanResult(phases ?? [], phase_instructions, reason, model_tiers);
-                    return "Iteration plan recorded.";
-                },
-                "report_iteration_plan",
-                "Report your iteration plan — which phases to run and in what order."),
-            .. BrainTools.BuildDependencyTools(_goalStore, pipelineResolver, _knowledgeGraph, _logger),
-        ];
+        var actor = Volatile.Read(ref _brainActor);
+        if (actor is not null && !actor.Tell(new DeregisterPipelineMessage(goalId)))
+            _logger.LogWarning("DeregisterPipeline: Tell failed for goal {GoalId} (mailbox closed)", goalId);
     }
 
     /// <summary>Base type for results captured from Brain tool calls.</summary>
@@ -544,327 +444,93 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         string? ModelTiers)
         : BrainToolCallResult("report_iteration_plan");
 
-    /// <summary>Creates all per-goal Brain resources (chat client, compaction client, coding
-    /// agent) and persists the goal session. Callers must hold <see cref="_sessionLock"/>.</summary>
-    private async Task<GoalBrainContext> CreateGoalBrainContextAsync(string goalId, AgentSession session, CancellationToken ct)
-    {
-        var model = _modelOverride;
-        var maxTokens = _maxContextTokens;
-        var reasoning = _reasoningEffort;
-        var systemPrompt = _systemPrompt;
-
-        IChatClient chatClient;
-        bool ownsClient;
-        if (_injectedChatClient is not null) { chatClient = _injectedChatClient; ownsClient = false; }
-        else { chatClient = _chatClientFactory(model); ownsClient = true; }
-
-        IChatClient? compactionClient = null;
-        try
-        {
-            compactionClient = !string.IsNullOrEmpty(_compactionModel)
-                ? ChatClientFactory.Create(_compactionModel) : null;
-
-            var workDir = _repoManager?.WorkDirectory ?? _stateDir;
-            var agent = new CodingAgent(chatClient, new AgentOptions
-            {
-                WorkDirectory = workDir,
-                MaxSteps = _maxSteps,
-                EnableBash = false,
-                EnableFileOps = _repoManager is not null,
-                EnableFileWrites = false,
-                EnableSkills = false,
-                SystemPrompt = systemPrompt,
-                CustomTools = _brainTools,
-                MaxContextTokens = maxTokens,
-                EnableAutoCompaction = true,
-                AutoLoadWorkspaceInstructions = false,
-                ReasoningEffort = reasoning,
-                Logger = _logger,
-                CompactionClient = compactionClient,
-                CompactionMaxTokens = !string.IsNullOrEmpty(_compactionModel)
-                    ? _hiveConfig?.TryGetContextWindowForModel(_compactionModel)
-                    : null,
-                OnCompacted = r =>
-                {
-                    _logger.LogInformation(
-                        "Brain context compaction: {TokensBefore} \u2192 {TokensAfter} tokens ({ReductionPercent}% reduction), {MessagesBefore} \u2192 {MessagesAfter} messages",
-                        r.TokensBefore, r.TokensAfter, r.ReductionPercent, r.MessagesBefore, r.MessagesAfter);
-                },
-            });
-
-            await session.SaveAsync(GetGoalSessionFilePath(goalId), ct);
-
-            _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
-            {
-                SessionId = $"brain-goal-{goalId}",
-                SessionType = LlmSessionType.BrainGoal,
-                GoalId = goalId,
-                Model = model,
-                Status = "idle",
-                CurrentTokens = session.EstimatedContextTokens,
-                MaxTokens = maxTokens,
-            });
-
-            return new GoalBrainContext(goalId, chatClient, ownsClient, compactionClient, agent, session, model, maxTokens, reasoning, systemPrompt);
-        }
-        catch
-        {
-            // Dispose partial resources on failure. CodingAgent is not IDisposable.
-            try { compactionClient?.Dispose(); } catch { }
-            if (ownsClient) { try { chatClient.Dispose(); } catch { } }
-            throw;
-        }
-    }
-
-    /// <summary>Returns the file path for a goal-specific forked session.</summary>
-    private string GetGoalSessionFilePath(string goalId)
-        => Path.Combine(_stateDir, $"brain-goal-{goalId}.json");
-
-    /// <summary>Returns the file path for the master Brain session.</summary>
-    private string GetMasterSessionFilePath() => Path.Combine(_stateDir, "brain-master.json");
-
-    /// <summary>Refreshes the <c>brain-master</c> registry entry with the current master session tokens.</summary>
-    private void RefreshMasterSessionRegistry(long? currentTokens = null)
-    {
-        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
-        {
-            SessionId = "brain-master",
-            SessionType = LlmSessionType.Brain,
-            Model = _modelOverride,
-            Status = "idle",
-            CurrentTokens = currentTokens ?? _masterSession.EstimatedContextTokens,
-            MaxTokens = _maxContextTokens,
-        });
-    }
-
-    /// <summary>Forks the master session for a goal and creates a dedicated Brain context.</summary>
+    /// <summary>Forks the master session for a goal inside the brain actor.</summary>
     /// <inheritdoc />
     public async Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default)
     {
         EnsureConnected();
-
-        await _sessionLock.WaitAsync(ct);
-        try
-        {
-            if (_disposing)
-                throw new InvalidOperationException("Brain is being disposed.");
-            if (_resetting)
-                throw new InvalidOperationException("Brain is being reset.");
-            if (_deletingGoals.ContainsKey(goalId))
-                throw new InvalidOperationException($"Goal '{goalId}' is being deleted.");
-
-            // Idempotent: skip creation when a context already exists, but still mirror below.
-            if (!_goalContexts.ContainsKey(goalId))
-            {
-                var goalSession = _masterSession.Fork($"brain-goal-{goalId}");
-                var context = await CreateGoalBrainContextAsync(goalId, goalSession, ct);
-                _goalContexts[goalId] = context;
-
-                _logger.LogInformation("Forked master session for goal '{GoalId}' ({Messages} messages)",
-                    goalId, goalSession.MessageHistory.Count);
-            }
-        }
-        finally
-        {
-            _sessionLock.Release();
-        }
+        if (_disposing)
+            throw new InvalidOperationException("Brain is being disposed.");
+        EnsureNotResetting();
 
         var forkMsg = BrainActorMessages.CreateForkSessionMessage(goalId);
-        await MirrorAsync(forkMsg, forkMsg.Reply, TimeSpan.FromSeconds(3));
+        await AskActorAsync(forkMsg, forkMsg.Reply, ct, TimeSpan.FromSeconds(3));
     }
 
-    /// <summary>Loads (or forks) an existing goal session from disk and creates its Brain context.</summary>
+    /// <summary>Registers an already-existing goal session inside the brain actor.</summary>
     /// <inheritdoc />
     public async Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default)
     {
         EnsureConnected();
-
-        await _sessionLock.WaitAsync(ct);
-        try
-        {
-            if (_disposing)
-                throw new InvalidOperationException("Brain is being disposed.");
-            if (_resetting)
-                throw new InvalidOperationException("Brain is being reset.");
-            if (_deletingGoals.ContainsKey(goalId))
-                throw new InvalidOperationException($"Goal '{goalId}' is being deleted.");
-
-            // Idempotent: skip creation when a context already exists, but still mirror below.
-            if (!_goalContexts.ContainsKey(goalId))
-            {
-                var session = await LoadOrForkGoalSessionAsync(goalId, ct);
-                _goalContexts[goalId] = await CreateGoalBrainContextAsync(goalId, session, ct);
-
-                _logger.LogInformation("Registered existing Brain context for goal '{GoalId}' ({Messages} messages)",
-                    goalId, session.MessageHistory.Count);
-            }
-        }
-        finally
-        {
-            _sessionLock.Release();
-        }
+        if (_disposing)
+            throw new InvalidOperationException("Brain is being disposed.");
+        EnsureNotResetting();
 
         var regMsg = BrainActorMessages.CreateRegisterExistingSessionMessage(goalId);
-        await MirrorAsync(regMsg, regMsg.Reply, TimeSpan.FromSeconds(3));
+        await AskActorAsync(regMsg, regMsg.Reply, ct, TimeSpan.FromSeconds(3));
     }
 
-    /// <summary>Loads a goal session from disk, falling back to a fresh fork of the master session.</summary>
-    private async Task<AgentSession> LoadOrForkGoalSessionAsync(string goalId, CancellationToken ct)
-    {
-        var goalSessionFile = GetGoalSessionFilePath(goalId);
-        if (!File.Exists(goalSessionFile))
-            return _masterSession.Fork($"brain-goal-{goalId}");
-
-        try
-        {
-            return await AgentSession.LoadAsync(goalSessionFile, ct);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex,
-                "Failed to load existing goal session for '{GoalId}' — forking from master", goalId);
-            return _masterSession.Fork($"brain-goal-{goalId}");
-        }
-    }
-
-    /// <summary>Deletes the persisted goal session file and disposes the goal's Brain context.</summary>
+    /// <summary>Deletes the goal session and its child actor inside the brain actor.</summary>
     /// <inheritdoc />
     public async Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default)
     {
-        await DeleteGoalSessionCoreAsync(goalId, ct);
+        EnsureConnected();
+        EnsureNotResetting();
 
         var deleteMsg = BrainActorMessages.CreateDeleteSessionMessage(goalId);
-        await MirrorAsync(deleteMsg, deleteMsg.Reply, TimeSpan.FromSeconds(3));
-    }
-
-    /// <summary>Authoritative goal-session deletion without shadow-actor mirroring.</summary>
-    private async Task DeleteGoalSessionCoreAsync(string goalId, CancellationToken ct)
-    {
-        EnsureConnected();
-
-        await _sessionLock.WaitAsync(ct);
-        GoalBrainContext? context;
-        try
-        {
-            // Single-owner deletion: if another call is already deleting this goal, return early.
-            // Only the owning delete adds the marker and removes it in the finally block, so a
-            // concurrent duplicate delete cannot clear the marker while the owner is still draining.
-            if (_deletingGoals.ContainsKey(goalId))
-                return;
-
-            _deletingGoals[goalId] = true;
-            _goalContexts.TryRemove(goalId, out context);
-        }
-        finally { _sessionLock.Release(); }
-
-        try
-        {
-            if (context is not null)
-            {
-                context.Release(); // release dictionary reference
-                await context.WaitForDrainAsync(); // non-cancelable — must drain
-                try { context.ActiveCallCts?.Cancel(); } catch { }
-            }
-
-            var file = GetGoalSessionFilePath(goalId);
-            try { if (File.Exists(file)) File.Delete(file); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete session file for {GoalId}", goalId); }
-
-            _sessionRegistry?.Unregister($"brain-goal-{goalId}");
-
-            if (context is not null)
-            {
-                try { await context.DisposeAsync(); }
-                catch (Exception ex) { _logger.LogWarning(ex, "Failed to dispose context for {GoalId}", goalId); }
-            }
-        }
-        finally
-        {
-            _deletingGoals.TryRemove(goalId, out _);
-        }
+        await AskActorAsync(deleteMsg, deleteMsg.Reply, ct, TimeSpan.FromSeconds(3));
     }
 
     /// <inheritdoc />
     public bool GoalSessionExists(string goalId)
     {
-        _sessionLock.Wait();
+        if (Volatile.Read(ref _brainActor) is not { } actor)
+            return false;
+
+        var msg = BrainActorMessages.CreateGoalSessionExistsMessage(goalId);
+        if (!actor.Tell(msg))
+            return false;
+
         try
         {
-            return File.Exists(GetGoalSessionFilePath(goalId));
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            return msg.Reply.Task.WaitAsync(cts.Token).GetAwaiter().GetResult();
         }
-        finally
+        catch
         {
-            _sessionLock.Release();
+            return false;
         }
-    }
-
-    /// <summary>Persists the master Brain session to disk.</summary>
-    internal async Task SaveSessionAsync(CancellationToken ct = default)
-    {
-        await _sessionLock.WaitAsync(ct);
-        try
-        {
-            await SaveSessionCoreAsync(ct);
-        }
-        finally
-        {
-            _sessionLock.Release();
-        }
-    }
-
-    /// <summary>Core master-session save logic. Callers must hold <see cref="_sessionLock"/>.</summary>
-    private async Task SaveSessionCoreAsync(CancellationToken ct)
-    {
-        var path = GetMasterSessionFilePath();
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        await _masterSession.SaveAsync(path, ct);
-        _logger.LogDebug("Brain master session saved ({Count} messages)", _masterSession.MessageHistory.Count);
     }
 
     /// <inheritdoc/>
     public async Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct)
     {
         EnsureConnected();
+        EnsureNotResetting();
 
         pipeline.Conversation.Add(new ConversationEntry("system", note, pipeline.Iteration, "plan-adjustment"));
 
-        await _sessionLock.WaitAsync(ct);
-        try
-        {
-            _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User,
-                $"SYSTEM NOTE (plan adjustment for goal {pipeline.GoalId}):\n\n{note}"));
-            _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.Assistant,
-                "Acknowledged. I have noted the plan adjustment and will craft prompts for all phases in the final plan."));
-            _masterSession.LastKnownContextTokens = 0;
-            RefreshMasterSessionRegistry();
-        }
-        finally { _sessionLock.Release(); }
-
         _logger.LogInformation("Injected plan adjustment note for goal {GoalId}: {Note}", pipeline.GoalId, note);
 
-        FireShadowNote(pipeline.GoalId, note);
+        var msg = BrainActorMessages.CreateInjectNoteOnChildMessage(pipeline.GoalId, note);
+        await AskActorAsync(msg, msg.Reply, ct, TimeSpan.FromSeconds(3));
     }
 
     /// <inheritdoc/>
     public async Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default)
     {
         EnsureConnected();
+        EnsureNotResetting();
 
         if (!string.IsNullOrWhiteSpace(instructions))
         {
-            await _sessionLock.WaitAsync(ct);
-            try
-            {
-                _systemPrompt = $"{DefaultSystemPrompt}\n\n{instructions}";
-            }
-            finally { _sessionLock.Release(); }
-
+            _systemPrompt = $"{DefaultSystemPrompt}\n\n{instructions}";
             _logger.LogInformation("Updated Brain system prompt with new orchestrator instructions ({Chars} chars)",
                 instructions.Length);
         }
 
         var injectMsg = BrainActorMessages.CreateInjectOrchestratorInstructionsMessage(_systemPrompt);
-        await MirrorAsync(injectMsg, injectMsg.Reply, TimeSpan.FromSeconds(3));
+        await AskActorAsync(injectMsg, injectMsg.Reply, ct, TimeSpan.FromSeconds(3));
     }
 
     /// <summary>Asks the Brain to plan which phases should run during the current iteration.</summary>
@@ -882,7 +548,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             for (int attempt = 1; attempt <= maxToolAttempts; attempt++)
             {
                 var (response, toolCall) = await Shared.CopilotRetryPolicy.ExecuteAsync(
-                    () => ExecuteBrainAsync(currentPrompt, pipeline.GoalId, ct, status: "planning"),
+                    () => ExecuteBrainAsync(currentPrompt, pipeline.GoalId, ct),
                     onRetry: (retryAttempt, delay, ex) =>
                     {
                         _logger.LogWarning(
@@ -951,33 +617,29 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     public async Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default)
     {
         EnsureConnected();
+        EnsureNotResetting();
 
         var prompt = BrainPromptBuilder.BuildSummarizePrompt(pipeline);
-        var (summaryText, _) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct, status: "summarizing");
+        var (summaryText, _) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct);
         var summary = string.IsNullOrWhiteSpace(summaryText)
             ? $"Goal '{pipeline.GoalId}' completed."
             : summaryText.Trim();
 
-        // Merge into master (AFTER releasing lease + gate — NO nested locks)
-        await _sessionLock.WaitAsync(ct);
-        try
+        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
         {
-            _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.User,
-                $"[Goal completed: {pipeline.GoalId}] Summarize what was done."));
-            _masterSession.MessageHistory.Add(new ChatMessage(ChatRole.Assistant, summary));
-            _masterSession.LastKnownContextTokens = 0;
-            await SaveSessionCoreAsync(ct);
-            RefreshMasterSessionRegistry();
-        }
-        finally { _sessionLock.Release(); }
+            SessionId = "brain-master",
+            SessionType = LlmSessionType.Brain,
+            Model = _modelOverride,
+            Status = "idle",
+            CurrentTokens = 0,
+            MaxTokens = _maxContextTokens,
+        });
 
         var mergeMsg = BrainActorMessages.CreateMergeSummaryMessage(pipeline.GoalId, summary);
-        await MirrorAsync(mergeMsg, mergeMsg.Reply, TimeSpan.FromSeconds(3));
-
-        await DeleteGoalSessionCoreAsync(pipeline.GoalId, ct);
+        await AskActorAsync(mergeMsg, mergeMsg.Reply, ct, TimeSpan.FromSeconds(3));
 
         var deleteMsg = BrainActorMessages.CreateDeleteSessionMessage(pipeline.GoalId);
-        await MirrorAsync(deleteMsg, deleteMsg.Reply, TimeSpan.FromSeconds(3));
+        await AskActorAsync(deleteMsg, deleteMsg.Reply, ct, TimeSpan.FromSeconds(3));
 
         _logger.LogInformation("Merged summary for goal '{GoalId}' into master session: {Summary}",
             pipeline.GoalId, BrainPromptBuilder.Truncate(summary, 200));
@@ -1003,7 +665,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             await Shared.CopilotRetryPolicy.ExecuteAsync(
                 async () =>
                 {
-                    var (response, _) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct, status: "generating-commit-message");
+                    var (response, _) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct);
 
                     if (!string.IsNullOrWhiteSpace(response))
                         message = response.Trim();
@@ -1052,7 +714,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     _logger.LogDebug("Brain craft-prompt request for {GoalId} (phase={Phase}):\n{Prompt}",
                         pipeline.GoalId, phase, BrainPromptBuilder.Truncate(prompt, Constants.TruncationVerbose));
 
-                    var (response, toolCall) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct, status: "crafting-prompt");
+                    var (response, toolCall) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct);
 
                     _logger.LogDebug("Brain craft-prompt response for {GoalId}:\n{Response}",
                         pipeline.GoalId, BrainPromptBuilder.Truncate(response, Constants.TruncationVerbose));
@@ -1123,7 +785,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         try
         {
             var (response, toolCall) = await Shared.CopilotRetryPolicy.ExecuteAsync(
-                () => ExecuteBrainAsync(prompt, goalId, ct, status: "answering-question"),
+                () => ExecuteBrainAsync(prompt, goalId, ct),
                 onRetry: (attempt, delay, ex) =>
                 {
                     _logger.LogWarning(
@@ -1160,21 +822,21 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     private async Task<(string Text, BrainToolCallResult? ToolCall)> ExecuteBrainAsync(
         string prompt, string goalId, CancellationToken ct,
-        string status = "idle",
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         EnsureConnected();
+        EnsureNotResetting();
 
-        if (_useBrainActors && Volatile.Read(ref _brainActor) is { } actor)
-            return await ExecuteBrainViaActorAsync(actor, prompt, goalId, ct, status, callerName);
+        var actor = Volatile.Read(ref _brainActor)
+            ?? throw new InvalidOperationException("BrainActor not available.");
 
-        return await ExecuteBrainViaContextAsync(prompt, goalId, ct, status, callerName);
+        return await ExecuteBrainViaActorAsync(actor, prompt, goalId, ct, callerName);
     }
 
     /// <summary>Routes the Brain LLM call through the BrainActor's per-goal child actor.</summary>
     private async Task<(string Text, BrainToolCallResult? ToolCall)> ExecuteBrainViaActorAsync(
         BrainActor actor, string prompt, string goalId, CancellationToken ct,
-        string status, string callerName)
+        string callerName)
     {
         var msg = BrainActorMessages.CreateExecutePromptOnChildMessage(goalId, prompt, ct);
         if (!actor.Tell(msg))
@@ -1206,209 +868,101 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         }
     }
 
-    /// <summary>Executes the Brain LLM call against the local per-goal context (non-actor path).</summary>
-    private async Task<(string Text, BrainToolCallResult? ToolCall)> ExecuteBrainViaContextAsync(
-        string prompt, string goalId, CancellationToken ct,
-        string status,
-        string callerName)
-    {
-        if (!_goalContexts.TryGetValue(goalId, out var context) || !context.TryAcquire())
-            throw new InvalidOperationException($"No Brain context for goal '{goalId}'.");
-
-        try
-        {
-            await context.Gate.WaitAsync(ct);
-            // Capture a STABLE reference to the goal session before the call. Idle-status
-            // restoration in the finally block must use this reference — not context.Session read
-            // fresh — so a mid-call session replacement (e.g. overflow recovery) cannot corrupt the
-            // restored token count.
-            var session = context.Session;
-            try
-            {
-                _currentContext.Value = context;
-                context.LastToolCallResult = null;
-                context.ActiveCallCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                context.ActiveCallCts.CancelAfter(TimeSpan.FromMinutes(Constants.TaskTimeoutMinutes));
-
-                _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
-                {
-                    SessionId = $"brain-goal-{goalId}",
-                    SessionType = LlmSessionType.BrainGoal,
-                    GoalId = goalId,
-                    Model = context.Model,
-                    Status = status,
-                    CurrentTokens = session.EstimatedContextTokens,
-                    MaxTokens = context.MaxContextTokens,
-                });
-
-                var result = await context.Agent.ExecuteAsync(session, prompt, context.ActiveCallCts.Token);
-                var responseText = result.Message;
-
-                // Log usage
-                if (result.Usage is not null)
-                {
-                    _logger.LogDebug(
-                        "Brain Usage: model={Model} in={InputTokens} out={OutputTokens} tools={ToolCalls}",
-                        result.ModelId, result.Usage.InputTokenCount, result.Usage.OutputTokenCount,
-                        result.ToolCallCount);
-                }
-
-                // Log context size (compaction is logged via OnCompacted callback)
-                var estimatedTokens = session.EstimatedContextTokens;
-                var usagePct = context.MaxContextTokens > 0 ? (int)(estimatedTokens * 100.0 / context.MaxContextTokens) : 0;
-                _logger.LogInformation(
-                    "Brain context: messages={Messages} ~tokens={EstTokens}/{Limit} ({Pct}%) cumIn={CumIn} cumOut={CumOut}",
-                    session.MessageHistory.Count, estimatedTokens, context.MaxContextTokens,
-                    usagePct, session.InputTokensUsed, session.OutputTokensUsed);
-
-                var contextTokens = session.LastKnownContextTokens > 0
-                    ? session.LastKnownContextTokens
-                    : session.EstimatedContextTokens;
-                _logger.LogInformation("{Message}", FormatContextUsageMessage(contextTokens, context.MaxContextTokens, callerName));
-
-                _logger.LogDebug("Brain response ({Length} chars), tool={Tool}",
-                    responseText?.Length ?? 0, context.LastToolCallResult?.ToolName ?? "none");
-
-                // Auto-save session after each Brain call
-                try { await session.SaveAsync(GetGoalSessionFilePath(goalId), ct); }
-                catch (Exception ex) { _logger.LogWarning(ex, "Failed to save Brain session"); }
-
-                return (responseText ?? string.Empty, context.LastToolCallResult);
-            }
-            finally
-            {
-                _currentContext.Value = null;
-                context.ActiveCallCts?.Dispose();
-                context.ActiveCallCts = null;
-                _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
-                {
-                    SessionId = $"brain-goal-{goalId}",
-                    SessionType = LlmSessionType.BrainGoal,
-                    GoalId = goalId,
-                    Model = context.Model,
-                    Status = "idle",
-                    CurrentTokens = session.EstimatedContextTokens,
-                    MaxTokens = context.MaxContextTokens,
-                });
-                context.Gate.Release();
-            }
-        }
-        finally
-        {
-            context.Release();
-        }
-    }
-
     /// <inheritdoc />
     public BrainStats? GetStats()
     {
         if (!_connected) return null;
 
-        _sessionLock.Wait();
+        // No _resetting check: during a reset the actor is detached, so the null-actor guard
+        // below is what makes GetStats report "no stats".
+        if (Volatile.Read(ref _brainActor) is not { } actor)
+            return null;
+
+        var statsMsg = BrainActorMessages.CreateGetStatsMessage();
+        if (!actor.Tell(statsMsg))
+            return null;
+
         try
         {
-            return GetStatsCore();
-        }
-        finally
-        {
-            _sessionLock.Release();
-        }
-    }
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            var stats = statsMsg.Reply.Task.WaitAsync(cts.Token).GetAwaiter().GetResult();
+            if (stats is null) return null;
 
-    /// <summary>Core stats logic. Callers must hold <see cref="_sessionLock"/>.</summary>
-    private BrainStats? GetStatsCore()
-    {
-        var contextTokens = _masterSession.LastKnownContextTokens > 0
-            ? _masterSession.LastKnownContextTokens
-            : _masterSession.EstimatedContextTokens;
-        var usagePct = _maxContextTokens > 0 ? (int)(contextTokens * 100.0 / _maxContextTokens) : 0;
+            var usagePct = stats.MaxContextTokens > 0
+                ? (int)(stats.ContextTokens * 100.0 / stats.MaxContextTokens)
+                : 0;
 
-        return new BrainStats
+            return new BrainStats
+            {
+                Model = stats.Model,
+                MessageCount = stats.MessageCount,
+                ContextTokens = stats.ContextTokens,
+                MaxContextTokens = stats.MaxContextTokens,
+                ContextUsagePercent = usagePct,
+                CumulativeInputTokens = stats.CumulativeInputTokens,
+                CumulativeOutputTokens = stats.CumulativeOutputTokens,
+                MaxSteps = stats.MaxSteps,
+                IsConnected = stats.IsConnected,
+            };
+        }
+        catch
         {
-            Model = _modelOverride,
-            MessageCount = _masterSession.MessageHistory.Count,
-            ContextTokens = contextTokens,
-            MaxContextTokens = _maxContextTokens,
-            ContextUsagePercent = usagePct,
-            CumulativeInputTokens = _masterSession.InputTokensUsed,
-            CumulativeOutputTokens = _masterSession.OutputTokensUsed,
-            MaxSteps = _maxSteps,
-            IsConnected = true,
-        };
+            return null;
+        }
     }
 
     /// <inheritdoc />
     public async Task ResetSessionAsync(CancellationToken ct = default)
     {
-        // NOTE: ResetSessionAsync intentionally does NOT call EnsureConnected(). With per-goal
-        // contexts there is no shared agent to recreate, so a reset just drains any existing
-        // goal contexts (none if never connected) and rebuilds the master session + reloads
-        // orchestrator instructions from disk. This matches the design spec and lets callers
-        // reset a Brain that was constructed but never connected.
-
-        // Phase 1: Mark resetting and snapshot contexts
-        List<GoalBrainContext> contextsToDrain;
-        await _sessionLock.WaitAsync(ct);
-        try
-        {
-            _resetting = true;
-            contextsToDrain = _goalContexts.Values.ToList();
-            _goalContexts.Clear();
-        }
-        finally { _sessionLock.Release(); }
-
-        // Phase 2: Non-cancelable cleanup of all goal contexts
-        foreach (var context in contextsToDrain)
-        {
-            context.Release();
-            try { await context.WaitForDrainAsync(); } catch { }
-            try { context.ActiveCallCts?.Cancel(); } catch { }
-            _sessionRegistry?.Unregister($"brain-goal-{context.GoalId}");
-            try { await context.DisposeAsync(); } catch { }
-        }
-
-        // Phase 3: Recreate master session
+        // NOTE: ResetSessionAsync intentionally does NOT call EnsureConnected(). All session state
+        // lives in the BrainActor, so a reset detaches and disposes it, clears the persisted state
+        // files, reloads orchestrator instructions from disk, and starts a fresh actor.
+        //
+        // _sessionLock is held for the ENTIRE reset — including ResetBrainActorAsync — so that
+        // ConnectAsync and DisposeAsyncCore (which both take the same lock) can never observe a
+        // half-reset brain, e.g. a detached-but-not-yet-replaced actor. The wait uses
+        // CancellationToken.None because an interrupted reset would leave exactly that state.
         await _sessionLock.WaitAsync(CancellationToken.None);
         try
         {
-            // Re-read orchestrator instructions from disk
+            Volatile.Write(ref _resetting, true);
+
             var freshInstructions = _agentsManager?.GetAgentsMd(WorkerRole.Orchestrator) ?? "";
             _systemPrompt = string.IsNullOrWhiteSpace(freshInstructions)
                 ? DefaultSystemPrompt
                 : $"{DefaultSystemPrompt}\n\n{freshInstructions}";
 
-            _masterSession = AgentSession.Create("brain");
-            RefreshMasterSessionRegistry(currentTokens: 0);
-
+            await ResetBrainActorAsync();
+            _logger.LogInformation("Brain session reset — actor state cleared, orchestrator instructions reloaded from disk, and session files deleted.");
+        }
+        catch
+        {
+            _connected = false;
+            _sessionRegistry?.Unregister("brain-master");
+            throw;
         }
         finally
         {
-            _resetting = false;
+            Volatile.Write(ref _resetting, false);
             _sessionLock.Release();
         }
-
-        _logger.LogInformation("Brain session reset — conversation history cleared, orchestrator instructions reloaded from disk, and session file deleted.");
-
-        await ResetBrainActorAsync();
     }
 
     /// <summary>
-    /// Atomically detaches and disposes the shadow actor, clears all session state from both the
-    /// actor and legacy state directories, then starts a fresh shadow with strict startup.
-    /// Throws when any session file survives deletion or when the replacement shadow fails to start.
+    /// Atomically detaches and disposes the brain actor, clears all session state from both the
+    /// actor and legacy state directories, then starts a fresh actor with strict startup.
+    /// Throws when any session file survives deletion or when the replacement actor fails to start.
     /// </summary>
     private async Task ResetBrainActorAsync()
     {
         var oldActor = Interlocked.Exchange(ref _brainActor, null);
 
-        // Known limitation: mirrors issued concurrently with the reset see a null actor and are
-        // silently skipped. The shadow is non-authoritative, so this divergence is accepted.
-        _logger.LogWarning("Shadow actor detached during reset — concurrent summaries may be permanently lost from the shadow (non-authoritative, rebuilt on next reset)");
+        _logger.LogWarning("Brain actor detached during reset — concurrent operations will fail until the replacement actor starts");
 
         if (oldActor is not null)
         {
             try { await oldActor.DisposeAsync(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to dispose shadow actor during reset"); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to dispose brain actor during reset"); }
         }
 
         if (!_connected)
@@ -1443,7 +997,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         if (actorSurvivors || stateSurvivors)
             throw new InvalidOperationException("Failed to clear session state during reset");
 
-        await StartShadowActorAsync(CancellationToken.None, throwOnFailure: true);
+        await StartBrainActorAsync(CancellationToken.None, throwOnFailure: true);
     }
 
     private void EnsureConnected()
@@ -1451,9 +1005,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         if (!_connected)
             throw new InvalidOperationException("Brain not connected. Call ConnectAsync first.");
     }
-
-    /// <summary>Drains and disposes all goal contexts, the shared injected chat client and the
-    /// shadow actor. Idempotent — concurrent callers await the same disposal task.</summary>
+    /// <summary>Disposes the brain actor and unregisters the master session entry.
+    /// Idempotent — concurrent callers await the same disposal task.</summary>
     public async ValueTask DisposeAsync()
     {
         Task taskToAwait;
@@ -1470,99 +1023,30 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     private async Task DisposeAsyncCore()
     {
-        List<GoalBrainContext> contexts;
+        // Serialized against ConnectAsync and ResetSessionAsync so disposal can never interleave
+        // with a mid-flight actor transition.
         await _sessionLock.WaitAsync();
         try
         {
-            contexts = _goalContexts.Values.ToList();
-            _goalContexts.Clear();
+            var actor = Interlocked.Exchange(ref _brainActor, null);
+            await DisposeActorSafelyAsync(actor);
+            _sessionRegistry?.Unregister("brain-master");
+
+            // Disposed AFTER the actor: child actors borrow this client with ownsClient=false and
+            // never dispose it, so the brain that injected it must — and only once the actor (and
+            // therefore every child that could still be using it) is gone.
+            if (_injectedChatClient is not null)
+            {
+                try { _injectedChatClient.Dispose(); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to dispose injected chat client"); }
+            }
         }
-        finally { _sessionLock.Release(); }
-
-        foreach (var context in contexts)
+        finally
         {
-            context.Release();
-            try { await context.WaitForDrainAsync(); } catch { }
-            try { context.ActiveCallCts?.Cancel(); } catch { }
-            _sessionRegistry?.Unregister($"brain-goal-{context.GoalId}");
-            try { await context.DisposeAsync(); } catch { }
-        }
-
-        // The shadow actor (and its children) may reference the injected chat client, so it must
-        // be shut down before that client is disposed.
-        await DisposeActorSafelyAsync(Volatile.Read(ref _brainActor));
-
-        if (_injectedChatClient is not null)
-        {
-            try { _injectedChatClient.Dispose(); } catch { }
+            _sessionLock.Release();
         }
 
         // _sessionLock is intentionally NOT disposed: it must live for the object's lifetime
         // because ConnectAsync reads _disposing only after acquiring it.
-    }
-
-    /// <summary>Per-goal Brain execution context. Owns a dedicated gate, chat client, compaction
-    /// client, coding agent, and forked session so goals can execute in parallel without sharing
-    /// mutable state. Reference-counted so in-flight calls drain before disposal.</summary>
-    private sealed class GoalBrainContext : IAsyncDisposable
-    {
-        public string GoalId { get; }
-        public IChatClient? ChatClient { get; }
-        public bool OwnsChatClient { get; }
-        public IChatClient? CompactionClient { get; }
-        public CodingAgent Agent { get; }
-        public AgentSession Session { get; set; }
-        public BrainToolCallResult? LastToolCallResult { get; set; }
-        public string Model { get; }
-        public int MaxContextTokens { get; }
-        public ReasoningEffort? ReasoningEffort { get; }
-        public string SystemPrompt { get; }
-        public SemaphoreSlim Gate { get; } = new(1, 1);
-        public CancellationTokenSource? ActiveCallCts { get; set; }
-        private int _refCount = 1;
-        private readonly TaskCompletionSource _drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        public GoalBrainContext(string goalId, IChatClient? chatClient, bool ownsChatClient,
-            IChatClient? compactionClient, CodingAgent agent, AgentSession session,
-            string model, int maxContextTokens, ReasoningEffort? reasoningEffort, string systemPrompt)
-        {
-            GoalId = goalId;
-            ChatClient = chatClient;
-            OwnsChatClient = ownsChatClient;
-            CompactionClient = compactionClient;
-            Agent = agent;
-            Session = session;
-            Model = model;
-            MaxContextTokens = maxContextTokens;
-            ReasoningEffort = reasoningEffort;
-            SystemPrompt = systemPrompt;
-        }
-
-        public bool TryAcquire()
-        {
-            while (true)
-            {
-                var current = Volatile.Read(ref _refCount);
-                if (current == 0) return false;
-                if (Interlocked.CompareExchange(ref _refCount, current + 1, current) == current)
-                    return true;
-            }
-        }
-
-        public void Release()
-        {
-            if (Interlocked.Decrement(ref _refCount) == 0)
-                _drained.TrySetResult();
-        }
-
-        public Task WaitForDrainAsync() => _drained.Task;
-
-        public async ValueTask DisposeAsync()
-        {
-            try { CompactionClient?.Dispose(); } catch { }
-            if (OwnsChatClient) { try { ChatClient?.Dispose(); } catch { } }
-            Gate.Dispose();
-            await ValueTask.CompletedTask;
-        }
     }
 }

@@ -522,34 +522,6 @@ public class BrainToolsIntegrationTests
     }
 
     // ──────────────────────────────────────────────────────────
-    //  #19 — DistributedBrain.BuildBrainTools still produces >= 7 tools after refactor
-    // ──────────────────────────────────────────────────────────
-
-    [Fact]
-    public void DistributedBrain_BuildBrainTools_ProducesSevenToolsAfterRefactor()
-    {
-        var goalStore = new InMemoryGoalStore();
-        var brain = new DistributedBrain("copilot/test-model",
-            NullLogger<DistributedBrain>.Instance, goalStore: goalStore);
-
-        // Use reflection to access the _brainTools field
-        var field = typeof(DistributedBrain)
-            .GetField("_brainTools", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        var tools = (List<AITool>)field.GetValue(brain)!;
-
-        Assert.True(tools.Count >= 7, $"Expected >= 7 tools, got {tools.Count}");
-
-        var names = tools.OfType<AIFunction>().Select(t => t.Name).ToHashSet();
-        Assert.Contains("escalate_to_composer", names);
-        Assert.Contains("report_iteration_plan", names);
-        Assert.Contains("get_goal", names);
-        Assert.Contains("search_knowledge", names);
-        Assert.Contains("read_document", names);
-        Assert.Contains("traverse_graph", names);
-        Assert.Contains("get_current_time", names);
-    }
-
-    // ──────────────────────────────────────────────────────────
     //  GoalBrainActor helpers (adapted from GoalBrainActorTests.cs)
     // ──────────────────────────────────────────────────────────
 
