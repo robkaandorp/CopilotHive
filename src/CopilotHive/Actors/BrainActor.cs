@@ -1,4 +1,6 @@
+using CopilotHive.Configuration;
 using CopilotHive.Services;
+using CopilotHive.Shared.AI;
 
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
@@ -19,6 +21,16 @@ internal sealed class BrainActor : Actor<IBrainMessage>
 
     private readonly Dictionary<string, string> _activeGoalSessions = [];
     private readonly Dictionary<string, GoalPipeline> _activePipelines = [];
+    private readonly Dictionary<string, GoalBrainActor> _childActors = [];
+
+    private readonly Func<string, IChatClient> _chatClientFactory;
+    private readonly IChatClient? _injectedChatClient;
+    private readonly string? _compactionModel;
+    private readonly HiveConfigFile? _hiveConfig;
+    private readonly int _maxSteps;
+    private readonly string? _systemPrompt;
+    private readonly string? _workDirectory;
+    private ReasoningEffort? _reasoningEffort;
 
     private AgentSession? _masterSession;
     private string _modelOverride;
@@ -27,12 +39,32 @@ internal sealed class BrainActor : Actor<IBrainMessage>
     private string _orchestratorInstructions = string.Empty;
 
     /// <summary>Creates a brain actor bound to the given state directory.</summary>
-    internal BrainActor(string modelOverride, int maxContextTokens, string stateDir, ILogger logger)
+    internal BrainActor(
+        string modelOverride,
+        int maxContextTokens,
+        string stateDir,
+        ILogger logger,
+        Func<string, IChatClient>? chatClientFactory = null,
+        IChatClient? injectedChatClient = null,
+        string? compactionModel = null,
+        HiveConfigFile? hiveConfig = null,
+        int maxSteps = 50,
+        string? systemPrompt = null,
+        ReasoningEffort? reasoningEffort = null,
+        string? workDirectory = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
         _stateDir = stateDir;
         _logger = logger;
+        _chatClientFactory = chatClientFactory ?? ChatClientFactory.Create;
+        _injectedChatClient = injectedChatClient;
+        _compactionModel = compactionModel;
+        _hiveConfig = hiveConfig;
+        _maxSteps = maxSteps;
+        _systemPrompt = systemPrompt;
+        _reasoningEffort = reasoningEffort;
+        _workDirectory = workDirectory;
     }
 
     /// <inheritdoc />
@@ -51,7 +83,7 @@ internal sealed class BrainActor : Actor<IBrainMessage>
                 break;
 
             case DeleteSessionMessage m:
-                DeleteSession(m.GoalId);
+                await DeleteSessionAsync(m.GoalId);
                 m.Reply.TrySetResult(true);
                 break;
 
@@ -66,6 +98,9 @@ internal sealed class BrainActor : Actor<IBrainMessage>
                 {
                     _maxContextTokens = maxTokens;
                 }
+
+                // Affects future children only; existing children keep their original model.
+                _reasoningEffort = ChatClientFactory.ParseProviderModelAndReasoning(m.Model).reasoning;
 
                 m.Reply.TrySetResult(true);
                 break;
@@ -100,10 +135,79 @@ internal sealed class BrainActor : Actor<IBrainMessage>
                 m.Reply.TrySetResult(true);
                 break;
 
+            case ExecutePromptOnChildMessage m:
+                ExecutePromptOnChild(m);
+                break;
+
+            case InjectNoteOnChildMessage m:
+                InjectNoteOnChild(m);
+                break;
+
             default:
                 throw new InvalidOperationException($"Unhandled brain message type '{message.GetType().Name}'.");
         }
     }
+
+    private void ExecutePromptOnChild(ExecutePromptOnChildMessage m)
+    {
+        if (!_childActors.TryGetValue(m.GoalId, out var child))
+        {
+            m.Reply.TrySetException(new KeyNotFoundException($"No child actor for goal '{m.GoalId}'."));
+            return;
+        }
+
+        var inner = GoalBrainActorMessages.CreateExecutePromptMessage(m.Prompt, m.Ct);
+        if (!child.Tell(inner))
+        {
+            m.Reply.TrySetException(new InvalidOperationException("Child actor mailbox closed."));
+            return;
+        }
+
+        Relay(inner.Reply.Task, m.Reply, static r => r);
+    }
+
+    private void InjectNoteOnChild(InjectNoteOnChildMessage m)
+    {
+        if (!_childActors.TryGetValue(m.GoalId, out var child))
+        {
+            m.Reply.TrySetException(new KeyNotFoundException($"No child actor for goal '{m.GoalId}'."));
+            return;
+        }
+
+        var inner = GoalBrainActorMessages.CreateInjectNoteMessage(m.Note);
+        if (!child.Tell(inner))
+        {
+            m.Reply.TrySetException(new InvalidOperationException("Child actor mailbox closed."));
+            return;
+        }
+
+        Relay(inner.Reply.Task, m.Reply, static _ => true);
+    }
+
+    /// <summary>Relays an inner reply to an outer reply without blocking the mailbox.</summary>
+    private static void Relay<TInner, TOuter>(
+        Task<TInner> innerTask,
+        TaskCompletionSource<TOuter> outer,
+        Func<TInner, TOuter> project) =>
+        innerTask.ContinueWith(
+            inner =>
+            {
+                if (inner.IsFaulted)
+                {
+                    outer.TrySetException(inner.Exception!);
+                }
+                else if (inner.IsCanceled)
+                {
+                    outer.TrySetCanceled();
+                }
+                else
+                {
+                    outer.TrySetResult(project(inner.Result));
+                }
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
     private async Task ConnectAsync(CancellationToken ct)
     {
@@ -143,8 +247,132 @@ internal sealed class BrainActor : Actor<IBrainMessage>
 
         var filePath = ValidateGoalPath(goalId);
         var goalSession = master.Fork($"brain-goal-{goalId}");
-        await SaveSessionAsync(goalSession, filePath, ct);
+
+        // Phase 1 — parent owns the raw clients. Phase 2 — ownership transfers to the child.
+        var resources = PrepareChildResources(goalId);
+        var child = CreateChildActor(goalId, goalSession, resources);
+
+        // Phase 3 — the parent owns the child; failures dispose the child, not the raw clients.
+        try
+        {
+            child.Start();
+            await SaveSessionAsync(goalSession, filePath, ct);
+        }
+        catch
+        {
+            await DisposeChildQuietlyAsync(child);
+            throw;
+        }
+
         _activeGoalSessions[goalId] = filePath;
+        _childActors[goalId] = child;
+    }
+
+    /// <summary>Raw, parent-owned resources prepared before the child constructor is invoked.</summary>
+    private readonly record struct ChildResources(
+        IChatClient ChatClient,
+        bool OwnsClient,
+        IChatClient? CompactionClient,
+        AgentOptions Options);
+
+    /// <summary>
+    /// Phase 1 — creates the raw chat clients and agent options. The parent owns these resources,
+    /// so any failure here disposes the owned clients (never the injected one) before rethrowing.
+    /// </summary>
+    private ChildResources PrepareChildResources(string goalId)
+    {
+        IChatClient chatClient;
+        bool ownsClient;
+        IChatClient? compactionClient = null;
+
+        if (_injectedChatClient is not null)
+        {
+            chatClient = _injectedChatClient;
+            ownsClient = false;
+        }
+        else
+        {
+            chatClient = _chatClientFactory(_modelOverride);
+            ownsClient = true;
+        }
+
+        try
+        {
+            compactionClient = !string.IsNullOrEmpty(_compactionModel)
+                ? ChatClientFactory.Create(_compactionModel)
+                : null;
+
+            var options = new AgentOptions
+            {
+                EnableBash = false,
+                EnableFileOps = false,
+                EnableFileWrites = false,
+                EnableSkills = false,
+                AutoLoadWorkspaceInstructions = false,
+                MaxSteps = _maxSteps,
+                SystemPrompt = _systemPrompt,
+                MaxContextTokens = _maxContextTokens,
+                EnableAutoCompaction = true,
+                ReasoningEffort = _reasoningEffort,
+                Logger = _logger,
+                CompactionClient = compactionClient,
+                CompactionMaxTokens = !string.IsNullOrEmpty(_compactionModel)
+                    ? _hiveConfig?.TryGetContextWindowForModel(_compactionModel)
+                    : null,
+                OnCompacted = r => _logger.LogInformation(
+                    "BrainActor child compaction: {TokensBefore} -> {TokensAfter} tokens",
+                    r.TokensBefore,
+                    r.TokensAfter),
+            };
+
+            if (!string.IsNullOrEmpty(_workDirectory))
+            {
+                options.WorkDirectory = _workDirectory;
+            }
+
+            return new ChildResources(chatClient, ownsClient, compactionClient, options);
+        }
+        catch
+        {
+            if (compactionClient is not null && !ReferenceEquals(compactionClient, chatClient))
+            {
+                try { compactionClient.Dispose(); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to dispose compaction client for {GoalId}", goalId); }
+            }
+
+            if (ownsClient)
+            {
+                try { chatClient.Dispose(); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to dispose chat client for {GoalId}", goalId); }
+            }
+
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Phase 2 — invokes the child constructor. Ownership of the raw clients transfers to the
+    /// child here; a constructor failure is handled by the child's own catch, so this call must
+    /// never sit inside the phase 1 catch (that would double-dispose the clients).
+    /// </summary>
+    private GoalBrainActor CreateChildActor(string goalId, AgentSession goalSession, ChildResources resources) =>
+        new(
+            goalId,
+            goalSession,
+            resources.ChatClient,
+            resources.OwnsClient,
+            resources.CompactionClient,
+            resources.Options,
+            _modelOverride,
+            _maxContextTokens,
+            _stateDir,
+            sessionRegistry: null,
+            _logger);
+
+    private async Task DisposeChildQuietlyAsync(GoalBrainActor child)
+    {
+        try { await child.DisposeAsync(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Failed to dispose goal brain child actor for {GoalId}", child.GoalId); }
     }
 
     /// <summary>
@@ -159,23 +387,68 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         }
 
         var filePath = ValidateGoalPath(goalId);
-        if (!File.Exists(filePath))
+        AgentSession? goalSession = null;
+        if (File.Exists(filePath))
         {
-            var goalSession = EnsureConnected().Fork($"brain-goal-{goalId}");
+            try
+            {
+                goalSession = await AgentSession.LoadAsync(filePath, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to load goal Brain session from {File} — forking a fresh one", filePath);
+            }
+        }
+
+        if (goalSession is null)
+        {
+            goalSession = EnsureConnected().Fork($"brain-goal-{goalId}");
             await SaveSessionAsync(goalSession, filePath, ct);
         }
 
+        // Phase 1 — parent owns the raw clients. Phase 2 — ownership transfers to the child.
+        var resources = PrepareChildResources(goalId);
+        var child = CreateChildActor(goalId, goalSession, resources);
+
+        // Phase 3 — the parent owns the child; failures dispose the child, not the raw clients.
+        try
+        {
+            child.Start();
+        }
+        catch
+        {
+            await DisposeChildQuietlyAsync(child);
+            throw;
+        }
+
         _activeGoalSessions[goalId] = filePath;
+        _childActors[goalId] = child;
     }
 
-    private void DeleteSession(string goalId)    {
+    /// <summary>
+    /// Removes all tracking for a goal and deletes its session file. Child disposal is awaited
+    /// before the file is deleted so a still-running child cannot re-save the file afterwards.
+    /// </summary>
+    private async Task DeleteSessionAsync(string goalId)
+    {
+        var hasChild = _childActors.Remove(goalId, out var child);
+        _activeGoalSessions.Remove(goalId);
+        _activePipelines.Remove(goalId);
+
+        if (hasChild)
+        {
+            await DisposeChildQuietlyAsync(child!);
+            if (!child!.IsCompleted)
+            {
+                _logger.LogWarning("Goal brain child actor for {GoalId} did not complete after disposal", goalId);
+            }
+        }
+
         var filePath = ValidateGoalPath(goalId);
         if (File.Exists(filePath))
         {
             File.Delete(filePath);
         }
-
-        _activeGoalSessions.Remove(goalId);
     }
 
     private async Task MergeSummaryAsync(string goalId, string summary, CancellationToken ct)
@@ -261,6 +534,8 @@ internal sealed class BrainActor : Actor<IBrainMessage>
             case GoalSessionExistsMessage m: m.Reply.TrySetCanceled(); break;
             case RegisterExistingSessionMessage m: m.Reply.TrySetCanceled(); break;
             case InjectOrchestratorInstructionsMessage m: m.Reply.TrySetCanceled(); break;
+            case ExecutePromptOnChildMessage m: m.Reply.TrySetCanceled(); break;
+            case InjectNoteOnChildMessage m: m.Reply.TrySetCanceled(); break;
         }
     }
 
@@ -279,10 +554,20 @@ internal sealed class BrainActor : Actor<IBrainMessage>
             case GoalSessionExistsMessage m: m.Reply.TrySetException(ex); break;
             case RegisterExistingSessionMessage m: m.Reply.TrySetException(ex); break;
             case InjectOrchestratorInstructionsMessage m: m.Reply.TrySetException(ex); break;
+            case ExecutePromptOnChildMessage m: m.Reply.TrySetException(ex); break;
+            case InjectNoteOnChildMessage m: m.Reply.TrySetException(ex); break;
             default:
                 _logger.LogError(ex, "Brain actor failed to handle {MessageType}", message.GetType().Name);
                 break;
         }
+    }
+
+    /// <inheritdoc />
+    protected override async Task OnShutdownAsync()
+    {
+        var children = _childActors.Values.ToList();
+        _childActors.Clear();
+        await Task.WhenAll(children.Select(c => DisposeChildQuietlyAsync(c)));
     }
 
     /// <inheritdoc />

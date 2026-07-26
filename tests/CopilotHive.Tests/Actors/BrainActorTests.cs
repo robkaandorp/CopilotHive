@@ -66,8 +66,30 @@ public class BrainActorTests
         }
     }
 
+    /// <summary>
+    /// Chat client stub so child-actor creation never reaches the real <c>ChatClientFactory</c>
+    /// (which would require provider credentials and attempt HTTP calls).
+    /// </summary>
+    private sealed class StubChatClient : IChatClient
+    {
+        public ChatClientMetadata Metadata => new("stub", null, "stub-model");
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken ct = default)
+            => Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "stub response")));
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken ct = default)
+            => throw new NotSupportedException("Streaming not used in stub client.");
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose() { }
+    }
+
     private static BrainActor CreateActor(string stateDir, string model = "test-model", int maxContextTokens = 100_000) =>
-        new(model, maxContextTokens, stateDir, NullLogger<BrainActor>.Instance);
+        new(model, maxContextTokens, stateDir, NullLogger<BrainActor>.Instance,
+            chatClientFactory: _ => new StubChatClient());
 
     private static GoalPipeline CreatePipeline(string goalId) =>
         new(new Goal { Id = goalId, Description = $"Description for {goalId}" });

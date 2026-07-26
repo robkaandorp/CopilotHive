@@ -41,6 +41,19 @@ internal sealed record RegisterExistingSessionMessage(string GoalId, TaskComplet
 /// <summary>Injects orchestrator instructions into the actor state.</summary>
 internal sealed record InjectOrchestratorInstructionsMessage(string Instructions, TaskCompletionSource<bool> Reply) : IBrainMessage;
 
+/// <summary>Executes a prompt on the goal's child actor.</summary>
+internal sealed record ExecutePromptOnChildMessage(
+    string GoalId,
+    string Prompt,
+    CancellationToken Ct,
+    TaskCompletionSource<GoalBrainExecutionResult> Reply) : IBrainMessage;
+
+/// <summary>Injects a note into the goal's child actor session.</summary>
+internal sealed record InjectNoteOnChildMessage(
+    string GoalId,
+    string Note,
+    TaskCompletionSource<bool> Reply) : IBrainMessage;
+
 /// <summary>Immutable snapshot of brain actor statistics.</summary>
 internal sealed record BrainActorStats(string Model, int MessageCount, long ContextTokens, long MaxContextTokens, bool IsConnected);
 
@@ -84,4 +97,12 @@ internal static class BrainActorMessages
     /// <summary>Creates an inject-orchestrator-instructions message with an asynchronous reply source.</summary>
     internal static InjectOrchestratorInstructionsMessage CreateInjectOrchestratorInstructionsMessage(string instructions) =>
         new(instructions, NewReply<bool>());
+
+    /// <summary>Creates an execute-prompt-on-child message with an asynchronous reply source.</summary>
+    internal static ExecutePromptOnChildMessage CreateExecutePromptOnChildMessage(string goalId, string prompt, CancellationToken ct) =>
+        new(goalId, prompt, ct, NewReply<GoalBrainExecutionResult>());
+
+    /// <summary>Creates an inject-note-on-child message with an asynchronous reply source.</summary>
+    internal static InjectNoteOnChildMessage CreateInjectNoteOnChildMessage(string goalId, string note) =>
+        new(goalId, note, NewReply<bool>());
 }

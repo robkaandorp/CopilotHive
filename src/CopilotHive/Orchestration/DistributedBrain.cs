@@ -218,7 +218,16 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             var actorStateDir = Path.Combine(_stateDir, "actors");
             Directory.CreateDirectory(actorStateDir);
             actor = _actorFactory?.Invoke(actorStateDir)
-                ?? new BrainActor(_modelOverride, _maxContextTokens, actorStateDir, _logger);
+                ?? new BrainActor(
+                    _modelOverride, _maxContextTokens, actorStateDir, _logger,
+                    chatClientFactory: _chatClientFactory,
+                    injectedChatClient: _injectedChatClient,
+                    compactionModel: _compactionModel,
+                    hiveConfig: _hiveConfig,
+                    maxSteps: _maxSteps,
+                    systemPrompt: _systemPrompt,
+                    reasoningEffort: _reasoningEffort,
+                    workDirectory: _repoManager?.WorkDirectory ?? _stateDir);
             actor.Start();
 
             var connectMsg = BrainActorMessages.CreateConnectMessage();
@@ -301,6 +310,72 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         if (!actor.Tell(message))
             _logger.LogWarning("BrainActor mirror: Tell failed for {Type} (mailbox closed)", message.GetType().Name);
+    }
+
+    /// <summary>
+    /// Fires a prompt to the shadow BrainActor for non-authoritative LLM execution.
+    /// Fire-and-forget: never blocks the caller, never propagates exceptions.
+    /// Only fires when <see cref="_useBrainActors"/> is true and the shadow actor is alive.
+    /// </summary>
+    private void FireShadowLlm(string goalId, string prompt, CancellationToken ct)
+    {
+        if (!_useBrainActors)
+            return;
+
+        if (Volatile.Read(ref _brainActor) is not { } actor)
+            return;
+
+        var msg = BrainActorMessages.CreateExecutePromptOnChildMessage(goalId, prompt, ct);
+        if (!actor.Tell(msg))
+        {
+            _logger.LogWarning("FireShadowLlm: Tell failed for goal {GoalId} (mailbox closed)", goalId);
+            return;
+        }
+
+        // Non-blocking continuation — log result, never propagate.
+        msg.Reply.Task.ContinueWith(
+            t =>
+            {
+                if (t.IsCompletedSuccessfully)
+                    _logger.LogDebug("FireShadowLlm: shadow completed for goal {GoalId}", goalId);
+                else if (t.IsFaulted)
+                    _logger.LogWarning(t.Exception, "FireShadowLlm: shadow faulted for goal {GoalId}", goalId);
+                else if (t.IsCanceled)
+                    _logger.LogDebug("FireShadowLlm: shadow canceled for goal {GoalId}", goalId);
+            },
+            TaskContinuationOptions.ExecuteSynchronously);
+    }
+
+    /// <summary>
+    /// Fires a note injection to the shadow BrainActor for a goal session.
+    /// Fire-and-forget: never blocks the caller, never propagates exceptions.
+    /// </summary>
+    private void FireShadowNote(string goalId, string note)
+    {
+        if (!_useBrainActors)
+            return;
+
+        if (Volatile.Read(ref _brainActor) is not { } actor)
+            return;
+
+        var msg = BrainActorMessages.CreateInjectNoteOnChildMessage(goalId, note);
+        if (!actor.Tell(msg))
+        {
+            _logger.LogWarning("FireShadowNote: Tell failed for goal {GoalId} (mailbox closed)", goalId);
+            return;
+        }
+
+        msg.Reply.Task.ContinueWith(
+            t =>
+            {
+                if (t.IsCompletedSuccessfully)
+                    _logger.LogDebug("FireShadowNote: shadow completed for goal {GoalId}", goalId);
+                else if (t.IsFaulted)
+                    _logger.LogWarning(t.Exception, "FireShadowNote: shadow faulted for goal {GoalId}", goalId);
+                else if (t.IsCanceled)
+                    _logger.LogDebug("FireShadowNote: shadow canceled for goal {GoalId}", goalId);
+            },
+            TaskContinuationOptions.ExecuteSynchronously);
     }
 
     /// <inheritdoc />
@@ -1035,6 +1110,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         finally { _sessionLock.Release(); }
 
         _logger.LogInformation("Injected plan adjustment note for goal {GoalId}: {Note}", pipeline.GoalId, note);
+
+        FireShadowNote(pipeline.GoalId, note);
     }
 
     /// <inheritdoc/>
@@ -1464,6 +1541,11 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 try { await session.SaveAsync(GetGoalSessionFilePath(goalId), ct); }
                 catch (Exception ex) { _logger.LogWarning(ex, "Failed to save Brain session"); }
 
+                // Fire shadow LLM execution (non-blocking, fire-and-forget).
+                // Fires on ANY non-throwing completion, including Status="Error".
+                // Does NOT fire on exception or cancellation (those propagate before reaching here).
+                FireShadowLlm(goalId, prompt, ct);
+
                 return (responseText ?? string.Empty, context.LastToolCallResult);
             }
             finally
@@ -1677,12 +1759,14 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             try { await context.DisposeAsync(); } catch { }
         }
 
+        // The shadow actor (and its children) may reference the injected chat client, so it must
+        // be shut down before that client is disposed.
+        await DisposeActorSafelyAsync(Volatile.Read(ref _brainActor));
+
         if (_injectedChatClient is not null)
         {
             try { _injectedChatClient.Dispose(); } catch { }
         }
-
-        await DisposeActorSafelyAsync(Volatile.Read(ref _brainActor));
 
         // _sessionLock is intentionally NOT disposed: it must live for the object's lifetime
         // because ConnectAsync reads _disposing only after acquiring it.

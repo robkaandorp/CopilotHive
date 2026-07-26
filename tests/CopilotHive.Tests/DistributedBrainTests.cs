@@ -3367,9 +3367,19 @@ public sealed class DistributedBrainTests
     private static void SetMirrorDelay(DistributedBrain brain, TimeSpan? delay) =>
         typeof(DistributedBrain).GetField("_mirrorDelay", NonPublicInstance)!.SetValue(brain, delay);
 
-    private static DistributedBrain NewActorBrain(string dir, bool enabled, ILogger<DistributedBrain>? logger = null) =>
-        new("copilot/test-model", logger ?? NullLogger<DistributedBrain>.Instance,
+    private static DistributedBrain NewActorBrain(string dir, bool enabled, ILogger<DistributedBrain>? logger = null)
+    {
+        var brain = new DistributedBrain("copilot/test-model", logger ?? NullLogger<DistributedBrain>.Instance,
             stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(enabled));
+        if (enabled)
+        {
+            SetActorFactory(brain, stateDir =>
+                new CopilotHive.Actors.BrainActor(
+                    "copilot/test-model", 100_000, stateDir, NullLogger.Instance,
+                    chatClientFactory: _ => new FakeChatClient()));
+        }
+        return brain;
+    }
 
     private static string ActorGoalFile(string dir, string goalId) =>
         Path.Combine(dir, "actors", $"brain-goal-{goalId}.json");
@@ -3523,6 +3533,10 @@ public sealed class DistributedBrainTests
             var stub = new IterationPlanStubClient("call-mirror-1", ["coding"], "mirror summary");
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
                 stateDir: dir, chatClient: stub, hiveConfig: ActorConfig(true));
+            SetActorFactory(brain, stateDir =>
+                new CopilotHive.Actors.BrainActor(
+                    "copilot/test-model", 100_000, stateDir, NullLogger<CopilotHive.Actors.BrainActor>.Instance,
+                    chatClientFactory: _ => new FakeChatClient()));
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
