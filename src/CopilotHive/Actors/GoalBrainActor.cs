@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Threading.Channels;
 
 using CopilotHive.Dashboard;
 
@@ -15,15 +14,8 @@ namespace CopilotHive.Actors;
 /// the goal session and the last tool call result. All state changes are serialized
 /// through a single-reader mailbox, so no locking is required by callers.
 /// </summary>
-internal sealed class GoalBrainActor : IAsyncDisposable
+internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
 {
-    private readonly Channel<IGoalBrainMessage> _mailbox = Channel.CreateUnbounded<IGoalBrainMessage>(
-        new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
-    private readonly CancellationTokenSource _cts = new();
-    private readonly TaskCompletionSource _loopCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly CancellationToken _loopToken;
-    private readonly object _lifecycleLock = new();
-
     private readonly IChatClient _chatClient;
     private readonly bool _ownsChatClient;
     private readonly IChatClient? _compactionClient;
@@ -35,8 +27,6 @@ internal sealed class GoalBrainActor : IAsyncDisposable
     private readonly List<AITool> _brainTools;
 
     private int _resourcesDisposed;
-    private Task? _loopTask;
-    private bool _disposed;
 
     /// <summary>Creates a goal-brain actor for a single goal.</summary>
     internal GoalBrainActor(
@@ -98,7 +88,6 @@ internal sealed class GoalBrainActor : IAsyncDisposable
             };
 
             CodingAgent = new CodingAgent(chatClient, configured);
-            _loopToken = _cts.Token;
         }
         catch
         {
@@ -121,35 +110,6 @@ internal sealed class GoalBrainActor : IAsyncDisposable
 
     /// <summary>Result of the most recent tool call, if any.</summary>
     internal GoalBrainToolCallResult? LastToolCallResult { get; set; }
-
-    /// <summary>Completes when the message loop has exited.</summary>
-    internal Task Completion => _loopCompletion.Task;
-
-    /// <summary>True once the message loop has exited.</summary>
-    internal bool IsCompleted => Completion.IsCompleted;
-
-    /// <summary>True once the message loop has been launched.</summary>
-    internal bool IsStarted
-    {
-        get { lock (_lifecycleLock) { return _loopTask is not null; } }
-    }
-
-    /// <summary>Enqueues a message. Returns false once the mailbox is closed.</summary>
-    internal bool Tell(IGoalBrainMessage message) => _mailbox.Writer.TryWrite(message);
-
-    /// <summary>Starts the message loop. Safe to call concurrently; only one loop runs.</summary>
-    internal void Start()
-    {
-        lock (_lifecycleLock)
-        {
-            if (_loopTask is not null || _disposed)
-            {
-                return;
-            }
-
-            _loopTask = Task.Run(() => MessageLoopAsync(_loopToken));
-        }
-    }
 
     private static void ValidateGoalId(string goalId)
     {
@@ -188,47 +148,8 @@ internal sealed class GoalBrainActor : IAsyncDisposable
             "Report your iteration plan — which phases to run and in what order."),
     ];
 
-    private async Task MessageLoopAsync(CancellationToken ct)
-    {
-        try
-        {
-            await foreach (var message in _mailbox.Reader.ReadAllAsync(ct))
-            {
-                try
-                {
-                    await HandleAsync(message);
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                {
-                    CancelReply(message);
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    FaultReplyOrLog(message, ex);
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // Cancelled — remaining items are drained below.
-        }
-        catch (ChannelClosedException)
-        {
-            // Normal exit — the mailbox was completed.
-        }
-        finally
-        {
-            while (_mailbox.Reader.TryRead(out var message))
-            {
-                CancelReply(message);
-            }
-
-            _loopCompletion.TrySetResult();
-        }
-    }
-
-    private async Task HandleAsync(IGoalBrainMessage message)
+    /// <inheritdoc />
+    protected override async Task HandleAsync(IGoalBrainMessage message, CancellationToken ct)
     {
         switch (message)
         {
@@ -255,7 +176,7 @@ internal sealed class GoalBrainActor : IAsyncDisposable
         LastToolCallResult = null;
         var sessionRef = Session;
 
-        var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(message.Ct, _loopToken);
+        var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(message.Ct, LoopToken);
         linkedCts.CancelAfter(TimeSpan.FromMinutes(Constants.TaskTimeoutMinutes));
 
         RegisterSessionStatus("active", sessionRef);
@@ -316,7 +237,8 @@ internal sealed class GoalBrainActor : IAsyncDisposable
         message.Reply.TrySetResult(true);
     }
 
-    private static void CancelReply(IGoalBrainMessage message)
+    /// <inheritdoc />
+    protected override void CancelReply(IGoalBrainMessage message)
     {
         switch (message)
         {
@@ -326,15 +248,16 @@ internal sealed class GoalBrainActor : IAsyncDisposable
         }
     }
 
-    private void FaultReplyOrLog(IGoalBrainMessage message, Exception exception)
+    /// <inheritdoc />
+    protected override void OnUnhandledException(IGoalBrainMessage message, Exception ex)
     {
         switch (message)
         {
-            case ExecutePromptMessage m: m.Reply.TrySetException(exception); break;
-            case InjectNoteMessage m: m.Reply.TrySetException(exception); break;
-            case GetGoalStateMessage m: m.Reply.TrySetException(exception); break;
+            case ExecutePromptMessage m: m.Reply.TrySetException(ex); break;
+            case InjectNoteMessage m: m.Reply.TrySetException(ex); break;
+            case GetGoalStateMessage m: m.Reply.TrySetException(ex); break;
             default:
-                _logger.LogError(exception, "Goal Brain actor failed to handle {MessageType}", message.GetType().Name);
+                _logger.LogError(ex, "Goal Brain actor failed to handle {MessageType}", message.GetType().Name);
                 break;
         }
     }
@@ -360,56 +283,17 @@ internal sealed class GoalBrainActor : IAsyncDisposable
         }
     }
 
-    /// <summary>Stops the actor, cancelling any pending replies and disposing owned clients.</summary>
-    public async ValueTask DisposeAsync()
+    /// <inheritdoc />
+    protected override Task OnShutdownAsync()
     {
-        try
-        {
-            lock (_lifecycleLock)
-            {
-                if (_disposed)
-                {
-                    return;
-                }
-
-                _disposed = true;
-                _cts.Cancel();
-                _mailbox.Writer.TryComplete();
-
-                if (_loopTask is null)
-                {
-                    // Unstarted — no loop is reading the mailbox, so draining here is single-reader safe.
-                    while (_mailbox.Reader.TryRead(out var message))
-                    {
-                        CancelReply(message);
-                    }
-
-                    _loopCompletion.TrySetResult();
-                    DisposeOwnedResources();
-                    _cts.Dispose();
-                    return;
-                }
-            }
-
-            try
-            {
-                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                await _loopCompletion.Task.WaitAsync(timeoutCts.Token);
-                DisposeOwnedResources();
-            }
-            catch (OperationCanceledException)
-            {
-                _logger.LogWarning(
-                    "Goal Brain actor for {GoalId} did not stop in time — deferring client disposal", GoalId);
-                _ = _loopCompletion.Task.ContinueWith(_ => DisposeOwnedResources(), TaskScheduler.Default);
-            }
-        }
-        finally
-        {
-            if (_loopTask is not null)
-            {
-                _cts.Dispose();
-            }
-        }
+        DisposeOwnedResources();
+        return Task.CompletedTask;
     }
+
+    /// <inheritdoc />
+    protected override void OnUnstartedDispose() => DisposeOwnedResources();
+
+    /// <inheritdoc />
+    protected override void OnDisposeTimeout() =>
+        _logger.LogWarning("Goal Brain actor for {GoalId} did not stop in time — deferring client disposal", GoalId);
 }

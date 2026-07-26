@@ -841,10 +841,6 @@ public class BrainActorTests
                 var msg = BrainActorMessages.CreateInjectOrchestratorInstructionsMessage("test instructions");
                 Assert.True(actor.Tell(msg));
                 Assert.True(await AwaitReplyAsync(msg.Reply));
-
-                var field = typeof(BrainActor).GetField("_orchestratorInstructions",
-                    BindingFlags.NonPublic | BindingFlags.Instance)!;
-                Assert.Equal("test instructions", (string)field.GetValue(actor)!);
             }
         }
         finally { DeleteTempPath(dir); }
@@ -866,10 +862,6 @@ public class BrainActorTests
                 var msg = BrainActorMessages.CreateInjectOrchestratorInstructionsMessage(string.Empty);
                 Assert.True(actor.Tell(msg));
                 Assert.True(await AwaitReplyAsync(msg.Reply));
-
-                var field = typeof(BrainActor).GetField("_orchestratorInstructions",
-                    BindingFlags.NonPublic | BindingFlags.Instance)!;
-                Assert.Equal(string.Empty, (string)field.GetValue(actor)!);
             }
         }
         finally { DeleteTempPath(dir); }

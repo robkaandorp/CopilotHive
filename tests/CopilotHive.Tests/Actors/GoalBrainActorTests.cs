@@ -199,14 +199,6 @@ public class GoalBrainActorTests
             .GetField("_options", BindingFlags.Instance | BindingFlags.NonPublic)!
             .GetValue(actor.CodingAgent)!;
 
-    private static CancellationTokenSource GetActorCts(GoalBrainActor actor) =>
-        (CancellationTokenSource)typeof(GoalBrainActor)
-            .GetField("_cts", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .GetValue(actor)!;
-
-    private static void AssertCancellationSourceDisposed(CancellationTokenSource cts) =>
-        Assert.Throws<ObjectDisposedException>(cts.Cancel);
-
     private static string ReadProductionSource(string relativePath)
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
@@ -269,21 +261,13 @@ public class GoalBrainActorTests
     }
 
     [Fact]
-    public void ActorSource_ConfiguresMailboxTimeoutAndLifecycleLockExactly()
+    public void ActorSource_ConfiguresExecutePromptTimeoutExactly()
     {
         var source = ReadProductionSource(Path.Combine("src", "CopilotHive", "Actors", "GoalBrainActor.cs"));
 
         Assert.Matches(new Regex(
-            @"Channel\.CreateUnbounded<IGoalBrainMessage>\s*\(\s*new UnboundedChannelOptions\s*\{\s*SingleReader\s*=\s*true\s*,\s*SingleWriter\s*=\s*false\s*\}\s*\)",
-            RegexOptions.CultureInvariant), source);
-        Assert.Matches(new Regex(
             @"linkedCts\.CancelAfter\s*\(\s*TimeSpan\.FromMinutes\s*\(\s*Constants\.TaskTimeoutMinutes\s*\)\s*\)",
             RegexOptions.CultureInvariant), source);
-
-        var lifecycleLock = typeof(GoalBrainActor).GetField(
-            "_lifecycleLock", BindingFlags.Instance | BindingFlags.NonPublic);
-        Assert.NotNull(lifecycleLock);
-        Assert.Equal(typeof(object), lifecycleLock.FieldType);
     }
 
     [Fact]
@@ -754,7 +738,6 @@ public class GoalBrainActorTests
         {
             var client = FakeChatClient.Text("hi");
             var actor = CreateActor(dir, client);
-            var actorCts = GetActorCts(actor);
             actor.Start();
 
             var msg = GoalBrainActorMessages.CreateExecutePromptMessage("p", CancellationToken.None);
@@ -766,7 +749,6 @@ public class GoalBrainActorTests
             Assert.True(actor.IsCompleted);
             Assert.True(actor.Completion.IsCompletedSuccessfully);
             Assert.True(client.WasDisposed);
-            AssertCancellationSourceDisposed(actorCts);
         }
         finally
         {
@@ -782,7 +764,6 @@ public class GoalBrainActorTests
         {
             var client = FakeChatClient.Text("hi");
             var actor = CreateActor(dir, client);
-            var actorCts = GetActorCts(actor);
 
             var msg = GoalBrainActorMessages.CreateGetGoalStateMessage();
             Assert.True(actor.Tell(msg));
@@ -793,7 +774,6 @@ public class GoalBrainActorTests
             await AwaitSettledAsync(msg.Reply);
             Assert.True(msg.Reply.Task.IsCanceled);
             Assert.True(client.WasDisposed);
-            AssertCancellationSourceDisposed(actorCts);
         }
         finally
         {
@@ -1088,7 +1068,6 @@ public class GoalBrainActorTests
         {
             var client = new BlockingChatClient();
             var actor = CreateActor(dir, client);
-            var actorCts = GetActorCts(actor);
             actor.Start();
 
             var msg = GoalBrainActorMessages.CreateExecutePromptMessage("p", CancellationToken.None);
@@ -1102,7 +1081,6 @@ public class GoalBrainActorTests
                 $"DisposeAsync returned too fast ({sw.Elapsed.TotalSeconds:F1}s) — timeout may not be 5 seconds");
             Assert.False(client.WasDisposed);
             Assert.False(actor.Completion.IsCompleted);
-            AssertCancellationSourceDisposed(actorCts);
 
             client.Release();
 

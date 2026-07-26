@@ -1,5 +1,3 @@
-using System.Threading.Channels;
-
 using CopilotHive.Services;
 
 using Microsoft.Extensions.AI;
@@ -14,15 +12,8 @@ namespace CopilotHive.Actors;
 /// per-goal sessions and active pipelines). All state changes are serialized through a
 /// single-reader mailbox, so no locking is required by callers.
 /// </summary>
-internal sealed class BrainActor : IAsyncDisposable
+internal sealed class BrainActor : Actor<IBrainMessage>
 {
-    private readonly Channel<IBrainMessage> _mailbox = Channel.CreateUnbounded<IBrainMessage>(
-        new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
-    private readonly CancellationTokenSource _cts = new();
-    private readonly TaskCompletionSource _loopCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly CancellationToken _loopToken;
-    private readonly object _lifecycleLock = new();
-
     private readonly string _stateDir;
     private readonly ILogger _logger;
 
@@ -35,9 +26,6 @@ internal sealed class BrainActor : IAsyncDisposable
     private bool _connected;
     private string _orchestratorInstructions = string.Empty;
 
-    private Task? _loopTask;
-    private bool _disposed;
-
     /// <summary>Creates a brain actor bound to the given state directory.</summary>
     internal BrainActor(string modelOverride, int maxContextTokens, string stateDir, ILogger logger)
     {
@@ -45,79 +33,10 @@ internal sealed class BrainActor : IAsyncDisposable
         _maxContextTokens = maxContextTokens;
         _stateDir = stateDir;
         _logger = logger;
-        _loopToken = _cts.Token;
     }
 
-    /// <summary>Completes when the message loop has exited.</summary>
-    internal Task Completion => _loopCompletion.Task;
-
-    /// <summary>True once the message loop has exited.</summary>
-    internal bool IsCompleted => Completion.IsCompleted;
-
-    /// <summary>True once the message loop has been launched.</summary>
-    internal bool IsStarted
-    {
-        get { lock (_lifecycleLock) { return _loopTask is not null; } }
-    }
-
-    /// <summary>Enqueues a message. Returns false once the mailbox is closed.</summary>
-    internal bool Tell(IBrainMessage message) => _mailbox.Writer.TryWrite(message);
-
-    /// <summary>Starts the message loop. Safe to call concurrently; only one loop runs.</summary>
-    internal void Start()
-    {
-        lock (_lifecycleLock)
-        {
-            if (_loopTask is not null || _disposed)
-            {
-                return;
-            }
-
-            _loopTask = Task.Run(() => MessageLoopAsync(_loopToken));
-        }
-    }
-
-    private async Task MessageLoopAsync(CancellationToken ct)
-    {
-        try
-        {
-            await foreach (var message in _mailbox.Reader.ReadAllAsync(ct))
-            {
-                try
-                {
-                    await HandleAsync(message, ct);
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                {
-                    CancelReply(message);
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    FaultReplyOrLog(message, ex);
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // Cancelled — remaining items are drained below.
-        }
-        catch (ChannelClosedException)
-        {
-            // Normal exit — the mailbox was completed.
-        }
-        finally
-        {
-            while (_mailbox.Reader.TryRead(out var message))
-            {
-                CancelReply(message);
-            }
-
-            _loopCompletion.TrySetResult();
-        }
-    }
-
-    private async Task HandleAsync(IBrainMessage message, CancellationToken ct)
+    /// <inheritdoc />
+    protected override async Task HandleAsync(IBrainMessage message, CancellationToken ct)
     {
         switch (message)
         {
@@ -327,7 +246,8 @@ internal sealed class BrainActor : IAsyncDisposable
         return fullPath;
     }
 
-    private static void CancelReply(IBrainMessage message)
+    /// <inheritdoc />
+    protected override void CancelReply(IBrainMessage message)
     {
         switch (message)
         {
@@ -344,70 +264,28 @@ internal sealed class BrainActor : IAsyncDisposable
         }
     }
 
-    private void FaultReplyOrLog(IBrainMessage message, Exception exception)
+    /// <inheritdoc />
+    protected override void OnUnhandledException(IBrainMessage message, Exception ex)
     {
         switch (message)
         {
-            case ConnectMessage m: m.Reply.TrySetException(exception); break;
-            case ForkSessionMessage m: m.Reply.TrySetException(exception); break;
-            case DeleteSessionMessage m: m.Reply.TrySetException(exception); break;
-            case MergeSummaryMessage m: m.Reply.TrySetException(exception); break;
-            case UpdateModelMessage m: m.Reply.TrySetException(exception); break;
-            case GetPipelineMessage m: m.Reply.TrySetException(exception); break;
-            case GetStatsMessage m: m.Reply.TrySetException(exception); break;
-            case GoalSessionExistsMessage m: m.Reply.TrySetException(exception); break;
-            case RegisterExistingSessionMessage m: m.Reply.TrySetException(exception); break;
-            case InjectOrchestratorInstructionsMessage m: m.Reply.TrySetException(exception); break;
+            case ConnectMessage m: m.Reply.TrySetException(ex); break;
+            case ForkSessionMessage m: m.Reply.TrySetException(ex); break;
+            case DeleteSessionMessage m: m.Reply.TrySetException(ex); break;
+            case MergeSummaryMessage m: m.Reply.TrySetException(ex); break;
+            case UpdateModelMessage m: m.Reply.TrySetException(ex); break;
+            case GetPipelineMessage m: m.Reply.TrySetException(ex); break;
+            case GetStatsMessage m: m.Reply.TrySetException(ex); break;
+            case GoalSessionExistsMessage m: m.Reply.TrySetException(ex); break;
+            case RegisterExistingSessionMessage m: m.Reply.TrySetException(ex); break;
+            case InjectOrchestratorInstructionsMessage m: m.Reply.TrySetException(ex); break;
             default:
-                _logger.LogError(exception, "Brain actor failed to handle {MessageType}", message.GetType().Name);
+                _logger.LogError(ex, "Brain actor failed to handle {MessageType}", message.GetType().Name);
                 break;
         }
     }
 
-    /// <summary>Stops the actor, cancelling any pending replies.</summary>
-    public async ValueTask DisposeAsync()
-    {
-        Task taskToAwait;
-        lock (_lifecycleLock)
-        {
-            if (_disposed)
-            {
-                return;
-            }
-
-            _disposed = true;
-            _cts.Cancel();
-            _mailbox.Writer.TryComplete();
-
-            if (_loopTask is null)
-            {
-                // Unstarted — no loop is reading the mailbox, so draining here is single-reader safe.
-                while (_mailbox.Reader.TryRead(out var message))
-                {
-                    CancelReply(message);
-                }
-
-                _loopCompletion.TrySetResult();
-                _cts.Dispose();
-                return;
-            }
-
-            taskToAwait = _loopTask;
-        }
-
-        try
-        {
-            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            await _loopCompletion.Task.WaitAsync(timeoutCts.Token);
-            await taskToAwait.WaitAsync(timeoutCts.Token);
-        }
-        catch (OperationCanceledException)
-        {
-            // Timed out — the loop is stuck; nothing more we can do safely.
-        }
-        finally
-        {
-            _cts.Dispose();
-        }
-    }
+    /// <inheritdoc />
+    protected override void OnDisposeTimeout() =>
+        _logger.LogWarning("BrainActor did not complete within 5 seconds.");
 }
