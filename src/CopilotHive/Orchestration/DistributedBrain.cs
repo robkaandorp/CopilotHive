@@ -332,16 +332,18 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             return;
         }
 
+        _logger.LogInformation("Shadow LLM execution fired for goal {GoalId}", goalId);
+
         // Non-blocking continuation — log result, never propagate.
         msg.Reply.Task.ContinueWith(
             t =>
             {
                 if (t.IsCompletedSuccessfully)
-                    _logger.LogDebug("FireShadowLlm: shadow completed for goal {GoalId}", goalId);
+                    _logger.LogInformation("Shadow LLM execution completed for goal {GoalId}", goalId);
                 else if (t.IsFaulted)
                     _logger.LogWarning(t.Exception, "FireShadowLlm: shadow faulted for goal {GoalId}", goalId);
                 else if (t.IsCanceled)
-                    _logger.LogDebug("FireShadowLlm: shadow canceled for goal {GoalId}", goalId);
+                    _logger.LogInformation("Shadow LLM execution canceled for goal {GoalId}", goalId);
             },
             TaskContinuationOptions.ExecuteSynchronously);
     }
@@ -365,15 +367,17 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             return;
         }
 
+        _logger.LogInformation("Shadow note injection fired for goal {GoalId}", goalId);
+
         msg.Reply.Task.ContinueWith(
             t =>
             {
                 if (t.IsCompletedSuccessfully)
-                    _logger.LogDebug("FireShadowNote: shadow completed for goal {GoalId}", goalId);
+                    _logger.LogInformation("Shadow note injection completed for goal {GoalId}", goalId);
                 else if (t.IsFaulted)
                     _logger.LogWarning(t.Exception, "FireShadowNote: shadow faulted for goal {GoalId}", goalId);
                 else if (t.IsCanceled)
-                    _logger.LogDebug("FireShadowNote: shadow canceled for goal {GoalId}", goalId);
+                    _logger.LogInformation("Shadow note injection canceled for goal {GoalId}", goalId);
             },
             TaskContinuationOptions.ExecuteSynchronously);
     }
