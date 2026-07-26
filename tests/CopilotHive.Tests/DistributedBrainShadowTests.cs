@@ -521,6 +521,8 @@ public class DistributedBrainShadowTests
             Func<string, IChatClient> chatClientFactory = _ => new TrackingChatClient();
             var hiveConfig = ActorConfig(true);
             var repoManager = new FakeRepoManager(repoDir);
+            var goalStore = new InMemoryGoalStore();
+            var knowledgeGraph = new CopilotHive.Knowledge.KnowledgeGraph();
 
             var brain = new DistributedBrain(
                 "copilot/test-model:high",
@@ -528,8 +530,10 @@ public class DistributedBrainShadowTests
                 maxSteps: 42,
                 repoManager: repoManager,
                 stateDir: dir,
+                goalStore: goalStore,
                 chatClient: injectedClient,
                 compactionModel: null,
+                knowledgeGraph: knowledgeGraph,
                 hiveConfig: hiveConfig);
             await using (brain)
             {
@@ -574,6 +578,10 @@ public class DistributedBrainShadowTests
                 // _workDirectory should be repoManager.WorkDirectory.
                 var actorWorkDir = GetField<string?>(a, "_workDirectory");
                 Assert.Equal(repoDir, actorWorkDir);
+
+                // _goalStore and _knowledgeGraph should be propagated from the DistributedBrain.
+                Assert.Same(goalStore, GetField<CopilotHive.Goals.IGoalStore?>(a, "_goalStore"));
+                Assert.Same(knowledgeGraph, GetField<CopilotHive.Knowledge.KnowledgeGraph?>(a, "_knowledgeGraph"));
             }
         }
         finally { DeleteDir(dir); }

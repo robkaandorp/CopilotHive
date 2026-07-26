@@ -1,6 +1,10 @@
 using System.ComponentModel;
 
 using CopilotHive.Dashboard;
+using CopilotHive.Knowledge;
+using CopilotHive.Orchestration;
+using CopilotHive.Goals;
+using CopilotHive.Services;
 
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
@@ -25,6 +29,9 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
     private readonly LlmSessionRegistry? _sessionRegistry;
     private readonly ILogger _logger;
     private readonly List<AITool> _brainTools;
+    private readonly IGoalStore? _goalStore;
+    private readonly KnowledgeGraph? _knowledgeGraph;
+    private readonly Func<IBrainMessage, bool>? _parentTell;
 
     private int _resourcesDisposed;
 
@@ -40,7 +47,10 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
         int maxContextTokens,
         string stateDir,
         LlmSessionRegistry? sessionRegistry,
-        ILogger logger)
+        ILogger logger,
+        IGoalStore? goalStore = null,
+        KnowledgeGraph? knowledgeGraph = null,
+        Func<IBrainMessage, bool>? parentTell = null)
     {
         ValidateGoalId(goalId);
 
@@ -54,6 +64,9 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
         _maxContextTokens = maxContextTokens;
         _sessionRegistry = sessionRegistry;
         _logger = logger;
+        _goalStore = goalStore;
+        _knowledgeGraph = knowledgeGraph;
+        _parentTell = parentTell;
 
         try
         {
@@ -124,29 +137,44 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
         }
     }
 
-    private List<AITool> BuildTools() =>
-    [
-        AIFunctionFactory.Create(
-            ([Description("The question to forward to the Composer for resolution.")] string question,
-             [Description("The reason why the Brain cannot answer this question from the codebase.")] string reason) =>
+    private List<AITool> BuildTools()
+    {
+        Func<string, Task<GoalPipeline?>> pipelineResolver = _parentTell is null
+            ? _ => Task.FromResult<GoalPipeline?>(null)
+            : async goalId =>
             {
-                LastToolCallResult = new EscalateToolResult(question, reason);
-                return "Escalation recorded.";
-            },
-            "escalate_to_composer",
-            "Escalate a question to the Composer when the Brain cannot answer from the codebase alone."),
-        AIFunctionFactory.Create(
-            ([Description("The phases to run in order.")] string[] phases,
-             [Description("Instructions for each phase.")] string phase_instructions,
-             [Description("Why this plan was chosen.")] string reason,
-             [Description("Optional JSON mapping phase names to model tiers.")] string? model_tiers) =>
-            {
-                LastToolCallResult = new PlanToolResult(phases ?? [], phase_instructions, reason, model_tiers);
-                return "Iteration plan recorded.";
-            },
-            "report_iteration_plan",
-            "Report your iteration plan — which phases to run and in what order."),
-    ];
+                var msg = BrainActorMessages.CreateGetPipelineMessage(goalId);
+                if (!_parentTell(msg)) return null;
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                try { return await msg.Reply.Task.WaitAsync(cts.Token); }
+                catch { return null; }
+            };
+
+        return
+        [
+            AIFunctionFactory.Create(
+                ([Description("The question to forward to the Composer for resolution.")] string question,
+                 [Description("The reason why the Brain cannot answer this question from the codebase.")] string reason) =>
+                {
+                    LastToolCallResult = new EscalateToolResult(question, reason);
+                    return "Escalation recorded.";
+                },
+                "escalate_to_composer",
+                "Escalate a question to the Composer when the Brain cannot answer from the codebase alone."),
+            AIFunctionFactory.Create(
+                ([Description("The phases to run in order.")] string[] phases,
+                 [Description("Instructions for each phase.")] string phase_instructions,
+                 [Description("Why this plan was chosen.")] string reason,
+                 [Description("Optional JSON mapping phase names to model tiers.")] string? model_tiers) =>
+                {
+                    LastToolCallResult = new PlanToolResult(phases ?? [], phase_instructions, reason, model_tiers);
+                    return "Iteration plan recorded.";
+                },
+                "report_iteration_plan",
+                "Report your iteration plan — which phases to run and in what order."),
+            .. BrainTools.BuildDependencyTools(_goalStore, pipelineResolver, _knowledgeGraph, _logger),
+        ];
+    }
 
     /// <inheritdoc />
     protected override async Task HandleAsync(IGoalBrainMessage message, CancellationToken ct)

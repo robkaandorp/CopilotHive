@@ -1093,8 +1093,8 @@ public sealed class DistributedBrainTests
         // Note: AIFunctionFactory.Create returns AIFunction which is then cast to AITool
         // The tool is identified by its name parameter passed to AIFunctionFactory.Create
         Assert.NotEmpty(brainTools);
-        // Verify there are at least 6 tools (escalate_to_composer, get_goal, search_knowledge, read_document, traverse_graph, report_iteration_plan)
-        Assert.True(brainTools.Count >= 6, "Brain should have at least 6 tools (escalate_to_composer, get_goal, search_knowledge, read_document, traverse_graph, report_iteration_plan)");
+        // Verify there are at least 7 tools (escalate_to_composer, report_iteration_plan, get_goal, search_knowledge, read_document, traverse_graph, get_current_time)
+        Assert.True(brainTools.Count >= 7, "Brain should have at least 7 tools (escalate_to_composer, report_iteration_plan, get_goal, search_knowledge, read_document, traverse_graph, get_current_time)");
     }
 
     [Fact]

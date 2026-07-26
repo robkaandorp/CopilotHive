@@ -181,7 +181,10 @@ public class GoalBrainActorTests
         IChatClient? compactionClient = null,
         AgentOptions? baseOptions = null,
         AgentSession? session = null,
-        LlmSessionRegistry? sessionRegistry = null) =>
+        LlmSessionRegistry? sessionRegistry = null,
+        CopilotHive.Goals.IGoalStore? goalStore = null,
+        CopilotHive.Knowledge.KnowledgeGraph? knowledgeGraph = null,
+        Func<IBrainMessage, bool>? parentTell = null) =>
         new(goalId,
             session ?? AgentSession.Create($"brain-goal-{goalId}"),
             chatClient,
@@ -192,7 +195,10 @@ public class GoalBrainActorTests
             100_000,
             stateDir,
             sessionRegistry,
-            NullLogger<GoalBrainActor>.Instance);
+            NullLogger<GoalBrainActor>.Instance,
+            goalStore,
+            knowledgeGraph,
+            parentTell);
 
     private static AgentOptions GetConfiguredOptions(GoalBrainActor actor) =>
         (AgentOptions)typeof(CodingAgent)
@@ -361,7 +367,9 @@ public class GoalBrainActorTests
 
             Assert.Equal(100_000, configured.MaxContextTokens);
             Assert.Same(compaction, configured.CompactionClient);
-            Assert.Equal(["escalate_to_composer", "report_iteration_plan"],
+            Assert.Equal(
+                ["escalate_to_composer", "report_iteration_plan", "get_goal", "search_knowledge",
+                 "read_document", "traverse_graph", "get_current_time"],
                 configured.CustomTools.Select(tool => tool.Name));
             Assert.DoesNotContain(configured.CustomTools, tool => tool.Name == "original_tool");
         }
@@ -1097,5 +1105,60 @@ public class GoalBrainActorTests
         {
             DeleteTempPath(dir);
         }
+    }
+    [Fact]
+    public async Task BuildTools_ReturnsSevenTools()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir, FakeChatClient.Text("unused"));
+            var tools = GetConfiguredOptions(actor).CustomTools;
+            Assert.Equal(7, tools.Count);
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task GetGoalTool_NoGoalStore_ReturnsUnavailable()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir, FakeChatClient.Text("unused"));
+            var tool = GetConfiguredOptions(actor).CustomTools.Cast<AIFunction>().First(t => t.Name == "get_goal");
+            var result = (await tool.InvokeAsync(
+                new AIFunctionArguments { ["goal_id"] = "g1" }, TestContext.Current.CancellationToken))?.ToString();
+            Assert.Equal("Goal store is not available.", result);
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task GetGoalTool_PipelineResolverTimesOut_ReportsPipelineNotActive()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var store = new CopilotHive.Tests.InMemoryGoalStore();
+            store.AddGoal(new CopilotHive.Goals.Goal
+            {
+                Id = "g1",
+                Description = "desc",
+                RepositoryNames = ["repo"],
+            });
+
+            // parentTell accepts the message but never replies → resolver times out → null pipeline.
+            await using var actor = CreateActor(dir, FakeChatClient.Text("unused"),
+                goalStore: store, parentTell: _ => true);
+
+            var tool = GetConfiguredOptions(actor).CustomTools.Cast<AIFunction>().First(t => t.Name == "get_goal");
+            var result = (await tool.InvokeAsync(
+                new AIFunctionArguments { ["goal_id"] = "g1" }, TestContext.Current.CancellationToken))?.ToString();
+
+            Assert.Contains("Goal ID: g1", result);
+            Assert.Contains("Pipeline not active.", result);
+        }
+        finally { DeleteTempPath(dir); }
     }
 }

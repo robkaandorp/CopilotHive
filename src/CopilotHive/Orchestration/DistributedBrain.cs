@@ -227,7 +227,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     maxSteps: _maxSteps,
                     systemPrompt: _systemPrompt,
                     reasoningEffort: _reasoningEffort,
-                    workDirectory: _repoManager?.WorkDirectory ?? _stateDir);
+                    workDirectory: _repoManager?.WorkDirectory ?? _stateDir,
+                    goalStore: _goalStore,
+                    knowledgeGraph: _knowledgeGraph);
             actor.Start();
 
             var connectMsg = BrainActorMessages.CreateConnectMessage();
@@ -458,6 +460,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         var validTiers = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { "standard", "premium" };
 
+        var pipelineResolver = (Func<string, Task<GoalPipeline?>>)(goalId =>
+            Task.FromResult(_activePipelines.TryGetValue(goalId, out var p) ? p : null));
+
         return
         [
             AIFunctionFactory.Create(
@@ -475,277 +480,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 },
                 "escalate_to_composer",
                 "Escalate a question to the Composer when the Brain cannot answer from the codebase alone."),
-            AIFunctionFactory.Create(
-                async ([Description("The goal ID to retrieve details for.")] string goal_id) =>
-                {
-                    if (_goalStore is null)
-                        return "Goal store is not available.";
-
-                    var goal = await _goalStore.GetGoalAsync(goal_id);
-                    if (goal is null)
-                        return $"Goal '{goal_id}' not found.";
-
-                    var pipeline = _activePipelines.TryGetValue(goal_id, out var activePipeline) ? activePipeline : null;
-                    var iterationInfo = pipeline is not null
-                        ? $"Current iteration: {pipeline.Iteration}, Phase: {pipeline.Phase}"
-                        : "Pipeline not active.";
-
-                    var relatedDocs = goal.Documents.Count > 0
-                        ? $"\nRelated docs: {string.Join(", ", goal.Documents.Select(docId =>
-                        {
-                            var title = _knowledgeGraph?.GetDocument(docId)?.Title;
-                            return title is not null ? $"{docId} ({title})" : docId;
-                        }))}"
-                        : "";
-
-                    return $"""
-                        Goal ID: {goal.Id}
-                        Description: {goal.Description}
-                        Status: {goal.Status}
-                        Review Status: {goal.ReviewStatus}
-                        Repositories: {string.Join(", ", goal.RepositoryNames)}
-                        {iterationInfo}{relatedDocs}
-                        """;
-                },
-                "get_goal",
-                "Retrieve goal details (description, status, repositories, iteration info) by goal ID."),
-            AIFunctionFactory.Create(
-                ([Description("Search terms to look up in the knowledge graph.")] string query,
-                 [Description("Optional topic filter (e.g. \"architecture\", \"features\").")] string? topic = null,
-                 [Description("Optional document type filter (e.g. \"implementation\", \"feature\").")] string? type = null,
-                 [Description("Maximum number of results to return (default 5).")] int? limit = null) =>
-                {
-                    if (_knowledgeGraph is null)
-                        return "Knowledge graph not available.";
-
-                    var results = _knowledgeGraph.Search(query);
-
-                    if (topic is not null)
-                        results = results.Where(d => string.Equals(d.Topic, topic, StringComparison.OrdinalIgnoreCase)).ToList();
-
-                    if (type is not null && Enum.TryParse<DocumentType>(type, ignoreCase: true, out var docType))
-                        results = results.Where(d => d.Type == docType).ToList();
-
-                    var maxResults = limit ?? 5;
-                    results = results.Take(maxResults).ToList();
-
-                    if (results.Count == 0)
-                        return "No documents match your query.";
-
-                    var sb = new System.Text.StringBuilder();
-                    sb.AppendLine($"Found {results.Count} document{(results.Count == 1 ? "" : "s")}:");
-                    for (var i = 0; i < results.Count; i++)
-                    {
-                        var doc = results[i];
-                        sb.AppendLine();
-                        sb.AppendLine($"{i + 1}. [{doc.Id}] {doc.Title} ({doc.Type.ToString().ToLowerInvariant()}, {doc.Status.ToString().ToLowerInvariant()})");
-                        const int snippetLength = 300;
-                        var snippet = doc.Content.Length > snippetLength
-                            ? doc.Content[..snippetLength] + "..."
-                            : doc.Content;
-                        sb.Append($"   {snippet}");
-                    }
-                    return sb.ToString();
-                },
-                "search_knowledge",
-                "Search the knowledge graph for architecture and design documents by query. Supports optional topic, type, and limit filters."),
-            AIFunctionFactory.Create(
-                ([Description("The ID of the document to read.")] string document_id) =>
-                {
-                    if (_knowledgeGraph is null)
-                        return "Knowledge graph not available.";
-
-                    var doc = _knowledgeGraph.GetDocument(document_id);
-                    if (doc is null)
-                        return $"Document '{document_id}' not found.";
-
-                    var sb = new System.Text.StringBuilder();
-                    sb.AppendLine($"## {doc.Title}");
-                    sb.AppendLine($"- **ID:** {doc.Id}");
-                    sb.AppendLine($"- **Type:** {doc.Type}");
-                    sb.AppendLine($"- **Status:** {doc.Status}");
-                    sb.AppendLine($"- **Topic:** {doc.Topic}" + (doc.Subtopic is not null ? $"/{doc.Subtopic}" : ""));
-                    sb.AppendLine($"- **File:** {doc.FilePath}");
-                    sb.AppendLine($"- **Author:** {doc.Author}");
-                    sb.AppendLine($"- **Created:** {doc.CreatedAt:yyyy-MM-dd}");
-                    sb.AppendLine($"- **Updated:** {doc.UpdatedAt:yyyy-MM-dd}");
-
-                    if (doc.Tags.Count > 0)
-                        sb.AppendLine($"- **Tags:** {string.Join(", ", doc.Tags)}");
-
-                    if (doc.Links.Count > 0)
-                    {
-                        sb.AppendLine("- **Links:**");
-                        foreach (var link in doc.Links)
-                        {
-                            var descPart = link.Description is not null ? $" — {link.Description}" : "";
-                            sb.AppendLine($"  - [{link.Type}] → {link.TargetId}{descPart}");
-                        }
-                    }
-
-                    sb.AppendLine();
-                    sb.Append(doc.Content);
-
-                    return sb.ToString();
-                },
-                "read_document",
-                "Read a knowledge document by ID. Returns full document including title, type, status, tags, links, and markdown body."),
-            AIFunctionFactory.Create(
-                ([Description("Starting document ID")] string document_id,
-                 [Description("Traversal depth (default 1, max 3)")] int depth = 1,
-                 [Description("Direction: 'outgoing' (default), 'incoming', or 'both'")] string direction = "outgoing",
-                 [Description("Filter to specific link types (optional array): parent, supersedes, depends_on, implements, related, references")] string[]? link_types = null) =>
-                {
-                    if (_knowledgeGraph is null)
-                        return "Knowledge graph not available.";
-
-                    var startDoc = _knowledgeGraph.GetDocument(document_id);
-                    if (startDoc is null)
-                        return $"Document '{document_id}' not found.";
-
-                    // Clamp depth to [1, 3]
-                    depth = Math.Clamp(depth, 1, 3);
-
-                    var validDirections = new[] { "outgoing", "incoming", "both" };
-                    if (!validDirections.Contains(direction, StringComparer.OrdinalIgnoreCase))
-                        return $"Invalid direction '{direction}'. Valid values: outgoing, incoming, both.";
-
-                    // Parse optional link type filter from string array
-                    HashSet<Knowledge.LinkType>? linkTypeFilter = null;
-                    if (link_types is { Length: > 0 })
-                    {
-                        linkTypeFilter = new HashSet<Knowledge.LinkType>();
-                        foreach (var ltStr in link_types)
-                        {
-                            var normalized = ltStr.Replace("_", "");
-                            if (Enum.TryParse<Knowledge.LinkType>(normalized, ignoreCase: true, out var lt))
-                                linkTypeFilter.Add(lt);
-                        }
-                    }
-
-                    var sb = new System.Text.StringBuilder();
-                    sb.AppendLine($"## Knowledge Graph: {startDoc.Id}");
-                    sb.AppendLine($"**{startDoc.Title}** ({startDoc.Type}, {startDoc.Status})");
-                    sb.AppendLine();
-
-                    // BFS traversal
-                    var visited = new HashSet<string> { document_id };
-                    var queue = new Queue<(string Id, int CurrentDepth)>();
-                    queue.Enqueue((document_id, 0));
-                    var edges = new List<(string From, string To, Knowledge.LinkType LinkType, string Direction)>();
-
-                    while (queue.Count > 0)
-                    {
-                        var (currentId, currentDepth) = queue.Dequeue();
-                        if (currentDepth >= depth) continue;
-
-                        var currentDoc = _knowledgeGraph.GetDocument(currentId);
-                        if (currentDoc is null) continue;
-
-                        // Outgoing links
-                        if (direction.Equals("outgoing", StringComparison.OrdinalIgnoreCase) ||
-                            direction.Equals("both", StringComparison.OrdinalIgnoreCase))
-                        {
-                            foreach (var link in currentDoc.Links)
-                            {
-                                if (linkTypeFilter is not null && !linkTypeFilter.Contains(link.Type))
-                                    continue;
-
-                                edges.Add((currentId, link.TargetId, link.Type, "→"));
-
-                                if (!visited.Contains(link.TargetId))
-                                {
-                                    visited.Add(link.TargetId);
-                                    queue.Enqueue((link.TargetId, currentDepth + 1));
-                                }
-                            }
-                        }
-
-                        // Incoming links (from reverse index via dedicated inverse-type methods)
-                        if (direction.Equals("incoming", StringComparison.OrdinalIgnoreCase) ||
-                            direction.Equals("both", StringComparison.OrdinalIgnoreCase))
-                        {
-                            // Combine all incoming docs from all inverse types (including Related and References)
-                            var incoming = new List<Knowledge.KnowledgeDocument>();
-                            incoming.AddRange(_knowledgeGraph.GetChildren(currentId));
-                            incoming.AddRange(_knowledgeGraph.GetSupersededBy(currentId));
-                            incoming.AddRange(_knowledgeGraph.GetDependedOnBy(currentId));
-                            incoming.AddRange(_knowledgeGraph.GetImplementedBy(currentId));
-                            incoming.AddRange(_knowledgeGraph.GetRelatedBy(currentId));
-                            incoming.AddRange(_knowledgeGraph.GetReferencedBy(currentId));
-
-                            foreach (var incomingDoc in incoming.DistinctBy(d => d.Id))
-                            {
-                                foreach (var link in incomingDoc.Links.Where(l => l.TargetId == currentId))
-                                {
-                                    if (linkTypeFilter is not null && !linkTypeFilter.Contains(link.Type))
-                                        continue;
-
-                                    edges.Add((incomingDoc.Id, currentId, link.Type, "←"));
-
-                                    if (!visited.Contains(incomingDoc.Id))
-                                    {
-                                        visited.Add(incomingDoc.Id);
-                                        queue.Enqueue((incomingDoc.Id, currentDepth + 1));
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if (edges.Count == 0)
-                    {
-                        sb.AppendLine("No links found in the specified direction and depth.");
-                        return sb.ToString().TrimEnd();
-                    }
-
-                    sb.AppendLine("### Relationships\n");
-                    foreach (var (from, to, lt, dir) in edges)
-                    {
-                        var toDoc = _knowledgeGraph.GetDocument(to);
-                        var toTitle = toDoc is not null ? $" ({toDoc.Title})" : " [not found]";
-                        var fromDoc = _knowledgeGraph.GetDocument(from);
-                        var fromTitle = fromDoc is not null ? $" ({fromDoc.Title})" : " [not found]";
-
-                        if (dir == "→")
-                            sb.AppendLine($"- {from}{fromTitle} **{dir}[{lt}]** {to}{toTitle}");
-                        else
-                            sb.AppendLine($"- {from}{fromTitle} **{dir}[{lt}]** {to}{toTitle}");
-                    }
-
-                    // List all reachable documents (excluding start)
-                    var reachable = visited.Where(id => id != document_id).ToList();
-                    if (reachable.Count > 0)
-                    {
-                        sb.AppendLine($"\n### Reachable Documents ({reachable.Count})");
-                        foreach (var docId in reachable)
-                        {
-                            var d = _knowledgeGraph.GetDocument(docId);
-                            if (d is not null)
-                                sb.AppendLine($"- **{d.Id}** — {d.Title} ({d.Type}, {d.Status})");
-                            else
-                                sb.AppendLine($"- **{docId}** [not found]");
-                        }
-                    }
-
-                    return sb.ToString().TrimEnd();
-                },
-                "traverse_graph",
-                "Explore the knowledge graph from a starting document, following links up to a given depth."),
-            AIFunctionFactory.Create(
-                () =>
-                {
-                    var now = DateTime.UtcNow;
-                    return System.Text.Json.JsonSerializer.Serialize(new
-                    {
-                        date = now.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
-                        time = now.ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture),
-                        iso = now.ToString("o", System.Globalization.CultureInfo.InvariantCulture),
-                        timezone = "UTC"
-                    });
-                },
-                "get_current_time",
-                "Get the current date and time in UTC. Use when you need to know the current date for changelog entries, release notes, or other date-sensitive content."),
             AIFunctionFactory.Create(
                 ([Description("Ordered phase names, e.g. [\"coding\",\"testing\",\"docwriting\",\"review\",\"merging\"]")] string[] phases,
                  [Description("JSON object with per-phase instructions.\n  Single-round: {\"coding\": \"...\", \"review\": \"...\"}\n  Multi-round:  {\"coding-1\": \"step 1: revert...\", \"coding-2\": \"step 2: restructure...\", \"review\": \"...\"}")] string phase_instructions,
@@ -799,6 +533,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 },
                 "report_iteration_plan",
                 "Report your iteration plan — which phases to run and in what order."),
+            .. BrainTools.BuildDependencyTools(_goalStore, pipelineResolver, _knowledgeGraph, _logger),
         ];
     }
 

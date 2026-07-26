@@ -1,4 +1,6 @@
 using CopilotHive.Configuration;
+using CopilotHive.Knowledge;
+using CopilotHive.Goals;
 using CopilotHive.Services;
 using CopilotHive.Shared.AI;
 
@@ -30,6 +32,8 @@ internal sealed class BrainActor : Actor<IBrainMessage>
     private readonly int _maxSteps;
     private readonly string? _systemPrompt;
     private readonly string? _workDirectory;
+    private readonly IGoalStore? _goalStore;
+    private readonly KnowledgeGraph? _knowledgeGraph;
     private ReasoningEffort? _reasoningEffort;
 
     private AgentSession? _masterSession;
@@ -51,7 +55,9 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         int maxSteps = 50,
         string? systemPrompt = null,
         ReasoningEffort? reasoningEffort = null,
-        string? workDirectory = null)
+        string? workDirectory = null,
+        IGoalStore? goalStore = null,
+        KnowledgeGraph? knowledgeGraph = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -65,6 +71,8 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         _systemPrompt = systemPrompt;
         _reasoningEffort = reasoningEffort;
         _workDirectory = workDirectory;
+        _goalStore = goalStore;
+        _knowledgeGraph = knowledgeGraph;
     }
 
     /// <inheritdoc />
@@ -367,7 +375,10 @@ internal sealed class BrainActor : Actor<IBrainMessage>
             _maxContextTokens,
             _stateDir,
             sessionRegistry: null,
-            _logger);
+            _logger,
+            goalStore: _goalStore,
+            knowledgeGraph: _knowledgeGraph,
+            parentTell: Tell);
 
     private async Task DisposeChildQuietlyAsync(GoalBrainActor child)
     {
