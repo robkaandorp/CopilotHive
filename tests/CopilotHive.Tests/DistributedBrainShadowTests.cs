@@ -641,6 +641,7 @@ public class DistributedBrainShadowTests
             var repoManager = new FakeRepoManager(repoDir);
             var goalStore = new InMemoryGoalStore();
             var knowledgeGraph = new CopilotHive.Knowledge.KnowledgeGraph();
+            var sessionRegistry = new LlmSessionRegistry();
 
             var brain = new DistributedBrain(
                 "copilot/test-model:high",
@@ -652,7 +653,8 @@ public class DistributedBrainShadowTests
                 chatClient: injectedClient,
                 compactionModel: null,
                 knowledgeGraph: knowledgeGraph,
-                hiveConfig: hiveConfig);
+                hiveConfig: hiveConfig,
+                sessionRegistry: sessionRegistry);
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
@@ -700,6 +702,9 @@ public class DistributedBrainShadowTests
                 // _goalStore and _knowledgeGraph should be propagated from the DistributedBrain.
                 Assert.Same(goalStore, GetField<CopilotHive.Goals.IGoalStore?>(a, "_goalStore"));
                 Assert.Same(knowledgeGraph, GetField<CopilotHive.Knowledge.KnowledgeGraph?>(a, "_knowledgeGraph"));
+
+                // _sessionRegistry should be propagated from the DistributedBrain.
+                Assert.Same(sessionRegistry, GetField<CopilotHive.Dashboard.LlmSessionRegistry?>(a, "_sessionRegistry"));
             }
         }
         finally { DeleteDir(dir); }
@@ -1064,8 +1069,6 @@ public class DistributedBrainShadowTests
     public async Task PostConstructorFailure_SessionSaveFails_ChildDisposed_NoRegistration()
     {
         var dir = NewTempDir();
-        var filePath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".tmp");
-        await File.WriteAllTextAsync(filePath, "not-a-directory", TestContext.Current.CancellationToken);
         try
         {
             var shadowClient = new TrackingChatClient();
@@ -1075,44 +1078,51 @@ public class DistributedBrainShadowTests
                 stateDir: dir, chatClient: new TrackingChatClient(),
                 hiveConfig: ActorConfig(true));
 
-            // Create a BrainActor whose state dir is a FILE, so SaveSessionAsync throws.
-            SetActorFactory(brain, _ =>
-                new BrainActor(
-                    "copilot/test-model", 100_000, filePath, NullLogger.Instance,
-                    chatClientFactory: _ => shadowClient));
+            // The shadow actor gets a VALID state directory so ConnectAsync succeeds and
+            // _brainActor is set. The fork failure is induced afterwards.
+            string? actorStateDir = null;
+            SetActorFactory(brain, stateDir =>
+            {
+                actorStateDir = stateDir;
+                return new BrainActor(
+                    "copilot/test-model", 100_000, stateDir, NullLogger.Instance,
+                    chatClientFactory: _ => shadowClient,
+                    sessionRegistry: new LlmSessionRegistry());
+            });
 
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
-                // ForkSessionForGoalAsync should succeed on the authoritative path.
-                // The shadow actor's ForkSessionAsync should fail (session save fails because
-                // state dir is a file), but the failure is logged and does NOT propagate.
-                await brain.ForkSessionForGoalAsync("goal-postfail", TestContext.Current.CancellationToken);
-
-                // Give the mirror a moment to process.
-                await Task.Delay(500, TestContext.Current.CancellationToken);
-
-                // Verify the shadow actor's state — no child should be registered.
                 var actor = (BrainActor?)GetBrainActor(brain);
                 Assert.NotNull(actor);
-                var children = GetChildActors(actor!);
-                Assert.False(children.ContainsKey("goal-postfail"),
-                    "Shadow actor should not have a child for goal-postfail (session save failed).");
-                var sessions = GetActiveGoalSessions(actor!);
-                Assert.False(sessions.ContainsKey("goal-postfail"),
-                    "Shadow actor should not have a session entry for goal-postfail.");
+                Assert.NotNull(actorStateDir);
 
-                // The chat client should have been disposed via the child's DisposeOwnedResources
-                // (post-constructor failure disposes the child actor, not raw clients).
-                Assert.True(shadowClient.WasDisposed,
-                    "Chat client should be disposed via child actor disposal after post-constructor failure.");
+                // Occupy the goal session file path with a DIRECTORY so the shadow actor's
+                // SaveSessionAsync cannot write the file. The failure happens after the child
+                // actor has been constructed and started — a true post-constructor failure.
+                var blockedGoalSessionPath = Path.Combine(actorStateDir!, "brain-goal-goal-postfail.json");
+                Directory.CreateDirectory(blockedGoalSessionPath);
+
+                // The authoritative path succeeds; the shadow fork faults and MirrorAsync
+                // swallows and logs the failure, so this call must not throw.
+                await brain.ForkSessionForGoalAsync("goal-postfail", TestContext.Current.CancellationToken);
+
+                // Let the actor mailbox settle after the faulted fork.
+                await Task.Delay(200, TestContext.Current.CancellationToken);
+
+                // ForkSessionAsync assigns both dictionaries only AFTER the save succeeds, so a
+                // failing save must leave no child and no session entry behind.
+                Assert.False(GetChildActors(actor!).ContainsKey("goal-postfail"),
+                    "Shadow actor must not track a child for goal-postfail when the session save fails.");
+                Assert.False(GetActiveGoalSessions(actor!).ContainsKey("goal-postfail"),
+                    "Shadow actor must not track a session entry for goal-postfail when the session save fails.");
             }
         }
         finally
         {
+            // Recursive delete also removes the directory planted at the goal session path.
             DeleteDir(dir);
-            try { if (File.Exists(filePath)) File.Delete(filePath); } catch { }
         }
     }
 

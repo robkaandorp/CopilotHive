@@ -55,7 +55,9 @@ internal sealed record InjectNoteOnChildMessage(
     TaskCompletionSource<bool> Reply) : IBrainMessage;
 
 /// <summary>Immutable snapshot of brain actor statistics.</summary>
-internal sealed record BrainActorStats(string Model, int MessageCount, long ContextTokens, long MaxContextTokens, bool IsConnected);
+internal sealed record BrainActorStats(
+    string Model, int MessageCount, long ContextTokens, long MaxContextTokens,
+    bool IsConnected, long CumulativeInputTokens, long CumulativeOutputTokens, int MaxSteps);
 
 /// <summary>Factory helpers for messages that carry reply channels.</summary>
 internal static class BrainActorMessages

@@ -331,35 +331,31 @@ public class BrainActorChildTests
     [Fact]
     public async Task ForkSession_PostConstructorFailure_SessionSaveFails_DisposesChild()
     {
+        // Use a real directory for actor state so ConnectAsync succeeds, but block the goal
+        // session file path with a directory so SaveSessionAsync throws after the child actor
+        // has been constructed.
         var dir = CreateTempDir();
         try
         {
             var client = new FakeChatClient();
-            // Use a file path as stateDir so SaveSessionAsync throws.
-            var filePath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".tmp");
-            await File.WriteAllTextAsync(filePath, "not-a-directory", TestContext.Current.CancellationToken);
-            try
-            {
-                await using var actor = CreateActor(filePath, FakeFactory(client));
-                actor.Start();
-                await ConnectAsync(actor);
+            var goalFilePath = Path.Combine(dir, "brain-goal-goal-1.json");
+            Directory.CreateDirectory(goalFilePath);
 
-                var fork = BrainActorMessages.CreateForkSessionMessage("goal-1");
-                Assert.True(actor.Tell(fork));
-                await AwaitSettledAsync(fork.Reply);
-                Assert.True(fork.Reply.Task.IsFaulted);
+            await using var actor = CreateActor(dir, FakeFactory(client));
+            actor.Start();
+            await ConnectAsync(actor);
 
-                // No child registered in either dict.
-                Assert.Empty(GetChildActors(actor));
-                Assert.Empty(GetActiveGoalSessions(actor));
+            var fork = BrainActorMessages.CreateForkSessionMessage("goal-1");
+            Assert.True(actor.Tell(fork));
+            await AwaitSettledAsync(fork.Reply);
+            Assert.True(fork.Reply.Task.IsFaulted);
 
-                // The chat client should be disposed (the child was disposed, which disposes owned clients).
-                Assert.True(client.WasDisposed, "Chat client must be disposed when child actor is disposed.");
-            }
-            finally
-            {
-                DeleteTempPath(filePath);
-            }
+            // No child registered in either dict.
+            Assert.Empty(GetChildActors(actor));
+            Assert.Empty(GetActiveGoalSessions(actor));
+
+            // The chat client should be disposed (the child was disposed, which disposes owned clients).
+            Assert.True(client.WasDisposed, "Chat client must be disposed when child actor is disposed.");
         }
         finally { DeleteTempPath(dir); }
     }

@@ -3758,13 +3758,13 @@ public sealed class DistributedBrainTests
                 // The old actor was disposed — its mailbox loop is completed.
                 Assert.True(originalActor.IsCompleted, "Old actor must be disposed during reset");
 
-                // All actor state files (including brain-master.json) were deleted during reset.
-                // The new actor creates an in-memory master session on connect but only persists
-                // it to disk on the next merge — so brain-master.json should not exist yet.
+                // All actor goal session files were deleted during reset. The new shadow actor's
+                // ConnectAsync immediately persists a fresh master session, so brain-master.json
+                // is recreated by the time the actor reports connected.
                 Assert.False(File.Exists(ActorGoalFile(dir, "g7")),
                     "Actor goal session files must be deleted during reset");
-                Assert.False(File.Exists(Path.Combine(dir, "actors", "brain-master.json")),
-                    "brain-master.json must be deleted during reset (not yet recreated by new actor)");
+                Assert.True(File.Exists(Path.Combine(dir, "actors", "brain-master.json")),
+                    "brain-master.json must be recreated by the new shadow actor's ConnectAsync");
 
                 // The recreated shadow is live and connected.
                 var stats = CopilotHive.Actors.BrainActorMessages.CreateGetStatsMessage();

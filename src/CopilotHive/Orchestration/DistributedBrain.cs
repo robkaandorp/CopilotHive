@@ -233,7 +233,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     reasoningEffort: _reasoningEffort,
                     workDirectory: _repoManager?.WorkDirectory,
                     goalStore: _goalStore,
-                    knowledgeGraph: _knowledgeGraph);
+                    knowledgeGraph: _knowledgeGraph,
+                    sessionRegistry: _sessionRegistry);
             actor.Start();
 
             var connectMsg = BrainActorMessages.CreateConnectMessage();

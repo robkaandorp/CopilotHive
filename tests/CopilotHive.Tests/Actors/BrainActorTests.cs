@@ -1,6 +1,7 @@
 using System.Reflection;
 
 using CopilotHive.Actors;
+using CopilotHive.Dashboard;
 using CopilotHive.Goals;
 using CopilotHive.Services;
 
@@ -87,9 +88,16 @@ public class BrainActorTests
         public void Dispose() { }
     }
 
-    private static BrainActor CreateActor(string stateDir, string model = "test-model", int maxContextTokens = 100_000) =>
+    private static BrainActor CreateActor(
+        string stateDir,
+        string model = "test-model",
+        int maxContextTokens = 100_000,
+        int maxSteps = 50,
+        LlmSessionRegistry? sessionRegistry = null) =>
         new(model, maxContextTokens, stateDir, NullLogger<BrainActor>.Instance,
-            chatClientFactory: _ => new StubChatClient());
+            chatClientFactory: _ => new StubChatClient(),
+            maxSteps: maxSteps,
+            sessionRegistry: sessionRegistry);
 
     private static GoalPipeline CreatePipeline(string goalId) =>
         new(new Goal { Id = goalId, Description = $"Description for {goalId}" });
@@ -143,7 +151,6 @@ public class BrainActorTests
             await using var actor = CreateActor(dir);
             actor.Start();
             await ConnectAsync(actor);
-
             var fork = BrainActorMessages.CreateForkSessionMessage("goal-1");
             actor.Tell(fork);
             Assert.True(await AwaitReplyAsync(fork.Reply));
@@ -175,7 +182,6 @@ public class BrainActorTests
             await using var actor = CreateActor(dir);
             actor.Start();
             await ConnectAsync(actor);
-
             var first = BrainActorMessages.CreateForkSessionMessage("goal-1");
             actor.Tell(first);
             Assert.True(await AwaitReplyAsync(first.Reply));
@@ -211,7 +217,6 @@ public class BrainActorTests
             await using var actor = CreateActor(dir);
             actor.Start();
             await ConnectAsync(actor);
-
             // Seed a non-zero token count so the reset in MergeSummary is observable.
             GetMasterSession(actor).LastKnownContextTokens = 4242;
 
@@ -281,7 +286,6 @@ public class BrainActorTests
             await using var actor = CreateActor(dir);
             actor.Start();
             await ConnectAsync(actor);
-
             var update = BrainActorMessages.CreateUpdateModelMessage("new-model", 50_000);
             actor.Tell(update);
             Assert.True(await AwaitReplyAsync(update.Reply));
@@ -425,17 +429,17 @@ public class BrainActorTests
     [Fact]
     public async Task HandlerException_FaultsReply_AndLoopContinues()
     {
-        // A file (not a directory) as the state dir makes session persistence fail with an I/O error.
-        var filePath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".tmp");
-        await File.WriteAllTextAsync(filePath, "not-a-directory", TestContext.Current.CancellationToken);
+        // An invalid goal id triggers an exception in the handler. The reply must be faulted,
+        // and the actor loop must keep processing subsequent messages.
+        var dir = CreateTempDir();
         try
         {
-            await using var actor = CreateActor(filePath);
+            await using var actor = CreateActor(dir);
             actor.Start();
 
             Assert.True(await ConnectAsync(actor));
 
-            var fork = BrainActorMessages.CreateForkSessionMessage("goal-1");
+            var fork = BrainActorMessages.CreateForkSessionMessage("../escape");
             actor.Tell(fork);
             await AwaitSettledAsync(fork.Reply);
             Assert.True(fork.Reply.Task.IsFaulted);
@@ -449,7 +453,7 @@ public class BrainActorTests
         }
         finally
         {
-            DeleteTempPath(filePath);
+            DeleteTempPath(dir);
         }
     }
 
@@ -462,7 +466,6 @@ public class BrainActorTests
             await using var actor = CreateActor(dir);
             actor.Start();
             await ConnectAsync(actor);
-
             var fork = BrainActorMessages.CreateForkSessionMessage("../../etc/passwd");
             actor.Tell(fork);
             await AwaitSettledAsync(fork.Reply);
@@ -488,7 +491,6 @@ public class BrainActorTests
             await using var actor = CreateActor(dir);
             actor.Start();
             await ConnectAsync(actor);
-
             var traversal = BrainActorMessages.CreateForkSessionMessage("..");
             actor.Tell(traversal);
             await AwaitSettledAsync(traversal.Reply);
@@ -572,7 +574,6 @@ public class BrainActorTests
             await using var actor = CreateActor(dir);
             actor.Start();
             await ConnectAsync(actor);
-
             using var barrier = new Barrier(producerCount);
             var forkMsgs = new ForkSessionMessage[producerCount];
             var producers = new List<Task>(producerCount);
@@ -905,6 +906,199 @@ public class BrainActorTests
 
             Assert.True(register.Reply.Task.IsCanceled);
             Assert.True(inject.Reply.Task.IsCanceled);
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    // ── Phase 3c-3b: BrainActor authoritative capabilities ──
+
+    [Fact]
+    public async Task ConnectAsync_SavesBrainMasterFile()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+
+            Assert.True(await ConnectAsync(actor));
+            Assert.True(File.Exists(Path.Combine(dir, "brain-master.json")), "brain-master.json should exist after connect.");
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task DeleteSessionAsync_UnregistersBrainGoalSession()
+    {
+        var dir = CreateTempDir();
+        var registry = new LlmSessionRegistry();
+        var goalId = "goal-9";
+        try
+        {
+            await using var actor = CreateActor(dir, sessionRegistry: registry);
+            actor.Start();
+            await ConnectAsync(actor);
+            // Register the goal session so the registry is seeded.
+            registry.RegisterOrUpdate(new LlmSessionInfo
+            {
+                SessionId = $"brain-goal-{goalId}",
+                SessionType = LlmSessionType.BrainGoal,
+                GoalId = goalId,
+                Model = "test-model",
+                Status = "idle",
+            });
+            Assert.Contains(registry.GetAll(), s => s.SessionId == $"brain-goal-{goalId}");
+
+            var delete = BrainActorMessages.CreateDeleteSessionMessage(goalId);
+            Assert.True(actor.Tell(delete));
+            Assert.True(await AwaitReplyAsync(delete.Reply));
+
+            Assert.DoesNotContain(registry.GetAll(), s => s.SessionId == $"brain-goal-{goalId}");
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task OnShutdownAsync_UnregistersAllChildSessions()
+    {
+        var dir = CreateTempDir();
+        var registry = new LlmSessionRegistry();
+        const string goalId1 = "goal-10a";
+        const string goalId2 = "goal-10b";
+        try
+        {
+            var actor = CreateActor(dir, sessionRegistry: registry);
+            actor.Start();
+            await ConnectAsync(actor);
+            await ForkSessionAsync(actor, goalId1);
+            await ForkSessionAsync(actor, goalId2);
+
+            // Seed registry entries for the two children. This gives OnShutdownAsync something
+            // to unregister, so the test is non-vacuous: deleting the unregister loop would make
+            // the post-dispose assertions fail.
+            registry.RegisterOrUpdate(new LlmSessionInfo
+            {
+                SessionId = $"brain-goal-{goalId1}",
+                SessionType = LlmSessionType.BrainGoal,
+                GoalId = goalId1,
+                Model = "test-model",
+                Status = "active",
+                CurrentTokens = 0,
+                MaxTokens = 100_000,
+            });
+            registry.RegisterOrUpdate(new LlmSessionInfo
+            {
+                SessionId = $"brain-goal-{goalId2}",
+                SessionType = LlmSessionType.BrainGoal,
+                GoalId = goalId2,
+                Model = "test-model",
+                Status = "active",
+                CurrentTokens = 0,
+                MaxTokens = 100_000,
+            });
+
+            // Verify the seeded entries exist before disposal.
+            Assert.Contains(registry.GetAll(), s => s.SessionId == $"brain-goal-{goalId1}");
+            Assert.Contains(registry.GetAll(), s => s.SessionId == $"brain-goal-{goalId2}");
+
+            // Dispose triggers OnShutdownAsync. Wait for completion so the unregister loop runs.
+            await actor.DisposeAsync();
+            await Task.WhenAny(actor.Completion, Task.Delay(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+            Assert.True(actor.IsCompleted, "Actor loop should have completed after dispose.");
+
+            // OnShutdownAsync unregisters every captured child.
+            Assert.DoesNotContain(registry.GetAll(), s => s.SessionId == $"brain-goal-{goalId1}");
+            Assert.DoesNotContain(registry.GetAll(), s => s.SessionId == $"brain-goal-{goalId2}");
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    private static async Task ForkSessionAsync(BrainActor actor, string goalId)
+    {
+        var fork = BrainActorMessages.CreateForkSessionMessage(goalId);
+        Assert.True(actor.Tell(fork));
+        await AwaitReplyAsync(fork.Reply);
+    }
+
+    [Fact]
+    public async Task MergeSummaryAsync_UpdatesBrainMasterRegistry()
+    {
+        var dir = CreateTempDir();
+        var registry = new LlmSessionRegistry();
+        const string goalId = "goal-11";
+        try
+        {
+            await using var actor = CreateActor(dir, model: "registry-test-model", sessionRegistry: registry);
+            actor.Start();
+            await ConnectAsync(actor);
+            var merge = BrainActorMessages.CreateMergeSummaryMessage(goalId, "Registry update test summary.");
+            Assert.True(actor.Tell(merge));
+            Assert.True(await AwaitReplyAsync(merge.Reply));
+
+            var master = Assert.Single(registry.GetAll(), s => s.SessionId == "brain-master");
+            Assert.Equal(LlmSessionType.Brain, master.SessionType);
+            Assert.Equal("registry-test-model", master.Model);
+            Assert.Equal("idle", master.Status);
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task GetStats_ReturnsCompleteStats()
+    {
+        var dir = CreateTempDir();
+        const int maxSteps = 77;
+        try
+        {
+            await using var actor = CreateActor(dir, maxContextTokens: 100_000, maxSteps: maxSteps);
+            actor.Start();
+            await ConnectAsync(actor);
+
+            // Seed distinguishable, non-zero values on the master session so every field mapping
+            // in CreateStats is exercised. Hard-coded zeros or swapped mappings will fail.
+            var masterSession = GetMasterSession(actor);
+            masterSession.LastKnownContextTokens = 5000;
+            masterSession.InputTokensUsed = 12345;
+            masterSession.OutputTokensUsed = 67890;
+
+            var stats = BrainActorMessages.CreateGetStatsMessage();
+            Assert.True(actor.Tell(stats));
+            var result = await AwaitReplyAsync(stats.Reply);
+
+            Assert.NotNull(result);
+            Assert.Equal("test-model", result!.Model);
+            Assert.Equal(0, result.MessageCount);
+            Assert.Equal(5000, result.ContextTokens);
+            Assert.Equal(100_000, result.MaxContextTokens);
+            Assert.True(result.IsConnected);
+            Assert.Equal(12345L, result.CumulativeInputTokens);
+            Assert.Equal(67890L, result.CumulativeOutputTokens);
+            Assert.Equal(maxSteps, result.MaxSteps);
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task CreateChildActor_ReceivesNonNullRegistry()
+    {
+        var dir = CreateTempDir();
+        var registry = new LlmSessionRegistry();
+        const string goalId = "goal-12";
+        try
+        {
+            await using var actor = CreateActor(dir, sessionRegistry: registry);
+            actor.Start();
+            await ConnectAsync(actor);
+            await ForkSessionAsync(actor, goalId);
+
+            var childActorsField = typeof(BrainActor).GetField("_childActors", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var children = (Dictionary<string, GoalBrainActor>)childActorsField.GetValue(actor)!;
+            Assert.True(children.TryGetValue(goalId, out var child));
+
+            var childRegistryField = typeof(GoalBrainActor).GetField("_sessionRegistry", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var childRegistry = childRegistryField.GetValue(child);
+            Assert.NotNull(childRegistry);
+            Assert.Same(registry, childRegistry);
         }
         finally { DeleteTempPath(dir); }
     }

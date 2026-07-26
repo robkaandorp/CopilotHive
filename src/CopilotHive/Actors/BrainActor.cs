@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
 using CopilotHive.Knowledge;
 using CopilotHive.Goals;
 using CopilotHive.Services;
@@ -34,6 +35,7 @@ internal sealed class BrainActor : Actor<IBrainMessage>
     private readonly string? _workDirectory;
     private readonly IGoalStore? _goalStore;
     private readonly KnowledgeGraph? _knowledgeGraph;
+    private readonly LlmSessionRegistry? _sessionRegistry;
     private ReasoningEffort? _reasoningEffort;
 
     private AgentSession? _masterSession;
@@ -57,7 +59,8 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         ReasoningEffort? reasoningEffort = null,
         string? workDirectory = null,
         IGoalStore? goalStore = null,
-        KnowledgeGraph? knowledgeGraph = null)
+        KnowledgeGraph? knowledgeGraph = null,
+        LlmSessionRegistry? sessionRegistry = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -73,6 +76,7 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         _workDirectory = workDirectory;
         _goalStore = goalStore;
         _knowledgeGraph = knowledgeGraph;
+        _sessionRegistry = sessionRegistry;
     }
 
     /// <inheritdoc />
@@ -243,6 +247,9 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         }
 
         _connected = true;
+        var path = GetMasterSessionFilePath();
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await _masterSession.SaveAsync(path, ct);
     }
 
     private async Task ForkSessionAsync(string goalId, CancellationToken ct)
@@ -269,6 +276,7 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         catch
         {
             await DisposeChildQuietlyAsync(child);
+            _sessionRegistry?.Unregister($"brain-goal-{goalId}");
             throw;
         }
 
@@ -374,7 +382,7 @@ internal sealed class BrainActor : Actor<IBrainMessage>
             _modelOverride,
             _maxContextTokens,
             _stateDir,
-            sessionRegistry: null,
+            sessionRegistry: _sessionRegistry,
             _logger,
             goalStore: _goalStore,
             knowledgeGraph: _knowledgeGraph,
@@ -460,6 +468,8 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         {
             File.Delete(filePath);
         }
+
+        _sessionRegistry?.Unregister($"brain-goal-{goalId}");
     }
 
     private async Task MergeSummaryAsync(string goalId, string summary, CancellationToken ct)
@@ -469,6 +479,16 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         master.MessageHistory.Add(new ChatMessage(ChatRole.Assistant, summary));
         master.LastKnownContextTokens = 0;
         await SaveSessionAsync(master, GetMasterSessionFilePath(), ct);
+
+        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+        {
+            SessionId = "brain-master",
+            SessionType = LlmSessionType.Brain,
+            Model = _modelOverride,
+            Status = "idle",
+            CurrentTokens = master.EstimatedContextTokens,
+            MaxTokens = _maxContextTokens,
+        });
     }
 
     private BrainActorStats? CreateStats()
@@ -487,7 +507,10 @@ internal sealed class BrainActor : Actor<IBrainMessage>
             _masterSession.MessageHistory.Count,
             contextTokens,
             _maxContextTokens,
-            _connected);
+            _connected,
+            _masterSession.InputTokensUsed,
+            _masterSession.OutputTokensUsed,
+            _maxSteps);
     }
 
     private AgentSession EnsureConnected() =>
@@ -579,6 +602,10 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         var children = _childActors.Values.ToList();
         _childActors.Clear();
         await Task.WhenAll(children.Select(c => DisposeChildQuietlyAsync(c)));
+        foreach (var child in children)
+        {
+            _sessionRegistry?.Unregister($"brain-goal-{child.GoalId}");
+        }
     }
 
     /// <inheritdoc />
