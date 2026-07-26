@@ -759,6 +759,7 @@ public class DistributedBrainShadowTests
 
                 var actorMasterPath = Path.Combine(dir, "actors", "brain-master.json");
                 Assert.True(File.Exists(actorMasterPath), "Actor master session should be migrated.");
+                Assert.True(File.Exists(Path.Combine(dir, "actors", ".migrated")), ".migrated marker should be created.");
 
                 var actorMaster = await AgentSession.LoadAsync(actorMasterPath, TestContext.Current.CancellationToken);
                 Assert.Contains(actorMaster.MessageHistory,
@@ -794,6 +795,8 @@ public class DistributedBrainShadowTests
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
+                Assert.True(File.Exists(Path.Combine(dir, "actors", ".migrated")), ".migrated marker should be created.");
+
                 var actorMaster = await AgentSession.LoadAsync(actorMasterPath, TestContext.Current.CancellationToken);
                 Assert.DoesNotContain(actorMaster.MessageHistory,
                     m => m.Text.Contains("LEGACY_MASTER_MARKER", StringComparison.Ordinal));
@@ -827,6 +830,8 @@ public class DistributedBrainShadowTests
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                Assert.True(File.Exists(Path.Combine(dir, "actors", ".migrated")), ".migrated marker should be created.");
 
                 for (int i = 1; i <= 2; i++)
                 {
@@ -876,6 +881,8 @@ public class DistributedBrainShadowTests
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
+                Assert.True(File.Exists(Path.Combine(dir, "actors", ".migrated")), ".migrated marker should be created.");
+
                 for (int i = 1; i <= 2; i++)
                 {
                     var goalId = $"goal-{i}";
@@ -888,6 +895,387 @@ public class DistributedBrainShadowTests
                         m => m.Text.Contains($"EXISTING_ACTOR_GOAL_{i}_MARKER", StringComparison.Ordinal));
                 }
             }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Criterion 11-15: marker-based migration durability
+    // ════════════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public async Task StartShadowActorAsync_Migration_CreatesMigratedMarker()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var legacyMaster = AgentSession.Create("brain");
+            legacyMaster.MessageHistory.Add(new ChatMessage(ChatRole.User, "LEGACY_MASTER"));
+            await legacyMaster.SaveAsync(Path.Combine(dir, "brain-master.json"), TestContext.Current.CancellationToken);
+
+            var legacyGoal = AgentSession.Create("brain-goal-g1");
+            legacyGoal.MessageHistory.Add(new ChatMessage(ChatRole.User, "LEGACY_GOAL"));
+            await legacyGoal.SaveAsync(Path.Combine(dir, "brain-goal-g1.json"), TestContext.Current.CancellationToken);
+
+            var brain = new DistributedBrain(
+                "copilot/test-model",
+                NullLogger<DistributedBrain>.Instance,
+                stateDir: dir,
+                chatClient: new TrackingChatClient(),
+                hiveConfig: ActorConfig(true));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                Assert.True(File.Exists(Path.Combine(dir, "actors", ".migrated")), "Marker should be created.");
+                Assert.True(File.Exists(Path.Combine(dir, "actors", "brain-master.json")), "Master should be copied.");
+                Assert.True(File.Exists(Path.Combine(dir, "actors", "brain-goal-g1.json")), "Goal should be copied.");
+                Assert.True(File.Exists(Path.Combine(dir, "brain-master.json")), "Legacy master should still exist.");
+                Assert.True(File.Exists(Path.Combine(dir, "brain-goal-g1.json")), "Legacy goal should still exist.");
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task StartShadowActorAsync_Migration_DoesNotReRunWhenMarkerExists()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var legacyMaster = AgentSession.Create("brain");
+            legacyMaster.MessageHistory.Add(new ChatMessage(ChatRole.User, "LEGACY"));
+            await legacyMaster.SaveAsync(Path.Combine(dir, "brain-master.json"), TestContext.Current.CancellationToken);
+
+            var brain1 = new DistributedBrain(
+                "copilot/test-model",
+                NullLogger<DistributedBrain>.Instance,
+                stateDir: dir,
+                chatClient: new TrackingChatClient(),
+                hiveConfig: ActorConfig(true));
+            await using (brain1)
+            {
+                await brain1.ConnectAsync(TestContext.Current.CancellationToken);
+                Assert.True(File.Exists(Path.Combine(dir, "actors", ".migrated")));
+            }
+
+            // Delete the migrated actor master and set a trap copier to prove migration does NOT re-copy.
+            var actorMasterPath = Path.Combine(dir, "actors", "brain-master.json");
+            File.Delete(actorMasterPath);
+
+            var copyInvoked = false;
+            var brain2 = new DistributedBrain(
+                "copilot/test-model",
+                NullLogger<DistributedBrain>.Instance,
+                stateDir: dir,
+                chatClient: new TrackingChatClient(),
+                hiveConfig: ActorConfig(true));
+            brain2._fileCopier = (src, dst) =>
+            {
+                copyInvoked = true;
+                return false;
+            };
+
+            await using (brain2)
+            {
+                await brain2.ConnectAsync(TestContext.Current.CancellationToken);
+
+                Assert.False(copyInvoked, "Migration should be skipped when .migrated marker exists.");
+
+                // The actor's own startup may save a fresh master; the key point is that the legacy
+                // marker did NOT get re-migrated into it.
+                var actorMasterContent = await File.ReadAllTextAsync(actorMasterPath, TestContext.Current.CancellationToken);
+                Assert.DoesNotContain("LEGACY", actorMasterContent);
+
+                Assert.True(File.Exists(Path.Combine(dir, "actors", ".migrated")), "Marker should still exist.");
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task StartShadowActorAsync_Migration_FailedCopy_CreatesMarker_RetainsSource()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var legacyMaster = AgentSession.Create("brain");
+            legacyMaster.MessageHistory.Add(new ChatMessage(ChatRole.User, "LEGACY"));
+            var legacyPath = Path.Combine(dir, "brain-master.json");
+            await legacyMaster.SaveAsync(legacyPath, TestContext.Current.CancellationToken);
+
+            var brain = new DistributedBrain(
+                "copilot/test-model",
+                NullLogger<DistributedBrain>.Instance,
+                stateDir: dir,
+                chatClient: new TrackingChatClient(),
+                hiveConfig: ActorConfig(true));
+            brain._fileCopier = (src, dst) => false;
+
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                Assert.True(File.Exists(Path.Combine(dir, "actors", ".migrated")), "Marker should be created despite copy failure.");
+                Assert.True(File.Exists(legacyPath), "Legacy source must be retained.");
+
+                // The actor's own startup saved a fresh master; verify it does NOT contain the legacy marker.
+                var actorMasterPath = Path.Combine(dir, "actors", "brain-master.json");
+                Assert.True(File.Exists(actorMasterPath), "Actor master file should exist after actor startup.");
+                var actorMasterContent = await File.ReadAllTextAsync(actorMasterPath, TestContext.Current.CancellationToken);
+                Assert.DoesNotContain("LEGACY", actorMasterContent);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task StartShadowActorAsync_Migration_Conflict_KeepsActorAndLegacy()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var legacyMaster = AgentSession.Create("brain");
+            legacyMaster.MessageHistory.Add(new ChatMessage(ChatRole.User, "LEGACY_MARKER"));
+            await legacyMaster.SaveAsync(Path.Combine(dir, "brain-master.json"), TestContext.Current.CancellationToken);
+
+            Directory.CreateDirectory(Path.Combine(dir, "actors"));
+            var actorMaster = AgentSession.Create("brain");
+            actorMaster.MessageHistory.Add(new ChatMessage(ChatRole.User, "ACTOR_MARKER"));
+            var actorMasterPath = Path.Combine(dir, "actors", "brain-master.json");
+            await actorMaster.SaveAsync(actorMasterPath, TestContext.Current.CancellationToken);
+
+            var brain = new DistributedBrain(
+                "copilot/test-model",
+                NullLogger<DistributedBrain>.Instance,
+                stateDir: dir,
+                chatClient: new TrackingChatClient(),
+                hiveConfig: ActorConfig(true));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                Assert.True(File.Exists(Path.Combine(dir, "actors", ".migrated")), "Marker should be created.");
+
+                var loadedActorMaster = await AgentSession.LoadAsync(actorMasterPath, TestContext.Current.CancellationToken);
+                Assert.Contains(loadedActorMaster.MessageHistory,
+                    m => m.Text.Contains("ACTOR_MARKER", StringComparison.Ordinal));
+                Assert.DoesNotContain(loadedActorMaster.MessageHistory,
+                    m => m.Text.Contains("LEGACY_MARKER", StringComparison.Ordinal));
+
+                var loadedLegacyMaster = await AgentSession.LoadAsync(Path.Combine(dir, "brain-master.json"), TestContext.Current.CancellationToken);
+                Assert.Contains(loadedLegacyMaster.MessageHistory,
+                    m => m.Text.Contains("LEGACY_MARKER", StringComparison.Ordinal));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Criteria 16-22: reset durability
+    // ════════════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public async Task ResetSessionAsync_DeletesAllSessionFilesAndRestartsWithEmptyHistory()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("reset-goal", TestContext.Current.CancellationToken);
+                await brain.SaveSessionAsync(TestContext.Current.CancellationToken);
+
+                Assert.True(File.Exists(Path.Combine(dir, "brain-master.json")));
+                Assert.True(File.Exists(Path.Combine(dir, "brain-goal-reset-goal.json")));
+                Assert.True(File.Exists(Path.Combine(dir, "actors", "brain-master.json")));
+                Assert.True(File.Exists(Path.Combine(dir, "actors", "brain-goal-reset-goal.json")));
+                Assert.True(File.Exists(Path.Combine(dir, "actors", ".migrated")));
+
+                await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+                Assert.False(File.Exists(Path.Combine(dir, "brain-master.json")), "stateDir master should be deleted.");
+                Assert.False(File.Exists(Path.Combine(dir, "brain-goal-reset-goal.json")), "stateDir goal should be deleted.");
+                Assert.False(File.Exists(Path.Combine(dir, "actors", "brain-goal-reset-goal.json")), "actor goal should be deleted.");
+
+                var freshActorMasterPath = Path.Combine(dir, "actors", "brain-master.json");
+                Assert.True(File.Exists(freshActorMasterPath), "New actor master should be created after restart.");
+
+                var freshMaster = await AgentSession.LoadAsync(freshActorMasterPath, TestContext.Current.CancellationToken);
+                Assert.Empty(freshMaster.MessageHistory);
+
+                var stats = ((BrainActor?)GetBrainActor(brain))?.Tell(BrainActorMessages.CreateGetStatsMessage()) ?? false;
+                Assert.True(stats, "Recreated actor should be live.");
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_DeletionFailure_ActorsMaster_Throws()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("del-fail", TestContext.Current.CancellationToken);
+
+                brain._fileDeleter = path =>
+                {
+                    if (path.Contains(Path.Combine(dir, "actors")) && path.Contains("brain-master"))
+                        throw new IOException("simulated actors master delete failure");
+                    File.Delete(path);
+                };
+
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
+                Assert.Contains("Failed to clear session state during reset", ex.Message);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_DeletionFailure_StateDirMaster_Throws()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("state-fail", TestContext.Current.CancellationToken);
+                await brain.SaveSessionAsync(TestContext.Current.CancellationToken);
+
+                brain._fileDeleter = path =>
+                {
+                    if (path.StartsWith(dir) && !path.Contains("actors") && path.Contains("brain-master"))
+                        throw new IOException("simulated state dir master delete failure");
+                    File.Delete(path);
+                };
+
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
+                Assert.Contains("Failed to clear session state during reset", ex.Message);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_DeletionFailure_ActorsGoal_Throws()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-fail", TestContext.Current.CancellationToken);
+
+                brain._fileDeleter = path =>
+                {
+                    if (path.Contains(Path.Combine(dir, "actors")) && path.Contains("brain-goal-goal-fail"))
+                        throw new IOException("simulated actors goal delete failure");
+                    File.Delete(path);
+                };
+
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
+                Assert.Contains("Failed to clear session state during reset", ex.Message);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_DeletesMigratedMarker()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                var markerPath = Path.Combine(dir, "actors", ".migrated");
+                Assert.True(File.Exists(markerPath));
+
+                // Track whether the deleter was invoked for the .migrated marker.
+                var markerDeleted = false;
+                brain._fileDeleter = path =>
+                {
+                    if (path == markerPath)
+                        markerDeleted = true;
+                    File.Delete(path);
+                };
+
+                await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+                Assert.True(markerDeleted, "Reset must delete the .migrated marker via _fileDeleter.");
+                // The new actor's startup migration recreates the marker.
+                Assert.True(File.Exists(markerPath),
+                    "Marker should be recreated by the new actor's startup migration.");
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_RestartFailure_ThrowsAndLeavesDegraded()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                SetActorFactory(brain, _ => throw new InvalidOperationException("actor factory failure"));
+
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => brain.ResetSessionAsync(TestContext.Current.CancellationToken));
+                Assert.Contains("actor factory failure", ex.Message);
+
+                Assert.True(IsConnected(brain), "Brain should remain connected in degraded state.");
+                Assert.Null(GetBrainActor(brain));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task ResetSessionAsync_Unconnected_DoesNotTouchFiles()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var legacyMaster = AgentSession.Create("brain");
+            legacyMaster.MessageHistory.Add(new ChatMessage(ChatRole.User, "LEGACY"));
+            await legacyMaster.SaveAsync(Path.Combine(dir, "brain-master.json"), TestContext.Current.CancellationToken);
+
+            var brain = new DistributedBrain(
+                "copilot/test-model",
+                NullLogger<DistributedBrain>.Instance,
+                stateDir: dir,
+                chatClient: new TrackingChatClient(),
+                hiveConfig: ActorConfig(true));
+
+            Assert.False(Directory.Exists(Path.Combine(dir, "actors")));
+
+            await brain.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+            Assert.False(Directory.Exists(Path.Combine(dir, "actors")));
+            Assert.True(File.Exists(Path.Combine(dir, "brain-master.json")), "Legacy master should be untouched.");
+            Assert.Null(GetBrainActor(brain));
         }
         finally { DeleteDir(dir); }
     }

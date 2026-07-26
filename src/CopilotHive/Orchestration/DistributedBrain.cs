@@ -61,7 +61,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private volatile bool _disposing;
     private bool _resetting;
     private bool _connected;
-    private bool _skipSessionMigration;
 
     /// <summary>Shadow brain actor, created on connect when <c>UseBrainActors</c> is enabled.</summary>
     private BrainActor? _brainActor;
@@ -77,6 +76,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     /// <summary>Test seam: artificial delay applied before mirroring a message to the shadow actor.</summary>
     internal TimeSpan? _mirrorDelay;
+
+    /// <summary>Test seam: deletes a file during reset. Default is File.Delete.</summary>
+    internal Action<string> _fileDeleter = File.Delete;
+
+    /// <summary>Test seam: copies a file during migration. Returns true on success, false on failure.</summary>
+    internal Func<string, string, bool> _fileCopier = (src, dst) => { try { File.Copy(src, dst); return true; } catch { return false; } };
 
     /// <summary>Guards one-shot disposal bookkeeping.</summary>
     private readonly object _lifecycleLock = new();
@@ -208,7 +213,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// Starts the shadow <see cref="BrainActor"/> when enabled. Startup failures are logged and
     /// leave the brain fully functional without a shadow; caller cancellation propagates.
     /// </summary>
-    private async Task StartShadowActorAsync(CancellationToken ct)
+    private async Task StartShadowActorAsync(CancellationToken ct, bool throwOnFailure = false)
     {
         if (!_useBrainActors)
             return;
@@ -258,6 +263,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         {
             _logger.LogWarning(ex, "BrainActor startup failed — shadow disabled");
             await DisposeActorSafelyAsync(actor);
+            if (throwOnFailure) throw;
         }
     }
 
@@ -271,25 +277,30 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
     /// <summary>
     /// Migrates legacy session files from the state directory into the actor state directory.
-    /// Files are only copied if they do not already exist in the actor directory.
+    /// The <code>actors/.migrated</code> marker controls one-time migration: files are copied
+    /// only when the actor file is missing, legacy files are never deleted, and actor files are
+    /// never overwritten. The marker is created after processing even if individual copies failed.
     /// </summary>
     private void MigrateSessionFiles(string actorStateDir)
     {
-        if (_resetting || _skipSessionMigration)
+        if (_resetting)
+            return;
+
+        var markerPath = Path.Combine(actorStateDir, ".migrated");
+        if (File.Exists(markerPath))
             return;
 
         var legacyMasterFile = Path.Combine(_stateDir, "brain-master.json");
         var actorMasterFile = Path.Combine(actorStateDir, "brain-master.json");
         if (File.Exists(legacyMasterFile) && !File.Exists(actorMasterFile))
         {
-            try
+            if (_fileCopier(legacyMasterFile, actorMasterFile))
             {
-                File.Copy(legacyMasterFile, actorMasterFile);
                 _logger.LogInformation("Migrated legacy master session to actor directory");
             }
-            catch (Exception ex)
+            else
             {
-                _logger.LogWarning(ex, "Failed to migrate legacy master session to actor directory");
+                _logger.LogWarning("Failed to migrate legacy master session to actor directory");
             }
         }
 
@@ -299,16 +310,24 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             var actorGoalFile = Path.Combine(actorStateDir, fileName);
             if (!File.Exists(actorGoalFile))
             {
-                try
+                if (_fileCopier(legacyGoalFile, actorGoalFile))
                 {
-                    File.Copy(legacyGoalFile, actorGoalFile);
                     _logger.LogInformation("Migrated legacy goal session {File} to actor directory", fileName);
                 }
-                catch (Exception ex)
+                else
                 {
-                    _logger.LogWarning(ex, "Failed to migrate legacy goal session {File} to actor directory", fileName);
+                    _logger.LogWarning("Failed to migrate legacy goal session {File} to actor directory", fileName);
                 }
             }
+        }
+
+        try
+        {
+            File.WriteAllText(markerPath, "");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to create migration marker {Marker}", markerPath);
         }
     }
 
@@ -1361,9 +1380,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             _masterSession = AgentSession.Create("brain");
             RefreshMasterSessionRegistry(currentTokens: 0);
 
-            var sessionFile = GetMasterSessionFilePath();
-            if (File.Exists(sessionFile))
-                File.Delete(sessionFile);
         }
         finally
         {
@@ -1373,14 +1389,15 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         _logger.LogInformation("Brain session reset — conversation history cleared, orchestrator instructions reloaded from disk, and session file deleted.");
 
-        await ResetShadowActorAsync();
+        await ResetBrainActorAsync();
     }
 
     /// <summary>
-    /// Atomically detaches and disposes the shadow actor, clears its persisted state and starts a
-    /// fresh shadow when brain actors are enabled and the brain is connected.
+    /// Atomically detaches and disposes the shadow actor, clears all session state from both the
+    /// actor and legacy state directories, then starts a fresh shadow with strict startup.
+    /// Throws when any session file survives deletion or when the replacement shadow fails to start.
     /// </summary>
-    private async Task ResetShadowActorAsync()
+    private async Task ResetBrainActorAsync()
     {
         var oldActor = Interlocked.Exchange(ref _brainActor, null);
 
@@ -1394,43 +1411,39 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to dispose shadow actor during reset"); }
         }
 
-        if (!_useBrainActors || !_connected)
+        if (!_connected)
             return;
 
-        DeleteActorStateFiles();
-        _skipSessionMigration = true;
-        try
-        {
-            await StartShadowActorAsync(CancellationToken.None);
-        }
-        finally
-        {
-            _skipSessionMigration = false;
-        }
-    }
-
-    /// <summary>Deletes persisted shadow-actor session files so a new shadow starts fresh.</summary>
-    private void DeleteActorStateFiles()
-    {
         var actorsDir = Path.Combine(_stateDir, "actors");
-        try
-        {
-            if (!Directory.Exists(actorsDir))
-                return;
 
+        if (Directory.Exists(actorsDir))
+        {
             foreach (var file in Directory.EnumerateFiles(actorsDir, "brain-*.json"))
             {
-                try { File.Delete(file); }
+                try { _fileDeleter(file); }
                 catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete actor state file {File}", file); }
             }
+        }
 
-            if (File.Exists(Path.Combine(actorsDir, "brain-master.json")))
-                _logger.LogWarning("Brain actor master session file survived reset deletion");
-        }
-        catch (Exception ex)
+        var migratedMarker = Path.Combine(actorsDir, ".migrated");
+        if (File.Exists(migratedMarker))
         {
-            _logger.LogWarning(ex, "Failed to clean actor state directory during reset");
+            try { _fileDeleter(migratedMarker); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete migration marker {File}", migratedMarker); }
         }
+
+        foreach (var file in Directory.EnumerateFiles(_stateDir, "brain-*.json"))
+        {
+            try { _fileDeleter(file); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete legacy state file {File}", file); }
+        }
+
+        var actorSurvivors = Directory.Exists(actorsDir) && Directory.EnumerateFiles(actorsDir, "brain-*.json").Any();
+        var stateSurvivors = Directory.EnumerateFiles(_stateDir, "brain-*.json").Any();
+        if (actorSurvivors || stateSurvivors)
+            throw new InvalidOperationException("Failed to clear session state during reset");
+
+        await StartShadowActorAsync(CancellationToken.None, throwOnFailure: true);
     }
 
     private void EnsureConnected()
