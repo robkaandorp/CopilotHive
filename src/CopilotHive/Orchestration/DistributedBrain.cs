@@ -315,42 +315,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <summary>
-    /// Fires a prompt to the shadow BrainActor for non-authoritative LLM execution.
-    /// Fire-and-forget: never blocks the caller, never propagates exceptions.
-    /// Only fires when <see cref="_useBrainActors"/> is true and the shadow actor is alive.
-    /// </summary>
-    private void FireShadowLlm(string goalId, string prompt, CancellationToken ct)
-    {
-        if (!_useBrainActors)
-            return;
-
-        if (Volatile.Read(ref _brainActor) is not { } actor)
-            return;
-
-        var msg = BrainActorMessages.CreateExecutePromptOnChildMessage(goalId, prompt, ct);
-        if (!actor.Tell(msg))
-        {
-            _logger.LogWarning("FireShadowLlm: Tell failed for goal {GoalId} (mailbox closed)", goalId);
-            return;
-        }
-
-        _logger.LogInformation("Shadow LLM execution fired for goal {GoalId}", goalId);
-
-        // Non-blocking continuation — log result, never propagate.
-        msg.Reply.Task.ContinueWith(
-            t =>
-            {
-                if (t.IsCompletedSuccessfully)
-                    _logger.LogInformation("Shadow LLM execution completed for goal {GoalId}", goalId);
-                else if (t.IsFaulted)
-                    _logger.LogWarning(t.Exception, "FireShadowLlm: shadow faulted for goal {GoalId}", goalId);
-                else if (t.IsCanceled)
-                    _logger.LogInformation("Shadow LLM execution canceled for goal {GoalId}", goalId);
-            },
-            TaskContinuationOptions.ExecuteSynchronously);
-    }
-
-    /// <summary>
     /// Fires a note injection to the shadow BrainActor for a goal session.
     /// Fire-and-forget: never blocks the caller, never propagates exceptions.
     /// </summary>
@@ -453,13 +417,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <summary>Builds the AIFunction tools that the Brain LLM can call.</summary>
     private List<AITool> BuildBrainTools()
     {
-        var validPhases = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "coding", "testing", "docwriting", "review", "improve", "merging" };
-        var tierablePhases = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "coding", "testing", "docwriting", "review", "improve" };
-        var validTiers = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "standard", "premium" };
-
         var pipelineResolver = (Func<string, Task<GoalPipeline?>>)(goalId =>
             Task.FromResult(_activePipelines.TryGetValue(goalId, out var p) ? p : null));
 
@@ -486,41 +443,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                  [Description("Why you chose this iteration plan")] string reason,
                  [Description("Optional JSON-encoded dict of phase name to model tier, e.g. {\"coding\":\"premium\"}. Valid phases: coding, testing, docwriting, review, improve. Valid tiers: standard, premium. Omitted phases use the default tier.")] string? model_tiers = null) =>
                 {
-                    var invalidPhases = phases?.Where(p => !validPhases.Contains(p)).ToList() ?? [];
-
-                    // Validate model_tiers if provided
-                    Dictionary<string, string>? parsedTiers = null;
-                    List<string> tierErrors = [];
-                    if (model_tiers is not null)
-                    {
-                        try
-                        {
-                            parsedTiers = JsonSerializer.Deserialize<Dictionary<string, string>>(model_tiers, ProtocolJson.Options);
-                        }
-                        catch (JsonException)
-                        {
-                            tierErrors.Add("model_tiers must be valid JSON");
-                        }
-
-                        if (parsedTiers is not null)
-                        {
-                            var invalidTierPhases = parsedTiers.Keys.Where(k => !tierablePhases.Contains(k)).ToList();
-                            if (invalidTierPhases.Count > 0)
-                                tierErrors.Add($"invalid phase names in model_tiers: {string.Join(", ", invalidTierPhases)}. Valid: {string.Join(", ", tierablePhases)}");
-
-                            var invalidTierValues = parsedTiers.Values.Where(v => !validTiers.Contains(v)).ToList();
-                            if (invalidTierValues.Count > 0)
-                                tierErrors.Add($"invalid tier values in model_tiers: {string.Join(", ", invalidTierValues)}. Valid: {string.Join(", ", validTiers)}");
-                        }
-                    }
-
-                    var error = Shared.ToolValidation.Check(
-                        (phases is { Length: > 0 }, "phases must be a non-empty array"),
-                        (invalidPhases.Count == 0,
-                            $"invalid phase names: {string.Join(", ", invalidPhases)}. Valid: {string.Join(", ", validPhases)}"),
-                        (!string.IsNullOrEmpty(reason), "reason is required"),
-                        (tierErrors.Count == 0, string.Join("; ", tierErrors)));
-                    if (error is not null) return error;
+                    var (valid, validationError) = BrainTools.ValidateIterationPlan(
+                        phases ?? [], phase_instructions, reason, model_tiers);
+                    if (!valid) return validationError!;
 
                     var ctx = _currentContext.Value;
                     if (ctx is null)
@@ -960,57 +885,11 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     {
         EnsureConnected();
 
-        if (!_goalContexts.TryGetValue(pipeline.GoalId, out var context) || !context.TryAcquire())
-            throw new InvalidOperationException($"No Brain context for goal '{pipeline.GoalId}'.");
-
-        string summary;
-        try
-        {
-            await context.Gate.WaitAsync(ct);
-            try
-            {
-                _currentContext.Value = context;
-                context.LastToolCallResult = null;
-                context.ActiveCallCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                context.ActiveCallCts.CancelAfter(TimeSpan.FromMinutes(Constants.TaskTimeoutMinutes));
-
-                _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
-                {
-                    SessionId = $"brain-goal-{pipeline.GoalId}",
-                    SessionType = LlmSessionType.BrainGoal,
-                    GoalId = pipeline.GoalId,
-                    Model = context.Model,
-                    Status = "summarizing",
-                    CurrentTokens = context.Session.EstimatedContextTokens,
-                    MaxTokens = context.MaxContextTokens,
-                });
-
-                var prompt = BrainPromptBuilder.BuildSummarizePrompt(pipeline);
-                var result = await context.Agent.ExecuteAsync(context.Session, prompt, context.ActiveCallCts.Token);
-                summary = result.Message?.Trim() ?? $"Goal '{pipeline.GoalId}' completed.";
-
-                try { await context.Session.SaveAsync(GetGoalSessionFilePath(pipeline.GoalId), ct); }
-                catch (Exception ex) { _logger.LogWarning(ex, "Failed to save Brain session"); }
-            }
-            finally
-            {
-                _currentContext.Value = null;
-                context.ActiveCallCts?.Dispose();
-                context.ActiveCallCts = null;
-                _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
-                {
-                    SessionId = $"brain-goal-{pipeline.GoalId}",
-                    SessionType = LlmSessionType.BrainGoal,
-                    GoalId = pipeline.GoalId,
-                    Model = context.Model,
-                    Status = "idle",
-                    CurrentTokens = context.Session.EstimatedContextTokens,
-                    MaxTokens = context.MaxContextTokens,
-                });
-                context.Gate.Release();
-            }
-        }
-        finally { context.Release(); }
+        var prompt = BrainPromptBuilder.BuildSummarizePrompt(pipeline);
+        var (summaryText, _) = await ExecuteBrainAsync(prompt, pipeline.GoalId, ct, status: "summarizing");
+        var summary = string.IsNullOrWhiteSpace(summaryText)
+            ? $"Goal '{pipeline.GoalId}' completed."
+            : summaryText.Trim();
 
         // Merge into master (AFTER releasing lease + gate — NO nested locks)
         await _sessionLock.WaitAsync(ct);
@@ -1219,6 +1098,53 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     {
         EnsureConnected();
 
+        if (_useBrainActors && Volatile.Read(ref _brainActor) is { } actor)
+            return await ExecuteBrainViaActorAsync(actor, prompt, goalId, ct, status, callerName);
+
+        return await ExecuteBrainViaContextAsync(prompt, goalId, ct, status, callerName);
+    }
+
+    /// <summary>Routes the Brain LLM call through the BrainActor's per-goal child actor.</summary>
+    private async Task<(string Text, BrainToolCallResult? ToolCall)> ExecuteBrainViaActorAsync(
+        BrainActor actor, string prompt, string goalId, CancellationToken ct,
+        string status, string callerName)
+    {
+        var msg = BrainActorMessages.CreateExecutePromptOnChildMessage(goalId, prompt, ct);
+        if (!actor.Tell(msg))
+            throw new InvalidOperationException("BrainActor mailbox closed.");
+
+        var result = await msg.Reply.Task.WaitAsync(ct);
+
+        BrainToolCallResult? mapped = result.ToolCall switch
+        {
+            EscalateToolResult escalate => new EscalateResult(escalate.Question, escalate.Reason),
+            PlanToolResult plan => MapPlan(plan),
+            null => null,
+            _ => throw new InvalidOperationException(
+                $"Unknown tool call result type '{result.ToolCall.GetType().Name}' from actor."),
+        };
+
+        _logger.LogInformation("Brain execution via actor for {GoalId} ({Caller})", goalId, callerName);
+
+        return (result.Text, mapped);
+
+        static IterationPlanResult MapPlan(PlanToolResult plan)
+        {
+            var (valid, error) = BrainTools.ValidateIterationPlan(
+                plan.Phases, plan.PhaseInstructions, plan.Reason, plan.ModelTiers);
+            if (!valid)
+                throw new InvalidOperationException($"Invalid iteration plan from actor: {error}");
+
+            return new IterationPlanResult(plan.Phases, plan.PhaseInstructions, plan.Reason, plan.ModelTiers);
+        }
+    }
+
+    /// <summary>Executes the Brain LLM call against the local per-goal context (non-actor path).</summary>
+    private async Task<(string Text, BrainToolCallResult? ToolCall)> ExecuteBrainViaContextAsync(
+        string prompt, string goalId, CancellationToken ct,
+        string status,
+        string callerName)
+    {
         if (!_goalContexts.TryGetValue(goalId, out var context) || !context.TryAcquire())
             throw new InvalidOperationException($"No Brain context for goal '{goalId}'.");
 
@@ -1279,11 +1205,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 // Auto-save session after each Brain call
                 try { await session.SaveAsync(GetGoalSessionFilePath(goalId), ct); }
                 catch (Exception ex) { _logger.LogWarning(ex, "Failed to save Brain session"); }
-
-                // Fire shadow LLM execution (non-blocking, fire-and-forget).
-                // Fires on ANY non-throwing completion, including Status="Error".
-                // Does NOT fire on exception or cancellation (those propagate before reaching here).
-                FireShadowLlm(goalId, prompt, ct);
 
                 return (responseText ?? string.Empty, context.LastToolCallResult);
             }

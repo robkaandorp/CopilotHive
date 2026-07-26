@@ -18,6 +18,58 @@ namespace CopilotHive.Orchestration;
 internal static class BrainTools
 {
     /// <summary>
+    /// Validates an iteration plan reported by the Brain LLM (phases, reason and optional model tiers).
+    /// </summary>
+    /// <returns><c>(true, null)</c> when valid, otherwise <c>(false, error)</c>.</returns>
+    internal static (bool Valid, string? Error) ValidateIterationPlan(
+        string[] phases, string phaseInstructions, string reason, string? modelTiers)
+    {
+        var validPhases = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "coding", "testing", "docwriting", "review", "improve", "merging" };
+        var tierablePhases = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "coding", "testing", "docwriting", "review", "improve" };
+        var validTiers = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "standard", "premium" };
+
+        var invalidPhases = phases?.Where(p => !validPhases.Contains(p)).ToList() ?? [];
+
+        // Validate model_tiers if provided
+        Dictionary<string, string>? parsedTiers = null;
+        List<string> tierErrors = [];
+        if (modelTiers is not null)
+        {
+            try
+            {
+                parsedTiers = JsonSerializer.Deserialize<Dictionary<string, string>>(modelTiers, ProtocolJson.Options);
+            }
+            catch (JsonException)
+            {
+                tierErrors.Add("model_tiers must be valid JSON");
+            }
+
+            if (parsedTiers is not null)
+            {
+                var invalidTierPhases = parsedTiers.Keys.Where(k => !tierablePhases.Contains(k)).ToList();
+                if (invalidTierPhases.Count > 0)
+                    tierErrors.Add($"invalid phase names in model_tiers: {string.Join(", ", invalidTierPhases)}. Valid: {string.Join(", ", tierablePhases)}");
+
+                var invalidTierValues = parsedTiers.Values.Where(v => !validTiers.Contains(v)).ToList();
+                if (invalidTierValues.Count > 0)
+                    tierErrors.Add($"invalid tier values in model_tiers: {string.Join(", ", invalidTierValues)}. Valid: {string.Join(", ", validTiers)}");
+            }
+        }
+
+        var error = Shared.ToolValidation.Check(
+            (phases is { Length: > 0 }, "phases must be a non-empty array"),
+            (invalidPhases.Count == 0,
+                $"invalid phase names: {string.Join(", ", invalidPhases)}. Valid: {string.Join(", ", validPhases)}"),
+            (!string.IsNullOrEmpty(reason), "reason is required"),
+            (tierErrors.Count == 0, string.Join("; ", tierErrors)));
+
+        return error is not null ? (false, error) : (true, null);
+    }
+
+    /// <summary>
     /// Builds the dependency-only Brain tools: <c>get_goal</c>, <c>search_knowledge</c>,
     /// <c>read_document</c>, <c>traverse_graph</c> and <c>get_current_time</c>.
     /// </summary>

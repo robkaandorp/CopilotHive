@@ -104,6 +104,9 @@ public class DistributedBrainShadowTests
                     ["phases"] = _phases,
                     ["phase_instructions"] = "{}",
                     ["reason"] = _reason,
+                    // The goal-actor's report_iteration_plan declares model_tiers as a required
+                    // (non-optional) parameter, so it must always be supplied explicitly.
+                    ["model_tiers"] = null,
                 });
                 var response = new ChatResponse(new ChatMessage(ChatRole.Assistant, [toolCallContent]))
                 {
@@ -116,6 +119,105 @@ public class DistributedBrainShadowTests
             {
                 FinishReason = ChatFinishReason.Stop,
             });
+        }
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose() { }
+    }
+
+    /// <summary>Chat client that always returns a fixed text response.</summary>
+    private sealed class TextStubClient : IChatClient
+    {
+        private readonly string _text;
+
+        internal TextStubClient(string text) => _text = text;
+
+        public ChatClientMetadata Metadata => new("text", null, "text-model");
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken ct = default)
+            => Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, _text))
+            {
+                FinishReason = ChatFinishReason.Stop,
+            });
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose() { }
+    }
+
+    /// <summary>Chat client that returns an escalate_to_composer tool call, then text.</summary>
+    private sealed class EscalateStubClient : IChatClient
+    {
+        private int _callCount;
+        private readonly string _question;
+        private readonly string _reason;
+
+        internal EscalateStubClient(string question, string reason)
+        {
+            _question = question;
+            _reason = reason;
+        }
+
+        public ChatClientMetadata Metadata => new("escalate", null, "escalate-model");
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken ct = default)
+        {
+            if (Interlocked.Increment(ref _callCount) == 1)
+            {
+                var call = new FunctionCallContent("esc-1", "escalate_to_composer", new Dictionary<string, object?>
+                {
+                    ["question"] = _question,
+                    ["reason"] = _reason,
+                });
+                return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, [call]))
+                {
+                    FinishReason = ChatFinishReason.ToolCalls,
+                });
+            }
+
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "Escalated."))
+            {
+                FinishReason = ChatFinishReason.Stop,
+            });
+        }
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose() { }
+    }
+
+    /// <summary>Chat client that delays before responding, so cancellation can be observed.</summary>
+    private sealed class DelayingChatClient : IChatClient
+    {
+        private readonly TimeSpan _delay;
+
+        internal DelayingChatClient(TimeSpan delay) => _delay = delay;
+
+        public ChatClientMetadata Metadata => new("delay", null, "delay-model");
+
+        public async Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken ct = default)
+        {
+            await Task.Delay(_delay, ct);
+            return new ChatResponse(new ChatMessage(ChatRole.Assistant, "late"))
+            {
+                FinishReason = ChatFinishReason.Stop,
+            };
         }
 
         public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
@@ -231,6 +333,47 @@ public class DistributedBrainShadowTests
     private static Dictionary<string, string> GetActiveGoalSessions(BrainActor actor) =>
         GetField<Dictionary<string, string>>(actor, "_activeGoalSessions");
 
+    /// <summary>Sets the internal <c>_mirrorDelay</c> test seam that parks each MirrorAsync call.</summary>
+    private static void SetMirrorDelay(DistributedBrain brain, TimeSpan? delay) =>
+        typeof(DistributedBrain).GetField("_mirrorDelay", NonPublicInstance)!.SetValue(brain, delay);
+
+    /// <summary>True when the session history contains a message with the given text.</summary>
+    private static bool ContainsSummary(AgentSession session, string text)
+    {
+        // Snapshot to avoid tearing while the production code mutates the history concurrently.
+        var messages = session.MessageHistory.ToArray();
+        return messages.Any(m => m.Text.Contains(text, StringComparison.Ordinal));
+    }
+
+    /// <summary>Timestamps <paramref name="name"/> the first time <paramref name="predicate"/> holds.</summary>
+    private static void Record(
+        List<(string Name, TimeSpan At)> events,
+        System.Diagnostics.Stopwatch clock,
+        string name,
+        Func<bool> predicate)
+    {
+        if (events.Any(e => e.Name == name)) return;
+        if (predicate()) events.Add((name, clock.Elapsed));
+    }
+
+    /// <summary>ContainsKey on a dictionary being mutated by the actor loop; treats a torn read as "present".</summary>
+    private static bool SafeContainsChild(Dictionary<string, GoalBrainActor> children, string goalId)
+    {
+        try { return children.ContainsKey(goalId); }
+        catch (InvalidOperationException) { return true; }
+    }
+
+    /// <summary>Invokes the private ExecuteBrainAsync via reflection and returns its tuple result.</summary>
+    private static async Task<(string Text, DistributedBrain.BrainToolCallResult? ToolCall)> InvokeExecuteBrainAsync(
+        DistributedBrain brain, string prompt, string goalId, CancellationToken ct, string status = "test")
+    {
+        var method = typeof(DistributedBrain).GetMethod("ExecuteBrainAsync", NonPublicInstance)!;
+        var task = (Task)method.Invoke(brain, [prompt, goalId, ct, status, "TestMethod"])!;
+        await task;
+        var result = task.GetType().GetProperty("Result")!.GetValue(task)!;
+        return ((string, DistributedBrain.BrainToolCallResult?))result;
+    }
+
     private static GoalPipeline CreatePipeline(string goalId, string description = "test") =>
         new(new Goal { Id = goalId, Description = description });
 
@@ -278,12 +421,12 @@ public class DistributedBrainShadowTests
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // Criterion 12: ExecuteBrainAsync split — FireShadowLlm fires on non-throwing
-    // completion including Status="Error"
+    // Criterion 12: ExecuteBrainAsync split — authoritative routing sends the prompt
+    // to the actor on non-throwing completion including Status="Error"
     // ════════════════════════════════════════════════════════════════════════
 
     [Fact]
-    public async Task ExecuteBrainAsync_SuccessfulCompletion_FiresShadowLlm()
+    public async Task ExecuteBrainAsync_SuccessfulCompletion_RoutesToActor()
     {
         var dir = NewTempDir();
         try
@@ -299,33 +442,30 @@ public class DistributedBrainShadowTests
                 var pipeline = CreatePipeline("goal-1", "test goal");
                 await brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
 
-                // Give the fire-and-forget shadow a moment to process.
-                await Task.Delay(500, TestContext.Current.CancellationToken);
-
-                // Verify the shadow actor received the prompt — check child's session history.
+                // Verify the actor received the prompt — check child's session history.
                 var actor = (BrainActor?)GetBrainActor(brain);
                 Assert.NotNull(actor);
                 var children = GetChildActors(actor!);
-                Assert.True(children.ContainsKey("goal-1"), "Shadow actor should have a child for goal-1.");
+                Assert.True(children.ContainsKey("goal-1"), "Actor should have a child for goal-1.");
                 var child = children["goal-1"];
 
-                // The child's session should contain the planning prompt (it was relayed via ExecutePromptOnChild).
-                // The ExecutePromptOnChildMessage sends the prompt to the child's CodingAgent, which adds it to the session.
+                // The child's session contains the planning prompt — the authoritative call was routed
+                // through ExecutePromptOnChild to the child's CodingAgent.
                 Assert.True(child.Session.MessageHistory.Count > 0,
-                    "Child session should have messages after shadow LLM execution.");
+                    "Child session should have messages after authoritative actor execution.");
             }
         }
         finally { DeleteDir(dir); }
     }
 
     [Fact]
-    public async Task ExecuteBrainAsync_StatusError_StillFiresShadowLlm()
+    public async Task ExecuteBrainAsync_StatusError_RoutesToActor()
     {
         var dir = NewTempDir();
         try
         {
             // A throwing client causes CodingAgent.ExecuteAsync to return Status="Error" (not throw).
-            // ExecuteBrainAsync completes without throwing, so FireShadowLlm should still fire.
+            // ExecuteBrainAsync completes without throwing and still routes through the actor.
             var throwing = new ThrowingChatClient();
             var brain = NewShadowBrain(dir, chatClient: throwing);
             await using (brain)
@@ -339,19 +479,16 @@ public class DistributedBrainShadowTests
                 var response = await brain.AskQuestionAsync("goal-err", 1, "coding", "coder", "what?", TestContext.Current.CancellationToken);
                 Assert.NotNull(response);
 
-                // Give the fire-and-forget shadow a moment to process.
-                await Task.Delay(500, TestContext.Current.CancellationToken);
-
-                // Verify the shadow actor received the prompt despite Status="Error".
+                // Verify the actor received the prompt despite Status="Error".
                 var actor = (BrainActor?)GetBrainActor(brain);
                 Assert.NotNull(actor);
                 var children = GetChildActors(actor!);
-                Assert.True(children.ContainsKey("goal-err"), "Shadow actor should have a child for goal-err.");
+                Assert.True(children.ContainsKey("goal-err"), "Actor should have a child for goal-err.");
                 var child = children["goal-err"];
 
-                // The child's session should have messages — the prompt was relayed.
+                // The child's session should have messages — the prompt was routed to the actor.
                 Assert.True(child.Session.MessageHistory.Count > 0,
-                    "Child session should have messages after shadow LLM execution (Status=Error still fires).");
+                    "Child session should have messages after actor execution (Status=Error still routes).");
             }
         }
         finally { DeleteDir(dir); }
@@ -362,7 +499,7 @@ public class DistributedBrainShadowTests
     // ════════════════════════════════════════════════════════════════════════
 
     [Fact]
-    public async Task ExecuteBrainAsync_PreCanceledToken_DoesNotFireShadowLlm()
+    public async Task ExecuteBrainAsync_PreCanceledToken_PropagatesCancellation()
     {
         var dir = NewTempDir();
         try
@@ -374,36 +511,21 @@ public class DistributedBrainShadowTests
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
                 await brain.ForkSessionForGoalAsync("goal-cancel", TestContext.Current.CancellationToken);
 
-                // Record child's message count before the call.
-                var actor = (BrainActor?)GetBrainActor(brain);
-                Assert.NotNull(actor);
-                var children = GetChildActors(actor!);
-                var child = children["goal-cancel"];
-                var beforeCount = child.Session.MessageHistory.Count;
-
-                // Use a pre-canceled token — ExecuteBrainAsync throws OperationCanceledException
-                // before reaching FireShadowLlm.
+                // Pre-canceled token — ExecuteBrainViaActorAsync awaits the reply with ct,
+                // so cancellation propagates to the caller.
                 using var cts = new CancellationTokenSource();
-                cts.Cancel();
+                await cts.CancelAsync();
 
-                // Call AskQuestionAsync (catches exceptions and returns fallback).
-                // But the retry policy re-throws OperationCanceledException immediately when ct is canceled.
                 // TaskCanceledException is a subclass of OperationCanceledException.
                 await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
                     brain.AskQuestionAsync("goal-cancel", 1, "coding", "coder", "q", cts.Token));
-
-                // Give any potential shadow fire a moment (there shouldn't be one).
-                await Task.Delay(200, TestContext.Current.CancellationToken);
-
-                // The child's session should NOT have been modified.
-                Assert.Equal(beforeCount, child.Session.MessageHistory.Count);
             }
         }
         finally { DeleteDir(dir); }
     }
 
     [Fact]
-    public async Task ExecuteBrainAsync_NoGoalContext_ThrowsAndDoesNotFireShadowLlm()
+    public async Task ExecuteBrainAsync_NoGoalContext_Throws()
     {
         var dir = NewTempDir();
         try
@@ -414,22 +536,18 @@ public class DistributedBrainShadowTests
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
-                // Do NOT fork a session for this goal — ExecuteBrainAsync will throw
-                // "No Brain context for goal" immediately.
-                // Use reflection to call ExecuteBrainAsync directly (bypassing the retry policy).
-                var method = typeof(DistributedBrain).GetMethod("ExecuteBrainAsync", NonPublicInstance)!;
-
-                // Invoke via dynamic to avoid needing the internal BrainToolCallResult type.
-                Task task = (Task)method.Invoke(brain,
-                    ["prompt", "nonexistent-goal", CancellationToken.None, "test", "TestMethod"])!;
-                await Assert.ThrowsAsync<InvalidOperationException>(() => task);
+                // Do NOT fork a session for this goal. With UseBrainActors=true the routing
+                // method goes to the actor, which has no child for the goal and replies with
+                // KeyNotFoundException.
+                await Assert.ThrowsAsync<KeyNotFoundException>(() =>
+                    InvokeExecuteBrainAsync(brain, "prompt", "nonexistent-goal", CancellationToken.None));
 
                 // No child should exist for the nonexistent goal.
                 var actor = (BrainActor?)GetBrainActor(brain);
                 Assert.NotNull(actor);
                 var children = GetChildActors(actor!);
                 Assert.False(children.ContainsKey("nonexistent-goal"),
-                    "Shadow should not have a child for a goal that was never forked.");
+                    "Actor should not have a child for a goal that was never forked.");
             }
         }
         finally { DeleteDir(dir); }
@@ -845,11 +963,11 @@ public class DistributedBrainShadowTests
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // Additional: Verify FireShadowLlm is truly fire-and-forget (non-blocking)
+    // Additional: Verify authoritative routing completes promptly (non-blocking)
     // ════════════════════════════════════════════════════════════════════════
 
     [Fact]
-    public async Task FireShadowLlm_IsFireAndForget_DoesNotBlockCaller()
+    public async Task ExecuteBrainAsync_AuthoritativeRouting_DoesNotBlockCaller()
     {
         var dir = NewTempDir();
         try
@@ -868,10 +986,9 @@ public class DistributedBrainShadowTests
                 sw.Stop();
 
                 Assert.NotNull(result);
-                // PlanIterationAsync should complete quickly — FireShadowLlm is fire-and-forget.
-                // The authoritative call + shadow relay should not block.
+                // PlanIterationAsync should complete promptly via authoritative actor routing.
                 Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5),
-                    $"PlanIterationAsync took {sw.Elapsed.TotalSeconds:F1}s — FireShadowLlm may be blocking.");
+                    $"PlanIterationAsync took {sw.Elapsed.TotalSeconds:F1}s — actor routing may be blocking.");
             }
         }
         finally { DeleteDir(dir); }
@@ -945,6 +1062,419 @@ public class DistributedBrainShadowTests
                     "Shadow should have removed session entry after delete.");
                 Assert.False(File.Exists(Path.Combine(dir, "actors", "brain-goal-goal-del.json")),
                     "Shadow should have deleted the session file.");
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Criteria 14-25: authoritative routing through the BrainActor
+    // ════════════════════════════════════════════════════════════════════════
+
+    // Criterion 14: flag on — ExecuteBrainAsync routes to the actor and returns the tool call.
+    [Fact]
+    public async Task ExecuteBrainAsync_FlagOn_RoutesToActor_ReturnsResultWithToolCall()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir,
+                chatClient: new ThrowingChatClient(),  // context path would fail — proves the actor path ran
+                factoryChatClientFactory: _ => new PlanStubClient("call-14", ["coding", "review"], "actor plan"));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-14", TestContext.Current.CancellationToken);
+
+                var result = await brain.PlanIterationAsync(
+                    CreatePipeline("goal-14"), null, TestContext.Current.CancellationToken);
+
+                Assert.NotNull(result);
+                Assert.False(result.IsEscalation);
+                Assert.NotNull(result.Plan);
+                Assert.NotEmpty(result.Plan!.Phases);
+                Assert.Equal("actor plan", result.Plan!.Reason);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // Criterion 15: flag on but actor is null — falls back to the context path.
+    [Fact]
+    public async Task ExecuteBrainAsync_FlagOn_ActorNull_FallsBackToContextPath()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir,
+                chatClient: new PlanStubClient("call-15", ["coding"], "context plan"),
+                factoryChatClientFactory: _ => new ThrowingChatClient());
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                // Drop the actor so routing must fall back to the context path.
+                var actorField = typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!;
+                var actor = (BrainActor?)actorField.GetValue(brain);
+                actorField.SetValue(brain, null);
+                if (actor is not null)
+                    await actor.DisposeAsync();
+
+                await brain.ForkSessionForGoalAsync("goal-15", TestContext.Current.CancellationToken);
+
+                var result = await brain.PlanIterationAsync(
+                    CreatePipeline("goal-15"), null, TestContext.Current.CancellationToken);
+
+                Assert.NotNull(result);
+                Assert.False(result.IsEscalation);
+                Assert.Equal("context plan", result.Plan!.Reason);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // Criterion 16: flag on — Tell returns false (mailbox closed) → InvalidOperationException.
+    [Fact]
+    public async Task ExecuteBrainAsync_FlagOn_TellFalse_Throws()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => new PlanStubClient("call-16", ["coding"], "r"));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-16", TestContext.Current.CancellationToken);
+
+                var actor = (BrainActor?)GetBrainActor(brain);
+                Assert.NotNull(actor);
+                await actor!.DisposeAsync();  // closes the mailbox → Tell returns false
+
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                    InvokeExecuteBrainAsync(brain, "prompt", "goal-16", CancellationToken.None));
+                Assert.Contains("mailbox closed", ex.Message, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // Criterion 17: flag on — no child actor for the goal → KeyNotFoundException.
+    [Fact]
+    public async Task ExecuteBrainAsync_FlagOn_ChildNotFound_Throws()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => new PlanStubClient("call-17", ["coding"], "r"));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                // No fork → the actor has no child for this goal.
+                await Assert.ThrowsAsync<KeyNotFoundException>(() =>
+                    InvokeExecuteBrainAsync(brain, "prompt", "goal-17-missing", CancellationToken.None));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // Criterion 18: flag on — empty text is a successful completion, not an error.
+    [Fact]
+    public async Task ExecuteBrainAsync_FlagOn_EmptyText_SuccessfulCompletion()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir, factoryChatClientFactory: _ => new TextStubClient(""));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-18", TestContext.Current.CancellationToken);
+
+                var (text, toolCall) = await InvokeExecuteBrainAsync(
+                    brain, "prompt", "goal-18", TestContext.Current.CancellationToken);
+
+                Assert.True(string.IsNullOrEmpty(text));
+                Assert.Null(toolCall);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // Criterion 19: flag on — EscalateToolResult is mapped to DistributedBrain.EscalateResult.
+    [Fact]
+    public async Task ExecuteBrainAsync_FlagOn_EscalateToolResult_MappedToEscalateResult()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => new EscalateStubClient("Which API?", "not in codebase"));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-19", TestContext.Current.CancellationToken);
+
+                var (_, toolCall) = await InvokeExecuteBrainAsync(
+                    brain, "prompt", "goal-19", TestContext.Current.CancellationToken);
+
+                var escalate = Assert.IsType<DistributedBrain.EscalateResult>(toolCall);
+                Assert.Equal("Which API?", escalate.Question);
+                Assert.Equal("not in codebase", escalate.Reason);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // Criterion 20: flag on — PlanToolResult is mapped to DistributedBrain.IterationPlanResult.
+    [Fact]
+    public async Task ExecuteBrainAsync_FlagOn_PlanToolResult_MappedToIterationPlanResult()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => new PlanStubClient("call-20", ["coding", "testing"], "plan reason"));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-20", TestContext.Current.CancellationToken);
+
+                var (_, toolCall) = await InvokeExecuteBrainAsync(
+                    brain, "prompt", "goal-20", TestContext.Current.CancellationToken);
+
+                var plan = Assert.IsType<DistributedBrain.IterationPlanResult>(toolCall);
+                Assert.Equal(["coding", "testing"], plan.Phases);
+                Assert.Equal("{}", plan.PhaseInstructions);
+                Assert.Equal("plan reason", plan.Reason);
+                Assert.Null(plan.ModelTiers);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // Criterion 21: flag on — an invalid plan from the actor makes PlanIterationAsync fall back to default.
+    [Fact]
+    public async Task ExecuteBrainAsync_FlagOn_InvalidPlan_PlanIterationReturnsDefault()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => new PlanStubClient("call-21", ["invalid_phase"], "bogus"));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-21", TestContext.Current.CancellationToken);
+
+                var result = await brain.PlanIterationAsync(
+                    CreatePipeline("goal-21"), null, TestContext.Current.CancellationToken);
+
+                Assert.False(result.IsEscalation);
+                var expected = IterationPlan.Default();
+                Assert.Equal(expected.Phases, result.Plan!.Phases);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // Criterion 22: flag on — SummarizeAndMergeAsync routes the summary LLM call via the actor.
+    [Fact]
+    public async Task SummarizeAndMergeAsync_FlagOn_RoutesSummaryViaActor()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir,
+                chatClient: new ThrowingChatClient(),  // context path would produce no text
+                factoryChatClientFactory: _ => new TextStubClient("Summary from actor"));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-22", TestContext.Current.CancellationToken);
+
+                var summary = await brain.SummarizeAndMergeAsync(
+                    CreatePipeline("goal-22"), TestContext.Current.CancellationToken);
+
+                Assert.Equal("Summary from actor", summary);
+
+                var master = GetField<AgentSession>(brain, "_masterSession");
+                Assert.Contains(master.MessageHistory, m => m.Text.Contains("Summary from actor", StringComparison.Ordinal));
+
+                var contexts = GetField<System.Collections.IDictionary>(brain, "_goalContexts");
+                Assert.False(contexts.Contains("goal-22"), "Goal context should be deleted after summarize+merge.");
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // Criterion 23: flag on — empty/whitespace summary text falls back to the canned summary.
+    [Fact]
+    public async Task SummarizeAndMergeAsync_FlagOn_EmptySummary_UsesFallback()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir, factoryChatClientFactory: _ => new TextStubClient("   "));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-23", TestContext.Current.CancellationToken);
+
+                var summary = await brain.SummarizeAndMergeAsync(
+                    CreatePipeline("goal-23"), TestContext.Current.CancellationToken);
+
+                Assert.Equal("Goal 'goal-23' completed.", summary);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // Criterion 24: flag on — ordering: local merge → actor merge mirror → local delete → actor delete mirror.
+    //
+    // Removal-proof design. `_mirrorDelay` parks the START of every MirrorAsync call, BEFORE the
+    // message reaches the actor, so each mirror costs a known `MirrorGate` (1.5s) while the two
+    // local steps are effectively instantaneous. A background poller timestamps the first moment
+    // each of the four effects becomes observable:
+    //   local-merge  → the brain's own master session gains the summary
+    //   actor-merge  → the ACTOR's master session gains the summary
+    //   local-delete → the goal leaves _goalContexts
+    //   actor-delete → the child actor leaves the actor's _childActors
+    //
+    // The correct production sequence therefore produces this timing fingerprint:
+    //   t≈0.0  local-merge   (no gate yet)
+    //   t≈1.5  actor-merge   (after the merge mirror's gate)
+    //   t≈1.5  local-delete  (immediately after, no gate)
+    //   t≈3.0  actor-delete  (after the delete mirror's gate)
+    //
+    // Asserting BOTH the sequence and the gate positions makes every reordering detectable:
+    //   • local-delete before local-merge / before the merge mirror → sequence assertions fail
+    //   • actor-delete before actor-merge                          → sequence assertions fail
+    //   • local-delete moved AFTER the delete mirror (swapping steps 5 and 6) → the sequence still
+    //     looks right (both land at t≈3.0) but local-delete now sits on the FAR side of the second
+    //     gate, so the "local-delete follows actor-merge without a gate" assertion fails.
+    [Fact]
+    public async Task SummarizeAndMergeAsync_FlagOn_Ordering_LocalMergeBeforeActorDelete()
+    {
+        const string Goal = "goal-24";
+        const string Text = "Ordered summary";
+        var mirrorGate = TimeSpan.FromMilliseconds(1500);
+
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir, factoryChatClientFactory: _ => new TextStubClient(Text));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync(Goal, TestContext.Current.CancellationToken);
+
+                var actor = (BrainActor?)GetBrainActor(brain);
+                Assert.NotNull(actor);
+                var actorMaster = GetField<AgentSession?>(actor!, "_masterSession");
+                Assert.NotNull(actorMaster);
+
+                var localMaster = GetField<AgentSession>(brain, "_masterSession");
+                var contexts = GetField<System.Collections.IDictionary>(brain, "_goalContexts");
+                var children = GetChildActors(actor!);
+
+                // Preconditions: nothing has happened yet.
+                Assert.True(children.ContainsKey(Goal));
+                Assert.True(contexts.Contains(Goal));
+                Assert.False(ContainsSummary(localMaster, Text));
+                Assert.False(ContainsSummary(actorMaster!, Text));
+
+                // Gate every MirrorAsync (its reply timeout is 3s, so messages are still delivered).
+                SetMirrorDelay(brain, mirrorGate);
+
+                var events = new List<(string Name, TimeSpan At)>();
+                using var pollerCts = new CancellationTokenSource();
+                var clock = System.Diagnostics.Stopwatch.StartNew();
+
+                var poller = PollAsync();
+                async Task PollAsync()
+                {
+                    await Task.Yield();
+                    while (!pollerCts.IsCancellationRequested)
+                    {
+                        Record(events, clock, "local-merge", () => ContainsSummary(localMaster, Text));
+                        Record(events, clock, "actor-merge", () => ContainsSummary(actorMaster!, Text));
+                        Record(events, clock, "local-delete", () => !contexts.Contains(Goal));
+                        Record(events, clock, "actor-delete", () => !SafeContainsChild(children, Goal));
+                        if (events.Count == 4) return;
+                        try { await Task.Delay(1, pollerCts.Token); }
+                        catch (OperationCanceledException) { return; }
+                    }
+                }
+
+                var summary = await brain.SummarizeAndMergeAsync(
+                    CreatePipeline(Goal), TestContext.Current.CancellationToken);
+                Assert.Equal(Text, summary);
+
+                // Let the poller observe an effect that landed on the very last instruction.
+                await Task.Delay(250, TestContext.Current.CancellationToken);
+                await pollerCts.CancelAsync();
+                await poller;
+
+                SetMirrorDelay(brain, null);
+
+                var trace = string.Join(", ", events.Select(e => $"{e.Name}@{e.At.TotalMilliseconds:F0}ms"));
+
+                // Every step must have been observed exactly once, in the mandated sequence.
+                Assert.Equal(4, events.Count);
+                Assert.Equal(
+                    ["local-merge", "actor-merge", "local-delete", "actor-delete"],
+                    events.Select(e => e.Name));
+
+                var localMerge = events[0].At;
+                var actorMerge = events[1].At;
+                var localDelete = events[2].At;
+                var actorDelete = events[3].At;
+
+                // The merge mirror's gate sits BETWEEN the local merge and the actor merge —
+                // proving the local merge ran first and was not merely observed first.
+                Assert.True(actorMerge - localMerge >= mirrorGate * 0.6,
+                    $"Expected the merge mirror's gate between local-merge and actor-merge. Trace: {trace}");
+
+                // No gate between the actor merge and the local delete: the local delete must run
+                // immediately after the merge mirror, NOT after the delete mirror. This is what
+                // catches a swap of step 5 (local delete) and step 6 (actor delete mirror).
+                Assert.True(localDelete - actorMerge < mirrorGate * 0.6,
+                    $"Local delete must run right after the merge mirror, before the delete mirror's gate. Trace: {trace}");
+
+                // The delete mirror's gate sits between the local delete and the actor delete.
+                Assert.True(actorDelete - localDelete >= mirrorGate * 0.6,
+                    $"Expected the delete mirror's gate between local-delete and actor-delete. Trace: {trace}");
+
+                // The merge survived the delete on both sides.
+                Assert.True(ContainsSummary(localMaster, Text));
+                Assert.True(ContainsSummary(actorMaster!, Text));
+                Assert.False(GetActiveGoalSessions(actor!).ContainsKey(Goal));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // Criterion 25: flag on — caller cancellation propagates out of ExecuteBrainViaActorAsync.
+    [Fact]
+    public async Task ExecuteBrainAsync_FlagOn_CallerCancellation_Propagates()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => new DelayingChatClient(TimeSpan.FromSeconds(30)));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-25", TestContext.Current.CancellationToken);
+
+                using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                    InvokeExecuteBrainAsync(brain, "prompt", "goal-25", cts.Token));
             }
         }
         finally { DeleteDir(dir); }
