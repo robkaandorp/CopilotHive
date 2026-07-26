@@ -203,4 +203,80 @@ public class BrainToolsTests
         Assert.True(json.RootElement.TryGetProperty("time", out _));
         Assert.True(json.RootElement.TryGetProperty("iso", out _));
     }
+
+    [Theory]
+    [InlineData("coding-1", "coding")]
+    [InlineData("testing-2", "testing")]
+    [InlineData("review", "review")]
+    [InlineData("coding", "coding")]
+    [InlineData("coding-0", "coding-0")]
+    [InlineData("coding-x", "coding-x")]
+    [InlineData("coding-", "coding-")]
+    [InlineData("coding--1", "coding--1")]
+    [InlineData("coding-99999999999999999999", "coding-99999999999999999999")]
+    // Unicode digits (Arabic-Indic 1, U+0661) must NOT be treated as numeric suffixes (ASCII-only)
+    [InlineData("coding-١", "coding-١")]
+    public void StripOccurrenceSuffix_RemovesPositiveNumericSuffixes(string input, string expected) =>
+        Assert.Equal(expected, BrainTools.StripOccurrenceSuffix(input));
+
+    [Fact]
+    public void StripOccurrenceSuffix_NullOrEmpty_ReturnsEmpty()
+    {
+        Assert.Equal("", BrainTools.StripOccurrenceSuffix(null));
+        Assert.Equal("", BrainTools.StripOccurrenceSuffix(""));
+    }
+
+    [Fact]
+    public void ValidateIterationPlan_SuffixedPhases_AreValid()
+    {
+        var result = BrainTools.ValidateIterationPlan(["coding-1", "testing-1", "review"], "", "reason", null);
+        Assert.True(result.Valid);
+        Assert.Null(result.Error);
+    }
+
+    [Theory]
+    [InlineData("coding-0")]
+    [InlineData("foo-1")]
+    public void ValidateIterationPlan_InvalidSuffixes_AreRejected(string phase)
+    {
+        var result = BrainTools.ValidateIterationPlan([phase], "", "reason", null);
+        Assert.False(result.Valid);
+        Assert.Contains(phase, result.Error);
+        Assert.Contains("coding, testing, docwriting, review, improve, merging", result.Error);
+    }
+
+    [Fact]
+    public void ValidateIterationPlan_ModelTiersWithSuffixedKeys_AreValid()
+    {
+        var tiers = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, string> { ["coding-1"] = "premium" });
+        var result = BrainTools.ValidateIterationPlan(["coding-1"], "", "reason", tiers);
+        Assert.True(result.Valid);
+        Assert.Null(result.Error);
+    }
+
+    [Fact]
+    public void ValidateIterationPlan_ModelTiersInvalidPhaseName_ReportedAsIs()
+    {
+        var tiers = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, string> { ["foo-1"] = "premium" });
+        var result = BrainTools.ValidateIterationPlan(["coding-1"], "", "reason", tiers);
+        Assert.False(result.Valid);
+        Assert.Contains("foo-1", result.Error);
+        Assert.Contains("coding, testing, docwriting, review, improve", result.Error);
+    }
+
+    [Fact]
+    public void ValidateIterationPlan_NullPhases_IsInvalid()
+    {
+        var result = BrainTools.ValidateIterationPlan(null!, "", "reason", null);
+        Assert.False(result.Valid);
+        Assert.Contains("phases must be a non-empty array", result.Error);
+    }
+
+    [Fact]
+    public void ValidateIterationPlan_EmptyPhases_IsInvalid()
+    {
+        var result = BrainTools.ValidateIterationPlan([], "", "reason", null);
+        Assert.False(result.Valid);
+        Assert.Contains("phases must be a non-empty array", result.Error);
+    }
 }

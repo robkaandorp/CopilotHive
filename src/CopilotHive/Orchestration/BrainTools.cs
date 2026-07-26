@@ -18,6 +18,21 @@ namespace CopilotHive.Orchestration;
 internal static class BrainTools
 {
     /// <summary>
+    /// Strips an occurrence suffix (e.g. "-1", "-2") from a phase name, leaving base names like "coding" unchanged.
+    /// Only positive numeric suffixes are removed; "-0", non-digit suffixes, overflow and malformed values are preserved.
+    /// </summary>
+    internal static string StripOccurrenceSuffix(string? phase)
+    {
+        if (string.IsNullOrEmpty(phase)) return phase ?? "";
+        var dashIndex = phase.IndexOf('-');
+        if (dashIndex <= 0 || dashIndex >= phase.Length - 1) return phase;
+        var suffix = phase[(dashIndex + 1)..];
+        if (suffix.Length > 0 && suffix.All(c => c >= '0' && c <= '9') && int.TryParse(suffix, out var n) && n > 0)
+            return phase[..dashIndex];
+        return phase;
+    }
+
+    /// <summary>
     /// Validates an iteration plan reported by the Brain LLM (phases, reason and optional model tiers).
     /// </summary>
     /// <returns><c>(true, null)</c> when valid, otherwise <c>(false, error)</c>.</returns>
@@ -31,7 +46,7 @@ internal static class BrainTools
         var validTiers = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { "standard", "premium" };
 
-        var invalidPhases = phases?.Where(p => !validPhases.Contains(p)).ToList() ?? [];
+        var invalidPhases = phases?.Where(p => !validPhases.Contains(StripOccurrenceSuffix(p))).ToList() ?? [];
 
         // Validate model_tiers if provided
         Dictionary<string, string>? parsedTiers = null;
@@ -49,7 +64,7 @@ internal static class BrainTools
 
             if (parsedTiers is not null)
             {
-                var invalidTierPhases = parsedTiers.Keys.Where(k => !tierablePhases.Contains(k)).ToList();
+                var invalidTierPhases = parsedTiers.Keys.Where(k => !tierablePhases.Contains(StripOccurrenceSuffix(k))).ToList();
                 if (invalidTierPhases.Count > 0)
                     tierErrors.Add($"invalid phase names in model_tiers: {string.Join(", ", invalidTierPhases)}. Valid: {string.Join(", ", tierablePhases)}");
 

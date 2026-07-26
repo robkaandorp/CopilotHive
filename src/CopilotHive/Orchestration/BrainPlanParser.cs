@@ -47,7 +47,8 @@ public static class BrainPlanParser
         var phases = new List<GoalPhase>();
         foreach (var name in dto.Phases)
         {
-            if (Enum.TryParse<GoalPhase>(name, ignoreCase: true, out var phase)
+            var baseName = BrainTools.StripOccurrenceSuffix(name);
+            if (Enum.TryParse<GoalPhase>(baseName, ignoreCase: true, out var phase)
                 && phase is not (GoalPhase.Planning or GoalPhase.Done or GoalPhase.Failed))
             {
                 phases.Add(phase);
@@ -69,7 +70,8 @@ public static class BrainPlanParser
         {
             foreach (var (key, value) in dto.ModelTiers)
             {
-                if (Enum.TryParse<GoalPhase>(key, ignoreCase: true, out var phase) && value is not null)
+                var baseKey = BrainTools.StripOccurrenceSuffix(key);
+                if (Enum.TryParse<GoalPhase>(baseKey, ignoreCase: true, out var phase) && value is not null)
                     phaseTiers[phase] = ModelTierExtensions.ParseModelTier(value);
             }
         }
