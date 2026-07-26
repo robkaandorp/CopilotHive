@@ -5,6 +5,7 @@ using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using SharpCoder;
 
@@ -3122,6 +3123,244 @@ public sealed class DistributedBrainTests
         }
     }
 
+
+    // -- UseBrainActors shadow-actor lifecycle tests --
+
+    private static readonly System.Reflection.BindingFlags NonPublicInstance =
+        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+
+    private static object? GetBrainActor(DistributedBrain brain) =>
+        typeof(DistributedBrain).GetField("_brainActor", NonPublicInstance)!.GetValue(brain);
+
+    private static bool IsConnected(DistributedBrain brain) =>
+        (bool)typeof(DistributedBrain).GetField("_connected", NonPublicInstance)!.GetValue(brain)!;
+
+    private static bool IsDisposing(DistributedBrain brain) =>
+        (bool)typeof(DistributedBrain).GetField("_disposing", NonPublicInstance)!.GetValue(brain)!;
+
+    private static Task? GetDisposeTask(DistributedBrain brain) =>
+        (Task?)typeof(DistributedBrain).GetField("_disposeTask", NonPublicInstance)!.GetValue(brain);
+
+    private static void SetActorFactory(DistributedBrain brain, Func<string, CopilotHive.Actors.BrainActor> factory) =>
+        typeof(DistributedBrain).GetField("_actorFactory", NonPublicInstance)!.SetValue(brain, factory);
+
+    private static CopilotHive.Configuration.HiveConfigFile ActorConfig(bool enabled) =>
+        new() { Orchestrator = new CopilotHive.Configuration.OrchestratorConfig { UseBrainActors = enabled } };
+
+    private static string NewTempDir()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"brain-actor-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    private static void DeleteDir(string dir)
+    {
+        try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
+        catch (IOException) { }
+    }
+
+    [Fact]
+    public async Task UseBrainActors_FlagOff_NoActorCreated()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(false));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                Assert.Null(GetBrainActor(brain));
+                Assert.False(Directory.Exists(Path.Combine(dir, "actors")));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task UseBrainActors_FlagOn_ActorCreatedAndConnected()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(true));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                var actor = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
+                Assert.NotNull(actor);
+                Assert.True(Directory.Exists(Path.Combine(dir, "actors")));
+
+                // The actor's loop must actually be running.
+                var isStarted = (bool)typeof(CopilotHive.Actors.BrainActor)
+                    .GetProperty("IsStarted", NonPublicInstance)!.GetValue(actor)!;
+                Assert.True(isStarted);
+
+                // The ConnectMessage must have been processed, not merely enqueued.
+                var stats = CopilotHive.Actors.BrainActorMessages.CreateGetStatsMessage();
+                Assert.True(actor!.Tell(stats));
+                var reply = await stats.Reply.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+                Assert.NotNull(reply);
+                Assert.True(reply!.IsConnected);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task ActorFactory_Throws_ConnectSucceeds_ActorNull()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var logger = new TestLogger<DistributedBrain>();
+            var brain = new DistributedBrain("copilot/test-model", logger,
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(true));
+            await using (brain)
+            {
+                var factoryInvoked = false;
+                SetActorFactory(brain, _ =>
+                {
+                    factoryInvoked = true;
+                    throw new InvalidOperationException("factory boom");
+                });
+
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                Assert.True(factoryInvoked);
+                Assert.Null(GetBrainActor(brain));
+                Assert.Contains(logger.LogEntries, e =>
+                    e.LogLevel == LogLevel.Warning
+                    && e.Message.Contains("BrainActor startup failed", StringComparison.Ordinal)
+                    && e.Exception is InvalidOperationException
+                    && e.Exception.Message.Contains("factory boom", StringComparison.Ordinal));
+
+                // The brain itself must have connected despite the shadow-actor failure.
+                Assert.True(IsConnected(brain));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task ActorFactory_ReturnsDisposedActor_TellFalse_ActorNull()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var logger = new TestLogger<DistributedBrain>();
+            var brain = new DistributedBrain("copilot/test-model", logger,
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(true));
+            await using (brain)
+            {
+                var factoryInvoked = false;
+                SetActorFactory(brain, stateDir =>
+                {
+                    factoryInvoked = true;
+                    var actor = new CopilotHive.Actors.BrainActor("test-model", 1000, stateDir, logger);
+                    actor.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                    return actor;
+                });
+
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                Assert.True(factoryInvoked);
+                Assert.Null(GetBrainActor(brain));
+                // The failure must come from the Tell-false guard, not from the 5s connect timeout.
+                // Without that guard the reply never completes and the captured exception would be
+                // an OperationCanceledException instead.
+                Assert.Contains(logger.LogEntries, e =>
+                    e.LogLevel == LogLevel.Warning
+                    && e.Message.Contains("BrainActor startup failed", StringComparison.Ordinal)
+                    && e.Exception is InvalidOperationException
+                    && e.Exception.Message.Contains("BrainActor mailbox closed", StringComparison.Ordinal));
+
+                // The brain itself must have connected despite the shadow-actor failure.
+                Assert.True(IsConnected(brain));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task DisposeAsync_Idempotent_BothCallsComplete()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(true));
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var actorBefore = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
+            Assert.NotNull(actorBefore);
+
+            var first = Task.Factory.StartNew(() => brain.DisposeAsync().AsTask(),
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+            var second = Task.Factory.StartNew(() => brain.DisposeAsync().AsTask(),
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+
+            await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            Assert.True(IsDisposing(brain));
+            Assert.NotNull(GetDisposeTask(brain));
+
+            // The shadow actor was disposed, so its message loop has stopped.
+            Assert.True(actorBefore!.IsCompleted);
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task DisposeAsync_CalledTwice_ReusesTheSameDisposeTask()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(true));
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var actorBefore = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
+            Assert.NotNull(actorBefore);
+
+            await brain.DisposeAsync();
+
+            var firstTask = GetDisposeTask(brain);
+            Assert.NotNull(firstTask);
+            Assert.True(firstTask!.IsCompleted);
+
+            await brain.DisposeAsync();
+
+            var secondTask = GetDisposeTask(brain);
+
+            // A second disposal must reuse the stored task rather than starting a fresh one.
+            Assert.Same(firstTask, secondTask);
+
+            Assert.True(IsDisposing(brain));
+            Assert.True(actorBefore!.IsCompleted);
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task ConnectAsync_AfterDispose_ThrowsObjectDisposed()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(false));
+            await brain.DisposeAsync();
+
+            await Assert.ThrowsAsync<ObjectDisposedException>(
+                () => brain.ConnectAsync(TestContext.Current.CancellationToken));
+        }
+        finally { DeleteDir(dir); }
+    }
 }
 
 /// <summary>

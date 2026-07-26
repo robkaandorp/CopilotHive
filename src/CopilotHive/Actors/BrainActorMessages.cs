@@ -35,6 +35,12 @@ internal sealed record GetStatsMessage(TaskCompletionSource<BrainActorStats?> Re
 /// <summary>Checks whether a goal session file exists on disk.</summary>
 internal sealed record GoalSessionExistsMessage(string GoalId, TaskCompletionSource<bool> Reply) : IBrainMessage;
 
+/// <summary>Registers an already-existing goal session, forking one if the file is missing.</summary>
+internal sealed record RegisterExistingSessionMessage(string GoalId, TaskCompletionSource<bool> Reply) : IBrainMessage;
+
+/// <summary>Injects orchestrator instructions into the actor state.</summary>
+internal sealed record InjectOrchestratorInstructionsMessage(string Instructions, TaskCompletionSource<bool> Reply) : IBrainMessage;
+
 /// <summary>Immutable snapshot of brain actor statistics.</summary>
 internal sealed record BrainActorStats(string Model, int MessageCount, long ContextTokens, long MaxContextTokens, bool IsConnected);
 
@@ -70,4 +76,12 @@ internal static class BrainActorMessages
     /// <summary>Creates a goal-session-exists message with an asynchronous reply source.</summary>
     internal static GoalSessionExistsMessage CreateGoalSessionExistsMessage(string goalId) =>
         new(goalId, NewReply<bool>());
+
+    /// <summary>Creates a register-existing-session message with an asynchronous reply source.</summary>
+    internal static RegisterExistingSessionMessage CreateRegisterExistingSessionMessage(string goalId) =>
+        new(goalId, NewReply<bool>());
+
+    /// <summary>Creates an inject-orchestrator-instructions message with an asynchronous reply source.</summary>
+    internal static InjectOrchestratorInstructionsMessage CreateInjectOrchestratorInstructionsMessage(string instructions) =>
+        new(instructions, NewReply<bool>());
 }

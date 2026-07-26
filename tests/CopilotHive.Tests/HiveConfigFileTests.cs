@@ -182,7 +182,8 @@ public sealed class HiveConfigFileTests
                 AlwaysImprove = true,
                 VerboseLogging = true,
                 BrainMaxSteps = 50,
-                BranchCleanupDelayHours = 24
+                BranchCleanupDelayHours = 24,
+                UseBrainActors = true
             },
             Models = new ModelsConfig
             {
@@ -236,6 +237,7 @@ public sealed class HiveConfigFileTests
         Assert.True(receiver.Orchestrator.VerboseLogging);
         Assert.Equal(50, receiver.Orchestrator.BrainMaxSteps);
         Assert.Equal(24, receiver.Orchestrator.BranchCleanupDelayHours);
+        Assert.True(receiver.Orchestrator.UseBrainActors);
 
         // Assert — Models
         Assert.NotNull(receiver.Models);
@@ -253,6 +255,42 @@ public sealed class HiveConfigFileTests
         Assert.Equal("copilot/composer-model", receiver.Composer.Models[0]);
         Assert.Equal("copilot/alt-model", receiver.Composer.Models[1]);
         Assert.Equal(25, receiver.Composer.MaxSteps);
+    }
+
+    /// <summary>
+    /// The UseBrainActors flag defaults to false and is copied in both directions by ReloadFrom.
+    /// </summary>
+    [Fact]
+    public void ReloadFrom_UseBrainActorsFlag_CopiedCorrectly()
+    {
+        // Default is opt-out.
+        Assert.False(new OrchestratorConfig().UseBrainActors);
+
+        // false -> true
+        var enabledSource = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { UseBrainActors = true }
+        };
+        var freshReceiver = new HiveConfigFile();
+        Assert.False(freshReceiver.Orchestrator.UseBrainActors);
+
+        freshReceiver.ReloadFrom(enabledSource);
+
+        Assert.True(freshReceiver.Orchestrator.UseBrainActors);
+
+        // true -> false (proves the copy overwrites rather than leaving the previous value).
+        var disabledSource = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { UseBrainActors = false }
+        };
+        var enabledReceiver = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { UseBrainActors = true }
+        };
+
+        enabledReceiver.ReloadFrom(disabledSource);
+
+        Assert.False(enabledReceiver.Orchestrator.UseBrainActors);
     }
 
     /// <summary>

@@ -637,4 +637,261 @@ public class BrainActorTests
             DeleteTempPath(dir);
         }
     }
+
+    // -- RegisterExistingSessionMessage / InjectOrchestratorInstructionsMessage tests --
+
+    private static async Task<BrainActor> CreateConnectedActorAsync(string dir)
+    {
+        var actor = CreateActor(dir);
+        actor.Start();
+        var connect = BrainActorMessages.CreateConnectMessage();
+        Assert.True(actor.Tell(connect));
+        await AwaitReplyAsync(connect.Reply);
+        return actor;
+    }
+
+    [Fact]
+    public async Task RegisterExistingSession_FileExists_TracksSession()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var actor = await CreateConnectedActorAsync(dir);
+            await using (actor)
+            {
+                // Pre-create a session file carrying a marker that a fork of the master would not contain.
+                var path = Path.Combine(dir, "brain-goal-g1.json");
+                var preExisting = AgentSession.Create("brain-goal-g1");
+                preExisting.MessageHistory.Add(new ChatMessage(ChatRole.User, "PRE_EXISTING_MARKER"));
+                await preExisting.SaveAsync(path, TestContext.Current.CancellationToken);
+
+                var register = BrainActorMessages.CreateRegisterExistingSessionMessage("g1");
+                Assert.True(actor.Tell(register));
+                Assert.True(await AwaitReplyAsync(register.Reply));
+
+                // The pre-existing file must be adopted, not overwritten by a fresh fork.
+                var afterRegister = await File.ReadAllTextAsync(path, TestContext.Current.CancellationToken);
+                Assert.Contains("PRE_EXISTING_MARKER", afterRegister, StringComparison.Ordinal);
+
+                // Mutate the master so a fork would now produce clearly different content.
+                var merge = BrainActorMessages.CreateMergeSummaryMessage("other-goal", "MASTER_MUTATION");
+                Assert.True(actor.Tell(merge));
+                Assert.True(await AwaitReplyAsync(merge.Reply));
+
+                // ForkSession short-circuits only when the goal is present in the tracking dictionary.
+                // If RegisterExistingSession had not tracked it, this fork would overwrite the file.
+                var fork = BrainActorMessages.CreateForkSessionMessage("g1");
+                Assert.True(actor.Tell(fork));
+                Assert.True(await AwaitReplyAsync(fork.Reply));
+
+                var afterFork = await File.ReadAllTextAsync(path, TestContext.Current.CancellationToken);
+                Assert.Equal(afterRegister, afterFork);
+                Assert.Contains("PRE_EXISTING_MARKER", afterFork, StringComparison.Ordinal);
+                Assert.DoesNotContain("MASTER_MUTATION", afterFork, StringComparison.Ordinal);
+
+                // The actor owns the tracked path and can delete it.
+                var delete = BrainActorMessages.CreateDeleteSessionMessage("g1");
+                Assert.True(actor.Tell(delete));
+                Assert.True(await AwaitReplyAsync(delete.Reply));
+                Assert.False(File.Exists(path));
+
+                var exists = BrainActorMessages.CreateGoalSessionExistsMessage("g1");
+                Assert.True(actor.Tell(exists));
+                Assert.False(await AwaitReplyAsync(exists.Reply));
+            }
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task RegisterExistingSession_FileMissing_ForksAndSaves()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var actor = await CreateConnectedActorAsync(dir);
+            await using (actor)
+            {
+                // Seed the master session so a genuine fork is distinguishable from an empty file.
+                var merge = BrainActorMessages.CreateMergeSummaryMessage("seed-goal", "MASTER_FORK_MARKER");
+                Assert.True(actor.Tell(merge));
+                Assert.True(await AwaitReplyAsync(merge.Reply));
+
+                var path = Path.Combine(dir, "brain-goal-g2.json");
+                Assert.False(File.Exists(path));
+
+                var register = BrainActorMessages.CreateRegisterExistingSessionMessage("g2");
+                Assert.True(actor.Tell(register));
+                Assert.True(await AwaitReplyAsync(register.Reply));
+
+                Assert.True(File.Exists(path));
+
+                // The saved file must be a real fork of the master, not an empty placeholder.
+                var forked = await AgentSession.LoadAsync(path, TestContext.Current.CancellationToken);
+                Assert.NotEmpty(forked.MessageHistory);
+                Assert.Contains(forked.MessageHistory, m => m.Text.Contains("MASTER_FORK_MARKER", StringComparison.Ordinal));
+
+                var exists = BrainActorMessages.CreateGoalSessionExistsMessage("g2");
+                Assert.True(actor.Tell(exists));
+                Assert.True(await AwaitReplyAsync(exists.Reply));
+
+                // Tracked: a subsequent fork must not rewrite the file.
+                var contentAfterRegister = await File.ReadAllTextAsync(path, TestContext.Current.CancellationToken);
+                var mutate = BrainActorMessages.CreateMergeSummaryMessage("other-goal", "LATER_MUTATION");
+                Assert.True(actor.Tell(mutate));
+                Assert.True(await AwaitReplyAsync(mutate.Reply));
+
+                var fork = BrainActorMessages.CreateForkSessionMessage("g2");
+                Assert.True(actor.Tell(fork));
+                Assert.True(await AwaitReplyAsync(fork.Reply));
+
+                Assert.Equal(contentAfterRegister, await File.ReadAllTextAsync(path, TestContext.Current.CancellationToken));
+            }
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task RegisterExistingSession_AlreadyRegistered_RepliesTrue()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var actor = await CreateConnectedActorAsync(dir);
+            await using (actor)
+            {
+                var first = BrainActorMessages.CreateRegisterExistingSessionMessage("g3");
+                Assert.True(actor.Tell(first));
+                Assert.True(await AwaitReplyAsync(first.Reply));
+
+                var path = Path.Combine(dir, "brain-goal-g3.json");
+                Assert.True(File.Exists(path));
+
+                // Mutate the master so a non-idempotent second registration would rewrite the file.
+                var merge = BrainActorMessages.CreateMergeSummaryMessage("other-goal", "SECOND_PASS_MUTATION");
+                Assert.True(actor.Tell(merge));
+                Assert.True(await AwaitReplyAsync(merge.Reply));
+
+                // Remove the file behind the actor's back. The already-tracked guard must short-circuit
+                // on the dictionary alone; without it the handler would observe the missing file and
+                // re-fork, recreating it.
+                File.Delete(path);
+
+                var second = BrainActorMessages.CreateRegisterExistingSessionMessage("g3");
+                Assert.True(actor.Tell(second));
+                Assert.True(await AwaitReplyAsync(second.Reply));
+
+                Assert.False(File.Exists(path));
+            }
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task RegisterExistingSession_NotConnected_ReplyFaulted()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var actor = CreateActor(dir);
+            actor.Start();
+            await using (actor)
+            {
+                var register = BrainActorMessages.CreateRegisterExistingSessionMessage("g4");
+                Assert.True(actor.Tell(register));
+                await AwaitSettledAsync(register.Reply);
+                Assert.True(register.Reply.Task.IsFaulted);
+            }
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task RegisterExistingSession_InvalidGoalId_ReplyFaulted_LoopContinues()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var actor = await CreateConnectedActorAsync(dir);
+            await using (actor)
+            {
+                var register = BrainActorMessages.CreateRegisterExistingSessionMessage("../escape");
+                Assert.True(actor.Tell(register));
+                await AwaitSettledAsync(register.Reply);
+                Assert.True(register.Reply.Task.IsFaulted);
+
+                // The loop must survive the fault.
+                var stats = BrainActorMessages.CreateGetStatsMessage();
+                Assert.True(actor.Tell(stats));
+                Assert.NotNull(await AwaitReplyAsync(stats.Reply));
+            }
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task InjectOrchestratorInstructions_StoresAndRepliesTrue()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var actor = await CreateConnectedActorAsync(dir);
+            await using (actor)
+            {
+                var msg = BrainActorMessages.CreateInjectOrchestratorInstructionsMessage("test instructions");
+                Assert.True(actor.Tell(msg));
+                Assert.True(await AwaitReplyAsync(msg.Reply));
+
+                var field = typeof(BrainActor).GetField("_orchestratorInstructions",
+                    BindingFlags.NonPublic | BindingFlags.Instance)!;
+                Assert.Equal("test instructions", (string)field.GetValue(actor)!);
+            }
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task InjectOrchestratorInstructions_EmptyString_RepliesTrue()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var actor = await CreateConnectedActorAsync(dir);
+            await using (actor)
+            {
+                var seed = BrainActorMessages.CreateInjectOrchestratorInstructionsMessage("seed");
+                Assert.True(actor.Tell(seed));
+                Assert.True(await AwaitReplyAsync(seed.Reply));
+
+                var msg = BrainActorMessages.CreateInjectOrchestratorInstructionsMessage(string.Empty);
+                Assert.True(actor.Tell(msg));
+                Assert.True(await AwaitReplyAsync(msg.Reply));
+
+                var field = typeof(BrainActor).GetField("_orchestratorInstructions",
+                    BindingFlags.NonPublic | BindingFlags.Instance)!;
+                Assert.Equal(string.Empty, (string)field.GetValue(actor)!);
+            }
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task CancelDrain_UnstartedActor_NewMessagesCanceled()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var actor = CreateActor(dir);
+            var register = BrainActorMessages.CreateRegisterExistingSessionMessage("g5");
+            var inject = BrainActorMessages.CreateInjectOrchestratorInstructionsMessage("x");
+            Assert.True(actor.Tell(register));
+            Assert.True(actor.Tell(inject));
+
+            await actor.DisposeAsync();
+
+            Assert.True(register.Reply.Task.IsCanceled);
+            Assert.True(inject.Reply.Task.IsCanceled);
+        }
+        finally { DeleteTempPath(dir); }
+    }
 }

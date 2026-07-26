@@ -1,3 +1,4 @@
+using CopilotHive.Actors;
 using CopilotHive.Agents;
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
@@ -57,9 +58,19 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <summary>Goal IDs currently being deleted, guarded so no new context is created during teardown.</summary>
     private readonly ConcurrentDictionary<string, bool> _deletingGoals = new();
 
-    private bool _disposing;
+    private volatile bool _disposing;
     private bool _resetting;
     private bool _connected;
+
+    /// <summary>Shadow brain actor, created on connect when <c>UseBrainActors</c> is enabled.</summary>
+    private BrainActor? _brainActor;
+
+    /// <summary>Test seam for constructing the shadow actor from a state directory.</summary>
+    internal Func<string, BrainActor>? _actorFactory;
+
+    /// <summary>Guards one-shot disposal bookkeeping.</summary>
+    private readonly object _lifecycleLock = new();
+    private Task? _disposeTask;
 
     /// <summary>An externally-injected chat client shared across contexts (never owned/disposed by a context).</summary>
     private readonly IChatClient? _injectedChatClient;
@@ -131,6 +142,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         await _sessionLock.WaitAsync(ct);
         try
         {
+            if (_disposing)
+                throw new ObjectDisposedException(nameof(DistributedBrain));
+
             if (_connected)
                 return;
 
@@ -151,6 +165,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     _logger.LogInformation("Loaded Brain master session with {Count} messages from {File}",
                         _masterSession.MessageHistory.Count, masterFile);
                 }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Failed to load Brain master session from {File} — starting fresh", masterFile);
@@ -161,6 +179,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             RefreshMasterSessionRegistry();
 
             _connected = true;
+
+            await StartShadowActorAsync(ct);
         }
         finally
         {
@@ -169,6 +189,55 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         _logger.LogInformation("Brain connected (model={Model}, contextWindow={ContextWindow})",
             _modelOverride, _maxContextTokens);
+    }
+
+    /// <summary>
+    /// Starts the shadow <see cref="BrainActor"/> when enabled. Startup failures are logged and
+    /// leave the brain fully functional without a shadow; caller cancellation propagates.
+    /// </summary>
+    private async Task StartShadowActorAsync(CancellationToken ct)
+    {
+        if (_hiveConfig?.Orchestrator?.UseBrainActors != true)
+            return;
+
+        BrainActor? actor = null;
+        try
+        {
+            var actorStateDir = Path.Combine(_stateDir, "actors");
+            Directory.CreateDirectory(actorStateDir);
+            actor = _actorFactory?.Invoke(actorStateDir)
+                ?? new BrainActor(_modelOverride, _maxContextTokens, actorStateDir, _logger);
+            actor.Start();
+
+            var connectMsg = BrainActorMessages.CreateConnectMessage();
+            if (!actor.Tell(connectMsg))
+                throw new InvalidOperationException("BrainActor mailbox closed");
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
+            await connectMsg.Reply.Task.WaitAsync(timeoutCts.Token);
+
+            Volatile.Write(ref _brainActor, actor);
+            actor = null;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            await DisposeActorSafelyAsync(actor);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "BrainActor startup failed — shadow disabled");
+            await DisposeActorSafelyAsync(actor);
+        }
+    }
+
+    private static async Task DisposeActorSafelyAsync(BrainActor? actor)
+    {
+        if (actor is null)
+            return;
+
+        try { await actor.DisposeAsync(); } catch { }
     }
 
     /// <inheritdoc />
@@ -1429,11 +1498,24 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             throw new InvalidOperationException("Brain not connected. Call ConnectAsync first.");
     }
 
-    /// <summary>Drains and disposes all goal contexts and the shared injected chat client.</summary>
+    /// <summary>Drains and disposes all goal contexts, the shared injected chat client and the
+    /// shadow actor. Idempotent — concurrent callers await the same disposal task.</summary>
     public async ValueTask DisposeAsync()
     {
-        _disposing = true;
+        Task taskToAwait;
+        lock (_lifecycleLock)
+        {
+            _disposing = true;
+            _disposeTask ??= DisposeAsyncCore();
+            taskToAwait = _disposeTask;
+        }
 
+        try { await taskToAwait; }
+        catch { }
+    }
+
+    private async Task DisposeAsyncCore()
+    {
         List<GoalBrainContext> contexts;
         await _sessionLock.WaitAsync();
         try
@@ -1457,7 +1539,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             try { _injectedChatClient.Dispose(); } catch { }
         }
 
-        _sessionLock.Dispose();
+        await DisposeActorSafelyAsync(Volatile.Read(ref _brainActor));
+
+        // _sessionLock is intentionally NOT disposed: it must live for the object's lifetime
+        // because ConnectAsync reads _disposing only after acquiring it.
     }
 
     /// <summary>Per-goal Brain execution context. Owns a dedicated gate, chat client, compaction

@@ -35,4 +35,7 @@ public sealed class OrchestratorConfig
     /// heartbeating while their LLM call hangs. Set to 0 to disable.
     /// </summary>
     public int WorkerTaskTimeoutMinutes { get; set; } = Services.CleanupDefaults.WorkerTaskTimeoutMinutes;
+
+    /// <summary>When true, creates a BrainActor shadow alongside the existing DistributedBrain on connect.</summary>
+    public bool UseBrainActors { get; set; }
 }

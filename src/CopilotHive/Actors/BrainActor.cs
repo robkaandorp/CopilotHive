@@ -33,6 +33,7 @@ internal sealed class BrainActor : IAsyncDisposable
     private string _modelOverride;
     private int _maxContextTokens;
     private bool _connected;
+    private string _orchestratorInstructions = string.Empty;
 
     private Task? _loopTask;
     private bool _disposed;
@@ -170,6 +171,16 @@ internal sealed class BrainActor : IAsyncDisposable
                 m.Reply.TrySetResult(File.Exists(ValidateGoalPath(m.GoalId)));
                 break;
 
+            case RegisterExistingSessionMessage m:
+                await RegisterExistingSessionAsync(m.GoalId, ct);
+                m.Reply.TrySetResult(true);
+                break;
+
+            case InjectOrchestratorInstructionsMessage m:
+                _orchestratorInstructions = m.Instructions;
+                m.Reply.TrySetResult(true);
+                break;
+
             default:
                 throw new InvalidOperationException($"Unhandled brain message type '{message.GetType().Name}'.");
         }
@@ -217,8 +228,28 @@ internal sealed class BrainActor : IAsyncDisposable
         _activeGoalSessions[goalId] = filePath;
     }
 
-    private void DeleteSession(string goalId)
+    /// <summary>
+    /// Tracks a goal session that already exists on disk. When the file is missing the master
+    /// session is forked and persisted so the goal has a usable session either way.
+    /// </summary>
+    private async Task RegisterExistingSessionAsync(string goalId, CancellationToken ct)
     {
+        if (_activeGoalSessions.ContainsKey(goalId))
+        {
+            return;
+        }
+
+        var filePath = ValidateGoalPath(goalId);
+        if (!File.Exists(filePath))
+        {
+            var goalSession = EnsureConnected().Fork($"brain-goal-{goalId}");
+            await SaveSessionAsync(goalSession, filePath, ct);
+        }
+
+        _activeGoalSessions[goalId] = filePath;
+    }
+
+    private void DeleteSession(string goalId)    {
         var filePath = ValidateGoalPath(goalId);
         if (File.Exists(filePath))
         {
@@ -308,6 +339,8 @@ internal sealed class BrainActor : IAsyncDisposable
             case GetPipelineMessage m: m.Reply.TrySetCanceled(); break;
             case GetStatsMessage m: m.Reply.TrySetCanceled(); break;
             case GoalSessionExistsMessage m: m.Reply.TrySetCanceled(); break;
+            case RegisterExistingSessionMessage m: m.Reply.TrySetCanceled(); break;
+            case InjectOrchestratorInstructionsMessage m: m.Reply.TrySetCanceled(); break;
         }
     }
 
@@ -323,6 +356,8 @@ internal sealed class BrainActor : IAsyncDisposable
             case GetPipelineMessage m: m.Reply.TrySetException(exception); break;
             case GetStatsMessage m: m.Reply.TrySetException(exception); break;
             case GoalSessionExistsMessage m: m.Reply.TrySetException(exception); break;
+            case RegisterExistingSessionMessage m: m.Reply.TrySetException(exception); break;
+            case InjectOrchestratorInstructionsMessage m: m.Reply.TrySetException(exception); break;
             default:
                 _logger.LogError(exception, "Brain actor failed to handle {MessageType}", message.GetType().Name);
                 break;
