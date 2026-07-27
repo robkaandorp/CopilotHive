@@ -499,42 +499,6 @@ public sealed class GoalStore : IGoalStore
         }
     }
 
-    // ── Import ───────────────────────────────────────────────────────────
-
-    /// <inheritdoc />
-    public async Task<int> ImportGoalsAsync(IEnumerable<Goal> goals, CancellationToken ct = default)
-    {
-        var imported = 0;
-        var (db, ownsContext) = ResolveDbContext();
-        try
-        {
-            foreach (var goal in goals)
-            {
-                var exists = await db.Goals.AsNoTracking().AnyAsync(g => g.Id == goal.Id, ct);
-                if (exists) continue;
-
-                db.Goals.Add(goal);
-                foreach (var summary in goal.IterationSummaries)
-                    db.Add(ToEntity(goal.Id, summary));
-
-                imported++;
-            }
-
-            if (imported > 0)
-                await db.SaveChangesAsync(ct);
-        }
-        finally
-        {
-            if (ownsContext)
-                await db.DisposeAsync();
-        }
-
-        if (imported > 0)
-            _logger.LogInformation("Imported {Count} goals into SQLite store", imported);
-
-        return imported;
-    }
-
     // ── Release CRUD ─────────────────────────────────────────────────────
 
     /// <inheritdoc />

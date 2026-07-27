@@ -844,9 +844,6 @@ public sealed class GoalDispatcher : BackgroundService
             }
         }
 
-        // Commit to config repo (already best-effort internally)
-        await _lifecycleService.CommitGoalsToConfigRepoAsync($"Goal '{goal.Id}' started", ct);
-
         // Create a pipeline for this goal
         var maxRetries = _config?.Orchestrator?.MaxRetriesPerTask ?? Constants.DefaultMaxRetriesPerTask;
         var maxIterations = _config?.Orchestrator?.MaxIterations ?? Constants.DefaultMaxIterations;

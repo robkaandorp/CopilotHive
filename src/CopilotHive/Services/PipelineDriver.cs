@@ -589,8 +589,6 @@ internal sealed class PipelineDriver
                         Notes = [$"Improver skipped: {ex.Message}"],
                     };
                     await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.InProgress, notesMeta, ct);
-                    await _lifecycleService.CommitGoalsToConfigRepoAsync(
-                        $"Goal '{pipeline.GoalId}': improver skipped ({ex.GetType().Name})", ct);
 
                     // Advance past the failed Improve phase (non-blocking in state machine)
                     var skipResult = pipeline.StateMachine.Transition(PhaseInput.Failed);

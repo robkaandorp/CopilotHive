@@ -16,7 +16,7 @@ namespace CopilotHive.Tests.Goals;
 /// 2. Old JSON data with string values deserializes correctly into the new enum types
 /// 3. New serialization produces the same JSON format as before the refactor
 /// 4. IterationPlan with GoalPhase values round-trips through PipelineStore
-/// 5. FileGoalSource YAML mapping between string DTO and enum-typed PhaseResult works
+/// 5. PhaseResult string-DTO mapping for removed YAML source compatibility
 /// </summary>
 public sealed class PhaseResultSerializationTests : IDisposable
 {
@@ -346,13 +346,12 @@ public sealed class PhaseResultSerializationTests : IDisposable
         Assert.DoesNotContain("\"phases\":[1,", json);
     }
 
-    // ─── Test 5: FileGoalSource YAML round-trip ───────────────────────────────
+    // ─── Test 5: String-DTO mapping round-trip ───────────────────────────────
 
     [Fact]
-    public void FileGoalSource_PhaseResultEntry_MapsToPhaseResultCorrectly()
+    public void PhaseResultEntry_MapsToPhaseResultCorrectly()
     {
-        // Simulate what FileGoalSource does: map from string DTO (PhaseResultEntry)
-        // to enum-typed PhaseResult
+        // Map from string DTO (PhaseResultEntry) to enum-typed PhaseResult
         var entry = new PhaseResultEntry
         {
             Name = "Coding",
@@ -360,7 +359,6 @@ public sealed class PhaseResultSerializationTests : IDisposable
             DurationSeconds = 30.0,
         };
 
-        // Replicate the mapping logic from FileGoalSource.MapIterationSummary
         var phaseResult = new PhaseResult
         {
             Name = Enum.Parse<GoalPhase>(entry.Name ?? string.Empty),
@@ -374,9 +372,9 @@ public sealed class PhaseResultSerializationTests : IDisposable
     }
 
     [Fact]
-    public void FileGoalSource_PhaseResult_MapsBackToPhaseResultEntryCorrectly()
+    public void PhaseResult_MapsBackToPhaseResultEntryCorrectly()
     {
-        // Simulate the reverse mapping: enum PhaseResult → string PhaseResultEntry
+        // Map from enum PhaseResult → string PhaseResultEntry
         var phaseResult = new PhaseResult
         {
             Name = GoalPhase.Testing,
@@ -384,7 +382,6 @@ public sealed class PhaseResultSerializationTests : IDisposable
             DurationSeconds = 15.0,
         };
 
-        // Replicate the mapping logic from FileGoalSource.MapIterationSummaryEntry
         var entry = new PhaseResultEntry
         {
             Name = phaseResult.Name.ToString(),
@@ -398,7 +395,7 @@ public sealed class PhaseResultSerializationTests : IDisposable
     }
 
     [Fact]
-    public void FileGoalSource_RoundTrip_AllPhaseOutcomes()
+    public void PhaseResultEntry_RoundTrip_AllPhaseOutcomes()
     {
         // Verify round-trip fidelity for all PhaseOutcome values
         var outcomes = new[] { PhaseOutcome.Pass, PhaseOutcome.Fail, PhaseOutcome.Skip };
@@ -412,7 +409,7 @@ public sealed class PhaseResultSerializationTests : IDisposable
                 DurationSeconds = 5.0,
             };
 
-            // PhaseResult → PhaseResultEntry (string DTO for YAML)
+            // PhaseResult → PhaseResultEntry (string DTO)
             var entry = new PhaseResultEntry
             {
                 Name = phaseResult.Name.ToString(),
@@ -435,9 +432,9 @@ public sealed class PhaseResultSerializationTests : IDisposable
     }
 
     [Fact]
-    public void FileGoalSource_RoundTrip_AllGoalPhases()
+    public void PhaseResultEntry_RoundTrip_AllGoalPhases()
     {
-        // Verify round-trip fidelity for all GoalPhase values that could appear in YAML
+        // Verify round-trip fidelity for all GoalPhase values
         var phases = new[]
         {
             GoalPhase.Planning,
@@ -480,7 +477,7 @@ public sealed class PhaseResultSerializationTests : IDisposable
     }
 
     /// <summary>
-    /// Mimics the internal PhaseResultEntry DTO from FileGoalSource for testing.
+    /// Stand-in for the internal PhaseResultEntry DTO previously used by the removed YAML source.
     /// </summary>
     private sealed class PhaseResultEntry
     {

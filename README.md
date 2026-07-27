@@ -68,7 +68,6 @@ The **Brain** (`DistributedBrain`) plans iteration phases and crafts worker prom
    dotnet build CopilotHive.slnx
    dotnet run --project src/CopilotHive -- \
      --port=9000 \
-     --goals-file=goals.yaml \
      --config-repo=https://github.com/your-org/CopilotHive-Config \
      --config-repo-path=./config-repo
    ```
@@ -92,85 +91,11 @@ The first GitHub user to sign in becomes the admin. The OAuth access token repla
 
 ### Configuring Goals
 
-Goals are stored in **SQLite** (`copilothive.db`) as the primary source of truth. The recommended way to create goals is through the **Composer Chat UI** at `/composer`, which provides a conversational interface for decomposing high-level intent into well-scoped goals. Goals can also be created via the REST API (`POST /api/goals`) or imported from `goals.yaml` on first startup.
+Goals are stored in **SQLite** (`copilothive.db`) as the primary source of truth. The recommended way to create goals is through the **Composer Chat UI** at `/composer`, which provides a conversational interface for decomposing high-level intent into well-scoped goals. Goals can also be created via the REST API (`POST /api/goals`).
 
-The `goals.yaml` format (used for initial bootstrap):
-
-```yaml
-goals:
-  - id: my-feature
-    description: "Implement feature X in repository Y"
-    repo: https://github.com/your-org/target-repo
-    models:
-      coder: gpt-4o
-      reviewer: gpt-4o-mini
-      tester: gpt-4o-mini
-      improver: gpt-4o
-```
+> **Pre-upgrade migration notice**: If you are using goals.yaml, run the current version once with `--goals-file=goals.yaml` to import goals into SQLite. Verify import succeeded by checking the dashboard or `GET /api/goals` before upgrading to v0.20.0+ — the import path is removed in v0.20.0.
 
 **Goal ID Format**: Goal IDs must be non-empty, lowercase kebab-case identifiers containing only letters (a–z), digits (0–9), and hyphens (–). IDs must not start or end with a hyphen (e.g., `fix-build-error`, `add-feature`, `release-v1-0`). This format mirrors git branch naming conventions (e.g., `copilothive/{goal-id}`). Invalid goal IDs will throw an `ArgumentException` with a descriptive error message.
-
-When a goal completes (success or failure), the Orchestrator updates the goal entry with metadata including `total_duration_seconds` — total wall-clock duration from start to completion — `phase_durations` — a map of phase names to wall-clock durations in seconds — and `iteration_summaries` — an array of structured summaries (one per iteration) capturing phases, test results, and review verdicts:
-
-```yaml
-goals:
-  - id: my-feature
-    # ... (input fields above)
-    started_at: "2026-03-17T19:38:37Z"
-    completed_at: "2026-03-17T19:42:15Z"
-    total_duration_seconds: 218
-    iterations: 2
-    status: completed
-    phase_durations:
-      Coding: 125.5
-      Testing: 85.3
-      DocWriting: 45.2
-      Review: 60.1
-      Merge: 12.5
-    iteration_summaries:
-      - iteration: 1
-        phases:
-          - name: Coding
-            result: pass
-            duration_seconds: 60.0
-            worker_output: "Coder: Implemented feature X."
-          - name: Testing
-            result: fail
-            duration_seconds: 20.5
-            worker_output: "Tester: 2 tests failed."
-        test_counts:
-          total: 10
-          passed: 8
-          failed: 2
-        review_verdict: null
-        notes: []
-        phase_outputs:
-          coder-1: "Coder: Implemented feature X."
-          tester-1: "Tester: 2 tests failed."
-      - iteration: 2
-        phases:
-          - name: Coding
-            result: pass
-            duration_seconds: 65.5
-          - name: Testing
-            result: pass
-            duration_seconds: 65.3
-          - name: DocWriting
-            result: pass
-            duration_seconds: 45.2
-          - name: Review
-            result: pass
-            duration_seconds: 60.1
-          - name: Merge
-            result: pass
-            duration_seconds: 12.5
-        test_counts:
-          total: 10
-          passed: 10
-          failed: 0
-        review_verdict: approve
-        notes: []
-```
 
 ## Project Structure
 
@@ -179,7 +104,7 @@ goals:
 | `src/CopilotHive/` | Main orchestrator — Brain, GoalDispatcher, persistence, metrics |
 | `src/CopilotHive.Shared/` | Shared protobuf definitions and DTOs |
 | `src/CopilotHive.Worker/` | Worker process (runs inside Docker containers) |
-| `tests/` | 2700+ xUnit tests |
+| `tests/` | 2975+ xUnit tests |
 | `agents/` | Default agent templates (overridden by config repo at runtime) |
 | `docker/` | Dockerfiles and container configuration |
 
@@ -241,8 +166,8 @@ goals:
 - **HTTP resilience** — all LLM API calls use `Microsoft.Extensions.Http.Resilience` with 3 retries, exponential backoff, and 2-minute per-attempt timeout
 - **Worker feedback in Brain context** — worker output (verdicts, test metrics, issues) is injected into the Brain conversation for informed replanning after failures
 - **Automatic branch cleanup** — when a Failed goal is deleted, its remote feature branches are automatically cleaned up from all associated repositories; best-effort (logs warning on failure, doesn't prevent goal deletion). `DispatcherMaintenance` periodically deletes `copilothive/{goal-id}` feature branches from target repositories after a configurable delay once the goal is completed and merged.
-- **Goal notes** — non-fatal observations tracked in goals.yaml (e.g. "Improver skipped: timeout")
-- **Iteration summaries** — structured per-iteration metrics (phases, test counts, review verdicts) recorded in goals.yaml for observability without reading logs; build success state now correctly persists after goal completion
+- **Goal notes** — non-fatal observations tracked in the goal database (e.g. "Improver skipped: timeout")
+- **Iteration summaries** — structured per-iteration metrics (phases, test counts, review verdicts) recorded in the goal database for observability without reading logs; build success state now correctly persists after goal completion
 - **Phase duration logging** — each pipeline phase logs its wall-clock duration in seconds when it completes (e.g., "Phase Testing for goal X completed in 45.2s")
 - **Goal dependency visualization** — the dashboard displays dependency relationships: 🔗 icon for unblocked goals (all dependencies completed), ⏳ icon for blocked goals (dependencies pending); the goal detail page lists dependencies as clickable links with status indicators
 - **Visible Planning phase in iteration timeline** — the Goal Detail page shows the Brain's planning phase as a distinct phase box (active when planning, completed once plan is determined), with the plan's reasoning displayed below the phase bar for transparency

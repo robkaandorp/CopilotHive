@@ -5144,9 +5144,6 @@ internal sealed class FakeGoalSource : IGoalSource, IGoalStore
     public Task<bool> DeleteGoalAsync(string goalId, CancellationToken ct = default) =>
         Task.FromResult(true);
 
-    public Task<int> ImportGoalsAsync(IEnumerable<Goal> goals, CancellationToken ct = default) =>
-        Task.FromResult(0);
-
     public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(string goalId, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<IterationSummary>>([]);
 

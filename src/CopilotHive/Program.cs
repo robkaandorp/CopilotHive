@@ -39,7 +39,6 @@ public sealed class Program
             if (portArg is not null && int.TryParse(portArg["--port=".Length..], out var p))
                 port = p;
 
-            var goalsFile = args.FirstOrDefault(a => a.StartsWith("--goals-file="))?["--goals-file=".Length..];
             var configRepoUrl = args.FirstOrDefault(a => a.StartsWith("--config-repo="))?["--config-repo=".Length..];
             var configRepoPath = args.FirstOrDefault(a => a.StartsWith("--config-repo-path="))?["--config-repo-path=".Length..]
                 ?? "./config-repo";
@@ -350,14 +349,6 @@ public sealed class Program
                     sp.GetRequiredService<IBrainRepoManager>(),
                     sp.GetRequiredService<ILogger<ReleaseExecutionService>>()));
 
-                // If no explicit goals file, check config repo for goals.yaml
-                if (string.IsNullOrEmpty(goalsFile))
-                {
-                    var configGoalsFile = Path.Combine(configRepo.LocalPath, "goals.yaml");
-                    if (File.Exists(configGoalsFile))
-                        goalsFile = configGoalsFile;
-                }
-
                 // Enable debug logging if verbose_logging is set in config
                 if (hiveConfigFile.Orchestrator.VerboseLogging)
                 {
@@ -445,8 +436,6 @@ public sealed class Program
                 logger.LogInformation("Synced config repo from {ConfigRepoUrl}", configRepoUrl);
                 if (hiveConfigFile is not null)
                 {
-                    if (!string.IsNullOrEmpty(goalsFile))
-                        logger.LogInformation("Using goals file from config repo: {GoalsFile}", goalsFile);
                     logger.LogInformation(
                         "Config loaded: {RepoCount} repo(s), {WorkerConfigCount} worker config(s)",
                         hiveConfigFile.Repositories.Count, hiveConfigFile.Workers.Count);
@@ -540,20 +529,6 @@ public sealed class Program
                     {
                         logger.LogWarning(ex, "Failed to clone repo '{RepoName}' at startup", repo.Name);
                     }
-                }
-            }
-
-            // Bootstrap: import goals from YAML file into SQLite (one-time migration)
-            if (!string.IsNullOrEmpty(goalsFile) && File.Exists(goalsFile))
-            {
-                var goalStore = app.Services.GetRequiredService<IGoalStore>();
-                var fileSource = new FileGoalSource(goalsFile);
-                var yamlGoals = await fileSource.ReadGoalsAsync();
-                if (yamlGoals.Count > 0)
-                {
-                    var imported = await goalStore.ImportGoalsAsync(yamlGoals);
-                    if (imported > 0)
-                        logger.LogInformation("Imported {Count} goals from {GoalsFile} into SQLite", imported, goalsFile);
                 }
             }
 

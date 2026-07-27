@@ -38,12 +38,6 @@ public interface IGoalStore : IGoalSource
     /// <summary>Returns all iteration summaries for a goal, ordered by iteration number.</summary>
     Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(string goalId, CancellationToken ct = default);
 
-    /// <summary>
-    /// Imports goals from a list (e.g. from goals.yaml). Skips goals whose IDs already exist.
-    /// Returns the number of goals imported.
-    /// </summary>
-    Task<int> ImportGoalsAsync(IEnumerable<Goal> goals, CancellationToken ct = default);
-
     // ── Release CRUD ─────────────────────────────────────────────────────
 
     /// <summary>Creates a new release. Throws if a release with the same ID already exists.</summary>

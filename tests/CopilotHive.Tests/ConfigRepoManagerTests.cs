@@ -608,7 +608,7 @@ public class ConfigRepoManagerTests : IDisposable
         var blockingTask = Task.Run(async () =>
         {
             started.TrySetResult(true);
-            await manager.CommitFileAsync("goals.yaml", "update goals", ct);
+            await manager.CommitFileAsync("config.txt", "update config", ct);
         }, ct);
 
         await started.Task;

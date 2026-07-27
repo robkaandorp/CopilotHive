@@ -1,5 +1,13 @@
 ## [Unreleased]
 
+### Removed
+
+- **`FileGoalSource` and goals.yaml support** — Deleted `FileGoalSource.cs` and all goals.yaml import paths. Removed `--goals-file` CLI argument and bootstrap logic from `Program.cs`. Removed `CommitGoalsToConfigRepoAsync` from `GoalLifecycleService` and call sites in `GoalDispatcher.cs` and `PipelineDriver.cs`. Removed `ImportGoalsAsync` from `IGoalStore` and `GoalStore`.
+
+### Changed
+
+- **Documentation** — `README.md` updated to remove all operational, format, and feature-list goals.yaml references; added pre-upgrade migration notice. `VISION.md` updated to reference `hive-config.yaml` instead of `goals.yaml`.
+
 ## [0.19.0] - 2026-07-27
 
 ### Added

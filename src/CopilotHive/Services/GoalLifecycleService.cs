@@ -129,11 +129,6 @@ internal sealed class GoalLifecycleService
         };
 
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, status, meta, ct);
-        await CommitGoalsToConfigRepoAsync(
-            failureReason is not null
-                ? $"Goal '{pipeline.GoalId}' failed: {failureReason}"
-                : $"Goal '{pipeline.GoalId}' completed",
-            ct);
 
         pipeline.Metrics.Iteration = pipeline.Iteration;
         pipeline.Metrics.Duration = duration;
@@ -237,26 +232,6 @@ internal sealed class GoalLifecycleService
         }
 
         return modified;
-    }
-
-    internal async Task CommitGoalsToConfigRepoAsync(string commitMessage, CancellationToken ct)
-    {
-        if (_configRepo is null)
-            return;
-
-        var goalsPath = Path.Combine(_configRepo.LocalPath, "goals.yaml");
-        if (!File.Exists(goalsPath))
-            return;
-
-        try
-        {
-            await _configRepo.CommitFileAsync(goalsPath, commitMessage, ct);
-            _logger.LogInformation("Committed goals.yaml update: {Message}", commitMessage);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to commit goals.yaml update to config repo");
-        }
     }
 
     internal async Task CommitMetricsToConfigRepoAsync(GoalPipeline pipeline, CancellationToken ct)

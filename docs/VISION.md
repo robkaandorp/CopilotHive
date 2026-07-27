@@ -30,7 +30,7 @@ As CopilotHive scales, the orchestration layer will evolve to support generic wo
 Workers register without a fixed role and dynamically accept any role (coder, tester, reviewer, improver) per task. The orchestrator sends role-specific agents.md before each assignment. Docker Compose uses a single `worker` service with configurable replicas. This removes the one-container-per-role constraint and enables scaling based on pipeline load.
 
 ### Pluggable Model Providers
-Per-role model selection is already implemented via `goals.yaml`. The next step is a provider abstraction layer so non-Copilot backends (OpenAI, Anthropic, Azure OpenAI, local models via Ollama) can be swapped in without code changes.
+Per-role model selection is already implemented via `hive-config.yaml`. The next step is a provider abstraction layer so non-Copilot backends (OpenAI, Anthropic, Azure OpenAI, local models via Ollama) can be swapped in without code changes.
 
 ### Observability Dashboard
 A real-time web dashboard will surface pipeline state, per-goal metrics, worker health, and historical trends. Telemetry data will feed a live UI, enabling operators to monitor and intervene without reading log files.

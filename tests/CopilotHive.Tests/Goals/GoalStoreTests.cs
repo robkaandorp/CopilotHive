@@ -389,44 +389,6 @@ public sealed class GoalStoreTests : IDisposable
         Assert.Equal(50, iterations[1].TestCounts!.Total);
     }
 
-    // ── Import ────────────────────────────────────────────────────────────
-
-    [Fact]
-    public async Task ImportGoals_ImportsNewGoals()
-    {
-        var ct = TestContext.Current.CancellationToken;
-        var goals = new[]
-        {
-            MakeGoal("import-1", "First imported"),
-            MakeGoal("import-2", "Second imported"),
-        };
-
-        var count = await _store.ImportGoalsAsync(goals, ct);
-        Assert.Equal(2, count);
-
-        var all = await _store.GetAllGoalsAsync(ct);
-        Assert.Equal(2, all.Count);
-    }
-
-    [Fact]
-    public async Task ImportGoals_SkipsExisting()
-    {
-        var ct = TestContext.Current.CancellationToken;
-        await _store.CreateGoalAsync(MakeGoal("existing", "Already here"), ct);
-
-        var goals = new[]
-        {
-            MakeGoal("existing", "Duplicate"),
-            MakeGoal("new-one", "Brand new"),
-        };
-
-        var count = await _store.ImportGoalsAsync(goals, ct);
-        Assert.Equal(1, count);
-
-        var all = await _store.GetAllGoalsAsync(ct);
-        Assert.Equal(2, all.Count);
-    }
-
     // ── Repositories & Metadata roundtrip ─────────────────────────────────
 
     [Fact]

@@ -501,18 +501,6 @@ file sealed class DependencyTestGoalStore : IGoalStore
         Task.FromResult<IReadOnlyList<IterationSummary>>([]);
 
     /// <inheritdoc/>
-    public Task<int> ImportGoalsAsync(IEnumerable<Goal> goals, CancellationToken ct = default)
-    {
-        var count = 0;
-        foreach (var g in goals)
-        {
-            if (_goals.TryAdd(g.Id, g))
-                count++;
-        }
-        return Task.FromResult(count);
-    }
-
-    /// <inheritdoc/>
     public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default) =>
         Task.FromResult(release);
 

@@ -2334,9 +2334,6 @@ file sealed class FakeGoalStore : IGoalStore
     public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(string goalId, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<IterationSummary>>(Array.Empty<IterationSummary>());
 
-    public Task<int> ImportGoalsAsync(IEnumerable<Goal> goals, CancellationToken ct = default) =>
-        Task.FromResult(0);
-
     public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Goal>>(Array.Empty<Goal>());
 

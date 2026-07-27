@@ -191,7 +191,7 @@ public class ConfigRepoManager
 
     /// <summary>
     /// Commits and pushes a single file that has already been written to disk.
-    /// Used to persist goals.yaml status updates back to the config repo.
+    /// Used to persist config file updates back to the config repo.
     /// </summary>
     public virtual async Task CommitFileAsync(string filePath, string commitMessage, CancellationToken ct = default)
     {
