@@ -16,7 +16,6 @@ public sealed class DashboardStateService : IDisposable
 {
     private readonly WorkerPool _workerPool;
     private readonly GoalPipelineManager _pipelineManager;
-    private readonly GoalManager _goalManager;
     private readonly IGoalStore? _goalStore;
     private readonly DashboardLogSink _logSink;
     private readonly ProgressLog _progressLog;
@@ -24,6 +23,7 @@ public sealed class DashboardStateService : IDisposable
     private readonly Composer? _composer;
     private readonly HiveConfigFile? _config;
     private readonly KnowledgeGraph? _knowledgeGraph;
+    private readonly DashboardNotifier? _notifier;
     private readonly Timer _timer;
     private readonly DateTime _startTime = DateTime.UtcNow;
     private readonly string _version =
@@ -32,18 +32,20 @@ public sealed class DashboardStateService : IDisposable
         ?? Assembly.GetExecutingAssembly().GetName().Version?.ToString()
         ?? "unknown";
     private readonly string? _sharpCoderVersion = typeof(SharpCoder.CodingAgent).Assembly.GetName().Version?.ToString();
-    private List<Goal> _cachedPendingGoals = [];
 
     /// <summary>Fired when state has been polled and components should re-render.</summary>
     public event Action? OnStateChanged;
+
+    /// <summary>Timer polling period used by the dashboard refresh timer.</summary>
+    internal TimeSpan TimerPeriod { get; } = TimeSpan.FromSeconds(10);
 
     /// <summary>Creates the service with required dependencies.</summary>
     public DashboardStateService(
         WorkerPool workerPool,
         GoalPipelineManager pipelineManager,
-        GoalManager goalManager,
         DashboardLogSink logSink,
         ProgressLog progressLog,
+        DashboardNotifier? notifier = null,
         IDistributedBrain? brain = null,
         Composer? composer = null,
         HiveConfigFile? config = null,
@@ -52,42 +54,29 @@ public sealed class DashboardStateService : IDisposable
     {
         _workerPool = workerPool;
         _pipelineManager = pipelineManager;
-        _goalManager = goalManager;
         _logSink = logSink;
         _progressLog = progressLog;
+        _notifier = notifier;
         _brain = brain;
         _composer = composer;
         _config = config;
         _goalStore = goalStore;
         _knowledgeGraph = knowledgeGraph;
-        _timer = new Timer(_ => PollAndNotify(), null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(3));
+
+        if (_notifier is not null)
+            _notifier.OnStateChanged += RelayNotifier;
+
+        _timer = new Timer(_ => PollAndNotify(), null, TimerPeriod, TimerPeriod);
     }
+
+    private void RelayNotifier() => OnStateChanged?.Invoke();
 
     // ── Timer callback ─────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Timer callback: refreshes cached pending goals asynchronously on the thread pool
-    /// then fires <see cref="OnStateChanged"/>.
+    /// Timer callback: fires <see cref="OnStateChanged"/> so components re-render.
     /// </summary>
-    private async void PollAndNotify()
-    {
-        try
-        {
-            var goals = new List<Goal>();
-            foreach (var source in _goalManager.Sources)
-            {
-                var pending = await source.GetPendingGoalsAsync();
-                goals.AddRange(pending);
-            }
-            _cachedPendingGoals = goals;
-        }
-        catch
-        {
-            // Don't crash the timer on transient failures
-        }
-
-        OnStateChanged?.Invoke();
-    }
+    private void PollAndNotify() => OnStateChanged?.Invoke();
 
     // ── Snapshot ───────────────────────────────────────────────────────────────
 
@@ -97,11 +86,7 @@ public sealed class DashboardStateService : IDisposable
         var workers = _workerPool.GetAllWorkers();
         var pipelines = _pipelineManager.GetAllPipelines();
 
-        // Collect goals from cached pending goals (refreshed by timer on threadpool)
         var goalsById = new Dictionary<string, Goal>();
-
-        foreach (var g in _cachedPendingGoals)
-            goalsById.TryAdd(g.Id, g);
 
         // Add all goals from SQLite store (includes all statuses)
         if (_goalStore is not null)
@@ -306,5 +291,10 @@ public sealed class DashboardStateService : IDisposable
     }
 
     /// <inheritdoc />
-    public void Dispose() => _timer.Dispose();
+    public void Dispose()
+    {
+        if (_notifier is not null)
+            _notifier.OnStateChanged -= RelayNotifier;
+        _timer.Dispose();
+    }
 }

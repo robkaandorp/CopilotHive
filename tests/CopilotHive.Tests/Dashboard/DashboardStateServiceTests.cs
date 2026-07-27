@@ -85,14 +85,15 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
 
         // Act
         var detail = await service.GetGoalDetail("parent-goal-beta");
@@ -178,14 +179,15 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
 
         // Act
         var detail = await service.GetGoalDetail("doc-linked-goal");
@@ -242,14 +244,15 @@ public sealed class DashboardStateServiceTests : IDisposable
         // Build the DashboardStateService with required dependencies
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
 
         // Exercise the service method under test
         var detail = await service.GetGoalDetail("service-dep-goal");
@@ -279,14 +282,15 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
 
         var detail = await service.GetGoalDetail("no-dep-service-goal");
 
@@ -314,14 +318,15 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
 
         var detail = await service.GetGoalDetail("merged-goal");
 
@@ -347,14 +352,15 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
 
         var detail = await service.GetGoalDetail("unmerged-goal");
 
@@ -604,14 +610,15 @@ public sealed class DashboardStateServiceTests : IDisposable
         worker.CurrentModel = "gpt-4";
 
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
 
         // Act
         var snapshot = await service.GetSnapshot();
@@ -634,14 +641,15 @@ public sealed class DashboardStateServiceTests : IDisposable
         workerPool.RegisterWorker("w-idle-test", []);
 
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
 
         // Act
         var snapshot = await service.GetSnapshot();
@@ -699,14 +707,15 @@ public sealed class DashboardStateServiceTests : IDisposable
         // Build service WITHOUT a pipeline for this goal (simulating completed state)
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
 
         // Verify the iteration is persisted correctly in the store
         var storedGoal = await _store.GetGoalAsync("completed-goal", ct);
@@ -782,15 +791,15 @@ public sealed class DashboardStateServiceTests : IDisposable
 #pragma warning disable CS0618
         pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(30);
 #pragma warning restore CS0618
-
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
 
         // Verify the iteration summary is persisted correctly
         var storedGoal = await _store.GetGoalAsync("prefers-persisted-goal", ct);
@@ -843,16 +852,16 @@ public sealed class DashboardStateServiceTests : IDisposable
 #pragma warning disable CS0618
         pipeline.Metrics.PhaseDurations["Coding"] = TimeSpan.FromSeconds(30);
 #pragma warning restore CS0618
-
-        var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
-        goalManager.AddSource(goalSource);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
 
         var detail = await service.GetGoalDetail("fallback-goal");
 
@@ -888,16 +897,16 @@ public sealed class DashboardStateServiceTests : IDisposable
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
         // Pipeline starts in Planning phase by default, no plan set
-
-        var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
-        goalManager.AddSource(goalSource);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
 
         var detail = await service.GetGoalDetail("planning-only-goal");
 
@@ -950,16 +959,16 @@ public sealed class DashboardStateServiceTests : IDisposable
             Result = PhaseOutcome.Pass,
             StartedAt = DateTime.UtcNow,
         });
-
-        var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
-        goalManager.AddSource(goalSource);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
 
         var detail = await service.GetGoalDetail("post-planning-goal");
 
@@ -997,16 +1006,16 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         // Advance past Planning WITHOUT setting a plan (Plan remains null)
         pipeline.AdvanceTo(GoalPhase.Coding);
-
-        var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
-        goalManager.AddSource(goalSource);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
 
         var detail = await service.GetGoalDetail("null-plan-goal");
 
@@ -1273,14 +1282,16 @@ public sealed class DashboardStateServiceTests : IDisposable
     {
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         return new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store, config: config);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store,
+            config: config);
     }
 
     // ── GetVersion ─────────────────────────────────────────────────────────────
@@ -1361,16 +1372,16 @@ public sealed class DashboardStateServiceTests : IDisposable
             WorkerOutput = "Coder finished.",
             CompletedAt = DateTime.UtcNow,
         });
-
-        var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
-        goalManager.AddSource(goalSource);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
 
         var detail = await service.GetGoalDetail("prompt-goal");
 
@@ -1415,16 +1426,16 @@ public sealed class DashboardStateServiceTests : IDisposable
             PlanningPrompt = "Please plan iteration 1",
             PlanningResponse = "I will code and test.",
         });
-
-        var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
-        goalManager.AddSource(goalSource);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
 
         var detail = await service.GetGoalDetail("planning-prompt-goal");
 
@@ -1454,16 +1465,16 @@ public sealed class DashboardStateServiceTests : IDisposable
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
         pipelineManager.CreatePipeline(goal, maxRetries: 3);
-
-        var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
-        goalManager.AddSource(goalSource);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
 
         var detail = await service.GetGoalDetail("no-planning-prompt-goal");
 
@@ -1497,16 +1508,16 @@ public sealed class DashboardStateServiceTests : IDisposable
         pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
         pipeline.AdvanceTo(GoalPhase.Coding);
         // No conversation entries added
-
-        var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
-        goalManager.AddSource(goalSource);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
 
         var detail = await service.GetGoalDetail("no-conv-prompt-goal");
 
@@ -1558,14 +1569,15 @@ public sealed class DashboardStateServiceTests : IDisposable
         // Build service WITHOUT a pipeline for this goal (simulating completed state)
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
 
         var detail = await service.GetGoalDetail("completed-iteration-goal");
 
@@ -1625,14 +1637,15 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
 
         var detail = await service.GetGoalDetail("breaking-goal");
 
@@ -1679,14 +1692,15 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
 
         var detail = await service.GetGoalDetail("pending-review-goal");
 
@@ -1733,14 +1747,15 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
 
         var detail = await service.GetGoalDetail("iteration-exhausted-goal");
 
@@ -1767,14 +1782,15 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
 
         var detail = await service.GetGoalDetail("completed-goal");
 
@@ -1833,13 +1849,15 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
 
         var releases = await service.GetReleasesAsync(ct: ct);
 
@@ -2131,14 +2149,15 @@ public sealed class DashboardStateServiceTests : IDisposable
             "composer"));
 
         var workerPool = new WorkerPool();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
 
         var detail = await service.GetGoalDetail("planning-clarif-live");
 
@@ -2200,16 +2219,16 @@ public sealed class DashboardStateServiceTests : IDisposable
             Result = PhaseOutcome.Pass,
             StartedAt = start.AddSeconds(25),
         });
-
-        var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
-        goalManager.AddSource(goalSource);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
 
         var detail = await service.GetGoalDetail("multi-round-goal");
 
@@ -2294,16 +2313,16 @@ public sealed class DashboardStateServiceTests : IDisposable
             Result = PhaseOutcome.Pass,
             StartedAt = start.AddSeconds(25),
         });
-
-        var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
-        goalManager.AddSource(goalSource);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
 
         var detail = await service.GetGoalDetail("positional-status-goal");
 
@@ -2379,16 +2398,16 @@ public sealed class DashboardStateServiceTests : IDisposable
         pipeline.RecordTestOutput(WorkerRole.Coder, 1, "Second coding output", occurrence: 2);
         pipeline.RecordTestOutput(WorkerRole.Tester, 1, "Second testing output", occurrence: 2);
         pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, "Review output", occurrence: 1);
-
-        var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
-        goalManager.AddSource(goalSource);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
 
         var detail = await service.GetGoalDetail("worker-output-goal");
 
@@ -2519,16 +2538,16 @@ public sealed class DashboardStateServiceTests : IDisposable
             Timestamp = DateTime.UtcNow.AddSeconds(10),
             Occurrence = 2,
         });
-
-        var goalManager = new GoalManager();
         var goalSource = new FakeGoalSourceForOutputTests(goal);
-        goalManager.AddSource(goalSource);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null);
 
         var detail = await service.GetGoalDetail("progress-reports-goal");
 
@@ -2763,122 +2782,145 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Equal("approve", review.ReviewVerdict);
     }
 
-    // ── Stale cached Pending goal → InProgress in DB ───────────────────────
-
-    /// <summary>
-    /// Verifies that a goal cached as <see cref="GoalStatus.Pending"/> in
-    /// <c>_cachedPendingGoals</c> is shown as <see cref="GoalStatus.InProgress"/>
-    /// in the dashboard snapshot after its status is updated to InProgress in the
-    /// goal store. The database is the source of truth and must overwrite the stale
-    /// cached Pending entry.
-    /// </summary>
-    [Fact]
-    public async Task GetSnapshot_StaleCachedPendingGoal_UpdatedToInProgress_ShowsInProgress()
-    {
-        var ct = TestContext.Current.CancellationToken;
-
-        // Arrange: create a goal with Pending status in the store
-        var goalId = "stale-pending-goal";
-        var goal = new Goal
-        {
-            Id = goalId,
-            Description = "Goal that starts as Pending and transitions to InProgress",
-            Status = GoalStatus.Pending,
-        };
-        await _store.CreateGoalAsync(goal, ct);
-
-        // Build the service with the in-memory store
-        var workerPool = new WorkerPool();
-        var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
-        var logSink = new DashboardLogSink();
-        var progressLog = new ProgressLog();
-
-        using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
-
-        // Simulate the timer having cached this goal as Pending (stale cache)
-        var cachedField = typeof(DashboardStateService)
-            .GetField("_cachedPendingGoals", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        var staleGoal = new Goal
-        {
-            Id = goalId,
-            Description = goal.Description,
-            Status = GoalStatus.Pending,
-        };
-        cachedField.SetValue(service, new List<Goal> { staleGoal });
-
-        // Act: update the goal's status to InProgress in the store (simulating dispatch)
-        await _store.UpdateGoalStatusAsync(goalId, GoalStatus.InProgress, ct: ct);
-
-        // Assert: GetSnapshot must reflect the DB status (InProgress), not the stale cache (Pending)
-        var snapshot = await service.GetSnapshot();
-        var snapshotGoal = snapshot.Goals.Single(g => g.Id == goalId);
-        Assert.Equal(GoalStatus.InProgress, snapshotGoal.Status);
-
-        // The pending/active counters must also reflect the correct status
-        Assert.Equal(0, snapshot.PendingGoals);
-        Assert.Equal(1, snapshot.ActiveGoals);
-    }
-
-    /// <summary>
-    /// Verifies that a goal cached as <see cref="GoalStatus.Pending"/> remains Pending
-    /// in the snapshot when no pipeline exists and the DB status is still Pending.
-    /// This is the non-regression baseline for the stale-cache fix.
-    /// </summary>
-    [Fact]
-    public async Task GetSnapshot_CachedPendingGoal_StillPendingInDb_ShowsPending()
-    {
-        var ct = TestContext.Current.CancellationToken;
-
-        // Arrange: create a goal with Pending status in the store
-        var goalId = "still-pending-goal";
-        var goal = new Goal
-        {
-            Id = goalId,
-            Description = "Goal that remains Pending",
-            Status = GoalStatus.Pending,
-        };
-        await _store.CreateGoalAsync(goal, ct);
-
-        var workerPool = new WorkerPool();
-        var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
-        var logSink = new DashboardLogSink();
-        var progressLog = new ProgressLog();
-
-        using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
-
-        // Simulate the timer having cached this goal as Pending
-        var cachedField = typeof(DashboardStateService)
-            .GetField("_cachedPendingGoals", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        cachedField.SetValue(service, new List<Goal> { goal });
-
-        // Act: do NOT update the status — it stays Pending in the DB
-        var snapshot = await service.GetSnapshot();
-
-        // Assert: goal should still show Pending
-        var snapshotGoal = snapshot.Goals.Single(g => g.Id == goalId);
-        Assert.Equal(GoalStatus.Pending, snapshotGoal.Status);
-        Assert.Equal(1, snapshot.PendingGoals);
-    }
-
     private DashboardStateService CreateService()
     {
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
-        goalManager.AddSource(_store);
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
         return new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: _store);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
+    }
+
+    // ── DashboardNotifier + cache removal tests ───────────────────────────────
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardStateService.GetSnapshot"/> returns goals
+    /// directly from the configured goal store when the obsolete cached-pending list is gone.
+    /// </summary>
+    [Fact]
+    public async Task GetSnapshot_WithoutCache_ReturnsDbGoalsDirectly()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var goal = new Goal
+        {
+            Id = "db-direct-goal",
+            Description = "Goal read directly from store",
+            Status = GoalStatus.Pending,
+        };
+        await _store.CreateGoalAsync(goal, ct);
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: _store);
+
+        var snapshot = await service.GetSnapshot();
+
+        var snapshotGoal = snapshot.Goals.Single(g => g.Id == "db-direct-goal");
+        Assert.Equal("Goal read directly from store", snapshotGoal.Description);
+        Assert.Equal(GoalStatus.Pending, snapshotGoal.Status);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DashboardNotifier.NotifyStateChanged"/> relays the event
+    /// through <see cref="DashboardStateService.OnStateChanged"/>.
+    /// </summary>
+    [Fact]
+    public void DashboardNotifier_NotifyStateChanged_TriggersOnStateChanged()
+    {
+        var notifier = new DashboardNotifier();
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            notifier: notifier);
+
+        var triggered = false;
+        service.OnStateChanged += () => triggered = true;
+
+        notifier.NotifyStateChanged();
+
+        Assert.True(triggered);
+    }
+
+    /// <summary>
+    /// Verifies that the timer polling period is exposed as ten seconds for tests.
+    /// </summary>
+    [Fact]
+    public void TimerPeriod_IsTenSeconds()
+    {
+        using var service = CreateService();
+        Assert.Equal(TimeSpan.FromSeconds(10), service.TimerPeriod);
+    }
+
+    /// <summary>
+    /// Verifies that constructing the service without a notifier works and the timer-only
+    /// path does not throw.
+    /// </summary>
+    [Fact]
+    public async Task Constructor_WithoutNotifier_WorksTimerOnly()
+    {
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog);
+
+        var snapshot = await service.GetSnapshot();
+        Assert.NotNull(snapshot);
+    }
+
+    /// <summary>
+    /// Verifies that disposing the service unsubscribes from the notifier so that subsequent
+    /// notifications do not trigger the service's <see cref="DashboardStateService.OnStateChanged"/> event.
+    /// </summary>
+    [Fact]
+    public void Dispose_UnsubscribesFromNotifier_NoNotificationAfterDispose()
+    {
+        var notifier = new DashboardNotifier();
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        var service = new DashboardStateService(
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            notifier: notifier);
+
+        var triggered = false;
+        service.OnStateChanged += () => triggered = true;
+
+        service.Dispose();
+        notifier.NotifyStateChanged();
+
+        Assert.False(triggered);
     }
 
     // ── Knowledge Graph ─────────────────────────────────────────────────────
@@ -2898,13 +2940,16 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null, knowledgeGraph: knowledgeGraph);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null,
+            knowledgeGraph: knowledgeGraph);
 
         Assert.Equal(3, service.GetKnowledgeDocumentCount());
     }
@@ -2918,13 +2963,16 @@ public sealed class DashboardStateServiceTests : IDisposable
     {
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null, knowledgeGraph: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null,
+            knowledgeGraph: null);
 
         Assert.Equal(0, service.GetKnowledgeDocumentCount());
     }
@@ -2940,13 +2988,16 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null, knowledgeGraph: knowledgeGraph);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null,
+            knowledgeGraph: knowledgeGraph);
 
         Assert.NotNull(service.KnowledgeGraph);
         Assert.Same(knowledgeGraph, service.KnowledgeGraph);
@@ -2961,13 +3012,16 @@ public sealed class DashboardStateServiceTests : IDisposable
     {
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null, knowledgeGraph: null);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null,
+            knowledgeGraph: null);
 
         Assert.Null(service.KnowledgeGraph);
     }
@@ -2983,13 +3037,16 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         var workerPool = new WorkerPool();
         var pipelineManager = new GoalPipelineManager();
-        var goalManager = new GoalManager();
         var logSink = new DashboardLogSink();
         var progressLog = new ProgressLog();
 
         using var service = new DashboardStateService(
-            workerPool, pipelineManager, goalManager,
-            logSink, progressLog, goalStore: null, knowledgeGraph: knowledgeGraph);
+            workerPool,
+            pipelineManager,
+            logSink,
+            progressLog,
+            goalStore: null,
+            knowledgeGraph: knowledgeGraph);
 
         Assert.Equal(0, service.GetKnowledgeDocumentCount());
     }

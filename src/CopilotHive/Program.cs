@@ -308,6 +308,7 @@ public sealed class Program
             });
 
             // Dashboard: Blazor Server + real-time state aggregation
+            builder.Services.AddSingleton<DashboardNotifier>();
             builder.Services.AddSingleton<DashboardStateService>();
             builder.Services.AddScoped<PageHeaderState>();
             builder.Services.AddScoped<GoalsFilterState>();
