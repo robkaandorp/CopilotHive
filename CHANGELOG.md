@@ -1,5 +1,28 @@
 ## [Unreleased]
 
+## [0.19.0] - 2026-07-27
+
+### Added
+
+- **Actor-only Brain execution** — The `GoalBrainContext` legacy path has been removed. `BrainActor` and `GoalBrainActor` child actors are now the sole execution path for all Brain LLM calls. No feature flag, no fallback. The `Actor<TMessage>` base class with `System.Threading.Channels` mailbox serializes all state access — no locks, no `AsyncLocal`, no CAS lease protocol, no tombstones.
+- **BrainActor authoritative capabilities** — `BrainActor` now manages the `LlmSessionRegistry` lifecycle (register on connect, update on merge/model change, unregister on delete/shutdown). `ConnectAsync` persists the master session. `GetStats` returns complete statistics including cumulative token counts.
+- **Session migration** — One-time migration copies legacy `brain-master.json` and `brain-goal-*.json` files from the state directory to the actor's `actors/` subdirectory. A `.migrated` marker file prevents re-migration.
+- **Reset durability** — `ResetSessionAsync` deletes all session files in both directories, verifies no survivors remain, and starts a fresh actor. Reset-restart failure leaves the brain in a recoverable degraded state (`_connected = false`, `ConnectAsync` can recover).
+- **Multi-round plan validation** — `BrainTools.ValidateIterationPlan` and `BrainPlanParser.MapIterationPlan` now accept occurrence-suffixed phase names (e.g., `coding-1`, `testing-2`) and normalize them to base `GoalPhase` values. Previously, multi-round plans with suffixed names were rejected and retried.
+
+### Changed
+
+- **~525 lines deleted from `DistributedBrain.cs`** — `GoalBrainContext` class, `CreateGoalBrainContextAsync`, `ExecuteBrainViaContextAsync`, `BuildBrainTools`, `AsyncLocal<GoalBrainContext?>`, `_deletingGoals` tombstone, `_goalContexts`/`_activePipelines` ConcurrentDictionaries, `MirrorAsync`/`MirrorFireAndForget`/`FireShadowNote` shadow helpers, `SaveSessionCoreAsync`, `RefreshMasterSessionRegistry`, `_sessionLock` usage in per-goal operations, and the `UseBrainActors` config flag.
+- **`UseBrainActors` config flag removed** — actors are always used. Removed from `OrchestratorConfig` and `HiveConfigFile.ReloadFrom`.
+- **`StartShadowActorAsync` renamed to `StartBrainActorAsync`** — no longer a "shadow".
+- **`_resetting` made visible across threads** — uses `Volatile.Read`/`Volatile.Write` for compile-safe memory visibility without `volatile` keyword (avoids CS0420 with `TreatWarningsAsErrors`).
+- **`ConnectAsync` actor startup is mandatory** — failure rolls back `_connected`, unregisters `brain-master`, disposes partial actor, and throws. Second `_disposing` check catches Connect-vs-Dispose race.
+- **Lifecycle cancellation** — LLM execution passes caller `ct` to actor (cancels LLM). Lifecycle messages use caller `ct` for reply wait only (actor operation completes on its own with loop token).
+
+### Fixed
+
+- **Multi-round plan validation** — Phase names with occurrence suffixes (`coding-1`, `testing-2`) are now properly accepted and normalized, instead of being rejected and causing retry loops.
+
 ## [0.18.0] - 2026-07-26
 
 ### Added
