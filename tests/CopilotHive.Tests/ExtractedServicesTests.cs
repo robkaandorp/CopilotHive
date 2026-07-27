@@ -1,5 +1,6 @@
 using CopilotHive.Agents;
 using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Metrics;
@@ -586,6 +587,33 @@ public sealed class GoalLifecycleServiceTests
         Assert.True(pipeline.CompletedAt.HasValue);
     }
 
+    [Fact]
+    public async Task MarkGoalFailedAsync_NotifiesDashboardOnce()
+    {
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
+        var pipeline = new GoalPipeline(goal);
+        pipeline.StateMachine.StartIteration([GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging]);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        var goalManager = new GoalManager();
+        var goalSource = new FakeGoalSource(goal);
+        goalManager.AddSource(goalSource);
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+
+        var notifier = new DashboardNotifier();
+        var notificationCount = 0;
+        notifier.OnStateChanged += () => Interlocked.Increment(ref notificationCount);
+
+        var service = new GoalLifecycleService(
+            goalManager: goalManager,
+            logger: NullLogger<GoalLifecycleService>.Instance,
+            dashboardNotifier: notifier);
+
+        await service.MarkGoalFailedAsync(pipeline, "Test failure", TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, notificationCount);
+    }
+
     // ── MarkGoalCompletedAsync ──────────────────────────────────────────────
 
     [Fact]
@@ -610,6 +638,61 @@ public sealed class GoalLifecycleServiceTests
 
         Assert.Equal(GoalPhase.Done, pipeline.Phase);
         Assert.True(pipeline.CompletedAt.HasValue);
+    }
+
+    [Fact]
+    public async Task MarkGoalCompletedAsync_FirstCompletion_NotifiesDashboardOnce()
+    {
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
+        var pipeline = new GoalPipeline(goal);
+        pipeline.StateMachine.StartIteration([GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging]);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        var goalManager = new GoalManager();
+        var goalSource = new FakeGoalSource(goal);
+        goalManager.AddSource(goalSource);
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+
+        var notifier = new DashboardNotifier();
+        var notificationCount = 0;
+        notifier.OnStateChanged += () => Interlocked.Increment(ref notificationCount);
+
+        var service = new GoalLifecycleService(
+            goalManager: goalManager,
+            logger: NullLogger<GoalLifecycleService>.Instance,
+            dashboardNotifier: notifier);
+
+        await service.MarkGoalCompletedAsync(pipeline, TestContext.Current.CancellationToken);
+
+        Assert.Equal(GoalPhase.Done, pipeline.Phase);
+        Assert.Equal(1, notificationCount);
+    }
+
+    [Fact]
+    public async Task MarkGoalCompletedAsync_AlreadyDone_GuardReturnsZeroNotifications()
+    {
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
+        var pipeline = new GoalPipeline(goal);
+        pipeline.StateMachine.StartIteration([GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging]);
+        pipeline.AdvanceTo(GoalPhase.Done);
+
+        var goalManager = new GoalManager();
+        var goalSource = new FakeGoalSource(goal);
+        goalManager.AddSource(goalSource);
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+
+        var notifier = new DashboardNotifier();
+        var notificationCount = 0;
+        notifier.OnStateChanged += () => Interlocked.Increment(ref notificationCount);
+
+        var service = new GoalLifecycleService(
+            goalManager: goalManager,
+            logger: NullLogger<GoalLifecycleService>.Instance,
+            dashboardNotifier: notifier);
+
+        await service.MarkGoalCompletedAsync(pipeline, TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, notificationCount);
     }
 
     // ── CommitMetricsToConfigRepoAsync ───────────────────────────────────────

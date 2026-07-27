@@ -1,5 +1,6 @@
 using CopilotHive.Agents;
 using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Metrics;
@@ -20,6 +21,7 @@ internal sealed class GoalLifecycleService
     private readonly AgentsManager? _agentsManager;
     private readonly ConfigRepoManager? _configRepo;
     private readonly IDistributedBrain? _brain;
+    private readonly DashboardNotifier? _dashboardNotifier;
     private readonly ILogger _logger;
 
     public GoalLifecycleService(
@@ -28,7 +30,8 @@ internal sealed class GoalLifecycleService
         MetricsTracker? metricsTracker = null,
         AgentsManager? agentsManager = null,
         ConfigRepoManager? configRepo = null,
-        IDistributedBrain? brain = null)
+        IDistributedBrain? brain = null,
+        DashboardNotifier? dashboardNotifier = null)
     {
         _goalManager = goalManager;
         _logger = logger;
@@ -36,6 +39,7 @@ internal sealed class GoalLifecycleService
         _agentsManager = agentsManager;
         _configRepo = configRepo;
         _brain = brain;
+        _dashboardNotifier = dashboardNotifier;
     }
 
     public async Task MarkGoalCompletedAsync(GoalPipeline pipeline, CancellationToken ct)
@@ -129,6 +133,7 @@ internal sealed class GoalLifecycleService
         };
 
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, status, meta, ct);
+        _dashboardNotifier?.NotifyStateChanged();
 
         pipeline.Metrics.Iteration = pipeline.Iteration;
         pipeline.Metrics.Duration = duration;

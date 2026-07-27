@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
@@ -9,6 +10,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 using WorkerRole = CopilotHive.Workers.WorkerRole;
+using BranchDeleteResult = CopilotHive.Git.BranchDeleteResult;
 
 #pragma warning disable CS0618 // Obsolete members tested for backward compatibility
 
@@ -88,9 +90,14 @@ public sealed class GoalDispatcherReviewVerdictTests
     /// ReviewVerdict population logic in <c>DriveNextPhaseAsync</c>.
     /// </summary>
     private static (GoalDispatcher dispatcher, GoalPipeline pipeline, string taskId)
-        CreateDispatcher(GoalPhase phase, IDistributedBrain brain, int maxRetries = 3)
+        CreateDispatcher(GoalPhase phase, IDistributedBrain brain, int maxRetries = 3, DashboardNotifier? dashboardNotifier = null)
     {
-        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
+        var goal = new Goal
+        {
+            Id = $"goal-{Guid.NewGuid():N}",
+            Description = "Test goal",
+            RepositoryNames = ["test-repo"],
+        };
         var goalSource = new FakeGoalSource(goal);
         var goalManager = new GoalManager();
         goalManager.AddSource(goalSource);
@@ -105,6 +112,14 @@ public sealed class GoalDispatcherReviewVerdictTests
         var taskId = $"task-{Guid.NewGuid():N}";
         pipelineManager.RegisterTask(taskId, goal.Id);
 
+        var config = new HiveConfigFile
+        {
+            Repositories =
+            [
+                new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/repo.git", DefaultBranch = "main" },
+            ],
+        };
+
         var notifier = new TaskCompletionNotifier();
         var dispatcher = new GoalDispatcher(
             goalManager,
@@ -113,10 +128,88 @@ public sealed class GoalDispatcherReviewVerdictTests
             new GrpcWorkerGateway(new WorkerPool()),
             notifier,
             NullLogger<GoalDispatcher>.Instance,
-            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
-            brain);
+            new FakeRepoManager(),
+            brain,
+            config: config,
+            dashboardNotifier: dashboardNotifier);
 
         return (dispatcher, pipeline, taskId);
+    }
+
+    private sealed class FakeRepoManager : IBrainRepoManager
+    {
+        public string WorkDirectory => "/fake/work";
+        public Task<string> EnsureCloneAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+            Task.FromResult($"/fake/work/{repoName}");
+        public Task<string> MergeFeatureBranchAsync(string repoName, string featureBranch, string defaultBranch, string commitMessage, CancellationToken ct = default) =>
+            Task.FromResult("fake-sha");
+        public Task<BranchDeleteResult> DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default) =>
+            Task.FromResult(BranchDeleteResult.Success);
+        public string GetClonePath(string repoName) => $"/fake/work/{repoName}";
+        public Task<string?> GetHeadShaAsync(string repoName, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+        public Task<string?> MergeBranchAsync(string repoName, string sourceBranch, string targetBranch, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+        public Task<bool> CreateTagAsync(string repoName, string tag, string branch, string message, CancellationToken ct = default) =>
+            Task.FromResult(false);
+        public Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default) =>
+            Task.FromResult(false);
+        public Task<List<string>> ListRemoteBranchesAsync(string repoName, CancellationToken ct = default) =>
+            Task.FromResult(new List<string>());
+    }
+    [Fact]
+    public async Task HandleTaskCompletionAsync_PhaseChangesNonTerminally_NotifiesDashboardOnce()
+    {
+        var brain = new FakeDispatcherBrain();
+        var notifier = new DashboardNotifier();
+        var notificationCount = 0;
+        notifier.OnStateChanged += () => Interlocked.Increment(ref notificationCount);
+
+        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Coding, brain, dashboardNotifier: notifier);
+        pipeline.SetPlan(new IterationPlan { Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging] });
+        pipeline.StateMachine.StartIteration([GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging]);
+
+        var phaseBefore = pipeline.Phase;
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "Coding done.",
+            GitStatus = new GitChangeSummary { FilesChanged = 3, Pushed = true },
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.NotEqual(phaseBefore, pipeline.Phase);
+        Assert.True(pipeline.Phase is not GoalPhase.Done and not GoalPhase.Failed);
+        Assert.Equal(1, notificationCount);
+    }
+
+    [Fact]
+    public async Task HandleTaskCompletionAsync_PhaseUnchanged_DoesNotNotifyDashboard()
+    {
+        var brain = new FakeDispatcherBrain();
+        var notifier = new DashboardNotifier();
+        var notificationCount = 0;
+        notifier.OnStateChanged += () => Interlocked.Increment(ref notificationCount);
+
+        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Coding, brain, dashboardNotifier: notifier);
+        pipeline.SetPlan(new IterationPlan { Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging] });
+        pipeline.StateMachine.StartIteration([GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging]);
+
+        var phaseBefore = pipeline.Phase;
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "Coding done.",
+            Metrics = new TaskMetrics { Verdict = "FAIL" },
+        }, TestContext.Current.CancellationToken);
+
+        // Phase stayed Coding (retry in the same phase) → no notification.
+        Assert.Equal(phaseBefore, pipeline.Phase);
+        Assert.Equal(0, notificationCount);
     }
 }
 
@@ -1243,6 +1336,39 @@ public sealed class GoalDispatcherDispatchLoggingTests
 
         // Assert
         Assert.Contains(logger.Logs, l => l.Message.Contains("High"));
+    }
+
+    [Fact]
+    public async Task DispatchNextGoalAsync_NotifiesDashboardOnce()
+    {
+        var goal = new Goal { Id = "goal-dispatch-notify-test", Description = "Dispatch notify test", Status = GoalStatus.Pending };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+
+        var notifier = new DashboardNotifier();
+        var notificationCount = 0;
+        notifier.OnStateChanged += () => Interlocked.Increment(ref notificationCount);
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            new GoalPipelineManager(),
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            startupDelay: TimeSpan.Zero,
+            dashboardNotifier: notifier);
+
+        using var cts = new CancellationTokenSource();
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, TestContext.Current.CancellationToken);
+        var executeTask = dispatcher.StartAsync(linkedCts.Token);
+        await Task.Delay(300, TestContext.Current.CancellationToken);
+        cts.Cancel();
+        await Task.WhenAny(executeTask, Task.Delay(1000, TestContext.Current.CancellationToken));
+
+        Assert.Equal(1, notificationCount);
     }
 }
 

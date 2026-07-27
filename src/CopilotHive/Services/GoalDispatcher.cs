@@ -49,6 +49,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly GoalLifecycleService _lifecycleService;
     private readonly PipelineDriver _pipelineDriver;
     private readonly DispatcherMaintenance _maintenance;
+    private readonly DashboardNotifier? _dashboardNotifier;
     private DateTime _lastBranchCleanup = DateTime.MinValue;
 
     /// <summary>
@@ -73,6 +74,7 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="progressLog">Optional progress log for recording clarification events.</param>
     /// <param name="knowledgeGraph">Optional knowledge graph for reloading on sync cycles.</param>
     /// <param name="goalStore">Optional goal store for direct CRUD operations such as branch cleanup.</param>
+    /// <param name="dashboardNotifier">Optional dashboard notifier for state-change events.</param>
     public GoalDispatcher(
         GoalManager goalManager,
         GoalPipelineManager pipelineManager,
@@ -92,7 +94,8 @@ public sealed class GoalDispatcher : BackgroundService
         TimeSpan? startupDelay = null,
         ProgressLog? progressLog = null,
         KnowledgeGraph? knowledgeGraph = null,
-        IGoalStore? goalStore = null)
+        IGoalStore? goalStore = null,
+        DashboardNotifier? dashboardNotifier = null)
     {
         _repoManager = repoManager ?? throw new ArgumentNullException(nameof(repoManager));
         _goalManager = goalManager;
@@ -109,10 +112,11 @@ public sealed class GoalDispatcher : BackgroundService
         _knowledgeGraph = knowledgeGraph;
         _configRepo = configRepo;
         _goalStore = goalStore;
+        _dashboardNotifier = dashboardNotifier;
         _clarificationHandler = new ClarificationHandler(brain, clarificationRouter, clarificationQueue, logger);
 
         _lifecycleService = new GoalLifecycleService(
-            goalManager, logger, metricsTracker, agentsManager, configRepo, brain);
+            goalManager, logger, metricsTracker, agentsManager, configRepo, brain, dashboardNotifier);
 
         _maintenance = new DispatcherMaintenance(
             pipelineManager, goalManager, taskQueue, workerGateway, brain,
@@ -188,6 +192,7 @@ public sealed class GoalDispatcher : BackgroundService
 
         await _goalManager.UpdateGoalStatusAsync(goalId, GoalStatus.Failed,
             new GoalUpdateMetadata { FailureReason = "Cancelled by user" }, ct);
+        _dashboardNotifier?.NotifyStateChanged();
         _dispatchedGoals.TryRemove(goalId, out _);
         _logger.LogInformation("Goal {GoalId} cancelled (was {Status})", goalId, goal.Status);
         if (_brain is not null)
@@ -543,6 +548,7 @@ public sealed class GoalDispatcher : BackgroundService
             return;
         }
 
+        var phaseBefore = pipeline.Phase;
         try
         {
             await _pipelineDriver.DriveNextPhaseAsync(pipeline, result, ct);
@@ -552,6 +558,9 @@ public sealed class GoalDispatcher : BackgroundService
             _logger.LogError(ex, "Error driving pipeline {GoalId} to next phase", pipeline.GoalId);
             await _lifecycleService.MarkGoalFailedAsync(pipeline, ex.Message, ct);
         }
+
+        if (pipeline.Phase != phaseBefore && pipeline.Phase is not GoalPhase.Done and not GoalPhase.Failed)
+            _dashboardNotifier?.NotifyStateChanged();
 
         _pipelineManager.PersistFull(pipeline);
     }
@@ -799,6 +808,7 @@ public sealed class GoalDispatcher : BackgroundService
             goal.Status = GoalStatus.InProgress;
             if (startedMeta.StartedAt.HasValue)
                 goal.StartedAt = startedMeta.StartedAt.Value;
+            _dashboardNotifier?.NotifyStateChanged();
             _logger.LogInformation("Dispatcher: successfully updated goal '{GoalId}' status to InProgress", goal.Id);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)

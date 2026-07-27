@@ -1,3 +1,4 @@
+using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
@@ -18,7 +19,8 @@ public sealed class GoalDispatcherCancelTests
 
     private static GoalDispatcher CreateDispatcher(
         GoalManager goalManager,
-        GoalPipelineManager pipelineManager) =>
+        GoalPipelineManager pipelineManager,
+        DashboardNotifier? dashboardNotifier = null) =>
         new GoalDispatcher(
             goalManager,
             pipelineManager,
@@ -26,7 +28,8 @@ public sealed class GoalDispatcherCancelTests
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
             NullLogger<GoalDispatcher>.Instance,
-            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            dashboardNotifier: dashboardNotifier);
 
     private static (GoalDispatcher dispatcher, GoalPipeline pipeline, GoalManager goalManager, GoalPipelineManager pipelineManager, CancelFakeGoalSource goalSource)
         CreateInProgressDispatcher(GoalPhase phase = GoalPhase.Coding)
@@ -45,7 +48,11 @@ public sealed class GoalDispatcherCancelTests
         var taskId = $"task-{Guid.NewGuid():N}";
         pipelineManager.RegisterTask(taskId, goal.Id);
 
-        var dispatcher = CreateDispatcher(goalManager, pipelineManager);
+        var notifier = new DashboardNotifier();
+        var notificationCount = 0;
+        notifier.OnStateChanged += () => Interlocked.Increment(ref notificationCount);
+
+        var dispatcher = CreateDispatcher(goalManager, pipelineManager, notifier);
         return (dispatcher, pipeline, goalManager, pipelineManager, goalSource);
     }
 
@@ -154,12 +161,43 @@ public sealed class GoalDispatcherCancelTests
         await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
 
         var pipelineManager = new GoalPipelineManager();
-        var dispatcher = CreateDispatcher(goalManager, pipelineManager);
+        var notifier = new DashboardNotifier();
+        var notificationCount = 0;
+        notifier.OnStateChanged += () => Interlocked.Increment(ref notificationCount);
+
+        var dispatcher = CreateDispatcher(goalManager, pipelineManager, notifier);
 
         await dispatcher.CancelGoalAsync(goal.Id, TestContext.Current.CancellationToken);
 
         Assert.Equal(GoalStatus.Failed, goalSource.LastUpdatedStatus);
         Assert.Equal("Cancelled by user", goalSource.LastUpdatedReason);
+        Assert.Equal(1, notificationCount);
+    }
+
+    [Fact]
+    public async Task CancelGoalAsync_InProgressPipeline_NotifiesDashboardOnce()
+    {
+        var notifier = new DashboardNotifier();
+        var notificationCount = 0;
+        notifier.OnStateChanged += () => Interlocked.Increment(ref notificationCount);
+
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
+        var goalSource = new CancelFakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipelineManager.RegisterTask($"task-{Guid.NewGuid():N}", goal.Id);
+
+        var dispatcher = CreateDispatcher(goalManager, pipelineManager, notifier);
+
+        await dispatcher.CancelGoalAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+
+        Assert.Equal(GoalStatus.Failed, goalSource.LastUpdatedStatus);
+        Assert.Equal(1, notificationCount);
     }
 
     [Fact]

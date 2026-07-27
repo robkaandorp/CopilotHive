@@ -13,5 +13,14 @@ public sealed class DashboardNotifier
     /// <summary>
     /// Notifies subscribers that dashboard state has changed.
     /// </summary>
-    public void NotifyStateChanged() => OnStateChanged?.Invoke();
+    public void NotifyStateChanged()
+    {
+        var handlers = OnStateChanged;
+        if (handlers is null) return;
+        foreach (var handler in handlers.GetInvocationList())
+        {
+            try { ((Action)handler)(); }
+            catch { }
+        }
+    }
 }

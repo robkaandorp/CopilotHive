@@ -2923,6 +2923,38 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.False(triggered);
     }
 
+    /// <summary>
+    /// Verifies that a subscriber exception is swallowed and does not propagate to the caller,
+    /// and that other subscribers still receive the notification.
+    /// </summary>
+    [Fact]
+    public void DashboardNotifier_NotifyStateChanged_IsolatesSubscriberExceptions()
+    {
+        var notifier = new DashboardNotifier();
+        var firstFired = false;
+        var secondFired = false;
+
+        notifier.OnStateChanged += () => { firstFired = true; throw new InvalidOperationException("boom"); };
+        notifier.OnStateChanged += () => secondFired = true;
+
+        notifier.NotifyStateChanged();
+
+        Assert.True(firstFired);
+        Assert.True(secondFired);
+    }
+
+    /// <summary>
+    /// Genuinely races <see cref="DashboardNotifier.NotifyStateChanged"/> against concurrent
+    /// unsubscribe/resubscribe using a <see cref="Barrier"/>. Asserts no exception escapes and
+    /// that at least one captured handler still ran while it was logically unsubscribed,
+    /// proving the <c>GetInvocationList()</c> snapshot semantics.
+    /// </summary>
+    [Fact]
+    public void DashboardNotifier_NotifyStateChanged_ConcurrentUnsubscribe_SnapshotSemanticsHold()
+    {
+        Assert.True(DashboardNotifierRaceHelper.RaceUnsubscribe());
+    }
+
     // ── Knowledge Graph ─────────────────────────────────────────────────────
 
     /// <summary>

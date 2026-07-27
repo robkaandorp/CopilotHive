@@ -303,7 +303,6 @@ internal sealed class PipelineDriver
                 break;
 
             case TransitionEffect.Completed:
-                pipeline.AdvanceTo(GoalPhase.Done);
                 await AppendToProgressDocumentAsync(pipeline.GoalId,
                     "### Brain Summary (Final)\n\nGoal completed successfully.", ct);
                 await _lifecycleService.MarkGoalCompletedAsync(pipeline, ct);
