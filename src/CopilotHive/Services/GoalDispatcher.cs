@@ -50,6 +50,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly PipelineDriver _pipelineDriver;
     private readonly DispatcherMaintenance _maintenance;
     private readonly TaskDispatchService _taskDispatchService;
+    private readonly TaskCompletionService _taskCompletionService;
     private readonly DashboardNotifier? _dashboardNotifier;
     private DateTime _lastBranchCleanup = DateTime.MinValue;
 
@@ -148,6 +149,10 @@ public sealed class GoalDispatcher : BackgroundService
             logger: logger,
             knowledgeGraph: _knowledgeGraph,
             configRepo: _configRepo);
+
+        _taskCompletionService = new TaskCompletionService(
+            _pipelineManager, _brain, _pipelineDriver, _lifecycleService,
+            _dashboardNotifier, _logger);
 
         completionNotifier.OnTaskCompleted+= result => HandleTaskCompletionAsync(result);
     }
@@ -509,60 +514,8 @@ public sealed class GoalDispatcher : BackgroundService
     /// Called by HiveOrchestratorService when a worker completes a task.
     /// Drives the pipeline to its next phase using the Brain.
     /// </summary>
-    public async Task HandleTaskCompletionAsync(TaskResult result, CancellationToken ct = default)
-    {
-        var pipeline = _pipelineManager.GetByTaskId(result.TaskId);
-        if (pipeline is null)
-        {
-            _logger.LogWarning("No pipeline found for completed task {TaskId}", result.TaskId);
-            return;
-        }
-
-        // Guard: ignore late-arriving completions for goals already finished
-        if (pipeline.Phase is GoalPhase.Done or GoalPhase.Failed)
-        {
-            _logger.LogInformation(
-                "Task {TaskId} completed but goal {GoalId} already {Phase} — ignoring duplicate",
-                result.TaskId, pipeline.GoalId, pipeline.Phase);
-            return;
-        }
-
-        // Guard: ignore completions from tasks that are no longer the active task
-        // (e.g., a stale task from a previous phase completing after the pipeline advanced)
-        if (pipeline.ActiveTaskId is not null && pipeline.ActiveTaskId != result.TaskId)
-        {
-            _logger.LogWarning(
-                "Task {TaskId} completed but pipeline {GoalId} active task is {ActiveTaskId} — ignoring stale completion",
-                result.TaskId, pipeline.GoalId, pipeline.ActiveTaskId);
-            return;
-        }
-
-        _logger.LogInformation("Pipeline {GoalId} task completed (phase={Phase}, status={Status}, model={Model})",
-            pipeline.GoalId, pipeline.Phase, result.Status,
-            string.IsNullOrEmpty(result.Model) ? "unknown" : result.Model);
-
-        if (_brain is null)
-        {
-            await _lifecycleService.MarkGoalCompletedAsync(pipeline, ct);
-            return;
-        }
-
-        var phaseBefore = pipeline.Phase;
-        try
-        {
-            await _pipelineDriver.DriveNextPhaseAsync(pipeline, result, ct);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error driving pipeline {GoalId} to next phase", pipeline.GoalId);
-            await _lifecycleService.MarkGoalFailedAsync(pipeline, ex.Message, ct);
-        }
-
-        if (pipeline.Phase != phaseBefore && pipeline.Phase is not GoalPhase.Done and not GoalPhase.Failed)
-            _dashboardNotifier?.NotifyStateChanged();
-
-        _pipelineManager.PersistFull(pipeline);
-    }
+    public Task HandleTaskCompletionAsync(TaskResult result, CancellationToken ct = default)
+        => _taskCompletionService.HandleTaskCompletionAsync(result, ct);
 
     // ── Forwarding wrappers for instance methods (tests call via reflection) ──
 

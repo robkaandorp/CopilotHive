@@ -1443,22 +1443,50 @@ public sealed class GoalDispatcherPhaseDurationLoggingTests
 }
 
 /// <summary>
-/// Tests for model name appearing in GoalDispatcher log messages.
+/// Tests for model name appearing in TaskCompletionService log messages.
+/// After extraction, the task completion log is emitted by <see cref="TaskCompletionService"/>
+/// using its own logger category.
 /// </summary>
-public sealed class GoalDispatcherModelLoggingTests
+public sealed class TaskCompletionServiceModelLoggingTests
 {
+    private static TaskCompletionService CreateService(
+        GoalPipelineManager pipelineManager,
+        IDistributedBrain? brain,
+        ILogger<TaskCompletionService> logger,
+        DashboardNotifier? dashboardNotifier = null)
+    {
+        var goalManager = new GoalManager();
+        var lifecycleService = new GoalLifecycleService(
+            goalManager, NullLogger<GoalLifecycleService>.Instance);
+
+        var pipelineDriver = new PipelineDriver(
+            brain: brain,
+            lifecycleService: lifecycleService,
+            goalManager: goalManager,
+            repoManager: new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            improvementAnalyzer: null,
+            agentsManager: null,
+            metricsTracker: null,
+            dispatchToRole: (_, _, _, _) => Task.CompletedTask,
+            resolvePrompt: (_, _, _, _) => Task.FromResult("prompt"),
+            resolvePlan: (_, _, _) => Task.FromResult(IterationPlan.Default()),
+            resolveRepositories: _ => [],
+            syncAgents: _ => Task.CompletedTask,
+            generateMergeCommitMessage: (_, _) => Task.FromResult("message"),
+            logger: NullLogger<PipelineDriver>.Instance);
+
+        return new TaskCompletionService(
+            pipelineManager, brain, pipelineDriver, lifecycleService,
+            dashboardNotifier, logger);
+    }
+
     [Fact]
     public async Task HandleTaskCompletionAsync_LogsModelName_InTaskCompletedMessage()
     {
         // Arrange
-        var logger = new CollectingLogger<GoalDispatcher>();
+        var logger = new CollectingLogger<TaskCompletionService>();
         var brain = new FakeDispatcherBrain();
-        var taskQueue = new TaskQueue();
         var goal = new Goal { Id = "goal-model-log-test", Description = "Test model logging" };
-        var goalSource = new FakeGoalSource(goal);
-        var goalManager = new GoalManager();
-        goalManager.AddSource(goalSource);
-        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken); // Populate internal map
 
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
@@ -1468,18 +1496,10 @@ public sealed class GoalDispatcherModelLoggingTests
         pipelineManager.RegisterTask(taskId, goal.Id);
         pipeline.SetActiveTask(taskId);
 
-        var dispatcher = new GoalDispatcher(
-            goalManager,
-            pipelineManager,
-            taskQueue,
-            new GrpcWorkerGateway(new WorkerPool()),
-            new TaskCompletionNotifier(),
-            logger,
-            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
-            brain);
+        var service = CreateService(pipelineManager, brain, logger);
 
         // Act — Model is carried directly on the TaskResult (populated by HiveOrchestratorService)
-        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        await service.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
             Status = TaskOutcome.Completed,
@@ -1496,6 +1516,48 @@ public sealed class GoalDispatcherModelLoggingTests
         Assert.Contains("model=claude-sonnet-4-20250514", taskCompletedLog.Message);
     }
 
+    [Fact]
+    public async Task HandleTaskCompletionAsync_WhenModelIsEmpty_LogsUnknownModel()
+    {
+        // Arrange
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var brain = new FakeDispatcherBrain();
+        var goal = new Goal { Id = "goal-unknown-model-test", Description = "Test unknown model logging" };
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        var taskId = $"task-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+        pipeline.SetActiveTask(taskId);
+
+        var service = CreateService(pipelineManager, brain, logger);
+
+        // Act — Model defaults to "" when not set on TaskResult
+        await service.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "Work completed.",
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert - verify "model=unknown" appears when model is empty
+        var taskCompletedLog = logger.Logs.FirstOrDefault(l =>
+            l.Message.Contains("task completed") &&
+            l.Message.Contains(goal.Id));
+        Assert.True(taskCompletedLog != default, $"Expected task completed log. Logs: {string.Join(", ", logger.Logs.Select(l => l.Message))}");
+        Assert.Contains("model=unknown", taskCompletedLog.Message);
+    }
+}
+
+/// <summary>
+/// Tests for model name appearing in the phase-completed log emitted by
+/// <see cref="PipelineDriver"/>, which still uses the <see cref="GoalDispatcher"/> logger.
+/// </summary>
+public sealed class GoalDispatcherPhaseModelLoggingTests
+{
     [Fact]
     public async Task HandleTaskCompletionAsync_LogsModelName_InPhaseCompletedMessage()
     {
@@ -1545,53 +1607,204 @@ public sealed class GoalDispatcherModelLoggingTests
         Assert.True(phaseCompletedLog != default, $"Expected phase completed log. Logs: {string.Join(", ", logger.Logs.Select(l => l.Message))}");
         Assert.Contains("model=claude-sonnet-4-20250514", phaseCompletedLog.Message);
     }
+}
 
-    [Fact]
-    public async Task HandleTaskCompletionAsync_WhenModelIsEmpty_LogsUnknownModel()
+/// <summary>
+/// Integration tests for <see cref="TaskCompletionService"/> guard logic extracted from
+/// <see cref="GoalDispatcher"/>. These tests construct <see cref="TaskCompletionService"/>
+/// directly (via <c>InternalsVisibleTo</c>) to verify the three early-exit guards:
+/// no pipeline, already terminal (Done/Failed), and stale task (ActiveTaskId mismatch).
+/// Also verifies <see cref="GoalPipelineManager.PersistFull"/> is called after a successful
+/// phase transition.
+/// </summary>
+public sealed class TaskCompletionServiceGuardTests
+{
+    private static TaskCompletionService CreateService(
+        GoalPipelineManager pipelineManager,
+        IDistributedBrain? brain,
+        ILogger<TaskCompletionService> logger,
+        DashboardNotifier? dashboardNotifier = null,
+        GoalManager? goalManager = null)
     {
-        // Arrange
-        var logger = new CollectingLogger<GoalDispatcher>();
-        var brain = new FakeDispatcherBrain();
-        var taskQueue = new TaskQueue();
-        var goal = new Goal { Id = "goal-unknown-model-test", Description = "Test unknown model logging" };
+        goalManager ??= new GoalManager();
+        var lifecycleService = new GoalLifecycleService(
+            goalManager, NullLogger<GoalLifecycleService>.Instance);
+
+        var pipelineDriver = new PipelineDriver(
+            brain: brain,
+            lifecycleService: lifecycleService,
+            goalManager: goalManager,
+            repoManager: new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            improvementAnalyzer: null,
+            agentsManager: null,
+            metricsTracker: null,
+            dispatchToRole: (_, _, _, _) => Task.CompletedTask,
+            resolvePrompt: (_, _, _, _) => Task.FromResult("prompt"),
+            resolvePlan: (_, _, _) => Task.FromResult(IterationPlan.Default()),
+            resolveRepositories: _ => [],
+            syncAgents: _ => Task.CompletedTask,
+            generateMergeCommitMessage: (_, _) => Task.FromResult("message"),
+            logger: NullLogger<PipelineDriver>.Instance);
+
+        return new TaskCompletionService(
+            pipelineManager, brain, pipelineDriver, lifecycleService,
+            dashboardNotifier, logger);
+    }
+
+    /// <summary>
+    /// Guard 1: when no pipeline exists for the task ID, the service logs a warning
+    /// and returns without throwing or advancing any pipeline.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_NoPipelineForTaskId_LogsWarningAndReturns()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var pipelineManager = new GoalPipelineManager();
+        var service = CreateService(pipelineManager, brain: new FakeDispatcherBrain(), logger);
+
+        // Act — task ID has no registered pipeline
+        await service.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = "nonexistent-task-id",
+            Status = TaskOutcome.Completed,
+            Output = "done",
+        }, TestContext.Current.CancellationToken);
+
+        // Assert — warning was logged, no exception, no pipeline created
+        var warning = logger.Logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Warning &&
+            l.Message.Contains("No pipeline found for completed task") &&
+            l.Message.Contains("nonexistent-task-id"));
+        Assert.True(warning != default,
+            $"Expected 'No pipeline found' warning. Logs: {string.Join(", ", logger.Logs.Select(l => l.Message))}");
+    }
+
+    /// <summary>
+    /// Guard 2: when the pipeline is already in a terminal phase (Done or Failed), the service
+    /// logs an info message and returns without re-driving the pipeline.
+    /// </summary>
+    [Theory]
+    [InlineData(GoalPhase.Done)]
+    [InlineData(GoalPhase.Failed)]
+    public async Task HandleTaskCompletionAsync_PipelineAlreadyTerminal_LogsInfoAndReturns(GoalPhase terminalPhase)
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var goal = new Goal { Id = $"goal-terminal-{Guid.NewGuid():N}", Description = "Test" };
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(terminalPhase);
+
+        var taskId = $"task-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+        pipeline.SetActiveTask(taskId);
+
+        var service = CreateService(pipelineManager, brain: new FakeDispatcherBrain(), logger);
+
+        // Act
+        await service.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "done",
+        }, TestContext.Current.CancellationToken);
+
+        // Assert — info log about ignoring duplicate, pipeline phase unchanged
+        var infoLog = logger.Logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Information &&
+            l.Message.Contains("already") &&
+            l.Message.Contains("ignoring duplicate"));
+        Assert.True(infoLog != default,
+            $"Expected 'already terminal' info log. Logs: {string.Join(", ", logger.Logs.Select(l => l.Message))}");
+        Assert.Equal(terminalPhase, pipeline.Phase);
+    }
+
+    /// <summary>
+    /// Guard 3: when the task ID does not match the pipeline's ActiveTaskId
+    /// (stale completion from a previous phase), the service logs a warning and returns.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_StaleTask_LogsWarningAndReturns()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var goal = new Goal { Id = $"goal-stale-{Guid.NewGuid():N}", Description = "Test" };
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Testing);
+
+        var oldTaskId = "task-old-phase";
+        var currentTaskId = "task-current-phase";
+        pipelineManager.RegisterTask(oldTaskId, goal.Id);
+        pipelineManager.RegisterTask(currentTaskId, goal.Id);
+        pipeline.SetActiveTask(currentTaskId); // pipeline advanced; active task is now current
+
+        var service = CreateService(pipelineManager, brain: new FakeDispatcherBrain(), logger);
+
+        // Act — late-arriving completion for the OLD task (stale)
+        await service.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = oldTaskId,
+            Status = TaskOutcome.Completed,
+            Output = "stale completion",
+        }, TestContext.Current.CancellationToken);
+
+        // Assert — stale warning logged, pipeline phase unchanged
+        var staleLog = logger.Logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Warning &&
+            l.Message.Contains("ignoring stale completion") &&
+            l.Message.Contains(oldTaskId));
+        Assert.True(staleLog != default,
+            $"Expected 'stale completion' warning. Logs: {string.Join(", ", logger.Logs.Select(l => l.Message))}");
+        Assert.Equal(GoalPhase.Testing, pipeline.Phase);
+    }
+
+    /// <summary>
+    /// After a successful phase transition, <see cref="GoalPipelineManager.PersistFull"/>
+    /// must be called so the pipeline state is persisted. This test uses a real
+    /// <see cref="PipelineStore"/> (in-memory SQLite) and verifies the persisted snapshot
+    /// reflects the post-transition phase.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_AfterPhaseTransition_PersistsFullPipeline()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var ct = TestContext.Current.CancellationToken;
+        var goal = new Goal { Id = $"goal-persist-{Guid.NewGuid():N}", Description = "Test persist", RepositoryNames = ["test-repo"] };
         var goalSource = new FakeGoalSource(goal);
         var goalManager = new GoalManager();
         goalManager.AddSource(goalSource);
-        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+        await goalManager.GetNextGoalAsync(ct);
 
-        var pipelineManager = new GoalPipelineManager();
+        using var dbContext = CopilotHive.Persistence.CopilotHiveDbContext.CreateInMemory();
+        var store = new CopilotHive.Persistence.PipelineStore(dbContext, NullLogger<CopilotHive.Persistence.PipelineStore>.Instance);
+        var pipelineManager = new GoalPipelineManager(store);
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.SetPlan(new IterationPlan { Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging] });
+        pipeline.StateMachine.StartIteration([GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging]);
         pipeline.AdvanceTo(GoalPhase.Coding);
 
         var taskId = $"task-{Guid.NewGuid():N}";
         pipelineManager.RegisterTask(taskId, goal.Id);
         pipeline.SetActiveTask(taskId);
 
-        var dispatcher = new GoalDispatcher(
-            goalManager,
-            pipelineManager,
-            taskQueue,
-            new GrpcWorkerGateway(new WorkerPool()),
-            new TaskCompletionNotifier(),
-            logger,
-            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
-            brain);
+        var service = CreateService(pipelineManager, brain: new FakeDispatcherBrain(), logger, goalManager: goalManager);
 
-        // Act — Model defaults to "" when not set on TaskResult
-        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        // Act — Coding phase completes with PASS → should advance to Testing and PersistFull
+        await service.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
             Status = TaskOutcome.Completed,
-            Output = "Work completed.",
+            Output = "Coding done.",
+            GitStatus = new GitChangeSummary { FilesChanged = 2, Pushed = true },
             Metrics = new TaskMetrics { Verdict = "PASS" },
-        }, TestContext.Current.CancellationToken);
+        }, ct);
 
-        // Assert - verify "model=unknown" appears when model is empty
-        var taskCompletedLog = logger.Logs.FirstOrDefault(l =>
-            l.Message.Contains("task completed") &&
-            l.Message.Contains(goal.Id));
-        Assert.True(taskCompletedLog != default, $"Expected task completed log. Logs: {string.Join(", ", logger.Logs.Select(l => l.Message))}");
-        Assert.Contains("model=unknown", taskCompletedLog.Message);
+        // Assert — pipeline advanced past Coding
+        Assert.NotEqual(GoalPhase.Coding, pipeline.Phase);
+
+        // Assert — PersistFull was called: the persisted snapshot reflects the new phase
+        var snapshot = store.LoadPipeline(goal.Id);
+        Assert.NotNull(snapshot);
+        Assert.Equal(pipeline.Phase, snapshot!.Phase);
     }
 }
 
