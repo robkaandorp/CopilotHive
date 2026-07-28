@@ -51,6 +51,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly DispatcherMaintenance _maintenance;
     private readonly TaskDispatchService _taskDispatchService;
     private readonly TaskCompletionService _taskCompletionService;
+    private readonly GoalDispatchService _goalDispatchService;
     private readonly DashboardNotifier? _dashboardNotifier;
     private DateTime _lastBranchCleanup = DateTime.MinValue;
 
@@ -153,6 +154,11 @@ public sealed class GoalDispatcher : BackgroundService
         _taskCompletionService = new TaskCompletionService(
             _pipelineManager, _brain, _pipelineDriver, _lifecycleService,
             _dashboardNotifier, _logger);
+
+        _goalDispatchService = new GoalDispatchService(
+            _goalManager, _pipelineManager, _brain, _config,
+            _taskDispatchService, _clarificationHandler, _knowledgeGraph,
+            _goalStore, _configRepo, _dashboardNotifier, _logger);
 
         completionNotifier.OnTaskCompleted+= result => HandleTaskCompletionAsync(result);
     }
@@ -566,241 +572,11 @@ public sealed class GoalDispatcher : BackgroundService
     /// queued pipeline. Called from the main poll loop — all dispatching happens here,
     /// avoiding race conditions from polling-based orphan detection.
     /// </summary>
-    private async Task DrainRedispatchQueueAsync(CancellationToken ct)
-    {
-        while (_redispatchQueue.TryDequeue(out var goalId))
-        {
-            var pipeline = _pipelineManager.GetByGoalId(goalId);
-            if (pipeline is null) continue;
-            if (pipeline.ActiveTaskId is not null) continue;
-            if (pipeline.Phase is GoalPhase.Done or GoalPhase.Failed) continue;
+    private Task DrainRedispatchQueueAsync(CancellationToken ct)
+        => _goalDispatchService.DrainRedispatchQueueAsync(_redispatchQueue, ct);
 
-            var role = pipeline.Phase switch
-            {
-                GoalPhase.Coding => WorkerRole.Coder,
-                GoalPhase.Testing => WorkerRole.Tester,
-                GoalPhase.Review => WorkerRole.Reviewer,
-                GoalPhase.DocWriting => WorkerRole.DocWriter,
-                GoalPhase.Improve => WorkerRole.Improver,
-                _ => (WorkerRole?)null,
-            };
-
-            if (role is null)
-            {
-                _logger.LogWarning("Pipeline {GoalId} queued for re-dispatch in phase {Phase} — no role mapping, skipping",
-                    pipeline.GoalId, pipeline.Phase);
-                continue;
-            }
-
-            _logger.LogInformation("Re-dispatching pipeline {GoalId} (phase={Phase}, role={Role})",
-                pipeline.GoalId, pipeline.Phase, role);
-
-            var prompt = _brain is not null
-                ? await ResolvePromptAsync(pipeline, pipeline.Phase,
-                    "This task is being re-dispatched after the previous worker was lost. Continue from where the previous worker left off.",
-                    ct)
-                : $"Continue task for: {pipeline.Description}";
-
-            await DispatchToRole(pipeline, role.Value, prompt, ct);
-        }
-    }
-
-    private async Task DispatchNextGoalAsync(CancellationToken ct)
-    {
-        // Parallelism gate: allow multiple goals to run concurrently when MaxParallelGoals > 1.
-        // Each goal has its own Brain context with its own gate, so Brain LLM calls for different goals run in parallel.
-        var maxParallel = _config?.Orchestrator?.MaxParallelGoals ?? 1;
-        var activePipelines = _pipelineManager.GetActivePipelines();
-        if (activePipelines.Count >= maxParallel)
-            return;
-
-        var goal = await _goalManager.GetNextGoalAsync(ct);
-        if (goal is null)
-            return;
-
-        if (_pipelineManager.GetByGoalId(goal.Id) is not null)
-            return;
-
-        _logger.LogInformation("Dispatching goal '{GoalId}': {Description} (Priority={Priority})",
-            goal.Id, goal.Description, goal.Priority);
-
-        // Mark goal as in_progress IMMEDIATELY after selection, before any subsequent async work
-        var startedMeta = new GoalUpdateMetadata { StartedAt = DateTime.UtcNow };
-        _logger.LogInformation("Dispatcher: updating goal '{GoalId}' status to InProgress", goal.Id);
-        try
-        {
-            await _goalManager.UpdateGoalStatusAsync(goal.Id, GoalStatus.InProgress, startedMeta, ct);
-            goal.Status = GoalStatus.InProgress;
-            if (startedMeta.StartedAt.HasValue)
-                goal.StartedAt = startedMeta.StartedAt.Value;
-            _dashboardNotifier?.NotifyStateChanged();
-            _logger.LogInformation("Dispatcher: successfully updated goal '{GoalId}' status to InProgress", goal.Id);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw; // propagate cancellation
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Dispatcher: failed to update goal '{GoalId}' status to InProgress — continuing dispatch", goal.Id);
-        }
-
-        // Best-effort verification: re-read the goal to check if the status was persisted
-        try
-        {
-            var verifyGoal = await _goalManager.GetGoalAsync(goal.Id, ct);
-            if (verifyGoal is null)
-                _logger.LogWarning("Dispatcher: verification returned null — goal '{GoalId}' not found after status update", goal.Id);
-            else if (verifyGoal.Status != GoalStatus.InProgress)
-                _logger.LogError("Dispatcher: VERIFICATION FAILED — goal '{GoalId}' DB status is {Status} after UpdateGoalStatusAsync(InProgress)", goal.Id, verifyGoal.Status);
-            else
-                _logger.LogInformation("Dispatcher: verified goal '{GoalId}' DB status is InProgress", goal.Id);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Dispatcher: failed to verify goal '{GoalId}' status (non-critical)", goal.Id);
-        }
-
-        // Ensure Brain repo clones are up-to-date before planning
-        if (_brain is not null)
-        {
-            var repos = ResolveRepositories(goal);
-            foreach (var repo in repos)
-            {
-                try { await _brain.EnsureBrainRepoAsync(repo.Name, repo.Url, repo.DefaultBranch, ct); }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to ensure Brain repo for '{RepoName}'", repo.Name);
-                }
-            }
-        }
-
-        // Create a pipeline for this goal
-        var maxRetries = _config?.Orchestrator?.MaxRetriesPerTask ?? Constants.DefaultMaxRetriesPerTask;
-        var maxIterations = _config?.Orchestrator?.MaxIterations ?? Constants.DefaultMaxIterations;
-        var pipeline = _pipelineManager.CreatePipeline(goal, maxRetries, maxIterations);
-        pipeline.GoalStartedAt = startedMeta.StartedAt;
-
-        // Register with Brain so the get_goal tool can return live iteration/phase info
-        (_brain as DistributedBrain)?.RegisterActivePipeline(pipeline);
-
-        // Fork a per-goal Brain session from the master so this goal's context
-        // is isolated from other concurrent goals.
-        if (_brain is not null)
-        {
-            await _brain.ForkSessionForGoalAsync(goal.Id, ct);
-        }
-
-        // Plan iteration phases
-        IterationPlan iterationPlan;
-        if (_brain is not null)
-        {
-            try
-            {
-                var rawPlan = await ResolvePlanAsync(pipeline, null, ct);
-                var originalPhases = rawPlan.Phases.ToList();
-                iterationPlan = IterationPlanValidator.ValidatePlan(rawPlan);
-
-                if (!originalPhases.SequenceEqual(iterationPlan.Phases))
-                {
-                    var note = IterationPlanValidator.BuildPlanAdjustmentNote(originalPhases, iterationPlan.Phases);
-                    await _brain.InjectSystemNoteAsync(pipeline, note, ct);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Brain failed to plan iteration for {GoalId}, using default plan", pipeline.GoalId);
-                iterationPlan = IterationPlan.Default();
-            }
-        }
-        else
-        {
-            iterationPlan = IterationPlan.Default();
-        }
-
-        pipeline.SetPlan(iterationPlan);
-        pipeline.StateMachine.StartIteration(iterationPlan.Phases);
-        var firstPhase = iterationPlan.Phases[0];
-        pipeline.AdvanceTo(firstPhase);
-
-        // Create a living progress document in the knowledge graph for this goal.
-        await CreateProgressDocumentAsync(goal, pipeline, iterationPlan, ct);
-
-        // Craft prompt for first phase and dispatch
-        var firstPhasePrompt = _brain is not null
-            ? await ResolvePromptAsync(pipeline, firstPhase, null, ct)
-            : (firstPhase == GoalPhase.Coding ? BuildCoderPrompt(goal) : $"Work on: {pipeline.Description}");
-
-        // PhaseLog: append entry for the first phase of the pipeline
-        pipeline.PhaseLog.Add(PhaseResult.Create(firstPhase, pipeline.Iteration, 1));
-        if (pipeline.CurrentPhaseEntry is { } firstPhaseEntry)
-        {
-            firstPhaseEntry.WorkerPrompt = firstPhasePrompt;
-            firstPhaseEntry.BrainPrompt = PipelineHelpers.GetLastCraftPromptFromConversation(pipeline);
-            // Capture planning prompt/response from conversation onto the first entry
-            var (planningPrompt, planningResponse) = PipelineHelpers.GetPlanningPromptsFromConversation(pipeline);
-            firstPhaseEntry.PlanningPrompt = planningPrompt;
-            firstPhaseEntry.PlanningResponse = planningResponse;
-        }
-
-        var firstRole = firstPhase.ToWorkerRole();
-        await DispatchToRole(pipeline, firstRole, firstPhasePrompt, ct);
-
-        _pipelineManager.PersistFull(pipeline);
-    }
-
-    /// <summary>
-    /// Creates a living progress document in the knowledge graph for the given goal, links it to the
-    /// goal via the <see cref="Goal.Documents"/> field, and appends the Brain's initial iteration plan.
-    /// Failures are logged and swallowed — the progress document is best-effort and never blocks dispatch.
-    /// </summary>
-    private async Task CreateProgressDocumentAsync(Goal goal, GoalPipeline pipeline, IterationPlan iterationPlan, CancellationToken ct)
-    {
-        if (_knowledgeGraph is null)
-            return;
-
-        var docId = $"progress-{goal.Id}";
-        try
-        {
-            var title = $"Progress: {goal.Id}";
-            var headerContent = $"# {title}\n";
-
-            await _knowledgeGraph.CreateDocumentAsync(
-                id: docId,
-                title: title,
-                type: DocumentType.Scratch,
-                content: headerContent,
-                topic: "progress",
-                ct: ct);
-
-            // Link the document to the goal via the documents field
-            if (_goalStore is not null && !goal.Documents.Contains(docId))
-            {
-                goal.Documents.Add(docId);
-                await _goalStore.UpdateGoalAsync(goal, ct);
-            }
-
-            // Append the Brain's initial iteration plan
-            var planText = PipelineProgressFormatting.BuildPlanSection(pipeline.Iteration, iterationPlan);
-            var doc = _knowledgeGraph.GetDocument(docId);
-            if (doc is not null)
-            {
-                var newContent = doc.Content.TrimEnd() + "\n\n" + planText;
-                await _knowledgeGraph.UpdateDocumentAsync(docId, content: newContent, ct: ct);
-            }
-
-            if (_configRepo is not null)
-                await _knowledgeGraph.CommitToConfigRepoAsync(_configRepo.LocalPath, $"Create progress document: {docId}", ct);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to create progress document for goal {GoalId}", goal.Id);
-        }
-    }
+    private Task DispatchNextGoalAsync(CancellationToken ct)
+        => _goalDispatchService.DispatchNextGoalAsync(ct);
 
     internal List<TargetRepository> ResolveRepositories(Goal goal)
         => _taskDispatchService.ResolveRepositories(goal);
