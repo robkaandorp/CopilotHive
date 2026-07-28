@@ -1,3 +1,14 @@
+## [0.22.0] - 2026-07-28
+
+### Added
+- **Event-driven dispatch** — `GoalReadyNotifier` wake-up signal replaces pure polling for goal dispatch. When a goal transitions to `Pending` status (via Composer approve, API update, or goal creation), the polling loop wakes immediately instead of waiting for the 5-second interval. The `SemaphoreSlim`-based signal coalesces concurrent notifications and falls back to the 5-second timeout when no notification arrives. The polling loop remains the single consumer — no concurrent dispatch.
+- **TaskCompletionService** — Extracted `HandleTaskCompletionAsync` from `GoalDispatcher` into a new `internal sealed TaskCompletionService`. All guards preserved: no pipeline, already Done/Failed, stale task. Phase transition via `PipelineDriver.DriveNextPhaseAsync`, exception handling, dashboard notification, and persistence.
+- **GoalDispatchService** — Extracted `DispatchNextGoalAsync`, `DrainRedispatchQueueAsync`, and `CreateProgressDocumentAsync` from `GoalDispatcher` into a new `internal sealed GoalDispatchService`. All dispatch behaviors preserved: goal selection, status update, verification, repo sync, pipeline creation, brain fork, plan iteration, progress doc, prompt crafting, dispatch, persist. Redispatch queue behaviors preserved: drain, role mapping, prompt resolution, dispatch.
+
+### Changed
+- **GoalDispatcher reduced to coordinator** — After extracting `TaskDispatchService`, `TaskCompletionService`, and `GoalDispatchService`, `GoalDispatcher` is now a thin coordinator with the polling loop, goal lifecycle (cancel, resume, retry, redispatch), clarification routing, and maintenance scheduling. All dispatch, completion, and task creation logic is delegated to focused services.
+- **Startup flow preserved** — `RestoreActivePipelinesAsync` → `SyncAgentsFromConfigRepoAsync` → `Task.Delay(_startupDelay)` → first dispatch → loop. The startup delay remains unchanged. Stale-reset signals during restore are consumed on the first loop iteration after the initial dispatch.
+
 ## [0.21.0] - 2026-07-28
 
 ### Added
