@@ -88,12 +88,14 @@ public static class ApiEndpoints
             return goal is null ? Results.NotFound(new { error = $"Goal '{id}' not found." }) : Results.Ok(goal);
         });
 
-        goalsApi.MapPost("/", async (Goal goal, IGoalStore store) =>
+        goalsApi.MapPost("/", async (Goal goal, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier) =>
         {
             try
             {
                 var created = await store.CreateGoalAsync(goal);
-                return Results.Created($"/api/goals/{created.Id}", created);
+                var result = Results.Created($"/api/goals/{created.Id}", created);
+                dashboardNotifier.NotifyStateChanged();
+                return result;
             }
             catch (ArgumentException ex)
             {
@@ -110,7 +112,8 @@ public static class ApiEndpoints
         });
 
         goalsApi.MapPatch("/{id}/status", async (string id, GoalStatusUpdate update, IGoalStore store,
-            [FromServices] IBrainRepoManager? repoManager, [FromServices] GoalDispatcher? dispatcher, ILogger<Program> endpointLogger) =>
+            [FromServices] IBrainRepoManager? repoManager, [FromServices] GoalDispatcher? dispatcher, ILogger<Program> endpointLogger,
+            [FromServices] DashboardNotifier dashboardNotifier) =>
         {
             try
             {
@@ -150,6 +153,7 @@ public static class ApiEndpoints
 
                 await store.UpdateGoalStatusAsync(id, status);
                 var goal = await store.GetGoalAsync(id);
+                dashboardNotifier.NotifyStateChanged();
                 return Results.Ok(goal);
             }
             catch (KeyNotFoundException)
@@ -162,7 +166,7 @@ public static class ApiEndpoints
             }
         });
 
-        goalsApi.MapDelete("/{id}", async (string id, IGoalStore store, [FromServices] IBrainRepoManager? repoManager, ILogger<Program> logger) =>
+        goalsApi.MapDelete("/{id}", async (string id, IGoalStore store, [FromServices] IBrainRepoManager? repoManager, ILogger<Program> logger, [FromServices] DashboardNotifier dashboardNotifier) =>
         {
             var goal = await store.GetGoalAsync(id);
             if (goal is null)
@@ -188,6 +192,7 @@ public static class ApiEndpoints
                 }
             }
 
+            dashboardNotifier.NotifyStateChanged();
             return Results.NoContent();
         });
 
@@ -230,7 +235,7 @@ public static class ApiEndpoints
             return Results.Ok(results);
         });
 
-        goalsApi.MapPatch("/{id}/release", async (string id, AssignGoalReleaseRequest request, IGoalStore store) =>
+        goalsApi.MapPatch("/{id}/release", async (string id, AssignGoalReleaseRequest request, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier) =>
         {
             var release = await store.GetReleaseAsync(request.ReleaseId);
             if (release is null)
@@ -242,10 +247,11 @@ public static class ApiEndpoints
 
             goal.ReleaseId = request.ReleaseId;
             await store.UpdateGoalAsync(goal);
+            dashboardNotifier.NotifyStateChanged();
             return Results.Ok(goal);
         });
 
-        goalsApi.MapPatch("/{id}/review-status", async (string id, GoalReviewStatusUpdate update, IGoalStore store) =>
+        goalsApi.MapPatch("/{id}/review-status", async (string id, GoalReviewStatusUpdate update, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier) =>
         {
             var goal = await store.GetGoalAsync(id);
             if (goal is null)
@@ -266,6 +272,7 @@ public static class ApiEndpoints
             goal.ReviewStatus = reviewStatus;
             await store.UpdateGoalAsync(goal);
             var updated = await store.GetGoalAsync(id);
+            dashboardNotifier.NotifyStateChanged();
             return Results.Ok(updated);
         });
 
@@ -302,7 +309,7 @@ public static class ApiEndpoints
         // ── Releases REST API ────────────────────────────────────────────────────
         var releasesApi = app.MapGroup("/api/releases");
 
-        releasesApi.MapPost("/", async (CreateReleaseRequest request, IGoalStore store) =>
+        releasesApi.MapPost("/", async (CreateReleaseRequest request, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier) =>
         {
             if (string.IsNullOrWhiteSpace(request.Version))
                 return Results.BadRequest(new { error = "Version is required." });
@@ -317,7 +324,9 @@ public static class ApiEndpoints
             try
             {
                 var created = await store.CreateReleaseAsync(release);
-                return Results.Created($"/api/releases/{created.Id}", created);
+                var createdResult = Results.Created($"/api/releases/{created.Id}", created);
+                dashboardNotifier.NotifyStateChanged();
+                return createdResult;
             }
             catch (InvalidOperationException ex)
             {
@@ -325,7 +334,7 @@ public static class ApiEndpoints
             }
         });
 
-        releasesApi.MapPatch("/{id}/status", async (string id, UpdateReleaseStatusRequest request, IGoalStore store, IServiceProvider services, HttpContext HttpContext) =>
+        releasesApi.MapPatch("/{id}/status", async (string id, UpdateReleaseStatusRequest request, IGoalStore store, IServiceProvider services, HttpContext HttpContext, [FromServices] DashboardNotifier dashboardNotifier) =>
         {
             var existing = await store.GetReleaseAsync(id);
             if (existing is null)
@@ -378,15 +387,17 @@ public static class ApiEndpoints
                 updated!.Status = ReleaseStatus.Released;
                 updated.ReleasedAt = DateTime.UtcNow;
                 await store.UpdateReleaseAsync(updated);
+                dashboardNotifier.NotifyStateChanged();
                 return Results.Ok(new { release = updated, result = result });
             }
 
             existing.Status = newStatus;
             await store.UpdateReleaseAsync(existing);
+            dashboardNotifier.NotifyStateChanged();
             return Results.Ok(existing);
         });
 
-        releasesApi.MapPatch("/{id}/notes", async (string id, UpdateReleaseNotesRequest request, IGoalStore store) =>
+        releasesApi.MapPatch("/{id}/notes", async (string id, UpdateReleaseNotesRequest request, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier) =>
         {
             var existing = await store.GetReleaseAsync(id);
             if (existing is null)
@@ -394,10 +405,11 @@ public static class ApiEndpoints
 
             existing.Notes = request.Notes;
             await store.UpdateReleaseAsync(existing);
+            dashboardNotifier.NotifyStateChanged();
             return Results.Ok(existing);
         });
 
-        releasesApi.MapPatch("/{id}/tag", async (string id, UpdateReleaseTagRequest request, IGoalStore store) =>
+        releasesApi.MapPatch("/{id}/tag", async (string id, UpdateReleaseTagRequest request, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier) =>
         {
             if (string.IsNullOrWhiteSpace(request.Tag))
                 return Results.BadRequest(new { error = "Tag is required." });
@@ -416,10 +428,11 @@ public static class ApiEndpoints
             }
 
             var updated = await store.GetReleaseAsync(id);
+            dashboardNotifier.NotifyStateChanged();
             return Results.Ok(updated);
         });
 
-        releasesApi.MapPatch("/{id}/repositories", async (string id, UpdateReleaseRepositoriesRequest request, IGoalStore store) =>
+        releasesApi.MapPatch("/{id}/repositories", async (string id, UpdateReleaseRepositoriesRequest request, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier) =>
         {
             try
             {
@@ -435,6 +448,7 @@ public static class ApiEndpoints
             }
 
             var updated = await store.GetReleaseAsync(id);
+            dashboardNotifier.NotifyStateChanged();
             return Results.Ok(updated);
         });
 

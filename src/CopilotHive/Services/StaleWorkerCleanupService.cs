@@ -19,6 +19,7 @@ public sealed class StaleWorkerCleanupService : BackgroundService
     private readonly GoalDispatcher? _goalDispatcher;
     private readonly Configuration.HiveConfigFile? _config;
     private readonly ILogger<StaleWorkerCleanupService> _logger;
+    private readonly Dashboard.DashboardNotifier? _dashboardNotifier;
 
     /// <summary>
     /// Delay between cleanup passes. Defaults to <see cref="CleanupDefaults.CleanupIntervalSeconds"/>.
@@ -35,7 +36,8 @@ public sealed class StaleWorkerCleanupService : BackgroundService
         GoalPipelineManager pipelineManager,
         ILogger<StaleWorkerCleanupService> logger,
         GoalDispatcher? goalDispatcher = null,
-        Configuration.HiveConfigFile? config = null)
+        Configuration.HiveConfigFile? config = null,
+        Dashboard.DashboardNotifier? dashboardNotifier = null)
     {
         _workerPool = workerPool;
         _taskQueue = taskQueue;
@@ -43,6 +45,7 @@ public sealed class StaleWorkerCleanupService : BackgroundService
         _logger = logger;
         _goalDispatcher = goalDispatcher;
         _config = config;
+        _dashboardNotifier = dashboardNotifier;
     }
 
     /// <summary>
@@ -83,6 +86,8 @@ public sealed class StaleWorkerCleanupService : BackgroundService
     {
         var removed = _workerPool.PurgeStaleWorkers(TimeSpan.FromMinutes(CleanupDefaults.StaleTimeoutMinutes));
 
+        var anyRemoval = removed.Count > 0;
+
         foreach (var worker in removed)
         {
             _logger.LogWarning("Removing stale worker {WorkerId} (lastHeartbeat={LastHeartbeat})",
@@ -94,7 +99,11 @@ public sealed class StaleWorkerCleanupService : BackgroundService
             }
         }
 
-        ReclaimTimedOutTasks();
+        var reclaimResult = ReclaimTimedOutTasks();
+        anyRemoval = anyRemoval || reclaimResult;
+
+        if (anyRemoval)
+            _dashboardNotifier?.NotifyStateChanged();
 
         return Task.CompletedTask;
     }
@@ -105,16 +114,18 @@ public sealed class StaleWorkerCleanupService : BackgroundService
     /// hung — typically an LLM call that never returns. Without this the pipeline keeps its
     /// ActiveTaskId forever and permanently consumes a parallel-goal slot.
     /// </summary>
-    private void ReclaimTimedOutTasks()
+    /// <returns><c>true</c> if at least one worker was removed.</returns>
+    private bool ReclaimTimedOutTasks()
     {
         var timeoutMinutes = _config?.Orchestrator?.WorkerTaskTimeoutMinutes
             ?? CleanupDefaults.WorkerTaskTimeoutMinutes;
 
         if (timeoutMinutes <= 0)
-            return;
+            return false;
 
         var timedOut = _workerPool.GetWorkersWithTimedOutTasks(TimeSpan.FromMinutes(timeoutMinutes));
 
+        var anyRemoved = false;
         foreach (var worker in timedOut)
         {
             _logger.LogWarning(
@@ -122,10 +133,12 @@ public sealed class StaleWorkerCleanupService : BackgroundService
                 worker.Id, worker.CurrentTaskId, timeoutMinutes, worker.CurrentTaskStartedAt);
 
             // Drop the hung worker so it cannot report a late completion for a re-dispatched task.
-            _workerPool.RemoveWorker(worker.Id);
+            anyRemoved |= _workerPool.RemoveWorker(worker.Id);
 
             RescheduleAbandonedTask(worker.Id, worker.CurrentTaskId!);
         }
+
+        return anyRemoved;
     }
 
     private void RescheduleAbandonedTask(string workerId, string taskId)

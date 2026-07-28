@@ -2,6 +2,7 @@ using System.Reflection;
 using Grpc.Core;
 using Microsoft.Extensions.Logging;
 using CopilotHive.Agents;
+using CopilotHive.Dashboard;
 using CopilotHive.Goals;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
@@ -19,8 +20,19 @@ public sealed class HiveOrchestratorService(
     GoalDispatcher goalDispatcher,
     ILogger<HiveOrchestratorService> logger,
     AgentsManager? agentsManager = null,
-    IGoalStore? goalStore = null) : HiveOrchestrator.HiveOrchestratorBase
+    IGoalStore? goalStore = null,
+    DashboardNotifier? dashboardNotifier = null) : HiveOrchestrator.HiveOrchestratorBase
 {
+    private readonly DashboardNotifier? _dashboardNotifier = dashboardNotifier;
+
+    private readonly Dictionary<string, (DateTime LastNotify, bool WasBusy, int LastNotifiedCtx)> _heartbeatState = new();
+    private readonly object _heartbeatLock = new();
+
+    /// <summary>Clock used for heartbeat throttling. Overridable for tests.</summary>
+    internal Func<DateTime> _now = () => DateTime.UtcNow;
+
+    /// <summary>Maximum number of tracked heartbeat entries before the oldest is evicted.</summary>
+    internal int MaxHeartbeatEntries { get; set; } = 200;
 
 
     /// <summary>
@@ -39,6 +51,13 @@ public sealed class HiveOrchestratorService(
         {
             workerPool.RegisterWorker(workerId, [.. request.Capabilities]);
             logger.LogInformation("Worker registered: {WorkerId}", workerId);
+
+            lock (_heartbeatLock)
+            {
+                _heartbeatState.Remove(workerId);
+            }
+
+            _dashboardNotifier?.NotifyStateChanged();
 
             return Task.FromResult(new RegisterResponse
             {
@@ -150,8 +169,13 @@ public sealed class HiveOrchestratorService(
         {
             if (workerId is not null)
             {
-                workerPool.RemoveWorker(workerId);
+                var removed = workerPool.RemoveWorker(workerId);
+                lock (_heartbeatLock)
+                {
+                    _heartbeatState.Remove(workerId);
+                }
                 logger.LogInformation("Worker disconnected from WorkStream: {WorkerId}", workerId);
+                if (removed) _dashboardNotifier?.NotifyStateChanged();
             }
         }
     }
@@ -167,6 +191,51 @@ public sealed class HiveOrchestratorService(
         workerPool.UpdateHeartbeat(request.WorkerId, request.ContextUsagePercent);
         logger.LogDebug("Heartbeat from {WorkerId} (busy={Busy}, role={Role}, task={TaskId}, ctx={Ctx}%)",
             request.WorkerId, request.Busy, request.CurrentRole, request.CurrentTaskId, request.ContextUsagePercent);
+
+        if (workerPool.GetWorker(request.WorkerId) is not null)
+        {
+            var shouldNotify = false;
+            lock (_heartbeatLock)
+            {
+                if (!_heartbeatState.TryGetValue(request.WorkerId, out var entry))
+                {
+                    if (_heartbeatState.Count >= MaxHeartbeatEntries)
+                    {
+                        var oldestKey = _heartbeatState
+                            .OrderBy(kv => kv.Value.LastNotify)
+                            .Select(kv => kv.Key)
+                            .FirstOrDefault();
+                        if (oldestKey is not null)
+                            _heartbeatState.Remove(oldestKey);
+                    }
+
+                    _heartbeatState[request.WorkerId] =
+                        (_now(), request.Busy, request.ContextUsagePercent);
+                    shouldNotify = true;
+                }
+                else if (request.Busy != entry.WasBusy)
+                {
+                    _heartbeatState[request.WorkerId] =
+                        (_now(), request.Busy, request.ContextUsagePercent);
+                    shouldNotify = true;
+                }
+                else if (Math.Abs(request.ContextUsagePercent - entry.LastNotifiedCtx) >= 5)
+                {
+                    _heartbeatState[request.WorkerId] =
+                        (_now(), request.Busy, request.ContextUsagePercent);
+                    shouldNotify = true;
+                }
+                else if ((_now() - entry.LastNotify).TotalSeconds >= 30)
+                {
+                    _heartbeatState[request.WorkerId] =
+                        (_now(), request.Busy, request.ContextUsagePercent);
+                    shouldNotify = true;
+                }
+            }
+
+            if (shouldNotify)
+                _dashboardNotifier?.NotifyStateChanged();
+        }
 
         return Task.FromResult(new HeartbeatResponse { Acknowledged = true });
     }
@@ -231,6 +300,7 @@ public sealed class HiveOrchestratorService(
         taskQueue.Activate(task, worker.Id);
         workerPool.MarkBusy(worker.Id, task.TaskId);
         worker.CurrentModel = task.Model;
+        _dashboardNotifier?.NotifyStateChanged();
     }
 
     /// <summary>
@@ -274,6 +344,10 @@ public sealed class HiveOrchestratorService(
             await worker.MessageChannel.Writer.WriteAsync(
                 new OrchestratorMessage { Assignment = GrpcMapper.ToGrpc(task) },
                 cancellationToken);
+        }
+        else
+        {
+            _dashboardNotifier?.NotifyStateChanged();
         }
     }
 
@@ -458,6 +532,7 @@ public sealed class HiveOrchestratorService(
 
         // Convert to domain type at the boundary, injecting the model retrieved above
         var result = GrpcMapper.ToDomain(complete) with { Model = completedTaskModel ?? "" };
+        _dashboardNotifier?.NotifyStateChanged();
         _ = Task.Run(async () =>
         {
             try
