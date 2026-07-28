@@ -232,16 +232,17 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
                 }
             }
 
+            RegisterSessionStatus("idle", sessionRef);
             message.Reply.TrySetResult(new GoalBrainExecutionResult(result.Message ?? string.Empty, LastToolCallResult));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Goal Brain execution failed for {GoalId}", GoalId);
+            RegisterSessionStatus("idle", sessionRef);
             message.Reply.TrySetException(ex);
         }
         finally
         {
-            RegisterSessionStatus("idle", sessionRef);
             linkedCts.Dispose();
         }
     }
