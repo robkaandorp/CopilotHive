@@ -163,7 +163,7 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         var models = await svc.DiscoverOllamaModelsAsync(TestContext.Current.CancellationToken);
 
         Assert.Equal(2, models.Count);
-        Assert.Equal("llama3.2", models[0].Id);
+        Assert.Equal("ollama-local/llama3.2", models[0].Id);
         Assert.Equal("llama3.2", models[0].Name);
         Assert.Null(models[0].ContextWindow);
         Assert.Equal("ollama", models[0].Vendor);
@@ -200,6 +200,59 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
         Assert.NotNull(captured);
         Assert.Equal("http://custom-host:9999/api/tags", captured!.RequestUri?.ToString());
         Assert.Null(captured.Headers.Authorization);
+    }
+
+    [Fact]
+    public async Task DiscoverOllamaModelsAsync_WithApiKey_PrefixesOllamaCloud()
+    {
+        Environment.SetEnvironmentVariable("OLLAMA_API_KEY", "ollama-key");
+        const string body = """
+        {
+            "models": [ { "name": "kimi-k3" } ]
+        }
+        """;
+        var svc = CreateService(new FakeHttpMessageHandler(HttpStatusCode.OK, body));
+
+        var models = await svc.DiscoverOllamaModelsAsync(TestContext.Current.CancellationToken);
+
+        Assert.Single(models);
+        Assert.Equal("ollama-cloud/kimi-k3", models[0].Id);
+    }
+
+    [Fact]
+    public async Task DiscoverOllamaModelsAsync_WithUrlOnly_PrefixesOllamaLocal()
+    {
+        Environment.SetEnvironmentVariable("OLLAMA_URL", "http://localhost:11434");
+        const string body = """
+        {
+            "models": [ { "name": "mistral" } ]
+        }
+        """;
+        var svc = CreateService(new FakeHttpMessageHandler(HttpStatusCode.OK, body));
+
+        var models = await svc.DiscoverOllamaModelsAsync(TestContext.Current.CancellationToken);
+
+        Assert.Single(models);
+        Assert.Equal("ollama-local/mistral", models[0].Id);
+    }
+
+    [Fact]
+    public async Task DiscoverOllamaModelsAsync_WithApiKeyAndUrl_PrefersCloudPrefix()
+    {
+        // When both OLLAMA_API_KEY and OLLAMA_URL are set, the API key wins (cloud prefix).
+        Environment.SetEnvironmentVariable("OLLAMA_API_KEY", "ollama-key");
+        Environment.SetEnvironmentVariable("OLLAMA_URL", "http://localhost:11434");
+        const string body = """
+        {
+            "models": [ { "name": "kimi-k3" } ]
+        }
+        """;
+        var svc = CreateService(new FakeHttpMessageHandler(HttpStatusCode.OK, body));
+
+        var models = await svc.DiscoverOllamaModelsAsync(TestContext.Current.CancellationToken);
+
+        Assert.Single(models);
+        Assert.Equal("ollama-cloud/kimi-k3", models[0].Id);
     }
 
     [Fact]
@@ -248,7 +301,7 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
 
         Assert.Equal(2, models.Count);
         Assert.Equal("copilot/claude", models[0].Id);
-        Assert.Equal("llama3.2", models[1].Id);
+        Assert.Equal("ollama-cloud/llama3.2", models[1].Id);
         Assert.Equal("ollama", models[1].Vendor);
     }
 
@@ -267,6 +320,59 @@ public sealed class ModelDiscoveryServiceTests : IDisposable
 
         Assert.Single(models);
         Assert.Equal("copilot/claude", models[0].Id);
+    }
+
+    [Fact]
+    public async Task DiscoverAllAsync_CombinesCopilotAndLocalOllamaModels()
+    {
+        Environment.SetEnvironmentVariable("GH_TOKEN", "test-token");
+        Environment.SetEnvironmentVariable("OLLAMA_URL", "http://localhost:11434");
+
+        const string copilotBody = """
+        { "data": [ { "id": "claude", "name": "Claude", "policy": { "state": "enabled" } } ] }
+        """;
+        const string ollamaBody = """
+        { "models": [ { "name": "mistral" } ] }
+        """;
+
+        var handler = new RoutingHttpMessageHandler(req =>
+            req.RequestUri!.Host.Contains("githubcopilot")
+                ? (HttpStatusCode.OK, copilotBody)
+                : (HttpStatusCode.OK, ollamaBody));
+        var svc = CreateService(handler);
+
+        var models = await svc.DiscoverAllAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, models.Count);
+        Assert.Equal("copilot/claude", models[0].Id);
+        Assert.Equal("ollama-local/mistral", models[1].Id);
+        Assert.Equal("ollama", models[1].Vendor);
+    }
+
+    [Fact]
+    public async Task DiscoverAllAsync_CopilotModelsUnchanged_PrefixesWithCopilot()
+    {
+        Environment.SetEnvironmentVariable("GH_TOKEN", "test-token");
+
+        const string copilotBody = """
+        {
+            "data": [
+                { "id": "gpt-5", "name": "GPT-5", "vendor": "OpenAI", "capabilities": { "limits": { "max_context_window_tokens": 128000 } }, "policy": { "state": "enabled" } },
+                { "id": "claude-sonnet-4", "name": "Claude Sonnet 4", "vendor": "Anthropic", "capabilities": { "limits": { "max_context_window_tokens": 200000 } }, "policy": { "state": "enabled" } }
+            ]
+        }
+        """;
+        var handler = new RoutingHttpMessageHandler(_ => (HttpStatusCode.OK, copilotBody));
+        var svc = CreateService(handler);
+
+        var models = await svc.DiscoverAllAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, models.Count);
+        Assert.All(models, m => Assert.StartsWith("copilot/", m.Id));
+        Assert.Equal("copilot/gpt-5", models[0].Id);
+        Assert.Equal("copilot/claude-sonnet-4", models[1].Id);
+        Assert.Equal("OpenAI", models[0].Vendor);
+        Assert.Equal("Anthropic", models[1].Vendor);
     }
 }
 

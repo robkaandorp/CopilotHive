@@ -168,8 +168,9 @@ public sealed class ModelDiscoveryService
                     if (string.IsNullOrWhiteSpace(name))
                         continue;
 
+                    var providerPrefix = !string.IsNullOrWhiteSpace(apiKey) ? "ollama-cloud" : "ollama-local";
                     results.Add(new DiscoveredModel(
-                        Id: name,
+                        Id: $"{providerPrefix}/{name}",
                         Name: name,
                         Vendor: "ollama",
                         ContextWindow: null,
