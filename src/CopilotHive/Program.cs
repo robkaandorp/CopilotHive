@@ -76,9 +76,6 @@ public sealed class Program
                     sp.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>(),
                     sp.GetRequiredService<ILogger<PipelineStore>>()));
 
-            builder.Services.AddDbContext<CopilotHiveDbContext>(options =>
-                options.UseSqlite($"Data Source={dbPath}"));
-
             builder.Services.AddDbContextFactory<CopilotHiveDbContext>(options =>
                 options.UseSqlite($"Data Source={dbPath}"));
 
@@ -392,12 +389,36 @@ public sealed class Program
 
             try
             {
-                using var scope = app.Services.CreateScope();
-                var dbContext = scope.ServiceProvider.GetRequiredService<CopilotHiveDbContext>();
+                var dbContextFactory = app.Services.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>();
+                await using var dbContext = dbContextFactory.CreateDbContext();
                 DatabaseMigration.EnsureSchemaUpToDate(dbContext, logger);
                 logger.LogInformation("Database schema reconciliation completed");
                 await dbContext.Database.MigrateAsync();
                 logger.LogInformation("EF Core migrations applied");
+
+                await dbContext.Database.OpenConnectionAsync();
+                try
+                {
+                    using var walCmd = dbContext.Database.GetDbConnection().CreateCommand();
+                    walCmd.CommandText = "PRAGMA journal_mode = WAL;";
+                    var result = await walCmd.ExecuteScalarAsync();
+                    if (result is string mode && mode.Equals("wal", StringComparison.OrdinalIgnoreCase))
+                    {
+                        logger.LogInformation("SQLite WAL mode enabled");
+                    }
+                    else
+                    {
+                        logger.LogWarning("SQLite WAL mode not enabled: PRAGMA returned {Mode}", result);
+                    }
+                }
+                catch (Exception walEx)
+                {
+                    logger.LogWarning(walEx, "Failed to enable WAL mode; continuing startup");
+                }
+                finally
+                {
+                    await dbContext.Database.CloseConnectionAsync();
+                }
             }
             catch (DbUpdateConcurrencyException ex)
             {
