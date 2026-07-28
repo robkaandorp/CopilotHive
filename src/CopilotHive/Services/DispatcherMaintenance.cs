@@ -30,7 +30,6 @@ internal sealed class DispatcherMaintenance
     private readonly HiveConfigFile? _config;
 
     // Mutable state shared with GoalDispatcher via reference
-    private readonly ConcurrentDictionary<string, bool> _dispatchedGoals;
     private readonly ConcurrentQueue<string> _redispatchQueue;
 
     /// <summary>Tracks when agents were last synced so callers can throttle.</summary>
@@ -44,7 +43,6 @@ internal sealed class DispatcherMaintenance
         IDistributedBrain? brain,
         AgentsManager? agentsManager,
         ConfigRepoManager? configRepo,
-        ConcurrentDictionary<string, bool> dispatchedGoals,
         ConcurrentQueue<string> redispatchQueue,
         ILogger logger,
         KnowledgeGraph? knowledgeGraph = null,
@@ -60,7 +58,6 @@ internal sealed class DispatcherMaintenance
         _agentsManager = agentsManager;
         _configRepo = configRepo;
         _knowledgeGraph = knowledgeGraph;
-        _dispatchedGoals = dispatchedGoals;
         _redispatchQueue = redispatchQueue;
         _logger = logger;
         _goalStore = goalStore;
@@ -190,7 +187,7 @@ internal sealed class DispatcherMaintenance
 
     /// <summary>
     /// Restore active pipelines from the persistence store on startup.
-    /// Re-primes Brain sessions and marks goals as dispatched.
+    /// Re-primes Brain sessions so restored active pipelines are tracked by the pipeline manager.
     /// </summary>
     public async Task RestoreActivePipelinesAsync(CancellationToken ct)
     {
@@ -207,8 +204,6 @@ internal sealed class DispatcherMaintenance
 
         foreach (var pipeline in restored)
         {
-            _dispatchedGoals.TryAdd(pipeline.GoalId, true);
-
             // Register restored active pipelines with the Brain so get_goal tool works
             if (pipeline.Phase is not (GoalPhase.Done or GoalPhase.Failed))
                 (_brain as DistributedBrain)?.RegisterActivePipeline(pipeline);
@@ -241,7 +236,6 @@ internal sealed class DispatcherMaintenance
                     _logger.LogInformation("Pipeline {GoalId} has stale phase {Phase} but goal is {Status} — cleaning up",
                         pipeline.GoalId, pipeline.Phase, goal.Status);
                     _pipelineManager.RemovePipeline(pipeline.GoalId);
-                    _dispatchedGoals.TryRemove(pipeline.GoalId, out _);
                     (_brain as DistributedBrain)?.DeregisterActivePipeline(pipeline.GoalId);
                     continue;
                 }
@@ -259,7 +253,6 @@ internal sealed class DispatcherMaintenance
                     pipeline.GoalId, pipeline.Phase);
 
                 _pipelineManager.RemovePipeline(pipeline.GoalId);
-                _dispatchedGoals.TryRemove(pipeline.GoalId, out _);
                 // Pipeline was registered above — clean it up from Brain's _activePipelines
                 (_brain as DistributedBrain)?.DeregisterActivePipeline(pipeline.GoalId);
                 await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Pending, null, ct);

@@ -38,9 +38,8 @@ public sealed class GoalDispatcher : BackgroundService
 
     private readonly BranchCoordinator _branchCoordinator = new();
     private readonly TaskBuilder _taskBuilder = new(new BranchCoordinator());
-    private readonly ConcurrentDictionary<string, bool> _dispatchedGoals = new();
     private readonly ConcurrentQueue<string> _redispatchQueue = new();
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _resumeLocks = new();
+    private readonly SemaphoreSlim _resumeLock = new(1, 1);
     private readonly TimeSpan _startupDelay;
     private readonly IClarificationRouter? _clarificationRouter;
     private readonly ClarificationQueueService? _clarificationQueue;
@@ -120,7 +119,7 @@ public sealed class GoalDispatcher : BackgroundService
 
         _maintenance = new DispatcherMaintenance(
             pipelineManager, goalManager, taskQueue, workerGateway, brain,
-            agentsManager, configRepo, _dispatchedGoals, _redispatchQueue, logger,
+            agentsManager, configRepo, _redispatchQueue, logger,
             knowledgeGraph,
             goalStore: goalStore,
             repoManager: repoManager,
@@ -175,7 +174,6 @@ public sealed class GoalDispatcher : BackgroundService
 
             await _lifecycleService.MarkGoalFailedAsync(pipeline, "Cancelled by user", ct);
             _pipelineManager.RemovePipeline(goalId);
-            _dispatchedGoals.TryRemove(goalId, out _);
             _logger.LogInformation("Goal {GoalId} cancelled (was InProgress, phase={Phase})", goalId, pipeline.Phase);
             if (_brain is not null)
                 await _brain.DeleteGoalSessionAsync(goalId);
@@ -193,7 +191,6 @@ public sealed class GoalDispatcher : BackgroundService
         await _goalManager.UpdateGoalStatusAsync(goalId, GoalStatus.Failed,
             new GoalUpdateMetadata { FailureReason = "Cancelled by user" }, ct);
         _dashboardNotifier?.NotifyStateChanged();
-        _dispatchedGoals.TryRemove(goalId, out _);
         _logger.LogInformation("Goal {GoalId} cancelled (was {Status})", goalId, goal.Status);
         if (_brain is not null)
             await _brain.DeleteGoalSessionAsync(goalId);
@@ -229,7 +226,7 @@ public sealed class GoalDispatcher : BackgroundService
 
     /// <summary>
     /// Resumes a goal that failed due to iteration exhaustion by extending its iteration budget
-    /// and dispatching a new iteration. Serialized per-goal via <see cref="_resumeLocks"/>.
+    /// and dispatching a new iteration. Serialized via a global lock.
     /// </summary>
     /// <param name="goalId">The goal to resume.</param>
     /// <param name="additionalIterations">Number of additional iterations to grant (1-1000).</param>
@@ -247,7 +244,7 @@ public sealed class GoalDispatcher : BackgroundService
         if (goal is null || !IsIterationExhaustionFailure(goal))
             return false;
 
-        var lockObj = _resumeLocks.GetOrAdd(goalId, _ => new SemaphoreSlim(1, 1));
+        var lockObj = _resumeLock;
         await lockObj.WaitAsync(ct);
         try
         {
@@ -382,15 +379,12 @@ public sealed class GoalDispatcher : BackgroundService
         finally
         {
             lockObj.Release();
-            // Do NOT remove/dispose the semaphore — another thread may be waiting.
-            // Accept bounded leak of one SemaphoreSlim per unique goal ID for the process lifetime.
         }
     }
 
     /// <summary>
     /// Clears all dispatcher runtime state for a goal that is being retried (Failed→Draft).
-    /// Removes the goal from <see cref="_dispatchedGoals"/> so it can be dispatched again,
-    /// and removes the stale pipeline from the <see cref="GoalPipelineManager"/> so the
+    /// Removes the stale pipeline from the <see cref="GoalPipelineManager"/> so the
     /// dispatcher does not see an active pipeline blocking new goal dispatch.
     /// </summary>
     /// <param name="goalId">The goal being retried.</param>
@@ -404,7 +398,6 @@ public sealed class GoalDispatcher : BackgroundService
                 catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete goal session for {GoalId}", goalId); }
             });
         }
-        _dispatchedGoals.TryRemove(goalId, out _);
         _pipelineManager.RemovePipeline(goalId);
         _logger.LogInformation("Cleared dispatcher retry state for goal {GoalId}", goalId);
     }
@@ -728,7 +721,7 @@ public sealed class GoalDispatcher : BackgroundService
 
     /// <summary>
     /// Restore active pipelines from the persistence store on startup.
-    /// Re-primes Brain sessions and marks goals as dispatched.
+    /// Re-primes Brain sessions and restores pipelines in the GoalPipelineManager.
     /// </summary>
     private Task RestoreActivePipelinesAsync(CancellationToken ct)
         => _maintenance.RestoreActivePipelinesAsync(ct);
@@ -793,7 +786,7 @@ public sealed class GoalDispatcher : BackgroundService
         if (goal is null)
             return;
 
-        if (!_dispatchedGoals.TryAdd(goal.Id, true))
+        if (_pipelineManager.GetByGoalId(goal.Id) is not null)
             return;
 
         _logger.LogInformation("Dispatching goal '{GoalId}': {Description} (Priority={Priority})",

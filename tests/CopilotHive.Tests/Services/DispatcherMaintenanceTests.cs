@@ -27,11 +27,9 @@ public sealed class DispatcherMaintenanceTests
         IBrainRepoManager? repoManager = null,
         HiveConfigFile? config = null,
         GoalPipelineManager? pipelineManager = null,
-        ConcurrentDictionary<string, bool>? dispatchedGoals = null,
         GoalManager? goalManager = null)
     {
         pipelineManager ??= new GoalPipelineManager();
-        dispatchedGoals ??= new ConcurrentDictionary<string, bool>();
         goalManager ??= new GoalManager();
         var taskQueue = new TaskQueue();
         var workerGateway = new GrpcWorkerGateway(new WorkerPool());
@@ -44,7 +42,6 @@ public sealed class DispatcherMaintenanceTests
             brain: null,
             agentsManager: null,
             configRepo: null,
-            dispatchedGoals: dispatchedGoals,
             redispatchQueue: new ConcurrentQueue<string>(),
             logger: NullLogger.Instance,
             knowledgeGraph: null,
@@ -455,7 +452,7 @@ public sealed class DispatcherMaintenanceTests
     // ═══════════════════════════════════════════════════════════════════════
 
     [Fact]
-    public async Task RestoreActivePipelinesAsync_StaleFailedGoal_CleansUpPipelineAndDispatchedGoal()
+    public async Task RestoreActivePipelinesAsync_StaleFailedGoal_CleansUpPipeline()
     {
         using var db = CopilotHiveDbContext.CreateInMemory();
         await using var pipelineStore = new PipelineStore(db, NullLogger<PipelineStore>.Instance);
@@ -467,21 +464,17 @@ public sealed class DispatcherMaintenanceTests
         originalManager.PersistState(pipeline);
 
         var freshManager = new GoalPipelineManager(pipelineStore);
-        var dispatchedGoals = new ConcurrentDictionary<string, bool>();
-        dispatchedGoals.TryAdd(goal.Id, true);
 
         var goalStore = new Mock<IGoalStore>();
         goalStore.Setup(s => s.GetGoalAsync(goal.Id, It.IsAny<CancellationToken>())).ReturnsAsync(goal);
 
         var maintenance = CreateMaintenance(
             goalStore: goalStore.Object,
-            pipelineManager: freshManager,
-            dispatchedGoals: dispatchedGoals);
+            pipelineManager: freshManager);
 
         await maintenance.RestoreActivePipelinesAsync(CancellationToken.None);
 
         Assert.Null(freshManager.GetByGoalId(goal.Id));
-        Assert.False(dispatchedGoals.ContainsKey(goal.Id));
     }
 
     [Fact]
@@ -497,12 +490,10 @@ public sealed class DispatcherMaintenanceTests
         originalManager.PersistFull(pipeline);
 
         var freshManager = new GoalPipelineManager(pipelineStore);
-        var dispatchedGoals = new ConcurrentDictionary<string, bool>();
 
         var maintenance = CreateMaintenance(
             goalStore: null,
-            pipelineManager: freshManager,
-            dispatchedGoals: dispatchedGoals);
+            pipelineManager: freshManager);
 
         var ex = await Record.ExceptionAsync(() => maintenance.RestoreActivePipelinesAsync(CancellationToken.None));
 
@@ -510,8 +501,6 @@ public sealed class DispatcherMaintenanceTests
         Assert.Null(ex);
         // The pipeline survives because the null goalStore guard prevents any reconciliation cleanup.
         Assert.NotNull(freshManager.GetByGoalId(goal.Id));
-        // The pipeline was still processed — the TryAdd at the top of the loop ran.
-        Assert.True(dispatchedGoals.ContainsKey(goal.Id));
     }
 
     [Fact]
@@ -527,15 +516,13 @@ public sealed class DispatcherMaintenanceTests
         originalManager.PersistFull(pipeline);
 
         var freshManager = new GoalPipelineManager(pipelineStore);
-        var dispatchedGoals = new ConcurrentDictionary<string, bool>();
 
         var goalStore = new Mock<IGoalStore>();
         goalStore.Setup(s => s.GetGoalAsync(goal.Id, It.IsAny<CancellationToken>())).ReturnsAsync((Goal?)null);
 
         var maintenance = CreateMaintenance(
             goalStore: goalStore.Object,
-            pipelineManager: freshManager,
-            dispatchedGoals: dispatchedGoals);
+            pipelineManager: freshManager);
 
         await maintenance.RestoreActivePipelinesAsync(CancellationToken.None);
 
@@ -543,8 +530,32 @@ public sealed class DispatcherMaintenanceTests
         goalStore.Verify(s => s.GetGoalAsync(goal.Id, It.IsAny<CancellationToken>()), Times.Once);
         // Missing goal in DB → warned and fall through: pipeline is NOT removed.
         Assert.NotNull(freshManager.GetByGoalId(goal.Id));
-        // The pipeline was still processed and remains dispatched.
-        Assert.True(dispatchedGoals.ContainsKey(goal.Id));
+    }
+
+    [Fact]
+    public async Task RestoreActivePipelinesAsync_RegistersExactlyOnePipelinePerGoal()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        await using var pipelineStore = new PipelineStore(db, NullLogger<PipelineStore>.Instance);
+
+        var goal = new Goal { Id = "restore-unique-goal", Description = "Unique restore", Status = GoalStatus.InProgress };
+        var originalManager = new GoalPipelineManager(pipelineStore);
+        var pipeline = originalManager.CreatePipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipeline.SetActiveTask("task-1", "feature/restore-unique-goal");
+        originalManager.PersistFull(pipeline);
+
+        var freshManager = new GoalPipelineManager(pipelineStore);
+
+        var maintenance = CreateMaintenance(
+            goalStore: null,
+            pipelineManager: freshManager);
+
+        await maintenance.RestoreActivePipelinesAsync(CancellationToken.None);
+
+        // Exactly one pipeline should exist for the goal; the pipeline manager is the source of truth.
+        Assert.NotNull(freshManager.GetByGoalId(goal.Id));
+        Assert.Single(freshManager.GetActivePipelines(), p => p.GoalId == goal.Id);
     }
 
     [Fact]
@@ -675,7 +686,6 @@ public sealed class DispatcherMaintenanceSyncTests : IDisposable
             brain: null,
             agentsManager: agentsManager,
             configRepo: configRepo,
-            dispatchedGoals: new ConcurrentDictionary<string, bool>(),
             redispatchQueue: new ConcurrentQueue<string>(),
             logger: NullLogger.Instance,
             knowledgeGraph: knowledgeGraph,
