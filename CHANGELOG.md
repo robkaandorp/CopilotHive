@@ -1,12 +1,19 @@
-## [Unreleased]
+## [0.20.0] - 2026-07-28
+
+### Added
+
+- **Event-driven dashboard** — `DashboardNotifier` service replaces 3-second timer-based polling. The dashboard now refreshes immediately on state changes (goal dispatch, completion, failure, phase transitions, worker register/remove, task assignment, API mutations) instead of waiting for the next poll cycle. A slow 10-second timer remains for time-based displays (elapsed durations, uptime, logs).
+- **Heartbeat throttle** — Worker heartbeat notifications are throttled per worker: immediate on busy/idle state change, immediate on >=5pp context usage change (accumulated from last-notified baseline), 30-second fallback. Bounded by `MaxHeartbeatEntries` (200) with oldest-entry eviction. Unknown workers excluded.
 
 ### Removed
 
-- **`FileGoalSource` and goals.yaml support** — Deleted `FileGoalSource.cs` and all goals.yaml import paths. Removed `--goals-file` CLI argument and bootstrap logic from `Program.cs`. Removed `CommitGoalsToConfigRepoAsync` from `GoalLifecycleService` and call sites in `GoalDispatcher.cs` and `PipelineDriver.cs`. Removed `ImportGoalsAsync` from `IGoalStore` and `GoalStore`.
+- **`FileGoalSource` and goals.yaml support** — Deleted `FileGoalSource.cs` and all goals.yaml import paths. Removed `--goals-file` CLI argument and bootstrap logic from `Program.cs`. Removed `CommitGoalsToConfigRepoAsync` from `GoalLifecycleService` and call sites in `GoalDispatcher.cs` and `PipelineDriver.cs`. Removed `ImportGoalsAsync` from `IGoalStore` and `GoalStore`. **Breaking change for YAML-only deployments:** run v0.19.x once with `--goals-file=goals.yaml` to import goals into SQLite. Verify via the dashboard or `GET /api/goals` before upgrading to v0.20.0+.
 
 ### Changed
 
 - **Documentation** — `README.md` updated to remove all operational, format, and feature-list goals.yaml references; added pre-upgrade migration notice. `VISION.md` updated to reference `hive-config.yaml` instead of `goals.yaml`.
+- **DashboardStateService simplified** — `_cachedPendingGoals` cache removed (dead code — DB is sole source). `GoalManager` dependency removed. Timer slowed from 3s to 10s (time-based displays only). `TimerPeriod` internal property for testable verification. `DashboardNotifier` optional constructor param (backward compatible).
+- **PipelineDriver** — premature `AdvanceTo(Done)` before `MarkGoalCompletedAsync` removed. `GoalLifecycleService` handles the phase advance.
 
 ## [0.19.0] - 2026-07-27
 
