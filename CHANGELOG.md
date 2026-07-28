@@ -1,3 +1,21 @@
+## [0.21.0] - 2026-07-28
+
+### Added
+
+- **SQLite WAL mode** — Enabled Write-Ahead Logging on the SQLite database at startup. WAL allows concurrent readers alongside one writer, reducing "database is locked" errors that occurred when event-driven dashboard notifications triggered reads during goal status writes. The WAL setting is validated at startup and logged.
+- **Ollama model prefix** — `ModelDiscoveryService` now prefixes discovered Ollama model IDs with `ollama-cloud/` or `ollama-local/` based on which environment variable is set. Previously, Ollama models were saved without a provider prefix, causing `ChatClientFactory` to route them to the wrong provider (GitHub Copilot instead of Ollama Cloud).
+- **TaskDispatchService** — Extracted `DispatchToRole` and `ResolveRepositories` from `GoalDispatcher` into a new `internal sealed TaskDispatchService`. `GoalDispatcher` constructs it unconditionally and delegates via one-line forwarding wrappers. All dispatch behaviors preserved: premium model selection, reasoning suffix, context/compaction metadata, iteration SHA, tester report metadata, improver branch downgrade, task building, tracking, registration, queue, idle worker dispatch, repository failure handling.
+
+### Changed
+
+- **Redundant `AddDbContext` removed** — `Program.cs` no longer registers both `AddDbContext` (scoped) and `AddDbContextFactory` (transient). Only `AddDbContextFactory` remains. Startup migration uses factory-created context instead of scoped context.
+- **`_dispatchedGoals` and `_resumeLocks` removed** — `GoalDispatcher` no longer uses these concurrency dictionaries. Double-dispatch prevention uses `_pipelineManager.GetByGoalId()` (pipeline existence check). Resume serialization uses a single `SemaphoreSlim _resumeLock` instead of per-goal `ConcurrentDictionary<string, SemaphoreSlim>`.
+- **SharpCoder updated to 0.12.1** — Includes `UsageCapturingChatClient` fix for inflated `LastKnownContextTokens` from `FunctionInvokingChatClient` aggregate usage.
+
+### Fixed
+
+- **GoalBrainActor status race** — `RegisterSessionStatus("idle")` was called in the `finally` block after the reply was set, causing tests to see `"active"` instead of `"idle"` when reading the registry after the LLM call completed. Fixed by moving the status update before the reply.
+
 ## [0.20.0] - 2026-07-28
 
 ### Added
