@@ -21,7 +21,7 @@ namespace CopilotHive.Services;
 /// </summary>
 public sealed class GoalDispatcher : BackgroundService
 {
-    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(5);
+    internal static TimeSpan PollInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan AgentsSyncInterval = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan BranchCleanupInterval = TimeSpan.FromHours(1);
 
@@ -53,6 +53,7 @@ public sealed class GoalDispatcher : BackgroundService
     private readonly TaskCompletionService _taskCompletionService;
     private readonly GoalDispatchService _goalDispatchService;
     private readonly DashboardNotifier? _dashboardNotifier;
+    private readonly GoalReadyNotifier? _goalReadyNotifier;
     private DateTime _lastBranchCleanup = DateTime.MinValue;
 
     /// <summary>
@@ -78,6 +79,7 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="knowledgeGraph">Optional knowledge graph for reloading on sync cycles.</param>
     /// <param name="goalStore">Optional goal store for direct CRUD operations such as branch cleanup.</param>
     /// <param name="dashboardNotifier">Optional dashboard notifier for state-change events.</param>
+    /// <param name="goalReadyNotifier">Optional notifier used to wake the dispatcher when a goal becomes pending.</param>
     public GoalDispatcher(
         GoalManager goalManager,
         GoalPipelineManager pipelineManager,
@@ -98,7 +100,8 @@ public sealed class GoalDispatcher : BackgroundService
         ProgressLog? progressLog = null,
         KnowledgeGraph? knowledgeGraph = null,
         IGoalStore? goalStore = null,
-        DashboardNotifier? dashboardNotifier = null)
+        DashboardNotifier? dashboardNotifier = null,
+        GoalReadyNotifier? goalReadyNotifier = null)
     {
         _repoManager = repoManager ?? throw new ArgumentNullException(nameof(repoManager));
         _goalManager = goalManager;
@@ -116,6 +119,7 @@ public sealed class GoalDispatcher : BackgroundService
         _configRepo = configRepo;
         _goalStore = goalStore;
         _dashboardNotifier = dashboardNotifier;
+        _goalReadyNotifier = goalReadyNotifier;
         _clarificationHandler = new ClarificationHandler(brain, clarificationRouter, clarificationQueue, logger);
 
         _lifecycleService = new GoalLifecycleService(
@@ -127,7 +131,8 @@ public sealed class GoalDispatcher : BackgroundService
             knowledgeGraph,
             goalStore: goalStore,
             repoManager: repoManager,
-            config: config);
+            config: config,
+            goalReadyNotifier: goalReadyNotifier);
 
         _taskDispatchService = new TaskDispatchService(
             _taskQueue, _workerGateway, _taskBuilder, _config,
@@ -510,7 +515,10 @@ public sealed class GoalDispatcher : BackgroundService
                 _logger.LogError(ex, "GoalDispatcher error");
             }
 
-            await Task.Delay(PollInterval, stoppingToken);
+            if (_goalReadyNotifier is not null)
+                await _goalReadyNotifier.WaitForSignalAsync(PollInterval, stoppingToken);
+            else
+                await Task.Delay(PollInterval, stoppingToken);
         }
 
         _logger.LogInformation("GoalDispatcher stopped");

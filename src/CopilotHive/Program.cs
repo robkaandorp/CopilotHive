@@ -60,6 +60,7 @@ public sealed class Program
             builder.Services.AddSingleton<TaskQueue>();
             builder.Services.AddSingleton<TaskCompletionNotifier>();
             builder.Services.AddSingleton<ImprovementAnalyzer>();
+            builder.Services.AddSingleton<GoalReadyNotifier>();
 
             // Agents: AGENTS.md versioning and rollback
             var agentsDir = Environment.GetEnvironmentVariable("AGENTS_DIR") ?? Path.Combine(AppContext.BaseDirectory, "agents");
@@ -271,7 +272,8 @@ public sealed class Program
                     compactionModel: config?.Models?.CompactionModel,
                     knowledgeGraph: sp.GetService<KnowledgeGraph>(),
                     goalReviewService: sp.GetService<GoalReviewService>(),
-                    sessionRegistry: sp.GetService<LlmSessionRegistry>());
+                    sessionRegistry: sp.GetService<LlmSessionRegistry>(),
+                    goalReadyNotifier: sp.GetService<GoalReadyNotifier>());
             });
             builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 

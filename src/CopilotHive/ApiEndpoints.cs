@@ -88,13 +88,15 @@ public static class ApiEndpoints
             return goal is null ? Results.NotFound(new { error = $"Goal '{id}' not found." }) : Results.Ok(goal);
         });
 
-        goalsApi.MapPost("/", async (Goal goal, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier) =>
+        goalsApi.MapPost("/", async (Goal goal, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier,
+            [FromServices] GoalReadyNotifier? goalReadyNotifier) =>
         {
             try
             {
                 var created = await store.CreateGoalAsync(goal);
                 var result = Results.Created($"/api/goals/{created.Id}", created);
                 dashboardNotifier.NotifyStateChanged();
+                if (created.Status == GoalStatus.Pending) goalReadyNotifier?.NotifyGoalReady();
                 return result;
             }
             catch (ArgumentException ex)
@@ -113,7 +115,8 @@ public static class ApiEndpoints
 
         goalsApi.MapPatch("/{id}/status", async (string id, GoalStatusUpdate update, IGoalStore store,
             [FromServices] IBrainRepoManager? repoManager, [FromServices] GoalDispatcher? dispatcher, ILogger<Program> endpointLogger,
-            [FromServices] DashboardNotifier dashboardNotifier) =>
+            [FromServices] DashboardNotifier dashboardNotifier,
+            [FromServices] GoalReadyNotifier? goalReadyNotifier) =>
         {
             try
             {
@@ -154,6 +157,7 @@ public static class ApiEndpoints
                 await store.UpdateGoalStatusAsync(id, status);
                 var goal = await store.GetGoalAsync(id);
                 dashboardNotifier.NotifyStateChanged();
+                if (status == GoalStatus.Pending) goalReadyNotifier?.NotifyGoalReady();
                 return Results.Ok(goal);
             }
             catch (KeyNotFoundException)

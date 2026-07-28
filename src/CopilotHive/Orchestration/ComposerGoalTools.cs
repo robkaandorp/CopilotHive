@@ -130,6 +130,7 @@ public sealed partial class Composer
 
         goal.Status = GoalStatus.Pending;
         await _goalStore.UpdateGoalAsync(goal);
+        _goalReadyNotifier?.NotifyGoalReady();
         _logger.LogInformation("Composer approved goal '{GoalId}' → Pending", id);
 
         return $"✅ Goal '{id}' approved — status changed to Pending. It will be dispatched in the next cycle.";
@@ -333,6 +334,7 @@ public sealed partial class Composer
 
                 goal.Status = newStatus;
                 await _goalStore.UpdateGoalAsync(goal);
+                if (newStatus == GoalStatus.Pending) _goalReadyNotifier?.NotifyGoalReady();
                 _logger.LogInformation("Composer updated goal '{GoalId}' status to {Status}", id, newStatus);
                 return AppendDocuments($"✅ Goal '{id}' status updated to {newStatus.ToDisplayName()}.", goal);
 

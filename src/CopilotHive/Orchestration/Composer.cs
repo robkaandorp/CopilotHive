@@ -51,6 +51,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     // Clarification sessions are out of scope for registry tracking — they are short-lived and ephemeral.
     private readonly LlmSessionRegistry? _sessionRegistry;
 
+    private readonly GoalReadyNotifier? _goalReadyNotifier;
+
     /// <summary>Models the Composer can switch between at runtime.</summary>
     public IReadOnlyList<string> AvailableModels =>
         _hiveConfig?.Models?.AvailableModels is { Count: > 0 } available
@@ -269,7 +271,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         string? compactionModel = null,
         KnowledgeGraph? knowledgeGraph = null,
         GoalReviewService? goalReviewService = null,
-        LlmSessionRegistry? sessionRegistry = null)
+        LlmSessionRegistry? sessionRegistry = null,
+        GoalReadyNotifier? goalReadyNotifier = null)
     {
         _model = model;
         _maxContextTokens = maxContextTokens;
@@ -288,6 +291,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _chatClientFactory = chatClientFactory;
         _compactionModel = compactionModel;
         _sessionRegistry = sessionRegistry;
+        _goalReadyNotifier = goalReadyNotifier;
         _session = AgentSession.Create("composer");
 
         _startupAvailableModels = (availableModels?.ToList() ?? [model]).AsReadOnly();

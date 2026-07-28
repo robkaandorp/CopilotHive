@@ -28,6 +28,7 @@ internal sealed class DispatcherMaintenance
     private readonly IGoalStore? _goalStore;
     private readonly IBrainRepoManager? _repoManager;
     private readonly HiveConfigFile? _config;
+    private readonly GoalReadyNotifier? _goalReadyNotifier;
 
     // Mutable state shared with GoalDispatcher via reference
     private readonly ConcurrentQueue<string> _redispatchQueue;
@@ -48,7 +49,8 @@ internal sealed class DispatcherMaintenance
         KnowledgeGraph? knowledgeGraph = null,
         IGoalStore? goalStore = null,
         IBrainRepoManager? repoManager = null,
-        HiveConfigFile? config = null)
+        HiveConfigFile? config = null,
+        GoalReadyNotifier? goalReadyNotifier = null)
     {
         _pipelineManager = pipelineManager;
         _goalManager = goalManager;
@@ -63,6 +65,7 @@ internal sealed class DispatcherMaintenance
         _goalStore = goalStore;
         _repoManager = repoManager;
         _config = config;
+        _goalReadyNotifier = goalReadyNotifier;
     }
 
     /// <summary>
@@ -256,6 +259,7 @@ internal sealed class DispatcherMaintenance
                 // Pipeline was registered above — clean it up from Brain's _activePipelines
                 (_brain as DistributedBrain)?.DeregisterActivePipeline(pipeline.GoalId);
                 await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.Pending, null, ct);
+                _goalReadyNotifier?.NotifyGoalReady();
                 continue;
             }
 
