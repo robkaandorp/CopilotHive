@@ -22,10 +22,6 @@ namespace CopilotHive.Orchestration;
 /// </summary>
 public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 {
-    private string _model;
-    private int _maxContextTokens;
-    private readonly int _maxSteps;
-    private ReasoningEffort? _reasoningEffort;
     private readonly ILogger<Composer> _logger;
     private readonly IGoalStore _goalStore;
     private readonly IBrainRepoManager? _repoManager;
@@ -33,11 +29,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly string _stateDir;
     private readonly IHttpClientFactory? _httpClientFactory;
     private readonly string? _ollamaApiKey;
-    private readonly string? _compactionModel;
-    private IChatClient? _chatClient;
-    private CodingAgent? _agent;
-    private AgentSession _session;
-    private AgentOptions _agentOptions = null!;
+    private readonly ComposerAgentService _agentService;
 
     private readonly HiveConfigFile? _hiveConfig;
     private readonly string _systemPrompt;
@@ -45,8 +37,6 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly ConfigRepoManager? _configRepo;
     private readonly KnowledgeGraph? _knowledgeGraph;
     private readonly GoalReviewService? _goalReviewService;
-    private readonly Func<string, IChatClient>? _chatClientFactory;
-    private readonly IReadOnlyList<string> _startupAvailableModels;
 
     // Clarification sessions are out of scope for registry tracking — they are short-lived and ephemeral.
     private readonly LlmSessionRegistry? _sessionRegistry;
@@ -54,12 +44,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly GoalReadyNotifier? _goalReadyNotifier;
 
     /// <summary>Models the Composer can switch between at runtime.</summary>
-    public IReadOnlyList<string> AvailableModels =>
-        _hiveConfig?.Models?.AvailableModels is { Count: > 0 } available
-            ? available.Select(m => string.IsNullOrEmpty(m.ReasoningEffort)
-                ? m.Name
-                : $"{m.Name}:{m.ReasoningEffort}").ToList().AsReadOnly()
-            : _startupAvailableModels;
+    public IReadOnlyList<string> AvailableModels => _agentService.AvailableModels;
 
     // Streaming state owned by the service (survives component navigation)
     private string _streamingContent = "";
@@ -274,9 +259,6 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         LlmSessionRegistry? sessionRegistry = null,
         GoalReadyNotifier? goalReadyNotifier = null)
     {
-        _model = model;
-        _maxContextTokens = maxContextTokens;
-        _maxSteps = maxSteps;
         _logger = logger;
         _goalStore = goalStore;
         _repoManager = repoManager;
@@ -288,16 +270,10 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _configRepo = configRepo;
         _knowledgeGraph = knowledgeGraph;
         _goalReviewService = goalReviewService;
-        _chatClientFactory = chatClientFactory;
-        _compactionModel = compactionModel;
         _sessionRegistry = sessionRegistry;
         _goalReadyNotifier = goalReadyNotifier;
-        _session = AgentSession.Create("composer");
-
-        _startupAvailableModels = (availableModels?.ToList() ?? [model]).AsReadOnly();
 
         var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
-        _reasoningEffort = reasoning;
 
         _systemPrompt = DefaultSystemPrompt;
         if (_ollamaApiKey is not null)
@@ -318,10 +294,30 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             _systemPrompt += KnowledgeGraphSystemPromptSection;
 
         _composerTools = BuildComposerTools();
+
+        _agentService = new ComposerAgentService(
+            model, maxContextTokens, maxSteps, reasoning,
+            _hiveConfig, _systemPrompt, _composerTools,
+            _repoManager, _stateDir,
+            compactionModel, _logger,
+            chatClientFactory,
+            _sessionRegistry,
+            (availableModels?.ToList() ?? [model]).AsReadOnly(),
+            () =>
+            {
+                IsCompacting = true;
+                OnCompactingStarted?.Invoke();
+            },
+            r =>
+            {
+                IsCompacting = false;
+                WasCompacted = true;
+                OnCompacted?.Invoke();
+            });
     }
 
     /// <summary>Whether the Composer has connected and is ready for streaming.</summary>
-    public bool IsConnected => _agent is not null;
+    public bool IsConnected => _agentService.IsConnected;
 
     /// <summary>Returns the system prompt used by the Composer.</summary>
     internal string GetSystemPrompt() => _systemPrompt;
@@ -329,23 +325,25 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <summary>Returns current Composer session statistics.</summary>
     public BrainStats? GetStats()
     {
-        if (_agent is null) return null;
+        if (_agentService.Agent is null) return null;
 
-        var contextTokens = _session.LastKnownContextTokens > 0
-            ? _session.LastKnownContextTokens
-            : _session.EstimatedContextTokens;
-        var usagePct = _maxContextTokens > 0 ? (int)(contextTokens * 100.0 / _maxContextTokens) : 0;
+        var session = _agentService.Session;
+        var maxContextTokens = _agentService.MaxContextTokens;
+        var contextTokens = session.LastKnownContextTokens > 0
+            ? session.LastKnownContextTokens
+            : session.EstimatedContextTokens;
+        var usagePct = maxContextTokens > 0 ? (int)(contextTokens * 100.0 / maxContextTokens) : 0;
 
         return new BrainStats
         {
-            Model = _model,
-            MessageCount = _session.MessageHistory.Count,
+            Model = _agentService.Model,
+            MessageCount = session.MessageHistory.Count,
             ContextTokens = contextTokens,
-            MaxContextTokens = _maxContextTokens,
+            MaxContextTokens = maxContextTokens,
             ContextUsagePercent = usagePct,
-            CumulativeInputTokens = _session.InputTokensUsed,
-            CumulativeOutputTokens = _session.OutputTokensUsed,
-            MaxSteps = _maxSteps,
+            CumulativeInputTokens = session.InputTokensUsed,
+            CumulativeOutputTokens = session.OutputTokensUsed,
+            MaxSteps = _agentService.MaxSteps,
             IsConnected = true,
         };
     }
@@ -356,95 +354,12 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// </summary>
     /// <param name="model">The model identifier to switch to.</param>
     /// <exception cref="ArgumentException">Thrown when <paramref name="model"/> is not in <see cref="AvailableModels"/>.</exception>
-    public async Task SwitchModelAsync(string model)
-    {
-        if (!AvailableModels.Contains(model, StringComparer.OrdinalIgnoreCase))
-            throw new ArgumentException($"Model '{model}' is not available. Available models: {string.Join(", ", AvailableModels)}.", nameof(model));
-
-        _logger.LogInformation("Switching Composer model from '{OldModel}' to '{NewModel}'", _model, model);
-
-        // Dispose old client
-        if (_chatClient is IAsyncDisposable asyncDisposable)
-            await asyncDisposable.DisposeAsync();
-        else if (_chatClient is IDisposable disposable)
-            disposable.Dispose();
-
-        // Update model and re-parse reasoning effort
-        _model = model;
-        var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
-        _reasoningEffort = reasoning;
-
-        // Update context window when the new model has a different value in the global model list.
-        // Strip only the reasoning suffix (if present) while preserving the provider prefix and any
-        // tag (e.g. ollama-cloud/gpt-oss:120b:medium → ollama-cloud/gpt-oss:120b) so the lookup
-        // matches ModelEntry.Name.
-        var modelForLookup = model;
-        if (reasoning is not null)
-        {
-            var lastColon = model.LastIndexOf(':');
-            if (lastColon > 0)
-                modelForLookup = model.Substring(0, lastColon);
-        }
-        var modelCtx = _hiveConfig?.TryGetContextWindowForModel(modelForLookup);
-        if (modelCtx.HasValue && modelCtx.Value > 0 && _maxContextTokens != modelCtx.Value)
-        {
-            _logger.LogInformation(
-                "Updating Composer context window from {OldContextWindow} to {NewContextWindow} for model '{Model}'",
-                _maxContextTokens, modelCtx.Value, model);
-            _maxContextTokens = modelCtx.Value;
-        }
-
-        // Create new client
-        _chatClient = (_chatClientFactory ?? ChatClientFactory.Create)(model);
-
-        // Rebuild agent — session is preserved
-        RecreateAgent();
-
-        RefreshComposerRegistry();
-
-        _logger.LogInformation("Composer switched to model '{Model}'", _model);
-    }
+    public Task SwitchModelAsync(string model) => _agentService.SwitchModelAsync(model);
 
     /// <summary>
     /// Creates the IChatClient and CodingAgent, and loads any persisted session.
     /// </summary>
-    public async Task ConnectAsync(CancellationToken ct = default)
-    {
-        _logger.LogInformation("Composer connecting with model '{Model}'…", _model);
-
-        _chatClient = (_chatClientFactory ?? ChatClientFactory.Create)(_model);
-
-        var sessionFile = GetSessionFilePath();
-        if (File.Exists(sessionFile))
-        {
-            try
-            {
-                _session = await AgentSession.LoadAsync(sessionFile, ct);
-                _logger.LogInformation("Loaded Composer session with {Count} messages from {File}",
-                    _session.MessageHistory.Count, sessionFile);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to load Composer session from {File} — starting fresh", sessionFile);
-                _session = AgentSession.Create("composer");
-            }
-        }
-
-        RecreateAgent();
-
-        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
-        {
-            SessionId = "composer",
-            SessionType = LlmSessionType.Composer,
-            Model = _model,
-            Status = "idle",
-            CurrentTokens = _session.EstimatedContextTokens,
-            MaxTokens = _maxContextTokens,
-        });
-
-        _logger.LogInformation("Composer connected (model={Model}, contextWindow={ContextWindow})",
-            _model, _maxContextTokens);
-    }
+    public Task ConnectAsync(CancellationToken ct = default) => _agentService.ConnectAsync(ct);
 
     /// <summary>
     /// Sends a message and streams the response in the background.
@@ -453,7 +368,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// </summary>
     public void SendMessage(string userMessage)
     {
-        if (_agent is null)
+        if (_agentService.Agent is null)
             throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
         if (_isStreaming)
             throw new InvalidOperationException("Composer is already streaming a response.");
@@ -475,7 +390,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         {
             RefreshComposerRegistry(status: "streaming");
 
-            await foreach (var update in _agent!.ExecuteStreamingAsync(_session, userMessage, ct))
+            await foreach (var update in _agentService.Agent!.ExecuteStreamingAsync(_agentService.Session, userMessage, ct))
             {
                 switch (update.Kind)
                 {
@@ -500,10 +415,9 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         {
             _logger.LogWarning(ex, "Composer context overflow detected — resetting session");
             _streamingContent += "\n\n⚠️ Context limit reached. Session has been reset automatically. Please repeat your request.";
-            _session = AgentSession.Create("composer");
+            _agentService.ResetSession();
             IsCompacting = false;
             WasCompacted = false;
-            RecreateAgent();
             var sessionFile = GetSessionFilePath();
             if (File.Exists(sessionFile))
                 File.Delete(sessionFile);
@@ -557,10 +471,9 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// </summary>
     public async Task ResetSessionAsync(CancellationToken ct = default)
     {
-        _session = AgentSession.Create("composer");
+        _agentService.ResetSession();
         IsCompacting = false;
         WasCompacted = false;
-        RecreateAgent();
 
         var sessionFile = GetSessionFilePath();
         if (File.Exists(sessionFile))
@@ -586,10 +499,10 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         {
             SessionId = "composer",
             SessionType = LlmSessionType.Composer,
-            Model = _model,
+            Model = _agentService.Model,
             Status = status,
-            CurrentTokens = currentTokens ?? _session.EstimatedContextTokens,
-            MaxTokens = _maxContextTokens,
+            CurrentTokens = currentTokens ?? _agentService.Session.EstimatedContextTokens,
+            MaxTokens = _agentService.MaxContextTokens,
         });
     }
 
@@ -598,8 +511,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     {
         var path = GetSessionFilePath();
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        await _session.SaveAsync(path, ct);
-        _logger.LogDebug("Composer session saved ({Count} messages)", _session.MessageHistory.Count);
+        await _agentService.Session.SaveAsync(path, ct);
+        _logger.LogDebug("Composer session saved ({Count} messages)", _agentService.Session.MessageHistory.Count);
     }
 
     /// <summary>
@@ -609,7 +522,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <returns><c>true</c> if compaction occurred; otherwise <c>false</c>.</returns>
     public async Task<bool> CompactSessionAsync(CancellationToken ct = default)
     {
-        if (_agent is null)
+        if (_agentService.Agent is null)
             throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
 
         if (_isStreaming)
@@ -620,15 +533,15 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
         try
         {
-            var compactor = new ContextCompactor(_agentOptions.CompactionClient ?? _chatClient!, _logger);
-            var result = await compactor.ForceCompactAsync(_session, _agentOptions, ct);
+            var compactor = new ContextCompactor(_agentService.AgentOptions.CompactionClient ?? _agentService.ChatClient!, _logger);
+            var result = await compactor.ForceCompactAsync(_agentService.Session, _agentService.AgentOptions, ct);
             if (result)
             {
                 await SaveSessionAsync(ct);
                 RefreshComposerRegistry();
                 _logger.LogInformation(
                     "Composer session manually compacted ({Count} messages remaining)",
-                    _session.MessageHistory.Count);
+                    _agentService.Session.MessageHistory.Count);
             }
             return result;
         }
@@ -651,7 +564,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// </summary>
     public async Task<bool> CompactOldestPercentAsync(int percent, CancellationToken ct = default)
     {
-        if (_agent is null)
+        if (_agentService.Agent is null)
             throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
         if (_isStreaming)
             throw new InvalidOperationException("Cannot compact while streaming.");
@@ -662,17 +575,17 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         try
         {
             var compactor = new ContextCompactor(
-                _agentOptions.CompactionClient ?? _chatClient!,
+                _agentService.AgentOptions.CompactionClient ?? _agentService.ChatClient!,
                 _logger);
 
-            var result = await compactor.CompactOldestPercentAsync(_session, _agentOptions, percent, ct);
+            var result = await compactor.CompactOldestPercentAsync(_agentService.Session, _agentService.AgentOptions, percent, ct);
 
             if (result)
             {
                 await SaveSessionAsync(ct);
                 RefreshComposerRegistry();
                 _logger.LogInformation("Composer session partially compacted ({Percent}% oldest, {Count} messages remaining)",
-                    percent, _session.MessageHistory.Count);
+                    percent, _agentService.Session.MessageHistory.Count);
             }
 
             return result;
@@ -689,56 +602,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         }
     }
 
-    private void RecreateAgent()
-    {
-        if (_chatClient is null)
-            throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
-
-        var workDir = _repoManager?.WorkDirectory ?? _stateDir;
-
-        _agentOptions = new AgentOptions
-        {
-            WorkDirectory = workDir,
-            MaxSteps = _maxSteps,
-            EnableBash = false,
-            EnableFileOps = _repoManager is not null,
-            EnableFileWrites = false,
-            EnableSkills = false,
-            SystemPrompt = _systemPrompt,
-            CustomTools = _composerTools,
-            MaxContextTokens = _maxContextTokens,
-            EnableAutoCompaction = true,
-            AutoLoadWorkspaceInstructions = false,
-            ReasoningEffort = _reasoningEffort,
-            ShowToolCallsInStream = true,
-            Logger = _logger,
-            CompactionClient = !string.IsNullOrEmpty(_compactionModel)
-                ? ChatClientFactory.Create(_compactionModel)
-                : null,
-            CompactionMaxTokens = !string.IsNullOrEmpty(_compactionModel)
-                ? _hiveConfig?.TryGetContextWindowForModel(_compactionModel)
-                : null,
-            OnCompacting = () =>
-            {
-                IsCompacting = true;
-                OnCompactingStarted?.Invoke();
-            },
-            OnCompacted = r =>
-            {
-                _logger.LogInformation(
-                    "Composer context compaction: {TokensBefore} → {TokensAfter} tokens ({ReductionPercent}% reduction)",
-                    r.TokensBefore, r.TokensAfter, r.ReductionPercent);
-                IsCompacting = false;
-                WasCompacted = true;
-                OnCompacted?.Invoke();
-            },
-        };
-
-        _agent = new CodingAgent(_chatClient, _agentOptions);
-
-        _logger.LogDebug("Composer CodingAgent created with WorkDirectory={WorkDir}, FileOps={FileOps}",
-            workDir, _repoManager is not null);
-    }
+    private void RecreateAgent() => _agentService.RecreateAgent();
 
     internal List<AITool> BuildComposerTools()
     {
@@ -941,7 +805,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         ClarificationRequest request,
         CancellationToken ct = default)
     {
-        if (_agent is null)
+        if (_agentService.Agent is null)
         {
             _logger.LogWarning("Composer not connected — escalating clarification to human for goal {GoalId}", goalId);
             clarificationQueue.EscalateToHuman(request.Id);
@@ -969,10 +833,10 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
             // Use the agent to get a response via a fresh one-shot session
             // so we don't pollute the main Composer conversation
-            var clarificationSession = _session.Fork($"clarification-{request.Id}");
+            var clarificationSession = _agentService.Session.Fork($"clarification-{request.Id}");
             string responseText = "";
 
-            await foreach (var update in _agent.ExecuteStreamingAsync(clarificationSession, prompt, timeoutCts.Token))
+            await foreach (var update in _agentService.Agent.ExecuteStreamingAsync(clarificationSession, prompt, timeoutCts.Token))
             {
                 if (update.Kind == StreamingUpdateKind.TextDelta)
                     responseText += update.Text;
@@ -1025,9 +889,6 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
-        if (_chatClient is IAsyncDisposable asyncDisposable)
-            await asyncDisposable.DisposeAsync();
-        else if (_chatClient is IDisposable disposable)
-            disposable.Dispose();
+        await _agentService.DisposeAsync();
     }
 }

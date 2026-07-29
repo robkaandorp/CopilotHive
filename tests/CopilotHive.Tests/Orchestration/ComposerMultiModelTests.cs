@@ -1005,11 +1005,17 @@ public sealed class ComposerCompactionTests : IDisposable
             chatClientFactory: _ => new Mock<IChatClient>().Object,
             compactionModel: "copilot/gpt-5.4-mini");
 
-        var field = typeof(Composer)
-            .GetField("_compactionModel", BindingFlags.NonPublic | BindingFlags.Instance)
-            ?? throw new InvalidOperationException("_compactionModel field not found on Composer");
+        var agentServiceField = typeof(Composer)
+            .GetField("_agentService", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException("_agentService field not found on Composer");
+        var agentService = agentServiceField.GetValue(composer)
+            ?? throw new InvalidOperationException("_agentService was null");
 
-        Assert.Equal("copilot/gpt-5.4-mini", field.GetValue(composer));
+        var field = agentService.GetType()
+            .GetField("_compactionModel", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException("_compactionModel field not found on ComposerAgentService");
+
+        Assert.Equal("copilot/gpt-5.4-mini", field.GetValue(agentService));
     }
 }
 

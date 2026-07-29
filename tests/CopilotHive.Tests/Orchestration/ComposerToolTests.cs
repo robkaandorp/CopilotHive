@@ -4534,19 +4534,23 @@ public sealed class ComposerToolTests : IDisposable
     /// </summary>
     private static void InjectFakeChatClient(Composer composer, IChatClient fakeClient)
     {
-        var composerType = typeof(Composer);
+        const System.Reflection.BindingFlags flags =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
 
-        // Replace the private _chatClient field
-        var chatClientField = composerType.GetField("_chatClient",
-            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("_chatClient field not found on Composer");
-        chatClientField.SetValue(composer, fakeClient);
+        // The agent lifecycle lives on ComposerAgentService
+        var agentServiceField = typeof(Composer).GetField("_agentService", flags)
+            ?? throw new InvalidOperationException("_agentService field not found on Composer");
+        var agentService = agentServiceField.GetValue(composer)
+            ?? throw new InvalidOperationException("_agentService was null");
+        var serviceType = agentService.GetType();
 
-        // Rebuild the CodingAgent with the injected client
-        var recreateAgent = composerType.GetMethod("RecreateAgent",
-            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("RecreateAgent method not found on Composer");
-        recreateAgent.Invoke(composer, null);
+        var chatClientField = serviceType.GetField("_chatClient", flags)
+            ?? throw new InvalidOperationException("_chatClient field not found on ComposerAgentService");
+        chatClientField.SetValue(agentService, fakeClient);
+
+        var recreateAgent = serviceType.GetMethod("RecreateAgent", flags | System.Reflection.BindingFlags.Public)
+            ?? throw new InvalidOperationException("RecreateAgent method not found on ComposerAgentService");
+        recreateAgent.Invoke(agentService, null);
     }
 
     [Fact]

@@ -33,17 +33,18 @@ public sealed class ComposerCompactTests
     /// </summary>
     private static void InjectFakeChatClient(Composer composer, IChatClient fakeClient)
     {
-        var composerType = typeof(Composer);
+        var agentService = GetAgentService(composer);
+        var serviceType = agentService.GetType();
 
-        var chatClientField = composerType.GetField("_chatClient",
+        var chatClientField = serviceType.GetField("_chatClient",
             BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("_chatClient field not found on Composer");
-        chatClientField.SetValue(composer, fakeClient);
+            ?? throw new InvalidOperationException("_chatClient field not found on ComposerAgentService");
+        chatClientField.SetValue(agentService, fakeClient);
 
-        var recreateAgent = composerType.GetMethod("RecreateAgent",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("RecreateAgent method not found on Composer");
-        recreateAgent.Invoke(composer, null);
+        var recreateAgent = serviceType.GetMethod("RecreateAgent",
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
+            ?? throw new InvalidOperationException("RecreateAgent method not found on ComposerAgentService");
+        recreateAgent.Invoke(agentService, null);
     }
 
     /// <summary>
@@ -51,10 +52,21 @@ public sealed class ComposerCompactTests
     /// </summary>
     private static AgentSession GetSession(Composer composer)
     {
-        var sessionField = typeof(Composer).GetField("_session",
+        var agentService = GetAgentService(composer);
+        var sessionField = agentService.GetType().GetField("_session",
             BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("_session field not found on Composer");
-        return (AgentSession)sessionField.GetValue(composer)!;
+            ?? throw new InvalidOperationException("_session field not found on ComposerAgentService");
+        return (AgentSession)sessionField.GetValue(agentService)!;
+    }
+
+    /// <summary>Gets the private <c>_agentService</c> instance from a <see cref="Composer"/>.</summary>
+    private static object GetAgentService(Composer composer)
+    {
+        var field = typeof(Composer).GetField("_agentService",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("_agentService field not found on Composer");
+        return field.GetValue(composer)
+            ?? throw new InvalidOperationException("_agentService was null");
     }
 
     /// <summary>

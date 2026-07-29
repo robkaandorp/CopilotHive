@@ -13,7 +13,7 @@ public sealed partial class Composer
     public IReadOnlyList<(string Role, string Content)> GetChatHistory(int maxMessages = 50)
     {
         var result = new List<(string Role, string Content)>();
-        foreach (var msg in _session.MessageHistory)
+        foreach (var msg in _agentService.Session.MessageHistory)
         {
             if (msg.Role == Microsoft.Extensions.AI.ChatRole.User)
             {
