@@ -325,11 +325,7 @@ public sealed class GoalDispatcher : BackgroundService
             {
                 (_brain as DistributedBrain)?.RegisterActivePipeline(pipeline);
                 if (_brain is not null)
-                    await _brain.ForkSessionForGoalAsync(goalId, ct);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
+                    await _brain.ForkSessionForGoalAsync(goalId, CancellationToken.None);
             }
             catch (Exception ex)
             {
@@ -340,12 +336,8 @@ public sealed class GoalDispatcher : BackgroundService
             IterationPlan validatedPlan;
             try
             {
-                var rawPlan = await ResolvePlanAsync(pipeline, null, ct);
+                var rawPlan = await ResolvePlanAsync(pipeline, null, CancellationToken.None);
                 validatedPlan = IterationPlanValidator.ValidatePlan(rawPlan);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
             }
             catch (Exception ex)
             {
@@ -364,12 +356,8 @@ public sealed class GoalDispatcher : BackgroundService
             try
             {
                 prompt = _brain is not null
-                    ? await ResolvePromptAsync(pipeline, firstPhase, null, ct)
+                    ? await ResolvePromptAsync(pipeline, firstPhase, null, CancellationToken.None)
                     : BuildCoderPrompt(pipeline.Goal);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
             }
             catch (Exception ex)
             {
@@ -380,11 +368,7 @@ public sealed class GoalDispatcher : BackgroundService
             // Dispatch (best-effort — if this fails, goal is InProgress and dispatch loop handles it)
             try
             {
-                await DispatchToRole(pipeline, firstPhase.ToWorkerRole(), prompt, ct);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
+                await DispatchToRole(pipeline, firstPhase.ToWorkerRole(), prompt, CancellationToken.None);
             }
             catch (Exception ex)
             {

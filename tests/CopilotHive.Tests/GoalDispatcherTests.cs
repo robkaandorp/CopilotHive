@@ -3263,6 +3263,121 @@ public sealed class GoalDispatcherResumeTests
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     [Fact]
+    public async Task ResumeGoalAsync_HttpTokenCancelled_MidResume_CompletesSuccessfully()
+    {
+        var brain = new CancellationTokenTrackingBrain();
+        var goalStore = new ResumeFakeGoalStore();
+        var goal = CreateFailedGoal("resume-cancel-mid");
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var manager = new GoalPipelineManager();
+        var pipeline = CreateFailedPipeline(manager, goal);
+
+        var dispatcher = CreateResumeDispatcher(goalStore, manager, brain: brain, config: ConfigWithRepo());
+
+        using var cts = new CancellationTokenSource();
+        cts.CancelAfter(TimeSpan.FromMilliseconds(50));
+
+        var result = await dispatcher.ResumeGoalAsync("resume-cancel-mid", 5, cts.Token);
+
+        Assert.True(result);
+
+        var updated = await goalStore.GetGoalAsync("resume-cancel-mid", TestContext.Current.CancellationToken);
+        Assert.NotNull(updated);
+        Assert.Equal(GoalStatus.InProgress, updated!.Status);
+        Assert.Null(updated.FailureReason);
+
+        Assert.NotEqual(GoalPhase.Failed, pipeline.Phase);
+
+        // Verify Brain calls were invoked (proving the method progressed past the lock)
+        Assert.True(brain.ForkSessionCalled, "ForkSessionForGoalAsync should have been called");
+        Assert.True(brain.PlanIterationCalled, "PlanIterationAsync should have been called");
+        Assert.True(brain.CraftPromptCalled, "CraftPromptAsync should have been called");
+
+        // Verify ALL Brain calls received CancellationToken.None — not the HTTP ct
+        Assert.All(brain.ForkSessionTokens, t => Assert.True(t.CanBeCanceled == false || t.IsCancellationRequested == false,
+            "ForkSessionForGoalAsync must receive a non-cancelled token (CancellationToken.None)"));
+        Assert.All(brain.PlanIterationTokens, t => Assert.True(t.CanBeCanceled == false || t.IsCancellationRequested == false,
+            "PlanIterationAsync must receive a non-cancelled token (CancellationToken.None)"));
+        Assert.All(brain.CraftPromptTokens, t => Assert.True(t.CanBeCanceled == false || t.IsCancellationRequested == false,
+            "CraftPromptAsync must receive a non-cancelled token (CancellationToken.None)"));
+    }
+
+    [Fact]
+    public async Task ResumeGoalAsync_PreCancelledToken_FailsFastBeforeBrainCalls()
+    {
+        // When a pre-cancelled CancellationToken is passed, ResumeGoalAsync should fail fast
+        // on the goal store read or resume lock acquisition — before reaching any Brain calls.
+        var brain = new CancellationTokenTrackingBrain();
+        var goalStore = new ResumeFakeGoalStore();
+        var goal = CreateFailedGoal("resume-pre-cancelled");
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var manager = new GoalPipelineManager();
+        CreateFailedPipeline(manager, goal);
+
+        var dispatcher = CreateResumeDispatcher(goalStore, manager, brain: brain, config: ConfigWithRepo());
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel(); // Pre-cancel immediately
+
+        // The method should throw OperationCanceledException (fail fast) or return false
+        // — but it must NOT reach any Brain calls.
+        bool result;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            result = await dispatcher.ResumeGoalAsync("resume-pre-cancelled", 5, cts.Token);
+        });
+
+        // No Brain calls should have been made — the pre-cancelled ct stops before reaching them.
+        Assert.False(brain.ForkSessionCalled, "ForkSessionForGoalAsync must NOT be called with a pre-cancelled token");
+        Assert.False(brain.PlanIterationCalled, "PlanIterationAsync must NOT be called with a pre-cancelled token");
+        Assert.False(brain.CraftPromptCalled, "CraftPromptAsync must NOT be called with a pre-cancelled token");
+    }
+
+    [Fact]
+    public async Task ResumeGoalAsync_BrainCallsReceiveCancellationTokenNone_NotHttpToken()
+    {
+        // Verify that the CancellationToken passed to each Brain call is CancellationToken.None,
+        // not the HTTP request's ct. The brain introduces a delay so the HTTP ct is cancelled
+        // by the time Brain calls execute, proving Brain calls use CancellationToken.None.
+        var brain = new CancellationTokenTrackingBrain(brainCallDelayMs: 200);
+        var goalStore = new ResumeFakeGoalStore();
+        var goal = CreateFailedGoal("resume-ct-none");
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var manager = new GoalPipelineManager();
+        var pipeline = CreateFailedPipeline(manager, goal);
+
+        var dispatcher = CreateResumeDispatcher(goalStore, manager, brain: brain, config: ConfigWithRepo());
+
+        // Use a ct that cancels after a short delay — by the time Brain calls execute,
+        // the HTTP ct will be cancelled, proving Brain calls use CancellationToken.None.
+        using var cts = new CancellationTokenSource();
+        cts.CancelAfter(TimeSpan.FromMilliseconds(50));
+
+        var result = await dispatcher.ResumeGoalAsync("resume-ct-none", 5, cts.Token);
+
+        Assert.True(result);
+
+        // The HTTP ct should be cancelled by now (brain calls took 200ms+ each).
+        Assert.True(cts.Token.IsCancellationRequested, "HTTP ct should be cancelled by the time Brain calls execute");
+
+        // But all Brain calls should have completed with CancellationToken.None.
+        Assert.True(brain.ForkSessionCalled);
+        Assert.True(brain.PlanIterationCalled);
+        Assert.True(brain.CraftPromptCalled);
+
+        // Every token passed to Brain methods must be CancellationToken.None (not cancellable).
+        Assert.All(brain.ForkSessionTokens, t => Assert.False(t.IsCancellationRequested,
+            "ForkSessionForGoalAsync token must NOT be the cancelled HTTP ct"));
+        Assert.All(brain.PlanIterationTokens, t => Assert.False(t.IsCancellationRequested,
+            "PlanIterationAsync token must NOT be the cancelled HTTP ct"));
+        Assert.All(brain.CraftPromptTokens, t => Assert.False(t.IsCancellationRequested,
+            "CraftPromptAsync token must NOT be the cancelled HTTP ct"));
+    }
+
+    [Fact]
     public async Task ResumeGoalAsync_FailedGoal_ResumesExecution()
     {
         var goalStore = new ResumeFakeGoalStore();
@@ -3508,6 +3623,83 @@ public sealed class GoalDispatcherResumeTests
         var queue = (System.Collections.Concurrent.ConcurrentQueue<string>)queueField.GetValue(dispatcher)!;
         Assert.Contains("resume-dispatch-fail", queue);
     }
+}
+
+/// <summary>
+/// Brain stub that captures the CancellationToken passed to each Brain call,
+/// so tests can assert that ResumeGoalAsync passes CancellationToken.None (not the HTTP ct).
+/// </summary>
+file sealed class CancellationTokenTrackingBrain : IDistributedBrain
+{
+    private readonly int _brainCallDelayMs;
+
+    public CancellationTokenTrackingBrain(int brainCallDelayMs = 0) => _brainCallDelayMs = brainCallDelayMs;
+
+    public List<CancellationToken> ForkSessionTokens { get; } = [];
+    public List<CancellationToken> PlanIterationTokens { get; } = [];
+    public List<CancellationToken> CraftPromptTokens { get; } = [];
+
+    public bool ForkSessionCalled => ForkSessionTokens.Count > 0;
+    public bool PlanIterationCalled => PlanIterationTokens.Count > 0;
+    public bool CraftPromptCalled => CraftPromptTokens.Count > 0;
+
+    public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
+    {
+        PlanIterationTokens.Add(ct);
+        if (_brainCallDelayMs > 0)
+            return Task.Delay(_brainCallDelayMs, CancellationToken.None).ContinueWith(_ => PlanResult.Success(IterationPlan.Default()), TaskContinuationOptions.ExecuteSynchronously);
+        return Task.FromResult(PlanResult.Success(IterationPlan.Default()));
+    }
+
+    public Task<PromptResult> CraftPromptAsync(
+        GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
+    {
+        CraftPromptTokens.Add(ct);
+        if (_brainCallDelayMs > 0)
+            return Task.Delay(_brainCallDelayMs, CancellationToken.None).ContinueWith(_ => PromptResult.Success($"Work on {pipeline.Description} as {phase}"), TaskContinuationOptions.ExecuteSynchronously);
+        return Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+    }
+
+    public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult<string?>(null);
+
+    public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct) =>
+        Task.CompletedTask;
+
+    public Task<BrainResponse> AskQuestionAsync(
+        string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+        Task.FromResult(BrainResponse.Answer("proceed"));
+
+    public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default)
+    {
+        ForkSessionTokens.Add(ct);
+        if (_brainCallDelayMs > 0)
+            return Task.Delay(_brainCallDelayMs, CancellationToken.None);
+        return Task.CompletedTask;
+    }
+
+    public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public bool GoalSessionExists(string goalId) => false;
+
+    public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
+
+    public BrainStats? GetStats() => null;
 }
 
 /// <summary>In-memory goal store for GoalDispatcher resume tests.</summary>
