@@ -79,10 +79,21 @@ public sealed class LlmSessionRegistryIntegrationTests
     /// <summary>Gets the private <c>_isStreaming</c> field value from a Composer.</summary>
     private static bool GetComposerIsStreaming(Composer composer)
     {
-        var field = typeof(Composer).GetField("_isStreaming",
+        var streamingService = GetComposerStreamingService(composer);
+        var field = streamingService.GetType().GetField("_isStreaming",
             BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("_isStreaming field not found on Composer");
-        return (bool)field.GetValue(composer)!;
+            ?? throw new InvalidOperationException("_isStreaming field not found on ComposerStreamingService");
+        return (bool)field.GetValue(streamingService)!;
+    }
+
+    /// <summary>Gets the private <c>_streamingService</c> instance from a Composer.</summary>
+    private static object GetComposerStreamingService(Composer composer)
+    {
+        var field = typeof(Composer).GetField("_streamingService",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("_streamingService field not found on Composer");
+        return field.GetValue(composer)
+            ?? throw new InvalidOperationException("_streamingService was null");
     }
 
     /// <summary>Populates a session with a system message plus <paramref name="count"/> user/assistant messages.</summary>

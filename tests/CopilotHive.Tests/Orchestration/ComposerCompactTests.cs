@@ -74,10 +74,11 @@ public sealed class ComposerCompactTests
     /// </summary>
     private static bool GetIsStreaming(Composer composer)
     {
-        var field = typeof(Composer).GetField("_isStreaming",
+        var streamingService = GetStreamingService(composer);
+        var field = streamingService.GetType().GetField("_isStreaming",
             BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("_isStreaming field not found on Composer");
-        return (bool)field.GetValue(composer)!;
+            ?? throw new InvalidOperationException("_isStreaming field not found on ComposerStreamingService");
+        return (bool)field.GetValue(streamingService)!;
     }
 
     /// <summary>
@@ -85,10 +86,21 @@ public sealed class ComposerCompactTests
     /// </summary>
     private static void SetIsStreaming(Composer composer, bool value)
     {
-        var field = typeof(Composer).GetField("_isStreaming",
+        var streamingService = GetStreamingService(composer);
+        var field = streamingService.GetType().GetField("_isStreaming",
             BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("_isStreaming field not found on Composer");
-        field.SetValue(composer, value);
+            ?? throw new InvalidOperationException("_isStreaming field not found on ComposerStreamingService");
+        field.SetValue(streamingService, value);
+    }
+
+    /// <summary>Gets the private <c>_streamingService</c> instance from a <see cref="Composer"/>.</summary>
+    private static object GetStreamingService(Composer composer)
+    {
+        var field = typeof(Composer).GetField("_streamingService",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("_streamingService field not found on Composer");
+        return field.GetValue(composer)
+            ?? throw new InvalidOperationException("_streamingService was null");
     }
 
     /// <summary>

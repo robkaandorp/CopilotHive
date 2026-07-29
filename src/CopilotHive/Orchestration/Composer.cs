@@ -30,6 +30,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly IHttpClientFactory? _httpClientFactory;
     private readonly string? _ollamaApiKey;
     private readonly ComposerAgentService _agentService;
+    private readonly ComposerStreamingService _streamingService;
 
     private readonly HiveConfigFile? _hiveConfig;
     private readonly string _systemPrompt;
@@ -46,20 +47,14 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <summary>Models the Composer can switch between at runtime.</summary>
     public IReadOnlyList<string> AvailableModels => _agentService.AvailableModels;
 
-    // Streaming state owned by the service (survives component navigation)
-    private string _streamingContent = "";
-    private bool _isStreaming;
-    private int _lastToolCalls;
-    private CancellationTokenSource? _streamCts;
-
     /// <summary>Whether the Composer is currently streaming a response.</summary>
-    public bool IsStreaming => _isStreaming;
+    public bool IsStreaming => _streamingService.IsStreaming;
 
     /// <summary>The accumulated streaming text (partial response in progress).</summary>
-    public string StreamingContent => _streamingContent;
+    public string StreamingContent => _streamingService.StreamingContent;
 
     /// <summary>Tool call count from the last completed response.</summary>
-    public int LastToolCalls => _lastToolCalls;
+    public int LastToolCalls => _streamingService.LastToolCalls;
 
     /// <summary>Whether context compaction is currently running.</summary>
     public bool IsCompacting { get; private set; }
@@ -314,6 +309,21 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 WasCompacted = true;
                 OnCompacted?.Invoke();
             });
+
+        _streamingService = new ComposerStreamingService(
+            _agentService,
+            _logger,
+            SaveSessionAsync,
+            RefreshComposerRegistry,
+            () => OnStreamingUpdate?.Invoke(),
+            () =>
+            {
+                IsCompacting = false;
+                WasCompacted = false;
+                var sessionFile = GetSessionFilePath();
+                if (File.Exists(sessionFile))
+                    File.Delete(sessionFile);
+            });
     }
 
     /// <summary>Whether the Composer has connected and is ready for streaming.</summary>
@@ -368,76 +378,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// </summary>
     public void SendMessage(string userMessage)
     {
-        if (_agentService.Agent is null)
-            throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
-        if (_isStreaming)
-            throw new InvalidOperationException("Composer is already streaming a response.");
-
-        _streamingContent = "";
-        _isStreaming = true;
-        _lastToolCalls = 0;
-        _streamCts = new CancellationTokenSource();
-
-        _ = RunStreamingAsync(userMessage, _streamCts.Token);
-    }
-
-    private async Task RunStreamingAsync(string userMessage, CancellationToken ct)
-    {
-        _logger.LogInformation("Composer streaming response for: {Message}",
-            userMessage.Length > 100 ? userMessage[..100] + "…" : userMessage);
-
-        try
-        {
-            RefreshComposerRegistry(status: "streaming");
-
-            await foreach (var update in _agentService.Agent!.ExecuteStreamingAsync(_agentService.Session, userMessage, ct))
-            {
-                switch (update.Kind)
-                {
-                    case StreamingUpdateKind.TextDelta:
-                        _streamingContent += update.Text;
-                        OnStreamingUpdate?.Invoke();
-                        break;
-
-                    case StreamingUpdateKind.Completed:
-                        _lastToolCalls = update.Result?.ToolCallCount ?? 0;
-                        break;
-                }
-            }
-
-            await SaveSessionAsync(ct);
-        }
-        catch (OperationCanceledException)
-        {
-            _logger.LogInformation("Composer streaming cancelled");
-        }
-        catch (Exception ex) when (IsContextOverflowError(ex))
-        {
-            _logger.LogWarning(ex, "Composer context overflow detected — resetting session");
-            _streamingContent += "\n\n⚠️ Context limit reached. Session has been reset automatically. Please repeat your request.";
-            _agentService.ResetSession();
-            IsCompacting = false;
-            WasCompacted = false;
-            var sessionFile = GetSessionFilePath();
-            if (File.Exists(sessionFile))
-                File.Delete(sessionFile);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Composer streaming failed");
-            _streamingContent += $"\n\n❌ Error: {ex.Message}";
-        }
-        finally
-        {
-            _isStreaming = false;
-            _streamCts?.Dispose();
-            _streamCts = null;
-
-            // Use current _session (not a captured ref) because overflow recovery may replace _session during streaming. If a reset/model-change runs while streaming, finally may overwrite — acceptable for monitoring view.
-            RefreshComposerRegistry(status: "idle");
-
-            OnStreamingUpdate?.Invoke();
-        }
+        _streamingService.SendMessage(userMessage);
     }
 
     /// <summary>
@@ -447,23 +388,14 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// </summary>
     /// <param name="ex">The exception to inspect.</param>
     /// <returns><c>true</c> when the exception indicates a context-window overflow.</returns>
-    internal static bool IsContextOverflowError(Exception? ex)
-    {
-        while (ex is not null)
-        {
-            if (ex.Message.Contains("model_max_prompt_tokens_exceeded", StringComparison.OrdinalIgnoreCase))
-                return true;
-            ex = ex.InnerException;
-        }
-        return false;
-    }
+    internal static bool IsContextOverflowError(Exception? ex) => ComposerStreamingService.IsContextOverflowError(ex);
 
     /// <summary>
     /// Cancels the current streaming response if one is in progress.
     /// </summary>
     public void CancelStreaming()
     {
-        _streamCts?.Cancel();
+        _streamingService.CancelStreaming();
     }
 
     /// <summary>
@@ -525,7 +457,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         if (_agentService.Agent is null)
             throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
 
-        if (_isStreaming)
+        if (_streamingService.IsStreaming)
             throw new InvalidOperationException("Cannot compact while streaming.");
 
         IsCompacting = true;
@@ -566,7 +498,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     {
         if (_agentService.Agent is null)
             throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
-        if (_isStreaming)
+        if (_streamingService.IsStreaming)
             throw new InvalidOperationException("Cannot compact while streaming.");
 
         IsCompacting = true;
@@ -889,6 +821,28 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
-        await _agentService.DisposeAsync();
+        Exception? disposeEx = null;
+        try
+        {
+            await _streamingService.DisposeAsync();
+        }
+        catch (Exception ex)
+        {
+            disposeEx = ex;
+        }
+        finally
+        {
+            try
+            {
+                await _agentService.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                disposeEx = disposeEx is null ? ex : new AggregateException(disposeEx, ex);
+            }
+        }
+
+        if (disposeEx is not null)
+            throw disposeEx;
     }
 }
