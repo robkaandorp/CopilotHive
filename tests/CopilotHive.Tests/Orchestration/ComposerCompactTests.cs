@@ -28,10 +28,10 @@ public sealed class ComposerCompactTests
     /// <summary>
     /// Uses reflection to inject a fake <see cref="IChatClient"/> into a
     /// <see cref="Composer"/> instance and then rebuilds its internal
-    /// <c>CodingAgent</c> by calling the private <c>RecreateAgent()</c> method.
+    /// <c>CodingAgent</c> by calling the private <c>RecreateAgentAsync()</c> method.
     /// Call this BEFORE <c>SendMessage</c> — no <c>ConnectAsync</c> call is needed.
     /// </summary>
-    private static void InjectFakeChatClient(Composer composer, IChatClient fakeClient)
+    private static async Task InjectFakeChatClient(Composer composer, IChatClient fakeClient)
     {
         var agentService = GetAgentService(composer);
         var serviceType = agentService.GetType();
@@ -41,10 +41,10 @@ public sealed class ComposerCompactTests
             ?? throw new InvalidOperationException("_chatClient field not found on ComposerAgentService");
         chatClientField.SetValue(agentService, fakeClient);
 
-        var recreateAgent = serviceType.GetMethod("RecreateAgent",
+        var recreateAgent = serviceType.GetMethod("RecreateAgentAsync",
             BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
-            ?? throw new InvalidOperationException("RecreateAgent method not found on ComposerAgentService");
-        recreateAgent.Invoke(agentService, null);
+            ?? throw new InvalidOperationException("RecreateAgentAsync method not found on ComposerAgentService");
+        await (Task)recreateAgent.Invoke(agentService, null)!;
     }
 
     /// <summary>
@@ -196,7 +196,7 @@ public sealed class ComposerCompactTests
                 store,
                 stateDir: tmpDir);
 
-            InjectFakeChatClient(composer, mockClient.Object);
+            await InjectFakeChatClient(composer, mockClient.Object);
 
             // Trigger streaming — it will fail quickly due to the throwing client.
             composer.SendMessage("test");
@@ -234,7 +234,7 @@ public sealed class ComposerCompactTests
     public async Task CompactSessionAsync_WithEnoughMessages_ReturnsTrueAndCompacts()
     {
         var composer = CreateComposerWithMockSummaryClient(out var mockClient);
-        InjectFakeChatClient(composer, mockClient.Object);
+        await InjectFakeChatClient(composer, mockClient.Object);
 
         var session = GetSession(composer);
         PopulateSession(session, 15); // 1 system + 15 user/assistant = 16 total, 15 non-system > 10+1
@@ -255,7 +255,7 @@ public sealed class ComposerCompactTests
     public async Task CompactSessionAsync_WithTooFewMessages_ReturnsFalse()
     {
         var composer = CreateComposerWithMockSummaryClient(out var mockClient);
-        InjectFakeChatClient(composer, mockClient.Object);
+        await InjectFakeChatClient(composer, mockClient.Object);
 
         var session = GetSession(composer);
         PopulateSession(session, 2); // 1 system + 2 user/assistant = 3 total, 2 non-system < 10+1
@@ -288,7 +288,7 @@ public sealed class ComposerCompactTests
                 It.IsAny<ChatOptions?>(),
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(new ChatResponse(new ChatMessage(ChatRole.Assistant, "summary")));
-        InjectFakeChatClient(composer, mockClient.Object);
+        await InjectFakeChatClient(composer, mockClient.Object);
 
         // Add enough messages to trigger compaction.
         var session = GetSession(composer);
@@ -326,7 +326,7 @@ public sealed class ComposerCompactTests
                 It.IsAny<ChatOptions?>(),
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(new ChatResponse(new ChatMessage(ChatRole.Assistant, "summary")));
-        InjectFakeChatClient(composer, mockClient.Object);
+        await InjectFakeChatClient(composer, mockClient.Object);
 
         // Do NOT add any messages — session starts empty (0 messages).
 
@@ -434,7 +434,7 @@ public sealed class ComposerCompactTests
                 store,
                 stateDir: tmpDir);
 
-            InjectFakeChatClient(composer, mockClient.Object);
+            await InjectFakeChatClient(composer, mockClient.Object);
 
             // Trigger streaming — it will fail quickly due to the throwing client.
             composer.SendMessage("test");
@@ -472,7 +472,7 @@ public sealed class ComposerCompactTests
     public async Task CompactOldestPercentAsync_WithEnoughMessages_ReturnsTrueAndCompacts()
     {
         var composer = CreateComposerWithMockSummaryClient(out var mockClient);
-        InjectFakeChatClient(composer, mockClient.Object);
+        await InjectFakeChatClient(composer, mockClient.Object);
 
         var session = GetSession(composer);
         // 1 system + 30 user/assistant = 31 total. 50% of 30 non-system messages
@@ -495,7 +495,7 @@ public sealed class ComposerCompactTests
     public async Task CompactOldestPercentAsync_WithTooFewMessages_ReturnsFalse()
     {
         var composer = CreateComposerWithMockSummaryClient(out var mockClient);
-        InjectFakeChatClient(composer, mockClient.Object);
+        await InjectFakeChatClient(composer, mockClient.Object);
 
         var session = GetSession(composer);
         PopulateSession(session, 2); // 1 system + 2 user/assistant = 3 total
@@ -528,7 +528,7 @@ public sealed class ComposerCompactTests
                 It.IsAny<ChatOptions?>(),
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(new ChatResponse(new ChatMessage(ChatRole.Assistant, "summary")));
-        InjectFakeChatClient(composer, mockClient.Object);
+        await InjectFakeChatClient(composer, mockClient.Object);
 
         // Add enough messages to trigger compaction.
         var session = GetSession(composer);
@@ -568,7 +568,7 @@ public sealed class ComposerCompactTests
                 It.IsAny<ChatOptions?>(),
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(new ChatResponse(new ChatMessage(ChatRole.Assistant, "summary")));
-        InjectFakeChatClient(composer, mockClient.Object);
+        await InjectFakeChatClient(composer, mockClient.Object);
 
         // Do NOT add any messages — session starts empty (0 messages).
 

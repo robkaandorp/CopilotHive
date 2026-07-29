@@ -6,6 +6,7 @@ using CopilotHive.Shared.AI;
 using Microsoft.Extensions.AI;
 
 using SharpCoder;
+using SharpCoder.SubAgents;
 
 using System.Text.Json;
 
@@ -31,7 +32,9 @@ internal sealed class ComposerAgentService(
     LlmSessionRegistry? sessionRegistry,
     IReadOnlyList<string> startupAvailableModels,
     Action? onCompacting,
-    Action<CompactionResult>? onCompacted) : IAsyncDisposable
+    Action<CompactionResult>? onCompacted,
+    bool subAgentsEnabled,
+    IReadOnlyList<ModelEntry> subAgentModels) : IAsyncDisposable
 {
     private string _model = model;
     private int _maxContextTokens = maxContextTokens;
@@ -49,12 +52,28 @@ internal sealed class ComposerAgentService(
     private readonly IReadOnlyList<string> _startupAvailableModels = startupAvailableModels;
     private readonly Action? _onCompacting = onCompacting;
     private readonly Action<CompactionResult>? _onCompacted = onCompacted;
+    private readonly bool _subAgentsEnabled = subAgentsEnabled;
+
+    /// <summary>
+    /// Immutable construction-time snapshot of the sub-agent model catalog. Deliberately NOT read
+    /// from <c>_hiveConfig</c>, which is a mutable singleton live-updated by config reloads — a
+    /// reload must never desynchronise the already-appended sub-agent prompt section from the
+    /// catalog handed to <see cref="SubAgentOptions"/>.
+    /// </summary>
+    private readonly IReadOnlyList<ModelEntry> _subAgentModels = subAgentModels;
 
     private IChatClient? _chatClient;
     private IChatClient? _compactionChatClient;
     private CodingAgent? _agent;
     private AgentSession _session = AgentSession.Create("composer");
     private AgentOptions? _agentOptions;
+
+    /// <summary>
+    /// Invoked immediately before each <see cref="CodingAgent.DisposeAsync"/> call.
+    /// If the hook throws, the exception is captured and rethrown (or aggregated with a
+    /// disposal failure) after agent disposal completes.
+    /// </summary>
+    internal Action<CodingAgent>? OnAgentDisposing;
 
     /// <summary>The active chat client, or <c>null</c> when not connected.</summary>
     public IChatClient? ChatClient => _chatClient;
@@ -68,7 +87,7 @@ internal sealed class ComposerAgentService(
     /// <summary>The agent options used to build the current agent.</summary>
     /// <exception cref="InvalidOperationException">Thrown when the agent has not been created yet.</exception>
     public AgentOptions AgentOptions => _agentOptions
-        ?? throw new InvalidOperationException("AgentOptions not yet created. Call ConnectAsync or RecreateAgent first.");
+        ?? throw new InvalidOperationException("AgentOptions not yet created. Call ConnectAsync or RecreateAgentAsync first.");
 
     /// <summary>Whether both the chat client and the agent exist.</summary>
     public bool IsConnected => _chatClient is not null && _agent is not null;
@@ -98,22 +117,71 @@ internal sealed class ComposerAgentService(
     private string GetSessionFilePath() => Path.Combine(_stateDir, "composer-session.json");
 
     /// <summary>
-    /// Clears all connection state first, then disposes both distinct clients.
-    /// Both clients are attempted even if one throws; the same instance is disposed only once.
-    /// Any disposal failure is re-thrown after cleanup completes.
+    /// Disposes the old agent asynchronously, invoking <see cref="OnAgentDisposing"/> first.
+    /// If the hook throws, the exception is captured — agent disposal is still attempted —
+    /// and the captured exception is rethrown after disposal completes.
+    /// </summary>
+    private async Task DisposeAgentAsync(CodingAgent? agent)
+    {
+        if (agent is null)
+            return;
+
+        Exception? hookEx = null;
+        try
+        {
+            OnAgentDisposing?.Invoke(agent);
+        }
+        catch (Exception ex)
+        {
+            hookEx = ex;
+        }
+
+        try
+        {
+            await agent.DisposeAsync();
+        }
+        catch (Exception disposeEx)
+        {
+            if (hookEx is not null)
+                throw new AggregateException(hookEx, disposeEx);
+            throw;
+        }
+
+        if (hookEx is not null)
+            throw hookEx;
+    }
+
+    /// <summary>
+    /// Disposes the old agent first, then clears all connection state and disposes both clients.
+    /// Agent disposal invokes <see cref="OnAgentDisposing"/>. Client disposal proceeds even if
+    /// agent disposal throws. Both clients are attempted even if one throws; the same instance is
+    /// disposed only once. Any disposal failure is re-thrown after cleanup completes.
     /// </summary>
     private async ValueTask DisposeClientsAndClearStateAsync()
     {
+        var oldAgent = _agent;
         var main = _chatClient;
         var compaction = _compactionChatClient;
 
         // Clear state BEFORE disposal so no stale references survive a disposal failure.
-        _chatClient = null;
-        _compactionChatClient = null;
         _agent = null;
         _agentOptions = null;
+        _chatClient = null;
+        _compactionChatClient = null;
 
-        Exception? disposeEx = null;
+        Exception? agentEx = null;
+        try
+        {
+            await DisposeAgentAsync(oldAgent);
+        }
+        catch (Exception ex)
+        {
+            agentEx = ex;
+        }
+
+        // Clients are disposed even when agent disposal threw — the agent failure is captured
+        // above and re-thrown (aggregated) only after all client disposals are attempted.
+        Exception? clientEx = null;
 
         if (main is not null)
         {
@@ -123,7 +191,7 @@ internal sealed class ComposerAgentService(
             }
             catch (Exception ex)
             {
-                disposeEx = ex;
+                clientEx = ex;
             }
         }
 
@@ -135,17 +203,22 @@ internal sealed class ComposerAgentService(
             }
             catch (Exception ex)
             {
-                disposeEx = disposeEx is null ? ex : new AggregateException(disposeEx, ex);
+                clientEx = clientEx is null ? ex : new AggregateException(clientEx, ex);
             }
         }
 
-        if (disposeEx is not null)
-            throw disposeEx;
+        // Aggregate failures — agent first, then client.
+        if (agentEx is not null && clientEx is not null)
+            throw new AggregateException(agentEx, clientEx);
+        if (agentEx is not null)
+            throw agentEx;
+        if (clientEx is not null)
+            throw clientEx;
     }
 
     /// <summary>
-    /// Same as <see cref="DisposeClientsAndClearStateAsync"/> but swallows (and logs) disposal
-    /// failures. Used on failure paths so the original exception is never masked.
+    /// Same as <see cref="DisposeClientsAndClearStateAsync"/> but swallows (and logs) agent and
+    /// client disposal failures. Used on failure paths so the original exception is never masked.
     /// </summary>
     private async ValueTask SafeDisposeClientsAndClearStateAsync()
     {
@@ -174,6 +247,8 @@ internal sealed class ComposerAgentService(
     {
         _logger.LogInformation("Composer connecting with model '{Model}'…", _model);
 
+        // Reconnect: dispose old agent + clients. Operation-failure cleanup via SafeDispose in
+        // catch blocks logs failures.
         await DisposeClientsAndClearStateAsync();
 
         try
@@ -184,6 +259,8 @@ internal sealed class ComposerAgentService(
         }
         catch
         {
+            // Failed client creation: safe cleanup logs failures so the original exception
+            // propagates. The hook fires only if an old agent exists.
             await SafeDisposeClientsAndClearStateAsync();
             throw;
         }
@@ -221,7 +298,7 @@ internal sealed class ComposerAgentService(
 
         try
         {
-            RecreateAgent();
+            await RecreateAgentAsync();
         }
         catch
         {
@@ -256,6 +333,7 @@ internal sealed class ComposerAgentService(
 
         _logger.LogInformation("Switching Composer model from '{OldModel}' to '{NewModel}'", _model, newModel);
 
+        // Model switch: dispose old agent + clients before creating new ones.
         await DisposeClientsAndClearStateAsync();
 
         _model = newModel;
@@ -287,10 +365,12 @@ internal sealed class ComposerAgentService(
                 _compactionChatClient = CreateClient(_compactionModel);
 
             // Session is preserved — do NOT reload from file.
-            RecreateAgent();
+            await RecreateAgentAsync();
         }
         catch
         {
+            // Failed new client creation: safe cleanup logs failures so the original
+            // exception propagates.
             await SafeDisposeClientsAndClearStateAsync();
             throw;
         }
@@ -310,10 +390,17 @@ internal sealed class ComposerAgentService(
 
     /// <summary>Rebuilds <see cref="AgentOptions"/> and the <see cref="CodingAgent"/>. Preserves the session.</summary>
     /// <exception cref="InvalidOperationException">Thrown when no chat client exists.</exception>
-    public void RecreateAgent()
+    public async Task RecreateAgentAsync()
     {
         if (_chatClient is null)
             throw new InvalidOperationException("Composer not connected");
+
+        // Agent-only replacement: client retained, only the old agent is disposed.
+        // Non-failure path: disposal failure MAY propagate.
+        var oldAgent = _agent;
+        _agent = null;
+        _agentOptions = null;
+        await DisposeAgentAsync(oldAgent);
 
         var workDir = _repoManager?.WorkDirectory ?? _stateDir;
 
@@ -345,6 +432,7 @@ internal sealed class ComposerAgentService(
                     r.TokensBefore, r.TokensAfter, r.ReductionPercent);
                 _onCompacted?.Invoke(r);
             },
+            SubAgents = BuildSubAgentOptions(),
         };
 
         _agent = new CodingAgent(_chatClient, _agentOptions);
@@ -353,17 +441,72 @@ internal sealed class ComposerAgentService(
             workDir, _repoManager is not null);
     }
 
+    /// <summary>
+    /// Builds sub-agent options when enabled, or <c>null</c> when disabled.
+    /// Sub-sessions inherit the parent's reasoning effort — reasoning suffixes are NOT applied
+    /// to the catalog model identifiers.
+    /// </summary>
+    private SubAgentOptions? BuildSubAgentOptions()
+    {
+        if (!_subAgentsEnabled || _repoManager is null)
+            return null;
+
+        // Construction-time snapshot, NOT the mutable _hiveConfig.
+        if (_subAgentModels is null || _subAgentModels.Count == 0)
+            return null;
+
+        var options = new SubAgentOptions
+        {
+            MaxConcurrentSubAgents = 4,
+            DefaultTimeout = TimeSpan.FromMinutes(5),
+            MaxTimeout = TimeSpan.FromMinutes(15),
+            MaxSummaryChars = 8_000,
+            ClientFactory = modelId => CreateClient(modelId),
+            DefaultClient = null,
+            // Sub-agents are read-only: no bash, no writes, no skills.
+            DefaultEnableBash = false,
+            DefaultEnableFileOps = true,
+            DefaultEnableFileWrites = false,
+            DefaultEnableSkills = false,
+        };
+
+        foreach (var entry in _subAgentModels)
+        {
+            options.AvailableModels.Add(new SubAgentModelInfo(
+                entry.Name,
+                entry.ContextWindow is int cw ? $"Configured model, {cw / 1000}K context window" : "Configured model",
+                entry.ContextWindow));
+        }
+
+        return options;
+    }
+
     /// <summary>Replaces the session with a fresh one and rebuilds the agent.</summary>
     /// <exception cref="InvalidOperationException">Thrown when no chat client exists.</exception>
-    public void ResetSession()
+    public async Task ResetSessionAsync()
     {
         if (_chatClient is null)
             throw new InvalidOperationException("Composer not connected");
 
+        // Agent-only replacement: client retained, only the old agent is disposed.
+        // Non-failure path: disposal failure MAY propagate.
+        var oldAgent = _agent;
+        _agent = null;
+        _agentOptions = null;
+        await DisposeAgentAsync(oldAgent);
+
         _session = AgentSession.Create("composer");
-        RecreateAgent();
+
+        // _agent is already null, so RecreateAgentAsync's own disposal step is a no-op; it
+        // simply builds the new agent over the freshly created session.
+        await RecreateAgentAsync();
     }
 
     /// <inheritdoc />
-    public async ValueTask DisposeAsync() => await DisposeClientsAndClearStateAsync();
+    public async ValueTask DisposeAsync()
+    {
+        // Shutdown: dispose agent first, then clients.
+        // Non-failure path: disposal failure MAY propagate.
+        await DisposeClientsAndClearStateAsync();
+    }
 }

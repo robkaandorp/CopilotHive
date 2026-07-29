@@ -29,9 +29,9 @@ public sealed class ComposerStreamingServiceTests
     /// <summary>
     /// Uses reflection to inject a fake <see cref="IChatClient"/> into a
     /// <see cref="Composer"/> instance and then rebuilds its internal
-    /// <c>CodingAgent</c> by calling <c>RecreateAgent()</c>.
+    /// <c>CodingAgent</c> by calling <c>RecreateAgentAsync()</c>.
     /// </summary>
-    private static void InjectFakeChatClient(Composer composer, IChatClient fakeClient)
+    private static async Task InjectFakeChatClient(Composer composer, IChatClient fakeClient)
     {
         var agentService = GetAgentService(composer);
         var serviceType = agentService.GetType();
@@ -40,10 +40,10 @@ public sealed class ComposerStreamingServiceTests
             ?? throw new InvalidOperationException("_chatClient field not found on ComposerAgentService");
         chatClientField.SetValue(agentService, fakeClient);
 
-        var recreateAgent = serviceType.GetMethod("RecreateAgent",
+        var recreateAgent = serviceType.GetMethod("RecreateAgentAsync",
             PrivateFlags | BindingFlags.Public)
-            ?? throw new InvalidOperationException("RecreateAgent method not found on ComposerAgentService");
-        recreateAgent.Invoke(agentService, null);
+            ?? throw new InvalidOperationException("RecreateAgentAsync method not found on ComposerAgentService");
+        await (Task)recreateAgent.Invoke(agentService, null)!;
     }
 
     /// <summary>Gets the private <c>_agentService</c> instance from a <see cref="Composer"/>.</summary>
@@ -255,7 +255,7 @@ public sealed class ComposerStreamingServiceTests
         {
             (composer, dbContext) = CreateComposer(tmpDir);
             blockingClient = new BlockingStreamingClient();
-            InjectFakeChatClient(composer, blockingClient);
+            await InjectFakeChatClient(composer, blockingClient);
 
             var streamingService = GetStreamingService(composer);
 
@@ -298,7 +298,7 @@ public sealed class ComposerStreamingServiceTests
         {
             (composer, dbContext) = CreateComposer(tmpDir);
             var blockingClient = new BlockingStreamingClient();
-            InjectFakeChatClient(composer, blockingClient);
+            await InjectFakeChatClient(composer, blockingClient);
 
             var streamingService = GetStreamingService(composer);
             streamingService.SendMessage("hello");
@@ -333,7 +333,7 @@ public sealed class ComposerStreamingServiceTests
         {
             (composer, dbContext) = CreateComposer(tmpDir);
             var blockingClient = new BlockingStreamingClient();
-            InjectFakeChatClient(composer, blockingClient);
+            await InjectFakeChatClient(composer, blockingClient);
 
             var streamingService = GetStreamingService(composer);
             streamingService.SendMessage("hello");
@@ -384,7 +384,7 @@ public sealed class ComposerStreamingServiceTests
                     It.IsAny<CancellationToken>()))
                 .ThrowsAsync(overflowEx);
 
-            InjectFakeChatClient(composer, mockClient.Object);
+            await InjectFakeChatClient(composer, mockClient.Object);
 
             var streamingService = GetStreamingService(composer);
 
@@ -446,7 +446,7 @@ public sealed class ComposerStreamingServiceTests
                     It.IsAny<CancellationToken>()))
                 .ThrowsAsync(genericEx);
 
-            InjectFakeChatClient(composer, mockClient.Object);
+            await InjectFakeChatClient(composer, mockClient.Object);
 
             var streamingService = GetStreamingService(composer);
             streamingService.SendMessage("hello");
@@ -479,7 +479,7 @@ public sealed class ComposerStreamingServiceTests
         {
             (composer, dbContext) = CreateComposer(tmpDir);
             var blockingClient = new BlockingStreamingClient();
-            InjectFakeChatClient(composer, blockingClient);
+            await InjectFakeChatClient(composer, blockingClient);
 
             var streamingService = GetStreamingService(composer);
             streamingService.SendMessage("hello");
@@ -521,7 +521,7 @@ public sealed class ComposerStreamingServiceTests
             // A blocking client keeps the stream alive so the "streaming" status can be observed
             // before the finally block flips it back to "idle".
             var blockingClient = new BlockingStreamingClient();
-            InjectFakeChatClient(composer, blockingClient);
+            await InjectFakeChatClient(composer, blockingClient);
 
             var streamingService = GetStreamingService(composer);
 
@@ -581,7 +581,7 @@ public sealed class ComposerStreamingServiceTests
             (composer, dbContext) = CreateComposer(tmpDir);
 
             var client = new StreamingTextClient("Hello world");
-            InjectFakeChatClient(composer, client);
+            await InjectFakeChatClient(composer, client);
 
             var streamingService = GetStreamingService(composer);
 
@@ -626,7 +626,7 @@ public sealed class ComposerStreamingServiceTests
             (composer, dbContext) = CreateComposer(tmpDir);
 
             var client = new StreamingTextClient("Save me");
-            InjectFakeChatClient(composer, client);
+            await InjectFakeChatClient(composer, client);
 
             var streamingService = GetStreamingService(composer);
 
@@ -667,7 +667,7 @@ public sealed class ComposerStreamingServiceTests
             (composer, dbContext) = CreateComposer(tmpDir);
 
             var client = new StreamingTextClient("Hello world");
-            InjectFakeChatClient(composer, client);
+            await InjectFakeChatClient(composer, client);
 
             var streamingService = GetStreamingService(composer);
 
@@ -760,7 +760,7 @@ public sealed class ComposerStreamingServiceTests
 
             // Inject a chat client so the agent service is "connected".
             var client = new StreamingTextClient("hello");
-            InjectFakeChatClient(composer, client);
+            await InjectFakeChatClient(composer, client);
             Assert.True(composer.IsConnected, "Composer should be connected after injecting chat client");
 
             // Get the streaming service and its internal _streamCts.
@@ -816,7 +816,7 @@ public sealed class ComposerStreamingServiceTests
             (composer, dbContext) = CreateComposer(tmpDir);
 
             // Connect the agent so the service is in a realistic state.
-            InjectFakeChatClient(composer, new StreamingTextClient("hello"));
+            await InjectFakeChatClient(composer, new StreamingTextClient("hello"));
 
             var streamingService = GetStreamingService(composer);
 
@@ -860,7 +860,7 @@ public sealed class ComposerStreamingServiceTests
             (composer, dbContext) = CreateComposer(tmpDir);
 
             var client = new StreamingTextClient("streamed text");
-            InjectFakeChatClient(composer, client);
+            await InjectFakeChatClient(composer, client);
 
             var streamingService = GetStreamingService(composer);
 
@@ -936,7 +936,7 @@ public sealed class ComposerStreamingServiceTests
         try
         {
             (composer, dbContext) = CreateComposer(tmpDir);
-            InjectFakeChatClient(composer, new StreamingTextClient("hello"));
+            await InjectFakeChatClient(composer, new StreamingTextClient("hello"));
 
             var streamingService = GetStreamingService(composer);
 

@@ -40,7 +40,7 @@ public sealed class LlmSessionRegistryIntegrationTests
         new(new Goal { Id = goalId, Description = description });
 
     /// <summary>Injects a fake chat client into a Composer and rebuilds its internal agent.</summary>
-    private static void InjectComposerChatClient(Composer composer, IChatClient fakeClient)
+    private static async Task InjectComposerChatClient(Composer composer, IChatClient fakeClient)
     {
         var agentService = GetComposerAgentService(composer);
         var serviceType = agentService.GetType();
@@ -50,10 +50,10 @@ public sealed class LlmSessionRegistryIntegrationTests
             ?? throw new InvalidOperationException("_chatClient field not found on ComposerAgentService");
         chatClientField.SetValue(agentService, fakeClient);
 
-        var recreateAgent = serviceType.GetMethod("RecreateAgent",
+        var recreateAgent = serviceType.GetMethod("RecreateAgentAsync",
             BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
-            ?? throw new InvalidOperationException("RecreateAgent method not found on ComposerAgentService");
-        recreateAgent.Invoke(agentService, null);
+            ?? throw new InvalidOperationException("RecreateAgentAsync method not found on ComposerAgentService");
+        await (Task)recreateAgent.Invoke(agentService, null)!;
     }
 
     /// <summary>Gets the private <c>_agentService</c> instance from a Composer.</summary>
@@ -1107,7 +1107,7 @@ public sealed class LlmSessionRegistryIntegrationTests
 
             // A streaming client that captures the composer's registry status while streaming.
             var streaming = new StatusCapturingStreamingChatClient(registry, "composer");
-            InjectComposerChatClient(composer, streaming);
+            await InjectComposerChatClient(composer, streaming);
 
             // Deterministic completion signal: OnStreamingUpdate fires in the streaming finally block
             // (after _isStreaming is set to false and the idle status is refreshed). Complete the TCS
@@ -1153,7 +1153,7 @@ public sealed class LlmSessionRegistryIntegrationTests
                 sessionRegistry: registry);
             await composer.ConnectAsync(TestContext.Current.CancellationToken);
 
-            InjectComposerChatClient(composer, new CannedReplyChatClient("Summary of conversation"));
+            await InjectComposerChatClient(composer, new CannedReplyChatClient("Summary of conversation"));
 
             var session = GetComposerSession(composer);
             PopulateSession(session, 15);
@@ -1186,7 +1186,7 @@ public sealed class LlmSessionRegistryIntegrationTests
                 sessionRegistry: registry);
             await composer.ConnectAsync(TestContext.Current.CancellationToken);
 
-            InjectComposerChatClient(composer, new CannedReplyChatClient("Summary of conversation"));
+            await InjectComposerChatClient(composer, new CannedReplyChatClient("Summary of conversation"));
 
             var session = GetComposerSession(composer);
             PopulateSession(session, 30);

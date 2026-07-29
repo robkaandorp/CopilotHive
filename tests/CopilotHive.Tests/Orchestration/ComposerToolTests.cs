@@ -4528,11 +4528,11 @@ public sealed class ComposerToolTests : IDisposable
     /// <summary>
     /// Helper that uses reflection to inject a fake <see cref="IChatClient"/> into a
     /// <see cref="Composer"/> instance and then builds its internal <c>CodingAgent</c>
-    /// by calling the private <c>RecreateAgent()</c> method.  Call this BEFORE
+    /// by calling the private <c>RecreateAgentAsync()</c> method.  Call this BEFORE
     /// <c>SendMessage</c> — no <c>ConnectAsync</c> call is needed, making the test
     /// fully hermetic (no real LLM endpoint required).
     /// </summary>
-    private static void InjectFakeChatClient(Composer composer, IChatClient fakeClient)
+    private static async Task InjectFakeChatClient(Composer composer, IChatClient fakeClient)
     {
         const System.Reflection.BindingFlags flags =
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
@@ -4548,9 +4548,9 @@ public sealed class ComposerToolTests : IDisposable
             ?? throw new InvalidOperationException("_chatClient field not found on ComposerAgentService");
         chatClientField.SetValue(agentService, fakeClient);
 
-        var recreateAgent = serviceType.GetMethod("RecreateAgent", flags | System.Reflection.BindingFlags.Public)
-            ?? throw new InvalidOperationException("RecreateAgent method not found on ComposerAgentService");
-        recreateAgent.Invoke(agentService, null);
+        var recreateAgent = serviceType.GetMethod("RecreateAgentAsync", flags | System.Reflection.BindingFlags.Public)
+            ?? throw new InvalidOperationException("RecreateAgentAsync method not found on ComposerAgentService");
+        await (Task)recreateAgent.Invoke(agentService, null)!;
     }
 
     [Fact]
@@ -4593,7 +4593,7 @@ public sealed class ComposerToolTests : IDisposable
                     It.IsAny<CancellationToken>()))
                 .ThrowsAsync(overflowEx);
 
-            InjectFakeChatClient(composer, mockClient.Object);
+            await InjectFakeChatClient(composer, mockClient.Object);
 
             // The session file exists before we trigger the overflow
             Assert.True(File.Exists(sessionFile));
@@ -4663,7 +4663,7 @@ public sealed class ComposerToolTests : IDisposable
                     It.IsAny<CancellationToken>()))
                 .ThrowsAsync(overflowEx);
 
-            InjectFakeChatClient(composer, mockClient.Object);
+            await InjectFakeChatClient(composer, mockClient.Object);
 
             // Act: trigger the streaming path
             composer.SendMessage("hello");

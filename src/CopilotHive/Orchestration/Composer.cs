@@ -197,6 +197,29 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - One commit per logical change — do not bundle unrelated AGENTS.md updates
         """;
 
+    private const string SubAgentsSystemPromptSection = """
+
+
+        ## Sub-Agents
+        You can delegate self-contained exploration and verification subtasks to background sub-sessions.
+        Only a summary of the sub-session's work returns to you — your own context stays lean.
+
+        Sub-agent tools:
+        - start_sub_agent(prompt, model?, timeout_seconds?) — launch a background sub-session with a self-contained prompt
+        - await_sub_agents() — wait for all running sub-agents to complete and receive their summaries
+        - get_sub_agent_status(sub_agent_id) — check the status of a specific sub-agent
+        - list_sub_agent_models() — list the models available to sub-agents
+
+        When to use sub-agents:
+        - Prefer start_sub_agent over many sequential read/grep/glob calls when you need a thorough digest of a codebase area
+        - Use them for verification sweeps (e.g. "check all callers of method X") — the summary returns findings without bloating your context
+        - Keep sub-agent prompts self-contained — sub-sessions cannot see your conversation history
+
+        Sub-agent limitations (read-only):
+        - Sub-sessions have file read/grep/glob tools ONLY — no bash, no writes, no composer tools (web search, git, knowledge graph)
+        - Sub-sessions are read-only and cannot modify any files
+        """;
+
     private const string KnowledgeGraphSystemPromptSection = """
 
 
@@ -288,6 +311,17 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         if (_knowledgeGraph is not null)
             _systemPrompt += KnowledgeGraphSystemPromptSection;
 
+        // Construction-time snapshot: sub-agents need a model catalog and repo file access.
+        bool subAgentsEnabled = _hiveConfig?.Models?.AvailableModels is { Count: > 0 } && _repoManager is not null;
+
+        // Snapshot the catalog now — _hiveConfig is a mutable singleton that config reloads
+        // live-update, and the prompt section appended below is fixed for the process lifetime.
+        IReadOnlyList<ModelEntry> subAgentModels =
+            _hiveConfig?.Models?.AvailableModels?.ToList().AsReadOnly() ?? (IReadOnlyList<ModelEntry>)[];
+
+        if (subAgentsEnabled)
+            _systemPrompt += SubAgentsSystemPromptSection;
+
         _composerTools = BuildComposerTools();
 
         _agentService = new ComposerAgentService(
@@ -308,7 +342,9 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 IsCompacting = false;
                 WasCompacted = true;
                 OnCompacted?.Invoke();
-            });
+            },
+            subAgentsEnabled,
+            subAgentModels);
 
         _streamingService = new ComposerStreamingService(
             _agentService,
@@ -403,7 +439,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// </summary>
     public async Task ResetSessionAsync(CancellationToken ct = default)
     {
-        _agentService.ResetSession();
+        await _agentService.ResetSessionAsync();
         IsCompacting = false;
         WasCompacted = false;
 
@@ -534,7 +570,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         }
     }
 
-    private void RecreateAgent() => _agentService.RecreateAgent();
+    private async Task RecreateAgentAsync() => await _agentService.RecreateAgentAsync();
 
     internal List<AITool> BuildComposerTools()
     {

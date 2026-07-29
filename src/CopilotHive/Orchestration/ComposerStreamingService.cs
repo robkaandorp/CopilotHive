@@ -94,7 +94,7 @@ internal sealed class ComposerStreamingService(
         {
             logger.LogWarning(ex, "Composer context overflow detected — resetting session");
             _streamingContent += "\n\n⚠️ Context limit reached. Session has been reset automatically. Please repeat your request.";
-            agentService.ResetSession();
+            await agentService.ResetSessionAsync();
             onOverflowRecovery?.Invoke();
         }
         catch (Exception ex)
