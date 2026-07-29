@@ -66,12 +66,20 @@ file sealed class DashboardLogger(string category, DashboardLogSink sink) : ILog
     {
         if (!IsEnabled(logLevel)) return;
 
+        var message = formatter(state, exception);
+        if (exception is not null)
+        {
+            message += $"\n{exception.GetType().Name}: {exception.Message}";
+            if (exception.InnerException is not null)
+                message += $"\nInner: {exception.InnerException.GetType().Name}: {exception.InnerException.Message}";
+        }
+
         sink.Add(new LogEntry
         {
             Timestamp = DateTime.UtcNow,
             Level = logLevel,
             Category = SimplifyCategory(category),
-            Message = formatter(state, exception),
+            Message = message,
         });
     }
 
