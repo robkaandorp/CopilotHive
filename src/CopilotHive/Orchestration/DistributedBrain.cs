@@ -70,6 +70,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly IChatClient? _injectedChatClient;
 
     private string _systemPrompt;
+    private readonly IReadOnlyList<SubAgentModelEntry>? _subAgentModels;
+    private readonly bool _subAgentsEnabled;
     private readonly AgentsManager? _agentsManager;
 
     /// <summary>Serialises brain lifecycle transitions (connect, reset, dispose).</summary>
@@ -111,10 +113,16 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(modelOverride);
         _reasoningEffort = reasoning;
 
+        var availableModels = _hiveConfig?.Models?.AvailableModels;
+        _subAgentModels = availableModels is null || availableModels.Count == 0
+            ? null
+            : availableModels.Select(m => new SubAgentModelEntry(m.Name, m.ContextWindow)).ToList();
+        _subAgentsEnabled = _subAgentModels is not null && _subAgentModels.Count > 0;
+
         var orchestratorInstructions = agentsManager?.GetAgentsMd(WorkerRole.Orchestrator) ?? "";
         _systemPrompt = string.IsNullOrWhiteSpace(orchestratorInstructions)
-            ? DefaultSystemPrompt
-            : $"{DefaultSystemPrompt}\n\n{orchestratorInstructions}";
+            ? BrainPromptBuilder.BuildSystemPrompt(_subAgentsEnabled)
+            : $"{BrainPromptBuilder.BuildSystemPrompt(_subAgentsEnabled)}\n\n{orchestratorInstructions}";
     }
 
     /// <summary>Starts the brain actor, which owns the master session and all per-goal sessions. Idempotent.</summary>
@@ -237,7 +245,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     workDirectory: _repoManager?.WorkDirectory,
                     goalStore: _goalStore,
                     knowledgeGraph: _knowledgeGraph,
-                    sessionRegistry: _sessionRegistry);
+                    sessionRegistry: _sessionRegistry,
+                    subAgentModels: _subAgentModels,
+                    subAgentsEnabled: _subAgentsEnabled);
             actor.Start();
 
             var connectMsg = BrainActorMessages.CreateConnectMessage();
@@ -524,7 +534,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         if (!string.IsNullOrWhiteSpace(instructions))
         {
-            _systemPrompt = $"{DefaultSystemPrompt}\n\n{instructions}";
+            _systemPrompt = $"{BrainPromptBuilder.BuildSystemPrompt(_subAgentsEnabled)}\n\n{instructions}";
             _logger.LogInformation("Updated Brain system prompt with new orchestrator instructions ({Chars} chars)",
                 instructions.Length);
         }
@@ -929,8 +939,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
             var freshInstructions = _agentsManager?.GetAgentsMd(WorkerRole.Orchestrator) ?? "";
             _systemPrompt = string.IsNullOrWhiteSpace(freshInstructions)
-                ? DefaultSystemPrompt
-                : $"{DefaultSystemPrompt}\n\n{freshInstructions}";
+                ? BrainPromptBuilder.BuildSystemPrompt(_subAgentsEnabled)
+                : $"{BrainPromptBuilder.BuildSystemPrompt(_subAgentsEnabled)}\n\n{freshInstructions}";
 
             await ResetBrainActorAsync();
             _logger.LogInformation("Brain session reset — actor state cleared, orchestrator instructions reloaded from disk, and session files deleted.");
@@ -1050,3 +1060,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         // because ConnectAsync reads _disposing only after acquiring it.
     }
 }
+
+/// <summary>Immutable snapshot of a configured model available to Brain sub-agents.</summary>
+internal sealed record SubAgentModelEntry(string Name, int? ContextWindow);

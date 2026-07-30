@@ -1,6 +1,7 @@
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Knowledge;
+using CopilotHive.Orchestration;
 using CopilotHive.Goals;
 using CopilotHive.Services;
 using CopilotHive.Shared.AI;
@@ -9,6 +10,7 @@ using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 
 using SharpCoder;
+using SharpCoder.SubAgents;
 
 namespace CopilotHive.Actors;
 
@@ -36,6 +38,8 @@ internal sealed class BrainActor : Actor<IBrainMessage>
     private readonly IGoalStore? _goalStore;
     private readonly KnowledgeGraph? _knowledgeGraph;
     private readonly LlmSessionRegistry? _sessionRegistry;
+    private readonly IReadOnlyList<SubAgentModelEntry>? _subAgentModels;
+    private readonly bool _subAgentsEnabled;
     private ReasoningEffort? _reasoningEffort;
 
     private AgentSession? _masterSession;
@@ -60,7 +64,9 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         string? workDirectory = null,
         IGoalStore? goalStore = null,
         KnowledgeGraph? knowledgeGraph = null,
-        LlmSessionRegistry? sessionRegistry = null)
+        LlmSessionRegistry? sessionRegistry = null,
+        IReadOnlyList<SubAgentModelEntry>? subAgentModels = null,
+        bool subAgentsEnabled = false)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -77,6 +83,8 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         _goalStore = goalStore;
         _knowledgeGraph = knowledgeGraph;
         _sessionRegistry = sessionRegistry;
+        _subAgentModels = subAgentModels;
+        _subAgentsEnabled = subAgentsEnabled;
     }
 
     /// <inheritdoc />
@@ -339,6 +347,7 @@ internal sealed class BrainActor : Actor<IBrainMessage>
                     "BrainActor child compaction: {TokensBefore} -> {TokensAfter} tokens",
                     r.TokensBefore,
                     r.TokensAfter),
+                SubAgents = BuildSubAgentOptions(),
             };
 
             if (!string.IsNullOrEmpty(_workDirectory))
@@ -364,6 +373,41 @@ internal sealed class BrainActor : Actor<IBrainMessage>
 
             throw;
         }
+    }
+
+    /// <summary>
+    /// Builds the sub-agent options for child Brain sessions, or null when sub-agents are disabled.
+    /// </summary>
+    private SubAgentOptions? BuildSubAgentOptions()
+    {
+        if (!_subAgentsEnabled || _subAgentModels is null || _subAgentModels.Count == 0)
+        {
+            return null;
+        }
+
+        var options = new SubAgentOptions
+        {
+            MaxConcurrentSubAgents = 2,
+            DefaultTimeout = TimeSpan.FromMinutes(5),
+            MaxTimeout = TimeSpan.FromMinutes(15),
+            MaxSummaryChars = 8_000,
+            ClientFactory = modelId => _chatClientFactory(modelId),
+            DefaultClient = null,
+            DefaultEnableBash = false,
+            DefaultEnableFileOps = true,
+            DefaultEnableFileWrites = false,
+            DefaultEnableSkills = false,
+        };
+
+        foreach (var entry in _subAgentModels)
+        {
+            options.AvailableModels.Add(new SubAgentModelInfo(
+                entry.Name,
+                entry.ContextWindow is int cw ? $"Configured model, {cw / 1000}K context window" : "Configured model",
+                entry.ContextWindow));
+        }
+
+        return options;
     }
 
     /// <summary>

@@ -95,6 +95,7 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
                 ReasoningEffort = baseOptions.ReasoningEffort,
                 ShowToolCallsInStream = baseOptions.ShowToolCallsInStream,
                 CompactionMaxTokens = baseOptions.CompactionMaxTokens,
+                SubAgents = baseOptions.SubAgents,
                 CustomTools = _brainTools,
                 CompactionClient = compactionClient,
                 MaxContextTokens = maxContextTokens,
@@ -291,7 +292,7 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
         }
     }
 
-    /// <summary>Disposes owned chat clients exactly once, per the ownership rules.</summary>
+    /// <summary>Disposes the agent and owned chat clients exactly once, per the ownership rules.</summary>
     private void DisposeOwnedResources()
     {
         if (Interlocked.CompareExchange(ref _resourcesDisposed, 1, 0) != 0)
@@ -299,6 +300,29 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
             return;
         }
 
+        // CodingAgent is sealed and implements only IAsyncDisposable.
+        // The actor's message loop runs on TaskScheduler.Default (no SynchronizationContext),
+        // so blocking here cannot deadlock. The try/finally ensures clients are disposed
+        // even if CodingAgent.DisposeAsync throws.
+        if (CodingAgent is not null)
+        {
+            try
+            {
+                CodingAgent.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }
+            finally
+            {
+                DisposeClients();
+            }
+        }
+        else
+        {
+            DisposeClients();
+        }
+    }
+
+    private void DisposeClients()
+    {
         if (!_compactionIsChatClient && _compactionClient is not null)
         {
             try { _compactionClient.Dispose(); }
@@ -313,10 +337,23 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
     }
 
     /// <inheritdoc />
-    protected override Task OnShutdownAsync()
+    protected override async Task OnShutdownAsync()
     {
-        DisposeOwnedResources();
-        return Task.CompletedTask;
+        if (CodingAgent is not null)
+        {
+            try
+            {
+                await CodingAgent.DisposeAsync();
+            }
+            finally
+            {
+                DisposeOwnedResources();
+            }
+        }
+        else
+        {
+            DisposeOwnedResources();
+        }
     }
 
     /// <inheritdoc />

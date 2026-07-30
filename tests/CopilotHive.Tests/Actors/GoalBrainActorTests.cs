@@ -1134,6 +1134,150 @@ public class GoalBrainActorTests
         finally { DeleteTempPath(dir); }
     }
 
+    // ── Sub-agent wiring: options copy + disposal ordering ──
+
+    /// <summary>Chat client that records whether the coding agent was already disposed when it was disposed.</summary>
+    private sealed class OrderTrackingChatClient : IChatClient
+    {
+        private Func<bool>? _agentDisposedProbe;
+
+        internal void BindProbe(Func<bool> probe) => _agentDisposedProbe = probe;
+
+        internal bool WasDisposed { get; private set; }
+
+        internal bool? AgentDisposedWhenClientDisposed { get; private set; }
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+            => Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "ok")));
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose()
+        {
+            AgentDisposedWhenClientDisposed ??= _agentDisposedProbe?.Invoke();
+            WasDisposed = true;
+        }
+    }
+
+    private static bool IsAgentDisposed(CodingAgent agent) =>
+        (int)typeof(CodingAgent)
+            .GetField("_disposed", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(agent)! != 0;
+
+    [Fact]
+    public async Task Constructor_CopiesSubAgentOptionsReferenceFromBaseOptions()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var subAgents = new SharpCoder.SubAgents.SubAgentOptions { MaxConcurrentSubAgents = 2 };
+            var options = CreateBaseOptions(dir);
+            options.SubAgents = subAgents;
+
+            await using var actor = CreateActor(dir, FakeChatClient.Text("unused"), baseOptions: options);
+
+            Assert.Same(subAgents, GetConfiguredOptions(actor).SubAgents);
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task Constructor_WhenBaseOptionsHaveNoSubAgents_ConfiguredSubAgentsIsNull()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir, FakeChatClient.Text("unused"));
+            Assert.Null(GetConfiguredOptions(actor).SubAgents);
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task DisposeAsync_AfterStart_DisposesAgentBeforeChatClient()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var client = new OrderTrackingChatClient();
+            var actor = CreateActor(dir, client);
+            client.BindProbe(() => IsAgentDisposed(actor.CodingAgent));
+            actor.Start();
+
+            await actor.DisposeAsync();
+
+            Assert.True(client.WasDisposed);
+            Assert.True(client.AgentDisposedWhenClientDisposed,
+                "The coding agent must be disposed before the owned chat client.");
+            Assert.True(IsAgentDisposed(actor.CodingAgent));
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public async Task DisposeAsync_WithoutStart_DisposesAgentBeforeClients()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var client = new OrderTrackingChatClient();
+            var compaction = FakeChatClient.Text("c");
+            var actor = CreateActor(dir, client, compactionClient: compaction);
+            client.BindProbe(() => IsAgentDisposed(actor.CodingAgent));
+
+            // Never started → OnUnstartedDispose path.
+            await actor.DisposeAsync();
+
+            Assert.True(client.WasDisposed);
+            Assert.True(compaction.WasDisposed);
+            Assert.True(client.AgentDisposedWhenClientDisposed,
+                "The coding agent must be disposed before the owned chat client on the unstarted path.");
+            Assert.True(IsAgentDisposed(actor.CodingAgent));
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
+    public void Constructor_WhenConstructionFailsBeforeAgentExists_DisposesClientsWithoutThrowingFromNullAgent()
+    {
+        var dir = CreateTempDir();
+        var chat = FakeChatClient.Text("hi");
+        var compaction = FakeChatClient.Text("c");
+        try
+        {
+            // stateDir null → Path.Combine throws before `new CodingAgent`, so CodingAgent is null
+            // when DisposeOwnedResources runs from the constructor catch block.
+            var ex = Assert.Throws<ArgumentNullException>(() => new GoalBrainActor(
+                "goal-x", AgentSession.Create("s"), chat, ownsChatClient: true, compaction,
+                CreateBaseOptions(dir), "test-model", 100_000, null!, null, NullLogger<GoalBrainActor>.Instance));
+
+            Assert.IsType<ArgumentNullException>(ex);
+            Assert.Equal(1, chat.DisposeCallCount);
+            Assert.Equal(1, compaction.DisposeCallCount);
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
     [Fact]
     public async Task GetGoalTool_PipelineResolverTimesOut_ReportsPipelineNotActive()
     {

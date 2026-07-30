@@ -12,6 +12,20 @@ namespace CopilotHive.Orchestration;
 public static class BrainPromptBuilder
 {
     /// <summary>
+    /// Builds the Brain system prompt, optionally appending sub-agent planning guidance.
+    /// </summary>
+    internal static string BuildSystemPrompt(bool subAgentsEnabled)
+    {
+        var prompt = DefaultSystemPrompt;
+        if (subAgentsEnabled)
+        {
+            prompt += "\n\nSUB-AGENT PLANNING:\nWhen planning an iteration that requires reading many files, delegate the exploration to a start_sub_agent sub-session and plan from its summary, rather than reading each file into your own context.";
+        }
+
+        return prompt;
+    }
+
+    /// <summary>
     /// The default system prompt for the Brain LLM.
     /// Kept here so it can be referenced by <see cref="DistributedBrain"/> as a constant alias.
     /// </summary>
