@@ -116,4 +116,40 @@ public sealed class ComposerSubAgentSnapshotTests : IDisposable
         Assert.Equal("curated", entry.Name);
         Assert.Equal("Curated pick", entry.Description);
     }
+
+    [Fact]
+    public async Task Composer_CuratedEntryWithMatchingAvailable_MergesContextWindow()
+    {
+        var hiveConfig = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "ollama-cloud/glm-5.2", ContextWindow = 976000 },
+                ],
+                SubAgentModels =
+                [
+                    new ModelEntry { Name = "ollama-cloud/glm-5.2" },
+                ],
+            }
+        };
+
+        var repoManager = new Mock<IBrainRepoManager>();
+        repoManager.SetupGet(r => r.WorkDirectory).Returns(Path.GetTempPath());
+
+        await using var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            repoManager: repoManager.Object,
+            stateDir: Path.GetTempPath(),
+            hiveConfig: hiveConfig,
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+        var entry = Assert.Single(GetSnapshot(composer));
+        Assert.Equal("ollama-cloud/glm-5.2", entry.Name);
+        // ContextWindow inherited from the matching available_models entry via GetSubAgentModels merge
+        Assert.Equal(976000, entry.ContextWindow);
+    }
 }

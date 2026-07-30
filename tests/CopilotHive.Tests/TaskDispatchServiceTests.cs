@@ -1006,6 +1006,40 @@ public sealed class TaskDispatchServiceTests
         return (service, pipeline, taskQueue);
     }
 
+    [Fact]
+    public async Task DispatchToRole_CuratedEntryWithMatchingAvailable_MergesContextWindow()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels =
+            [
+                new ModelEntry { Name = "ollama-cloud/glm-5.2", ContextWindow = 976000 },
+            ],
+            SubAgentModels =
+            [
+                new ModelEntry { Name = "ollama-cloud/glm-5.2" },
+            ],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        var entry = Assert.Single(capturedTask!.SubAgentModels);
+        Assert.Equal("ollama-cloud/glm-5.2", entry.Id);
+        // ContextWindow inherited from the matching available_models entry
+        Assert.Equal(976000, entry.ContextWindow);
+        // Auto-description is generated from the merged ContextWindow
+        Assert.Contains("976K context", entry.Description);
+    }
+
     /// <summary>
     /// Minimal <see cref="IGoalSource"/> that returns a single pre-configured goal.
     /// </summary>

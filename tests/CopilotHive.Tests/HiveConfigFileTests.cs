@@ -1497,4 +1497,152 @@ public sealed class HiveConfigFileTests
 
         Assert.Empty(config.GetSubAgentModels());
     }
+
+    [Fact]
+    public void GetSubAgentModels_MergesNullContextWindowFromAvailable()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "m", ContextWindow = 976000 }],
+                SubAgentModels = [new ModelEntry { Name = "m" }]
+            }
+        };
+
+        var result = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal(976000, result.ContextWindow);
+    }
+
+    [Fact]
+    public void GetSubAgentModels_MergesNullReasoningEffortFromAvailable()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "m", ReasoningEffort = "high" }],
+                SubAgentModels = [new ModelEntry { Name = "m" }]
+            }
+        };
+
+        var result = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal("high", result.ReasoningEffort);
+    }
+
+    [Fact]
+    public void GetSubAgentModels_MergesNullDescriptionFromAvailable()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "m", Description = "merged desc" }],
+                SubAgentModels = [new ModelEntry { Name = "m" }]
+            }
+        };
+
+        var result = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal("merged desc", result.Description);
+    }
+
+    [Fact]
+    public void GetSubAgentModels_KeepsCuratedContextWindowWhenSet()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "m", ContextWindow = 976000 }],
+                SubAgentModels = [new ModelEntry { Name = "m", ContextWindow = 128000 }]
+            }
+        };
+
+        var result = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal(128000, result.ContextWindow);
+    }
+
+    [Fact]
+    public void GetSubAgentModels_MatchesAvailableEntryCaseInsensitively()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "my-model", ContextWindow = 4000 }],
+                SubAgentModels = [new ModelEntry { Name = "My-Model" }]
+            }
+        };
+
+        var result = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal(4000, result.ContextWindow);
+    }
+
+    [Fact]
+    public void GetSubAgentModels_UnmatchedCuratedNameKeepsNulls()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "other", ContextWindow = 4000 }],
+                SubAgentModels = [new ModelEntry { Name = "unmatched" }]
+            }
+        };
+
+        var result = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal("unmatched", result.Name);
+        Assert.Null(result.ContextWindow);
+        Assert.Null(result.ReasoningEffort);
+        Assert.Null(result.Description);
+    }
+
+    [Fact]
+    public void GetSubAgentModels_DoesNotMutateSourceLists()
+    {
+        var available = new ModelEntry { Name = "m", ContextWindow = 976000 };
+        var curated = new ModelEntry { Name = "m" };
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [available],
+                SubAgentModels = [curated]
+            }
+        };
+
+        config.GetSubAgentModels();
+
+        Assert.Null(curated.ContextWindow);
+        Assert.Equal(976000, available.ContextWindow);
+    }
+
+    [Fact]
+    public void GetSubAgentModels_AfterReloadFrom_MergesFields()
+    {
+        var target = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var source = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "m", ContextWindow = 976000, ReasoningEffort = "high", Description = "merged desc" }],
+                SubAgentModels = [new ModelEntry { Name = "m" }]
+            }
+        };
+
+        target.ReloadFrom(source);
+
+        var result = Assert.Single(target.GetSubAgentModels());
+        Assert.Equal(976000, result.ContextWindow);
+        Assert.Equal("high", result.ReasoningEffort);
+        Assert.Equal("merged desc", result.Description);
+    }
 }

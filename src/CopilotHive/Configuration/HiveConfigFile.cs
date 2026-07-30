@@ -165,11 +165,32 @@ public sealed class HiveConfigFile
     /// </summary>
     public IReadOnlyList<ModelEntry> GetSubAgentModels()
     {
-        if (Models?.SubAgentModels is { Count: > 0 } curated)
-            return curated;
-        if (Models?.AvailableModels is { Count: > 0 } available)
-            return available;
-        return [];
+        if (Models?.SubAgentModels is not { Count: > 0 })
+        {
+            if (Models?.AvailableModels is { Count: > 0 } available)
+                return available;
+            return [];
+        }
+
+        var curated = Models.SubAgentModels;
+        var availableByName = Models.AvailableModels is { Count: > 0 } availableModels
+            ? availableModels.ToDictionary(a => a.Name, StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, ModelEntry>(StringComparer.OrdinalIgnoreCase);
+
+        List<ModelEntry> merged = new(curated.Count);
+        foreach (var entry in curated)
+        {
+            var available = availableByName.GetValueOrDefault(entry.Name);
+            merged.Add(new ModelEntry
+            {
+                Name = entry.Name,
+                ContextWindow = entry.ContextWindow ?? available?.ContextWindow,
+                ReasoningEffort = entry.ReasoningEffort ?? available?.ReasoningEffort,
+                Description = entry.Description ?? available?.Description
+            });
+        }
+
+        return merged;
     }
 
     /// <summary>

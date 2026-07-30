@@ -292,6 +292,39 @@ public class BrainSubAgentPromptTests
     }
 
     [Fact]
+    public async Task DistributedBrain_CuratedEntryWithMatchingAvailable_MergesContextWindow()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var config = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels =
+                    [
+                        new ModelEntry { Name = "ollama-cloud/glm-5.2", ContextWindow = 976000 },
+                    ],
+                    SubAgentModels =
+                    [
+                        new ModelEntry { Name = "ollama-cloud/glm-5.2" },
+                    ],
+                }
+            };
+
+            using var unusedClient = new StubChatClient();
+            await using var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: stateDir, hiveConfig: config, chatClient: unusedClient);
+
+            var entry = Assert.Single(SubAgentModels(brain)!);
+            Assert.Equal("ollama-cloud/glm-5.2", entry.Name);
+            // ContextWindow inherited from the matching available_models entry via GetSubAgentModels merge
+            Assert.Equal(976000, entry.ContextWindow);
+        }
+        finally { DeleteTempPath(stateDir); }
+    }
+
+    [Fact]
     public async Task DistributedBrain_NullDescription_IsPreservedAsNull_ForDownstreamFallback()
     {
         var stateDir = CreateTempDir();
