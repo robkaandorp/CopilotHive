@@ -2,6 +2,7 @@
 @using CopilotHive.Dashboard
 @using CopilotHive.Orchestration
 @using Markdig
+@using SharpCoder.SubAgents
 @implements IDisposable
 @inject Composer Composer
 @inject IJSRuntime JS
@@ -18,6 +19,46 @@ else
 {
     <div class="composer-layout">
         <div class="chat-container">
+            @{
+                var subAgents = Composer.GetSubAgents();
+            }
+            @if (subAgents.Count > 0)
+            {
+                <div style="border: 1px solid var(--border-color, #333); border-radius: 6px; margin-bottom: 0.5rem; overflow: hidden;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; padding: 0.4rem 0.6rem; font-size: 0.85rem; font-weight: 600;">
+                        <span>⚙️ Background tasks (@subAgents.Count)</span>
+                        <button class="chat-action-btn" style="padding: 0.1rem 0.5rem; font-size: 0.8rem;"
+                                @onclick="ToggleSubAgents">
+                            @(_subAgentsExpanded ? "▾" : "▸")
+                        </button>
+                    </div>
+                    @if (_subAgentsExpanded)
+                    {
+                        <div style="padding: 0 0.6rem 0.4rem 0.6rem;">
+                            @foreach (var sa in subAgents)
+                            {
+                                <div style="padding: 0.3rem 0; border-top: 1px solid var(--border-color, #333);">
+                                    <div style="display: flex; align-items: center; gap: 0.6rem; font-size: 0.8rem;">
+                                        <span style="flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">@Truncate(sa.Task)</span>
+                                        <span class="text-muted" style="flex: 0 0 auto;">@(string.IsNullOrWhiteSpace(sa.Model) ? "—" : sa.Model)</span>
+                                        <span style="flex: 0 0 auto;">@StatusBadge(sa.Status)</span>
+                                        <span class="text-muted" style="flex: 0 0 auto;">@Elapsed(sa)</span>
+                                    </div>
+                                    @if (sa.Status == SubAgentStatus.Completed && !string.IsNullOrWhiteSpace(sa.Summary))
+                                    {
+                                        <div class="text-muted" style="font-size: 0.75rem; margin-top: 0.2rem;">@sa.Summary</div>
+                                    }
+                                    else if ((sa.Status == SubAgentStatus.Failed || sa.Status == SubAgentStatus.TimedOut)
+                                             && !string.IsNullOrWhiteSpace(sa.Error))
+                                    {
+                                        <div style="font-size: 0.75rem; margin-top: 0.2rem; color: var(--danger-color, #e05561);">@sa.Error</div>
+                                    }
+                                </div>
+                            }
+                        </div>
+                    }
+                </div>
+            }
             <div class="chat-messages" id="chat-messages">
                 @if (_messages.Count == 0 && !Composer.IsStreaming)
                 {
@@ -230,6 +271,7 @@ else
     private string _questionFeedback = "";
     private List<string> _availableModels = [];
     private string _selectedModel = "";
+    private bool _subAgentsExpanded = true;
 
     protected override async Task OnInitializedAsync()
     {
@@ -245,6 +287,7 @@ else
         Composer.OnQuestionAsked += HandleQuestionAsked;
         Composer.OnCompactingStarted += HandleCompactingStarted;
         Composer.OnCompacted += HandleCompacted;
+        Composer.OnSubAgentChanged += HandleSubAgentChanged;
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -431,6 +474,57 @@ else
         Composer.OnQuestionAsked -= HandleQuestionAsked;
         Composer.OnCompactingStarted -= HandleCompactingStarted;
         Composer.OnCompacted -= HandleCompacted;
+        Composer.OnSubAgentChanged -= HandleSubAgentChanged;
+    }
+
+    private void HandleSubAgentChanged(SubAgentInfo info)
+    {
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void ToggleSubAgents()
+    {
+        _subAgentsExpanded = !_subAgentsExpanded;
+    }
+
+    /// <summary>Truncates the sub-agent task text for the single-line summary row.</summary>
+    private static string Truncate(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return "";
+        var oneLine = text.ReplaceLineEndings(" ").Trim();
+        return oneLine.Length <= 50 ? oneLine : oneLine[..50] + "…";
+    }
+
+    private static string StatusBadge(SubAgentStatus status) => status switch
+    {
+        SubAgentStatus.Running => "⏳ Running",
+        SubAgentStatus.Completed => "✅ Completed",
+        SubAgentStatus.Failed => "❌ Failed",
+        SubAgentStatus.TimedOut => "⏱️ Timed out",
+        SubAgentStatus.Cancelled => "🚫 Cancelled",
+        _ => throw new InvalidOperationException($"Unhandled sub-agent status '{status}'.")
+    };
+
+    /// <summary>
+    /// Formats the elapsed time. Running entries measure from <c>StartedAt</c> to now (refreshed
+    /// only when a status event arrives — there is no per-second timer); terminal entries measure
+    /// to <c>CompletedAt</c> when available.
+    /// </summary>
+    private static string Elapsed(SubAgentInfo info)
+    {
+        var end = info.Status == SubAgentStatus.Running
+            ? DateTimeOffset.UtcNow
+            : info.CompletedAt;
+
+        if (end is null) return "";
+
+        var span = end.Value - info.StartedAt;
+        if (span < TimeSpan.Zero) span = TimeSpan.Zero;
+
+        var totalMinutes = (int)span.TotalMinutes;
+        return totalMinutes > 0
+            ? $"{totalMinutes}m {span.Seconds}s"
+            : $"{(int)span.TotalSeconds}s";
     }
 
     private void HandleCompactingStarted()

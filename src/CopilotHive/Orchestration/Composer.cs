@@ -9,6 +9,7 @@ using CopilotHive.Shared.AI;
 using Microsoft.Extensions.AI;
 
 using SharpCoder;
+using SharpCoder.SubAgents;
 
 using System.ComponentModel;
 
@@ -31,6 +32,13 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly string? _ollamaApiKey;
     private readonly ComposerAgentService _agentService;
     private readonly ComposerStreamingService _streamingService;
+
+    /// <summary>
+    /// Stored delegate forwarding <see cref="ComposerAgentService.OnSubAgentChanged"/> to
+    /// <see cref="OnSubAgentChanged"/>. Held in a field (rather than subscribed as an inline
+    /// lambda) so the exact same instance can be detached in <see cref="DisposeAsync"/>.
+    /// </summary>
+    private readonly Action<SubAgentInfo> _handleSubAgentChanged;
 
     private readonly HiveConfigFile? _hiveConfig;
     private readonly string _systemPrompt;
@@ -70,6 +78,12 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
     /// <summary>Raised when context compaction completes.</summary>
     public event Action? OnCompacted;
+
+    /// <summary>
+    /// Raised when a background sub-agent starts or reaches a terminal state.
+    /// The payload is a defensive clone — mutating it cannot affect tracked state.
+    /// </summary>
+    public event Action<SubAgentInfo>? OnSubAgentChanged;
 
     /// <summary>The question currently waiting for a user answer, or <c>null</c> if none.</summary>
     public ComposerQuestion? PendingQuestion { get; private set; }
@@ -355,6 +369,9 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             subAgentsEnabled,
             subAgentModels);
 
+        _handleSubAgentChanged = info => OnSubAgentChanged?.Invoke(info);
+        _agentService.OnSubAgentChanged += _handleSubAgentChanged;
+
         _streamingService = new ComposerStreamingService(
             _agentService,
             _logger,
@@ -410,6 +427,13 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <param name="model">The model identifier to switch to.</param>
     /// <exception cref="ArgumentException">Thrown when <paramref name="model"/> is not in <see cref="AvailableModels"/>.</exception>
     public Task SwitchModelAsync(string model) => _agentService.SwitchModelAsync(model);
+
+    /// <summary>
+    /// Returns the current background sub-agent entries — running ones first (oldest first), then
+    /// the most recent terminal ones. Items are defensive clones and safe to read from the UI.
+    /// </summary>
+    public IReadOnlyList<SubAgentInfo> GetSubAgents() => _agentService.GetSubAgents();
+
 
     /// <summary>
     /// Creates the IChatClient and CodingAgent, and loads any persisted session.
@@ -866,6 +890,11 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
+        // Detach the forwarding delegate before anything is torn down. Removing a handler cannot
+        // throw, so this needs no guard, and doing it first guarantees detachment no matter which
+        // disposal step below fails.
+        _agentService.OnSubAgentChanged -= _handleSubAgentChanged;
+
         Exception? disposeEx = null;
         try
         {

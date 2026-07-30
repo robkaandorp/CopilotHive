@@ -69,6 +69,52 @@ internal sealed class ComposerAgentService(
     private AgentOptions? _agentOptions;
 
     /// <summary>
+    /// Channel-fed consumer holding the current sub-agent status snapshot. Created lazily when the
+    /// agent is (re)created and torn down with the rest of the connection state.
+    /// </summary>
+    private SubAgentStateTracker? _subAgentTracker;
+
+    /// <summary>
+    /// Raised when a sub-agent starts or reaches a terminal state, carrying a defensive clone.
+    /// Forwarded from <see cref="SubAgentStateTracker.OnSubAgentChanged"/>.
+    /// </summary>
+    public event Action<SubAgentInfo>? OnSubAgentChanged;
+
+    /// <summary>
+    /// Returns the current sub-agent entries (running first, then most recent terminal ones), or an
+    /// empty list when no agent has been created yet.
+    /// </summary>
+    public IReadOnlyList<SubAgentInfo> GetSubAgents() => _subAgentTracker?.GetSubAgents() ?? [];
+
+    /// <summary>
+    /// Agent-level handler for <see cref="CodingAgent.SubAgentChanged"/>. Declared as a method (not
+    /// a lambda) so the exact same delegate can be removed with <c>-=</c> on every teardown path.
+    /// </summary>
+    private void HandleSubAgentChanged(SubAgentInfo info) => _subAgentTracker?.Post(info);
+
+    /// <summary>Re-raises the tracker's event to this service's subscribers.</summary>
+    private void ForwardSubAgentChanged(SubAgentInfo info) => OnSubAgentChanged?.Invoke(info);
+
+    /// <summary>
+    /// Unsubscribes from and stops the current tracker, then clears the field so the panel reads as
+    /// empty until a new agent creates a replacement. Idempotent: a no-op when no tracker exists, so
+    /// the nested calls from <see cref="DisposeClientsAndClearStateAsync"/> cannot double-stop.
+    /// </summary>
+    private async Task StopAndClearTrackerAsync()
+    {
+        var tracker = _subAgentTracker;
+        if (tracker is null)
+            return;
+
+        _subAgentTracker = null;
+
+        tracker.OnSubAgentChanged -= ForwardSubAgentChanged;
+
+        // StopAsync logs (and never rethrows) reader failures, so it cannot mask a disposal error.
+        await tracker.StopAsync();
+    }
+
+    /// <summary>
     /// Invoked immediately before each <see cref="CodingAgent.DisposeAsync"/> call.
     /// If the hook throws, the exception is captured and rethrown (or aggregated with a
     /// disposal failure) after agent disposal completes.
@@ -120,11 +166,25 @@ internal sealed class ComposerAgentService(
     /// Disposes the old agent asynchronously, invoking <see cref="OnAgentDisposing"/> first.
     /// If the hook throws, the exception is captured — agent disposal is still attempted —
     /// and the captured exception is rethrown after disposal completes.
+    /// <para>
+    /// The sub-agent tracker is scoped to the agent it observes, so it is torn down here too:
+    /// every agent replacement (reset, recreate, model switch, reconnect, dispose) routes through
+    /// this method, which guarantees the panel is cleared and a stale snapshot can never survive
+    /// into the next agent.
+    /// </para>
     /// </summary>
     private async Task DisposeAgentAsync(CodingAgent? agent)
     {
         if (agent is null)
             return;
+
+        // Detach before disposal so no late event can reach a tracker that is about to be dropped.
+        agent.SubAgentChanged -= HandleSubAgentChanged;
+
+        // Tear the tracker down with its agent: complete the writer, let the reader drain whatever
+        // is already queued, then publish an empty snapshot. RecreateAgentAsync builds a fresh
+        // tracker for the new agent.
+        await StopAndClearTrackerAsync();
 
         Exception? hookEx = null;
         try
@@ -164,6 +224,8 @@ internal sealed class ComposerAgentService(
         var compaction = _compactionChatClient;
 
         // Clear state BEFORE disposal so no stale references survive a disposal failure.
+        // _subAgentTracker is deliberately NOT cleared here — DisposeAgentAsync owns its teardown
+        // and needs to read the field. The safety-net call below covers the agent-less case.
         _agent = null;
         _agentOptions = null;
         _chatClient = null;
@@ -178,6 +240,11 @@ internal sealed class ComposerAgentService(
         {
             agentEx = ex;
         }
+
+        // Safety net: DisposeAgentAsync already stopped the tracker for a non-null agent, and
+        // StopAndClearTrackerAsync is idempotent. This only does work when there was no agent to
+        // dispose (or when agent disposal threw before reaching its own teardown).
+        await StopAndClearTrackerAsync();
 
         // Clients are disposed even when agent disposal threw — the agent failure is captured
         // above and re-thrown (aggregated) only after all client disposals are attempted.
@@ -436,6 +503,18 @@ internal sealed class ComposerAgentService(
         };
 
         _agent = new CodingAgent(_chatClient, _agentOptions);
+
+        // A fresh tracker per agent: DisposeAgentAsync stopped and cleared the previous one, so the
+        // new agent always starts from an empty snapshot and stale entries can never linger.
+        var tracker = new SubAgentStateTracker(_logger);
+        tracker.OnSubAgentChanged += ForwardSubAgentChanged;
+        _subAgentTracker = tracker;
+        await tracker.StartAsync();
+
+        // Subscribe only once the tracker is live so the first Running event cannot be dropped.
+        // CodingAgent wires SubAgentChanged through its lazily-created SubAgentManager, so the
+        // subscription is valid from construction and no early sub-agent start is missed.
+        _agent.SubAgentChanged += HandleSubAgentChanged;
 
         _logger.LogDebug("Composer CodingAgent created with WorkDirectory={WorkDir}, FileOps={FileOps}",
             workDir, _repoManager is not null);
