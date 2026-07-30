@@ -1,3 +1,22 @@
+## [0.23.0] - 2026-07-29
+
+### Added
+
+- **Sub-Agents (sub-sessions)** — the Composer, Brain, and all worker roles (coder, tester, reviewer, docwriter, improver) can now delegate self-contained subtasks (codebase exploration, verification sweeps, large-text summarization) to background sub-sessions via SharpCoder's `start_sub_agent` tool. Only a summary (plus status metadata) returns to the calling session, keeping its context clean. Sub-sessions run read-only by default and can never exceed the parent agent's capabilities (capability ceiling). Catalog flows from the orchestrator to workers over gRPC (`TaskAssignment.sub_agent_models`). Bumps SharpCoder to **0.13.1** (which includes the sub-agent runtime and the client-ownership leak fix).
+  - Composer wiring (`ComposerAgentService`): 4 concurrent, gated on a configured model catalog + repo file access; system-prompt guidance.
+  - Brain wiring (`GoalBrainActor`/`BrainActor`/`DistributedBrain`): delegates planning exploration; immutable catalog snapshot shared by prompt + options; 2 concurrent.
+  - Worker wiring (`SharpCoderRunner` + gRPC catalog round-trip through `WorkTask` + `GrpcMapper`): all roles; per-prompt agent disposal; role capability ceilings (reviewer read-only, improver no-bash).
+- **Sub-Agent model catalog** — new optional `models.sub_agent_models` config section curates which models are offered to sub-agents (falls back to `models.available_models` when unset). Each model entry gains a `description` field (strength/cost/speed hints shown to the LLM via `list_sub_agent_models`). Fully editable in the dashboard: a **Description** field in the Available Models tab and a new **Sub-Agent Models** tab (add/edit/remove, persisted to `hive-config.yaml`).
+
+### Changed
+
+- **Sub-agent catalog defaults** — a curated `sub_agent_models` entry that omits `context_window` (or `reasoning_effort`/`description`) now inherits the value from the same-named entry in `available_models` instead of surfacing `null`. Merging is per-field, case-insensitive, and never mutates config (`HiveConfigFile.GetSubAgentModels`).
+- **`HiveConfigFile.ReloadFrom`** now preserves `ModelEntry.Description` and `Models.SubAgentModels` across live config reloads.
+
+### Fixed
+
+- **Configuration model tables layout** — the Available Models and Sub-Agent Models tables are wider (~1100px); model names no longer wrap and the Edit/Remove (and Save/Cancel) action buttons always render horizontally instead of stacking.
+
 ## [0.22.0] - 2026-07-28
 
 ### Added
