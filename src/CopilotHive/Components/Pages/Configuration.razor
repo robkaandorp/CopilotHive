@@ -321,7 +321,7 @@ else
                 }
                 else
                 {
-                    <table style="border-collapse:collapse;width:100%;max-width:800px">
+                    <table style="border-collapse:collapse;width:100%;max-width:1100px">
                         <thead>
                             <tr style="border-bottom:1px solid var(--border)">
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Name</th>
@@ -337,7 +337,7 @@ else
                                 <tr style="border-bottom:1px solid var(--border)">
                                     @if (_editingModelName == model.Name)
                                     {
-                                        <td style="padding:0.5rem;font-size:0.9rem">@model.Name</td>
+                                        <td style="white-space:nowrap;padding:0.5rem;font-size:0.9rem">@model.Name</td>
                                         <td style="padding:0.5rem">
                                             <input type="number" @bind="_editModelContextWindow" placeholder="optional"
                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem" />
@@ -356,18 +356,18 @@ else
                                             <input @bind="_editModelDescription" placeholder="optional"
                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:12rem" />
                                         </td>
-                                        <td style="padding:0.5rem;text-align:right">
+                                        <td style="white-space:nowrap;padding:0.5rem;text-align:right">
                                             <button class="approve-btn" @onclick="SaveEditModelAsync">💾 Save</button>
                                             <button class="approve-btn" @onclick="CancelEditModel">Cancel</button>
                                         </td>
                                     }
                                     else
                                     {
-                                        <td style="padding:0.5rem;font-size:0.9rem">@model.Name</td>
+                                        <td style="white-space:nowrap;padding:0.5rem;font-size:0.9rem">@model.Name</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(model.ContextWindow?.ToString() ?? "—")</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(model.ReasoningEffort) ? "—" : model.ReasoningEffort)</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(model.Description) ? "—" : model.Description)</td>
-                                        <td style="padding:0.5rem;text-align:right">
+                                        <td style="white-space:nowrap;padding:0.5rem;text-align:right">
                                             <button class="approve-btn" @onclick="() => StartEditModel(model)">✏️ Edit</button>
                                             <button class="approve-btn" style="color:var(--red)" @onclick="() => RemoveModelAsync(model.Name)">🗑️ Remove</button>
                                         </td>
@@ -502,7 +502,7 @@ else
                 }
                 else
                 {
-                    <table style="border-collapse:collapse;width:100%;max-width:900px">
+                    <table style="border-collapse:collapse;width:100%;max-width:1100px">
                         <thead>
                             <tr style="border-bottom:1px solid var(--border)">
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Name</th>
@@ -518,7 +518,7 @@ else
                                 <tr style="border-bottom:1px solid var(--border)">
                                     @if (_editingSubAgentModelName == sam.Name)
                                     {
-                                        <td style="padding:0.5rem;font-size:0.9rem">@sam.Name</td>
+                                        <td style="white-space:nowrap;padding:0.5rem;font-size:0.9rem">@sam.Name</td>
                                         <td style="padding:0.5rem">
                                             <input type="number" @bind="_editSubAgentModelContextWindow" placeholder="optional"
                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem" />
@@ -537,18 +537,18 @@ else
                                             <input @bind="_editSubAgentModelDescription" placeholder="optional"
                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:12rem" />
                                         </td>
-                                        <td style="padding:0.5rem;text-align:right">
+                                        <td style="white-space:nowrap;padding:0.5rem;text-align:right">
                                             <button class="approve-btn" @onclick="SaveEditSubAgentModelAsync">💾 Save</button>
                                             <button class="approve-btn" @onclick="CancelEditSubAgentModel">Cancel</button>
                                         </td>
                                     }
                                     else
                                     {
-                                        <td style="padding:0.5rem;font-size:0.9rem">@sam.Name</td>
+                                        <td style="white-space:nowrap;padding:0.5rem;font-size:0.9rem">@sam.Name</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(sam.ContextWindow?.ToString() ?? "—")</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(sam.ReasoningEffort) ? "—" : sam.ReasoningEffort)</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(sam.Description) ? "—" : sam.Description)</td>
-                                        <td style="padding:0.5rem;text-align:right">
+                                        <td style="white-space:nowrap;padding:0.5rem;text-align:right">
                                             <button class="approve-btn" @onclick="() => StartEditSubAgentModel(sam)">✏️ Edit</button>
                                             <button class="approve-btn" style="color:var(--red)" @onclick="() => RemoveSubAgentModelAsync(sam.Name)">🗑️ Remove</button>
                                         </td>
