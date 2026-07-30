@@ -84,6 +84,14 @@ message TaskAssignment {
   string model = 9;               // Model ID for this task (e.g., "claude-sonnet-4.6")
   string session_id = 10;         // Session identifier: "goalId:roleName"
   int32 max_context_tokens = 11;  // Context window size for worker (tokens)
+  repeated SubAgentModel sub_agent_models = 12;  // Model catalog for sub-agent delegation
+}
+
+// A model available for sub-agent delegation
+message SubAgentModel {
+  string id = 1;
+  int32 context_window = 2;
+  string description = 3;
 }
 
 // === Session Management ===

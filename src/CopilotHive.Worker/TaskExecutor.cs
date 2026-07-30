@@ -63,6 +63,7 @@ public sealed class TaskExecutor(
             task.Metadata.TryGetValue("compaction_model", out var compModel) ? compModel : null);
         agentRunner.SetCompactionMaxTokens(
             task.Metadata.TryGetValue("compaction_max_tokens", out var cmt) && int.TryParse(cmt, out var cmtVal) ? cmtVal : (int?)null);
+        agentRunner.SetSubAgentModels(task.SubAgentModels);
         agentRunner.ClearTestReport();
         agentRunner.ClearWorkerReport();
 

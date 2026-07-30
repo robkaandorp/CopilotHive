@@ -41,6 +41,22 @@ public sealed record WorkTask
     public Dictionary<string, string> Metadata { get; init; } = new();
     /// <summary>Context window size in tokens for the worker's agent. Used for heartbeat Ctx% calculation and compaction threshold.</summary>
     public int MaxContextTokens { get; init; } = SharedConstants.DefaultBrainContextWindow;
+    /// <summary>Model catalog for sub-agent delegation. Empty when sub-agents are disabled.</summary>
+    public IReadOnlyList<SubAgentModelDto> SubAgentModels { get; init; } = [];
+}
+
+/// <summary>
+/// Domain representation of a model available for sub-agent delegation.
+/// Model IDs do NOT have reasoning-effort suffixes applied — sub-agents inherit the parent's reasoning.
+/// </summary>
+public sealed record SubAgentModelDto
+{
+    /// <summary>Model identifier (e.g. "copilot/claude-sonnet-4.6"). Never blank.</summary>
+    public required string Id { get; init; }
+    /// <summary>Context window in tokens, or null if unknown.</summary>
+    public int? ContextWindow { get; init; }
+    /// <summary>Human-readable description for the model.</summary>
+    public string Description { get; init; } = "";
 }
 
 /// <summary>

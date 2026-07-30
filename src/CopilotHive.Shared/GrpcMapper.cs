@@ -48,6 +48,18 @@ public static class GrpcMapper
         {
             assignment.Metadata[key] = value;
         }
+        foreach (var m in task.SubAgentModels)
+        {
+            if (!string.IsNullOrWhiteSpace(m.Id))
+            {
+                assignment.SubAgentModels.Add(new SubAgentModel
+                {
+                    Id = m.Id,
+                    ContextWindow = (m.ContextWindow is int cw && cw > 0) ? cw : 0,
+                    Description = m.Description ?? "",
+                });
+            }
+        }
         return assignment;
     }
 
@@ -151,6 +163,14 @@ public static class GrpcMapper
             })],
             Metadata = new Dictionary<string, string>(assignment.Metadata),
             MaxContextTokens = assignment.MaxContextTokens > 0 ? assignment.MaxContextTokens : SharedConstants.DefaultBrainContextWindow,
+            SubAgentModels = [.. assignment.SubAgentModels
+                .Where(m => !string.IsNullOrWhiteSpace(m.Id))
+                .Select(m => new SubAgentModelDto
+                {
+                    Id = m.Id,
+                    ContextWindow = m.ContextWindow > 0 ? m.ContextWindow : null,
+                    Description = m.Description ?? "",
+                })],
         };
     }
 

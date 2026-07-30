@@ -1,3 +1,4 @@
+using CopilotHive.Services;
 using CopilotHive.Workers;
 
 namespace CopilotHive.Worker;
@@ -81,6 +82,13 @@ public interface IAgentRunner : IAsyncDisposable
     /// </summary>
     /// <param name="maxTokens">Maximum tokens to pass to the compaction client, or <c>null</c> to use the fallback.</param>
     void SetCompactionMaxTokens(int? maxTokens);
+
+    /// <summary>
+    /// Sets the model catalog for sub-agent delegation. Pass an empty list to disable sub-agents.
+    /// Must be called before <see cref="SendPromptAsync"/>.
+    /// </summary>
+    /// <param name="models">Available models for sub-agent delegation.</param>
+    void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models);
 
     /// <summary>Connects to the underlying AI agent engine.</summary>
     Task ConnectAsync(CancellationToken ct = default);

@@ -517,4 +517,203 @@ public sealed class GrpcMapperTests
         // Assert
         Assert.Equal(original.Metrics!.Summary, roundTripped.Metrics!.Summary);
     }
+
+    // ── SubAgentModels round-trip ───────────────────────────────────────────
+
+    [Fact]
+    public void SubAgentModels_RoundTrip_PreservesEntriesAndContextWindowBoundary()
+    {
+        var original = BuildFullWorkTask() with
+        {
+            SubAgentModels =
+            [
+                new SubAgentModelDto { Id = "model-a", ContextWindow = 200_000, Description = "Big model" },
+                new SubAgentModelDto { Id = "model-b", ContextWindow = null, Description = "Unknown ctx" },
+            ],
+        };
+
+        var assignment = GrpcMapper.ToGrpc(original);
+        var restored = GrpcMapper.ToDomain(assignment);
+
+        Assert.Equal(2, restored.SubAgentModels.Count);
+        Assert.Equal("model-a", restored.SubAgentModels[0].Id);
+        Assert.Equal(200_000, restored.SubAgentModels[0].ContextWindow);
+        Assert.Equal("Big model", restored.SubAgentModels[0].Description);
+        Assert.Equal("model-b", restored.SubAgentModels[1].Id);
+        Assert.Null(restored.SubAgentModels[1].ContextWindow);
+        Assert.Equal("Unknown ctx", restored.SubAgentModels[1].Description);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-5)]
+    public void SubAgentModels_ToDomain_ContextWindowNonPositive_MapsToNull(int protoContextWindow)
+    {
+        var assignment = new TaskAssignment
+        {
+            TaskId = "t",
+            GoalId = "g",
+            GoalDescription = "d",
+            Prompt = "p",
+            Role = GrpcWorkerRole.Coder,
+        };
+        assignment.SubAgentModels.Add(new SubAgentModel
+        {
+            Id = "model-x",
+            ContextWindow = protoContextWindow,
+            Description = "test",
+        });
+
+        var restored = GrpcMapper.ToDomain(assignment);
+
+        Assert.Single(restored.SubAgentModels);
+        Assert.Equal("model-x", restored.SubAgentModels[0].Id);
+        Assert.Null(restored.SubAgentModels[0].ContextWindow);
+    }
+
+    [Fact]
+    public void SubAgentModels_ToGrpc_NullContextWindow_EncodesAsZero()
+    {
+        var original = BuildFullWorkTask() with
+        {
+            SubAgentModels =
+            [
+                new SubAgentModelDto { Id = "model-null", ContextWindow = null },
+            ],
+        };
+
+        var assignment = GrpcMapper.ToGrpc(original);
+
+        Assert.Single(assignment.SubAgentModels);
+        Assert.Equal("model-null", assignment.SubAgentModels[0].Id);
+        Assert.Equal(0, assignment.SubAgentModels[0].ContextWindow);
+    }
+
+    [Fact]
+    public void SubAgentModels_NullToZero_RoundTripsBackToNull()
+    {
+        var original = BuildFullWorkTask() with
+        {
+            SubAgentModels =
+            [
+                new SubAgentModelDto { Id = "model-null", ContextWindow = null },
+            ],
+        };
+
+        var assignment = GrpcMapper.ToGrpc(original);
+        var restored = GrpcMapper.ToDomain(assignment);
+
+        Assert.Single(restored.SubAgentModels);
+        Assert.Null(restored.SubAgentModels[0].ContextWindow);
+    }
+
+    /// <summary>
+    /// A non-positive domain <c>ContextWindow</c> (zero or negative) must be encoded as
+    /// exactly 0 on the proto side — negative values must never travel over the wire.
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(-5)]
+    [InlineData(int.MinValue)]
+    public void SubAgentModels_ToGrpc_NonPositiveContextWindow_EncodesAsZero(int domainContextWindow)
+    {
+        var original = BuildFullWorkTask() with
+        {
+            SubAgentModels =
+            [
+                new SubAgentModelDto { Id = "model-np", ContextWindow = domainContextWindow },
+            ],
+        };
+
+        var assignment = GrpcMapper.ToGrpc(original);
+
+        Assert.Single(assignment.SubAgentModels);
+        Assert.Equal("model-np", assignment.SubAgentModels[0].Id);
+        Assert.Equal(0, assignment.SubAgentModels[0].ContextWindow);
+    }
+
+    /// <summary>
+    /// A non-positive domain <c>ContextWindow</c> must survive a full round-trip as
+    /// <c>null</c> on the domain side (encoded 0 outbound, decoded null inbound).
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(-5)]
+    [InlineData(int.MinValue)]
+    public void SubAgentModels_NonPositiveContextWindow_RoundTripsBackToNull(int domainContextWindow)
+    {
+        var original = BuildFullWorkTask() with
+        {
+            SubAgentModels =
+            [
+                new SubAgentModelDto { Id = "model-np", ContextWindow = domainContextWindow },
+            ],
+        };
+
+        var assignment = GrpcMapper.ToGrpc(original);
+        Assert.Equal(0, assignment.SubAgentModels[0].ContextWindow);
+
+        var restored = GrpcMapper.ToDomain(assignment);
+
+        Assert.Single(restored.SubAgentModels);
+        Assert.Equal("model-np", restored.SubAgentModels[0].Id);
+        Assert.Null(restored.SubAgentModels[0].ContextWindow);
+    }
+
+    // ── SubAgentModels blank-name filtering ─────────────────────────────────
+
+    [Fact]
+    public void SubAgentModels_ToGrpc_FiltersBlankAndWhitespaceNames()
+    {
+        var original = BuildFullWorkTask() with
+        {
+            SubAgentModels =
+            [
+                new SubAgentModelDto { Id = "", ContextWindow = 1000 },
+                new SubAgentModelDto { Id = "   ", ContextWindow = 2000 },
+                new SubAgentModelDto { Id = "valid-model", ContextWindow = 3000 },
+            ],
+        };
+
+        var assignment = GrpcMapper.ToGrpc(original);
+
+        Assert.Single(assignment.SubAgentModels);
+        Assert.Equal("valid-model", assignment.SubAgentModels[0].Id);
+        Assert.Equal(3000, assignment.SubAgentModels[0].ContextWindow);
+    }
+
+    [Fact]
+    public void SubAgentModels_ToDomain_FiltersBlankAndWhitespaceNames()
+    {
+        var assignment = new TaskAssignment
+        {
+            TaskId = "t",
+            GoalId = "g",
+            GoalDescription = "d",
+            Prompt = "p",
+            Role = GrpcWorkerRole.Coder,
+        };
+        assignment.SubAgentModels.Add(new SubAgentModel { Id = "", ContextWindow = 1000 });
+        assignment.SubAgentModels.Add(new SubAgentModel { Id = "   ", ContextWindow = 2000 });
+        assignment.SubAgentModels.Add(new SubAgentModel { Id = "valid-model", ContextWindow = 3000 });
+
+        var restored = GrpcMapper.ToDomain(assignment);
+
+        Assert.Single(restored.SubAgentModels);
+        Assert.Equal("valid-model", restored.SubAgentModels[0].Id);
+    }
+
+    [Fact]
+    public void SubAgentModels_EmptyCatalog_RoundTripsToEmpty()
+    {
+        var original = BuildFullWorkTask() with { SubAgentModels = [] };
+
+        var assignment = GrpcMapper.ToGrpc(original);
+        var restored = GrpcMapper.ToDomain(assignment);
+
+        Assert.Empty(assignment.SubAgentModels);
+        Assert.Empty(restored.SubAgentModels);
+    }
 }

@@ -1,5 +1,6 @@
 #pragma warning disable CS1591
 #pragma warning disable OPENAI001 // ResponsesClient.AsIChatClient is experimental
+using CopilotHive.Services;
 using CopilotHive.Shared;
 using CopilotHive.Shared.AI;
 using CopilotHive.Workers;
@@ -7,6 +8,7 @@ using CopilotHive.Workers;
 using Microsoft.Extensions.AI;
 
 using SharpCoder;
+using SharpCoder.SubAgents;
 
 using System.ComponentModel;
 using System.Diagnostics;
@@ -51,6 +53,12 @@ public sealed class SharpCoderRunner : IAgentRunner
     private int _maxContextTokens = 150_000;
     private string? _compactionModel;
     private int? _compactionMaxTokens;
+    private IReadOnlyList<SubAgentModelDto> _subAgentModels = [];
+
+    // Test seams — nullable, set by tests only
+    internal Func<string?, IChatClient>? ClientCreationSeam;
+    internal Action<AgentOptions>? OnAgentOptionsCreated;
+    internal Action<CodingAgent>? OnAgentCreated;
 
     /// <summary>Current agent session; set via <see cref="SetSession"/> before <see cref="SendPromptAsync"/>.</summary>
     private AgentSession? _session;
@@ -86,6 +94,42 @@ public sealed class SharpCoderRunner : IAgentRunner
 
     /// <inheritdoc/>
     public void SetCompactionMaxTokens(int? maxTokens) => _compactionMaxTokens = maxTokens;
+
+    /// <inheritdoc/>
+    public void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models) => _subAgentModels = models ?? [];
+
+    /// <summary>
+    /// Builds the <see cref="SubAgentOptions"/> for the configured model catalog, or
+    /// <c>null</c> when the catalog is empty (sub-agents disabled).
+    /// </summary>
+    internal SubAgentOptions? BuildSubAgentOptions()
+    {
+        if (_subAgentModels.Count == 0)
+            return null;
+
+        var subOpts = new SubAgentOptions
+        {
+            MaxConcurrentSubAgents = 2,
+            DefaultTimeout = TimeSpan.FromMinutes(5),
+            MaxTimeout = TimeSpan.FromMinutes(15),
+            MaxSummaryChars = 8_000,
+        };
+
+        foreach (var m in _subAgentModels)
+        {
+            if (!string.IsNullOrWhiteSpace(m.Id))
+                subOpts.AvailableModels.Add(new SubAgentModelInfo(m.Id, m.Description, m.ContextWindow));
+        }
+
+        // ClientFactory delegates to the injectable seam, falling back to CreateChatClient.
+        // Factory-created clients are owned and disposed by SubAgentManager — do NOT track them here.
+        subOpts.ClientFactory = modelId =>
+            _clientFactory?.Invoke(modelId)
+            ?? ClientCreationSeam?.Invoke(modelId)
+            ?? CreateChatClient(modelId);
+
+        return subOpts;
+    }
 
     /// <summary>
     /// Builds the full system prompt for the given <paramref name="role"/> by combining the
@@ -284,7 +328,7 @@ public sealed class SharpCoderRunner : IAgentRunner
     public Task ConnectAsync(CancellationToken ct = default)
     {
         _log.Info("Initializing SharpCoderRunner IChatClient...");
-        _chatClient = CreateChatClient();
+        _chatClient = _clientFactory?.Invoke(null) ?? ClientCreationSeam?.Invoke(null) ?? CreateChatClient();
         return Task.CompletedTask;
     }
 
@@ -292,7 +336,7 @@ public sealed class SharpCoderRunner : IAgentRunner
     {
         _log.Info($"Resetting session. Requested model: {model ?? "default"}");
         _chatClient?.Dispose();
-        _chatClient = _clientFactory != null ? _clientFactory(model) : CreateChatClient(model);
+        _chatClient = _clientFactory?.Invoke(model) ?? ClientCreationSeam?.Invoke(model) ?? CreateChatClient(model);
         _session = null;
         return Task.CompletedTask;
     }
@@ -317,16 +361,23 @@ public sealed class SharpCoderRunner : IAgentRunner
             ShowToolCallsInStream = true,
         };
 
+        var subAgentOptions = BuildSubAgentOptions();
+        if (subAgentOptions != null)
+            options.SubAgents = subAgentOptions;
+
         if (!string.IsNullOrEmpty(_compactionModel))
             options.CompactionClient = ChatClientFactory.Create(_compactionModel);
 
         if (_compactionMaxTokens.HasValue)
             options.CompactionMaxTokens = _compactionMaxTokens.Value;
 
+        OnAgentOptionsCreated?.Invoke(options);
+
         // Write pre-execution diagnostics so we can inspect inputs even if the LLM call hangs or is killed
         WriteDiagnosticsFile(null, prompt, TimeSpan.Zero, options, "pre");
 
-        var agent = new CodingAgent(_chatClient, options);
+        await using var agent = new CodingAgent(_chatClient, options);
+        OnAgentCreated?.Invoke(agent);
 
         // Ensure session exists before streaming
         _session ??= AgentSession.Create(Guid.NewGuid().ToString("N"));

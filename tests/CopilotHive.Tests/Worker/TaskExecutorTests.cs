@@ -95,6 +95,11 @@ public sealed class TaskExecutorTests
         public void SetMaxContextTokens(int maxTokens) { }
         public void SetCompactionModel(string? model) { }
         public void SetCompactionMaxTokens(int? maxTokens) { }
+
+        /// <summary>Captures the catalog passed to <see cref="SetSubAgentModels"/>, or null if never called.</summary>
+        public IReadOnlyList<SubAgentModelDto>? CapturedSubAgentModels { get; private set; }
+
+        public void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models) => CapturedSubAgentModels = models;
         public void SetSession(object? session) => _session = session;
         public object? GetSession() => _session;
         public int GetContextUsagePercent() => 0;
@@ -111,6 +116,82 @@ public sealed class TaskExecutorTests
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// The sub-agent model catalog on the <see cref="WorkTask"/> must be forwarded verbatim to the
+    /// agent runner. Removing the <c>SetSubAgentModels</c> call from <see cref="TaskExecutor"/>
+    /// leaves <c>CapturedSubAgentModels</c> null and fails this test.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ForwardsSubAgentModelsToAgentRunner()
+    {
+        // Arrange
+        var git = new MockGitOperations { PushShouldFail = false, FilesChanged = 1 };
+        var agentRunner = new MockAgentRunner();
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        IReadOnlyList<SubAgentModelDto> catalog =
+        [
+            new SubAgentModelDto { Id = "model-a", ContextWindow = 200_000, Description = "Big model" },
+            new SubAgentModelDto { Id = "model-b", ContextWindow = null, Description = "Unknown ctx" },
+        ];
+
+        var task = new WorkTask
+        {
+            TaskId = "test-task-subagents",
+            GoalId = "goal-subagents",
+            GoalDescription = "Test goal",
+            Prompt = "Test prompt",
+            Role = WorkerRole.Coder,
+            Repositories = [new TargetRepository { Name = "test-repo", Url = "https://github.com/test/test.git", DefaultBranch = "main" }],
+            BranchInfo = new BranchSpec { Action = BranchAction.Create, BaseBranch = "main", FeatureBranch = "feature-branch" },
+            SubAgentModels = catalog,
+        };
+
+        // Act
+        await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        // Assert — the exact catalog instance and its contents reached the runner
+        Assert.NotNull(agentRunner.CapturedSubAgentModels);
+        Assert.Same(catalog, agentRunner.CapturedSubAgentModels);
+        Assert.Equal(2, agentRunner.CapturedSubAgentModels!.Count);
+
+        Assert.Equal("model-a", agentRunner.CapturedSubAgentModels[0].Id);
+        Assert.Equal(200_000, agentRunner.CapturedSubAgentModels[0].ContextWindow);
+        Assert.Equal("Big model", agentRunner.CapturedSubAgentModels[0].Description);
+
+        Assert.Equal("model-b", agentRunner.CapturedSubAgentModels[1].Id);
+        Assert.Null(agentRunner.CapturedSubAgentModels[1].ContextWindow);
+        Assert.Equal("Unknown ctx", agentRunner.CapturedSubAgentModels[1].Description);
+    }
+
+    /// <summary>
+    /// A task with no sub-agent catalog must still call <c>SetSubAgentModels</c> with an empty
+    /// list, so a previously-configured catalog on a reused runner is cleared.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_WithEmptyCatalog_StillForwardsEmptyListToAgentRunner()
+    {
+        var git = new MockGitOperations { PushShouldFail = false, FilesChanged = 1 };
+        var agentRunner = new MockAgentRunner();
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        var task = new WorkTask
+        {
+            TaskId = "test-task-no-subagents",
+            GoalId = "goal-no-subagents",
+            GoalDescription = "Test goal",
+            Prompt = "Test prompt",
+            Role = WorkerRole.Coder,
+            Repositories = [new TargetRepository { Name = "test-repo", Url = "https://github.com/test/test.git", DefaultBranch = "main" }],
+            BranchInfo = new BranchSpec { Action = BranchAction.Create, BaseBranch = "main", FeatureBranch = "feature-branch" },
+        };
+
+        await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(agentRunner.CapturedSubAgentModels);
+        Assert.Empty(agentRunner.CapturedSubAgentModels!);
     }
 
     [Fact]

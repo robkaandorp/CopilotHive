@@ -98,6 +98,25 @@ internal sealed class TaskDispatchService
         // Resolve context window: per-role override > global worker default > constant fallback
         var maxContextTokens = _config?.GetContextWindowForRole(roleName) ?? Constants.DefaultBrainContextWindow;
 
+        // Populate sub-agent model catalog from config (no reasoning suffix — sub-agents inherit parent reasoning)
+        var subAgentModels = new List<SubAgentModelDto>();
+        if (_config?.Models?.AvailableModels is { } availableModels)
+        {
+            foreach (var entry in availableModels)
+            {
+                if (string.IsNullOrWhiteSpace(entry.Name))
+                    continue;
+                subAgentModels.Add(new SubAgentModelDto
+                {
+                    Id = entry.Name,
+                    ContextWindow = entry.ContextWindow,
+                    Description = entry.ContextWindow is int cw && cw > 0
+                        ? $"Configured model, {cw / 1000}K context"
+                        : "Configured model",
+                });
+            }
+        }
+
         var task = _taskBuilder.Build(
             goalId: pipeline.GoalId,
             goalDescription: pipeline.Description,
@@ -107,7 +126,8 @@ internal sealed class TaskDispatchService
             prompt: prompt,
             branchAction: branchAction,
             model: model,
-            maxContextTokens: maxContextTokens);
+            maxContextTokens: maxContextTokens,
+            subAgentModels: subAgentModels);
 
         // Improver operates read-only: it can see the feature branch but must not push.
         // Downgrade the action to Unspecified so the worker runtime skips push operations.

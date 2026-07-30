@@ -594,6 +594,216 @@ public sealed class TaskDispatchServiceTests
         Assert.Equal(GoalPhase.Failed, pipeline.Phase);
     }
 
+    // ── DispatchToRole: sub-agent model catalog ──────────────────────────
+
+    [Fact]
+    public async Task DispatchToRole_PopulatesCatalogFromAvailableModels()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels =
+            [
+                new ModelEntry { Name = "model-a", ContextWindow = 200_000 },
+                new ModelEntry { Name = "model-b", ContextWindow = null },
+                new ModelEntry { Name = "model-c", ContextWindow = 128_000 },
+            ],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Equal(3, capturedTask!.SubAgentModels.Count);
+
+        Assert.Equal("model-a", capturedTask.SubAgentModels[0].Id);
+        Assert.Equal(200_000, capturedTask.SubAgentModels[0].ContextWindow);
+        Assert.Contains("K context", capturedTask.SubAgentModels[0].Description);
+
+        Assert.Equal("model-b", capturedTask.SubAgentModels[1].Id);
+        Assert.Null(capturedTask.SubAgentModels[1].ContextWindow);
+        Assert.Equal("Configured model", capturedTask.SubAgentModels[1].Description);
+
+        Assert.Equal("model-c", capturedTask.SubAgentModels[2].Id);
+        Assert.Equal(128_000, capturedTask.SubAgentModels[2].ContextWindow);
+        Assert.Contains("K context", capturedTask.SubAgentModels[2].Description);
+    }
+
+    [Fact]
+    public async Task DispatchToRole_DescriptionContainsContextInfo_WhenContextWindowKnown()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels =
+            [
+                new ModelEntry { Name = "model-a", ContextWindow = 200_000 },
+            ],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Single(capturedTask!.SubAgentModels);
+        Assert.Equal("Configured model, 200K context", capturedTask.SubAgentModels[0].Description);
+    }
+
+    [Fact]
+    public async Task DispatchToRole_DescriptionIsConfiguredModel_WhenContextWindowNull()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels =
+            [
+                new ModelEntry { Name = "model-unknown" },
+            ],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Single(capturedTask!.SubAgentModels);
+        Assert.Equal("Configured model", capturedTask.SubAgentModels[0].Description);
+    }
+
+    [Fact]
+    public async Task DispatchToRole_WhenModelsConfigNull_CatalogIsEmpty()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        // config.Models left null
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Empty(capturedTask!.SubAgentModels);
+    }
+
+    [Fact]
+    public async Task DispatchToRole_WhenAvailableModelsNull_CatalogIsEmpty()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels = null,
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Empty(capturedTask!.SubAgentModels);
+    }
+
+    [Fact]
+    public async Task DispatchToRole_WhenAvailableModelsEmpty_CatalogIsEmpty()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels = [],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Empty(capturedTask!.SubAgentModels);
+    }
+
+    [Fact]
+    public async Task DispatchToRole_FiltersBlankModelNames()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels =
+            [
+                new ModelEntry { Name = "valid-model", ContextWindow = 100_000 },
+                new ModelEntry { Name = "  " },
+            ],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Single(capturedTask!.SubAgentModels);
+        Assert.Equal("valid-model", capturedTask.SubAgentModels[0].Id);
+    }
+
+    [Fact]
+    public async Task DispatchToRole_NoReasoningSuffixAppliedToCatalogIds()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "my-model" };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels =
+            [
+                new ModelEntry { Name = "my-model", ReasoningEffort = "high" },
+            ],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Single(capturedTask!.SubAgentModels);
+        // The dispatched model gets the reasoning suffix, but the catalog ID must NOT.
+        Assert.Equal("my-model", capturedTask.SubAgentModels[0].Id);
+    }
+
     // ── DispatchToRole: null prompt defaults to description ───────────────
 
     [Fact]
