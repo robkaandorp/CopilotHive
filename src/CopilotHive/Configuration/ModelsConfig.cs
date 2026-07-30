@@ -15,6 +15,9 @@ public sealed class ModelEntry
     /// null = no reasoning configuration (use existing :suffix behavior).
     /// </summary>
     public string? ReasoningEffort { get; set; }
+
+    /// <summary>Human-readable description of the model's strengths/cost/speed for sub-agent selection.</summary>
+    public string? Description { get; set; }
 }
 
 /// <summary>
@@ -34,4 +37,10 @@ public sealed class ModelsConfig
     /// instead of free-text input.
     /// </summary>
     public List<ModelEntry>? AvailableModels { get; set; }
+
+    /// <summary>
+    /// Curated list of models for sub-agent selection. When null or empty,
+    /// falls back to <see cref="AvailableModels"/>.
+    /// </summary>
+    public List<ModelEntry>? SubAgentModels { get; set; }
 }

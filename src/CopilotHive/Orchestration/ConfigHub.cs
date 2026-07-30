@@ -30,6 +30,7 @@ public static class ConfigHub
                     kv => kv.Key,
                     kv => new { model = kv.Value.Model, premiumModel = kv.Value.PremiumModel }),
                 availableModels = config.Models?.AvailableModels,
+                subAgentModels = config.Models?.SubAgentModels,
             });
         });
 
@@ -60,7 +61,7 @@ public static class ConfigHub
                 return Results.Problem("Config service is not configured.");
             try
             {
-                await svc.AddAvailableModelAsync(req.Name, req.ContextWindow, req.ReasoningEffort);
+                await svc.AddAvailableModelAsync(req.Name, req.ContextWindow, req.ReasoningEffort, req.Description);
                 return Results.Ok(new { saved = true });
             }
             catch (InvalidOperationException ex)
@@ -77,7 +78,7 @@ public static class ConfigHub
             name = Uri.UnescapeDataString(name);
             try
             {
-                await svc.UpdateAvailableModelAsync(name, req.ContextWindow, req.ReasoningEffort);
+                await svc.UpdateAvailableModelAsync(name, req.ContextWindow, req.ReasoningEffort, req.Description);
                 return Results.Ok(new { saved = true });
             }
             catch (InvalidOperationException ex)
@@ -93,6 +94,49 @@ public static class ConfigHub
                 return Results.Problem("Config service is not configured.");
             name = Uri.UnescapeDataString(name);
             var removed = await svc.RemoveAvailableModelAsync(name);
+            return removed ? Results.Ok(new { removed = true }) : Results.NotFound(new { error = $"Model '{name}' not found." });
+        });
+
+        // Add a model to sub_agent_models
+        app.MapPost("/api/config/sub-agent-models", async (SubAgentModelRequest req, [FromServices] ConfigModelService? svc) =>
+        {
+            if (svc is null)
+                return Results.Problem("Config service is not configured.");
+            try
+            {
+                await svc.AddSubAgentModelAsync(req.Name, req.ContextWindow, req.ReasoningEffort, req.Description);
+                return Results.Ok(new { saved = true });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+        });
+
+        // Update a sub-agent model
+        app.MapPut("/api/config/sub-agent-models/{name}", async (string name, SubAgentModelRequest req, [FromServices] ConfigModelService? svc) =>
+        {
+            if (svc is null)
+                return Results.Problem("Config service is not configured.");
+            name = Uri.UnescapeDataString(name);
+            try
+            {
+                await svc.UpdateSubAgentModelAsync(name, req.ContextWindow, req.ReasoningEffort, req.Description);
+                return Results.Ok(new { saved = true });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        // Remove a sub-agent model
+        app.MapDelete("/api/config/sub-agent-models/{name}", async (string name, [FromServices] ConfigModelService? svc) =>
+        {
+            if (svc is null)
+                return Results.Problem("Config service is not configured.");
+            name = Uri.UnescapeDataString(name);
+            var removed = await svc.RemoveSubAgentModelAsync(name);
             return removed ? Results.Ok(new { removed = true }) : Results.NotFound(new { error = $"Model '{name}' not found." });
         });
 
@@ -256,4 +300,14 @@ public static class ConfigHub
 /// <param name="Name">Model name (used for add; ignored for update where the route name is authoritative).</param>
 /// <param name="ContextWindow">Optional context window in tokens.</param>
 /// <param name="ReasoningEffort">Optional default reasoning effort.</param>
-public sealed record AvailableModelRequest(string Name, int? ContextWindow, string? ReasoningEffort);
+/// <param name="Description">Optional human-readable description.</param>
+public sealed record AvailableModelRequest(string Name, int? ContextWindow, string? ReasoningEffort, string? Description = null);
+
+/// <summary>
+/// Request body for adding or updating a sub-agent model.
+/// </summary>
+/// <param name="Name">Model name (used for add; ignored for update where the route name is authoritative).</param>
+/// <param name="ContextWindow">Optional context window in tokens.</param>
+/// <param name="ReasoningEffort">Optional default reasoning effort.</param>
+/// <param name="Description">Optional human-readable description.</param>
+public sealed record SubAgentModelRequest(string Name, int? ContextWindow, string? ReasoningEffort, string? Description = null);

@@ -1601,6 +1601,91 @@ public sealed class ComposerAgentServiceTests
         }
     }
 
+    // ── Sub-agent model descriptions ──
+
+    [Fact]
+    public async Task BuildSubAgentOptions_UsesConfiguredDescription_WhenPresent()
+    {
+        var stateDir = CreateTempDir();
+        ComposerAgentService? service = null;
+        try
+        {
+            var repoManager = new Mock<IBrainRepoManager>();
+            repoManager.SetupGet(r => r.WorkDirectory).Returns(stateDir);
+            var mockClient = new Mock<IChatClient>();
+
+            service = CreateService(
+                stateDir,
+                chatClientFactory: _ => mockClient.Object,
+                repoManager: repoManager.Object,
+                subAgentsEnabled: true,
+                subAgentModels:
+                [
+                    new ModelEntry
+                    {
+                        Name = "model-a",
+                        ContextWindow = 128_000,
+                        Description = "Best for wide code search"
+                    }
+                ]);
+
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var subAgents = service.AgentOptions.SubAgents;
+            Assert.NotNull(subAgents);
+            var info = Assert.Single(subAgents!.AvailableModels);
+            Assert.Equal("model-a", info.Id);
+            // Must be the configured description, not the auto-generated fallback.
+            Assert.Equal("Best for wide code search", info.Description);
+        }
+        finally
+        {
+            if (service is not null)
+                await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task BuildSubAgentOptions_FallsBackToAutoDescription_WhenBlank(string? description)
+    {
+        var stateDir = CreateTempDir();
+        ComposerAgentService? service = null;
+        try
+        {
+            var repoManager = new Mock<IBrainRepoManager>();
+            repoManager.SetupGet(r => r.WorkDirectory).Returns(stateDir);
+            var mockClient = new Mock<IChatClient>();
+
+            service = CreateService(
+                stateDir,
+                chatClientFactory: _ => mockClient.Object,
+                repoManager: repoManager.Object,
+                subAgentsEnabled: true,
+                subAgentModels:
+                [
+                    new ModelEntry { Name = "model-a", ContextWindow = 128_000, Description = description },
+                    new ModelEntry { Name = "model-b", ContextWindow = null, Description = description },
+                ]);
+
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var subAgents = service.AgentOptions.SubAgents;
+            Assert.NotNull(subAgents);
+            Assert.Equal("Configured model, 128K context window", subAgents!.AvailableModels[0].Description);
+            Assert.Equal("Configured model", subAgents.AvailableModels[1].Description);
+        }
+        finally
+        {
+            if (service is not null)
+                await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
     // ── Utility ──
 
     /// <summary>

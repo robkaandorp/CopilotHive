@@ -209,4 +209,100 @@ public class BrainSubAgentPromptTests
         }
         finally { DeleteTempPath(stateDir); }
     }
+
+    // ── Config → SubAgentModelEntry mapping (DistributedBrain consumer) ──────
+
+    /// <summary>Reads the Brain's construction-time sub-agent catalog snapshot.</summary>
+    private static IReadOnlyList<SubAgentModelEntry>? SubAgentModels(DistributedBrain brain) =>
+        (IReadOnlyList<SubAgentModelEntry>?)typeof(DistributedBrain)
+            .GetField("_subAgentModels", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(brain);
+
+    [Fact]
+    public async Task DistributedBrain_MapsConfiguredDescription_IntoSubAgentModelEntry()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var config = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels =
+                    [
+                        new ModelEntry
+                        {
+                            Name = "copilot/model-a",
+                            ContextWindow = 128_000,
+                            Description = "Fast model for quick tasks"
+                        }
+                    ]
+                }
+            };
+
+            using var unusedClient = new StubChatClient();
+            await using var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: stateDir, hiveConfig: config, chatClient: unusedClient);
+
+            var entry = Assert.Single(SubAgentModels(brain)!);
+            Assert.Equal("copilot/model-a", entry.Name);
+            Assert.Equal(128_000, entry.ContextWindow);
+            // Must be the configured text — NOT the auto-generated "Configured model, ..." string.
+            Assert.Equal("Fast model for quick tasks", entry.Description);
+        }
+        finally { DeleteTempPath(stateDir); }
+    }
+
+    [Fact]
+    public async Task DistributedBrain_UsesCuratedSubAgentModels_OverAvailableModels()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var config = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels =
+                    [
+                        new ModelEntry { Name = "copilot/available-a", ContextWindow = 100_000 },
+                        new ModelEntry { Name = "copilot/available-b", ContextWindow = 200_000 },
+                    ],
+                    SubAgentModels =
+                    [
+                        new ModelEntry
+                        {
+                            Name = "copilot/curated-only",
+                            ContextWindow = 64_000,
+                            Description = "Curated pick"
+                        }
+                    ]
+                }
+            };
+
+            using var unusedClient = new StubChatClient();
+            await using var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: stateDir, hiveConfig: config, chatClient: unusedClient);
+
+            var entry = Assert.Single(SubAgentModels(brain)!);
+            Assert.Equal("copilot/curated-only", entry.Name);
+            Assert.Equal("Curated pick", entry.Description);
+        }
+        finally { DeleteTempPath(stateDir); }
+    }
+
+    [Fact]
+    public async Task DistributedBrain_NullDescription_IsPreservedAsNull_ForDownstreamFallback()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            using var unusedClient = new StubChatClient();
+            await using var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: stateDir, hiveConfig: ConfigWithModels(), chatClient: unusedClient);
+
+            Assert.Null(Assert.Single(SubAgentModels(brain)!).Description);
+        }
+        finally { DeleteTempPath(stateDir); }
+    }
 }

@@ -100,21 +100,20 @@ internal sealed class TaskDispatchService
 
         // Populate sub-agent model catalog from config (no reasoning suffix — sub-agents inherit parent reasoning)
         var subAgentModels = new List<SubAgentModelDto>();
-        if (_config?.Models?.AvailableModels is { } availableModels)
+        var subAgentCatalog = _config?.GetSubAgentModels() ?? [];
+        foreach (var entry in subAgentCatalog)
         {
-            foreach (var entry in availableModels)
+            if (string.IsNullOrWhiteSpace(entry.Name))
+                continue;
+            var autoDescription = entry.ContextWindow is int cw && cw > 0
+                ? $"Configured model, {cw / 1000}K context"
+                : "Configured model";
+            subAgentModels.Add(new SubAgentModelDto
             {
-                if (string.IsNullOrWhiteSpace(entry.Name))
-                    continue;
-                subAgentModels.Add(new SubAgentModelDto
-                {
-                    Id = entry.Name,
-                    ContextWindow = entry.ContextWindow,
-                    Description = entry.ContextWindow is int cw && cw > 0
-                        ? $"Configured model, {cw / 1000}K context"
-                        : "Configured model",
-                });
-            }
+                Id = entry.Name,
+                ContextWindow = entry.ContextWindow,
+                Description = !string.IsNullOrWhiteSpace(entry.Description) ? entry.Description : autoDescription,
+            });
         }
 
         var task = _taskBuilder.Build(

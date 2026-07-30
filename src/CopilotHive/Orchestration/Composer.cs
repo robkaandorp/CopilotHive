@@ -312,12 +312,21 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             _systemPrompt += KnowledgeGraphSystemPromptSection;
 
         // Construction-time snapshot: sub-agents need a model catalog and repo file access.
-        bool subAgentsEnabled = _hiveConfig?.Models?.AvailableModels is { Count: > 0 } && _repoManager is not null;
+        var subAgentCatalog = _hiveConfig?.GetSubAgentModels() ?? [];
+        bool subAgentsEnabled = subAgentCatalog.Count > 0 && _repoManager is not null;
 
         // Snapshot the catalog now — _hiveConfig is a mutable singleton that config reloads
         // live-update, and the prompt section appended below is fixed for the process lifetime.
-        IReadOnlyList<ModelEntry> subAgentModels =
-            _hiveConfig?.Models?.AvailableModels?.ToList().AsReadOnly() ?? (IReadOnlyList<ModelEntry>)[];
+        IReadOnlyList<ModelEntry> subAgentModels = subAgentCatalog
+            .Select(m => new ModelEntry
+            {
+                Name = m.Name,
+                ContextWindow = m.ContextWindow,
+                ReasoningEffort = m.ReasoningEffort,
+                Description = m.Description
+            })
+            .ToList()
+            .AsReadOnly();
 
         if (subAgentsEnabled)
             _systemPrompt += SubAgentsSystemPromptSection;

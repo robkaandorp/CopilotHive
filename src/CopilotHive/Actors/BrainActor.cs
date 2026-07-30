@@ -401,9 +401,10 @@ internal sealed class BrainActor : Actor<IBrainMessage>
 
         foreach (var entry in _subAgentModels)
         {
+            var autoDescription = entry.ContextWindow is int cw ? $"Configured model, {cw / 1000}K context window" : "Configured model";
             options.AvailableModels.Add(new SubAgentModelInfo(
                 entry.Name,
-                entry.ContextWindow is int cw ? $"Configured model, {cw / 1000}K context window" : "Configured model",
+                !string.IsNullOrWhiteSpace(entry.Description) ? entry.Description : autoDescription,
                 entry.ContextWindow));
         }
 

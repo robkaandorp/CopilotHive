@@ -159,6 +159,20 @@ public sealed class HiveConfigFile
     }
 
     /// <summary>
+    /// Returns the curated sub-agent model list. When <see cref="ModelsConfig.SubAgentModels"/>
+    /// is non-empty, it is returned; otherwise falls back to <see cref="ModelsConfig.AvailableModels"/>.
+    /// Returns an empty list when neither is configured.
+    /// </summary>
+    public IReadOnlyList<ModelEntry> GetSubAgentModels()
+    {
+        if (Models?.SubAgentModels is { Count: > 0 } curated)
+            return curated;
+        if (Models?.AvailableModels is { Count: > 0 } available)
+            return available;
+        return [];
+    }
+
+    /// <summary>
     /// Resolves the model to use for a given role (typed overload).
     /// Delegates to <see cref="GetModelForRole(string)"/> using the role's name.
     /// </summary>
@@ -225,7 +239,15 @@ public sealed class HiveConfigFile
                 {
                     Name = m.Name,
                     ContextWindow = m.ContextWindow,
-                    ReasoningEffort = m.ReasoningEffort
+                    ReasoningEffort = m.ReasoningEffort,
+                    Description = m.Description
+                }).ToList(),
+                SubAgentModels = source.Models.SubAgentModels?.Select(m => new ModelEntry
+                {
+                    Name = m.Name,
+                    ContextWindow = m.ContextWindow,
+                    ReasoningEffort = m.ReasoningEffort,
+                    Description = m.Description
                 }).ToList()
             };
         }

@@ -341,7 +341,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("copilot/claude-sonnet-4.6", 200000, "high", TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("copilot/claude-sonnet-4.6", 200000, "high", ct: TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.AvailableModels!);
         Assert.Equal("copilot/claude-sonnet-4.6", model.Name);
@@ -362,7 +362,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("copilot/claude-sonnet-4.6:high", null, null, TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("copilot/claude-sonnet-4.6:high", null, null, ct: TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.AvailableModels!);
         Assert.Equal("copilot/claude-sonnet-4.6", model.Name);
@@ -380,7 +380,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("model:custom", null, null, TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("model:custom", null, null, ct: TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.AvailableModels!);
         Assert.Equal("model:custom", model.Name);
@@ -398,7 +398,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("model:high", null, "low", TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("model:high", null, "low", ct: TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.AvailableModels!);
         Assert.Equal("model", model.Name);
@@ -416,7 +416,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("plain-model", 100000, null, TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("plain-model", 100000, null, ct: TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.AvailableModels!);
         Assert.Equal("plain-model", model.Name);
@@ -431,7 +431,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("model-a", null, null, TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("model-a", null, null, ct: TestContext.Current.CancellationToken);
 
         Assert.NotNull(config.Models);
         var model = Assert.Single(config.Models!.AvailableModels!);
@@ -445,10 +445,10 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("model-a", null, null, TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("model-a", null, null, ct: TestContext.Current.CancellationToken);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            svc.AddAvailableModelAsync("MODEL-A", null, null, TestContext.Current.CancellationToken));
+            svc.AddAvailableModelAsync("MODEL-A", null, null, ct: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -458,7 +458,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("model-a", null, null, TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("model-a", null, null, ct: TestContext.Current.CancellationToken);
 
         Assert.Single(repo.Commits);
         Assert.Equal("hive-config.yaml", repo.Commits[0].File);
@@ -481,7 +481,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateAvailableModelAsync("model-a", 256000, null, TestContext.Current.CancellationToken);
+        await svc.UpdateAvailableModelAsync("model-a", 256000, null, ct: TestContext.Current.CancellationToken);
 
         Assert.Equal(256000, config.Models!.AvailableModels![0].ContextWindow);
     }
@@ -500,7 +500,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateAvailableModelAsync("model-a", null, "high", TestContext.Current.CancellationToken);
+        await svc.UpdateAvailableModelAsync("model-a", null, "high", ct: TestContext.Current.CancellationToken);
 
         Assert.Equal("high", config.Models!.AvailableModels![0].ReasoningEffort);
     }
@@ -519,7 +519,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateAvailableModelAsync("model-a", null, null, TestContext.Current.CancellationToken);
+        await svc.UpdateAvailableModelAsync("model-a", null, null, ct: TestContext.Current.CancellationToken);
 
         Assert.Null(config.Models!.AvailableModels![0].ReasoningEffort);
     }
@@ -532,7 +532,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            svc.UpdateAvailableModelAsync("missing", 1000, null, TestContext.Current.CancellationToken));
+            svc.UpdateAvailableModelAsync("missing", 1000, null, ct: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -549,7 +549,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateAvailableModelAsync("model-a", 256000, null, TestContext.Current.CancellationToken);
+        await svc.UpdateAvailableModelAsync("model-a", 256000, null, ct: TestContext.Current.CancellationToken);
 
         Assert.Single(repo.Commits);
         Assert.Equal("hive-config.yaml", repo.Commits[0].File);
@@ -1245,6 +1245,253 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
             svc.AddRepositoryAsync("test-repo", "", "main", release: null, TestContext.Current.CancellationToken));
+    }
+
+    // ── Description on available models ──────────────────────────────────────
+
+    [Fact]
+    public async Task AddAvailableModelAsync_PersistsDescription()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [] }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddAvailableModelAsync("model-a", 1000, null, "Fast and cheap", ct: TestContext.Current.CancellationToken);
+
+        var model = Assert.Single(config.Models!.AvailableModels!);
+        Assert.Equal("Fast and cheap", model.Description);
+        Assert.Contains(repo.Commits, c => c.File == "hive-config.yaml");
+    }
+
+    [Fact]
+    public async Task UpdateAvailableModelAsync_PersistsDescription()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [new ModelEntry { Name = "model-a" }] }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateAvailableModelAsync("model-a", null, null, "Deep reasoning", ct: TestContext.Current.CancellationToken);
+
+        Assert.Equal("Deep reasoning", config.Models!.AvailableModels![0].Description);
+    }
+
+    // ── Sub-agent model CRUD ─────────────────────────────────────────────────
+
+    [Fact]
+    public async Task AddSubAgentModelAsync_AddsAndCommits()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddSubAgentModelAsync("model-a", 128000, "high", "Great for research", TestContext.Current.CancellationToken);
+
+        var model = Assert.Single(config.Models!.SubAgentModels!);
+        Assert.Equal("model-a", model.Name);
+        Assert.Equal(128000, model.ContextWindow);
+        Assert.Equal("high", model.ReasoningEffort);
+        Assert.Equal("Great for research", model.Description);
+        Assert.Contains(repo.Commits, c => c.Message.Contains("add sub-agent model"));
+    }
+
+    [Fact]
+    public async Task AddSubAgentModelAsync_Duplicate_Throws()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddSubAgentModelAsync("model-a", null, null, null, TestContext.Current.CancellationToken);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            svc.AddSubAgentModelAsync("MODEL-A", null, null, null, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task UpdateSubAgentModelAsync_UpdatesFields()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { SubAgentModels = [new ModelEntry { Name = "model-a" }] }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateSubAgentModelAsync("model-a", 256000, "low", "Cheap", TestContext.Current.CancellationToken);
+
+        var model = Assert.Single(config.Models!.SubAgentModels!);
+        Assert.Equal(256000, model.ContextWindow);
+        Assert.Equal("low", model.ReasoningEffort);
+        Assert.Equal("Cheap", model.Description);
+        Assert.Contains(repo.Commits, c => c.Message.Contains("update sub-agent model"));
+    }
+
+    [Fact]
+    public async Task UpdateSubAgentModelAsync_NotFound_Throws()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            svc.UpdateSubAgentModelAsync("missing", null, null, null, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task RemoveSubAgentModelAsync_RemovesAndCommits()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                SubAgentModels = [new ModelEntry { Name = "model-a" }, new ModelEntry { Name = "model-b" }]
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var removed = await svc.RemoveSubAgentModelAsync("MODEL-A", TestContext.Current.CancellationToken);
+
+        Assert.True(removed);
+        var remaining = Assert.Single(config.Models!.SubAgentModels!);
+        Assert.Equal("model-b", remaining.Name);
+        Assert.Contains(repo.Commits, c => c.Message.Contains("remove sub-agent model"));
+    }
+
+    [Fact]
+    public async Task RemoveSubAgentModelAsync_NotFound_ReturnsFalse()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        Assert.False(await svc.RemoveSubAgentModelAsync("missing", TestContext.Current.CancellationToken));
+        Assert.Empty(repo.Commits);
+    }
+
+    // ── Persisted YAML content proof ─────────────────────────────────────────
+
+    /// <summary>Reads the hive-config.yaml the service actually wrote to the temp repo.</summary>
+    private async Task<string> ReadWrittenYamlAsync() =>
+        await File.ReadAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
+
+    [Fact]
+    public async Task AddSubAgentModelAsync_StripsReasoningSuffix_AndPersistsToYaml()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddSubAgentModelAsync("copilot/test-model:high", 64000, null, "Research helper",
+            TestContext.Current.CancellationToken);
+
+        var model = Assert.Single(config.Models!.SubAgentModels!);
+        Assert.Equal("copilot/test-model", model.Name);
+        Assert.Equal("high", model.ReasoningEffort);
+
+        var yaml = await ReadWrittenYamlAsync();
+        Assert.Contains("sub_agent_models:", yaml, StringComparison.Ordinal);
+        Assert.Contains("copilot/test-model", yaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("copilot/test-model:high", yaml, StringComparison.Ordinal);
+        Assert.Contains("reasoning_effort: high", yaml, StringComparison.Ordinal);
+        Assert.Contains("Research helper", yaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task UpdateSubAgentModelAsync_PersistsUpdatedValuesToYaml()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                SubAgentModels = [new ModelEntry { Name = "model-a", Description = "old desc" }]
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateSubAgentModelAsync("model-a", 256000, "low", "new desc",
+            TestContext.Current.CancellationToken);
+
+        var yaml = await ReadWrittenYamlAsync();
+        Assert.Contains("sub_agent_models:", yaml, StringComparison.Ordinal);
+        Assert.Contains("context_window: 256000", yaml, StringComparison.Ordinal);
+        Assert.Contains("reasoning_effort: low", yaml, StringComparison.Ordinal);
+        Assert.Contains("new desc", yaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("old desc", yaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RemoveSubAgentModelAsync_RemovedEntryIsAbsentFromWrittenYaml()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                SubAgentModels =
+                [
+                    new ModelEntry { Name = "doomed-model" },
+                    new ModelEntry { Name = "kept-model" }
+                ]
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        Assert.True(await svc.RemoveSubAgentModelAsync("doomed-model", TestContext.Current.CancellationToken));
+
+        var yaml = await ReadWrittenYamlAsync();
+        Assert.DoesNotContain("doomed-model", yaml, StringComparison.Ordinal);
+        Assert.Contains("kept-model", yaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task UpdateAvailableModelAsync_PersistsDescriptionToYaml()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [new ModelEntry { Name = "model-a" }] }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateAvailableModelAsync("model-a", null, null, "Deep reasoning workhorse",
+            ct: TestContext.Current.CancellationToken);
+
+        var yaml = await ReadWrittenYamlAsync();
+        Assert.Contains("description: Deep reasoning workhorse", yaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AddAvailableModelAsync_PersistsDescriptionToYaml()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [] }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddAvailableModelAsync("model-a", 1000, null, "Fast and cheap",
+            ct: TestContext.Current.CancellationToken);
+
+        var yaml = await ReadWrittenYamlAsync();
+        Assert.Contains("description: Fast and cheap", yaml, StringComparison.Ordinal);
     }
 }
 

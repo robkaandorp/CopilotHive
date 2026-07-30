@@ -207,8 +207,9 @@ public sealed class ConfigModelService
     /// <param name="name">Model name.</param>
     /// <param name="contextWindow">Optional context window in tokens.</param>
     /// <param name="reasoningEffort">Optional default reasoning effort.</param>
+    /// <param name="description">Optional human-readable description.</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task AddAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, CancellationToken ct = default)
+    public async Task AddAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
     {
         _config.Models ??= new ModelsConfig();
         _config.Models.AvailableModels ??= new List<ModelEntry>();
@@ -224,7 +225,8 @@ public sealed class ConfigModelService
         {
             Name = name,
             ContextWindow = contextWindow,
-            ReasoningEffort = effectiveReasoningEffort
+            ReasoningEffort = effectiveReasoningEffort,
+            Description = description
         });
 
         var message = $"chore: add available model '{name}'";
@@ -241,8 +243,9 @@ public sealed class ConfigModelService
     /// <param name="name">Model name to update.</param>
     /// <param name="contextWindow">New context window (null clears it).</param>
     /// <param name="reasoningEffort">New reasoning effort (null clears it).</param>
+    /// <param name="description">New description (null clears it).</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task UpdateAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, CancellationToken ct = default)
+    public async Task UpdateAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
     {
         var model = _config.Models?.AvailableModels?
             .FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
@@ -251,6 +254,7 @@ public sealed class ConfigModelService
 
         model.ContextWindow = contextWindow;
         model.ReasoningEffort = reasoningEffort;
+        model.Description = description;
 
         var message = $"chore: update available model '{name}'";
         _logger.LogInformation("Updating available model: {Name}", name);
@@ -275,6 +279,90 @@ public sealed class ConfigModelService
 
         var message = $"chore: remove available model '{name}'";
         _logger.LogInformation("Removing available model: {Name}", name);
+
+        await _configRepo.WriteConfigAsync(_config, ct);
+        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+        return true;
+    }
+
+    /// <summary>
+    /// Adds a model to the sub_agent_models curated list. Throws <see cref="InvalidOperationException"/>
+    /// if a model with the same name already exists.
+    /// </summary>
+    /// <param name="name">Model name.</param>
+    /// <param name="contextWindow">Optional context window in tokens.</param>
+    /// <param name="reasoningEffort">Optional default reasoning effort.</param>
+    /// <param name="description">Optional human-readable description.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task AddSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
+    {
+        _config.Models ??= new ModelsConfig();
+        _config.Models.SubAgentModels ??= new List<ModelEntry>();
+
+        var (cleanName, extractedSuffix) = StripReasoningSuffix(name);
+        name = cleanName;
+        var effectiveReasoningEffort = reasoningEffort ?? extractedSuffix;
+
+        if (_config.Models.SubAgentModels.Any(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidOperationException($"Model '{name}' already exists in sub_agent_models");
+
+        _config.Models.SubAgentModels.Add(new ModelEntry
+        {
+            Name = name,
+            ContextWindow = contextWindow,
+            ReasoningEffort = effectiveReasoningEffort,
+            Description = description
+        });
+
+        var message = $"chore: add sub-agent model '{name}'";
+        _logger.LogInformation("Adding sub-agent model: {Name}", name);
+
+        await _configRepo.WriteConfigAsync(_config, ct);
+        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+    }
+
+    /// <summary>
+    /// Updates an existing sub-agent model. Throws <see cref="InvalidOperationException"/> if not found.
+    /// </summary>
+    /// <param name="name">Model name to update.</param>
+    /// <param name="contextWindow">New context window (null clears it).</param>
+    /// <param name="reasoningEffort">New reasoning effort (null clears it).</param>
+    /// <param name="description">New description (null clears it).</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task UpdateSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
+    {
+        var model = _config.Models?.SubAgentModels?
+            .FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
+        if (model is null)
+            throw new InvalidOperationException($"Model '{name}' not found in sub_agent_models");
+
+        model.ContextWindow = contextWindow;
+        model.ReasoningEffort = reasoningEffort;
+        model.Description = description;
+
+        var message = $"chore: update sub-agent model '{name}'";
+        _logger.LogInformation("Updating sub-agent model: {Name}", name);
+
+        await _configRepo.WriteConfigAsync(_config, ct);
+        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+    }
+
+    /// <summary>
+    /// Removes a model from the sub_agent_models curated list. Returns <c>false</c> if not found.
+    /// </summary>
+    /// <param name="name">Model name to remove.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<bool> RemoveSubAgentModelAsync(string name, CancellationToken ct = default)
+    {
+        var model = _config.Models?.SubAgentModels?
+            .FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
+        if (model is null)
+            return false;
+
+        _config.Models!.SubAgentModels!.Remove(model);
+
+        var message = $"chore: remove sub-agent model '{name}'";
+        _logger.LogInformation("Removing sub-agent model: {Name}", name);
 
         await _configRepo.WriteConfigAsync(_config, ct);
         await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);

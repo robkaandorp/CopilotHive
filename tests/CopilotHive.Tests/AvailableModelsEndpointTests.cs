@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
 using CopilotHive.Configuration;
 using CopilotHive.Services;
 using Microsoft.AspNetCore.Hosting;
@@ -134,6 +135,263 @@ public class AvailableModelsEndpointTests : IDisposable
             TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    // ── Sub-agent models endpoints ───────────────────────────────────────────
+
+    [Fact]
+    public async Task PostSubAgentModel_Success_Returns200()
+    {
+        var response = await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name = "sa-model", contextWindow = 128000, reasoningEffort = "high", description = "Fast" },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PostSubAgentModel_Duplicate_Returns409()
+    {
+        await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name = "sa-dup", contextWindow = (int?)null, reasoningEffort = (string?)null, description = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        var response = await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name = "SA-DUP", contextWindow = (int?)null, reasoningEffort = (string?)null, description = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PutSubAgentModel_Success_Returns200()
+    {
+        await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name = "sa-edit", contextWindow = 1000, reasoningEffort = (string?)null, description = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        var response = await _client.PutAsJsonAsync(
+            "/api/config/sub-agent-models/sa-edit",
+            new { name = "sa-edit", contextWindow = 2000, reasoningEffort = "low", description = "Updated" },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PutSubAgentModel_NotFound_Returns404()
+    {
+        var response = await _client.PutAsJsonAsync(
+            "/api/config/sub-agent-models/sa-missing",
+            new { name = "sa-missing", contextWindow = (int?)null, reasoningEffort = (string?)null, description = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task DeleteSubAgentModel_Success_Returns200()
+    {
+        await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name = "sa-delete", contextWindow = (int?)null, reasoningEffort = (string?)null, description = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        var response = await _client.DeleteAsync(
+            "/api/config/sub-agent-models/sa-delete",
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task DeleteSubAgentModel_NotFound_Returns404()
+    {
+        var response = await _client.DeleteAsync(
+            "/api/config/sub-agent-models/sa-no-such",
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    // ── GET /api/config/models — response includes subAgentModels + description ──
+
+    [Fact]
+    public async Task GetModels_ResponseIncludesSubAgentModelsField()
+    {
+        // Add a sub-agent model so the response carries a non-empty subAgentModels array
+        await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name = "sa-get-test", contextWindow = (int?)128000, reasoningEffort = (string?)"medium", description = "Fast model for quick tasks" },
+            TestContext.Current.CancellationToken);
+
+        var getResponse = await _client.GetAsync("/api/config/models", TestContext.Current.CancellationToken);
+        getResponse.EnsureSuccessStatusCode();
+        using var doc = await System.Text.Json.JsonDocument.ParseAsync(
+            await getResponse.Content.ReadAsStreamAsync(TestContext.Current.CancellationToken),
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        // The response must include the subAgentModels element
+        Assert.True(doc.RootElement.TryGetProperty("subAgentModels", out var subAgentModels),
+            "Expected 'subAgentModels' field in GET /api/config/models response");
+        var subEntry = Assert.Single(subAgentModels.EnumerateArray());
+        Assert.Equal("sa-get-test", subEntry.GetProperty("name").GetString());
+        Assert.Equal("Fast model for quick tasks", subEntry.GetProperty("description").GetString());
+    }
+
+    [Fact]
+    public async Task GetModels_AvailableModelsEntriesIncludeDescription()
+    {
+        // Add an available model with a description
+        await _client.PostAsJsonAsync(
+            "/api/config/available-models",
+            new { name = "desc-model", contextWindow = (int?)64000, reasoningEffort = (string?)"low", description = "Economical batch worker" },
+            TestContext.Current.CancellationToken);
+
+        var getResponse = await _client.GetAsync("/api/config/models", TestContext.Current.CancellationToken);
+        getResponse.EnsureSuccessStatusCode();
+        using var doc = await System.Text.Json.JsonDocument.ParseAsync(
+            await getResponse.Content.ReadAsStreamAsync(TestContext.Current.CancellationToken),
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        var availableModels = doc.RootElement.GetProperty("availableModels");
+        var found = false;
+        foreach (var entry in availableModels.EnumerateArray())
+        {
+            if (entry.GetProperty("name").GetString() == "desc-model")
+            {
+                Assert.True(entry.TryGetProperty("description", out var desc),
+                    "Expected 'description' field on availableModels entry");
+                Assert.Equal("Economical batch worker", desc.GetString());
+                found = true;
+                break;
+            }
+        }
+        Assert.True(found, "Expected a model with Name='desc-model' in availableModels");
+    }
+
+    // ── Sub-agent endpoints: verify actual persisted effects, not just status codes ──
+
+    /// <summary>GETs /api/config/models and returns the sub_agent_models array (may be null).</summary>
+    private async Task<JsonElement?> GetSubAgentModelsAsync()
+    {
+        var doc = await _client.GetFromJsonAsync<JsonElement>(
+            "/api/config/models", TestContext.Current.CancellationToken);
+        if (!doc.TryGetProperty("subAgentModels", out var arr) || arr.ValueKind != JsonValueKind.Array)
+            return null;
+        return arr;
+    }
+
+    private async Task<JsonElement?> FindSubAgentModelAsync(string name)
+    {
+        var arr = await GetSubAgentModelsAsync();
+        if (arr is null)
+            return null;
+        foreach (var e in arr.Value.EnumerateArray())
+        {
+            if (e.TryGetProperty("name", out var n) &&
+                string.Equals(n.GetString(), name, StringComparison.OrdinalIgnoreCase))
+                return e;
+        }
+        return null;
+    }
+
+    [Fact]
+    public async Task PutSubAgentModel_ActuallyUpdatesPersistedValues()
+    {
+        await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name = "effect-model", contextWindow = 1000, reasoningEffort = (string?)null, description = "before" },
+            TestContext.Current.CancellationToken);
+
+        var response = await _client.PutAsJsonAsync(
+            "/api/config/sub-agent-models/effect-model",
+            new { name = "effect-model", contextWindow = 250000, reasoningEffort = "high", description = "after" },
+            TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var entry = await FindSubAgentModelAsync("effect-model");
+        Assert.NotNull(entry);
+        Assert.Equal(250000, entry!.Value.GetProperty("contextWindow").GetInt32());
+        Assert.Equal("high", entry.Value.GetProperty("reasoningEffort").GetString());
+        Assert.Equal("after", entry.Value.GetProperty("description").GetString());
+    }
+
+    [Fact]
+    public async Task DeleteSubAgentModel_ActuallyRemovesEntry()
+    {
+        await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name = "gone-model", contextWindow = (int?)null, reasoningEffort = (string?)null, description = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        Assert.NotNull(await FindSubAgentModelAsync("gone-model"));
+
+        var response = await _client.DeleteAsync(
+            "/api/config/sub-agent-models/gone-model", TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        Assert.Null(await FindSubAgentModelAsync("gone-model"));
+    }
+
+    [Fact]
+    public async Task PutSubAgentModel_UrlEncodedSlash_UnescapesRouteNameAndUpdates()
+    {
+        const string name = "copilot/claude-sonnet-4.6";
+        await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name, contextWindow = 1000, reasoningEffort = (string?)null, description = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        var response = await _client.PutAsJsonAsync(
+            $"/api/config/sub-agent-models/{Uri.EscapeDataString(name)}",
+            new { name, contextWindow = 400000, reasoningEffort = "medium", description = "encoded update" },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var entry = await FindSubAgentModelAsync(name);
+        Assert.NotNull(entry);
+        Assert.Equal(400000, entry!.Value.GetProperty("contextWindow").GetInt32());
+        Assert.Equal("medium", entry.Value.GetProperty("reasoningEffort").GetString());
+        Assert.Equal("encoded update", entry.Value.GetProperty("description").GetString());
+    }
+
+    [Fact]
+    public async Task DeleteSubAgentModel_UrlEncodedSlash_UnescapesRouteNameAndRemoves()
+    {
+        const string name = "copilot/gemini-3.5-flash";
+        await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name, contextWindow = (int?)null, reasoningEffort = (string?)null, description = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        Assert.NotNull(await FindSubAgentModelAsync(name));
+
+        var response = await _client.DeleteAsync(
+            $"/api/config/sub-agent-models/{Uri.EscapeDataString(name)}",
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Null(await FindSubAgentModelAsync(name));
+    }
+
+    [Fact]
+    public async Task PostSubAgentModel_StripsReasoningSuffixFromName()
+    {
+        await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name = "suffix-model:high", contextWindow = (int?)null, reasoningEffort = (string?)null, description = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        var entry = await FindSubAgentModelAsync("suffix-model");
+        Assert.NotNull(entry);
+        Assert.Equal("high", entry!.Value.GetProperty("reasoningEffort").GetString());
+        Assert.Null(await FindSubAgentModelAsync("suffix-model:high"));
     }
 
     // ── GET /api/config/models/discover — 200 success (empty when no tokens) ──

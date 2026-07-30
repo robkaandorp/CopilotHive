@@ -1,0 +1,119 @@
+using System.Reflection;
+
+using CopilotHive.Configuration;
+using CopilotHive.Git;
+using CopilotHive.Goals;
+using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
+
+using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging.Abstractions;
+
+using Moq;
+
+namespace CopilotHive.Tests.Orchestration;
+
+/// <summary>
+/// Verifies that <see cref="Composer"/> takes a genuine deep-copy snapshot of the sub-agent
+/// model catalog at construction time. The catalog lives on the mutable
+/// <see cref="HiveConfigFile"/> singleton, which the dashboard mutates in place via
+/// <c>ConfigModelService</c>. Copying only the list wrapper would still expose the shared
+/// <see cref="ModelEntry"/> references.
+/// </summary>
+public sealed class ComposerSubAgentSnapshotTests : IDisposable
+{
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _store;
+
+    public ComposerSubAgentSnapshotTests()
+    {
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _store = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
+    }
+
+    public void Dispose() => _dbContext.Dispose();
+
+    /// <summary>Reads the sub-agent catalog snapshot the Composer handed to its agent service.</summary>
+    private static IReadOnlyList<ModelEntry> GetSnapshot(Composer composer)
+    {
+        var agentService = typeof(Composer)
+            .GetField("_agentService", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(composer)!;
+
+        return (IReadOnlyList<ModelEntry>)typeof(ComposerAgentService)
+            .GetField("_subAgentModels", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(agentService)!;
+    }
+
+    [Fact]
+    public async Task Composer_SubAgentSnapshot_IsDeepCopy_NotSharedWithLiveConfig()
+    {
+        var sourceEntry = new ModelEntry
+        {
+            Name = "test-model",
+            ContextWindow = 200000,
+            Description = "Original desc",
+        };
+        var hiveConfig = new HiveConfigFile
+        {
+            Models = new ModelsConfig { AvailableModels = [sourceEntry] }
+        };
+
+        var repoManager = new Mock<IBrainRepoManager>();
+        repoManager.SetupGet(r => r.WorkDirectory).Returns(Path.GetTempPath());
+
+        await using var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            repoManager: repoManager.Object,
+            stateDir: Path.GetTempPath(),
+            hiveConfig: hiveConfig,
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+        var snapshot = GetSnapshot(composer);
+        var snapshotEntry = Assert.Single(snapshot);
+        Assert.NotSame(sourceEntry, snapshotEntry);
+
+        // Mutate the live config entry in place — exactly what ConfigModelService does.
+        sourceEntry.Name = "mutated";
+        sourceEntry.ContextWindow = 999;
+        sourceEntry.Description = "changed";
+        sourceEntry.ReasoningEffort = "high";
+
+        // The construction-time snapshot must be unaffected.
+        Assert.Equal("test-model", snapshotEntry.Name);
+        Assert.Equal(200000, snapshotEntry.ContextWindow);
+        Assert.Equal("Original desc", snapshotEntry.Description);
+        Assert.Null(snapshotEntry.ReasoningEffort);
+    }
+
+    [Fact]
+    public async Task Composer_SubAgentSnapshot_PrefersCuratedSubAgentModels()
+    {
+        var hiveConfig = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "available-only" }],
+                SubAgentModels = [new ModelEntry { Name = "curated", Description = "Curated pick" }],
+            }
+        };
+
+        var repoManager = new Mock<IBrainRepoManager>();
+        repoManager.SetupGet(r => r.WorkDirectory).Returns(Path.GetTempPath());
+
+        await using var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            repoManager: repoManager.Object,
+            stateDir: Path.GetTempPath(),
+            hiveConfig: hiveConfig,
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+        var entry = Assert.Single(GetSnapshot(composer));
+        Assert.Equal("curated", entry.Name);
+        Assert.Equal("Curated pick", entry.Description);
+    }
+}

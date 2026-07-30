@@ -113,10 +113,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(modelOverride);
         _reasoningEffort = reasoning;
 
-        var availableModels = _hiveConfig?.Models?.AvailableModels;
-        _subAgentModels = availableModels is null || availableModels.Count == 0
+        var subAgentCatalog = _hiveConfig?.GetSubAgentModels() ?? [];
+        _subAgentModels = subAgentCatalog.Count == 0
             ? null
-            : availableModels.Select(m => new SubAgentModelEntry(m.Name, m.ContextWindow)).ToList();
+            : subAgentCatalog.Select(m => new SubAgentModelEntry(m.Name, m.ContextWindow, m.Description)).ToList();
         _subAgentsEnabled = _subAgentModels is not null && _subAgentModels.Count > 0;
 
         var orchestratorInstructions = agentsManager?.GetAgentsMd(WorkerRole.Orchestrator) ?? "";
@@ -1062,4 +1062,4 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 }
 
 /// <summary>Immutable snapshot of a configured model available to Brain sub-agents.</summary>
-internal sealed record SubAgentModelEntry(string Name, int? ContextWindow);
+internal sealed record SubAgentModelEntry(string Name, int? ContextWindow, string? Description);

@@ -107,6 +107,30 @@ public class BrainActorSubAgentTests
             .Invoke(actor, null);
 
     [Fact]
+    public async Task BuildSubAgentOptions_UsesConfiguredDescription_WhenPresent()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            IReadOnlyList<SubAgentModelEntry> snapshot =
+            [
+                new("copilot/model-a", 128_000, "Great for wide code search"),
+                new("copilot/model-b", 64_000, "   "),
+            ];
+
+            await using var actor = CreateActor(dir, snapshot, subAgentsEnabled: true);
+            var options = BuildSubAgentOptions(actor);
+
+            Assert.NotNull(options);
+            Assert.Equal("Great for wide code search", options!.AvailableModels[0].Description);
+            Assert.Equal("Configured model, 64K context window", options.AvailableModels[1].Description);
+        }
+        finally
+        {
+            DeleteTempPath(dir);        }
+    }
+
+    [Fact]
     public async Task BuildSubAgentOptions_WithSnapshot_BuildsModelCatalogAndLimits()
     {
         var dir = CreateTempDir();
@@ -114,8 +138,8 @@ public class BrainActorSubAgentTests
         {
             IReadOnlyList<SubAgentModelEntry> snapshot =
             [
-                new("copilot/model-a", 128_000),
-                new("copilot/model-b", null),
+                new("copilot/model-a", 128_000, null),
+                new("copilot/model-b", null, null),
             ];
 
             await using var actor = CreateActor(dir, snapshot, subAgentsEnabled: true);
@@ -153,7 +177,7 @@ public class BrainActorSubAgentTests
         var dir = CreateTempDir();
         try
         {
-            IReadOnlyList<SubAgentModelEntry> snapshot = [new("copilot/model-a", 64_000)];
+            IReadOnlyList<SubAgentModelEntry> snapshot = [new("copilot/model-a", 64_000, null)];
             await using var actor = CreateActor(dir, snapshot, subAgentsEnabled: true);
 
             var options = BuildSubAgentOptions(actor);
@@ -170,7 +194,7 @@ public class BrainActorSubAgentTests
         var dir = CreateTempDir();
         try
         {
-            IReadOnlyList<SubAgentModelEntry> snapshot = [new("copilot/model-a", 64_000)];
+            IReadOnlyList<SubAgentModelEntry> snapshot = [new("copilot/model-a", 64_000, null)];
             await using var actor = CreateActor(dir, snapshot, subAgentsEnabled: false);
 
             Assert.Null(BuildSubAgentOptions(actor));
@@ -201,7 +225,7 @@ public class BrainActorSubAgentTests
         {
             var requested = new List<string>();
             var stub = new StubChatClient();
-            IReadOnlyList<SubAgentModelEntry> snapshot = [new("copilot/model-a", 64_000)];
+            IReadOnlyList<SubAgentModelEntry> snapshot = [new("copilot/model-a", 64_000, null)];
 
             await using var actor = CreateActor(dir, snapshot, subAgentsEnabled: true,
                 chatClientFactory: model => { requested.Add(model); return stub; });
@@ -229,7 +253,7 @@ public class BrainActorSubAgentTests
         var dir = CreateTempDir();
         try
         {
-            IReadOnlyList<SubAgentModelEntry> snapshot = [new("copilot/model-a", 64_000)];
+            IReadOnlyList<SubAgentModelEntry> snapshot = [new("copilot/model-a", 64_000, null)];
             await using var actor = CreateActor(dir, snapshot, subAgentsEnabled: true);
 
             var resources = PrepareChildResources(actor);

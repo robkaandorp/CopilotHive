@@ -298,6 +298,10 @@ else
                                 <option value="high">high</option>
                                 <option value="extra_high">extra_high</option>
                             </select>
+
+                            <label style="color:var(--text-muted);font-size:0.9rem">Description</label>
+                            <input @bind="_newModelDescription" placeholder="e.g. Fast and cheap, good for simple tasks"
+                                   style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
                         </div>
                         <div style="margin-top:1rem;display:flex;gap:0.75rem">
                             <button class="approve-btn" @onclick="AddModelAsync">💾 Save</button>
@@ -323,6 +327,7 @@ else
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Name</th>
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Context Window</th>
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Reasoning Effort</th>
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Description</th>
                                 <th style="text-align:right;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Actions</th>
                             </tr>
                         </thead>
@@ -347,6 +352,10 @@ else
                                                 <option value="extra_high">extra_high</option>
                                             </select>
                                         </td>
+                                        <td style="padding:0.5rem">
+                                            <input @bind="_editModelDescription" placeholder="optional"
+                                                   style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:12rem" />
+                                        </td>
                                         <td style="padding:0.5rem;text-align:right">
                                             <button class="approve-btn" @onclick="SaveEditModelAsync">💾 Save</button>
                                             <button class="approve-btn" @onclick="CancelEditModel">Cancel</button>
@@ -357,6 +366,7 @@ else
                                         <td style="padding:0.5rem;font-size:0.9rem">@model.Name</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(model.ContextWindow?.ToString() ?? "—")</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(model.ReasoningEffort) ? "—" : model.ReasoningEffort)</td>
+                                        <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(model.Description) ? "—" : model.Description)</td>
                                         <td style="padding:0.5rem;text-align:right">
                                             <button class="approve-btn" @onclick="() => StartEditModel(model)">✏️ Edit</button>
                                             <button class="approve-btn" style="color:var(--red)" @onclick="() => RemoveModelAsync(model.Name)">🗑️ Remove</button>
@@ -410,6 +420,143 @@ else
                             </div>
                         </div>
                     </div>
+                }
+            </div>
+        }
+        else if (_activeTab == SubAgentModelsTabName)
+        {
+            <div style="margin-top:1rem">
+                <p style="color:var(--text-muted);font-size:0.9rem;margin-bottom:1rem">
+                    Curated catalog offered to sub-agents. When empty, the full Available Models list is used.
+                </p>
+                <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1.25rem">
+                    <button class="approve-btn" @onclick="() => { _showAddSubAgentModelForm = !_showAddSubAgentModelForm; _subAgentModelsError = null; _subAgentModelsSuccess = null; }">
+                        ➕ Add Model
+                    </button>
+                    @if (_subAgentModelsSuccess is not null)
+                    {
+                        <span style="color:var(--accent);font-size:0.9rem">@_subAgentModelsSuccess</span>
+                    }
+                    @if (_subAgentModelsError is not null)
+                    {
+                        <span style="color:var(--red);font-size:0.9rem">@_subAgentModelsError</span>
+                    }
+                </div>
+
+                @if (_showAddSubAgentModelForm)
+                {
+                    <div style="margin-bottom:1.5rem;padding:1rem 1.25rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;max-width:700px">
+                        <h3 style="font-size:1rem;font-weight:600;margin-bottom:0.75rem">Add Sub-Agent Model</h3>
+                        <div style="display:grid;grid-template-columns:10rem 1fr;gap:0.75rem 1rem;align-items:center">
+                            <label style="color:var(--text-muted);font-size:0.9rem">Name</label>
+                            @if (_modelsData?.AvailableModels is { Count: > 0 } pickable)
+                            {
+                                <select @bind="_newSubAgentModelName"
+                                        style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                                    <option value="">— select a model —</option>
+                                    @foreach (var pm in pickable)
+                                    {
+                                        <option value="@pm.Name">@pm.Name</option>
+                                    }
+                                </select>
+                            }
+                            else
+                            {
+                                <input @bind="_newSubAgentModelName" placeholder="e.g. copilot/claude-sonnet-4.6"
+                                       style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+                            }
+
+                            <label style="color:var(--text-muted);font-size:0.9rem">Context Window</label>
+                            <input type="number" @bind="_newSubAgentModelContextWindow" placeholder="optional"
+                                   style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                            <label style="color:var(--text-muted);font-size:0.9rem">Reasoning Effort</label>
+                            <select @bind="_newSubAgentModelReasoningEffort"
+                                    style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                                <option value="">none</option>
+                                <option value="low">low</option>
+                                <option value="medium">medium</option>
+                                <option value="high">high</option>
+                                <option value="extra_high">extra_high</option>
+                            </select>
+
+                            <label style="color:var(--text-muted);font-size:0.9rem">Description</label>
+                            <input @bind="_newSubAgentModelDescription" placeholder="e.g. Fast and cheap, good for simple lookups"
+                                   style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+                        </div>
+                        <div style="margin-top:1rem;display:flex;gap:0.75rem">
+                            <button class="approve-btn" @onclick="AddSubAgentModelAsync">💾 Save</button>
+                            <button class="approve-btn" @onclick="() => _showAddSubAgentModelForm = false">Cancel</button>
+                        </div>
+                    </div>
+                }
+
+                @{
+                    var subAgentModelList = _modelsData?.SubAgentModels;
+                }
+                @if (subAgentModelList is null || subAgentModelList.Count == 0)
+                {
+                    <p style="color:var(--text-muted);font-style:italic">
+                        No sub-agent models curated. The catalog falls back to all available models.
+                    </p>
+                }
+                else
+                {
+                    <table style="border-collapse:collapse;width:100%;max-width:900px">
+                        <thead>
+                            <tr style="border-bottom:1px solid var(--border)">
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Name</th>
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Context Window</th>
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Reasoning Effort</th>
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Description</th>
+                                <th style="text-align:right;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var sam in subAgentModelList)
+                            {
+                                <tr style="border-bottom:1px solid var(--border)">
+                                    @if (_editingSubAgentModelName == sam.Name)
+                                    {
+                                        <td style="padding:0.5rem;font-size:0.9rem">@sam.Name</td>
+                                        <td style="padding:0.5rem">
+                                            <input type="number" @bind="_editSubAgentModelContextWindow" placeholder="optional"
+                                                   style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem" />
+                                        </td>
+                                        <td style="padding:0.5rem">
+                                            <select @bind="_editSubAgentModelReasoningEffort"
+                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;cursor:pointer">
+                                                <option value="">none</option>
+                                                <option value="low">low</option>
+                                                <option value="medium">medium</option>
+                                                <option value="high">high</option>
+                                                <option value="extra_high">extra_high</option>
+                                            </select>
+                                        </td>
+                                        <td style="padding:0.5rem">
+                                            <input @bind="_editSubAgentModelDescription" placeholder="optional"
+                                                   style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:12rem" />
+                                        </td>
+                                        <td style="padding:0.5rem;text-align:right">
+                                            <button class="approve-btn" @onclick="SaveEditSubAgentModelAsync">💾 Save</button>
+                                            <button class="approve-btn" @onclick="CancelEditSubAgentModel">Cancel</button>
+                                        </td>
+                                    }
+                                    else
+                                    {
+                                        <td style="padding:0.5rem;font-size:0.9rem">@sam.Name</td>
+                                        <td style="padding:0.5rem;font-size:0.9rem">@(sam.ContextWindow?.ToString() ?? "—")</td>
+                                        <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(sam.ReasoningEffort) ? "—" : sam.ReasoningEffort)</td>
+                                        <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(sam.Description) ? "—" : sam.Description)</td>
+                                        <td style="padding:0.5rem;text-align:right">
+                                            <button class="approve-btn" @onclick="() => StartEditSubAgentModel(sam)">✏️ Edit</button>
+                                            <button class="approve-btn" style="color:var(--red)" @onclick="() => RemoveSubAgentModelAsync(sam.Name)">🗑️ Remove</button>
+                                        </td>
+                                    }
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
                 }
             </div>
         }
@@ -816,6 +963,7 @@ else
 @code {
     private const string ModelsTabName = "Models";
     private const string AvailableModelsTabName = "Available Models";
+    private const string SubAgentModelsTabName = "Sub-Agent Models";
     private const string BackupTabName = "Backup";
     private const string RepositoriesTabName = "Repositories";
     private const string OrchestratorTabName = "Orchestrator";
@@ -827,7 +975,8 @@ else
         [property: JsonPropertyName("composer")]        string? Composer,
         [property: JsonPropertyName("compaction")]      string? Compaction,
         [property: JsonPropertyName("workers")]         Dictionary<string, WorkerConfigDto>? Workers,
-        [property: JsonPropertyName("availableModels")] List<ModelEntryDto>? AvailableModels);
+        [property: JsonPropertyName("availableModels")] List<ModelEntryDto>? AvailableModels,
+        [property: JsonPropertyName("subAgentModels")]  List<ModelEntryDto>? SubAgentModels);
 
     private sealed record WorkerConfigDto(
         [property: JsonPropertyName("model")] string? Model,
@@ -836,7 +985,8 @@ else
     private sealed record ModelEntryDto(
         [property: JsonPropertyName("name")] string Name,
         [property: JsonPropertyName("contextWindow")] int? ContextWindow,
-        [property: JsonPropertyName("reasoningEffort")] string? ReasoningEffort);
+        [property: JsonPropertyName("reasoningEffort")] string? ReasoningEffort,
+        [property: JsonPropertyName("description")] string? Description);
 
     private sealed record DiscoveredModelDto(
         [property: JsonPropertyName("id")] string Id,
@@ -921,11 +1071,26 @@ else
     private string _newModelName = "";
     private int? _newModelContextWindow;
     private string _newModelReasoningEffort = "";
+    private string _newModelDescription = "";
     private string? _editingModelName;
     private int? _editModelContextWindow;
     private string _editModelReasoningEffort = "";
+    private string _editModelDescription = "";
     private string? _availableModelsError;
     private string? _availableModelsSuccess;
+
+    // Sub-Agent Models tab state
+    private bool _showAddSubAgentModelForm;
+    private string _newSubAgentModelName = "";
+    private int? _newSubAgentModelContextWindow;
+    private string _newSubAgentModelReasoningEffort = "";
+    private string _newSubAgentModelDescription = "";
+    private string? _editingSubAgentModelName;
+    private int? _editSubAgentModelContextWindow;
+    private string _editSubAgentModelReasoningEffort = "";
+    private string _editSubAgentModelDescription = "";
+    private string? _subAgentModelsError;
+    private string? _subAgentModelsSuccess;
 
     // Repositories tab
     private List<RepositoryDto> _repositories = [];
@@ -1030,11 +1195,12 @@ else
         _tabs = [.. _files.Keys];
         _tabs.Insert(0, ModelsTabName);
         _tabs.Insert(1, AvailableModelsTabName);
-        _tabs.Insert(2, BackupTabName);
-        _tabs.Insert(3, RepositoriesTabName);
-        _tabs.Insert(4, OrchestratorTabName);
-        _tabs.Insert(5, WorkersTabName);
-        _tabs.Insert(6, ComposerTabName);
+        _tabs.Insert(2, SubAgentModelsTabName);
+        _tabs.Insert(3, BackupTabName);
+        _tabs.Insert(4, RepositoriesTabName);
+        _tabs.Insert(5, OrchestratorTabName);
+        _tabs.Insert(6, WorkersTabName);
+        _tabs.Insert(7, ComposerTabName);
     }
 
     private async Task LoadModelsAsync()
@@ -1592,7 +1758,7 @@ else
         {
             foreach (var dm in _discoveredModels.Where(m => _selectedDiscoveredIds.Contains(m.Id)))
             {
-                var response = await PostAvailableModelAsync(dm.Id, dm.ContextWindow, null);
+                var response = await PostAvailableModelAsync(dm.Id, dm.ContextWindow, null, null);
                 if (!response.IsSuccessStatusCode)
                 {
                     var error = await response.Content.ReadAsStringAsync();
@@ -1627,12 +1793,14 @@ else
         try
         {
             var reasoning = string.IsNullOrEmpty(_newModelReasoningEffort) ? null : _newModelReasoningEffort;
-            var response = await PostAvailableModelAsync(_newModelName, _newModelContextWindow, reasoning);
+            var newDescription = string.IsNullOrWhiteSpace(_newModelDescription) ? null : _newModelDescription;
+            var response = await PostAvailableModelAsync(_newModelName, _newModelContextWindow, reasoning, newDescription);
             if (response.IsSuccessStatusCode)
             {
                 _newModelName = "";
                 _newModelContextWindow = null;
                 _newModelReasoningEffort = "";
+                _newModelDescription = "";
                 _showAddModelForm = false;
                 await LoadModelsAsync();
                 _availableModelsSuccess = "✅ Model added";
@@ -1658,6 +1826,7 @@ else
         _editingModelName = model.Name;
         _editModelContextWindow = model.ContextWindow;
         _editModelReasoningEffort = model.ReasoningEffort ?? "";
+        _editModelDescription = model.Description ?? "";
         _availableModelsError = null;
         _availableModelsSuccess = null;
     }
@@ -1676,12 +1845,14 @@ else
         try
         {
             var reasoning = string.IsNullOrEmpty(_editModelReasoningEffort) ? null : _editModelReasoningEffort;
+            var editDescription = string.IsNullOrWhiteSpace(_editModelDescription) ? null : _editModelDescription;
             var body = new StringContent(
                 System.Text.Json.JsonSerializer.Serialize(new
                 {
                     name = _editingModelName,
                     contextWindow = _editModelContextWindow,
                     reasoningEffort = reasoning,
+                    description = editDescription,
                 }),
                 System.Text.Encoding.UTF8,
                 "application/json");
@@ -1742,7 +1913,7 @@ else
         }
     }
 
-    private Task<HttpResponseMessage> PostAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort)
+    private Task<HttpResponseMessage> PostAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null)
     {
         var body = new StringContent(
             System.Text.Json.JsonSerializer.Serialize(new
@@ -1750,10 +1921,158 @@ else
                 name,
                 contextWindow,
                 reasoningEffort,
+                description,
             }),
             System.Text.Encoding.UTF8,
             "application/json");
         return HttpClient.PostAsync("/api/config/available-models", body);
+    }
+
+    private Task<HttpResponseMessage> PostSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description)
+    {
+        var body = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new
+            {
+                name,
+                contextWindow,
+                reasoningEffort,
+                description,
+            }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+        return HttpClient.PostAsync("/api/config/sub-agent-models", body);
+    }
+
+    private async Task AddSubAgentModelAsync()
+    {
+        _subAgentModelsError = null;
+        _subAgentModelsSuccess = null;
+        if (string.IsNullOrWhiteSpace(_newSubAgentModelName))
+        {
+            _subAgentModelsError = "Model name is required.";
+            return;
+        }
+        try
+        {
+            var reasoning = string.IsNullOrEmpty(_newSubAgentModelReasoningEffort) ? null : _newSubAgentModelReasoningEffort;
+            var description = string.IsNullOrWhiteSpace(_newSubAgentModelDescription) ? null : _newSubAgentModelDescription;
+            var response = await PostSubAgentModelAsync(_newSubAgentModelName, _newSubAgentModelContextWindow, reasoning, description);
+            if (response.IsSuccessStatusCode)
+            {
+                _newSubAgentModelName = "";
+                _newSubAgentModelContextWindow = null;
+                _newSubAgentModelReasoningEffort = "";
+                _newSubAgentModelDescription = "";
+                _showAddSubAgentModelForm = false;
+                await LoadModelsAsync();
+                _subAgentModelsSuccess = "✅ Model added";
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                _subAgentModelsError = $"Add failed ({(int)response.StatusCode}): {error}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _subAgentModelsError = $"Add failed: {ex.Message}";
+        }
+        finally
+        {
+            StateHasChanged();
+        }
+    }
+
+    private void StartEditSubAgentModel(ModelEntryDto model)
+    {
+        _editingSubAgentModelName = model.Name;
+        _editSubAgentModelContextWindow = model.ContextWindow;
+        _editSubAgentModelReasoningEffort = model.ReasoningEffort ?? "";
+        _editSubAgentModelDescription = model.Description ?? "";
+        _subAgentModelsError = null;
+        _subAgentModelsSuccess = null;
+    }
+
+    private void CancelEditSubAgentModel()
+    {
+        _editingSubAgentModelName = null;
+    }
+
+    private async Task SaveEditSubAgentModelAsync()
+    {
+        if (_editingSubAgentModelName is null)
+            return;
+        _subAgentModelsError = null;
+        _subAgentModelsSuccess = null;
+        try
+        {
+            var reasoning = string.IsNullOrEmpty(_editSubAgentModelReasoningEffort) ? null : _editSubAgentModelReasoningEffort;
+            var description = string.IsNullOrWhiteSpace(_editSubAgentModelDescription) ? null : _editSubAgentModelDescription;
+            var body = new StringContent(
+                System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    name = _editingSubAgentModelName,
+                    contextWindow = _editSubAgentModelContextWindow,
+                    reasoningEffort = reasoning,
+                    description,
+                }),
+                System.Text.Encoding.UTF8,
+                "application/json");
+
+            var response = await HttpClient.PutAsync($"/api/config/sub-agent-models/{Uri.EscapeDataString(_editingSubAgentModelName)}", body);
+            if (response.IsSuccessStatusCode)
+            {
+                _editingSubAgentModelName = null;
+                await LoadModelsAsync();
+                _subAgentModelsSuccess = "✅ Model updated";
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                _subAgentModelsError = $"Update failed ({(int)response.StatusCode}): {error}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _subAgentModelsError = $"Update failed: {ex.Message}";
+        }
+        finally
+        {
+            StateHasChanged();
+        }
+    }
+
+    private async Task RemoveSubAgentModelAsync(string name)
+    {
+        _subAgentModelsError = null;
+        _subAgentModelsSuccess = null;
+
+        var confirmed = await JS.InvokeAsync<bool>("confirm", $"Remove sub-agent model '{name}'?");
+        if (!confirmed)
+            return;
+
+        try
+        {
+            var response = await HttpClient.DeleteAsync($"/api/config/sub-agent-models/{Uri.EscapeDataString(name)}");
+            if (response.IsSuccessStatusCode)
+            {
+                await LoadModelsAsync();
+                _subAgentModelsSuccess = "✅ Model removed";
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                _subAgentModelsError = $"Remove failed ({(int)response.StatusCode}): {error}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _subAgentModelsError = $"Remove failed: {ex.Message}";
+        }
+        finally
+        {
+            StateHasChanged();
+        }
     }
 
     private static string FormatFileSize(long bytes) =>

@@ -1312,4 +1312,189 @@ public sealed class HiveConfigFileTests
 
         Assert.Null(config.TryGetReasoningEffortForModel("copilot/unknown-model:high"));
     }
+
+    // ── Description / SubAgentModels ─────────────────────────────────────────
+
+    /// <summary>
+    /// Serializes <paramref name="config"/> through the production write path
+    /// (<see cref="ConfigRepoManager.WriteConfigAsync"/>) and returns the raw YAML text.
+    /// This proves the fields survive the real serializer, not just a hand-written YAML fixture.
+    /// </summary>
+    private static async Task<string> WriteThroughProductionSerializerAsync(HiveConfigFile config)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"hive-config-roundtrip-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var repo = new ConfigRepoManager("https://example.com/config.git", dir);
+            await repo.WriteConfigAsync(config, TestContext.Current.CancellationToken);
+            return await File.ReadAllTextAsync(
+                Path.Combine(dir, "hive-config.yaml"), TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    [Fact]
+    public async Task RoundTrip_ModelEntryDescription_SurvivesSerializeAndDeserialize()
+    {
+        var original = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "model-a", ContextWindow = 200000, Description = "Fast and cheap" }
+                ]
+            }
+        };
+
+        var yaml = await WriteThroughProductionSerializerAsync(original);
+
+        // The serializer must actually emit the field.
+        Assert.Contains("description: Fast and cheap", yaml, StringComparison.Ordinal);
+
+        var reloaded = Deserializer.Deserialize<HiveConfigFile>(yaml);
+        var entry = Assert.Single(reloaded.Models!.AvailableModels!);
+        Assert.Equal("model-a", entry.Name);
+        Assert.Equal(200000, entry.ContextWindow);
+        Assert.Equal("Fast and cheap", entry.Description);
+    }
+
+    [Fact]
+    public async Task RoundTrip_SubAgentModels_SurvivesSerializeAndDeserialize()
+    {
+        var original = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "available-a" }],
+                SubAgentModels =
+                [
+                    new ModelEntry
+                    {
+                        Name = "curated-a",
+                        ContextWindow = 64000,
+                        ReasoningEffort = "high",
+                        Description = "Research helper"
+                    }
+                ]
+            }
+        };
+
+        var yaml = await WriteThroughProductionSerializerAsync(original);
+
+        Assert.Contains("sub_agent_models:", yaml, StringComparison.Ordinal);
+        Assert.Contains("curated-a", yaml, StringComparison.Ordinal);
+        Assert.Contains("Research helper", yaml, StringComparison.Ordinal);
+
+        var reloaded = Deserializer.Deserialize<HiveConfigFile>(yaml);
+        var entry = Assert.Single(reloaded.Models!.SubAgentModels!);
+        Assert.Equal("curated-a", entry.Name);
+        Assert.Equal(64000, entry.ContextWindow);
+        Assert.Equal("high", entry.ReasoningEffort);
+        Assert.Equal("Research helper", entry.Description);
+
+        // available_models must still round-trip alongside the new curated list.
+        Assert.Equal("available-a", Assert.Single(reloaded.Models.AvailableModels!).Name);
+    }
+
+    [Fact]
+    public void ReloadFrom_DeepCopiesEntries_InBothModelCollections()
+    {
+        var sourceAvailable = new ModelEntry
+        {
+            Name = "a",
+            ContextWindow = 100,
+            ReasoningEffort = "low",
+            Description = "desc-a"
+        };
+        var sourceCurated = new ModelEntry
+        {
+            Name = "b",
+            ContextWindow = 200,
+            ReasoningEffort = "medium",
+            Description = "desc-b"
+        };
+
+        var target = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var source = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [sourceAvailable],
+                SubAgentModels = [sourceCurated]
+            }
+        };
+
+        target.ReloadFrom(source);
+
+        var copiedAvailable = Assert.Single(target.Models!.AvailableModels!);
+        var copiedCurated = Assert.Single(target.Models.SubAgentModels!);
+        Assert.NotSame(sourceAvailable, copiedAvailable);
+        Assert.NotSame(sourceCurated, copiedCurated);
+
+        // Mutate EVERY field on both source entries in place.
+        sourceAvailable.Name = "mutated-a";
+        sourceAvailable.ContextWindow = 999;
+        sourceAvailable.ReasoningEffort = "extra_high";
+        sourceAvailable.Description = "changed-a";
+
+        sourceCurated.Name = "mutated-b";
+        sourceCurated.ContextWindow = 888;
+        sourceCurated.ReasoningEffort = "extra_high";
+        sourceCurated.Description = "changed-b";
+
+        // The reloaded target must retain the original values in BOTH collections.
+        Assert.Equal("a", copiedAvailable.Name);
+        Assert.Equal(100, copiedAvailable.ContextWindow);
+        Assert.Equal("low", copiedAvailable.ReasoningEffort);
+        Assert.Equal("desc-a", copiedAvailable.Description);
+
+        Assert.Equal("b", copiedCurated.Name);
+        Assert.Equal(200, copiedCurated.ContextWindow);
+        Assert.Equal("medium", copiedCurated.ReasoningEffort);
+        Assert.Equal("desc-b", copiedCurated.Description);
+    }
+
+    [Fact]
+    public void GetSubAgentModels_ReturnsCuratedWhenNonEmpty()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "a" }],
+                SubAgentModels = [new ModelEntry { Name = "b" }]
+            }
+        };
+
+        Assert.Equal("b", Assert.Single(config.GetSubAgentModels()).Name);
+    }
+
+    [Fact]
+    public void GetSubAgentModels_FallsBackToAvailableModels()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [new ModelEntry { Name = "a" }] }
+        };
+
+        Assert.Equal("a", Assert.Single(config.GetSubAgentModels()).Name);
+    }
+
+    [Fact]
+    public void GetSubAgentModels_ReturnsEmptyWhenNothingConfigured()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+
+        Assert.Empty(config.GetSubAgentModels());
+    }
 }
