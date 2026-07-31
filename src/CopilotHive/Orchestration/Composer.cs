@@ -623,7 +623,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             AIFunctionFactory.Create(GetPhaseOutputAsync, "get_phase_output",
                 "Get the raw worker output, brain prompt, or worker prompt for a specific phase within an iteration."),
             AIFunctionFactory.Create(ListGoalsAsync, "list_goals",
-                "List goals, optionally filtered by status."),
+                "List goals, optionally filtered by status and release. Default release filter is 'unreleased'. Use 'all' for all goals or a release ID for a specific release (selects all releases sharing its tag and status). Output always names the active filter."),
             AIFunctionFactory.Create(SearchGoalsAsync, "search_goals",
                 "Search goals by text query across ID, description, and failure reason."),
             AIFunctionFactory.Create(DeleteGoalAsync, "delete_goal",

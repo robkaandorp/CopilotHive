@@ -599,26 +599,63 @@ public sealed partial class Composer
         return truncated + $"\n... (truncated, {lines.Length} lines total)";
     }
 
-    [Description("List goals, optionally filtered by status.")]
+    [Description("List goals, optionally filtered by status and release. Default release filter is 'unreleased' (goals not in a shipped release). Use 'all' to show every goal, or pass a release ID to filter to that release (selects all releases sharing its tag and status). The output always names the active release filter.")]
     internal async Task<string> ListGoalsAsync(
-        [Description("Optional status filter: Draft, Pending, InProgress, Completed, Failed")] string? status = null)
+        [Description("Optional status filter: Draft, Pending, InProgress, Completed, Failed")] string? status = null,
+        [Description("Optional release filter: 'unreleased' (default), 'all', or a release ID")] string? release = null)
     {
-        IReadOnlyList<Goal> goals;
+        var trimmedRelease = release?.Trim() ?? string.Empty;
+        var effectiveRelease = string.IsNullOrEmpty(trimmedRelease) ? "unreleased" : trimmedRelease;
 
-        if (!string.IsNullOrEmpty(status) && Enum.TryParse<GoalStatus>(status, ignoreCase: true, out var filter))
+        if (effectiveRelease.Equals("unreleased", StringComparison.OrdinalIgnoreCase) ||
+            effectiveRelease.Equals("all", StringComparison.OrdinalIgnoreCase))
         {
-            goals = await _goalStore.GetGoalsByStatusAsync(filter);
+            effectiveRelease = effectiveRelease.ToLowerInvariant();
+        }
+
+        var allGoals = await _goalStore.GetAllGoalsAsync();
+
+        IEnumerable<Goal> filtered = allGoals;
+
+        if (effectiveRelease == "all")
+        {
+            // No release filtering applied.
+        }
+        else if (effectiveRelease == "unreleased")
+        {
+            var releases = await _goalStore.GetReleasesAsync();
+            var releaseStatusById = releases.ToDictionary(r => r.Id, r => r.Status);
+            filtered = allGoals.Where(g =>
+                string.IsNullOrEmpty(g.ReleaseId) ||
+                (releaseStatusById.TryGetValue(g.ReleaseId, out var s) && s == ReleaseStatus.Planning));
         }
         else
         {
-            goals = await _goalStore.GetAllGoalsAsync();
+            var releases = await _goalStore.GetReleasesAsync();
+            var selectedRelease = releases.FirstOrDefault(r => r.Id == effectiveRelease);
+            var taggedReleaseIds = selectedRelease is not null
+                ? releases
+                    .Where(r => r.Tag == selectedRelease.Tag && r.Status == selectedRelease.Status)
+                    .Select(r => r.Id)
+                    .ToHashSet()
+                : new HashSet<string> { effectiveRelease };
+            filtered = allGoals.Where(g => g.ReleaseId is not null && taggedReleaseIds.Contains(g.ReleaseId));
+        }
+
+        var goals = filtered.ToList();
+
+        if (!string.IsNullOrEmpty(status) && Enum.TryParse<GoalStatus>(status, ignoreCase: true, out var filter))
+        {
+            goals = goals.Where(g => g.Status == filter).ToList();
         }
 
         if (goals.Count == 0)
-            return status is not null ? $"No goals with status '{status}'." : "No goals found.";
+            return status is not null
+                ? $"No goals with status '{status}' (release filter: {effectiveRelease})."
+                : $"No goals (release filter: {effectiveRelease}).";
 
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine($"**{goals.Count} goal(s):**\n");
+        sb.AppendLine($"**{goals.Count} goal(s) (release filter: {effectiveRelease}):**\n");
 
         foreach (var g in goals.OrderByDescending(g => g.CreatedAt))
         {
