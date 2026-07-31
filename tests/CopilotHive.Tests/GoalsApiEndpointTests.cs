@@ -5,8 +5,10 @@ using System.Text.Json;
 using CopilotHive.Goals;
 using CopilotHive.Git;
 using CopilotHive.Services;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Moq;
 
 namespace CopilotHive.Tests;
@@ -526,8 +528,12 @@ public class GoalsApiEndpointTests
     // ── DELETE /api/goals/{id} ────────────────────────────────────────────
 
     [Fact]
+    [Trait("Category", "BackgroundLoopRace")]
     public async Task DeleteGoal_ExistingGoal_Returns204NoContent()
     {
+        // This test was previously flaky because the hosted GoalDispatcher dispatch loop ran in
+        // the Testing environment and could delete the same pipeline row concurrently with the
+        // endpoint. The Testing-environment gate on AddHostedService prevents that race.
         var id = UniqueId();
         await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
         // Patch to Draft so deletion is allowed
@@ -1009,8 +1015,13 @@ public class GoalsApiEndpointTests
     // ── POST /api/goals/{id}/extend-iterations ────────────────────────────
 
     [Fact]
+    [Trait("Category", "BackgroundLoopRace")]
     public async Task ExtendIterations_ValidRequest_Returns200OK()
     {
+        // This test was previously flaky because the hosted GoalDispatcher dispatch loop ran in
+        // the Testing environment and could create a pipeline for the Pending goal before the
+        // test did, causing a "Pipeline already exists" error. The Testing-environment gate on
+        // AddHostedService prevents that race.
         var id = UniqueId();
         await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
 
@@ -1046,6 +1057,37 @@ public class GoalsApiEndpointTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
         Assert.Contains("Extended iteration budget by 5", body);
+    }
+
+    // ── GoalDispatcher hosted-service gating in Testing environment ─────────
+
+    [Fact]
+    public void TestingEnvironment_GoalDispatcherHostedService_IsNotRegistered()
+    {
+        // The shared HiveTestFactory uses UseEnvironment("Testing"). The GoalDispatcher singleton
+        // must remain resolvable because Composer depends on it, but it must NOT be registered
+        // as an IHostedService, otherwise its dispatch loop races endpoint tests.
+        Assert.NotNull(_factory.Services.GetService<GoalDispatcher>());
+
+        var hostedServices = _factory.Services.GetServices<IHostedService>();
+        Assert.DoesNotContain(hostedServices, hs => hs is GoalDispatcher);
+
+        // Sanity check: unrelated hosted services such as StaleWorkerCleanupService are still
+        // registered so long-running cleanup still starts normally in tests.
+        Assert.Contains(hostedServices, hs => hs is StaleWorkerCleanupService);
+    }
+
+    [Fact]
+    public void NonTestingEnvironment_GoalDispatcherHostedService_IsRegistered()
+    {
+        // Spin up a separate factory without forcing the Testing environment to verify the
+        // production code path still registers GoalDispatcher as a hosted service. This
+        // is the companion assertion to the Testing-environment gate above.
+        using var factory = new WebApplicationFactory<Program>();
+        Assert.NotNull(factory.Services.GetService<GoalDispatcher>());
+
+        var hostedServices = factory.Services.GetServices<IHostedService>();
+        Assert.Contains(hostedServices, hs => hs is GoalDispatcher);
     }
 
     [Fact]

@@ -278,7 +278,13 @@ public sealed class Program
             builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 
             builder.Services.AddSingleton<GoalDispatcher>();
-            builder.Services.AddHostedService(sp => sp.GetRequiredService<GoalDispatcher>());
+            // The GoalDispatcher hosted loop races endpoint tests that create/delete Pending goals.
+            // Keep the singleton registered so dependent services resolve, but do not start the
+            // background service in the Testing environment.
+            if (!builder.Environment.IsEnvironment("Testing"))
+            {
+                builder.Services.AddHostedService(sp => sp.GetRequiredService<GoalDispatcher>());
+            }
 
             builder.Services.AddSingleton<GoalReviewService>(sp => new GoalReviewService(
                 sp.GetService<KnowledgeGraph>(),
