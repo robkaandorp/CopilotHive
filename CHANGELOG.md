@@ -1,3 +1,20 @@
+## [0.24.0] - 2026-08-01
+
+### Breaking Changes
+
+- **Reject-not-fix plan validation** — The pipeline now REJECTS invalid iteration plans instead of silently auto-fixing, reordering, or substituting a default plan. An actionable rejection reason is fed back to the Brain for a bounded replan (3 attempts). If no valid plan is produced within the budget, the goal FAILS. This replaces the former auto-adjust behavior where the system would insert missing phases and notify the Brain. Affected goals: `copilothive-plan-validator-reject-not-fix` (pure `ValidatePlanStrict` with block-based R1-R7 grammar), `copilothive-plan-reject-not-fix-loop` (wiring to `PlanResult.Failed` propagation across the 5-layer planning stack), `copilothive-plan-parser-reject-unknown-phases` (ingestion surfaces unknown/invalid phase names instead of silently dropping them), and `copilothive-brain-plan-grammar-prompt` (Brain's hardcoded planning prompt teaches R1-R7 + reject-and-replan).
+
+### Added
+
+- **Composer tooling enhancements** — `get_release` tool (returns release record + attached goals), `get_goal` enrichment (Release/Depends On/document-links summary lines), `list_goals` release-filter (defaults to dashboard-Unreleased semantics with labeled output), `search_goals` opt-in release filter (no hidden default — omitted means no filtering).
+- **Sub-agent vision support** — Informational `SupportsVision` flag flows end-to-end through the sub-agent model catalog (`ModelEntry` → `SubAgentModelEntry` → gRPC → workers). Dashboard displays a tri-state control (Unset/True/False).
+- **Composer Background-tasks panel** — Live sub-agent progress displayed in the Composer chat via SharpCoder 0.14.0's `SubAgentChanged` event, using a channel-fed consumer pattern with immutable snapshots.
+
+### Fixed
+
+- **Flaky CI endpoint tests** — `GoalDispatcher` hosted-service dispatch loop gated with `IsEnvironment("Testing")` check to prevent background dispatch from racing endpoint tests that create/delete Pending goals.
+- **`ask_user` options JSON array** — Composer `ask_user` tool's `options` parameter changed from `string` to `string[]` for correct `AIFunctionFactory` JSON schema generation, with strict content validation (min 2 entries, no blanks, no duplicates, max 50).
+
 ## [0.23.0] - 2026-07-29
 
 ### Added
