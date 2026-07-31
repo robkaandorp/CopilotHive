@@ -1,0 +1,267 @@
+using CopilotHive.Goals;
+using CopilotHive.Orchestration;
+using CopilotHive.Services;
+
+using Xunit;
+
+namespace CopilotHive.Tests;
+
+/// <summary>
+/// Text-level tests for <see cref="BrainPromptBuilder.BuildPlanningPrompt"/> ensuring the planning
+/// prompt documents the block-based plan grammar (R1-R7) and the phase-name rejection rules.
+/// </summary>
+public sealed class BrainPlanningPromptTests
+{
+    private static string BuildPrompt()
+    {
+        var pipeline = new GoalPipeline(new Goal
+        {
+            Id = "test-goal",
+            Description = "Test goal",
+            RepositoryNames = ["repo"],
+        });
+
+        return BrainPromptBuilder.BuildPlanningPrompt(pipeline);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_ContainsR1OccupancyRule()
+    {
+        var prompt = BuildPrompt();
+        Assert.Contains("R1 (Occupancy)", prompt);
+        Assert.Contains("at least one Coding or DocWriting", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_ContainsR2ContentBlockRule()
+    {
+        var prompt = BuildPrompt();
+        Assert.Contains("R2 (Testing after each content block)", prompt);
+        Assert.Contains("content block", prompt);
+        Assert.Contains("maximal contiguous run", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_ContainsR3ReviewRule()
+    {
+        var prompt = BuildPrompt();
+        Assert.Contains("R3 (Review)", prompt);
+        Assert.Contains("exactly one Review", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_ContainsR4ImproveRule()
+    {
+        var prompt = BuildPrompt();
+        Assert.Contains("R4 (Improve)", prompt);
+        Assert.Contains("at most one Improve", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_ContainsR5MergingRule()
+    {
+        var prompt = BuildPrompt();
+        Assert.Contains("R5 (Merging)", prompt);
+        Assert.Contains("exactly one Merging", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_ContainsR6AllowedPhasesRule()
+    {
+        var prompt = BuildPrompt();
+        Assert.Contains("R6 (Allowed phases only)", prompt);
+        Assert.Contains("only the six phase values", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_ContainsR7OrderingDependencyRule()
+    {
+        var prompt = BuildPrompt();
+        Assert.Contains("R7 (Ordering-dependency)", prompt);
+        Assert.Contains("Ordering-dependency", prompt);
+        Assert.Contains("first Testing", prompt);
+        Assert.Contains("first occurrences", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_R7DescribesSubmittedSequenceNotGoalNeeds()
+    {
+        var prompt = BuildPrompt();
+
+        // R7 must describe the submitted plan's phase sequence, not the goal's requirements.
+        Assert.Contains("when the submitted plan contains both Coding and DocWriting", prompt);
+        Assert.Contains("exactly one of their first occurrences comes after the first Testing", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_ContainsPhaseNameRejectionRules()
+    {
+        var prompt = BuildPrompt();
+        Assert.Contains("Phase-NAME rules", prompt);
+        Assert.Contains("Unrecognized phase names:", prompt);
+        Assert.Contains("Valid phases: coding, testing, docwriting, review, improve, merging.", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_PhaseNameRulesAreSeparateFromR6()
+    {
+        var prompt = BuildPrompt();
+
+        var r6Index = prompt.IndexOf("R6 (Allowed phases only)");
+        var phaseNameRulesIndex = prompt.IndexOf("Phase-NAME rules");
+
+        Assert.NotEqual(-1, r6Index);
+        Assert.NotEqual(-1, phaseNameRulesIndex);
+        Assert.True(phaseNameRulesIndex > r6Index, "Phase-NAME rules should appear after R6, not be conflated with it.");
+
+        // The unrecognized-name guidance paragraph itself must not contain the R6 label.
+        var paragraphEnd = prompt.IndexOf("\n\n", phaseNameRulesIndex);
+        var phaseNameParagraph = prompt[phaseNameRulesIndex..paragraphEnd];
+        Assert.DoesNotContain("R6", phaseNameParagraph);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_StatesNoAutoFixBehavior()
+    {
+        var prompt = BuildPrompt();
+        Assert.Contains("does NOT auto-fix", prompt);
+        Assert.Contains("bounded attempts", prompt);
+        Assert.Contains("no default-plan fallback", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_DoesNotContainStaleWording()
+    {
+        var prompt = BuildPrompt();
+        Assert.DoesNotContain("may skip testing", prompt);
+        Assert.DoesNotContain("auto-insert", prompt);
+        Assert.DoesNotContain("auto-adjust", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_DocsOnlyChangeClarifiesTestingIsRequired()
+    {
+        var prompt = BuildPrompt();
+        Assert.DoesNotContain("may skip testing", prompt);
+        Assert.Contains("DocWriting → Testing → Review → Merging", prompt);
+        Assert.Contains("Testing is always required after each content block per R2", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_DocsOnlyLineRemovesOldCoderThenDocwriterPhrasing()
+    {
+        var prompt = BuildPrompt();
+
+        // The iteration-2 fix replaced "coder edits, then docwriter — may skip testing"
+        // with "docwriter edits — a docs-only plan is DocWriting → Testing → Review → Merging".
+        // Assert the old stale phrasing is gone and the new one is present.
+        Assert.DoesNotContain("coder edits, then docwriter", prompt);
+        Assert.Contains("docwriter edits", prompt);
+        Assert.Contains("docs-only plan is DocWriting → Testing → Review → Merging", prompt);
+    }
+
+    // ── Additional gap-coverage tests ─────────────────────────────────────
+
+    [Fact]
+    public void BuildPlanningPrompt_ContainsExactRejectionMessageFormat()
+    {
+        var prompt = BuildPrompt();
+
+        // The full rejection message template must appear as a single contiguous string
+        // so the Brain can quote it verbatim when an unrecognized name is rejected.
+        Assert.Contains(
+            "Unrecognized phase names: <names>. Valid phases: coding, testing, docwriting, review, improve, merging.",
+            prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_RejectsLifecycleAndNumericNames()
+    {
+        var prompt = BuildPrompt();
+
+        // The prompt must name the lifecycle states and bare numeric tokens that are
+        // rejected as unrecognized, so the Brain does not confuse them with valid phases.
+        Assert.Contains("Planning", prompt);
+        Assert.Contains("Done", prompt);
+        Assert.Contains("Failed", prompt);
+        Assert.Contains("numeric token", prompt);
+        Assert.Contains("\"1\"", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_StatesNoReorderInsertOrFill()
+    {
+        var prompt = BuildPrompt();
+
+        // The goal requires the precise "no-auto-fix/no-reorder/no-insert/no-fill"
+        // wording, not a vague "does not alter".
+        Assert.Contains("reorder", prompt);
+        Assert.Contains("insert", prompt);
+        Assert.Contains("fill structural phases", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_StatesResubmitViaReportIterationPlan()
+    {
+        var prompt = BuildPrompt();
+
+        Assert.Contains("report_iteration_plan", prompt);
+        Assert.Contains("resubmit", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_R7DoesNotOverstateAsNeverInterleave()
+    {
+        var prompt = BuildPrompt();
+
+        // R7 must NOT be stated as a blanket "never interleave" rule. The prompt
+        // must explicitly negate this overstatement.
+        Assert.Contains("NOT a blanket", prompt);
+        Assert.Contains("\"never interleave\"", prompt);
+        Assert.Contains("prohibition", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_StaleAutoFixPhrasingsAbsent()
+    {
+        var prompt = BuildPrompt();
+
+        // Goal requires "no-auto-fix/no-reorder/no-insert" — the vague "does not alter"
+        // phrasing must not be used as a stand-in.
+        Assert.DoesNotContain("does not alter", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("auto-correct", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("auto-reorder", prompt, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_R7PrefersSingleBlockBeforeTesting()
+    {
+        var prompt = BuildPrompt();
+
+        // The preferred fix must describe consolidating both content phases into a
+        // single block before the Testing.
+        Assert.Contains("single block", prompt);
+        Assert.Contains("before that Testing", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_AcceptedPlanRunsInSubmittedOrder()
+    {
+        var prompt = BuildPrompt();
+
+        // The prompt must state that an accepted (recognized) phase sequence runs in
+        // the exact order submitted.
+        Assert.Contains("runs in the exact order you submit it", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_OccurrenceSuffixesNormalizedNotFixing()
+    {
+        var prompt = BuildPrompt();
+
+        // Suffix normalization and name-mapping are input parsing, not plan fixing.
+        Assert.Contains("coding-2", prompt);
+        Assert.Contains("normalized to the base name", prompt);
+        Assert.Contains("input parsing", prompt);
+    }
+}

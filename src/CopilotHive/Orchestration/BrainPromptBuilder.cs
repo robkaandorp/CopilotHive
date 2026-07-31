@@ -328,7 +328,7 @@ public static class BrainPromptBuilder
             {{conversationSummary}}
 
             Decide the ordered phases for this iteration. Consider:
-            - Is this a documentation-only change? (coder edits, then docwriter — may skip testing)
+            - Is this a documentation-only change? (docwriter edits — a docs-only plan is DocWriting → Testing → Review → Merging; Testing is always required after each content block per R2)
             - Is this a retry after failure? (what phases need re-running)
             IMPORTANT: Only include the docwriting phase when the goal explicitly requests
             documentation updates (e.g. "update README", "add changelog entry", "update docs").
@@ -338,6 +338,26 @@ public static class BrainPromptBuilder
             how the iteration went — especially when steps needed retries or produced issues.
 
             Available phases: coding, testing, docwriting, review, improve, merging
+
+            ## Plan Grammar
+
+            Your submitted plan must obey the following block-based grammar. The pipeline does NOT auto-fix, reorder, insert, or fill structural phases. An accepted (recognized) phase sequence runs in the exact order you submit it; suffix normalization and name-mapping are input parsing, not plan fixing. Invalid input (any rule violation or any unrecognized phase name) returns a reason naming what was violated. You must fix and resubmit via `report_iteration_plan`. There are bounded attempts; if no valid plan is submitted within the budget the goal FAILS. There is no default-plan fallback.
+
+            R1 (Occupancy): the plan must contain at least one Coding or DocWriting phase. An empty plan is invalid.
+
+            R2 (Testing after each content block): a content block is a maximal contiguous run of Coding/DocWriting phases. Every content block must be immediately followed by exactly one Testing, and a Testing with no preceding content block is invalid.
+
+            R3 (Review): the plan must contain exactly one Review, after all content-block + Testing rounds. No Coding, DocWriting, or Testing may appear after the Review.
+
+            R4 (Improve): at most one Improve is allowed, positioned after the Review and before Merging.
+
+            R5 (Merging): exactly one Merging is required, and it must be the final phase of the plan.
+
+            R6 (Allowed phases only): only the six phase values listed under "Available phases" may appear. No other phase values are allowed.
+
+            Phase-NAME rules (distinct from the allowed-phase-value rule above): each submitted phase name must be one of coding, testing, docwriting, review, improve, or merging. Occurrence suffixes like `coding-2` are fine and are normalized to the base name before validation. A name that is not one of the six — a typo/unknown word, lifecycle names like `Planning`/`Done`/`Failed`, or a bare numeric token like `"1"` — is REJECTED, not silently ignored, and not treated as an allowed-phase violation. The rejection message is exactly: `Unrecognized phase names: <names>. Valid phases: coding, testing, docwriting, review, improve, merging.` Fix this by replacing the unrecognized name with one of the six valid names and resubmitting.
+
+            R7 (Ordering-dependency): when the submitted plan contains both Coding and DocWriting, and exactly one of their first occurrences comes after the first Testing, the plan is invalid because that Testing would inspect the not-yet-produced artifact. Preferred fix: put both content phases in a single block before that Testing, e.g. `Coding -> DocWriting -> Testing` if DocWriting is the late type, or `DocWriting -> Coding -> Testing` if Coding is the late type. This rule examines only the FIRST type-vs-Testing interleaving; it is NOT a blanket "never interleave" prohibition.
 
             For large or complex coding tasks, you may plan multiple coding+testing rounds before review:
               ["coding", "testing", "coding", "testing", "review", "improve", "merging"]
