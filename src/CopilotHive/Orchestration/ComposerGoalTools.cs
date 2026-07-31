@@ -427,8 +427,31 @@ public sealed partial class Composer
         sb.AppendLine($"- **Repositories:** {(goal.RepositoryNames.Count > 0 ? string.Join(", ", goal.RepositoryNames) : "(none)")}");
         sb.AppendLine($"- **Description:** {goal.Description}");
 
+        if (!string.IsNullOrWhiteSpace(goal.ReleaseId))
+            sb.AppendLine($"- **Release:** {goal.ReleaseId}");
+
+        if (goal.DependsOn.Count > 0)
+            sb.AppendLine($"- **Depends On:** {string.Join(", ", goal.DependsOn)}");
+
         if (goal.Documents.Count > 0)
             sb.AppendLine($"- **Documents:** {string.Join(", ", goal.Documents)}");
+
+        if (_knowledgeGraph is not null && goal.Documents.Count > 0)
+        {
+            var linkParts = new List<string>();
+            foreach (var docId in goal.Documents)
+            {
+                if (_knowledgeGraph.GetDocument(docId) is null)
+                    continue;
+                var inCount = _knowledgeGraph.GetIncomingLinks(docId).Count;
+                var outCount = _knowledgeGraph.GetOutgoingLinks(docId).Count;
+                if (inCount + outCount > 0)
+                    linkParts.Add($"{docId} (in:{inCount} out:{outCount})");
+            }
+
+            if (linkParts.Count > 0)
+                sb.AppendLine($"- **Document Links:** {string.Join(", ", linkParts)}");
+        }
 
         if (goal.FailureReason is not null)
             sb.AppendLine($"- **Failure:** {goal.FailureReason}");

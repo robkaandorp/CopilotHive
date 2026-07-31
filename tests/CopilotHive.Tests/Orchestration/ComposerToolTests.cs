@@ -5182,6 +5182,381 @@ public sealed class ComposerToolTests : IDisposable
         Assert.NotNull(updated);
         Assert.Equal(ReviewStatus.None, updated!.ReviewStatus);
     }
+
+    // ── get_goal — Release field ──
+
+    [Fact]
+    public async Task GetGoal_ReleasePresent_IncludesReleaseLine()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("release-present", "Goal with release", repositories: "repo-a");
+        await _store.CreateReleaseAsync(new Release { Id = "v2.0.0", Tag = "v2.0.0" }, ct);
+        var goal = await _store.GetGoalAsync("release-present", ct);
+        Assert.NotNull(goal);
+        goal!.ReleaseId = "v2.0.0";
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.GetGoalAsync("release-present");
+
+        Assert.Contains("- **Release:** v2.0.0", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_ReleaseAbsent_OmitsReleaseLine()
+    {
+        await _composer.CreateGoalAsync("release-absent", "Goal without release");
+
+        var result = await _composer.GetGoalAsync("release-absent");
+
+        Assert.DoesNotContain("- **Release:**", result);
+        Assert.DoesNotContain("Release:", result);
+    }
+
+    // ── get_goal — Depends On field ──
+
+    [Fact]
+    public async Task GetGoal_DependsOnPresent_IncludesDependsOnLine()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("deps-present", "Goal with depends_on", depends_on: "goal-alpha, goal-beta");
+        var goal = await _store.GetGoalAsync("deps-present", ct);
+        Assert.NotNull(goal);
+        Assert.Equal(2, goal!.DependsOn.Count);
+
+        var result = await _composer.GetGoalAsync("deps-present");
+
+        Assert.Contains("- **Depends On:** goal-alpha, goal-beta", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_DependsOnAbsent_OmitsDependsOnLine()
+    {
+        await _composer.CreateGoalAsync("deps-absent", "Goal without depends_on");
+
+        var result = await _composer.GetGoalAsync("deps-absent");
+
+        Assert.DoesNotContain("- **Depends On:**", result);
+        Assert.DoesNotContain("Depends On:", result);
+    }
+
+    // ── get_goal — Documents field (unchanged) ──
+
+    [Fact]
+    public async Task GetGoal_DocumentsPresent_IncludesDocumentsLineVerbatim()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("docs-present", "Goal with documents", documents: "doc-1, doc-2");
+        var goal = await _store.GetGoalAsync("docs-present", ct);
+        Assert.NotNull(goal);
+        Assert.Equal(2, goal!.Documents.Count);
+
+        var result = await _composer.GetGoalAsync("docs-present");
+
+        Assert.Contains("- **Documents:** doc-1, doc-2", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_DocumentsAbsent_OmitsDocumentsLine()
+    {
+        await _composer.CreateGoalAsync("docs-absent", "Goal without documents");
+
+        var result = await _composer.GetGoalAsync("docs-absent");
+
+        Assert.DoesNotContain("- **Documents:**", result);
+    }
+
+    // ── get_goal — Document Links with KnowledgeGraph ──
+
+    [Fact]
+    public async Task GetGoal_DocumentLinks_WithLinks_IncludesCompactLinkLine()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var knowledgeGraph = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            knowledgeGraph: knowledgeGraph);
+
+        // Create two documents in the graph
+        await knowledgeGraph.CreateDocumentAsync("doc-a", "Doc A", CopilotHive.Knowledge.DocumentType.Idea, "Content A", topic: "doc", ct: ct);
+        await knowledgeGraph.CreateDocumentAsync("doc-b", "Doc B", CopilotHive.Knowledge.DocumentType.Idea, "Content B", topic: "doc", ct: ct);
+
+        // doc-a has an outgoing link to doc-b
+        knowledgeGraph.AddLink("doc-a", new CopilotHive.Knowledge.DocumentLink("doc-b", CopilotHive.Knowledge.LinkType.Related));
+        // doc-b has an outgoing link to doc-a
+        knowledgeGraph.AddLink("doc-b", new CopilotHive.Knowledge.DocumentLink("doc-a", CopilotHive.Knowledge.LinkType.DependsOn));
+
+        // Create a goal that references both documents
+        await composer.CreateGoalAsync("link-goal", "Goal with linked docs", documents: "doc-a, doc-b");
+        var goal = await _store.GetGoalAsync("link-goal", ct);
+        Assert.NotNull(goal);
+
+        var result = await composer.GetGoalAsync("link-goal");
+
+        // Document Links line should be present
+        Assert.Contains("- **Document Links:**", result);
+        // doc-a: 1 outgoing (→doc-b), 1 incoming (←doc-b DependsOn)
+        Assert.Contains("doc-a (in:1 out:1)", result);
+        // doc-b: 1 outgoing (→doc-a DependsOn), 1 incoming (←doc-a Related)
+        Assert.Contains("doc-b (in:1 out:1)", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_DocumentLinks_NullGraph_OmitsLinkLineAndNoThrow()
+    {
+        // _composer is constructed without a knowledgeGraph (null by default)
+        await _composer.CreateGoalAsync("null-graph-goal", "Goal with docs but null graph", documents: "doc-x");
+
+        // Should not throw and should not contain Document Links
+        var result = await _composer.GetGoalAsync("null-graph-goal");
+
+        Assert.DoesNotContain("- **Document Links:**", result);
+        Assert.DoesNotContain("Document Links:", result);
+        // Documents line still present
+        Assert.Contains("- **Documents:** doc-x", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_DocumentLinks_MissingDoc_SkipsWithoutThrowing()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var knowledgeGraph = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            knowledgeGraph: knowledgeGraph);
+
+        // Only create doc-existing in the graph; doc-missing does not exist as a document.
+        // doc-existing has an outgoing link targeting "doc-missing" — this populates the
+        // reverse index so GetIncomingLinks("doc-missing") returns a non-empty list,
+        // even though "doc-missing" is not a real document.
+        await knowledgeGraph.CreateDocumentAsync("doc-existing", "Existing", CopilotHive.Knowledge.DocumentType.Idea, "Content", topic: "doc", ct: ct);
+        knowledgeGraph.AddLink("doc-existing", new CopilotHive.Knowledge.DocumentLink("doc-missing", CopilotHive.Knowledge.LinkType.Related));
+
+        // Verify the edge case: doc-missing has incoming links (reverse index) but no outgoing
+        Assert.NotEmpty(knowledgeGraph.GetIncomingLinks("doc-missing"));
+        Assert.Empty(knowledgeGraph.GetOutgoingLinks("doc-missing"));
+
+        // Goal references both an existing doc and a non-existing doc
+        await composer.CreateGoalAsync("missing-doc-goal", "Goal with missing doc ref", documents: "doc-existing, doc-missing");
+        var goal = await _store.GetGoalAsync("missing-doc-goal", ct);
+        Assert.NotNull(goal);
+
+        // Should not throw; doc-missing should be silently skipped entirely —
+        // NOT shown with "(in:1 out:0)" even though it has incoming links.
+        var result = await composer.GetGoalAsync("missing-doc-goal");
+
+        Assert.Contains("- **Document Links:**", result);
+        // doc-existing has 1 outgoing (→doc-missing), 0 incoming
+        Assert.Contains("doc-existing (in:0 out:1)", result);
+        // doc-missing should not appear in the Document Links line at all
+        Assert.DoesNotContain("doc-missing (", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_DocumentLinks_MissingDocWithIncomingForwardLink_SkippedEntirely()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var knowledgeGraph = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            knowledgeGraph: knowledgeGraph);
+
+        // Create "doc-a" (a real document) with an outgoing link targeting "missing-doc"
+        // (a document id that is NOT created in the graph — just a link target string).
+        // This populates the reverse index so GetIncomingLinks("missing-doc") returns
+        // a non-empty list, even though "missing-doc" does not exist as a document.
+        await knowledgeGraph.CreateDocumentAsync("doc-a", "Doc A", CopilotHive.Knowledge.DocumentType.Idea, "Content A", topic: "doc", ct: ct);
+        knowledgeGraph.AddLink("doc-a", new CopilotHive.Knowledge.DocumentLink("missing-doc", CopilotHive.Knowledge.LinkType.Related));
+
+        // Sanity check: GetIncomingLinks("missing-doc") returns non-empty because the
+        // reverse index has an entry for "missing-doc" (doc-a links to it).
+        var incomingForMissing = knowledgeGraph.GetIncomingLinks("missing-doc");
+        Assert.NotEmpty(incomingForMissing);
+        // And GetOutgoingLinks("missing-doc") returns empty because the doc doesn't exist.
+        var outgoingForMissing = knowledgeGraph.GetOutgoingLinks("missing-doc");
+        Assert.Empty(outgoingForMissing);
+
+        // Goal references ONLY the missing doc
+        await composer.CreateGoalAsync("missing-incoming-goal", "Goal referencing missing doc with incoming link", documents: "missing-doc");
+        var goal = await _store.GetGoalAsync("missing-incoming-goal", ct);
+        Assert.NotNull(goal);
+
+        // The missing doc must be skipped entirely — NO Document Links line at all,
+        // not even "(in:1 out:0)".
+        var result = await composer.GetGoalAsync("missing-incoming-goal");
+
+        Assert.DoesNotContain("- **Document Links:**", result);
+        Assert.DoesNotContain("missing-doc (", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_DocumentLinks_MissingDocWithIncomingLink_MixedWithExistingDoc()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var knowledgeGraph = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            knowledgeGraph: knowledgeGraph);
+
+        // Create "doc-a" with an outgoing link to "missing-doc" (not created in the graph).
+        // The reverse index now has an entry for "missing-doc" pointing back to doc-a.
+        await knowledgeGraph.CreateDocumentAsync("doc-a", "Doc A", CopilotHive.Knowledge.DocumentType.Idea, "Content A", topic: "doc", ct: ct);
+        knowledgeGraph.AddLink("doc-a", new CopilotHive.Knowledge.DocumentLink("missing-doc", CopilotHive.Knowledge.LinkType.Related));
+
+        // Verify the edge case setup: missing-doc has incoming links via the reverse index
+        Assert.NotEmpty(knowledgeGraph.GetIncomingLinks("missing-doc"));
+
+        // Goal references BOTH the existing doc and the missing doc
+        await composer.CreateGoalAsync("mixed-missing-goal", "Goal with existing and missing doc", documents: "doc-a, missing-doc");
+        var goal = await _store.GetGoalAsync("mixed-missing-goal", ct);
+        Assert.NotNull(goal);
+
+        var result = await composer.GetGoalAsync("mixed-missing-goal");
+
+        // Document Links line should be present (doc-a has links)
+        Assert.Contains("- **Document Links:**", result);
+        // doc-a: 0 incoming, 1 outgoing (→missing-doc)
+        Assert.Contains("doc-a (in:0 out:1)", result);
+        // missing-doc must NOT appear in the Document Links line — skipped entirely,
+        // even though GetIncomingLinks("missing-doc") is non-empty.
+        Assert.DoesNotContain("missing-doc (", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_DocumentLinks_NoLinks_OmitsLinkLine()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var knowledgeGraph = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            knowledgeGraph: knowledgeGraph);
+
+        // Create documents with NO links at all
+        await knowledgeGraph.CreateDocumentAsync("doc-nolink-1", "No Link 1", CopilotHive.Knowledge.DocumentType.Idea, "Content", topic: "doc", ct: ct);
+        await knowledgeGraph.CreateDocumentAsync("doc-nolink-2", "No Link 2", CopilotHive.Knowledge.DocumentType.Idea, "Content", topic: "doc", ct: ct);
+
+        await composer.CreateGoalAsync("no-links-goal", "Goal with unlinked docs", documents: "doc-nolink-1, doc-nolink-2");
+        var goal = await _store.GetGoalAsync("no-links-goal", ct);
+        Assert.NotNull(goal);
+
+        var result = await composer.GetGoalAsync("no-links-goal");
+
+        // No Document Links line should appear since no doc has any links
+        Assert.DoesNotContain("- **Document Links:**", result);
+        // Documents line should still be present
+        Assert.Contains("- **Documents:** doc-nolink-1, doc-nolink-2", result);
+    }
+
+    // ── get_goal — plain goal regression ──
+
+    [Fact]
+    public async Task GetGoal_PlainGoal_OmitsAllNewLinesAndPreservesExistingFields()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("plain-goal", "A plain goal with no extras");
+        var goal = await _store.GetGoalAsync("plain-goal", ct);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.Failed;
+        goal.FailureReason = "Something went wrong";
+        goal.TotalDurationSeconds = 3600;
+        goal.Notes = ["This is a note"];
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.GetGoalAsync("plain-goal");
+
+        // New conditional lines must be absent
+        Assert.DoesNotContain("- **Release:**", result);
+        Assert.DoesNotContain("- **Depends On:**", result);
+        Assert.DoesNotContain("- **Documents:**", result);
+        Assert.DoesNotContain("- **Document Links:**", result);
+
+        // Existing fields must be present
+        Assert.Contains("- **Status:** Failed", result);
+        Assert.Contains("- **Review Status:**", result);
+        Assert.Contains("- **Priority:**", result);
+        Assert.Contains("- **Created:**", result);
+        Assert.Contains("- **Repositories:** (none)", result);
+        Assert.Contains("- **Description:** A plain goal with no extras", result);
+        Assert.Contains("- **Failure:** Something went wrong", result);
+        Assert.Contains("- **Duration:**", result);
+        Assert.Contains("### Notes", result);
+        Assert.Contains("- This is a note", result);
+    }
+
+    // ── get_goal — ordering of new lines ──
+
+    [Fact]
+    public async Task GetGoal_Ordering_NewLinesAppearInCorrectOrderBeforeFailure()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var knowledgeGraph = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            knowledgeGraph: knowledgeGraph);
+
+        // Create documents and links so Document Links line appears
+        await knowledgeGraph.CreateDocumentAsync("order-doc-1", "Order Doc 1", CopilotHive.Knowledge.DocumentType.Idea, "Content", topic: "doc", ct: ct);
+        await knowledgeGraph.CreateDocumentAsync("order-doc-2", "Order Doc 2", CopilotHive.Knowledge.DocumentType.Idea, "Content", topic: "doc", ct: ct);
+        knowledgeGraph.AddLink("order-doc-1", new CopilotHive.Knowledge.DocumentLink("order-doc-2", CopilotHive.Knowledge.LinkType.Related));
+
+        // Create a goal with release, depends_on, and documents — all set
+        await composer.CreateGoalAsync("order-goal", "Ordering test goal", repositories: "repo-a", depends_on: "order-dep-1, order-dep-2", documents: "order-doc-1, order-doc-2");
+        await _store.CreateReleaseAsync(new Release { Id = "order-release", Tag = "order-release" }, ct);
+        var goal = await _store.GetGoalAsync("order-goal", ct);
+        Assert.NotNull(goal);
+        goal!.ReleaseId = "order-release";
+        goal.Status = GoalStatus.Failed;
+        goal.FailureReason = "Ordered failure";
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await composer.GetGoalAsync("order-goal");
+
+        // All lines should be present
+        var releaseIdx = result.IndexOf("- **Release:** order-release");
+        var dependsOnIdx = result.IndexOf("- **Depends On:** order-dep-1, order-dep-2");
+        var documentsIdx = result.IndexOf("- **Documents:** order-doc-1, order-doc-2");
+        var documentLinksIdx = result.IndexOf("- **Document Links:**");
+        var failureIdx = result.IndexOf("- **Failure:** Ordered failure");
+
+        Assert.True(releaseIdx >= 0, "Release line not found");
+        Assert.True(dependsOnIdx >= 0, "Depends On line not found");
+        Assert.True(documentsIdx >= 0, "Documents line not found");
+        Assert.True(documentLinksIdx >= 0, "Document Links line not found");
+        Assert.True(failureIdx >= 0, "Failure line not found");
+
+        // Assert correct ordering: Release < Depends On < Documents < Document Links < Failure
+        Assert.True(releaseIdx < dependsOnIdx, $"Release ({releaseIdx}) should appear before Depends On ({dependsOnIdx})");
+        Assert.True(dependsOnIdx < documentsIdx, $"Depends On ({dependsOnIdx}) should appear before Documents ({documentsIdx})");
+        Assert.True(documentsIdx < documentLinksIdx, $"Documents ({documentsIdx}) should appear before Document Links ({documentLinksIdx})");
+        Assert.True(documentLinksIdx < failureIdx, $"Document Links ({documentLinksIdx}) should appear before Failure ({failureIdx})");
+    }
 }
 
 /// <summary>
