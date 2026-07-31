@@ -726,7 +726,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     internal async Task<string> AskUserAsync(
         [Description("The question text to display to the user.")] string question,
         [Description("Question type: YesNo, SingleChoice, or MultiChoice. Default: YesNo")] string type = "YesNo",
-        [Description("Comma-separated list of options for SingleChoice or MultiChoice questions. Leave empty for YesNo.")] string? options = null,
+        [Description("Array of option strings required for SingleChoice or MultiChoice questions. Ignored for YesNo.")] string[]? options = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(question))
@@ -735,18 +735,58 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         if (!Enum.TryParse<QuestionType>(type, ignoreCase: true, out var questionType))
             return $"❌ Invalid type '{type}'. Valid types: YesNo, SingleChoice, MultiChoice.";
 
-        var optionList = questionType == QuestionType.YesNo
-            ? ["Yes", "No"]
-            : (options?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList() ?? []);
+        if (questionType == QuestionType.YesNo)
+        {
+            var yesNoPending = new ComposerQuestion
+            {
+                Text = question,
+                Type = questionType,
+                Options = ["Yes", "No"],
+            };
 
-        if (questionType != QuestionType.YesNo && optionList.Count == 0)
+            PendingQuestion = yesNoPending;
+            OnQuestionAsked?.Invoke();
+
+            _logger.LogInformation("Composer waiting for user answer to question: {Question}", question);
+
+            try
+            {
+                return await yesNoPending.Completion.Task.WaitAsync(cancellationToken);
+            }
+            finally
+            {
+                PendingQuestion = null;
+            }
+        }
+
+        if (options is null || options.Length == 0)
             return $"❌ Options are required for {questionType} questions.";
+
+        if (options.Length < 2)
+            return $"❌ At least 2 options are required for {questionType} questions; received {options.Length}.";
+
+        if (options.Length > 50)
+            return $"❌ At most 50 options are allowed for {questionType} questions; received {options.Length}.";
+
+        var trimmed = new List<string>(options.Length);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var option in options)
+        {
+            var t = option?.Trim() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(t))
+                return $"❌ Option entries must be non-blank for {questionType} questions.";
+
+            if (!seen.Add(t))
+                return $"❌ Duplicate option '{t}' is not allowed for {questionType} questions.";
+
+            trimmed.Add(t);
+        }
 
         var pending = new ComposerQuestion
         {
             Text = question,
             Type = questionType,
-            Options = optionList,
+            Options = trimmed,
         };
 
         PendingQuestion = pending;

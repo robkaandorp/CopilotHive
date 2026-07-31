@@ -11,6 +11,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using System.Net;
+using System.Text.Json;
 
 namespace CopilotHive.Tests.Orchestration;
 
@@ -4339,6 +4340,57 @@ public sealed class ComposerToolTests : IDisposable
         var result = await _composer.AskUserAsync("Pick one?", type: "SingleChoice", options: null, cancellationToken: ct);
         Assert.Contains("❌", result);
         Assert.Contains("Options are required", result);
+        Assert.Null(_composer.PendingQuestion);
+    }
+
+    [Fact]
+    public async Task AskUser_MultiChoiceWithNoOptions_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.AskUserAsync("Pick all?", type: "MultiChoice", options: null, cancellationToken: ct);
+        Assert.Contains("❌", result);
+        Assert.Contains("Options are required", result);
+        Assert.Null(_composer.PendingQuestion);
+    }
+
+    [Fact]
+    public async Task AskUser_SingleChoiceTooFewOptions_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.AskUserAsync("Pick one?", type: "SingleChoice", options: ["Only"], cancellationToken: ct);
+        Assert.Contains("❌", result);
+        Assert.Contains("At least 2 options", result);
+        Assert.Null(_composer.PendingQuestion);
+    }
+
+    [Fact]
+    public async Task AskUser_SingleChoiceBlankOption_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.AskUserAsync("Pick one?", type: "SingleChoice", options: ["A", "   "], cancellationToken: ct);
+        Assert.Contains("❌", result);
+        Assert.Contains("non-blank", result);
+        Assert.Null(_composer.PendingQuestion);
+    }
+
+    [Fact]
+    public async Task AskUser_SingleChoiceDuplicateOption_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.AskUserAsync("Pick one?", type: "SingleChoice", options: ["Alpha", "alpha"], cancellationToken: ct);
+        Assert.Contains("❌", result);
+        Assert.Contains("Duplicate option", result);
+        Assert.Null(_composer.PendingQuestion);
+    }
+
+    [Fact]
+    public async Task AskUser_SingleChoiceOverCap_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var result = await _composer.AskUserAsync("Pick one?", type: "SingleChoice", options: Enumerable.Range(1, 51).Select(i => $"Option {i}").ToArray(), cancellationToken: ct);
+        Assert.Contains("❌", result);
+        Assert.Contains("At most 50 options", result);
+        Assert.Null(_composer.PendingQuestion);
     }
 
     [Fact]
@@ -4372,6 +4424,27 @@ public sealed class ComposerToolTests : IDisposable
     }
 
     [Fact]
+    public async Task AskUser_YesNoSuppliedOptions_IgnoredAndSucceeds()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var askTask = _composer.AskUserAsync("Confirm?", type: "YesNo", options: ["A", "B", "C"], cancellationToken: ct);
+
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (_composer.PendingQuestion is null && DateTime.UtcNow < deadline)
+            await Task.Delay(10, ct);
+
+        var pending = _composer.PendingQuestion;
+        Assert.NotNull(pending);
+        Assert.Equal(QuestionType.YesNo, pending!.Type);
+        Assert.Equal(["Yes", "No"], pending.Options);
+
+        _composer.SubmitAnswer("Yes");
+        var result = await askTask;
+        Assert.Equal("Yes", result);
+        Assert.Null(_composer.PendingQuestion);
+    }
+
+    [Fact]
     public async Task AskUser_CancelQuestion_ReturnsCancellationMessage()
     {
         var ct = TestContext.Current.CancellationToken;
@@ -4394,7 +4467,7 @@ public sealed class ComposerToolTests : IDisposable
     public async Task AskUser_SingleChoice_SetsPendingWithOptions()
     {
         var ct = TestContext.Current.CancellationToken;
-        var askTask = _composer.AskUserAsync("Pick one?", type: "SingleChoice", options: "Alpha, Beta, Gamma", cancellationToken: ct);
+        var askTask = _composer.AskUserAsync("Pick one?", type: "SingleChoice", options: ["Alpha", "Beta", "Gamma"], cancellationToken: ct);
 
         var deadline = DateTime.UtcNow.AddSeconds(3);
         while (_composer.PendingQuestion is null && DateTime.UtcNow < deadline)
@@ -4414,7 +4487,7 @@ public sealed class ComposerToolTests : IDisposable
     public async Task AskUser_MultiChoice_SetsPendingWithOptions()
     {
         var ct = TestContext.Current.CancellationToken;
-        var askTask = _composer.AskUserAsync("Pick all that apply?", type: "MultiChoice", options: "A, B, C", cancellationToken: ct);
+        var askTask = _composer.AskUserAsync("Pick all that apply?", type: "MultiChoice", options: ["A", "B", "C"], cancellationToken: ct);
 
         var deadline = DateTime.UtcNow.AddSeconds(3);
         while (_composer.PendingQuestion is null && DateTime.UtcNow < deadline)
@@ -4459,6 +4532,35 @@ public sealed class ComposerToolTests : IDisposable
 
         _composer.SubmitAnswer("Yes");
         await askTask;
+    }
+
+    [Fact]
+    public void AskUserTool_OptionsParameter_SchemaIsStringArray()
+    {
+        var tools = _composer.BuildComposerTools();
+        var askUser = tools.OfType<AIFunction>().Single(t => t.Name == "ask_user");
+
+        var schema = askUser.JsonSchema;
+        Assert.Equal("object", schema.GetProperty("type").GetString());
+
+        var properties = schema.GetProperty("properties");
+        Assert.True(properties.TryGetProperty("options", out var optionsSchema));
+
+        var typeValue = optionsSchema.GetProperty("type");
+        var types = typeValue.ValueKind == JsonValueKind.Array
+            ? typeValue.EnumerateArray().Select(e => e.GetString()).ToHashSet()
+            : [typeValue.GetString()];
+        Assert.Contains("array", types);
+
+        var itemsTypeValue = optionsSchema.GetProperty("items").GetProperty("type");
+        var itemTypes = itemsTypeValue.ValueKind == JsonValueKind.Array
+            ? itemsTypeValue.EnumerateArray().Select(e => e.GetString()).ToHashSet()
+            : [itemsTypeValue.GetString()];
+        Assert.Contains("string", itemTypes);
+
+        var description = optionsSchema.GetProperty("description").GetString();
+        Assert.NotNull(description);
+        Assert.DoesNotContain("comma-separated", description, StringComparison.OrdinalIgnoreCase);
     }
 
     // ── IsContextOverflowError ──
