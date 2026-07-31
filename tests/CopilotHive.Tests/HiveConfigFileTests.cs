@@ -1645,4 +1645,235 @@ public sealed class HiveConfigFileTests
         Assert.Equal("high", result.ReasoningEffort);
         Assert.Equal("merged desc", result.Description);
     }
+
+    // ── SupportsVision YAML round-trip (tri-state: true, false, null) ──────────
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [InlineData(null)]
+    public async Task RoundTrip_ModelEntrySupportsVision_PreservesTriState(bool? value)
+    {
+        var original = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "vision-model", ContextWindow = 200000, SupportsVision = value }
+                ]
+            }
+        };
+
+        var yaml = await WriteThroughProductionSerializerAsync(original);
+
+        if (value is null)
+        {
+            // null is omitted by the serializer (OmitNull) — must NOT appear in YAML
+            Assert.DoesNotContain("supports_vision", yaml, StringComparison.Ordinal);
+        }
+        else
+        {
+            // true/false must be emitted as YAML booleans
+            var expected = value is true ? "true" : "false";
+            Assert.Contains($"supports_vision: {expected}", yaml, StringComparison.Ordinal);
+        }
+
+        var reloaded = Deserializer.Deserialize<HiveConfigFile>(yaml);
+        var entry = Assert.Single(reloaded.Models!.AvailableModels!);
+        Assert.Equal("vision-model", entry.Name);
+        Assert.Equal(value, entry.SupportsVision);
+    }
+
+    [Fact]
+    public async Task RoundTrip_SubAgentModelSupportsVision_PreservesTriState()
+    {
+        var original = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "base" }],
+                SubAgentModels =
+                [
+                    new ModelEntry { Name = "curated-true", SupportsVision = true },
+                    new ModelEntry { Name = "curated-false", SupportsVision = false },
+                    new ModelEntry { Name = "curated-unset", SupportsVision = null },
+                ]
+            }
+        };
+
+        var yaml = await WriteThroughProductionSerializerAsync(original);
+
+        Assert.Contains("supports_vision: true", yaml, StringComparison.Ordinal);
+        Assert.Contains("supports_vision: false", yaml, StringComparison.Ordinal);
+
+        var reloaded = Deserializer.Deserialize<HiveConfigFile>(yaml);
+        var sub = reloaded.Models!.SubAgentModels!;
+        Assert.Equal(3, sub.Count);
+        Assert.True(sub[0].SupportsVision);
+        Assert.False(sub[1].SupportsVision);
+        Assert.Null(sub[2].SupportsVision);
+    }
+
+    // ── ReloadFrom deep-copies SupportsVision ─────────────────────────────────
+
+    [Fact]
+    public void ReloadFrom_DeepCopiesSupportsVision_OnModelEntries()
+    {
+        var sourceAvailable = new ModelEntry
+        {
+            Name = "a",
+            ContextWindow = 100,
+            SupportsVision = true
+        };
+        var sourceCurated = new ModelEntry
+        {
+            Name = "b",
+            ContextWindow = 200,
+            SupportsVision = false
+        };
+
+        var target = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var source = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [sourceAvailable],
+                SubAgentModels = [sourceCurated]
+            }
+        };
+
+        target.ReloadFrom(source);
+
+        var copiedAvailable = Assert.Single(target.Models!.AvailableModels!);
+        var copiedCurated = Assert.Single(target.Models.SubAgentModels!);
+        Assert.NotSame(sourceAvailable, copiedAvailable);
+        Assert.NotSame(sourceCurated, copiedCurated);
+        Assert.True(copiedAvailable.SupportsVision);
+        Assert.False(copiedCurated.SupportsVision);
+
+        // Mutate source — receiver must be unaffected
+        sourceAvailable.SupportsVision = false;
+        sourceCurated.SupportsVision = true;
+
+        Assert.True(copiedAvailable.SupportsVision);
+        Assert.False(copiedCurated.SupportsVision);
+    }
+
+    // ── GetSubAgentModels merge: SupportsVision preserve-null (regression) ─────
+
+    [Fact]
+    public void GetSubAgentModels_CuratedSupportsVisionTrue_MergedIsTrue()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "m", SupportsVision = false }],
+                SubAgentModels = [new ModelEntry { Name = "m", SupportsVision = true }]
+            }
+        };
+
+        var result = Assert.Single(config.GetSubAgentModels());
+        Assert.True(result.SupportsVision);
+    }
+
+    [Fact]
+    public void GetSubAgentModels_CuratedUnsetInheritsTrueFromAvailable()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "m", SupportsVision = true }],
+                SubAgentModels = [new ModelEntry { Name = "m", SupportsVision = null }]
+            }
+        };
+
+        var result = Assert.Single(config.GetSubAgentModels());
+        Assert.True(result.SupportsVision);
+    }
+
+    /// <summary>
+    /// THE critical regression test: curated unset + available also unset → merged stays null
+    /// (NOT false). The merge must preserve the distinction between merged-null and downstream-false.
+    /// </summary>
+    [Fact]
+    public void GetSubAgentModels_CuratedUnsetAndAvailableUnset_MergedStaysNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "m", SupportsVision = null }],
+                SubAgentModels = [new ModelEntry { Name = "m", SupportsVision = null }]
+            }
+        };
+
+        var result = Assert.Single(config.GetSubAgentModels());
+        Assert.Null(result.SupportsVision);
+    }
+
+    [Fact]
+    public void GetSubAgentModels_CuratedExplicitFalse_OverridesAvailableTrue()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "m", SupportsVision = true }],
+                SubAgentModels = [new ModelEntry { Name = "m", SupportsVision = false }]
+            }
+        };
+
+        var result = Assert.Single(config.GetSubAgentModels());
+        Assert.False(result.SupportsVision);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [InlineData(null)]
+    public void GetSubAgentModels_AvailableOnlyModel_KeepsItsOwnSupportsVision(bool? vision)
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "avail-only", SupportsVision = vision }]
+            }
+        };
+
+        var result = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal(vision, result.SupportsVision);
+    }
+
+    [Fact]
+    public void GetSubAgentModels_DoesNotMutateSourceSupportsVision()
+    {
+        var available = new ModelEntry { Name = "m", SupportsVision = true };
+        var curated = new ModelEntry { Name = "m", SupportsVision = null };
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [available],
+                SubAgentModels = [curated]
+            }
+        };
+
+        config.GetSubAgentModels();
+
+        Assert.Null(curated.SupportsVision);
+        Assert.True(available.SupportsVision);
+    }
 }

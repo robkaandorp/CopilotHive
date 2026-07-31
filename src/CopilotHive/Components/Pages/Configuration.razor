@@ -302,6 +302,15 @@ else
                             <label style="color:var(--text-muted);font-size:0.9rem">Description</label>
                             <input @bind="_newModelDescription" placeholder="e.g. Fast and cheap, good for simple tasks"
                                    style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                            <label style="color:var(--text-muted);font-size:0.9rem">Supports Vision</label>
+                            <select value="@FormatTriState(_newModelSupportsVision)"
+                                    @onchange="e => _newModelSupportsVision = ParseTriState(e.Value?.ToString())"
+                                    style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                                <option value="">unset</option>
+                                <option value="true">true</option>
+                                <option value="false">false</option>
+                            </select>
                         </div>
                         <div style="margin-top:1rem;display:flex;gap:0.75rem">
                             <button class="approve-btn" @onclick="AddModelAsync">💾 Save</button>
@@ -328,6 +337,7 @@ else
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Context Window</th>
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Reasoning Effort</th>
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Description</th>
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Supports Vision</th>
                                 <th style="text-align:right;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Actions</th>
                             </tr>
                         </thead>
@@ -356,6 +366,15 @@ else
                                             <input @bind="_editModelDescription" placeholder="optional"
                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:12rem" />
                                         </td>
+                                        <td style="padding:0.5rem">
+                                            <select value="@FormatTriState(_editModelSupportsVision)"
+                                                    @onchange="e => _editModelSupportsVision = ParseTriState(e.Value?.ToString())"
+                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;cursor:pointer">
+                                                <option value="">unset</option>
+                                                <option value="true">true</option>
+                                                <option value="false">false</option>
+                                            </select>
+                                        </td>
                                         <td style="white-space:nowrap;padding:0.5rem;text-align:right">
                                             <button class="approve-btn" @onclick="SaveEditModelAsync">💾 Save</button>
                                             <button class="approve-btn" @onclick="CancelEditModel">Cancel</button>
@@ -367,6 +386,7 @@ else
                                         <td style="padding:0.5rem;font-size:0.9rem">@(model.ContextWindow?.ToString() ?? "—")</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(model.ReasoningEffort) ? "—" : model.ReasoningEffort)</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(model.Description) ? "—" : model.Description)</td>
+                                        <td style="padding:0.5rem;font-size:0.9rem">@(model.SupportsVision.HasValue ? (model.SupportsVision.Value ? "true" : "false") : "—")</td>
                                         <td style="white-space:nowrap;padding:0.5rem;text-align:right">
                                             <button class="approve-btn" @onclick="() => StartEditModel(model)">✏️ Edit</button>
                                             <button class="approve-btn" style="color:var(--red)" @onclick="() => RemoveModelAsync(model.Name)">🗑️ Remove</button>
@@ -483,6 +503,15 @@ else
                             <label style="color:var(--text-muted);font-size:0.9rem">Description</label>
                             <input @bind="_newSubAgentModelDescription" placeholder="e.g. Fast and cheap, good for simple lookups"
                                    style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                            <label style="color:var(--text-muted);font-size:0.9rem">Supports Vision</label>
+                            <select value="@FormatTriState(_newSubAgentModelSupportsVision)"
+                                    @onchange="e => _newSubAgentModelSupportsVision = ParseTriState(e.Value?.ToString())"
+                                    style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                                <option value="">unset (inherit)</option>
+                                <option value="true">true</option>
+                                <option value="false">false</option>
+                            </select>
                         </div>
                         <div style="margin-top:1rem;display:flex;gap:0.75rem">
                             <button class="approve-btn" @onclick="AddSubAgentModelAsync">💾 Save</button>
@@ -509,6 +538,7 @@ else
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Context Window</th>
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Reasoning Effort</th>
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Description</th>
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Supports Vision</th>
                                 <th style="text-align:right;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Actions</th>
                             </tr>
                         </thead>
@@ -537,6 +567,15 @@ else
                                             <input @bind="_editSubAgentModelDescription" placeholder="optional"
                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:12rem" />
                                         </td>
+                                        <td style="padding:0.5rem">
+                                            <select value="@FormatTriState(_editSubAgentModelSupportsVision)"
+                                                    @onchange="e => _editSubAgentModelSupportsVision = ParseTriState(e.Value?.ToString())"
+                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;cursor:pointer">
+                                                <option value="">unset (inherit)</option>
+                                                <option value="true">true</option>
+                                                <option value="false">false</option>
+                                            </select>
+                                        </td>
                                         <td style="white-space:nowrap;padding:0.5rem;text-align:right">
                                             <button class="approve-btn" @onclick="SaveEditSubAgentModelAsync">💾 Save</button>
                                             <button class="approve-btn" @onclick="CancelEditSubAgentModel">Cancel</button>
@@ -548,6 +587,7 @@ else
                                         <td style="padding:0.5rem;font-size:0.9rem">@(sam.ContextWindow?.ToString() ?? "—")</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(sam.ReasoningEffort) ? "—" : sam.ReasoningEffort)</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(sam.Description) ? "—" : sam.Description)</td>
+                                        <td style="padding:0.5rem;font-size:0.9rem">@(sam.SupportsVision.HasValue ? (sam.SupportsVision.Value ? "true" : "false") : "—")</td>
                                         <td style="white-space:nowrap;padding:0.5rem;text-align:right">
                                             <button class="approve-btn" @onclick="() => StartEditSubAgentModel(sam)">✏️ Edit</button>
                                             <button class="approve-btn" style="color:var(--red)" @onclick="() => RemoveSubAgentModelAsync(sam.Name)">🗑️ Remove</button>
@@ -986,7 +1026,8 @@ else
         [property: JsonPropertyName("name")] string Name,
         [property: JsonPropertyName("contextWindow")] int? ContextWindow,
         [property: JsonPropertyName("reasoningEffort")] string? ReasoningEffort,
-        [property: JsonPropertyName("description")] string? Description);
+        [property: JsonPropertyName("description")] string? Description,
+        [property: JsonPropertyName("supportsVision")] bool? SupportsVision = null);
 
     private sealed record DiscoveredModelDto(
         [property: JsonPropertyName("id")] string Id,
@@ -1072,10 +1113,12 @@ else
     private int? _newModelContextWindow;
     private string _newModelReasoningEffort = "";
     private string _newModelDescription = "";
+    private bool? _newModelSupportsVision;
     private string? _editingModelName;
     private int? _editModelContextWindow;
     private string _editModelReasoningEffort = "";
     private string _editModelDescription = "";
+    private bool? _editModelSupportsVision;
     private string? _availableModelsError;
     private string? _availableModelsSuccess;
 
@@ -1085,10 +1128,12 @@ else
     private int? _newSubAgentModelContextWindow;
     private string _newSubAgentModelReasoningEffort = "";
     private string _newSubAgentModelDescription = "";
+    private bool? _newSubAgentModelSupportsVision;
     private string? _editingSubAgentModelName;
     private int? _editSubAgentModelContextWindow;
     private string _editSubAgentModelReasoningEffort = "";
     private string _editSubAgentModelDescription = "";
+    private bool? _editSubAgentModelSupportsVision;
     private string? _subAgentModelsError;
     private string? _subAgentModelsSuccess;
 
@@ -1794,13 +1839,14 @@ else
         {
             var reasoning = string.IsNullOrEmpty(_newModelReasoningEffort) ? null : _newModelReasoningEffort;
             var newDescription = string.IsNullOrWhiteSpace(_newModelDescription) ? null : _newModelDescription;
-            var response = await PostAvailableModelAsync(_newModelName, _newModelContextWindow, reasoning, newDescription);
+            var response = await PostAvailableModelAsync(_newModelName, _newModelContextWindow, reasoning, newDescription, _newModelSupportsVision);
             if (response.IsSuccessStatusCode)
             {
                 _newModelName = "";
                 _newModelContextWindow = null;
                 _newModelReasoningEffort = "";
                 _newModelDescription = "";
+                _newModelSupportsVision = null;
                 _showAddModelForm = false;
                 await LoadModelsAsync();
                 _availableModelsSuccess = "✅ Model added";
@@ -1827,6 +1873,7 @@ else
         _editModelContextWindow = model.ContextWindow;
         _editModelReasoningEffort = model.ReasoningEffort ?? "";
         _editModelDescription = model.Description ?? "";
+        _editModelSupportsVision = model.SupportsVision;
         _availableModelsError = null;
         _availableModelsSuccess = null;
     }
@@ -1853,6 +1900,7 @@ else
                     contextWindow = _editModelContextWindow,
                     reasoningEffort = reasoning,
                     description = editDescription,
+                    supportsVision = _editModelSupportsVision,
                 }),
                 System.Text.Encoding.UTF8,
                 "application/json");
@@ -1913,7 +1961,22 @@ else
         }
     }
 
-    private Task<HttpResponseMessage> PostAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null)
+    // Tri-state helpers: "" => null (unset), "true" => true, "false" => false.
+    private static string FormatTriState(bool? value) => value switch
+    {
+        true => "true",
+        false => "false",
+        null => "",
+    };
+
+    private static bool? ParseTriState(string? raw) => raw switch
+    {
+        "true" => true,
+        "false" => false,
+        _ => null,
+    };
+
+    private Task<HttpResponseMessage> PostAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, bool? supportsVision = null)
     {
         var body = new StringContent(
             System.Text.Json.JsonSerializer.Serialize(new
@@ -1922,13 +1985,14 @@ else
                 contextWindow,
                 reasoningEffort,
                 description,
+                supportsVision,
             }),
             System.Text.Encoding.UTF8,
             "application/json");
         return HttpClient.PostAsync("/api/config/available-models", body);
     }
 
-    private Task<HttpResponseMessage> PostSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description)
+    private Task<HttpResponseMessage> PostSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description, bool? supportsVision)
     {
         var body = new StringContent(
             System.Text.Json.JsonSerializer.Serialize(new
@@ -1937,6 +2001,7 @@ else
                 contextWindow,
                 reasoningEffort,
                 description,
+                supportsVision,
             }),
             System.Text.Encoding.UTF8,
             "application/json");
@@ -1956,13 +2021,14 @@ else
         {
             var reasoning = string.IsNullOrEmpty(_newSubAgentModelReasoningEffort) ? null : _newSubAgentModelReasoningEffort;
             var description = string.IsNullOrWhiteSpace(_newSubAgentModelDescription) ? null : _newSubAgentModelDescription;
-            var response = await PostSubAgentModelAsync(_newSubAgentModelName, _newSubAgentModelContextWindow, reasoning, description);
+            var response = await PostSubAgentModelAsync(_newSubAgentModelName, _newSubAgentModelContextWindow, reasoning, description, _newSubAgentModelSupportsVision);
             if (response.IsSuccessStatusCode)
             {
                 _newSubAgentModelName = "";
                 _newSubAgentModelContextWindow = null;
                 _newSubAgentModelReasoningEffort = "";
                 _newSubAgentModelDescription = "";
+                _newSubAgentModelSupportsVision = null;
                 _showAddSubAgentModelForm = false;
                 await LoadModelsAsync();
                 _subAgentModelsSuccess = "✅ Model added";
@@ -1989,6 +2055,7 @@ else
         _editSubAgentModelContextWindow = model.ContextWindow;
         _editSubAgentModelReasoningEffort = model.ReasoningEffort ?? "";
         _editSubAgentModelDescription = model.Description ?? "";
+        _editSubAgentModelSupportsVision = model.SupportsVision;
         _subAgentModelsError = null;
         _subAgentModelsSuccess = null;
     }
@@ -2015,6 +2082,7 @@ else
                     contextWindow = _editSubAgentModelContextWindow,
                     reasoningEffort = reasoning,
                     description,
+                    supportsVision = _editSubAgentModelSupportsVision,
                 }),
                 System.Text.Encoding.UTF8,
                 "application/json");

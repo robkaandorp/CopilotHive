@@ -113,6 +113,7 @@ internal sealed class TaskDispatchService
                 Id = entry.Name,
                 ContextWindow = entry.ContextWindow,
                 Description = !string.IsNullOrWhiteSpace(entry.Description) ? entry.Description : autoDescription,
+                SupportsVision = entry.SupportsVision ?? false,
             });
         }
 

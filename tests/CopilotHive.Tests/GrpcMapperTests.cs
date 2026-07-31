@@ -716,4 +716,59 @@ public sealed class GrpcMapperTests
         Assert.Empty(assignment.SubAgentModels);
         Assert.Empty(restored.SubAgentModels);
     }
+
+    // ── SubAgentModels SupportsVision round-trip (non-nullable bool) ──────────
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void SubAgentModels_SupportsVision_RoundTripsBothDirections(bool vision)
+    {
+        var original = BuildFullWorkTask() with
+        {
+            SubAgentModels =
+            [
+                new SubAgentModelDto { Id = "vision-model", ContextWindow = 200_000, SupportsVision = vision },
+            ],
+        };
+
+        var assignment = GrpcMapper.ToGrpc(original);
+        Assert.Equal(vision, assignment.SubAgentModels[0].SupportsVision);
+
+        var restored = GrpcMapper.ToDomain(assignment);
+        Assert.Equal(vision, restored.SubAgentModels[0].SupportsVision);
+    }
+
+    [Fact]
+    public void SubAgentModels_SupportsVision_DefaultsToFalseOnDto()
+    {
+        var dto = new SubAgentModelDto { Id = "test" };
+        Assert.False(dto.SupportsVision);
+    }
+
+    [Fact]
+    public void SubAgentModels_SupportsVision_UnsetProtoMessage_DecodesAsFalse()
+    {
+        // A proto SubAgentModel with supports_vision unset (proto3 default = false)
+        var assignment = new TaskAssignment
+        {
+            TaskId = "t",
+            GoalId = "g",
+            GoalDescription = "d",
+            Prompt = "p",
+            Role = GrpcWorkerRole.Coder,
+        };
+        assignment.SubAgentModels.Add(new SubAgentModel
+        {
+            Id = "default-vision",
+            ContextWindow = 1000,
+            Description = "test",
+            // SupportsVision not set — proto3 default is false
+        });
+
+        var restored = GrpcMapper.ToDomain(assignment);
+
+        Assert.Single(restored.SubAgentModels);
+        Assert.False(restored.SubAgentModels[0].SupportsVision);
+    }
 }

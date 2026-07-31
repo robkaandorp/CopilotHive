@@ -202,6 +202,51 @@ public class BrainActorSubAgentTests
         finally { DeleteTempPath(dir); }
     }
 
+    // ── SupportsVision mapping (non-nullable source → direct) ────────────────
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task BuildSubAgentOptions_MapsSupportsVisionDirectly(bool vision)
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            IReadOnlyList<SubAgentModelEntry> snapshot =
+            [
+                new("copilot/model-a", 128_000, null, vision),
+            ];
+
+            await using var actor = CreateActor(dir, snapshot, subAgentsEnabled: true);
+            var options = BuildSubAgentOptions(actor);
+
+            Assert.NotNull(options);
+            Assert.Equal(vision, options!.AvailableModels[0].SupportsVision);
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task BuildSubAgentOptions_SupportsVisionDefaultsToFalseWhenOmitted()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            // SubAgentModelEntry with default SupportsVision = false (3-param ctor)
+            IReadOnlyList<SubAgentModelEntry> snapshot =
+            [
+                new("copilot/model-a", 128_000, null),
+            ];
+
+            await using var actor = CreateActor(dir, snapshot, subAgentsEnabled: true);
+            var options = BuildSubAgentOptions(actor);
+
+            Assert.NotNull(options);
+            Assert.False(options!.AvailableModels[0].SupportsVision);
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
     [Fact]
     public async Task BuildSubAgentOptions_WhenSnapshotEmptyOrNull_ReturnsNull()
     {

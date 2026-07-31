@@ -61,7 +61,7 @@ public static class ConfigHub
                 return Results.Problem("Config service is not configured.");
             try
             {
-                await svc.AddAvailableModelAsync(req.Name, req.ContextWindow, req.ReasoningEffort, req.Description);
+                await svc.AddAvailableModelAsync(req.Name, req.ContextWindow, req.ReasoningEffort, req.Description, req.SupportsVision);
                 return Results.Ok(new { saved = true });
             }
             catch (InvalidOperationException ex)
@@ -78,7 +78,7 @@ public static class ConfigHub
             name = Uri.UnescapeDataString(name);
             try
             {
-                await svc.UpdateAvailableModelAsync(name, req.ContextWindow, req.ReasoningEffort, req.Description);
+                await svc.UpdateAvailableModelAsync(name, req.ContextWindow, req.ReasoningEffort, req.Description, req.SupportsVision);
                 return Results.Ok(new { saved = true });
             }
             catch (InvalidOperationException ex)
@@ -104,7 +104,7 @@ public static class ConfigHub
                 return Results.Problem("Config service is not configured.");
             try
             {
-                await svc.AddSubAgentModelAsync(req.Name, req.ContextWindow, req.ReasoningEffort, req.Description);
+                await svc.AddSubAgentModelAsync(req.Name, req.ContextWindow, req.ReasoningEffort, req.Description, req.SupportsVision);
                 return Results.Ok(new { saved = true });
             }
             catch (InvalidOperationException ex)
@@ -121,7 +121,7 @@ public static class ConfigHub
             name = Uri.UnescapeDataString(name);
             try
             {
-                await svc.UpdateSubAgentModelAsync(name, req.ContextWindow, req.ReasoningEffort, req.Description);
+                await svc.UpdateSubAgentModelAsync(name, req.ContextWindow, req.ReasoningEffort, req.Description, req.SupportsVision);
                 return Results.Ok(new { saved = true });
             }
             catch (InvalidOperationException ex)
@@ -301,7 +301,8 @@ public static class ConfigHub
 /// <param name="ContextWindow">Optional context window in tokens.</param>
 /// <param name="ReasoningEffort">Optional default reasoning effort.</param>
 /// <param name="Description">Optional human-readable description.</param>
-public sealed record AvailableModelRequest(string Name, int? ContextWindow, string? ReasoningEffort, string? Description = null);
+/// <param name="SupportsVision">Informational vision flag: <c>true</c>, <c>false</c>, or <c>null</c> for unset.</param>
+public sealed record AvailableModelRequest(string Name, int? ContextWindow, string? ReasoningEffort, string? Description = null, bool? SupportsVision = null);
 
 /// <summary>
 /// Request body for adding or updating a sub-agent model.
@@ -310,4 +311,5 @@ public sealed record AvailableModelRequest(string Name, int? ContextWindow, stri
 /// <param name="ContextWindow">Optional context window in tokens.</param>
 /// <param name="ReasoningEffort">Optional default reasoning effort.</param>
 /// <param name="Description">Optional human-readable description.</param>
-public sealed record SubAgentModelRequest(string Name, int? ContextWindow, string? ReasoningEffort, string? Description = null);
+/// <param name="SupportsVision">Informational vision flag: <c>true</c>, <c>false</c>, or <c>null</c> for unset (inherit).</param>
+public sealed record SubAgentModelRequest(string Name, int? ContextWindow, string? ReasoningEffort, string? Description = null, bool? SupportsVision = null);

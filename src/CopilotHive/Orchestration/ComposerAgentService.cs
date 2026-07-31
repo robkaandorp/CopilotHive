@@ -555,7 +555,8 @@ internal sealed class ComposerAgentService(
             options.AvailableModels.Add(new SubAgentModelInfo(
                 entry.Name,
                 !string.IsNullOrWhiteSpace(entry.Description) ? entry.Description : autoDescription,
-                entry.ContextWindow));
+                entry.ContextWindow,
+                supportsVision: entry.SupportsVision ?? false));
         }
 
         return options;

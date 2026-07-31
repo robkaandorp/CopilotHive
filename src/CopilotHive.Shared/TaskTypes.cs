@@ -57,6 +57,8 @@ public sealed record SubAgentModelDto
     public int? ContextWindow { get; init; }
     /// <summary>Human-readable description for the model.</summary>
     public string Description { get; init; } = "";
+    /// <summary>Informational flag: whether the model accepts image input (vision). Defaults to false.</summary>
+    public bool SupportsVision { get; init; }
 }
 
 /// <summary>

@@ -749,6 +749,55 @@ public sealed class ComposerAgentServiceTests
         }
     }
 
+    // ── SupportsVision mapping (nullable source → ?? false) ──────────────────
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [InlineData(null)]
+    public async Task SubAgents_MapsSupportsVision_NullableSourceResolvesToFalseWhenNull(bool? vision)
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var hiveConfig = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels =
+                    [
+                        new ModelEntry { Name = "gpt-4", ContextWindow = 200000, SupportsVision = vision },
+                    ]
+                }
+            };
+
+            var repoManager = new Mock<IBrainRepoManager>();
+            repoManager.SetupGet(r => r.WorkDirectory).Returns(stateDir);
+
+            var mockClient = new Mock<IChatClient>();
+
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => mockClient.Object,
+                hiveConfig: hiveConfig,
+                repoManager: repoManager.Object,
+                subAgentsEnabled: true);
+
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var subAgents = service.AgentOptions.SubAgents;
+            Assert.NotNull(subAgents);
+            // Composer maps nullable source as entry.SupportsVision ?? false
+            Assert.Equal(vision ?? false, subAgents!.AvailableModels[0].SupportsVision);
+
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
     // ── 12. SubAgents disabled when flag is false ──
 
     [Fact]

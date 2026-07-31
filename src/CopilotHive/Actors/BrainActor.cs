@@ -405,7 +405,8 @@ internal sealed class BrainActor : Actor<IBrainMessage>
             options.AvailableModels.Add(new SubAgentModelInfo(
                 entry.Name,
                 !string.IsNullOrWhiteSpace(entry.Description) ? entry.Description : autoDescription,
-                entry.ContextWindow));
+                entry.ContextWindow,
+                supportsVision: entry.SupportsVision));
         }
 
         return options;

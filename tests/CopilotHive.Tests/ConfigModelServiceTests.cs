@@ -1493,6 +1493,122 @@ public sealed class ConfigModelServiceTests : IDisposable
         var yaml = await ReadWrittenYamlAsync();
         Assert.Contains("description: Fast and cheap", yaml, StringComparison.Ordinal);
     }
+
+    // ── SupportsVision tri-state CRUD ────────────────────────────────────────
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [InlineData(null)]
+    public async Task AddAvailableModelAsync_PersistsSupportsVisionTriState(bool? vision)
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [] }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddAvailableModelAsync("vision-model", 1000, null, null, vision, TestContext.Current.CancellationToken);
+
+        var model = Assert.Single(config.Models!.AvailableModels!);
+        Assert.Equal(vision, model.SupportsVision);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [InlineData(null)]
+    public async Task UpdateAvailableModelAsync_PersistsSupportsVisionTriState(bool? vision)
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [new ModelEntry { Name = "model-a", SupportsVision = true }] }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateAvailableModelAsync("model-a", null, null, null, vision, TestContext.Current.CancellationToken);
+
+        Assert.Equal(vision, config.Models!.AvailableModels![0].SupportsVision);
+    }
+
+    [Fact]
+    public async Task UpdateAvailableModelAsync_ExplicitFalse_SurvivesRoundTripThroughService()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [new ModelEntry { Name = "model-a", SupportsVision = true }] }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        // Update to explicit false
+        await svc.UpdateAvailableModelAsync("model-a", null, null, null, false, TestContext.Current.CancellationToken);
+
+        Assert.False(config.Models!.AvailableModels![0].SupportsVision);
+
+        // The written YAML must contain supports_vision: false (not be omitted)
+        var yaml = await ReadWrittenYamlAsync();
+        Assert.Contains("supports_vision: false", yaml, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [InlineData(null)]
+    public async Task AddSubAgentModelAsync_PersistsSupportsVisionTriState(bool? vision)
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddSubAgentModelAsync("sa-model", 128000, null, null, vision, TestContext.Current.CancellationToken);
+
+        var model = Assert.Single(config.Models!.SubAgentModels!);
+        Assert.Equal(vision, model.SupportsVision);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [InlineData(null)]
+    public async Task UpdateSubAgentModelAsync_PersistsSupportsVisionTriState(bool? vision)
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { SubAgentModels = [new ModelEntry { Name = "model-a", SupportsVision = true }] }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateSubAgentModelAsync("model-a", null, null, null, vision, TestContext.Current.CancellationToken);
+
+        Assert.Equal(vision, config.Models!.SubAgentModels![0].SupportsVision);
+    }
+
+    [Fact]
+    public async Task UpdateSubAgentModelAsync_ExplicitFalse_SurvivesRoundTripThroughService()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { SubAgentModels = [new ModelEntry { Name = "model-a", SupportsVision = true }] }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateSubAgentModelAsync("model-a", null, null, null, false, TestContext.Current.CancellationToken);
+
+        Assert.False(config.Models!.SubAgentModels![0].SupportsVision);
+
+        var yaml = await ReadWrittenYamlAsync();
+        Assert.Contains("supports_vision: false", yaml, StringComparison.Ordinal);
+    }
 }
 
 /// <summary>

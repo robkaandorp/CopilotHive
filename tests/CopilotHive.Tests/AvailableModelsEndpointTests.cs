@@ -479,6 +479,190 @@ public class AvailableModelsEndpointTests : IDisposable
         }
         Assert.True(found, "Expected a model with Name='test-model' and ReasoningEffort='high' in availableModels");
     }
+
+    // ── SupportsVision tri-state REST round-trip (available models) ──────────
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [InlineData(null)]
+    public async Task PostAvailableModel_PersistsSupportsVisionTriState(bool? vision)
+    {
+        var response = await _client.PostAsJsonAsync(
+            "/api/config/available-models",
+            new { name = "vision-am-model", contextWindow = 1000, reasoningEffort = (string?)null, supportsVision = vision },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var entry = await FindAvailableModelAsync("vision-am-model");
+        Assert.NotNull(entry);
+        if (vision is null)
+        {
+            // Null may be omitted or present as null in JSON
+            Assert.True(!entry!.Value.TryGetProperty("supportsVision", out var sv) || sv.ValueKind == JsonValueKind.Null,
+                "supportsVision should be null/absent when unset");
+        }
+        else
+        {
+            Assert.Equal(vision, entry!.Value.GetProperty("supportsVision").GetBoolean());
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [InlineData(null)]
+    public async Task PutAvailableModel_PersistsSupportsVisionTriState(bool? vision)
+    {
+        // Add first
+        await _client.PostAsJsonAsync(
+            "/api/config/available-models",
+            new { name = "put-vision-model", contextWindow = 1000, reasoningEffort = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        // Update with SupportsVision
+        var response = await _client.PutAsJsonAsync(
+            "/api/config/available-models/put-vision-model",
+            new { name = "put-vision-model", contextWindow = 2000, reasoningEffort = (string?)null, supportsVision = vision },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var entry = await FindAvailableModelAsync("put-vision-model");
+        Assert.NotNull(entry);
+        if (vision is null)
+        {
+            Assert.True(!entry!.Value.TryGetProperty("supportsVision", out var sv) || sv.ValueKind == JsonValueKind.Null,
+                "supportsVision should be null/absent when unset");
+        }
+        else
+        {
+            Assert.Equal(vision, entry!.Value.GetProperty("supportsVision").GetBoolean());
+        }
+    }
+
+    [Fact]
+    public async Task PutAvailableModel_ExplicitFalseSurvivesRoundTrip()
+    {
+        // Add with true first
+        await _client.PostAsJsonAsync(
+            "/api/config/available-models",
+            new { name = "false-survive", contextWindow = 1000, reasoningEffort = (string?)null, supportsVision = true },
+            TestContext.Current.CancellationToken);
+
+        // Update to explicit false
+        var response = await _client.PutAsJsonAsync(
+            "/api/config/available-models/false-survive",
+            new { name = "false-survive", contextWindow = 2000, reasoningEffort = (string?)null, supportsVision = false },
+            TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var entry = await FindAvailableModelAsync("false-survive");
+        Assert.NotNull(entry);
+        Assert.False(entry!.Value.GetProperty("supportsVision").GetBoolean());
+    }
+
+    // ── SupportsVision tri-state REST round-trip (sub-agent models) ──────────
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [InlineData(null)]
+    public async Task PostSubAgentModel_PersistsSupportsVisionTriState(bool? vision)
+    {
+        var response = await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name = "vision-sa-model", contextWindow = 1000, reasoningEffort = (string?)null, description = (string?)null, supportsVision = vision },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var entry = await FindSubAgentModelAsync("vision-sa-model");
+        Assert.NotNull(entry);
+        if (vision is null)
+        {
+            Assert.True(!entry!.Value.TryGetProperty("supportsVision", out var sv) || sv.ValueKind == JsonValueKind.Null,
+                "supportsVision should be null/absent when unset");
+        }
+        else
+        {
+            Assert.Equal(vision, entry!.Value.GetProperty("supportsVision").GetBoolean());
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [InlineData(null)]
+    public async Task PutSubAgentModel_PersistsSupportsVisionTriState(bool? vision)
+    {
+        // Add first
+        await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name = "put-sa-vision", contextWindow = 1000, reasoningEffort = (string?)null, description = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        // Update with SupportsVision
+        var response = await _client.PutAsJsonAsync(
+            "/api/config/sub-agent-models/put-sa-vision",
+            new { name = "put-sa-vision", contextWindow = 2000, reasoningEffort = (string?)null, description = (string?)null, supportsVision = vision },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var entry = await FindSubAgentModelAsync("put-sa-vision");
+        Assert.NotNull(entry);
+        if (vision is null)
+        {
+            Assert.True(!entry!.Value.TryGetProperty("supportsVision", out var sv) || sv.ValueKind == JsonValueKind.Null,
+                "supportsVision should be null/absent when unset");
+        }
+        else
+        {
+            Assert.Equal(vision, entry!.Value.GetProperty("supportsVision").GetBoolean());
+        }
+    }
+
+    [Fact]
+    public async Task PutSubAgentModel_ExplicitFalseSurvivesRoundTrip()
+    {
+        // Add with true first
+        await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name = "sa-false-survive", contextWindow = 1000, reasoningEffort = (string?)null, description = (string?)null, supportsVision = true },
+            TestContext.Current.CancellationToken);
+
+        // Update to explicit false
+        var response = await _client.PutAsJsonAsync(
+            "/api/config/sub-agent-models/sa-false-survive",
+            new { name = "sa-false-survive", contextWindow = 2000, reasoningEffort = (string?)null, description = (string?)null, supportsVision = false },
+            TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var entry = await FindSubAgentModelAsync("sa-false-survive");
+        Assert.NotNull(entry);
+        Assert.False(entry!.Value.GetProperty("supportsVision").GetBoolean());
+    }
+
+    /// <summary>GETs /api/config/models and finds an available model by name (case-insensitive).</summary>
+    private async Task<JsonElement?> FindAvailableModelAsync(string name)
+    {
+        var getResponse = await _client.GetAsync("/api/config/models", TestContext.Current.CancellationToken);
+        getResponse.EnsureSuccessStatusCode();
+        using var doc = await System.Text.Json.JsonDocument.ParseAsync(
+            await getResponse.Content.ReadAsStreamAsync(TestContext.Current.CancellationToken),
+            cancellationToken: TestContext.Current.CancellationToken);
+        if (!doc.RootElement.TryGetProperty("availableModels", out var arr) || arr.ValueKind != JsonValueKind.Array)
+            return null;
+        foreach (var e in arr.EnumerateArray())
+        {
+            if (e.TryGetProperty("name", out var n) &&
+                string.Equals(n.GetString(), name, StringComparison.OrdinalIgnoreCase))
+                return e.Clone();
+        }
+        return null;
+    }
 }
 
 /// <summary>

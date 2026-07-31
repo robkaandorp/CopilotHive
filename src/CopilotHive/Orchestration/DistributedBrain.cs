@@ -116,7 +116,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         var subAgentCatalog = _hiveConfig?.GetSubAgentModels() ?? [];
         _subAgentModels = subAgentCatalog.Count == 0
             ? null
-            : subAgentCatalog.Select(m => new SubAgentModelEntry(m.Name, m.ContextWindow, m.Description)).ToList();
+            : subAgentCatalog.Select(m => new SubAgentModelEntry(m.Name, m.ContextWindow, m.Description, m.SupportsVision ?? false)).ToList();
         _subAgentsEnabled = _subAgentModels is not null && _subAgentModels.Count > 0;
 
         var orchestratorInstructions = agentsManager?.GetAgentsMd(WorkerRole.Orchestrator) ?? "";
@@ -1062,4 +1062,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 }
 
 /// <summary>Immutable snapshot of a configured model available to Brain sub-agents.</summary>
-internal sealed record SubAgentModelEntry(string Name, int? ContextWindow, string? Description);
+/// <param name="Name">Model identifier.</param>
+/// <param name="ContextWindow">Context window in tokens, or <c>null</c> when unknown.</param>
+/// <param name="Description">Human-readable description, or <c>null</c> when unset.</param>
+/// <param name="SupportsVision">Informational flag: whether the model accepts image input. Resolved from the nullable config flag (null → false).</param>
+internal sealed record SubAgentModelEntry(string Name, int? ContextWindow, string? Description, bool SupportsVision = false);

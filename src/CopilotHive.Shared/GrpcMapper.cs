@@ -57,6 +57,7 @@ public static class GrpcMapper
                     Id = m.Id,
                     ContextWindow = (m.ContextWindow is int cw && cw > 0) ? cw : 0,
                     Description = m.Description ?? "",
+                    SupportsVision = m.SupportsVision,
                 });
             }
         }
@@ -170,6 +171,7 @@ public static class GrpcMapper
                     Id = m.Id,
                     ContextWindow = m.ContextWindow > 0 ? m.ContextWindow : null,
                     Description = m.Description ?? "",
+                    SupportsVision = m.SupportsVision,
                 })],
         };
     }

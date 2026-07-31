@@ -209,7 +209,20 @@ public sealed class ConfigModelService
     /// <param name="reasoningEffort">Optional default reasoning effort.</param>
     /// <param name="description">Optional human-readable description.</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task AddAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
+    public Task AddAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
+        => AddAvailableModelAsync(name, contextWindow, reasoningEffort, description, supportsVision: null, ct);
+
+    /// <summary>
+    /// Adds a model to the available_models list, including the informational vision flag.
+    /// Throws <see cref="InvalidOperationException"/> if a model with the same name already exists.
+    /// </summary>
+    /// <param name="name">Model name.</param>
+    /// <param name="contextWindow">Optional context window in tokens.</param>
+    /// <param name="reasoningEffort">Optional default reasoning effort.</param>
+    /// <param name="description">Optional human-readable description.</param>
+    /// <param name="supportsVision">Vision flag: <c>true</c>, <c>false</c>, or <c>null</c> for unset.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task AddAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description, bool? supportsVision, CancellationToken ct = default)
     {
         _config.Models ??= new ModelsConfig();
         _config.Models.AvailableModels ??= new List<ModelEntry>();
@@ -226,7 +239,8 @@ public sealed class ConfigModelService
             Name = name,
             ContextWindow = contextWindow,
             ReasoningEffort = effectiveReasoningEffort,
-            Description = description
+            Description = description,
+            SupportsVision = supportsVision
         });
 
         var message = $"chore: add available model '{name}'";
@@ -245,7 +259,20 @@ public sealed class ConfigModelService
     /// <param name="reasoningEffort">New reasoning effort (null clears it).</param>
     /// <param name="description">New description (null clears it).</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task UpdateAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
+    public Task UpdateAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
+        => UpdateAvailableModelAsync(name, contextWindow, reasoningEffort, description, supportsVision: null, ct);
+
+    /// <summary>
+    /// Updates an existing model, including the informational vision flag.
+    /// Throws <see cref="InvalidOperationException"/> if the model is not found.
+    /// </summary>
+    /// <param name="name">Model name to update.</param>
+    /// <param name="contextWindow">New context window (null clears it).</param>
+    /// <param name="reasoningEffort">New reasoning effort (null clears it).</param>
+    /// <param name="description">New description (null clears it).</param>
+    /// <param name="supportsVision">Vision flag: <c>true</c>, <c>false</c>, or <c>null</c> to clear/unset.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task UpdateAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description, bool? supportsVision, CancellationToken ct = default)
     {
         var model = _config.Models?.AvailableModels?
             .FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
@@ -255,6 +282,7 @@ public sealed class ConfigModelService
         model.ContextWindow = contextWindow;
         model.ReasoningEffort = reasoningEffort;
         model.Description = description;
+        model.SupportsVision = supportsVision;
 
         var message = $"chore: update available model '{name}'";
         _logger.LogInformation("Updating available model: {Name}", name);
@@ -294,7 +322,20 @@ public sealed class ConfigModelService
     /// <param name="reasoningEffort">Optional default reasoning effort.</param>
     /// <param name="description">Optional human-readable description.</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task AddSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
+    public Task AddSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
+        => AddSubAgentModelAsync(name, contextWindow, reasoningEffort, description, supportsVision: null, ct);
+
+    /// <summary>
+    /// Adds a model to the sub_agent_models curated list, including the informational vision flag.
+    /// Throws <see cref="InvalidOperationException"/> if a model with the same name already exists.
+    /// </summary>
+    /// <param name="name">Model name.</param>
+    /// <param name="contextWindow">Optional context window in tokens.</param>
+    /// <param name="reasoningEffort">Optional default reasoning effort.</param>
+    /// <param name="description">Optional human-readable description.</param>
+    /// <param name="supportsVision">Vision flag: <c>true</c>, <c>false</c>, or <c>null</c> for unset (inherit).</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task AddSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description, bool? supportsVision, CancellationToken ct = default)
     {
         _config.Models ??= new ModelsConfig();
         _config.Models.SubAgentModels ??= new List<ModelEntry>();
@@ -311,7 +352,8 @@ public sealed class ConfigModelService
             Name = name,
             ContextWindow = contextWindow,
             ReasoningEffort = effectiveReasoningEffort,
-            Description = description
+            Description = description,
+            SupportsVision = supportsVision
         });
 
         var message = $"chore: add sub-agent model '{name}'";
@@ -329,7 +371,20 @@ public sealed class ConfigModelService
     /// <param name="reasoningEffort">New reasoning effort (null clears it).</param>
     /// <param name="description">New description (null clears it).</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task UpdateSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
+    public Task UpdateSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
+        => UpdateSubAgentModelAsync(name, contextWindow, reasoningEffort, description, supportsVision: null, ct);
+
+    /// <summary>
+    /// Updates an existing sub-agent model, including the informational vision flag.
+    /// Throws <see cref="InvalidOperationException"/> if not found.
+    /// </summary>
+    /// <param name="name">Model name to update.</param>
+    /// <param name="contextWindow">New context window (null clears it).</param>
+    /// <param name="reasoningEffort">New reasoning effort (null clears it).</param>
+    /// <param name="description">New description (null clears it).</param>
+    /// <param name="supportsVision">Vision flag: <c>true</c>, <c>false</c>, or <c>null</c> to clear/unset (inherit).</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task UpdateSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description, bool? supportsVision, CancellationToken ct = default)
     {
         var model = _config.Models?.SubAgentModels?
             .FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
@@ -339,6 +394,7 @@ public sealed class ConfigModelService
         model.ContextWindow = contextWindow;
         model.ReasoningEffort = reasoningEffort;
         model.Description = description;
+        model.SupportsVision = supportsVision;
 
         var message = $"chore: update sub-agent model '{name}'";
         _logger.LogInformation("Updating sub-agent model: {Name}", name);

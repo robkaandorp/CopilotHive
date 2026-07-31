@@ -3,13 +3,14 @@ using System.Xml.Linq;
 namespace CopilotHive.Tests.Orchestration;
 
 /// <summary>
-/// Verifies that the SharpCoder package reference is pinned to 0.14.0, which is required for the
-/// agent-level <c>CodingAgent.SubAgentChanged</c> event used by the sub-agent panel.
+/// Verifies that the SharpCoder package reference is pinned to 0.15.1, which is required for the
+/// agent-level <c>CodingAgent.SubAgentChanged</c> event used by the sub-agent panel and for the
+/// <c>SubAgentModelInfo</c> overload carrying the informational <c>supportsVision</c> flag.
 /// </summary>
 public sealed class SharpCoderPackageVersionTests
 {
     [Fact]
-    public void SharpCoder_PackageReference_IsVersion0_14_0()
+    public void SharpCoder_PackageReference_IsVersion0_15_1()
     {
         // Walk up from the test bin directory to the repository root.
         var repoRoot = Path.GetFullPath(
@@ -27,6 +28,6 @@ public sealed class SharpCoderPackageVersionTests
 
         Assert.NotNull(sharpCoder);
         var version = sharpCoder!.Attribute("Version")?.Value;
-        Assert.Equal("0.14.0", version);
+        Assert.Equal("0.15.1", version);
     }
 }

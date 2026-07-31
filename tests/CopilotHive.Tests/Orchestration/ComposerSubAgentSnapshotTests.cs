@@ -152,4 +152,108 @@ public sealed class ComposerSubAgentSnapshotTests : IDisposable
         // ContextWindow inherited from the matching available_models entry via GetSubAgentModels merge
         Assert.Equal(976000, entry.ContextWindow);
     }
+
+    /// <summary>
+    /// Removal-proof guard for the construction-time deep copy: dropping
+    /// <c>SupportsVision = m.SupportsVision</c> from the <see cref="ModelEntry"/> copy in
+    /// <c>Composer</c> leaves the snapshot entry at <c>null</c>, so this assertion fails.
+    /// Without it the Composer silently reported <c>supportsVision: false</c> to
+    /// <c>SubAgentModelInfo</c> even when the config explicitly set <c>supports_vision: true</c>.
+    /// </summary>
+    [Fact]
+    public async Task Composer_SubAgentSnapshot_CopiesSupportsVisionTrue()
+    {
+        var hiveConfig = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                SubAgentModels = [new ModelEntry { Name = "vision-model", SupportsVision = true }],
+            }
+        };
+
+        var repoManager = new Mock<IBrainRepoManager>();
+        repoManager.SetupGet(r => r.WorkDirectory).Returns(Path.GetTempPath());
+
+        await using var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            repoManager: repoManager.Object,
+            stateDir: Path.GetTempPath(),
+            hiveConfig: hiveConfig,
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+        var entry = Assert.Single(GetSnapshot(composer));
+        Assert.Equal("vision-model", entry.Name);
+        Assert.NotNull(entry.SupportsVision);
+        Assert.True(entry.SupportsVision);
+    }
+
+    /// <summary>
+    /// An explicit <c>supports_vision: false</c> on a curated entry must survive the snapshot as
+    /// <c>false</c> — never collapsed to <c>null</c> — so it keeps overriding an inherited
+    /// <c>true</c> from the matching available_models entry.
+    /// </summary>
+    [Fact]
+    public async Task Composer_SubAgentSnapshot_CopiesExplicitSupportsVisionFalse_OverridingAvailable()
+    {
+        var hiveConfig = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "shared-model", SupportsVision = true }],
+                SubAgentModels = [new ModelEntry { Name = "shared-model", SupportsVision = false }],
+            }
+        };
+
+        var repoManager = new Mock<IBrainRepoManager>();
+        repoManager.SetupGet(r => r.WorkDirectory).Returns(Path.GetTempPath());
+
+        await using var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            repoManager: repoManager.Object,
+            stateDir: Path.GetTempPath(),
+            hiveConfig: hiveConfig,
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+        var entry = Assert.Single(GetSnapshot(composer));
+        Assert.NotNull(entry.SupportsVision);
+        Assert.False(entry.SupportsVision);
+    }
+
+    /// <summary>
+    /// A curated entry that leaves <c>supports_vision</c> unset inherits the flag from the
+    /// matching available_models entry through the <c>GetSubAgentModels</c> merge, and the
+    /// inherited <c>true</c> must survive the Composer's deep copy.
+    /// </summary>
+    [Fact]
+    public async Task Composer_SubAgentSnapshot_InheritsSupportsVisionFromAvailableModel()
+    {
+        var hiveConfig = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "shared-model", SupportsVision = true }],
+                SubAgentModels = [new ModelEntry { Name = "shared-model" }],
+            }
+        };
+
+        var repoManager = new Mock<IBrainRepoManager>();
+        repoManager.SetupGet(r => r.WorkDirectory).Returns(Path.GetTempPath());
+
+        await using var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            repoManager: repoManager.Object,
+            stateDir: Path.GetTempPath(),
+            hiveConfig: hiveConfig,
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+        var entry = Assert.Single(GetSnapshot(composer));
+        Assert.NotNull(entry.SupportsVision);
+        Assert.True(entry.SupportsVision);
+    }
 }

@@ -128,6 +128,55 @@ public sealed class SharpCoderRunnerSubAgentTests
         }
     }
 
+    // ── SupportsVision mapping (non-nullable source → direct) ────────────────
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task BuildSubAgentOptions_MapsSupportsVisionDirectly(bool vision)
+    {
+        var runner = CreateRunnerWithStub();
+        try
+        {
+            runner.SetSubAgentModels(
+            [
+                new SubAgentModelDto { Id = "model-a", ContextWindow = 200_000, SupportsVision = vision },
+            ]);
+
+            var result = runner.BuildSubAgentOptions();
+
+            Assert.NotNull(result);
+            Assert.Equal(vision, result!.AvailableModels[0].SupportsVision);
+        }
+        finally
+        {
+            await runner.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task BuildSubAgentOptions_SupportsVisionDefaultsToFalseWhenUnset()
+    {
+        var runner = CreateRunnerWithStub();
+        try
+        {
+            // SubAgentModelDto.SupportsVision defaults to false (non-nullable, default false)
+            runner.SetSubAgentModels(
+            [
+                new SubAgentModelDto { Id = "model-a", ContextWindow = 200_000 },
+            ]);
+
+            var result = runner.BuildSubAgentOptions();
+
+            Assert.NotNull(result);
+            Assert.False(result!.AvailableModels[0].SupportsVision);
+        }
+        finally
+        {
+            await runner.DisposeAsync();
+        }
+    }
+
     // ── 2. ClientFactory delegation tests ──────────────────────────────────────
 
     [Fact]

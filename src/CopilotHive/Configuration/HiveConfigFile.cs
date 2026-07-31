@@ -186,7 +186,8 @@ public sealed class HiveConfigFile
                 Name = entry.Name,
                 ContextWindow = entry.ContextWindow ?? available?.ContextWindow,
                 ReasoningEffort = entry.ReasoningEffort ?? available?.ReasoningEffort,
-                Description = entry.Description ?? available?.Description
+                Description = entry.Description ?? available?.Description,
+                SupportsVision = entry.SupportsVision ?? available?.SupportsVision
             });
         }
 
@@ -261,14 +262,16 @@ public sealed class HiveConfigFile
                     Name = m.Name,
                     ContextWindow = m.ContextWindow,
                     ReasoningEffort = m.ReasoningEffort,
-                    Description = m.Description
+                    Description = m.Description,
+                    SupportsVision = m.SupportsVision
                 }).ToList(),
                 SubAgentModels = source.Models.SubAgentModels?.Select(m => new ModelEntry
                 {
                     Name = m.Name,
                     ContextWindow = m.ContextWindow,
                     ReasoningEffort = m.ReasoningEffort,
-                    Description = m.Description
+                    Description = m.Description,
+                    SupportsVision = m.SupportsVision
                 }).ToList()
             };
         }

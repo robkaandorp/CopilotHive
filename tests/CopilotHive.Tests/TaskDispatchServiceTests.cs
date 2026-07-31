@@ -1040,6 +1040,145 @@ public sealed class TaskDispatchServiceTests
         Assert.Contains("976K context", entry.Description);
     }
 
+    // ── SupportsVision boundary (null → false resolution) ────────────────────
+
+    [Fact]
+    public async Task DispatchToRole_SupportsVisionTrue_FlowsToDtoAsTrue()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels = [new ModelEntry { Name = "model-a", ContextWindow = 200_000, SupportsVision = true }],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.True(Assert.Single(capturedTask!.SubAgentModels).SupportsVision);
+    }
+
+    [Fact]
+    public async Task DispatchToRole_SupportsVisionFalse_FlowsToDtoAsFalse()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels = [new ModelEntry { Name = "model-a", ContextWindow = 200_000, SupportsVision = false }],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.False(Assert.Single(capturedTask!.SubAgentModels).SupportsVision);
+    }
+
+    [Fact]
+    public async Task DispatchToRole_SupportsVisionNull_ResolvesToFalseInDto()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels = [new ModelEntry { Name = "model-a", ContextWindow = 200_000, SupportsVision = null }],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        // null merged ModelEntry.SupportsVision must resolve to false at the DTO boundary
+        Assert.False(Assert.Single(capturedTask!.SubAgentModels).SupportsVision);
+    }
+
+    [Fact]
+    public async Task DispatchToRole_CuratedSupportsVisionTrueOverridesAvailableFalse()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels = [new ModelEntry { Name = "m", ContextWindow = 200_000, SupportsVision = false }],
+            SubAgentModels = [new ModelEntry { Name = "m", SupportsVision = true }],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.True(Assert.Single(capturedTask!.SubAgentModels).SupportsVision);
+    }
+
+    [Fact]
+    public async Task DispatchToRole_CuratedUnsetInheritsAvailableTrue()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels = [new ModelEntry { Name = "m", ContextWindow = 200_000, SupportsVision = true }],
+            SubAgentModels = [new ModelEntry { Name = "m", SupportsVision = null }],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.True(Assert.Single(capturedTask!.SubAgentModels).SupportsVision);
+    }
+
+    [Fact]
+    public async Task DispatchToRole_CuratedUnsetAndAvailableUnset_ResolvesToFalseInDto()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels = [new ModelEntry { Name = "m", ContextWindow = 200_000, SupportsVision = null }],
+            SubAgentModels = [new ModelEntry { Name = "m", SupportsVision = null }],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        // The merge preserves null, but the DTO boundary resolves it to false
+        Assert.False(Assert.Single(capturedTask!.SubAgentModels).SupportsVision);
+    }
+
     /// <summary>
     /// Minimal <see cref="IGoalSource"/> that returns a single pre-configured goal.
     /// </summary>

@@ -118,7 +118,7 @@ public sealed class SharpCoderRunner : IAgentRunner
         foreach (var m in _subAgentModels)
         {
             if (!string.IsNullOrWhiteSpace(m.Id))
-                subOpts.AvailableModels.Add(new SubAgentModelInfo(m.Id, m.Description, m.ContextWindow));
+                subOpts.AvailableModels.Add(new SubAgentModelInfo(m.Id, m.Description, m.ContextWindow, supportsVision: m.SupportsVision));
         }
 
         // ClientFactory delegates to the injectable seam, falling back to CreateChatClient.

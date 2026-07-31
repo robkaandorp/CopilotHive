@@ -92,6 +92,7 @@ message SubAgentModel {
   string id = 1;
   int32 context_window = 2;
   string description = 3;
+  bool supports_vision = 4;
 }
 
 // === Session Management ===

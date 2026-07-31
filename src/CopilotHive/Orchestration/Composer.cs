@@ -337,7 +337,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 Name = m.Name,
                 ContextWindow = m.ContextWindow,
                 ReasoningEffort = m.ReasoningEffort,
-                Description = m.Description
+                Description = m.Description,
+                SupportsVision = m.SupportsVision
             })
             .ToList()
             .AsReadOnly();

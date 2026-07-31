@@ -18,6 +18,13 @@ public sealed class ModelEntry
 
     /// <summary>Human-readable description of the model's strengths/cost/speed for sub-agent selection.</summary>
     public string? Description { get; set; }
+
+    /// <summary>
+    /// Informational flag indicating whether the model accepts image input (vision).
+    /// null = unset (inherit from the matching available model, or default to false at the catalog boundary).
+    /// YAML key: <c>supports_vision</c>.
+    /// </summary>
+    public bool? SupportsVision { get; set; }
 }
 
 /// <summary>
