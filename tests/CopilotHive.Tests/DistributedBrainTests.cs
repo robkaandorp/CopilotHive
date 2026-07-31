@@ -215,17 +215,98 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public void BuildIterationPlanFromToolCall_InvalidPhaseNames_Skipped()
+    public void BuildIterationPlanFromToolCall_UnknownPhaseName_SurfacedAsUnrecognized_NotSilentlyDropped()
     {
         var toolCall = new DistributedBrain.IterationPlanResult(
-            Phases: ["coding", "invalid_phase", "testing"],
+            Phases: ["coding", "GarbageName", "testing"],
             PhaseInstructions: "{}",
             Reason: "test",
             ModelTiers: null);
+
         var plan = BrainPlanParser.BuildIterationPlanFromToolCall(toolCall);
-        Assert.Equal(2, plan.Phases.Count);
-        Assert.Equal(GoalPhase.Coding, plan.Phases[0]);
-        Assert.Equal(GoalPhase.Testing, plan.Phases[1]);
+
+        // The typo is NOT silently dropped into a valid-looking [coding, testing] plan.
+        Assert.Equal(["GarbageName"], plan.UnrecognizedPhases);
+        Assert.Equal([GoalPhase.Coding, GoalPhase.Testing], plan.Phases);
+    }
+
+    [Theory]
+    [InlineData("Planning")]
+    [InlineData("Done")]
+    [InlineData("Failed")]
+    public void BuildIterationPlanFromToolCall_NonExecutableLifecyclePhase_SurfacedAsUnrecognized(string phaseName)
+    {
+        var toolCall = new DistributedBrain.IterationPlanResult(
+            Phases: ["coding", phaseName, "merging"],
+            PhaseInstructions: "{}",
+            Reason: "test",
+            ModelTiers: null);
+
+        var plan = BrainPlanParser.BuildIterationPlanFromToolCall(toolCall);
+
+        Assert.Equal([phaseName], plan.UnrecognizedPhases);
+        Assert.Equal([GoalPhase.Coding, GoalPhase.Merging], plan.Phases);
+    }
+
+    [Theory]
+    [InlineData("1")]
+    [InlineData("0")]
+    [InlineData("7")]
+    public void BuildIterationPlanFromToolCall_NumericPhaseToken_IsUnrecognized(string numeric)
+    {
+        // Name-based membership, NOT Enum.TryParse — which would accept "1" as GoalPhase.Coding.
+        var toolCall = new DistributedBrain.IterationPlanResult(
+            Phases: ["coding", numeric],
+            PhaseInstructions: "{}",
+            Reason: "test",
+            ModelTiers: null);
+
+        var plan = BrainPlanParser.BuildIterationPlanFromToolCall(toolCall);
+
+        Assert.Equal([numeric], plan.UnrecognizedPhases);
+        Assert.Equal([GoalPhase.Coding], plan.Phases);
+    }
+
+    [Fact]
+    public void BuildIterationPlanFromToolCall_AllSixValidPhases_ParseUnchanged()
+    {
+        var toolCall = new DistributedBrain.IterationPlanResult(
+            Phases: ["coding", "docwriting", "testing", "review", "improve", "merging"],
+            PhaseInstructions: "{}",
+            Reason: "full",
+            ModelTiers: null);
+
+        var plan = BrainPlanParser.BuildIterationPlanFromToolCall(toolCall);
+
+        Assert.Empty(plan.UnrecognizedPhases);
+        Assert.Equal(
+            [GoalPhase.Coding, GoalPhase.DocWriting, GoalPhase.Testing,
+             GoalPhase.Review, GoalPhase.Improve, GoalPhase.Merging],
+            plan.Phases);
+    }
+
+    [Fact]
+    public void BuildIterationPlanFromToolCall_OccurrenceSuffixes_NormalizeButInstructionKeysStayIntact()
+    {
+        var toolCall = new DistributedBrain.IterationPlanResult(
+            Phases: ["coding-1", "testing-1", "coding-2", "testing-2", "review", "merging"],
+            PhaseInstructions: """{"coding-1":"first round","coding-2":"second round"}""",
+            Reason: "multi-round",
+            ModelTiers: null);
+
+        var plan = BrainPlanParser.BuildIterationPlanFromToolCall(toolCall);
+
+        Assert.Empty(plan.UnrecognizedPhases);
+        Assert.Equal(
+            [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Coding,
+             GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
+            plan.Phases);
+
+        // Indexed instruction keys survive verbatim so GetPhaseInstruction can resolve them.
+        Assert.Equal("first round", plan.PhaseInstructions["coding-1"]);
+        Assert.Equal("second round", plan.PhaseInstructions["coding-2"]);
+        Assert.Equal("first round", plan.GetPhaseInstruction(GoalPhase.Coding, 1));
+        Assert.Equal("second round", plan.GetPhaseInstruction(GoalPhase.Coding, 2));
     }
 
     // -- FormatContextUsageMessage Tests --

@@ -593,8 +593,21 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 {
                     var plan = BrainPlanParser.BuildIterationPlanFromToolCall(iterationPlanResult);
 
+                    // Unrecognized phase names are never silently dropped: they are rejected here,
+                    // inside the bounded replan loop, with an actionable reason naming the tokens.
+                    var rejectionReasons = new List<string>();
+                    if (plan.UnrecognizedPhases.Count > 0)
+                    {
+                        rejectionReasons.Add(
+                            $"Unrecognized phase names: {string.Join(", ", plan.UnrecognizedPhases)}. "
+                            + "Valid phases: coding, testing, docwriting, review, improve, merging.");
+                    }
+
                     var validation = Services.IterationPlanValidator.ValidatePlanStrict(plan);
-                    if (validation.IsValid)
+                    if (!validation.IsValid)
+                        rejectionReasons.AddRange(validation.RejectionReasons);
+
+                    if (rejectionReasons.Count == 0)
                     {
                         _logger.LogInformation(
                             "Brain planned iteration {Iteration} for goal {GoalId}: [{Phases}] — {Reason}",
@@ -607,12 +620,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                         "Brain submitted an invalid iteration plan for goal {GoalId} (attempt {Attempt}/{Max}): [{Phases}]. Reasons: {Reasons}",
                         pipeline.GoalId, attempt, maxToolAttempts,
                         string.Join(", ", plan.Phases),
-                        string.Join(" | ", validation.RejectionReasons));
+                        string.Join(" | ", rejectionReasons));
 
-                    lastRejectionReasons = validation.RejectionReasons;
+                    lastRejectionReasons = rejectionReasons;
                     currentPrompt =
                         "Your previous plan was rejected because:\n"
-                        + string.Join("\n", validation.RejectionReasons)
+                        + string.Join("\n", rejectionReasons)
                         + "\n\nSubmit a corrected plan by calling the report_iteration_plan tool now.";
                     continue;
                 }
@@ -903,6 +916,10 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         static IterationPlanResult MapPlan(PlanToolResult plan)
         {
+            // Only structural errors (model tiers, missing reason/phases) throw here.
+            // Unrecognized phase NAMES are intentionally NOT rejected at this point: they are
+            // carried through parsing as IterationPlan.UnrecognizedPhases and rejected inside
+            // PlanIterationAsync's bounded replan loop, so the Brain can fix and resubmit.
             var (valid, error) = BrainTools.ValidateIterationPlan(
                 plan.Phases, plan.PhaseInstructions, plan.Reason, plan.ModelTiers);
             if (!valid)

@@ -2136,4 +2136,181 @@ public class DistributedBrainShadowTests
         }
         finally { DeleteDir(dir); }
     }
+
+    // ── unrecognized phase names are rejected in-loop, never silently dropped ────
+
+    /// <summary>
+    /// An unrecognized phase name does NOT throw out of the actor mapping — it is rejected
+    /// inside <c>PlanIterationAsync</c>'s bounded loop with an actionable reason naming the
+    /// bad token, and a valid replacement submitted within budget is accepted.
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_UnrecognizedPhaseName_RejectedInLoopThenValidReplanAccepted()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            SequencedPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new SequencedPlanStubClient(
+                    ["coding", "GarbageName", "testing", "review", "merging"],  // unrecognized token
+                    ["coding", "testing", "review", "merging"]));               // valid
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-unrecognized-1", TestContext.Current.CancellationToken);
+
+                var result = await brain.PlanIterationAsync(
+                    CreatePipeline("goal-unrecognized-1"), null, TestContext.Current.CancellationToken);
+
+                // No early throw: planning completed and the corrected plan was accepted.
+                Assert.False(result.IsFailed);
+                Assert.False(result.IsEscalation);
+                Assert.NotNull(result.Plan);
+                Assert.Equal(
+                    [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
+                    result.Plan!.Phases);
+                Assert.Empty(result.Plan.UnrecognizedPhases);
+
+                Assert.NotNull(stub);
+                Assert.Equal(2, stub!.ToolCallCount);
+
+                // The rejection reason fed back to the Brain names the offending token.
+                var nudge = stub.ObservedUserPrompts.FirstOrDefault(p => p.Contains("rejected because"));
+                Assert.NotNull(nudge);
+                Assert.Contains("Unrecognized phase names: GarbageName", nudge!);
+                Assert.Contains("coding, testing, docwriting, review, improve, merging", nudge!);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    /// <summary>
+    /// When the Brain keeps submitting unrecognized phase names, the goal fails after the
+    /// bounded attempt budget and the failure reason still names the bad token.
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_AlwaysUnrecognizedPhase_FailsWithReasonNamingTheToken()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            SequencedPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new SequencedPlanStubClient(
+                    ["coding", "GarbageName", "testing", "review", "merging"]));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-unrecognized-2", TestContext.Current.CancellationToken);
+
+                var result = await brain.PlanIterationAsync(
+                    CreatePipeline("goal-unrecognized-2"), null, TestContext.Current.CancellationToken);
+
+                Assert.True(result.IsFailed);
+                Assert.Null(result.Plan);
+                Assert.StartsWith(
+                    "Brain failed to produce a valid iteration plan after 3 attempts. Last rejection: ",
+                    result.FailureReason);
+                Assert.Contains("GarbageName", result.FailureReason);
+
+                Assert.NotNull(stub);
+                Assert.Equal(3, stub!.ToolCallCount);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    /// <summary>
+    /// A numeric-string phase token (e.g. "1") is rejected as unrecognized inside the bounded
+    /// loop — it is NOT silently mapped to a GoalPhase via Enum.TryParse. The rejection reason
+    /// names the offending token, and a valid replacement is accepted within budget.
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_NumericPhaseToken_RejectedAsUnrecognizedThenValidAccepted()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            SequencedPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new SequencedPlanStubClient(
+                    ["coding", "1", "testing", "review", "merging"],  // numeric token — not a phase name
+                    ["coding", "testing", "review", "merging"]));     // valid replacement
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-numeric-1", TestContext.Current.CancellationToken);
+
+                var result = await brain.PlanIterationAsync(
+                    CreatePipeline("goal-numeric-1"), null, TestContext.Current.CancellationToken);
+
+                // No early throw: the numeric token was rejected in-loop, valid plan accepted.
+                Assert.False(result.IsFailed);
+                Assert.False(result.IsEscalation);
+                Assert.NotNull(result.Plan);
+                Assert.Equal(
+                    [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
+                    result.Plan!.Phases);
+                Assert.Empty(result.Plan.UnrecognizedPhases);
+
+                Assert.NotNull(stub);
+                Assert.Equal(2, stub!.ToolCallCount);
+
+                // The rejection reason fed back to the Brain names the numeric token.
+                var nudge = stub.ObservedUserPrompts.FirstOrDefault(p => p.Contains("rejected because"));
+                Assert.NotNull(nudge);
+                Assert.Contains("Unrecognized phase names: 1", nudge!);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    /// <summary>
+    /// Lifecycle phase names (Planning/Done/Failed) are rejected as unrecognized inside the
+    /// bounded loop — they are not executable phases. The rejection reason names the offending
+    /// token, and a valid replacement is accepted within budget.
+    /// </summary>
+    [Theory]
+    [InlineData("Planning")]
+    [InlineData("Done")]
+    [InlineData("Failed")]
+    public async Task PlanIterationAsync_LifecyclePhaseName_RejectedAsUnrecognizedThenValidAccepted(string lifecyclePhase)
+    {
+        var dir = NewTempDir();
+        try
+        {
+            SequencedPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new SequencedPlanStubClient(
+                    ["coding", lifecyclePhase, "testing", "review", "merging"],  // lifecycle token
+                    ["coding", "testing", "review", "merging"]));                  // valid replacement
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync($"goal-lifecycle-{lifecyclePhase}", TestContext.Current.CancellationToken);
+
+                var result = await brain.PlanIterationAsync(
+                    CreatePipeline($"goal-lifecycle-{lifecyclePhase}"), null, TestContext.Current.CancellationToken);
+
+                // No early throw: the lifecycle token was rejected in-loop, valid plan accepted.
+                Assert.False(result.IsFailed);
+                Assert.False(result.IsEscalation);
+                Assert.NotNull(result.Plan);
+                Assert.Equal(
+                    [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
+                    result.Plan!.Phases);
+                Assert.Empty(result.Plan.UnrecognizedPhases);
+
+                Assert.NotNull(stub);
+                Assert.Equal(2, stub!.ToolCallCount);
+
+                // The rejection reason fed back to the Brain names the lifecycle token.
+                var nudge = stub.ObservedUserPrompts.FirstOrDefault(p => p.Contains("rejected because"));
+                Assert.NotNull(nudge);
+                Assert.Contains(lifecyclePhase, nudge!);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
 }

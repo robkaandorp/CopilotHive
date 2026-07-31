@@ -33,20 +33,21 @@ internal static class BrainTools
     }
 
     /// <summary>
-    /// Validates an iteration plan reported by the Brain LLM (phases, reason and optional model tiers).
+    /// Validates the structural parts of an iteration plan reported by the Brain LLM
+    /// (non-empty phases array, reason and optional model tiers).
+    /// Phase-name membership is deliberately NOT checked here: unrecognized phase names are
+    /// surfaced through <see cref="Services.IterationPlan.UnrecognizedPhases"/> and rejected
+    /// inside the bounded replan loop so the Brain gets an actionable "fix and resubmit" reason
+    /// instead of a hard failure during plan mapping.
     /// </summary>
     /// <returns><c>(true, null)</c> when valid, otherwise <c>(false, error)</c>.</returns>
     internal static (bool Valid, string? Error) ValidateIterationPlan(
         string[] phases, string phaseInstructions, string reason, string? modelTiers)
     {
-        var validPhases = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "coding", "testing", "docwriting", "review", "improve", "merging" };
         var tierablePhases = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { "coding", "testing", "docwriting", "review", "improve" };
         var validTiers = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { "standard", "premium" };
-
-        var invalidPhases = phases?.Where(p => !validPhases.Contains(StripOccurrenceSuffix(p))).ToList() ?? [];
 
         // Validate model_tiers if provided
         Dictionary<string, string>? parsedTiers = null;
@@ -76,8 +77,6 @@ internal static class BrainTools
 
         var error = Shared.ToolValidation.Check(
             (phases is { Length: > 0 }, "phases must be a non-empty array"),
-            (invalidPhases.Count == 0,
-                $"invalid phase names: {string.Join(", ", invalidPhases)}. Valid: {string.Join(", ", validPhases)}"),
             (!string.IsNullOrEmpty(reason), "reason is required"),
             (tierErrors.Count == 0, string.Join("; ", tierErrors)));
 

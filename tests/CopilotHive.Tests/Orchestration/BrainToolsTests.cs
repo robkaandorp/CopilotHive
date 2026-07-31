@@ -237,12 +237,29 @@ public class BrainToolsTests
     [Theory]
     [InlineData("coding-0")]
     [InlineData("foo-1")]
-    public void ValidateIterationPlan_InvalidSuffixes_AreRejected(string phase)
+    [InlineData("GarbageName")]
+    [InlineData("Planning")]
+    [InlineData("1")]
+    public void ValidateIterationPlan_UnknownPhaseNames_AreNotRejectedHere(string phase)
     {
+        // Phase-name membership moved out of this tool validator: unknown names are surfaced
+        // via IterationPlan.UnrecognizedPhases and rejected inside PlanIterationAsync's loop.
         var result = BrainTools.ValidateIterationPlan([phase], "", "reason", null);
-        Assert.False(result.Valid);
-        Assert.Contains(phase, result.Error);
-        Assert.Contains("coding, testing, docwriting, review, improve, merging", result.Error);
+        Assert.True(result.Valid);
+        Assert.Null(result.Error);
+    }
+
+    [Fact]
+    public void ValidateIterationPlan_UnknownPhaseName_DoesNotTriggerMapPlanEarlyThrow()
+    {
+        // MapPlan (DistributedBrain.ExecuteBrainViaActorAsync) throws only when this validator
+        // reports invalid. A previously-throwing unknown-phase submission now validates cleanly,
+        // so planning proceeds into the bounded replan loop instead of hard-crashing.
+        var result = BrainTools.ValidateIterationPlan(
+            ["coding", "GarbageName", "merging"], "{}", "reason", null);
+
+        Assert.True(result.Valid);
+        Assert.Null(result.Error);
     }
 
     [Fact]
@@ -278,5 +295,32 @@ public class BrainToolsTests
         var result = BrainTools.ValidateIterationPlan([], "", "reason", null);
         Assert.False(result.Valid);
         Assert.Contains("phases must be a non-empty array", result.Error);
+    }
+
+    [Fact]
+    public void ValidateIterationPlan_MissingReason_IsInvalid()
+    {
+        var result = BrainTools.ValidateIterationPlan(["coding", "merging"], "{}", "", null);
+        Assert.False(result.Valid);
+        Assert.Contains("reason is required", result.Error);
+    }
+
+    [Fact]
+    public void ValidateIterationPlan_InvalidTierValue_IsInvalid()
+    {
+        var tiers = System.Text.Json.JsonSerializer.Serialize(
+            new Dictionary<string, string> { ["coding"] = "turbo" });
+        var result = BrainTools.ValidateIterationPlan(["coding"], "", "reason", tiers);
+        Assert.False(result.Valid);
+        Assert.Contains("turbo", result.Error);
+        Assert.Contains("standard, premium", result.Error);
+    }
+
+    [Fact]
+    public void ValidateIterationPlan_MalformedTierJson_IsInvalid()
+    {
+        var result = BrainTools.ValidateIterationPlan(["coding"], "", "reason", "{not json");
+        Assert.False(result.Valid);
+        Assert.Contains("model_tiers must be valid JSON", result.Error);
     }
 }

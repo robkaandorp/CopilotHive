@@ -42,17 +42,35 @@ public static class BrainPlanParser
         return MapIterationPlan(dto);
     }
 
+    /// <summary>
+    /// The six executable phase names the Brain may submit, keyed case-insensitively.
+    /// Recognition is NAME-BASED on purpose: <c>Enum.TryParse&lt;GoalPhase&gt;</c> also accepts
+    /// numeric strings (e.g. "1"), which would silently map a garbage token onto a real phase.
+    /// </summary>
+    private static readonly Dictionary<string, GoalPhase> ExecutablePhaseNames =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["coding"] = GoalPhase.Coding,
+            ["testing"] = GoalPhase.Testing,
+            ["docwriting"] = GoalPhase.DocWriting,
+            ["review"] = GoalPhase.Review,
+            ["improve"] = GoalPhase.Improve,
+            ["merging"] = GoalPhase.Merging,
+        };
+
     internal static IterationPlan MapIterationPlan(IterationPlanDto dto)
     {
         var phases = new List<GoalPhase>();
+        var unrecognized = new List<string>();
         foreach (var name in dto.Phases)
         {
             var baseName = BrainTools.StripOccurrenceSuffix(name);
-            if (Enum.TryParse<GoalPhase>(baseName, ignoreCase: true, out var phase)
-                && phase is not (GoalPhase.Planning or GoalPhase.Done or GoalPhase.Failed))
-            {
+            if (ExecutablePhaseNames.TryGetValue(baseName, out var phase))
                 phases.Add(phase);
-            }
+            else
+                // Non-executable lifecycle names (planning/done/failed), numeric tokens and
+                // typos are all surfaced verbatim so validation can name them in its rejection.
+                unrecognized.Add(name);
         }
 
         var instructions = new Dictionary<string, string>();
@@ -82,6 +100,7 @@ public static class BrainPlanParser
             PhaseInstructions = instructions,
             PhaseTiers = phaseTiers,
             Reason = dto.Reason,
+            UnrecognizedPhases = unrecognized,
         };
     }
 

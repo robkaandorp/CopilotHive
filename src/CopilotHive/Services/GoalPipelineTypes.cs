@@ -77,6 +77,14 @@ public sealed class IterationPlan
     public string? Reason { get; init; }
 
     /// <summary>
+    /// Raw phase-name tokens submitted by the Brain that are not one of the six executable
+    /// phase names (coding, testing, docwriting, review, improve, merging).
+    /// The parser never silently drops them: they are carried here so plan validation can
+    /// reject the plan with an actionable reason naming the offending tokens.
+    /// </summary>
+    public List<string> UnrecognizedPhases { get; init; } = [];
+
+    /// <summary>
     /// Returns the instruction string for the given phase and occurrence index (1-based).
     /// Tries the indexed key first (e.g. "coding-2" for occurrence 2), then falls back
     /// to the bare key (e.g. "coding") for backward compatibility.
