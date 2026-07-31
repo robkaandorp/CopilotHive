@@ -199,31 +199,70 @@ internal sealed class ClarificationHandler
     /// <summary>
     /// Calls <see cref="IDistributedBrain.PlanIterationAsync"/> and handles any escalation
     /// by routing to the clarification pipeline. On successful clarification, retries planning
-    /// with the answer as additional context. On timeout, returns the default plan.
+    /// with the answer as additional context. Every failure path returns
+    /// <see cref="PlanResult.Failed(string)"/> — there is never a substituted default plan.
+    /// <see cref="OperationCanceledException"/> is NOT converted to a failure: it propagates
+    /// so shutdown is never mistaken for a planning failure.
     /// </summary>
-    public async Task<IterationPlan> ResolvePlanAsync(
+    /// <param name="pipeline">The goal pipeline being planned.</param>
+    /// <param name="additionalContext">Optional extra context for the planning prompt.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<PlanResult> ResolvePlanAsync(
         GoalPipeline pipeline, string? additionalContext, CancellationToken ct)
     {
         if (_brain is null)
-            return IterationPlan.Default();
+            return PlanResult.Failed("no brain available");
 
-        var result = await _brain.PlanIterationAsync(pipeline, additionalContext, ct);
+        PlanResult result;
+        try
+        {
+            result = await _brain.PlanIterationAsync(pipeline, additionalContext, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Brain planning threw for goal {GoalId}", pipeline.GoalId);
+            return PlanResult.Failed($"Planning failed: {ex.Message}");
+        }
 
         if (!result.IsEscalation)
-            return result.Plan ?? IterationPlan.Default();
+        {
+            if (result.IsFailed)
+                return result;
+
+            return result.Plan is not null
+                ? result
+                : PlanResult.Failed("brain returned success with no plan");
+        }
 
         // Brain needs clarification before planning
-        var answer = await RouteEscalationAsync(
-            pipeline,
-            result.EscalationQuestion ?? "Brain requested clarification during planning",
-            result.EscalationReason ?? string.Empty,
-            ct);
+        string answer;
+        try
+        {
+            answer = await RouteEscalationAsync(
+                pipeline,
+                result.EscalationQuestion ?? "Brain requested clarification during planning",
+                result.EscalationReason ?? string.Empty,
+                ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Planning escalation routing threw for goal {GoalId}", pipeline.GoalId);
+            return PlanResult.Failed($"Planning failed: {ex.Message}");
+        }
 
         if (answer == ClarificationQueueService.TimeoutFallbackMessage)
         {
             _logger.LogWarning(
-                "Brain planning escalation timed out for goal {GoalId} — using default plan", pipeline.GoalId);
-            return IterationPlan.Default();
+                "Brain planning escalation timed out for goal {GoalId} — failing planning", pipeline.GoalId);
+            return PlanResult.Failed("planning clarification timed out");
         }
 
         // Retry planning with the answer as additional context
@@ -233,8 +272,35 @@ internal sealed class ClarificationHandler
             ? $"{additionalContext}\n\n=== Clarification answer ===\n{answer}\n=== End clarification answer ==="
             : $"=== Clarification answer ===\n{answer}\n=== End clarification answer ===";
 
-        var retryResult = await _brain.PlanIterationAsync(pipeline, retryContext, ct);
-        return retryResult.Plan ?? IterationPlan.Default();
+        PlanResult retryResult;
+        try
+        {
+            retryResult = await _brain.PlanIterationAsync(pipeline, retryContext, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Brain re-planning threw for goal {GoalId}", pipeline.GoalId);
+            return PlanResult.Failed($"Planning failed: {ex.Message}");
+        }
+
+        // Bound the escalation loop: a second consecutive escalation is NOT routed again.
+        if (retryResult.IsEscalation)
+        {
+            _logger.LogWarning(
+                "Brain escalated again after clarification for goal {GoalId} — failing planning", pipeline.GoalId);
+            return PlanResult.Failed("planning escalation loop");
+        }
+
+        if (retryResult.IsFailed)
+            return retryResult;
+
+        return retryResult.Plan is not null
+            ? retryResult
+            : PlanResult.Failed("brain returned success with no plan after clarification");
     }
 
     /// <summary>

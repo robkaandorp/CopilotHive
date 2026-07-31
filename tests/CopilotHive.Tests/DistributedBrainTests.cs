@@ -409,15 +409,19 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task PlanIterationAsync_WithoutConnect_Throws()
+    public async Task PlanIterationAsync_WithoutConnect_ReturnsFailed()
     {
         var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
         var pipeline = CreatePipeline("g-plan", "Test plan");
 
-        // With per-goal contexts, methods require a connected Brain and no longer return a
-        // pre-connect default plan — they must throw InvalidOperationException instead.
-        await Assert.ThrowsAsync<InvalidOperationException>(
-            () => brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken));
+        // PlanIterationAsync must NEVER throw — every failure, including pre-connect misuse,
+        // surfaces as PlanResult.Failed so the goal fails with an explicit reason instead of
+        // silently receiving a default plan.
+        var result = await brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
+
+        Assert.True(result.IsFailed);
+        Assert.Null(result.Plan);
+        Assert.StartsWith("Planning failed:", result.FailureReason);
     }
 
     [Fact]

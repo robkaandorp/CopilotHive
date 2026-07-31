@@ -37,11 +37,13 @@ public sealed class BrainEscalationTests
         var (dispatcher, pipeline) = CreateDispatcher(planBrain, queue, router);
 
         // Act
-        var plan = await dispatcher.ResolvePlanAsync(pipeline, null, TestContext.Current.CancellationToken);
+        var planResult = await dispatcher.ResolvePlanAsync(pipeline, null, TestContext.Current.CancellationToken);
 
-        // Assert — second call should have received clarification context and returned a non-default plan marker
-        Assert.NotNull(plan);
-        Assert.False(plan.Phases.Count == 0);
+        // Assert — second call should have received clarification context and returned a valid plan
+        Assert.NotNull(planResult);
+        Assert.False(planResult.IsFailed);
+        Assert.NotNull(planResult.Plan);
+        Assert.NotEmpty(planResult.Plan!.Phases);
         // The retry context should have been passed through (fenced format)
         Assert.Contains(ComposerAnswer, planBrain.LastAdditionalContext ?? string.Empty);
         Assert.Contains("=== Clarification answer ===", planBrain.LastAdditionalContext ?? string.Empty);
@@ -50,10 +52,10 @@ public sealed class BrainEscalationTests
 
     /// <summary>
     /// When the Brain escalates during planning and the clarification times out,
-    /// <see cref="GoalDispatcher"/> falls back to <see cref="IterationPlan.Default"/>.
+    /// planning fails explicitly — no default plan is substituted.
     /// </summary>
     [Fact]
-    public async Task PlanIterationAsync_BrainEscalates_Timeout_FallsBackToDefaultPlan()
+    public async Task PlanIterationAsync_BrainEscalates_Timeout_ReturnsFailedPlanResult()
     {
         // Arrange
         var planBrain = new EscalatingPlanBrain(
@@ -65,12 +67,13 @@ public sealed class BrainEscalationTests
         var (dispatcher, pipeline) = CreateDispatcher(planBrain, queue, router);
 
         // Act — TimeoutRouter schedules MarkTimedOut after 200ms, which completes the TCS
-        // with the fallback message. ResolvePlanAsync maps that to IterationPlan.Default().
-        var plan = await dispatcher.ResolvePlanAsync(pipeline, null, TestContext.Current.CancellationToken);
+        // with the fallback message. ResolvePlanAsync maps that to PlanResult.Failed.
+        var planResult = await dispatcher.ResolvePlanAsync(pipeline, null, TestContext.Current.CancellationToken);
 
-        // Assert — should fall back to default plan
-        var defaultPhases = IterationPlan.Default().Phases;
-        Assert.Equal(defaultPhases, plan.Phases);
+        // Assert — planning fails explicitly with the timeout reason
+        Assert.True(planResult.IsFailed);
+        Assert.Equal("planning clarification timed out", planResult.FailureReason);
+        Assert.Null(planResult.Plan);
     }
 
     // ── CraftPromptAsync escalation — successful clarification ───────────

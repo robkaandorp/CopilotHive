@@ -26,16 +26,24 @@ public record BrainResponse(bool IsEscalation, string? Text, string? EscalationQ
 
 /// <summary>
 /// Discriminated result returned by <see cref="IDistributedBrain.PlanIterationAsync"/>.
-/// Either carries an <see cref="IterationPlan"/> or signals that the Brain needs
-/// a clarification answered before it can plan.
+/// Carries one of three outcomes: a valid <see cref="IterationPlan"/> (<see cref="Success"/>),
+/// a clarification request that must be answered before planning (<see cref="Escalated"/>),
+/// or an explicit planning failure with a reason (<see cref="Failed"/>).
+/// There is no implicit fallback plan — a failure must fail the goal.
 /// </summary>
 public sealed class PlanResult
 {
     /// <summary>When <c>true</c>, the Brain is requesting clarification before planning.</summary>
     public bool IsEscalation { get; private init; }
 
+    /// <summary>When <c>true</c>, planning failed and <see cref="FailureReason"/> explains why.</summary>
+    public bool IsFailed { get; private init; }
+
     /// <summary>The iteration plan, populated when <see cref="IsEscalation"/> is <c>false</c>.</summary>
     public IterationPlan? Plan { get; private init; }
+
+    /// <summary>The reason planning failed; populated when <see cref="IsFailed"/> is <c>true</c>.</summary>
+    public string? FailureReason { get; private init; }
 
     /// <summary>The question to forward to the Composer; populated when <see cref="IsEscalation"/> is <c>true</c>.</summary>
     public string? EscalationQuestion { get; private init; }
@@ -52,6 +60,11 @@ public sealed class PlanResult
     /// <param name="reason">Why the Brain is escalating.</param>
     public static PlanResult Escalated(string question, string reason) =>
         new() { IsEscalation = true, EscalationQuestion = question, EscalationReason = reason };
+
+    /// <summary>Creates a failed planning result. The goal must be failed with this reason.</summary>
+    /// <param name="reason">Why planning failed.</param>
+    public static PlanResult Failed(string reason) =>
+        new() { IsEscalation = false, IsFailed = true, FailureReason = reason };
 }
 
 /// <summary>

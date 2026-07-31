@@ -237,7 +237,7 @@ public class PremiumModelSelectionTests
 
         // Use the brain's plan so per-phase model tiers are applied
         var planResult = brain.PlanIterationAsync(pipeline).GetAwaiter().GetResult();
-        var plan = planResult.Plan ?? IterationPlan.Default();
+        var plan = planResult.Plan!;
         pipeline.SetPlan(plan);
         pipeline.StateMachine.StartIteration(plan.Phases);
 
@@ -369,7 +369,12 @@ file sealed class CapturingBrain : IDistributedBrain
 
     public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
     {
-        var plan = IterationPlan.Default();
+        // Coding → Testing → Review → Merging so the phase after Coding is Testing (tester worker).
+        var plan = new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
+            Reason = "Capturing brain plan",
+        };
 
         // Set the requested tier on phases that have workers
         foreach (var phase in plan.Phases)

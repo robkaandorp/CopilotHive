@@ -332,18 +332,48 @@ public sealed class GoalDispatcher : BackgroundService
                 _logger.LogWarning(ex, "Failed to re-register/fork Brain session for resumed goal '{GoalId}'", goalId);
             }
 
-            // Plan a new iteration (best-effort)
-            IterationPlan validatedPlan;
+            // Plan a new iteration — a planning failure fails the goal (no default plan substitution)
+            PlanResult planResult;
             try
             {
-                var rawPlan = await ResolvePlanAsync(pipeline, null, CancellationToken.None);
-                validatedPlan = IterationPlanValidator.ValidatePlan(rawPlan);
+                // The CALLER's token governs planning so the cancellation distinction below is
+                // real: only an OCE carrying this token means "the caller is shutting down".
+                planResult = await ResolvePlanAsync(pipeline, null, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // The CALLER's token was cancelled — service shutdown, not a planning failure.
+                // Propagate so the goal is NOT marked Failed: it stays InProgress and the next
+                // dispatch cycle picks it up again.
+                _logger.LogWarning("Resume of goal '{GoalId}' was cancelled by the caller", goalId);
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                // Self-cancellation from inside the planning call (e.g. a Brain-side timeout),
+                // NOT the caller's token. The goal is already persisted as InProgress/Planning,
+                // so fail it explicitly rather than stranding it.
+                _logger.LogWarning("Planning was cancelled for resumed goal '{GoalId}'", goalId);
+                await FailResumedGoalAsync(pipeline, "Planning failed: planning was cancelled");
+                return true;
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Brain failed to plan resumed iteration for {GoalId} — using default plan", goalId);
-                validatedPlan = IterationPlan.Default();
+                // The goal is already persisted as InProgress/Planning — a throw here would
+                // strand it. Fail the goal explicitly instead.
+                _logger.LogError(ex, "Brain planning threw for resumed goal '{GoalId}'", goalId);
+                await FailResumedGoalAsync(pipeline, $"Planning failed: {ex.Message}");
+                return true;
             }
+
+            if (planResult.IsFailed)
+            {
+                _logger.LogWarning("Brain failed to plan resumed iteration for {GoalId}: {Reason}", goalId, planResult.FailureReason);
+                await FailResumedGoalAsync(pipeline, planResult.FailureReason!);
+                return true;
+            }
+
+            var validatedPlan = planResult.Plan!;
 
             pipeline.SetPlan(validatedPlan);
             pipeline.StateMachine.StartIteration(validatedPlan.Phases);
@@ -385,6 +415,37 @@ public sealed class GoalDispatcher : BackgroundService
         finally
         {
             lockObj.Release();
+        }
+    }
+
+    /// <summary>
+    /// Fails a resumed goal whose iteration could not be planned. Synchronizes the state machine
+    /// with the pipeline phase, marks the goal Failed in the store and durably persists the
+    /// terminal pipeline state.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="GoalLifecycleService.MarkGoalFailedAsync"/> performs the
+    /// <c>AdvanceTo(GoalPhase.Failed)</c> transition itself, so this method must NOT advance the
+    /// pipeline as well — a second advance would rewrite <c>CompletedAt</c> after the lifecycle
+    /// metadata was already written, leaving the goal and the persisted pipeline with mismatched
+    /// timestamps. <c>StateMachine.Fail()</c> is a separate concern (<c>AdvanceTo</c> does not
+    /// touch the state machine) and is still required to keep the two in sync.
+    /// </remarks>
+    /// <param name="pipeline">The resumed pipeline.</param>
+    /// <param name="reason">Why planning failed.</param>
+    private async Task FailResumedGoalAsync(GoalPipeline pipeline, string reason)
+    {
+        // AdvanceTo does not touch the state machine, so fail it explicitly to keep both in sync.
+        pipeline.StateMachine.Fail();
+        try
+        {
+            await _lifecycleService.MarkGoalFailedAsync(pipeline, reason, CancellationToken.None);
+        }
+        finally
+        {
+            // Durably persist the terminal pipeline state even if finalization threw.
+            // No AdvanceTo here — MarkGoalFailedAsync owns that transition.
+            _pipelineManager.PersistFull(pipeline);
         }
     }
 
@@ -437,10 +498,11 @@ public sealed class GoalDispatcher : BackgroundService
     /// <summary>
     /// Calls <see cref="IDistributedBrain.PlanIterationAsync"/> and handles any escalation
     /// by routing to the clarification pipeline. On successful clarification, retries planning
-    /// with the answer as additional context. On timeout, returns the default plan.
+    /// with the answer as additional context. Failures are returned as
+    /// <see cref="PlanResult.Failed(string)"/> — never a substituted default plan.
     /// Exposed as <c>internal</c> for unit testing via <c>InternalsVisibleTo</c>.
     /// </summary>
-    internal Task<IterationPlan> ResolvePlanAsync(
+    internal Task<PlanResult> ResolvePlanAsync(
         GoalPipeline pipeline, string? additionalContext, CancellationToken ct)
         => _clarificationHandler.ResolvePlanAsync(pipeline, additionalContext, ct);
 

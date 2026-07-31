@@ -194,32 +194,48 @@ internal sealed class GoalDispatchService
             await _brain.ForkSessionForGoalAsync(goal.Id, ct);
         }
 
-        // Plan iteration phases
+        // Plan iteration phases — planning failures fail the goal, never substitute a default plan
         IterationPlan iterationPlan;
-        if (_brain is not null)
+        if (_brain is null)
         {
-            try
-            {
-                var rawPlan = await _clarificationHandler.ResolvePlanAsync(pipeline, null, ct);
-                var originalPhases = rawPlan.Phases.ToList();
-                iterationPlan = IterationPlanValidator.ValidatePlan(rawPlan);
+            // No brain — fail the goal immediately, no dispatch
+            await FailNewGoalAsync(goal, pipeline, "No brain available for planning");
+            return;
+        }
 
-                if (!originalPhases.SequenceEqual(iterationPlan.Phases))
-                {
-                    var note = IterationPlanValidator.BuildPlanAdjustmentNote(originalPhases, iterationPlan.Phases);
-                    await _brain.InjectSystemNoteAsync(pipeline, note, ct);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Brain failed to plan iteration for {GoalId}, using default plan", pipeline.GoalId);
-                iterationPlan = IterationPlan.Default();
-            }
-        }
-        else
+        PlanResult planResult;
+        try
         {
-            iterationPlan = IterationPlan.Default();
+            planResult = await _clarificationHandler.ResolvePlanAsync(pipeline, null, ct);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Service shutdown — not a planning failure. Leave the goal alone and propagate.
+            throw;
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancelled by the planning call itself (e.g. a Brain-side timeout) — fail the goal
+            // gracefully rather than leaving a half-started pipeline behind.
+            _logger.LogWarning("Planning was cancelled for goal '{GoalId}'", goal.Id);
+            await FailNewGoalAsync(goal, pipeline, "Planning failed: planning was cancelled");
+            return;
+        }
+        catch (Exception ex)
+        {
+            // A throw here leaves the pipeline half-started — fail the goal and clean up.
+            _logger.LogError(ex, "Planning threw for goal '{GoalId}'", goal.Id);
+            await FailNewGoalAsync(goal, pipeline, $"Planning failed: {ex.Message}");
+            return;
+        }
+
+        if (planResult.IsFailed)
+        {
+            await FailNewGoalAsync(goal, pipeline, planResult.FailureReason!);
+            return;
+        }
+
+        iterationPlan = planResult.Plan!;
 
         pipeline.SetPlan(iterationPlan);
         pipeline.StateMachine.StartIteration(iterationPlan.Phases);
@@ -250,6 +266,90 @@ internal sealed class GoalDispatchService
         await _taskDispatchService.DispatchToRole(pipeline, firstRole, firstPhasePrompt, ct);
 
         _pipelineManager.PersistFull(pipeline);
+    }
+
+    /// <summary>
+    /// Fails a freshly-created goal whose iteration could not be planned. Marks the goal
+    /// Failed with the reason, then independently attempts each cleanup step so a failure
+    /// in one step never prevents the others. No worker is dispatched.
+    /// </summary>
+    /// <remarks>
+    /// Every step uses <see cref="CancellationToken.None"/>: the caller's token may already be
+    /// cancelled (that cancellation is often WHY planning failed), and cleanup must still run to
+    /// completion. Using the caller's token here would abort the status write while still
+    /// deleting the pipeline, stranding a persisted InProgress goal with no pipeline.
+    /// The caller's token governs only the planning call itself, never this cleanup.
+    /// </remarks>
+    /// <param name="goal">The goal that could not be planned.</param>
+    /// <param name="pipeline">The pipeline created for the goal.</param>
+    /// <param name="failureReason">Why planning failed.</param>
+    private async Task FailNewGoalAsync(Goal goal, GoalPipeline pipeline, string failureReason)
+    {
+        _logger.LogError("Failing goal '{GoalId}' — planning failed: {Reason}", goal.Id, failureReason);
+
+        // Terminal state: both the pipeline phase and the state machine must agree.
+        pipeline.StateMachine.Fail();
+        pipeline.AdvanceTo(GoalPhase.Failed);
+
+        // Step 1 (primary): mark the goal Failed in the store. If it fails, log and continue
+        // with best-effort cleanup so no runtime state is left dangling.
+        try
+        {
+            var meta = new GoalUpdateMetadata
+            {
+                CompletedAt = DateTime.UtcNow,
+                Iterations = pipeline.Iteration,
+                FailureReason = failureReason,
+            };
+            await _goalManager.UpdateGoalStatusAsync(goal.Id, GoalStatus.Failed, meta, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to persist Failed status for goal '{GoalId}'", goal.Id);
+        }
+
+        // Step 2 (best-effort): deregister the pipeline from the Brain.
+        try
+        {
+            (_brain as DistributedBrain)?.DeregisterActivePipeline(goal.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to deregister active pipeline for goal '{GoalId}'", goal.Id);
+        }
+
+        // Step 3 (best-effort): remove the pipeline from the manager and the durable store.
+        try
+        {
+            _pipelineManager.RemovePipeline(goal.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to remove pipeline for goal '{GoalId}'", goal.Id);
+        }
+
+        // Step 4 (best-effort): delete the Brain goal session.
+        if (_brain is not null)
+        {
+            try
+            {
+                await _brain.DeleteGoalSessionAsync(goal.Id, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to delete Brain goal session for goal '{GoalId}'", goal.Id);
+            }
+        }
+
+        // Step 5 (best-effort): notify the dashboard.
+        try
+        {
+            _dashboardNotifier?.NotifyStateChanged();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to notify dashboard for failed goal '{GoalId}'", goal.Id);
+        }
     }
 
     /// <summary>

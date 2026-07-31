@@ -546,13 +546,22 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     /// <summary>Asks the Brain to plan which phases should run during the current iteration.</summary>
     public async Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
     {
-        EnsureConnected();
+        const int maxToolAttempts = 3;
 
-        var prompt = BrainPromptBuilder.BuildPlanningPrompt(pipeline, additionalContext);
+        // Tracks the rejection reasons from the most recent strict validation so the
+        // exhaustion failure can explain exactly WHY the last plan was rejected.
+        IReadOnlyList<string> lastRejectionReasons = [];
 
         try
         {
-            const int maxToolAttempts = 3;
+            // EnsureConnected and prompt building are BOTH inside the try: this method must
+            // NEVER throw a planning error at its callers. Any failure — including pre-connect
+            // misuse — surfaces as PlanResult.Failed so the goal fails with an explicit reason
+            // instead of silently receiving a default plan.
+            EnsureConnected();
+
+            var prompt = BrainPromptBuilder.BuildPlanningPrompt(pipeline, additionalContext);
+
             string currentPrompt = prompt;
 
             for (int attempt = 1; attempt <= maxToolAttempts; attempt++)
@@ -584,7 +593,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 {
                     var plan = BrainPlanParser.BuildIterationPlanFromToolCall(iterationPlanResult);
 
-                    if (plan is { Phases.Count: > 0 })
+                    var validation = Services.IterationPlanValidator.ValidatePlanStrict(plan);
+                    if (validation.IsValid)
                     {
                         _logger.LogInformation(
                             "Brain planned iteration {Iteration} for goal {GoalId}: [{Phases}] — {Reason}",
@@ -593,9 +603,18 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                         return PlanResult.Success(plan);
                     }
 
-                    _logger.LogWarning("Failed to parse iteration plan from Brain response: {Response}",
-                        BrainPromptBuilder.Truncate(response, Constants.TruncationShort));
-                    break;
+                    _logger.LogWarning(
+                        "Brain submitted an invalid iteration plan for goal {GoalId} (attempt {Attempt}/{Max}): [{Phases}]. Reasons: {Reasons}",
+                        pipeline.GoalId, attempt, maxToolAttempts,
+                        string.Join(", ", plan.Phases),
+                        string.Join(" | ", validation.RejectionReasons));
+
+                    lastRejectionReasons = validation.RejectionReasons;
+                    currentPrompt =
+                        "Your previous plan was rejected because:\n"
+                        + string.Join("\n", validation.RejectionReasons)
+                        + "\n\nSubmit a corrected plan by calling the report_iteration_plan tool now.";
+                    continue;
                 }
 
                 if (attempt < maxToolAttempts)
@@ -613,14 +632,29 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 }
             }
         }
+        catch (OperationCanceledException)
+        {
+            // Cancellation is NOT a planning failure — it means the caller (or the service)
+            // is shutting down. Rethrow so callers do not mark the goal Failed and do not
+            // attempt cleanup with an already-cancelled token.
+            throw;
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Brain iteration planning failed for goal {GoalId}", pipeline.GoalId);
             pipeline.Conversation.Add(new ConversationEntry("system", $"Error: {ex.Message}", pipeline.Iteration, "error"));
+            return PlanResult.Failed($"Planning failed: {ex.Message}");
         }
 
-        _logger.LogInformation("Using default iteration plan for goal {GoalId}", pipeline.GoalId);
-        return PlanResult.Success(IterationPlan.Default());
+        var exhaustionReason = lastRejectionReasons.Count > 0
+            ? $"Brain failed to produce a valid iteration plan after {maxToolAttempts} attempts. "
+              + $"Last rejection: {string.Join("; ", lastRejectionReasons)}"
+            : $"Brain failed to produce a valid iteration plan after {maxToolAttempts} attempts";
+
+        _logger.LogWarning(
+            "Brain failed to produce a valid iteration plan for goal {GoalId} — failing the goal. {Reason}",
+            pipeline.GoalId, exhaustionReason);
+        return PlanResult.Failed(exhaustionReason);
     }
 
     /// <summary>Generates a summary of the completed goal's work and appends it to the master session.</summary>

@@ -130,6 +130,71 @@ public class DistributedBrainShadowTests
         public void Dispose() { }
     }
 
+    /// <summary>
+    /// Chat client that reports a different iteration plan on each planning attempt.
+    /// Every attempt uses two calls: the first returns the <c>report_iteration_plan</c> tool call,
+    /// the second returns plain text so the agent loop terminates.
+    /// Records every user prompt it observes so nudge feedback can be asserted.
+    /// </summary>
+    private sealed class SequencedPlanStubClient : IChatClient
+    {
+        private readonly string[][] _planSequence;
+        private int _callCount;
+
+        internal SequencedPlanStubClient(params string[][] planSequence) => _planSequence = planSequence;
+
+        /// <summary>Number of <c>report_iteration_plan</c> tool calls emitted (one per planning attempt).</summary>
+        internal int ToolCallCount { get; private set; }
+
+        /// <summary>Every distinct user message text seen by this client, in order.</summary>
+        internal List<string> ObservedUserPrompts { get; } = [];
+
+        public ChatClientMetadata Metadata => new("sequenced-plan", null, "stub-model");
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken ct = default)
+        {
+            foreach (var message in messages.Where(m => m.Role == ChatRole.User))
+            {
+                var text = message.Text;
+                if (!string.IsNullOrEmpty(text) && !ObservedUserPrompts.Contains(text))
+                    ObservedUserPrompts.Add(text);
+            }
+
+            var call = Interlocked.Increment(ref _callCount);
+            if (call % 2 == 1)
+            {
+                var index = Math.Min((call - 1) / 2, _planSequence.Length - 1);
+                ToolCallCount++;
+                var toolCallContent = new FunctionCallContent(
+                    $"plan-call-{ToolCallCount}", "report_iteration_plan", new Dictionary<string, object?>
+                    {
+                        ["phases"] = _planSequence[index],
+                        ["phase_instructions"] = "{}",
+                        ["reason"] = "sequenced plan",
+                        ["model_tiers"] = null,
+                    });
+                return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, [toolCallContent]))
+                {
+                    FinishReason = ChatFinishReason.ToolCalls,
+                });
+            }
+
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "Plan reported."))
+            {
+                FinishReason = ChatFinishReason.Stop,
+            });
+        }
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose() { }
+    }
+
     /// <summary>Chat client that always returns a fixed text response.</summary>
     private sealed class TextStubClient : IChatClient
     {
@@ -1715,7 +1780,7 @@ public class DistributedBrainShadowTests
         {
             var brain = NewShadowBrain(dir,
                 chatClient: new ThrowingChatClient(),  // context path would fail — proves the actor path ran
-                factoryChatClientFactory: _ => new PlanStubClient("call-14", ["coding", "review"], "actor plan"));
+                factoryChatClientFactory: _ => new PlanStubClient("call-14", ["coding", "testing", "review", "merging"], "actor plan"));
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
@@ -1887,9 +1952,9 @@ public class DistributedBrainShadowTests
         finally { DeleteDir(dir); }
     }
 
-    // Criterion 21: flag on — an invalid plan from the actor makes PlanIterationAsync fall back to default.
+    // Criterion 21: flag on — an invalid plan from the actor makes PlanIterationAsync fail explicitly.
     [Fact]
-    public async Task ExecuteBrainAsync_InvalidPlan_PlanIterationReturnsDefault()
+    public async Task ExecuteBrainAsync_InvalidPlan_PlanIterationReturnsFailed()
     {
         var dir = NewTempDir();
         try
@@ -1905,8 +1970,9 @@ public class DistributedBrainShadowTests
                     CreatePipeline("goal-21"), null, TestContext.Current.CancellationToken);
 
                 Assert.False(result.IsEscalation);
-                var expected = IterationPlan.Default();
-                Assert.Equal(expected.Phases, result.Plan!.Phases);
+                Assert.True(result.IsFailed);
+                Assert.Null(result.Plan);
+                Assert.NotNull(result.FailureReason);
             }
         }
         finally { DeleteDir(dir); }
@@ -1984,6 +2050,88 @@ public class DistributedBrainShadowTests
 
                 await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
                     InvokeExecuteBrainAsync(brain, "prompt", "goal-25", cts.Token));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // ── validate-and-reject planning contract ───────────────────────────────
+
+    /// <summary>
+    /// An invalid first plan is rejected, the rejection reasons are fed back to the Brain,
+    /// and the corrected second plan is accepted.
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_InvalidThenValidPlan_FeedsBackReasonsAndAcceptsReplan()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            SequencedPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new SequencedPlanStubClient(
+                    ["review"],                                    // invalid: no content phase, no merging
+                    ["coding", "testing", "review", "merging"]));   // valid
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-reject-1", TestContext.Current.CancellationToken);
+
+                var result = await brain.PlanIterationAsync(
+                    CreatePipeline("goal-reject-1"), null, TestContext.Current.CancellationToken);
+
+                Assert.False(result.IsFailed);
+                Assert.False(result.IsEscalation);
+                Assert.NotNull(result.Plan);
+                Assert.Equal(
+                    [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
+                    result.Plan!.Phases);
+
+                Assert.NotNull(stub);
+                Assert.Equal(2, stub!.ToolCallCount);
+
+                // The nudge prompt carried the rejection reasons back to the Brain.
+                var nudge = stub.ObservedUserPrompts.FirstOrDefault(p => p.Contains("rejected because"));
+                Assert.NotNull(nudge);
+                Assert.Contains("R1 (Occupancy)", nudge!);
+                Assert.Contains("R5 (Merging)", nudge!);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    /// <summary>
+    /// When the Brain never produces a valid plan, planning fails after the bounded
+    /// 3-attempt budget — no default plan is substituted.
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_NeverValid_ReturnsFailedAfterThreeAttempts()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            SequencedPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new SequencedPlanStubClient(["review"]));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-reject-2", TestContext.Current.CancellationToken);
+
+                var result = await brain.PlanIterationAsync(
+                    CreatePipeline("goal-reject-2"), null, TestContext.Current.CancellationToken);
+
+                Assert.True(result.IsFailed);
+                Assert.Null(result.Plan);
+                // Exhaustion preserves WHY the last plan was rejected — the reason is not generic.
+                Assert.StartsWith(
+                    "Brain failed to produce a valid iteration plan after 3 attempts. Last rejection: ",
+                    result.FailureReason);
+                Assert.Contains("R1 (Occupancy)", result.FailureReason);
+
+                // Budget is bounded at 3 planning attempts.
+                Assert.NotNull(stub);
+                Assert.Equal(3, stub!.ToolCallCount);
             }
         }
         finally { DeleteDir(dir); }

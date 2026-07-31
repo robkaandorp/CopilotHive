@@ -913,13 +913,21 @@ public sealed class LlmSessionRegistryIntegrationTests
         try
         {
             // A fresh Brain that has NOT been connected. Every public operation must call
-            // EnsureConnected and throw InvalidOperationException before doing any work.
+            // EnsureConnected and throw InvalidOperationException before doing any work —
+            // EXCEPT PlanIterationAsync, which by contract never throws and instead reports
+            // the failure as PlanResult.Failed (see the assertion below).
             var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
                 stateDir: tempDir, chatClient: new FakeChatClient());
             var pipeline = CreatePipeline("goal-preconnect", "Pre-connect goal");
 
-            await Assert.ThrowsAsync<InvalidOperationException>(
-                () => brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken));
+            // PlanIterationAsync still guards with EnsureConnected, but converts the failure
+            // into an explicit PlanResult.Failed rather than throwing at its caller.
+            var planResult = await brain.PlanIterationAsync(
+                pipeline, null, TestContext.Current.CancellationToken);
+            Assert.True(planResult.IsFailed);
+            Assert.Null(planResult.Plan);
+            Assert.StartsWith("Planning failed:", planResult.FailureReason);
+
             await Assert.ThrowsAsync<InvalidOperationException>(
                 () => brain.CraftPromptAsync(pipeline, GoalPhase.Coding, null, TestContext.Current.CancellationToken));
             await Assert.ThrowsAsync<InvalidOperationException>(

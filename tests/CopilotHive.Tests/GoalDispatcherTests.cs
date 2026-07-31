@@ -782,239 +782,6 @@ public sealed class GoalDispatcherConversationExtractionTests
 }
 
 /// <summary>
-/// Tests for <see cref="IterationPlanValidator.ValidatePlan"/> logic.
-/// </summary>
-public sealed class GoalDispatcherValidatePlanTests
-{
-    [Fact]
-    public void DocsOnlyPlan_WithReview_CodingNotInserted()
-    {
-        // Arrange: docs-only plan with Review — Coding should NOT be inserted
-        var plan = new IterationPlan
-        {
-            Phases = [GoalPhase.DocWriting, GoalPhase.Review, GoalPhase.Merging],
-        };
-
-        // Act
-        var result = IterationPlanValidator.ValidatePlan(plan);
-
-        // Assert: Coding absent, DocWriting retained
-        Assert.DoesNotContain(GoalPhase.Coding, result.Phases);
-        Assert.Contains(GoalPhase.DocWriting, result.Phases);
-        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
-    }
-
-    [Fact]
-    public void DocsOnlyPlan_WithoutReview_CodingNotInserted()
-    {
-        // Arrange: docs-only plan with no Testing/Review — Testing will be inserted, but Coding must NOT be
-        var plan = new IterationPlan
-        {
-            Phases = [GoalPhase.DocWriting, GoalPhase.Merging],
-        };
-
-        // Act
-        var result = IterationPlanValidator.ValidatePlan(plan);
-
-        // Assert: Coding absent, DocWriting retained, ends with Merging
-        Assert.DoesNotContain(GoalPhase.Coding, result.Phases);
-        Assert.Contains(GoalPhase.DocWriting, result.Phases);
-        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
-    }
-
-    [Fact]
-    public void PlanWithNeitherCodingNorDocWriting_CodingInserted()
-    {
-        // Arrange: safety fallback — no Coding and no DocWriting
-        var plan = new IterationPlan
-        {
-            Phases = [GoalPhase.Review, GoalPhase.Merging],
-        };
-
-        // Act
-        var result = IterationPlanValidator.ValidatePlan(plan);
-
-        // Assert: Coding inserted as fallback
-        Assert.Contains(GoalPhase.Coding, result.Phases);
-        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
-    }
-
-    [Fact]
-    public void PlanWithBothCodingAndDocWriting_NeitherInsertedAgain()
-    {
-        // Arrange: plan already has both Coding and DocWriting
-        var plan = new IterationPlan
-        {
-            Phases = [GoalPhase.Coding, GoalPhase.DocWriting, GoalPhase.Review, GoalPhase.Merging],
-        };
-
-        // Act
-        var result = IterationPlanValidator.ValidatePlan(plan);
-
-        // Assert: plan is unchanged — Coding appears exactly once
-        Assert.Equal(1, result.Phases.Count(p => p == GoalPhase.Coding));
-        Assert.Contains(GoalPhase.DocWriting, result.Phases);
-        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
-    }
-
-    [Fact]
-    public void StandardCodingPlan_CodingNotDuplicated()
-    {
-        // Arrange: standard plan already containing Coding
-        var plan = new IterationPlan
-        {
-            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
-        };
-
-        // Act
-        var result = IterationPlanValidator.ValidatePlan(plan);
-
-        // Assert: Coding still present exactly once, Merging at end
-        Assert.Equal(1, result.Phases.Count(p => p == GoalPhase.Coding));
-        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
-    }
-
-    // ── Code-plan enforcement ─────────────────────────────────────────────────
-
-    [Fact]
-    public void CodingPlan_MissingReview_ReviewInserted()
-    {
-        // Arrange: code plan with Testing but no Review
-        var plan = new IterationPlan
-        {
-            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Merging],
-        };
-
-        // Act
-        var result = IterationPlanValidator.ValidatePlan(plan);
-
-        // Assert: Review inserted
-        Assert.Contains(GoalPhase.Review, result.Phases);
-        Assert.Contains(GoalPhase.Testing, result.Phases);
-        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
-    }
-
-    [Fact]
-    public void CodingPlan_MissingTesting_TestingInserted()
-    {
-        // Arrange: code plan with Review but no Testing
-        var plan = new IterationPlan
-        {
-            Phases = [GoalPhase.Coding, GoalPhase.Review, GoalPhase.Merging],
-        };
-
-        // Act
-        var result = IterationPlanValidator.ValidatePlan(plan);
-
-        // Assert: Testing inserted
-        Assert.Contains(GoalPhase.Testing, result.Phases);
-        Assert.Contains(GoalPhase.Review, result.Phases);
-        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
-    }
-
-    [Fact]
-    public void CodingPlan_MissingBothTestingAndReview_BothInserted()
-    {
-        // Arrange: code plan with neither Testing nor Review
-        var plan = new IterationPlan
-        {
-            Phases = [GoalPhase.Coding, GoalPhase.Merging],
-        };
-
-        // Act
-        var result = IterationPlanValidator.ValidatePlan(plan);
-
-        // Assert: both Testing and Review inserted
-        Assert.Contains(GoalPhase.Testing, result.Phases);
-        Assert.Contains(GoalPhase.Review, result.Phases);
-        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
-    }
-
-    [Fact]
-    public void CodingPlan_WithTestingAndReview_Unchanged()
-    {
-        // Arrange: code plan already has both Testing and Review
-        var plan = new IterationPlan
-        {
-            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
-        };
-
-        // Act
-        var result = IterationPlanValidator.ValidatePlan(plan);
-
-        // Assert: no duplicates, order preserved, Merging at end
-        Assert.Equal(1, result.Phases.Count(p => p == GoalPhase.Testing));
-        Assert.Equal(1, result.Phases.Count(p => p == GoalPhase.Review));
-        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
-        // Verify ordering: Coding < Testing < Review < Merging
-        var codingIdx = result.Phases.IndexOf(GoalPhase.Coding);
-        var testingIdx = result.Phases.IndexOf(GoalPhase.Testing);
-        var reviewIdx = result.Phases.IndexOf(GoalPhase.Review);
-        Assert.True(codingIdx < testingIdx);
-        Assert.True(testingIdx < reviewIdx);
-    }
-
-    // ── Docs-only plan behavior ───────────────────────────────────────────────
-
-    [Fact]
-    public void DocsOnlyPlan_WithTesting_ReviewNotInserted()
-    {
-        // Arrange: docs-only plan with Testing but no Review — Review must NOT be inserted
-        var plan = new IterationPlan
-        {
-            Phases = [GoalPhase.DocWriting, GoalPhase.Testing, GoalPhase.Merging],
-        };
-
-        // Act
-        var result = IterationPlanValidator.ValidatePlan(plan);
-
-        // Assert: Review absent, Coding absent
-        Assert.DoesNotContain(GoalPhase.Review, result.Phases);
-        Assert.DoesNotContain(GoalPhase.Coding, result.Phases);
-        Assert.Contains(GoalPhase.DocWriting, result.Phases);
-        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
-    }
-
-    [Fact]
-    public void DocsOnlyPlan_WithoutTestingOrReview_TestingInserted_ReviewNotRequired()
-    {
-        // Arrange: docs-only plan with neither Testing nor Review
-        var plan = new IterationPlan
-        {
-            Phases = [GoalPhase.DocWriting, GoalPhase.Merging],
-        };
-
-        // Act
-        var result = IterationPlanValidator.ValidatePlan(plan);
-
-        // Assert: Testing inserted; Review NOT inserted; Coding absent
-        Assert.Contains(GoalPhase.Testing, result.Phases);
-        Assert.DoesNotContain(GoalPhase.Review, result.Phases);
-        Assert.DoesNotContain(GoalPhase.Coding, result.Phases);
-        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
-    }
-
-    [Fact]
-    public void DocsOnlyPlan_WithReview_Unchanged()
-    {
-        // Arrange: docs-only plan that already has Review — should not change
-        var plan = new IterationPlan
-        {
-            Phases = [GoalPhase.DocWriting, GoalPhase.Review, GoalPhase.Merging],
-        };
-
-        // Act
-        var result = IterationPlanValidator.ValidatePlan(plan);
-
-        // Assert: Review retained, Testing NOT inserted, Coding absent
-        Assert.Contains(GoalPhase.Review, result.Phases);
-        Assert.DoesNotContain(GoalPhase.Testing, result.Phases);
-        Assert.DoesNotContain(GoalPhase.Coding, result.Phases);
-        Assert.Equal(GoalPhase.Merging, result.Phases[^1]);
-    }
-}
-
-/// <summary>
 /// Tests for <see cref="PipelineHelpers.BuildWorkerOutputSummary"/> logic.
 /// </summary>
 public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
@@ -1358,6 +1125,9 @@ public sealed class GoalDispatcherDispatchLoggingTests
             new TaskCompletionNotifier(),
             NullLogger<GoalDispatcher>.Instance,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            // A Brain is required to plan the goal — without one, dispatch fails the goal
+            // and emits a second (failure) dashboard notification.
+            brain: new FakeDispatcherBrain(),
             startupDelay: TimeSpan.Zero,
             dashboardNotifier: notifier);
 
@@ -1469,7 +1239,7 @@ public sealed class TaskCompletionServiceModelLoggingTests
             metricsTracker: null,
             dispatchToRole: (_, _, _, _) => Task.CompletedTask,
             resolvePrompt: (_, _, _, _) => Task.FromResult("prompt"),
-            resolvePlan: (_, _, _) => Task.FromResult(IterationPlan.Default()),
+            resolvePlan: (_, _, _) => Task.FromResult(PlanResult.Success(IterationPlan.Default())),
             resolveRepositories: _ => [],
             syncAgents: _ => Task.CompletedTask,
             generateMergeCommitMessage: (_, _) => Task.FromResult("message"),
@@ -1640,7 +1410,7 @@ public sealed class TaskCompletionServiceGuardTests
             metricsTracker: null,
             dispatchToRole: (_, _, _, _) => Task.CompletedTask,
             resolvePrompt: (_, _, _, _) => Task.FromResult("prompt"),
-            resolvePlan: (_, _, _) => Task.FromResult(IterationPlan.Default()),
+            resolvePlan: (_, _, _) => Task.FromResult(PlanResult.Success(IterationPlan.Default())),
             resolveRepositories: _ => [],
             syncAgents: _ => Task.CompletedTask,
             generateMergeCommitMessage: (_, _) => Task.FromResult("message"),
@@ -3210,6 +2980,10 @@ public sealed class GoalDispatcherResumeTests
         IWorkerGateway? workerGateway = null)
     {
         var goalManager = new GoalManager();
+        // Register the store as a goal source so status transitions (e.g. MarkGoalFailedAsync)
+        // can resolve the goal instead of throwing KeyNotFoundException.
+        if (goalStore is not null)
+            goalManager.AddSource(goalStore);
         return new GoalDispatcher(
             goalManager,
             pipelineManager,
@@ -3218,7 +2992,8 @@ public sealed class GoalDispatcherResumeTests
             new TaskCompletionNotifier(),
             NullLogger<GoalDispatcher>.Instance,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
-            brain,
+            // A Brain is required to plan the resumed iteration — without one, resume fails the goal.
+            brain ?? new FakeDispatcherBrain(),
             config: config,
             goalStore: goalStore);
     }
@@ -3294,13 +3069,14 @@ public sealed class GoalDispatcherResumeTests
         Assert.True(brain.PlanIterationCalled, "PlanIterationAsync should have been called");
         Assert.True(brain.CraftPromptCalled, "CraftPromptAsync should have been called");
 
-        // Verify ALL Brain calls received CancellationToken.None — not the HTTP ct
-        Assert.All(brain.ForkSessionTokens, t => Assert.True(t.CanBeCanceled == false || t.IsCancellationRequested == false,
-            "ForkSessionForGoalAsync must receive a non-cancelled token (CancellationToken.None)"));
-        Assert.All(brain.PlanIterationTokens, t => Assert.True(t.CanBeCanceled == false || t.IsCancellationRequested == false,
-            "PlanIterationAsync must receive a non-cancelled token (CancellationToken.None)"));
-        Assert.All(brain.CraftPromptTokens, t => Assert.True(t.CanBeCanceled == false || t.IsCancellationRequested == false,
-            "CraftPromptAsync must receive a non-cancelled token (CancellationToken.None)"));
+        // The best-effort Brain calls receive CancellationToken.None so they complete regardless
+        // of the caller. Planning receives the caller's token (see
+        // ResumeGoalAsync_BestEffortBrainCalls_ReceiveCancellationTokenNone_ButPlanningUsesCallerToken),
+        // and this brain ignores tokens, so resume still completes successfully here.
+        Assert.All(brain.ForkSessionTokens, t => Assert.False(t.CanBeCanceled,
+            "ForkSessionForGoalAsync must receive CancellationToken.None"));
+        Assert.All(brain.CraftPromptTokens, t => Assert.False(t.CanBeCanceled,
+            "CraftPromptAsync must receive CancellationToken.None"));
     }
 
     [Fact]
@@ -3336,11 +3112,14 @@ public sealed class GoalDispatcherResumeTests
     }
 
     [Fact]
-    public async Task ResumeGoalAsync_BrainCallsReceiveCancellationTokenNone_NotHttpToken()
+    public async Task ResumeGoalAsync_BestEffortBrainCalls_ReceiveCancellationTokenNone_ButPlanningUsesCallerToken()
     {
-        // Verify that the CancellationToken passed to each Brain call is CancellationToken.None,
-        // not the HTTP request's ct. The brain introduces a delay so the HTTP ct is cancelled
-        // by the time Brain calls execute, proving Brain calls use CancellationToken.None.
+        // Contract: the PLANNING call is governed by the CALLER's token so that a cancelled
+        // caller can be distinguished from a self-cancelled planning call (see
+        // ResumeGoalAsync_CallerTokenCancelledDuringPlanning_PropagatesAndDoesNotFailGoal).
+        // The BEST-EFFORT calls around it — session forking and prompt crafting — must still
+        // receive CancellationToken.None so they complete regardless of the caller.
+        // This brain ignores tokens entirely, so planning here simply succeeds.
         var brain = new CancellationTokenTrackingBrain(brainCallDelayMs: 200);
         var goalStore = new ResumeFakeGoalStore();
         var goal = CreateFailedGoal("resume-ct-none");
@@ -3351,8 +3130,8 @@ public sealed class GoalDispatcherResumeTests
 
         var dispatcher = CreateResumeDispatcher(goalStore, manager, brain: brain, config: ConfigWithRepo());
 
-        // Use a ct that cancels after a short delay — by the time Brain calls execute,
-        // the HTTP ct will be cancelled, proving Brain calls use CancellationToken.None.
+        // Cancel after a short delay — by the time the Brain calls execute the caller's token
+        // is cancelled, which makes the token-routing assertions below meaningful.
         using var cts = new CancellationTokenSource();
         cts.CancelAfter(TimeSpan.FromMilliseconds(50));
 
@@ -3360,21 +3139,134 @@ public sealed class GoalDispatcherResumeTests
 
         Assert.True(result);
 
-        // The HTTP ct should be cancelled by now (brain calls took 200ms+ each).
-        Assert.True(cts.Token.IsCancellationRequested, "HTTP ct should be cancelled by the time Brain calls execute");
+        // The caller's ct should be cancelled by now (brain calls take 200ms+ each).
+        Assert.True(cts.Token.IsCancellationRequested, "caller ct should be cancelled by the time Brain calls execute");
 
-        // But all Brain calls should have completed with CancellationToken.None.
         Assert.True(brain.ForkSessionCalled);
         Assert.True(brain.PlanIterationCalled);
         Assert.True(brain.CraftPromptCalled);
 
-        // Every token passed to Brain methods must be CancellationToken.None (not cancellable).
-        Assert.All(brain.ForkSessionTokens, t => Assert.False(t.IsCancellationRequested,
-            "ForkSessionForGoalAsync token must NOT be the cancelled HTTP ct"));
-        Assert.All(brain.PlanIterationTokens, t => Assert.False(t.IsCancellationRequested,
-            "PlanIterationAsync token must NOT be the cancelled HTTP ct"));
-        Assert.All(brain.CraftPromptTokens, t => Assert.False(t.IsCancellationRequested,
-            "CraftPromptAsync token must NOT be the cancelled HTTP ct"));
+        // Best-effort calls receive CancellationToken.None — a token that cannot be cancelled.
+        Assert.All(brain.ForkSessionTokens, t => Assert.False(t.CanBeCanceled,
+            "ForkSessionForGoalAsync must receive CancellationToken.None"));
+        Assert.All(brain.CraftPromptTokens, t => Assert.False(t.CanBeCanceled,
+            "CraftPromptAsync must receive CancellationToken.None"));
+
+        // Planning receives the CALLER's token, so the cancellation distinction is real and not
+        // dead code. (Asserting CanBeCanceled rather than IsCancellationRequested: CancellationToken
+        // is a struct over a live source, so a captured token reflects the source's current state.)
+        Assert.All(brain.PlanIterationTokens, t => Assert.True(t.CanBeCanceled,
+            "PlanIterationAsync must receive the caller's cancellable token, not CancellationToken.None"));
+    }
+
+    [Fact]
+    public async Task ResumeGoalAsync_CallerTokenCancelledDuringPlanning_PropagatesAndDoesNotFailGoal()
+    {
+        // Regression: the planning call must honour the CALLER's token so that
+        // `catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }`
+        // is functional rather than dead code. A caller cancelled mid-planning must NOT fail
+        // the goal — it stays InProgress for a later dispatch cycle.
+        var goalStore = new ResumeFakeGoalStore();
+        var goal = CreateFailedGoal("resume-caller-cancelled");
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var manager = new GoalPipelineManager();
+        var pipeline = CreateFailedPipeline(manager, goal);
+
+        using var cts = new CancellationTokenSource();
+
+        // The brain blocks in planning until the caller's token is cancelled, then surfaces the
+        // caller's OCE — exactly what a token-honouring Brain call does.
+        var planningStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var brain = new PlanningGateBrain(async planCt =>
+        {
+            planningStarted.TrySetResult();
+            await Task.Delay(Timeout.Infinite, planCt);
+            return PlanResult.Success(IterationPlan.Default());
+        });
+
+        var dispatcher = CreateResumeDispatcher(goalStore, manager, brain: brain, config: ConfigWithRepo());
+
+        var resumeTask = dispatcher.ResumeGoalAsync("resume-caller-cancelled", 5, cts.Token);
+
+        // Cancel only once planning is genuinely in flight.
+        await planningStarted.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        await cts.CancelAsync();
+
+        // Bounded wait: if planning ever regresses to CancellationToken.None the blocking Brain
+        // call would never observe cancellation, so this must fail fast rather than hang forever.
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => resumeTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken));
+
+        // The goal must NOT be marked Failed — cancellation is caller shutdown, not a planning
+        // failure. Resume already set it to InProgress before planning, and it stays there.
+        var updated = await goalStore.GetGoalAsync("resume-caller-cancelled", TestContext.Current.CancellationToken);
+        Assert.NotNull(updated);
+        Assert.Equal(GoalStatus.InProgress, updated!.Status);
+        Assert.Null(updated.FailureReason);
+
+        // FailResumedGoalAsync was not invoked: no terminal transition on the pipeline.
+        Assert.NotEqual(GoalPhase.Failed, pipeline.Phase);
+        Assert.NotEqual(GoalPhase.Failed, pipeline.StateMachine.Phase);
+    }
+
+    [Fact]
+    public async Task ResumeGoalAsync_PlanningSelfCancels_FailsGoal()
+    {
+        // Complement to the test above: an OCE that does NOT carry the caller's token is a
+        // self-cancelled planning call (e.g. a Brain-side timeout). The goal is already
+        // persisted as InProgress/Planning, so it must be failed rather than stranded.
+        var goalStore = new ResumeFakeGoalStore();
+        var goal = CreateFailedGoal("resume-self-cancelled");
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var manager = new GoalPipelineManager();
+        var pipeline = CreateFailedPipeline(manager, goal);
+
+        // Throws an OCE carrying an unrelated, already-cancelled token — the caller's token stays live.
+        var brain = new PlanningGateBrain(_ =>
+            throw new OperationCanceledException(new CancellationToken(canceled: true)));
+
+        var dispatcher = CreateResumeDispatcher(goalStore, manager, brain: brain, config: ConfigWithRepo());
+
+        var result = await dispatcher.ResumeGoalAsync(
+            "resume-self-cancelled", 5, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+
+        var updated = await goalStore.GetGoalAsync("resume-self-cancelled", TestContext.Current.CancellationToken);
+        Assert.NotNull(updated);
+        Assert.Equal(GoalStatus.Failed, updated!.Status);
+        Assert.Equal("Planning failed: planning was cancelled", updated.FailureReason);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+    }
+
+    [Fact]
+    public async Task ResumeGoalAsync_PlanningThrowsNonCancellation_FailsGoal()
+    {
+        // A non-OCE throw from planning must also fail the goal explicitly rather than
+        // propagating and stranding a goal already persisted as InProgress/Planning.
+        var goalStore = new ResumeFakeGoalStore();
+        var goal = CreateFailedGoal("resume-plan-throws");
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var manager = new GoalPipelineManager();
+        var pipeline = CreateFailedPipeline(manager, goal);
+
+        var brain = new PlanningGateBrain(_ => throw new InvalidOperationException("brain socket closed"));
+
+        var dispatcher = CreateResumeDispatcher(goalStore, manager, brain: brain, config: ConfigWithRepo());
+
+        var result = await dispatcher.ResumeGoalAsync(
+            "resume-plan-throws", 5, TestContext.Current.CancellationToken);
+
+        Assert.True(result);
+
+        var updated = await goalStore.GetGoalAsync("resume-plan-throws", TestContext.Current.CancellationToken);
+        Assert.NotNull(updated);
+        Assert.Equal(GoalStatus.Failed, updated!.Status);
+        Assert.Equal("Planning failed: brain socket closed", updated.FailureReason);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
     }
 
     [Fact]
@@ -3702,6 +3594,60 @@ file sealed class CancellationTokenTrackingBrain : IDistributedBrain
     public BrainStats? GetStats() => null;
 }
 
+/// <summary>
+/// Brain whose planning behaviour is supplied by the test, so cancellation semantics
+/// (caller-cancelled vs. self-cancelled vs. plain throw) can be exercised precisely.
+/// All other members are inert successes.
+/// </summary>
+file sealed class PlanningGateBrain : IDistributedBrain
+{
+    private readonly Func<CancellationToken, Task<PlanResult>> _plan;
+
+    public PlanningGateBrain(Func<CancellationToken, Task<PlanResult>> plan) => _plan = plan;
+
+    public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<PlanResult> PlanIterationAsync(
+        GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) => _plan(ct);
+
+    public Task<PromptResult> CraftPromptAsync(
+        GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
+        Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+
+    public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult<string?>(null);
+
+    public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct) =>
+        Task.CompletedTask;
+
+    public Task<BrainResponse> AskQuestionAsync(
+        string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+        Task.FromResult(BrainResponse.Answer("proceed"));
+
+    public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public bool GoalSessionExists(string goalId) => false;
+
+    public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
+
+    public BrainStats? GetStats() => null;
+}
+
 /// <summary>In-memory goal store for GoalDispatcher resume tests.</summary>
 file sealed class ResumeFakeGoalStore : IGoalStore
 {
@@ -3745,8 +3691,19 @@ file sealed class ResumeFakeGoalStore : IGoalStore
     public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Goal>>(Array.Empty<Goal>());
 
-    public Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
-        Task.CompletedTask;
+    public Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
+    {
+        // Apply the transition so tests can assert the persisted status / failure reason
+        // instead of silently observing the pre-update state.
+        if (_goals.TryGetValue(goalId, out var goal))
+        {
+            goal.Status = status;
+            if (metadata?.FailureReason is not null)
+                goal.FailureReason = metadata.FailureReason;
+        }
+
+        return Task.CompletedTask;
+    }
 
     public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default) =>
         Task.FromResult(release);

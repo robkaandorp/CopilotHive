@@ -32,7 +32,7 @@ internal sealed class PipelineDriver
     // Callbacks into GoalDispatcher
     private readonly Func<GoalPipeline, WorkerRole, string?, CancellationToken, Task> _dispatchToRole;
     private readonly Func<GoalPipeline, GoalPhase, string?, CancellationToken, Task<string>> _resolvePrompt;
-    private readonly Func<GoalPipeline, string?, CancellationToken, Task<IterationPlan>> _resolvePlan;
+    private readonly Func<GoalPipeline, string?, CancellationToken, Task<PlanResult>> _resolvePlan;
     private readonly Func<Goal, List<TargetRepository>> _resolveRepositories;
     private readonly Func<CancellationToken, Task> _syncAgents;
     private readonly Func<GoalPipeline, CancellationToken, Task<string>> _generateMergeCommitMessage;
@@ -47,7 +47,7 @@ internal sealed class PipelineDriver
         MetricsTracker? metricsTracker,
         Func<GoalPipeline, WorkerRole, string?, CancellationToken, Task> dispatchToRole,
         Func<GoalPipeline, GoalPhase, string?, CancellationToken, Task<string>> resolvePrompt,
-        Func<GoalPipeline, string?, CancellationToken, Task<IterationPlan>> resolvePlan,
+        Func<GoalPipeline, string?, CancellationToken, Task<PlanResult>> resolvePlan,
         Func<Goal, List<TargetRepository>> resolveRepositories,
         Func<CancellationToken, Task> syncAgents,
         Func<GoalPipeline, CancellationToken, Task<string>> generateMergeCommitMessage,
@@ -310,6 +310,20 @@ internal sealed class PipelineDriver
         }
     }
 
+    /// <summary>
+    /// Fails the goal because an iteration could not be planned. Synchronizes the state machine
+    /// with the terminal phase (<see cref="GoalLifecycleService.MarkGoalFailedAsync"/> advances
+    /// the pipeline phase itself, so this must not advance it beforehand).
+    /// </summary>
+    /// <param name="pipeline">The pipeline whose planning failed.</param>
+    /// <param name="reason">Why planning failed.</param>
+    /// <param name="ct">Cancellation token.</param>
+    private async Task FailPlanningAsync(GoalPipeline pipeline, string reason, CancellationToken ct)
+    {
+        pipeline.StateMachine.Fail();
+        await _lifecycleService.MarkGoalFailedAsync(pipeline, reason, ct);
+    }
+
     public async Task HandleNewIterationAsync(
         GoalPipeline pipeline, string verdict, CancellationToken ct)
     {
@@ -329,7 +343,10 @@ internal sealed class PipelineDriver
             return;
         }
 
-        pipeline.AdvanceTo(GoalPhase.Coding);
+        // NOTE: the pipeline phase is deliberately NOT advanced here. The new iteration's phase
+        // is only known after planning succeeds and is set from newPlan.Phases[0] below. Advancing
+        // to an assumed Coding phase would make planning observe a phase the Brain never chose,
+        // and would leave that wrong assumption behind if the caller cancels mid-planning.
 
         // Snapshot the ending iteration from PhaseLog
         var iterationSummary = PipelineHelpers.BuildIterationSummary(pipeline);
@@ -355,36 +372,57 @@ internal sealed class PipelineDriver
         // Reset metrics for the new iteration
         pipeline.Metrics.ResetForNewIteration(pipeline.Iteration);
 
-        // Re-plan the iteration with failure context
-        IterationPlan newPlan;
+        // Re-plan the iteration with failure context — a planning failure fails the goal
+        if (_brain is null)
+        {
+            await FailPlanningAsync(pipeline, "No brain available for re-planning", ct);
+            return;
+        }
+
+        PlanResult planResult;
         try
         {
-            if (_brain is not null)
-            {
-                var rawPlan = await _resolvePlan(pipeline, null, ct);
-                var originalPhases = rawPlan.Phases.ToList();
-                newPlan = IterationPlanValidator.ValidatePlan(rawPlan);
-
-                if (!originalPhases.SequenceEqual(newPlan.Phases))
-                {
-                    var note = IterationPlanValidator.BuildPlanAdjustmentNote(originalPhases, newPlan.Phases);
-                    await _brain.InjectSystemNoteAsync(pipeline, note, ct);
-                }
-            }
-            else
-            {
-                newPlan = IterationPlan.Default();
-            }
+            planResult = await _resolvePlan(pipeline, null, ct);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Cancelled by the planning call itself (e.g. Brain-side timeout), not by our caller —
+            // fail the goal gracefully rather than leaving it half-started.
+            _logger.LogWarning("Re-planning was cancelled for {GoalId}", pipeline.GoalId);
+            await FailPlanningAsync(pipeline, "Planning failed: planning was cancelled", CancellationToken.None);
+            return;
+        }
+        catch (OperationCanceledException)
+        {
+            // The caller's token was cancelled — service shutdown. Propagate so the goal
+            // is NOT marked Failed (no spurious failure on shutdown).
+            throw;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to re-plan iteration for {GoalId}, using default plan",
-                pipeline.GoalId);
-            newPlan = IterationPlan.Default();
+            // Never fall back to a default plan — a throw fails the goal with the reason.
+            _logger.LogError(ex, "Re-planning threw for {GoalId}", pipeline.GoalId);
+            await FailPlanningAsync(pipeline, $"Planning failed: {ex.Message}", ct);
+            return;
         }
+
+        if (planResult.IsFailed)
+        {
+            _logger.LogWarning("Failed to re-plan iteration for {GoalId}: {Reason}",
+                pipeline.GoalId, planResult.FailureReason);
+            await FailPlanningAsync(pipeline, planResult.FailureReason!, ct);
+            return;
+        }
+
+        var newPlan = planResult.Plan!;
 
         pipeline.SetPlan(newPlan);
         pipeline.StateMachine.StartIteration(newPlan.Phases);
+
+        // Honour the plan: the new iteration starts with whatever phase the Brain planned first,
+        // not an assumed Coding phase.
+        var firstPhase = newPlan.Phases[0];
+        pipeline.AdvanceTo(firstPhase);
 
         // Append a Brain summary of the completed iteration and the new plan to the progress document.
         var summaryAndPlan =
@@ -430,11 +468,11 @@ internal sealed class PipelineDriver
         }
 
         var fixPrompt = _brain is not null
-            ? await _resolvePrompt(pipeline, GoalPhase.Coding, context, ct)
+            ? await _resolvePrompt(pipeline, firstPhase, context, ct)
             : $"Fix issues for: {pipeline.Description}. {context}";
 
-        // PhaseLog: append a new entry for the coder phase in the new iteration
-        pipeline.PhaseLog.Add(PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1));
+        // PhaseLog: append a new entry for the first planned phase in the new iteration
+        pipeline.PhaseLog.Add(PhaseResult.Create(firstPhase, pipeline.Iteration, 1));
         if (pipeline.CurrentPhaseEntry is { } newIterEntry)
         {
             newIterEntry.WorkerPrompt = fixPrompt;
@@ -445,7 +483,7 @@ internal sealed class PipelineDriver
             newIterEntry.PlanningResponse = planningResponse;
         }
 
-        await _dispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
+        await _dispatchToRole(pipeline, firstPhase.ToWorkerRole(), fixPrompt, ct);
     }
 
     public async Task HandleMergeFailureAsync(GoalPipeline pipeline, string errorMessage, CancellationToken ct)
@@ -475,7 +513,9 @@ internal sealed class PipelineDriver
             await _lifecycleService.MarkGoalFailedAsync(pipeline, "Exceeded max iterations during merge conflict resolution", ct);
             return;
         }
-        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        // NOTE: the pipeline phase is deliberately NOT advanced here — see HandleNewIterationAsync.
+        // It is set from newPlan.Phases[0] once planning succeeds.
 
         var repos = _resolveRepositories(pipeline.Goal);
         var defaultBranch = repos.FirstOrDefault()?.DefaultBranch ?? "main";
@@ -495,34 +535,54 @@ internal sealed class PipelineDriver
             5. Commit the resolved changes
             """;
 
-        // Re-plan with full pipeline so the rebase goes through review and testing
-        IterationPlan newPlan;
+        // Re-plan with full pipeline so the rebase goes through review and testing —
+        // a planning failure fails the goal rather than substituting a default plan.
+        if (_brain is null)
+        {
+            await FailPlanningAsync(pipeline, "No brain available for re-planning", ct);
+            return;
+        }
+
+        PlanResult mergePlanResult;
         try
         {
-            if (_brain is not null)
-            {
-                var rawPlan = await _resolvePlan(pipeline, null, ct);
-                var originalPhases = rawPlan.Phases.ToList();
-                newPlan = IterationPlanValidator.ValidatePlan(rawPlan);
-
-                if (!originalPhases.SequenceEqual(newPlan.Phases))
-                {
-                    var note = IterationPlanValidator.BuildPlanAdjustmentNote(originalPhases, newPlan.Phases);
-                    await _brain.InjectSystemNoteAsync(pipeline, note, ct);
-                }
-            }
-            else
-            {
-                newPlan = IterationPlan.Default();
-            }
+            mergePlanResult = await _resolvePlan(pipeline, null, ct);
         }
-        catch
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            newPlan = IterationPlan.Default();
+            _logger.LogWarning("Merge-failure re-planning was cancelled for {GoalId}", pipeline.GoalId);
+            await FailPlanningAsync(pipeline, "Planning failed: planning was cancelled", CancellationToken.None);
+            return;
         }
+        catch (OperationCanceledException)
+        {
+            // The caller's token was cancelled — service shutdown. Propagate so the goal
+            // is NOT marked Failed (no spurious failure on shutdown).
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Merge-failure re-planning threw for {GoalId}", pipeline.GoalId);
+            await FailPlanningAsync(pipeline, $"Planning failed: {ex.Message}", ct);
+            return;
+        }
+
+        if (mergePlanResult.IsFailed)
+        {
+            _logger.LogWarning("Failed to re-plan merge-failure iteration for {GoalId}: {Reason}",
+                pipeline.GoalId, mergePlanResult.FailureReason);
+            await FailPlanningAsync(pipeline, mergePlanResult.FailureReason!, ct);
+            return;
+        }
+
+        var newPlan = mergePlanResult.Plan!;
 
         pipeline.SetPlan(newPlan);
         pipeline.StateMachine.StartIteration(newPlan.Phases);
+
+        // Honour the plan: start with the first planned phase rather than assuming Coding.
+        var firstPhase = newPlan.Phases[0];
+        pipeline.AdvanceTo(firstPhase);
 
         // Append a Brain summary of the failed-merge iteration and the new plan to the progress document.
         var mergeSummaryAndPlan =
@@ -532,9 +592,24 @@ internal sealed class PipelineDriver
         await AppendToProgressDocumentAsync(pipeline.GoalId, mergeSummaryAndPlan, ct);
 
         var fixPrompt = _brain is not null
-            ? await _resolvePrompt(pipeline, GoalPhase.Coding, rebaseContext, ct)
+            ? await _resolvePrompt(pipeline, firstPhase, rebaseContext, ct)
             : rebaseContext;
-        await _dispatchToRole(pipeline, WorkerRole.Coder, fixPrompt, ct);
+
+        // PhaseLog: append a new entry for the first planned phase of the retry iteration.
+        // Without this, CurrentPhaseEntry would still point at the prior Merging entry and the
+        // retry worker's output/verdict would overwrite the merge history.
+        pipeline.PhaseLog.Add(PhaseResult.Create(firstPhase, pipeline.Iteration, 1));
+        if (pipeline.CurrentPhaseEntry is { } firstPhaseEntry)
+        {
+            firstPhaseEntry.WorkerPrompt = fixPrompt;
+            firstPhaseEntry.BrainPrompt = PipelineHelpers.GetLastCraftPromptFromConversation(pipeline);
+            // Capture planning prompt/response from conversation onto the first entry of the new iteration
+            var (planningPrompt, planningResponse) = PipelineHelpers.GetPlanningPromptsFromConversation(pipeline);
+            firstPhaseEntry.PlanningPrompt = planningPrompt;
+            firstPhaseEntry.PlanningResponse = planningResponse;
+        }
+
+        await _dispatchToRole(pipeline, firstPhase.ToWorkerRole(), fixPrompt, ct);
     }
 
     /// <summary>Dispatch a specific pipeline phase to the appropriate worker.</summary>

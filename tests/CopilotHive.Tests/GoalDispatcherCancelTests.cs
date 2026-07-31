@@ -423,6 +423,8 @@ public sealed class GoalDispatcherCancelTests
             new TaskCompletionNotifier(),
             NullLogger<GoalDispatcher>.Instance,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            // A Brain is required to plan the resumed iteration — without one, resume fails the goal.
+            brain: new RetryStateFakeBrain(),
             goalStore: goalStore);
 
         // TCS to block the first resume while it holds the lock.
@@ -565,6 +567,8 @@ public sealed class GoalDispatcherClearRetryStateTests
             new TaskCompletionNotifier(),
             logger,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            // A Brain is required to plan the goal — without one, dispatch fails the goal.
+            brain: new RetryStateFakeBrain(),
             startupDelay: TimeSpan.Zero);
 
         // Act 1: Run the background service so DispatchNextGoalAsync executes and
@@ -1251,4 +1255,51 @@ public sealed class GoalDispatcherSessionCleanupTests
             }
         }
     }
+}
+
+/// <summary>
+/// Minimal <see cref="IDistributedBrain"/> that always returns a valid plan.
+/// A Brain is mandatory for dispatch: without one the goal is failed instead of dispatched.
+/// </summary>
+file sealed class RetryStateFakeBrain : IDistributedBrain
+{
+    public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
+        Task.FromResult(PlanResult.Success(IterationPlan.Default()));
+
+    public Task<PromptResult> CraftPromptAsync(
+        GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
+        Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+
+    public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult<string?>(null);
+
+    public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct) => Task.CompletedTask;
+
+    public Task<BrainResponse> AskQuestionAsync(
+        string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+        Task.FromResult(BrainResponse.Answer("Proceed."));
+
+    public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public bool GoalSessionExists(string goalId) => false;
+
+    public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+        Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
+
+    public BrainStats? GetStats() => null;
 }

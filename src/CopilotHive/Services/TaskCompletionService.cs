@@ -82,6 +82,13 @@ internal sealed class TaskCompletionService
         {
             await _pipelineDriver.DriveNextPhaseAsync(pipeline, result, ct);
         }
+        catch (OperationCanceledException)
+        {
+            // Caller cancellation (service shutdown) is NOT a pipeline failure. Propagate it
+            // instead of marking the goal Failed with an already-cancelled token — doing so
+            // would mutate the pipeline to Failed and then fail to persist it.
+            throw;
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error driving pipeline {GoalId} to next phase", pipeline.GoalId);
