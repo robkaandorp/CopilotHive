@@ -109,7 +109,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - Inspect repository history (git_log, git_diff, git_show, git_branch, git_blame, git_fetch)
         - Fetch remote branches (git_fetch(repository, remote?, branch?) — default: origin. Use to access remote feature branches.)
         - List configured repositories (list_repositories)
-        - Create and manage releases (create_release, list_releases, update_release)
+        - Create and manage releases (create_release, list_releases, get_release, update_release) — get_release retrieves a release's full record including attached goals
         - Manage knowledge documents in the knowledge graph (create_document, read_document, update_document, delete_document, search_knowledge, link_document, unlink_document, list_documents, traverse_graph)
         - Ask the user questions for clarification (ask_user)
         - Get the current date and time (get_current_time)
@@ -650,6 +650,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 "Create a new release in Planning status."),
             AIFunctionFactory.Create(ListReleasesAsync, "list_releases",
                 "List all releases with their status and goal count."),
+            AIFunctionFactory.Create(GetReleaseAsync, "get_release",
+                "Get the full record for a release, including its attached goals."),
             AIFunctionFactory.Create(UpdateReleaseAsync, "update_release",
                 "Update a field (tag, notes, or repositories) on a Planning release. Non-Planning releases cannot be edited."),
             AIFunctionFactory.Create(

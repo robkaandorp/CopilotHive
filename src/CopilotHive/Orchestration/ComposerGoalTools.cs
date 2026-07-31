@@ -708,6 +708,39 @@ public sealed partial class Composer
         return sb.ToString();
     }
 
+    [Description("Get full details for a release including its attached goals.")]
+    internal async Task<string> GetReleaseAsync(
+        [Description("Release ID to look up")] string id)
+    {
+        var error = Shared.ToolValidation.Check(
+            (!string.IsNullOrWhiteSpace(id), "id is required"));
+        if (error is not null) return error;
+
+        var release = await _goalStore.GetReleaseAsync(id);
+        if (release is null)
+            return $"❌ Release '{id}' not found.";
+
+        var goals = await _goalStore.GetGoalsByReleaseAsync(id);
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"✅ Release: {release.Id}");
+        sb.AppendLine($"- Tag: {release.Tag}");
+        sb.AppendLine($"- Status: {release.Status}");
+        sb.AppendLine($"- ExecutionState: {release.ExecutionState}");
+        sb.AppendLine($"- CreatedAt: {release.CreatedAt:yyyy-MM-dd HH:mm}");
+        sb.AppendLine($"- ReleasedAt: {(release.ReleasedAt.HasValue ? release.ReleasedAt.Value.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture) : "(not released)")}");
+        sb.AppendLine($"- RepositoryNames: {(release.RepositoryNames.Count > 0 ? string.Join(", ", release.RepositoryNames) : "(none)")}");
+        sb.AppendLine($"- Notes: {(string.IsNullOrWhiteSpace(release.Notes) ? "(none)" : release.Notes)}");
+        sb.AppendLine($"- Goals: {goals.Count} goal(s) attached");
+
+        foreach (var g in goals)
+        {
+            sb.AppendLine($"  - {g.Id} [Status: {g.Status.ToDisplayName()}, Priority: {g.Priority}, Scope: {g.Scope}]");
+        }
+
+        return sb.ToString();
+    }
+
     [Description("Update a field on a Planning release. Only tag, notes, and repositories can be changed. Non-Planning releases cannot be edited.")]
     internal async Task<string> UpdateReleaseAsync(
         [Description("Release ID to update")] string id,

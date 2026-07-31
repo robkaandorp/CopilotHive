@@ -5496,6 +5496,109 @@ public sealed class UpdateReleaseComposerToolTests : IDisposable
         var tools = _composer.BuildComposerTools();
         Assert.Contains(tools, t => t.Name == "update_release");
     }
+
+    // ── get_release ──
+
+    [Fact]
+    public void BuildComposerTools_IncludesGetRelease()
+    {
+        var tools = _composer.BuildComposerTools();
+        var names = tools.OfType<AIFunction>().Select(t => t.Name).ToList();
+        Assert.Contains("get_release", names);
+    }
+
+    [Fact]
+    public void SystemPrompt_MentionsGetReleaseCapability()
+    {
+        var prompt = _composer.GetSystemPrompt();
+        Assert.Contains("get_release", prompt);
+    }
+
+    [Fact]
+    public async Task GetRelease_NonexistentId_ReturnsNotFound()
+    {
+        var result = await _composer.GetReleaseAsync("nonexistent");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not found", result);
+    }
+
+    [Fact]
+    public async Task GetRelease_NoGoals_ReturnsZeroGoals()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateReleaseAsync("v9.9.9", "v9.9.9", "Test notes");
+
+        var result = await _composer.GetReleaseAsync("v9.9.9");
+
+        Assert.Contains("v9.9.9", result);
+        Assert.Contains("v9.9.9", result); // Tag
+        Assert.Contains("Planning", result); // Status
+        Assert.Contains("None", result); // ExecutionState
+        Assert.Contains("CreatedAt", result);
+        Assert.Contains("Test notes", result); // Notes
+        Assert.Contains("0 goal(s) attached", result);
+    }
+
+    [Fact]
+    public async Task GetRelease_WithGoals_ReturnsFullRecord()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var releaseId = "v2.0.0";
+        await _composer.CreateReleaseAsync(releaseId, "v2.0.0", "Release with goals", "repo-a, repo-b");
+
+        var goal1 = new Goal
+        {
+            Id = "goal-for-release-1",
+            Description = "First goal for the release",
+            Status = GoalStatus.Pending,
+            Priority = GoalPriority.High,
+            Scope = GoalScope.Feature,
+        };
+        goal1.ReleaseId = releaseId;
+        await _store.CreateGoalAsync(goal1, ct);
+
+        var goal2 = new Goal
+        {
+            Id = "goal-for-release-2",
+            Description = "Second goal for the release",
+            Status = GoalStatus.Completed,
+            Priority = GoalPriority.Normal,
+            Scope = GoalScope.Patch,
+        };
+        goal2.ReleaseId = releaseId;
+        await _store.CreateGoalAsync(goal2, ct);
+
+        var result = await _composer.GetReleaseAsync(releaseId);
+
+        // Release fields
+        Assert.Contains(releaseId, result);
+        Assert.Contains("v2.0.0", result); // Tag
+        Assert.Contains("Planning", result); // Status
+        Assert.Contains("None", result); // ExecutionState
+        Assert.Contains("CreatedAt", result);
+        Assert.Contains("(not released)", result); // ReleasedAt null for Planning release
+        Assert.Contains("repo-a", result); // RepositoryNames
+        Assert.Contains("repo-b", result);
+        Assert.Contains("Release with goals", result); // Notes
+
+        // Goal 1 details
+        Assert.Contains("goal-for-release-1", result);
+        Assert.Contains("Pending", result);
+        Assert.Contains("High", result);
+        Assert.Contains("Feature", result);
+
+        // Goal 2 details
+        Assert.Contains("goal-for-release-2", result);
+        Assert.Contains("Completed", result);
+        Assert.Contains("Normal", result);
+        Assert.Contains("Patch", result);
+
+        // Goals count
+        Assert.Contains("2 goal(s) attached", result);
+    }
 }
 
 /// <summary>
