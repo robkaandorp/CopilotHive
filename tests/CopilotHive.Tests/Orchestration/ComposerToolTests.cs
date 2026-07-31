@@ -1251,6 +1251,292 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("No goals matching", result);
     }
 
+    // ── search_goals — release filter (opt-in) ──
+    //
+    // The release parameter on search_goals is OPT-IN: when omitted (or "all"),
+    // no release filtering is applied and the header/empty-message remain identical
+    // to the pre-feature output. A genuinely-active filter ("unreleased", specific id,
+    // or blank→unreleased) is labeled in both the header and empty message.
+
+    [Fact]
+    public async Task SearchGoals_ReleaseOmitted_NoFilterLabel()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Seed a Released release so a goal in it WOULD be filtered out by "unreleased".
+        await _store.CreateReleaseAsync(new Release { Id = "rel-released", Tag = "v1.0", Status = ReleaseStatus.Released }, ct);
+
+        await _composer.CreateGoalAsync("search-free", "Shared keyword for matching");
+        await _composer.CreateGoalAsync("search-released", "Shared keyword for matching in released");
+        var releasedGoal = await _store.GetGoalAsync("search-released", ct);
+        Assert.NotNull(releasedGoal);
+        releasedGoal!.ReleaseId = "rel-released";
+        await _store.UpdateGoalAsync(releasedGoal, ct);
+
+        // Omitted release → no filtering, no label.
+        var result = await _composer.SearchGoalsAsync("keyword");
+
+        Assert.Contains("**2 result(s) for 'keyword':**", result);
+        Assert.DoesNotContain("release filter", result);
+        Assert.Contains("search-free", result);
+        Assert.Contains("search-released", result); // proves no filtering — would be excluded by unreleased
+
+        // Empty-message variant: non-matching query, omitted release → exact message, no filter label.
+        var emptyResult = await _composer.SearchGoalsAsync("zzz-nonexistent");
+        Assert.Contains("No goals matching 'zzz-nonexistent'.", emptyResult);
+        Assert.DoesNotContain("release filter", emptyResult);
+    }
+
+    [Theory]
+    [InlineData("all")]
+    [InlineData("ALL")]
+    [InlineData("All")]
+    public async Task SearchGoals_ReleaseAll_NoFilterLabel(string release)
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _store.CreateReleaseAsync(new Release { Id = "rel-released", Tag = "v1.0", Status = ReleaseStatus.Released }, ct);
+
+        await _composer.CreateGoalAsync("search-free", "Shared keyword for matching");
+        await _composer.CreateGoalAsync("search-released", "Shared keyword for matching in released");
+        var releasedGoal = await _store.GetGoalAsync("search-released", ct);
+        Assert.NotNull(releasedGoal);
+        releasedGoal!.ReleaseId = "rel-released";
+        await _store.UpdateGoalAsync(releasedGoal, ct);
+
+        // "all" must be byte-for-byte identical to omitted — no label, same goals, same empty message.
+        var omittedResult = await _composer.SearchGoalsAsync("keyword");
+        var allResult = await _composer.SearchGoalsAsync("keyword", release: release);
+
+        Assert.Equal(omittedResult, allResult);
+        Assert.Contains("**2 result(s) for 'keyword':**", allResult);
+        Assert.DoesNotContain("release filter", allResult);
+        Assert.Contains("search-free", allResult);
+        Assert.Contains("search-released", allResult);
+
+        var omittedEmptyResult = await _composer.SearchGoalsAsync("zzz-nonexistent");
+        var allEmptyResult = await _composer.SearchGoalsAsync("zzz-nonexistent", release: release);
+
+        Assert.Equal(omittedEmptyResult, allEmptyResult);
+        Assert.Contains("No goals matching 'zzz-nonexistent'.", allEmptyResult);
+        Assert.DoesNotContain("release filter", allEmptyResult);
+    }
+
+    [Fact]
+    public async Task SearchGoals_ReleaseUnreleased_FiltersAndLabels()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Null ReleaseId → included; Released release → excluded; Planning release → included.
+        await _store.CreateReleaseAsync(new Release { Id = "rel-released", Tag = "v1.0", Status = ReleaseStatus.Released }, ct);
+        await _store.CreateReleaseAsync(new Release { Id = "rel-planning", Tag = "v2.0", Status = ReleaseStatus.Planning }, ct);
+
+        await _composer.CreateGoalAsync("null-release-goal", "Shared keyword alpha");
+        await _composer.CreateGoalAsync("released-goal", "Shared keyword alpha released");
+        var releasedGoal = await _store.GetGoalAsync("released-goal", ct);
+        Assert.NotNull(releasedGoal);
+        releasedGoal!.ReleaseId = "rel-released";
+        await _store.UpdateGoalAsync(releasedGoal, ct);
+
+        await _composer.CreateGoalAsync("planning-goal", "Shared keyword alpha planning");
+        var planningGoal = await _store.GetGoalAsync("planning-goal", ct);
+        Assert.NotNull(planningGoal);
+        planningGoal!.ReleaseId = "rel-planning";
+        await _store.UpdateGoalAsync(planningGoal, ct);
+
+        var result = await _composer.SearchGoalsAsync("alpha", release: "unreleased");
+
+        Assert.Contains("(release filter: unreleased)", result);
+        Assert.Contains("null-release-goal", result);
+        Assert.Contains("planning-goal", result);
+        Assert.DoesNotContain("released-goal", result);
+    }
+
+    [Fact]
+    public async Task SearchGoals_ReleaseSpecificId_TagAndStatusMatch()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Two releases with the SAME tag but DIFFERENT statuses.
+        await _store.CreateReleaseAsync(new Release { Id = "v1.0.0-alpha1", Tag = "v1.0.0", Status = ReleaseStatus.Planning }, ct);
+        await _store.CreateReleaseAsync(new Release { Id = "v1.0.0-shipped", Tag = "v1.0.0", Status = ReleaseStatus.Released }, ct);
+
+        await _composer.CreateGoalAsync("alpha-goal", "Shared keyword beta");
+        var alphaGoal = await _store.GetGoalAsync("alpha-goal", ct);
+        Assert.NotNull(alphaGoal);
+        alphaGoal!.ReleaseId = "v1.0.0-alpha1";
+        await _store.UpdateGoalAsync(alphaGoal, ct);
+
+        await _composer.CreateGoalAsync("shipped-goal", "Shared keyword beta shipped");
+        var shippedGoal = await _store.GetGoalAsync("shipped-goal", ct);
+        Assert.NotNull(shippedGoal);
+        shippedGoal!.ReleaseId = "v1.0.0-shipped";
+        await _store.UpdateGoalAsync(shippedGoal, ct);
+
+        // Filter by the Planning release id — same-tag same-status included, same-tag different-status excluded.
+        var result = await _composer.SearchGoalsAsync("beta", release: "v1.0.0-alpha1");
+
+        Assert.Contains("(release filter: v1.0.0-alpha1)", result);
+        Assert.Contains("alpha-goal", result);
+        Assert.DoesNotContain("shipped-goal", result);
+    }
+
+    [Fact]
+    public async Task SearchGoals_ReleaseUnknownId_ExactIdFallback()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Goal with ReleaseId pointing to an ID that does NOT match any created release.
+        await _composer.CreateGoalAsync("unknown-rel-goal", "Shared keyword gamma");
+        var goal = await _store.GetGoalAsync("unknown-rel-goal", ct);
+        Assert.NotNull(goal);
+        goal!.ReleaseId = "no-such-release";
+        await _store.UpdateGoalAsync(goal, ct);
+
+        await _composer.CreateGoalAsync("other-goal", "Shared keyword gamma other");
+
+        var result = await _composer.SearchGoalsAsync("gamma", release: "no-such-release");
+
+        Assert.Contains("(release filter: no-such-release)", result);
+        Assert.Contains("unknown-rel-goal", result);  // exact-id fallback finds it
+        Assert.DoesNotContain("other-goal", result);
+    }
+
+    [Fact]
+    public async Task SearchGoals_ReleaseFilter_EmptyMessage_NamesFilter()
+    {
+        var result = await _composer.SearchGoalsAsync("nonexistent", release: "unreleased");
+
+        Assert.Contains("No goals matching", result);
+        Assert.Contains("(release filter: unreleased)", result);
+    }
+
+    [Fact]
+    public async Task SearchGoals_ReleaseBlank_TreatedAsUnreleased()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Null ReleaseId → included; Released release → excluded; Planning release → included.
+        await _store.CreateReleaseAsync(new Release { Id = "rel-released", Tag = "v1.0", Status = ReleaseStatus.Released }, ct);
+        await _store.CreateReleaseAsync(new Release { Id = "rel-planning", Tag = "v2.0", Status = ReleaseStatus.Planning }, ct);
+
+        await _composer.CreateGoalAsync("null-release-goal", "Shared keyword delta");
+        await _composer.CreateGoalAsync("released-goal", "Shared keyword delta released");
+        var releasedGoal = await _store.GetGoalAsync("released-goal", ct);
+        Assert.NotNull(releasedGoal);
+        releasedGoal!.ReleaseId = "rel-released";
+        await _store.UpdateGoalAsync(releasedGoal, ct);
+
+        await _composer.CreateGoalAsync("planning-goal", "Shared keyword delta planning");
+        var planningGoal = await _store.GetGoalAsync("planning-goal", ct);
+        Assert.NotNull(planningGoal);
+        planningGoal!.ReleaseId = "rel-planning";
+        await _store.UpdateGoalAsync(planningGoal, ct);
+
+        // Whitespace-only release is non-null, so it normalizes to "unreleased" — a real labeled filter.
+        var result = await _composer.SearchGoalsAsync("delta", release: "   ");
+
+        Assert.Contains("(release filter: unreleased)", result);
+        Assert.Contains("null-release-goal", result);
+        Assert.Contains("planning-goal", result);
+        Assert.DoesNotContain("released-goal", result);
+    }
+
+    [Fact]
+    public async Task SearchGoals_StatusUnfiltered_NoReleaseLabelInHeader()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _store.CreateReleaseAsync(new Release { Id = "rel-released", Tag = "v1.0", Status = ReleaseStatus.Released }, ct);
+
+        await _composer.CreateGoalAsync("draft-free", "Shared keyword phi");
+        await _composer.CreateGoalAsync("draft-released", "Shared keyword phi released");
+        var releasedGoal = await _store.GetGoalAsync("draft-released", ct);
+        Assert.NotNull(releasedGoal);
+        releasedGoal!.ReleaseId = "rel-released";
+        await _store.UpdateGoalAsync(releasedGoal, ct);
+
+        // Status filter without release must not add a release label and must be identical to status+all.
+        var statusResult = await _composer.SearchGoalsAsync("phi", status: "Draft");
+        var statusAllResult = await _composer.SearchGoalsAsync("phi", status: "Draft", release: "all");
+
+        Assert.Equal(statusResult, statusAllResult);
+        Assert.Contains("**2 result(s) for 'phi':**", statusResult);
+        Assert.DoesNotContain("release filter", statusResult); // header never includes status or release label
+        Assert.Contains("draft-free", statusResult);
+        Assert.Contains("draft-released", statusResult);
+
+        var emptyStatusResult = await _composer.SearchGoalsAsync("zzz-nonexistent", status: "Draft");
+        var emptyStatusAllResult = await _composer.SearchGoalsAsync("zzz-nonexistent", status: "Draft", release: "all");
+
+        Assert.Equal(emptyStatusResult, emptyStatusAllResult);
+        Assert.Contains("No goals matching 'zzz-nonexistent' with status Draft.", emptyStatusResult);
+        Assert.DoesNotContain("release filter", emptyStatusResult);
+    }
+
+    [Fact]
+    public async Task SearchGoals_StatusPlusRelease_Combines()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _store.CreateReleaseAsync(new Release { Id = "rel-planning", Tag = "v2.0", Status = ReleaseStatus.Planning }, ct);
+
+        // Draft goal with null ReleaseId — matches status=Draft AND unreleased.
+        await _composer.CreateGoalAsync("draft-free", "Shared keyword epsilon");
+
+        // Pending goal with null ReleaseId — matches unreleased but NOT status=Draft.
+        await _composer.CreateGoalAsync("pending-free", "Shared keyword epsilon pending");
+        var pendingGoal = await _store.GetGoalAsync("pending-free", ct);
+        Assert.NotNull(pendingGoal);
+        pendingGoal!.Status = GoalStatus.Pending;
+        await _store.UpdateGoalAsync(pendingGoal, ct);
+
+        // Draft goal in a Planning release — matches status=Draft AND unreleased (Planning is unreleased).
+        await _composer.CreateGoalAsync("draft-in-planning", "Shared keyword epsilon planning");
+        var draftInPlanning = await _store.GetGoalAsync("draft-in-planning", ct);
+        Assert.NotNull(draftInPlanning);
+        draftInPlanning!.ReleaseId = "rel-planning";
+        await _store.UpdateGoalAsync(draftInPlanning, ct);
+
+        // Filter by status=Draft AND release=unreleased.
+        var result = await _composer.SearchGoalsAsync("epsilon", status: "Draft", release: "unreleased");
+
+        Assert.Contains("(release filter: unreleased)", result);
+        Assert.Contains("draft-free", result);
+        Assert.Contains("draft-in-planning", result);
+        Assert.DoesNotContain("pending-free", result); // excluded by status filter
+    }
+
+    [Fact]
+    public void SearchGoals_RegisteredWithReleaseParameter()
+    {
+        var tools = _composer.BuildComposerTools();
+        var searchGoals = tools.OfType<AIFunction>().Single(t => t.Name == "search_goals");
+
+        var parameters = searchGoals.UnderlyingMethod!.GetParameters();
+        var releaseParam = parameters.Single(p => p.Name == "release");
+
+        Assert.True(releaseParam.HasDefaultValue);
+        Assert.Null(releaseParam.DefaultValue); // opt-in: default is null (no filtering)
+
+        var descriptionAttr = releaseParam.GetCustomAttributesData()
+            .First(a => a.AttributeType.FullName == "System.ComponentModel.DescriptionAttribute");
+        var description = descriptionAttr.ConstructorArguments[0].Value as string;
+
+        Assert.NotNull(description);
+        Assert.Contains("release", description, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("omitted", description, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void SearchGoals_SystemPromptDocumentsReleaseFilter()
+    {
+        var prompt = _composer.GetSystemPrompt();
+
+        Assert.Contains("search_goals", prompt);
+        Assert.Contains("release filter", prompt, StringComparison.OrdinalIgnoreCase);
+    }
+
     // ── Goal ID validation (via CreateGoalAsync) ──
 
     [Theory]

@@ -599,12 +599,30 @@ public sealed partial class Composer
         return truncated + $"\n... (truncated, {lines.Length} lines total)";
     }
 
-    [Description("List goals, optionally filtered by status and release. Default release filter is 'unreleased' (goals not in a shipped release). Use 'all' to show every goal, or pass a release ID to filter to that release (selects all releases sharing its tag and status). The output always names the active release filter.")]
-    internal async Task<string> ListGoalsAsync(
-        [Description("Optional status filter: Draft, Pending, InProgress, Completed, Failed")] string? status = null,
-        [Description("Optional release filter: 'unreleased' (default), 'all', or a release ID")] string? release = null)
+    /// <summary>
+    /// Normalizes the raw release parameter and, when a real filter is active, applies
+    /// the same release-filter semantics used by both list_goals and search_goals.
+    /// Returns the filtered sequence and the effective release label for display.
+    /// </summary>
+    /// <param name="goals">Goals to filter.</param>
+    /// <param name="release">Raw release value; null/omitted means no filtering.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>
+    /// A tuple: (filtered goals, effective release label, filter active flag).
+    /// When <paramref name="release"/> is null or "all", the input sequence is returned
+    /// unchanged and <c>isFilterActive</c> is false.
+    /// </returns>
+    private async Task<(IEnumerable<Goal> Filtered, string EffectiveRelease, bool IsFilterActive)> ApplyReleaseFilterAsync(
+        IEnumerable<Goal> goals, string? release, CancellationToken ct)
     {
-        var trimmedRelease = release?.Trim() ?? string.Empty;
+        // Only an actually omitted/null value bypasses filtering. A non-null value,
+        // including whitespace-only, is normalized just like list_goals (blank → "unreleased").
+        if (release is null)
+        {
+            return (goals, string.Empty, false);
+        }
+
+        var trimmedRelease = release.Trim();
         var effectiveRelease = string.IsNullOrEmpty(trimmedRelease) ? "unreleased" : trimmedRelease;
 
         if (effectiveRelease.Equals("unreleased", StringComparison.OrdinalIgnoreCase) ||
@@ -613,19 +631,18 @@ public sealed partial class Composer
             effectiveRelease = effectiveRelease.ToLowerInvariant();
         }
 
-        var allGoals = await _goalStore.GetAllGoalsAsync();
-
-        IEnumerable<Goal> filtered = allGoals;
-
         if (effectiveRelease == "all")
         {
-            // No release filtering applied.
+            return (goals, effectiveRelease, false);
         }
-        else if (effectiveRelease == "unreleased")
+
+        IEnumerable<Goal> filtered = goals;
+
+        if (effectiveRelease == "unreleased")
         {
             var releases = await _goalStore.GetReleasesAsync();
             var releaseStatusById = releases.ToDictionary(r => r.Id, r => r.Status);
-            filtered = allGoals.Where(g =>
+            filtered = goals.Where(g =>
                 string.IsNullOrEmpty(g.ReleaseId) ||
                 (releaseStatusById.TryGetValue(g.ReleaseId, out var s) && s == ReleaseStatus.Planning));
         }
@@ -639,8 +656,26 @@ public sealed partial class Composer
                     .Select(r => r.Id)
                     .ToHashSet()
                 : new HashSet<string> { effectiveRelease };
-            filtered = allGoals.Where(g => g.ReleaseId is not null && taggedReleaseIds.Contains(g.ReleaseId));
+            filtered = goals.Where(g => g.ReleaseId is not null && taggedReleaseIds.Contains(g.ReleaseId));
         }
+
+        return (filtered, effectiveRelease, true);
+    }
+
+    [Description("List goals, optionally filtered by status and release. Default release filter is 'unreleased' (goals not in a shipped release). Use 'all' to show every goal, or pass a release ID to filter to that release (selects all releases sharing its tag and status). The output always names the active release filter.")]
+    internal async Task<string> ListGoalsAsync(
+        [Description("Optional status filter: Draft, Pending, InProgress, Completed, Failed")] string? status = null,
+        [Description("Optional release filter: 'unreleased' (default), 'all', or a release ID")] string? release = null)
+    {
+        // list_goals defaults omitted release to "unreleased".
+        var listRelease = release?.Trim() ?? string.Empty;
+        if (string.IsNullOrEmpty(listRelease))
+        {
+            listRelease = "unreleased";
+        }
+
+        var allGoals = await _goalStore.GetAllGoalsAsync();
+        var (filtered, effectiveRelease, _) = await ApplyReleaseFilterAsync(allGoals, listRelease, CancellationToken.None);
 
         var goals = filtered.ToList();
 
@@ -668,7 +703,8 @@ public sealed partial class Composer
     [Description("Search goals using tokenized multi-term search (AND logic) across ID, description, and failure reason.")]
     internal async Task<string> SearchGoalsAsync(
         [Description("Search query text")] string query,
-        [Description("Optional status filter: Draft, Pending, InProgress, Completed, Failed")] string? status = null)
+        [Description("Optional status filter: Draft, Pending, InProgress, Completed, Failed")] string? status = null,
+        [Description("Optional release filter: 'unreleased', 'all', or a release ID. When omitted, no release filtering is applied.")] string? release = null)
     {
         var error = Shared.ToolValidation.Check(
             (!string.IsNullOrWhiteSpace(query), "query is required"));
@@ -680,11 +716,26 @@ public sealed partial class Composer
 
         var results = await _goalStore.SearchGoalsAsync(query, statusFilter);
 
+        var (filtered, effectiveRelease, isFilterActive) = await ApplyReleaseFilterAsync(results, release, CancellationToken.None);
+        results = filtered.ToList();
+
         if (results.Count == 0)
-            return $"No goals matching '{query}'" + (statusFilter.HasValue ? $" with status {statusFilter}" : "") + ".";
+        {
+            var releasePart = isFilterActive && !string.IsNullOrEmpty(effectiveRelease)
+                ? $" (release filter: {effectiveRelease})"
+                : string.Empty;
+            return $"No goals matching '{query}'" + (statusFilter.HasValue ? $" with status {statusFilter}" : "") + releasePart + ".";
+        }
 
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine($"**{results.Count} result(s) for '{query}':**\n");
+        if (isFilterActive && !string.IsNullOrEmpty(effectiveRelease))
+        {
+            sb.AppendLine($"**{results.Count} result(s) for '{query}' (release filter: {effectiveRelease}):**\n");
+        }
+        else
+        {
+            sb.AppendLine($"**{results.Count} result(s) for '{query}':**\n");
+        }
 
         foreach (var g in results)
         {

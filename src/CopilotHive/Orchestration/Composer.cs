@@ -97,7 +97,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
         Your capabilities:
         - Read the codebase to understand current state (read_file, glob, grep)
-        - Search existing goals to avoid duplication (search_goals)
+        - Search existing goals to avoid duplication (search_goals, with optional release filter)
         - Browse goal history and status (list_goals, get_goal)
         - Drill into worker phase output, brain prompts, or worker prompts for Coding, Testing, Review, DocWriting, or Improve (get_phase_output)
         - Create goals as drafts for user review (create_goal)
@@ -625,7 +625,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             AIFunctionFactory.Create(ListGoalsAsync, "list_goals",
                 "List goals, optionally filtered by status and release. Default release filter is 'unreleased'. Use 'all' for all goals or a release ID for a specific release (selects all releases sharing its tag and status). Output always names the active filter."),
             AIFunctionFactory.Create(SearchGoalsAsync, "search_goals",
-                "Search goals by text query across ID, description, and failure reason."),
+                "Search goals by text query across ID, description, and failure reason. Optional release filter: 'unreleased', 'all', or a release ID. When omitted, no release filtering is applied ('all' is equivalent to omitted)."),
             AIFunctionFactory.Create(DeleteGoalAsync, "delete_goal",
                 "Permanently delete a goal. Only Draft or Failed goals can be deleted."),
             AIFunctionFactory.Create(CancelGoalAsync, "cancel_goal",
