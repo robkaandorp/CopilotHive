@@ -18,6 +18,14 @@ namespace CopilotHive.Services;
 /// </summary>
 internal sealed class PipelineDriver
 {
+    /// <summary>
+    /// Replaces every character that could break a log line into multiple lines with <c>?</c>,
+    /// so an unusual or malicious changed-file path cannot inject fake log entries.
+    /// Delegates to <see cref="LogSanitizer.SanitizePath"/> so the worker-side and
+    /// orchestrator-side log sites share one definition of "unsafe".
+    /// </summary>
+    internal static string SanitizeLogPath(string path) => LogSanitizer.SanitizePath(path);
+
     private readonly IDistributedBrain? _brain;
     private readonly GoalLifecycleService _lifecycleService;
     private readonly GoalManager _goalManager;
@@ -188,9 +196,24 @@ internal sealed class PipelineDriver
             pipeline.GoalId, pipeline.Phase, outputPreview);
 
         if (result.GitStatus is { FilesChanged: > 0, Pushed: false })
-            _logger.LogWarning(
-                "Task {TaskId} had {Files} file changes but push failed",
-                result.TaskId, result.GitStatus.FilesChanged);
+        {
+            var changedFiles = result.GitStatus.ChangedFiles;
+            if (changedFiles.Count > 0)
+            {
+                var remaining = result.GitStatus.FilesChanged - changedFiles.Count;
+                var pathList = string.Join(", ", changedFiles.Select(SanitizeLogPath));
+                var moreMarker = remaining > 0 ? $" (+{remaining} more)" : "";
+                _logger.LogWarning(
+                    "Task {TaskId} had {Files} file changes but push failed. Changed files: {ChangedFiles}{More}",
+                    result.TaskId, result.GitStatus.FilesChanged, pathList, moreMarker);
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "Task {TaskId} had {Files} file changes but push failed",
+                    result.TaskId, result.GitStatus.FilesChanged);
+            }
+        }
 
         // Extract structured verdict from worker tool call metrics
         var verdict = Verdict.Pass; // Default: worker completed successfully

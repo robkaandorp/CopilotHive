@@ -464,6 +464,129 @@ public sealed class GrpcMapperTests
         Assert.False(restored.GitStatus.Pushed);
     }
 
+    // ── GitChangeSummary.ChangedFiles ─────────────────────────────────────────
+
+    /// <summary>
+    /// The changed-file path list must survive a full domain → gRPC → domain round-trip,
+    /// preserving order and the real repository-relative paths (not basenames).
+    /// </summary>
+    [Fact]
+    public void GitChangeSummary_ChangedFiles_RoundTripPreservesPathsAndOrder()
+    {
+        List<string> paths =
+        [
+            "src/Services/Foo.cs",
+            "src/CopilotHive.Worker/GitOperations.cs",
+            "tests/CopilotHive.Tests/GrpcMapperTests.cs",
+        ];
+
+        var result = BuildFullTaskResult() with
+        {
+            GitStatus = new GitChangeSummary
+            {
+                FilesChanged = 3,
+                Insertions = 12,
+                Deletions = 4,
+                Pushed = false,
+                ChangedFiles = paths,
+            },
+        };
+
+        var complete = GrpcMapper.ToGrpc(result);
+
+        // gRPC side carries the same repeated field content
+        Assert.Equal(paths, complete.GitStatus.ChangedFiles);
+
+        var restored = GrpcMapper.ToDomain(complete);
+
+        Assert.NotNull(restored.GitStatus);
+        Assert.Equal(paths, restored.GitStatus!.ChangedFiles);
+        // Count fields still map correctly alongside the new list
+        Assert.Equal(3, restored.GitStatus.FilesChanged);
+        Assert.Equal(12, restored.GitStatus.Insertions);
+        Assert.Equal(4, restored.GitStatus.Deletions);
+        Assert.False(restored.GitStatus.Pushed);
+    }
+
+    /// <summary>
+    /// An empty changed-file list round-trips as a NON-NULL empty list on the domain side.
+    /// </summary>
+    [Fact]
+    public void GitChangeSummary_EmptyChangedFiles_RoundTripsAsNonNullEmptyList()
+    {
+        var result = BuildFullTaskResult() with
+        {
+            GitStatus = new GitChangeSummary
+            {
+                FilesChanged = 0,
+                Insertions = 0,
+                Deletions = 0,
+                Pushed = true,
+                ChangedFiles = [],
+            },
+        };
+
+        var complete = GrpcMapper.ToGrpc(result);
+        Assert.Empty(complete.GitStatus.ChangedFiles);
+
+        var restored = GrpcMapper.ToDomain(complete);
+
+        Assert.NotNull(restored.GitStatus);
+        Assert.NotNull(restored.GitStatus!.ChangedFiles);
+        Assert.Empty(restored.GitStatus.ChangedFiles);
+        Assert.True(restored.GitStatus.Pushed);
+    }
+
+    /// <summary>
+    /// A gRPC <see cref="GitStatus"/> built without ever touching <c>changed_files</c>
+    /// maps to a non-null empty domain list.
+    /// </summary>
+    [Fact]
+    public void GitStatus_ToDomain_WithoutChangedFiles_YieldsEmptyList()
+    {
+        var status = new GitStatus
+        {
+            FilesChanged = 7,
+            Insertions = 1,
+            Deletions = 2,
+            Pushed = false,
+        };
+
+        var domain = GrpcMapper.ToDomain(status);
+
+        Assert.NotNull(domain.ChangedFiles);
+        Assert.Empty(domain.ChangedFiles);
+        Assert.Equal(7, domain.FilesChanged);
+        Assert.Equal(1, domain.Insertions);
+        Assert.Equal(2, domain.Deletions);
+        Assert.False(domain.Pushed);
+    }
+
+    /// <summary>
+    /// Repository-qualified paths (multi-repo aggregation form) survive the round-trip verbatim.
+    /// </summary>
+    [Fact]
+    public void GitChangeSummary_RepoQualifiedChangedFiles_RoundTripVerbatim()
+    {
+        List<string> paths = ["repoA:src/A.cs", "repoB:tests/B.cs"];
+
+        var result = BuildFullTaskResult() with
+        {
+            GitStatus = new GitChangeSummary
+            {
+                FilesChanged = 2,
+                Insertions = 5,
+                Deletions = 1,
+                Pushed = false,
+                ChangedFiles = paths,
+            },
+        };
+
+        var restored = GrpcMapper.ToDomain(GrpcMapper.ToGrpc(result));
+
+        Assert.Equal(paths, restored.GitStatus!.ChangedFiles);
+    }
+
     [Fact]
     public void TaskMetrics_IssuesList_RoundTripPreservesOrder()
     {

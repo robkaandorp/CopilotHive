@@ -400,6 +400,189 @@ public sealed class GitOperationsTests : IAsyncLifetime
         Assert.True(summary.Insertions > 0);
     }
 
+    /// <summary>
+    /// The changed-file list must contain the real repository-relative paths reported by
+    /// <c>git diff --numstat</c> — including nested directories — not just basenames.
+    /// </summary>
+    [Fact]
+    public async Task GetGitStatusAsync_CollectsRepositoryRelativeChangedPaths()
+    {
+        await CommitFileAsync("base.txt", "base content\n");
+
+        var (_, symRefOut, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "symbolic-ref --short HEAD", CancellationToken.None);
+        var defaultBranch = symRefOut.Trim();
+
+        await GitOperations.CreateBranchAsync(_repoDir, "feature-paths", defaultBranch, CancellationToken.None);
+
+        Directory.CreateDirectory(Path.Combine(_repoDir, "src", "Services"));
+        await CommitFileAsync(Path.Combine("src", "Services", "Foo.cs").Replace('\\', '/'), "class Foo {}\n");
+
+        var summary = await GitOperations.GetGitStatusAsync(_repoDir, null, CancellationToken.None);
+
+        Assert.Equal(1, summary.FilesChanged);
+        Assert.Contains("src/Services/Foo.cs", summary.ChangedFiles);
+        // Path is repository-relative, never a bare basename
+        Assert.DoesNotContain("Foo.cs", summary.ChangedFiles);
+    }
+
+    /// <summary>
+    /// The orphan-branch empty-tree fallback must also collect changed-file paths.
+    /// </summary>
+    [Fact]
+    public async Task GetGitStatusAsync_OrphanBranch_CollectsChangedPathsFromFallback()
+    {
+        var (_, symRefOut, _) = await GitOperations.RunGitCommandAsync(
+            _repoDir, "symbolic-ref --short HEAD", CancellationToken.None);
+        var defaultBranch = symRefOut.Trim();
+
+        await GitOperations.CreateBranchAsync(_repoDir, "orphan-paths", defaultBranch, CancellationToken.None);
+        await CommitFileAsync("alpha.txt", "line1\nline2\n");
+
+        Directory.CreateDirectory(Path.Combine(_repoDir, "nested"));
+        await CommitFileAsync(Path.Combine("nested", "beta.txt").Replace('\\', '/'), "a\nb\nc\n");
+
+        var summary = await GitOperations.GetGitStatusAsync(
+            _repoDir, "nonexistent-base", CancellationToken.None);
+
+        Assert.Equal(2, summary.FilesChanged);
+        Assert.Contains("alpha.txt", summary.ChangedFiles);
+        Assert.Contains("nested/beta.txt", summary.ChangedFiles);
+    }
+
+    /// <summary>
+    /// A GENUINE zero-diff: an empty commit on top of a real commit means nothing changed
+    /// between HEAD~1 and HEAD. Both the count and the path list must be empty.
+    /// </summary>
+    [Fact]
+    public async Task GetGitStatusAsync_NoChanges_ReturnsEmptyChangedFiles()
+    {
+        await CommitFileAsync("one.txt", "one\n");
+
+        // An empty commit produces a truly empty diff against its parent.
+        await RunAsync(_repoDir, "commit --allow-empty -m \"empty commit\"");
+
+        // baseBranch null → diffs HEAD~1...HEAD, which is the empty commit vs its parent.
+        var summary = await GitOperations.GetGitStatusAsync(_repoDir, null, CancellationToken.None);
+
+        Assert.Equal(0, summary.FilesChanged);
+        Assert.NotNull(summary.ChangedFiles);
+        Assert.Empty(summary.ChangedFiles);
+        Assert.Equal(0, summary.Insertions);
+        Assert.Equal(0, summary.Deletions);
+    }
+
+    /// <summary>
+    /// Filenames that plain <c>git diff --numstat</c> would C-quote (spaces, double quotes,
+    /// backslashes, non-ASCII) must be captured verbatim by the NUL-delimited parser —
+    /// with no surrounding quotes and no escape sequences.
+    /// </summary>
+    [Fact]
+    public async Task GetGitStatusAsync_FilenamesWithSpecialCharacters_AreCapturedVerbatim()
+    {
+        await CommitFileAsync("seed.txt", "seed\n");
+
+        Directory.CreateDirectory(Path.Combine(_repoDir, "dir with space"));
+        var specialNames = new[]
+        {
+            "dir with space/plain space.txt",
+            "dir with space/qu\"ote.txt",
+            "back\\slash.txt",
+            "unicode-é-ünï.txt",
+            "single'quote.txt",
+        };
+
+        foreach (var name in specialNames)
+            await File.WriteAllTextAsync(Path.Combine(_repoDir, name), "content\n", TestContext.Current.CancellationToken);
+
+        await RunAsync(_repoDir, "add -A");
+        await RunAsync(_repoDir, "commit -m \"add special names\"");
+
+        var summary = await GitOperations.GetGitStatusAsync(_repoDir, null, CancellationToken.None);
+
+        Assert.Equal(specialNames.Length, summary.FilesChanged);
+        foreach (var name in specialNames)
+            Assert.Contains(name, summary.ChangedFiles);
+
+        // No C-quoting artifacts leaked through: no path is wrapped in double quotes
+        // and no backslash-escape sequence was introduced.
+        Assert.DoesNotContain(summary.ChangedFiles, p => p.StartsWith('"') && p.EndsWith('"'));
+        Assert.DoesNotContain(summary.ChangedFiles, p => p.Contains("\\\""));
+        Assert.DoesNotContain(summary.ChangedFiles, p => p.Contains("\\303"));
+    }
+
+    /// <summary>
+    /// A filename with a leading/trailing space is legal in Git. The parser must NOT trim it,
+    /// otherwise the reported path no longer identifies the real file.
+    /// </summary>
+    [Fact]
+    public async Task GetGitStatusAsync_FilenameWithLeadingTrailingWhitespace_IsNotTrimmed()
+    {
+        await CommitFileAsync("seed.txt", "seed\n");
+
+        const string paddedName = " padded name ";
+        await File.WriteAllTextAsync(Path.Combine(_repoDir, paddedName), "content\n", TestContext.Current.CancellationToken);
+        await RunAsync(_repoDir, "add -A");
+        await RunAsync(_repoDir, "commit -m \"add padded name\"");
+
+        var summary = await GitOperations.GetGitStatusAsync(_repoDir, null, CancellationToken.None);
+
+        Assert.Contains(paddedName, summary.ChangedFiles);
+        Assert.DoesNotContain(paddedName.Trim(), summary.ChangedFiles);
+    }
+
+    /// <summary>
+    /// A rename record must yield the NEW path, never Git's <c>old =&gt; new</c> display notation
+    /// and never the old path.
+    /// </summary>
+    [Fact]
+    public async Task GetGitStatusAsync_RenamedFile_CapturesNewPathNotArrowNotation()
+    {
+        // A sizeable file so Git's rename detection fires on the identical content.
+        var body = string.Join("\n", Enumerable.Range(1, 50).Select(i => $"line {i} content here"));
+        await CommitFileAsync("oldname.txt", body + "\n");
+
+        Directory.CreateDirectory(Path.Combine(_repoDir, "sub"));
+        await RunAsync(_repoDir, "mv oldname.txt sub/newname.txt");
+        await RunAsync(_repoDir, "commit -m \"rename file\"");
+
+        var summary = await GitOperations.GetGitStatusAsync(_repoDir, null, CancellationToken.None);
+
+        Assert.Contains("sub/newname.txt", summary.ChangedFiles);
+        Assert.DoesNotContain("oldname.txt", summary.ChangedFiles);
+        Assert.DoesNotContain(summary.ChangedFiles, p => p.Contains("=>"));
+        // Counts stay consistent with the recorded path list.
+        Assert.Equal(1, summary.FilesChanged);
+        Assert.Single(summary.ChangedFiles);
+    }
+
+    /// <summary>
+    /// A rename mixed with ordinary modifications must not desynchronise the NUL-record cursor:
+    /// every changed file is still reported exactly once with its correct path.
+    /// </summary>
+    [Fact]
+    public async Task GetGitStatusAsync_RenameMixedWithEdits_ParsesAllRecords()
+    {
+        var body = string.Join("\n", Enumerable.Range(1, 50).Select(i => $"line {i} content here"));
+        await CommitFileAsync("tomove.txt", body + "\n");
+        await CommitFileAsync("stable.txt", "stable\n");
+
+        await RunAsync(_repoDir, "mv tomove.txt moved.txt");
+        await File.WriteAllTextAsync(Path.Combine(_repoDir, "stable.txt"), "stable edited\n", TestContext.Current.CancellationToken);
+        await File.WriteAllTextAsync(Path.Combine(_repoDir, "brandnew.txt"), "new\n", TestContext.Current.CancellationToken);
+        await RunAsync(_repoDir, "add -A");
+        await RunAsync(_repoDir, "commit -m \"rename plus edits\"");
+
+        var summary = await GitOperations.GetGitStatusAsync(_repoDir, null, CancellationToken.None);
+
+        Assert.Contains("moved.txt", summary.ChangedFiles);
+        Assert.Contains("stable.txt", summary.ChangedFiles);
+        Assert.Contains("brandnew.txt", summary.ChangedFiles);
+        Assert.DoesNotContain("tomove.txt", summary.ChangedFiles);
+        Assert.DoesNotContain(summary.ChangedFiles, p => p.Contains("=>"));
+        Assert.Equal(summary.FilesChanged, summary.ChangedFiles.Count);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private async Task CommitFileAsync(string fileName, string content)

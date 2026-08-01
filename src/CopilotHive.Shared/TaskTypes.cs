@@ -133,6 +133,14 @@ public sealed record GitChangeSummary
     public int Deletions { get; init; }
     /// <summary>Whether the changes were pushed to the remote.</summary>
     public bool Pushed { get; init; }
+    /// <summary>
+    /// Repository-relative paths of the changed files. Never null. When more than one
+    /// repository has changes, each path is qualified with its repository name
+    /// (<c>repoName:relativePath</c>). Truncated to
+    /// <c>GitOperations.ChangedFilesMaxPaths</c> entries; never contains synthetic
+    /// truncation markers.
+    /// </summary>
+    public List<string> ChangedFiles { get; init; } = [];
 }
 
 /// <summary>Domain-level branch action.</summary>

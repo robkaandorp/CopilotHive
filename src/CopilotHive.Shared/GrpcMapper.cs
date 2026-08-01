@@ -109,6 +109,7 @@ public static class GrpcMapper
             Insertions = status.Insertions,
             Deletions = status.Deletions,
             Pushed = status.Pushed,
+            ChangedFiles = [.. status.ChangedFiles],
         };
     }
 
@@ -214,6 +215,7 @@ public static class GrpcMapper
                 Insertions = result.GitStatus.Insertions,
                 Deletions = result.GitStatus.Deletions,
                 Pushed = result.GitStatus.Pushed,
+                ChangedFiles = { result.GitStatus.ChangedFiles },
             };
         }
         return complete;

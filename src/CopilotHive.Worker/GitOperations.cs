@@ -10,6 +10,12 @@ namespace CopilotHive.Worker;
 public static class GitOperations
 {
     /// <summary>
+    /// Maximum number of changed-file paths carried in a <see cref="GitChangeSummary"/>.
+    /// This is the single cap governing the diagnostic path list length.
+    /// </summary>
+    public const int ChangedFilesMaxPaths = 50;
+
+    /// <summary>
     /// Clones a remote repository into the specified target directory.
     /// Throws <see cref="GitOperationException"/> on failure.
     /// </summary>
@@ -140,15 +146,19 @@ public static class GitOperations
         var filesChanged = 0;
         var insertions = 0;
         var deletions = 0;
+        List<string> changedFiles = [];
 
         // Diff stat: compare all changes on the feature branch vs the base branch.
         // Uses three-dot diff (base...HEAD) to capture everything since the branch point.
+        // `--numstat -z` yields NUL-delimited records with UNQUOTED paths, so filenames with
+        // tabs, newlines, quotes, backslashes or non-ASCII bytes are captured verbatim.
+        // `--stat` is deliberately omitted: its human-readable table would corrupt the -z stream.
         var diffRef = !string.IsNullOrEmpty(baseBranch) ? $"origin/{baseBranch}...HEAD" : "HEAD~1";
         var (statExit, statOut, _) = await RunGitCommandAsync(
-            repoDir, $"diff --stat --numstat {diffRef}", ct);
+            repoDir, $"diff --numstat -z {diffRef}", ct);
         if (statExit == 0)
         {
-            ParseDiffStat(statOut, ref filesChanged, ref insertions, ref deletions);
+            ParseDiffStat(statOut, ref filesChanged, ref insertions, ref deletions, changedFiles);
         }
         else
         {
@@ -156,9 +166,9 @@ public static class GitOperations
             // diff HEAD against the empty tree so we still capture all files added on this branch.
             const string EmptyTreeSha = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
             var (fallbackExit, fallbackOut, _) = await RunGitCommandAsync(
-                repoDir, $"diff --stat --numstat {EmptyTreeSha} HEAD", ct);
+                repoDir, $"diff --numstat -z {EmptyTreeSha} HEAD", ct);
             if (fallbackExit == 0)
-                ParseDiffStat(fallbackOut, ref filesChanged, ref insertions, ref deletions);
+                ParseDiffStat(fallbackOut, ref filesChanged, ref insertions, ref deletions, changedFiles);
         }
 
         return new GitChangeSummary
@@ -166,6 +176,7 @@ public static class GitOperations
             FilesChanged = filesChanged,
             Insertions = insertions,
             Deletions = deletions,
+            ChangedFiles = changedFiles,
         };
     }
 
@@ -252,18 +263,57 @@ public static class GitOperations
         }
     }
 
-    private static void ParseDiffStat(string numstatOutput, ref int filesChanged, ref int insertions, ref int deletions)
+    /// <summary>
+    /// Parses the NUL-delimited output of <c>git diff --numstat -z</c>.
+    /// </summary>
+    /// <remarks>
+    /// With <c>-z</c> git disables C-quoting of paths and uses NUL terminators, so filenames
+    /// containing tabs, newlines, quotes, backslashes or non-ASCII bytes survive verbatim.
+    /// The wire format is a stream of NUL-terminated records:
+    /// <list type="bullet">
+    /// <item>ordinary record: <c>insertions\tdeletions\tpath\0</c></item>
+    /// <item>rename/copy record: <c>insertions\tdeletions\t\0oldPath\0newPath\0</c> — the path
+    /// field inside the first token is EMPTY and the old and new paths follow as two separate
+    /// NUL-terminated fields. The NEW path is recorded (never <c>old =&gt; new</c> notation).</item>
+    /// </list>
+    /// Paths are never trimmed: leading and trailing whitespace is legal in a filename.
+    /// Binary files report <c>-</c> for the counts, which simply contributes no line totals.
+    /// </remarks>
+    private static void ParseDiffStat(
+        string numstatOutput,
+        ref int filesChanged,
+        ref int insertions,
+        ref int deletions,
+        List<string> changedFiles)
     {
-        var lines = numstatOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        // Do NOT use RemoveEmptyEntries: empty fields are meaningful (rename records) and
+        // splitting keeps a trailing empty token after the final NUL terminator.
+        var fields = numstatOutput.Split('\0');
 
-        foreach (var line in lines)
+        for (var i = 0; i < fields.Length; i++)
         {
-            var parts = line.Split('\t', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length < 3) continue;
+            // Split into at most 3 parts so tabs embedded in the path are preserved.
+            var parts = fields[i].Split('\t', 3);
+            if (parts.Length < 3) continue; // trailing empty token or malformed record
 
             filesChanged++;
             if (int.TryParse(parts[0], out var added)) insertions += added;
             if (int.TryParse(parts[1], out var removed)) deletions += removed;
+
+            string path;
+            if (parts[2].Length == 0 && i + 2 < fields.Length)
+            {
+                // Rename/copy record: the two following NUL-terminated fields are old, then new.
+                path = fields[i + 2];
+                i += 2;
+            }
+            else
+            {
+                path = parts[2];
+            }
+
+            if (path.Length > 0)
+                changedFiles.Add(path);
         }
     }
 }

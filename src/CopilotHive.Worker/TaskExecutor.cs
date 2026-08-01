@@ -21,6 +21,16 @@ public sealed class TaskExecutor(
     private const string WorkRoot = "/copilot-home";
     private const string ConfigRepoDir = "/config-repo";
     private const string ConfigAgentsDir = "/config-repo/agents";
+
+    /// <summary>
+    /// Maximum number of changed-file paths rendered into the worker-side Improver log line.
+    /// Keeps the log bounded regardless of how many files the improver touched; the remainder
+    /// is reported as a <c>(+N more)</c> count. This governs LOG OUTPUT ONLY — the diagnostic
+    /// <see cref="GitChangeSummary.ChangedFiles"/> list is governed by
+    /// <see cref="GitOperations.ChangedFilesMaxPaths"/>.
+    /// </summary>
+    internal const int ImproverLogMaxPaths = 10;
+
     private readonly WorkerLogger _log = new("Task");
     private readonly IGitOperations _git = gitOperations ?? new DefaultGitOperations();
 
@@ -268,6 +278,15 @@ public sealed class TaskExecutor(
             {
                 var isReviewer = task.Role == WorkerRole.Reviewer;
 
+                // Accumulate counts and changed-file paths across ALL repositories that
+                // have changes. Paths are repo-qualified only when more than one repo changed.
+                var totalFilesChanged = 0;
+                var totalInsertions = 0;
+                var totalDeletions = 0;
+                var anyChanges = false;
+                var allPushed = true;
+                List<(string RepoName, GitChangeSummary Status)> changedRepos = [];
+
                 foreach (var (repo, dir) in repoDirectories)
                 {
                     var baseBranch = task.BranchInfo?.BaseBranch ?? repo.DefaultBranch;
@@ -295,20 +314,40 @@ public sealed class TaskExecutor(
                     }
 
                     // Only consider repos with actual changes for the aggregate.
-                    // Repos with no changes must never overwrite an existing aggregate or set FilesChanged=0.
+                    // Repos with no changes must never contribute counts or flip Pushed.
                     if (status.FilesChanged > 0)
                     {
-                        if (aggregatedStatus is null)
-                            aggregatedStatus = new GitChangeSummary
-                            {
-                                FilesChanged = status.FilesChanged,
-                                Insertions = status.Insertions,
-                                Deletions = status.Deletions,
-                                Pushed = pushed,
-                            };
-                        else if (!pushed)
-                            aggregatedStatus = aggregatedStatus with { Pushed = false };
+                        anyChanges = true;
+                        totalFilesChanged += status.FilesChanged;
+                        totalInsertions += status.Insertions;
+                        totalDeletions += status.Deletions;
+                        if (!pushed)
+                            allPushed = false;
+                        changedRepos.Add((repo.Name, status));
                     }
+                }
+
+                if (anyChanges)
+                {
+                    List<string> allChangedFiles = [];
+                    var qualify = changedRepos.Count > 1;
+                    foreach (var (repoName, status) in changedRepos)
+                    {
+                        foreach (var path in status.ChangedFiles)
+                            allChangedFiles.Add(qualify ? $"{repoName}:{path}" : path);
+                    }
+
+                    if (allChangedFiles.Count > GitOperations.ChangedFilesMaxPaths)
+                        allChangedFiles = [.. allChangedFiles.Take(GitOperations.ChangedFilesMaxPaths)];
+
+                    aggregatedStatus = new GitChangeSummary
+                    {
+                        FilesChanged = totalFilesChanged,
+                        Insertions = totalInsertions,
+                        Deletions = totalDeletions,
+                        Pushed = allPushed,
+                        ChangedFiles = allChangedFiles,
+                    };
                 }
 
                 if (pushErrors.Count > 0)
@@ -660,18 +699,35 @@ public sealed class TaskExecutor(
             return new GitChangeSummary();
         }
 
-        // Check if there are staged changes
+        // Check if there are staged changes.
+        // `-z` gives NUL-delimited, UNQUOTED paths so filenames with unusual characters survive.
         var (diffExit, diffOut, _) = await _git.RunGitCommandAsync(
-            ConfigRepoDir, "diff --cached --name-only", ct);
+            ConfigRepoDir, "diff --cached --name-only -z", ct);
         if (diffExit != 0 || string.IsNullOrWhiteSpace(diffOut))
         {
             _log.Info("No agents.md changes to commit");
             return new GitChangeSummary();
         }
 
-        var changedFiles = diffOut.Trim().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        var changedFiles = diffOut.Split('\0', StringSplitOptions.RemoveEmptyEntries);
         var filesChanged = changedFiles.Length;
-        _log.Info($"Improver changed {filesChanged} file(s): {string.Join(", ", changedFiles)}");
+
+        // Diagnostic path list for the orchestrator. The config repo is a SINGLE repository,
+        // so paths stay plain relative (no `repoName:` qualification). Capped by the single
+        // named constant; the cap never inserts a synthetic truncation marker.
+        List<string> cappedPaths = changedFiles.Length > GitOperations.ChangedFilesMaxPaths
+            ? [.. changedFiles.Take(GitOperations.ChangedFilesMaxPaths)]
+            : [.. changedFiles];
+
+        // The `-z` query returns UNQUOTED paths, so a legal staged filename may contain
+        // newlines, tabs, ESC or Unicode line separators. Bound the number of paths shown and
+        // sanitize each one so a filename can never forge extra worker log lines. The
+        // `(+N more)` suffix is log formatting only and never enters `cappedPaths`.
+        var displayPaths = changedFiles.Length > ImproverLogMaxPaths
+            ? changedFiles[..ImproverLogMaxPaths]
+            : changedFiles;
+        _log.Info($"Improver changed {filesChanged} file(s): " +
+                  $"{LogSanitizer.FormatPathList(displayPaths, filesChanged)}");
 
         // Commit
         var (commitExit, commitOut, commitErr) = await _git.RunGitCommandAsync(
@@ -679,7 +735,7 @@ public sealed class TaskExecutor(
         if (commitExit != 0)
         {
             _log.Error($"git commit failed: {commitErr.Trim()}");
-            return new GitChangeSummary { FilesChanged = filesChanged };
+            return new GitChangeSummary { FilesChanged = filesChanged, ChangedFiles = cappedPaths };
         }
 
         _log.Info($"Committed: {commitOut.Trim()}");
@@ -702,7 +758,7 @@ public sealed class TaskExecutor(
             if (pushExit != 0)
             {
                 _log.Error($"git push failed: {pushErr.Trim()}");
-                return new GitChangeSummary { FilesChanged = filesChanged };
+                return new GitChangeSummary { FilesChanged = filesChanged, ChangedFiles = cappedPaths };
             }
 
             pushed = true;
@@ -713,6 +769,11 @@ public sealed class TaskExecutor(
             _log.Error($"Push failed: {ex.Message}");
         }
 
-        return new GitChangeSummary { FilesChanged = filesChanged, Pushed = pushed };
+        return new GitChangeSummary
+        {
+            FilesChanged = filesChanged,
+            Pushed = pushed,
+            ChangedFiles = cappedPaths,
+        };
     }
 }

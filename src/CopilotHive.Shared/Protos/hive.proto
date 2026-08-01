@@ -184,6 +184,7 @@ message GitStatus {
   int32 insertions = 5;
   int32 deletions = 6;
   bool pushed = 7;
+  repeated string changed_files = 8;   // Repository-relative paths of changed files
 }
 
 message TaskMetrics {

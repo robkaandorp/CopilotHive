@@ -1679,6 +1679,204 @@ public sealed class GoalDispatcherPushFailureLoggingTests
             l.Message.Contains("push failed"));
         Assert.True(pushWarning == default, $"Unexpected push failure warning log found.");
     }
+
+    private static async Task<List<(LogLevel Level, string Message)>> RunPushFailureAsync(
+        string goalId, GitChangeSummary gitStatus)
+    {
+        var logger = new CollectingLogger<GoalDispatcher>();
+        var brain = new FakeDispatcherBrain();
+        var taskQueue = new TaskQueue();
+        var goal = new Goal { Id = goalId, Description = "Test push failure paths" };
+        var goalSource = new FakeGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalSource);
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        var taskId = $"task-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+        pipeline.SetActiveTask(taskId);
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain);
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "Coder completed.",
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+            GitStatus = gitStatus,
+        }, TestContext.Current.CancellationToken);
+
+        return logger.Logs;
+    }
+
+    /// <summary>
+    /// The push-failure warning must list the changed-file paths so the Composer/user can
+    /// tell which files the worker touched — including repository-qualified paths.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_PushFailureWarning_IncludesChangedFilePaths()
+    {
+        var logs = await RunPushFailureAsync("goal-push-paths", new GitChangeSummary
+        {
+            FilesChanged = 3,
+            Insertions = 30,
+            Deletions = 5,
+            Pushed = false,
+            ChangedFiles = ["repoA:src/Services/Foo.cs", "repoA:tests/FooTests.cs", "repoB:docs/README.md"],
+        });
+
+        var warning = logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Warning && l.Message.Contains("push failed"));
+        Assert.True(warning != default, "Expected push failure warning log.");
+        Assert.Contains("repoA:src/Services/Foo.cs", warning.Message);
+        Assert.Contains("repoA:tests/FooTests.cs", warning.Message);
+        Assert.Contains("repoB:docs/README.md", warning.Message);
+        // Not truncated → no "+N more" marker
+        Assert.DoesNotContain("more)", warning.Message);
+    }
+
+    /// <summary>
+    /// When the path list is shorter than the file count, the log adds a "+N more"
+    /// marker derived at format time (never stored in the list itself).
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_PushFailureWarning_AddsPlusNMoreWhenTruncated()
+    {
+        var logs = await RunPushFailureAsync("goal-push-truncated", new GitChangeSummary
+        {
+            FilesChanged = 60,
+            Insertions = 100,
+            Deletions = 10,
+            Pushed = false,
+            ChangedFiles = ["src/A.cs", "src/B.cs"],
+        });
+
+        var warning = logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Warning && l.Message.Contains("push failed"));
+        Assert.True(warning != default, "Expected push failure warning log.");
+        Assert.Contains("src/A.cs", warning.Message);
+        Assert.Contains("(+58 more)", warning.Message);
+    }
+
+    /// <summary>
+    /// Control characters in changed-file paths must be sanitized so a worker cannot inject
+    /// extra lines into the orchestrator log.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_PushFailureWarning_SanitizesControlCharacters()
+    {
+        var logs = await RunPushFailureAsync("goal-push-injection", new GitChangeSummary
+        {
+            FilesChanged = 1,
+            Pushed = false,
+            ChangedFiles = ["src/evil\n2026-01-01 FATAL fake\r\tline.cs"],
+        });
+
+        var warning = logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Warning && l.Message.Contains("push failed"));
+        Assert.True(warning != default, "Expected push failure warning log.");
+        Assert.DoesNotContain("\n", warning.Message);
+        Assert.DoesNotContain("\r", warning.Message);
+        Assert.DoesNotContain("\t", warning.Message);
+        Assert.Contains("src/evil?", warning.Message);
+    }
+
+    /// <summary>
+    /// When no paths are available, the warning omits the path section entirely.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_PushFailureWarning_OmitsPathSectionWhenListEmpty()
+    {
+        var logs = await RunPushFailureAsync("goal-push-nopaths", new GitChangeSummary
+        {
+            FilesChanged = 4,
+            Pushed = false,
+            ChangedFiles = [],
+        });
+
+        var warning = logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Warning && l.Message.Contains("push failed"));
+        Assert.True(warning != default, "Expected push failure warning log.");
+        Assert.DoesNotContain("Changed files:", warning.Message);
+    }
+
+    [Theory]
+    [InlineData("src/Foo.cs", "src/Foo.cs")]
+    [InlineData("a\nb", "a?b")]
+    [InlineData("a\r\nb", "a??b")]
+    [InlineData("a\tb", "a?b")]
+    [InlineData("", "")]
+    // NUL, backspace, vertical tab, form feed and other C0 characters
+    [InlineData("a\0b", "a?b")]
+    [InlineData("a\bb", "a?b")]
+    [InlineData("a\vb", "a?b")]
+    [InlineData("a\fb", "a?b")]
+    [InlineData("a\u0001\u0002\u0003\u0004b", "a????b")]
+    [InlineData("a\u0005\u0006\u0007\u0008b", "a????b")]
+    [InlineData("a\u001Bb", "a?b")]      // ESC — ANSI escape sequence injection
+    [InlineData("a\u007Fb", "a?b")]      // DEL
+    // Unicode line-breaking characters
+    [InlineData("a\u0085b", "a?b")]      // NEL (NEXT LINE)
+    [InlineData("a\u2028b", "a?b")]      // LINE SEPARATOR
+    [InlineData("a\u2029b", "a?b")]      // PARAGRAPH SEPARATOR
+    // Legal non-ASCII path characters must survive untouched
+    [InlineData("src/é-ünï-文件.cs", "src/é-ünï-文件.cs")]
+    [InlineData(" padded name ", " padded name ")]
+    public void SanitizeLogPath_ReplacesControlCharacters(string input, string expected)
+    {
+        Assert.Equal(expected, PipelineDriver.SanitizeLogPath(input));
+    }
+
+    /// <summary>
+    /// A path packed with EVERY category of line-breaking / control character must be fully
+    /// neutralised in the emitted warning: the formatted message must remain a single line
+    /// with no raw control characters at all.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_PushFailureWarning_SanitizesAllControlAndUnicodeLineBreakers()
+    {
+        // Every C0 control char (excluding none), DEL, and the Unicode line breakers,
+        // embedded in an otherwise ordinary-looking path used to forge a second log line.
+        var c0 = new string([.. Enumerable.Range(0, 0x20).Select(i => (char)i)]);
+        var evilPath = $"src/evil{c0}\u007F\u0085\u2028\u20292026-01-01 FATAL forged entry.cs";
+
+        var logs = await RunPushFailureAsync("goal-push-allcontrol", new GitChangeSummary
+        {
+            FilesChanged = 2,
+            Pushed = false,
+            ChangedFiles = [evilPath, "src/Ok.cs"],
+        });
+
+        var warning = logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Warning && l.Message.Contains("push failed"));
+        Assert.True(warning != default, "Expected push failure warning log.");
+
+        // No raw control character of ANY kind survived into the formatted message.
+        Assert.DoesNotContain(warning.Message, char.IsControl);
+        Assert.DoesNotContain('\u2028', warning.Message);
+        Assert.DoesNotContain('\u2029', warning.Message);
+
+        // Therefore the log entry is strictly single-line under every splitting convention.
+        Assert.Single(warning.Message.Split(['\n', '\r', '\u0085', '\u2028', '\u2029']));
+
+        // The surrounding legal text is preserved, and the clean sibling path is intact.
+        Assert.Contains("src/evil", warning.Message);
+        Assert.Contains("FATAL forged entry.cs", warning.Message);
+        Assert.Contains("src/Ok.cs", warning.Message);
+    }
 }
 
 /// <summary>
