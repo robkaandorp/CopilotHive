@@ -78,10 +78,14 @@ public sealed class TaskExecutorTests
         /// <summary>Every argument string passed to <see cref="RunGitCommandAsync"/>, in order.</summary>
         public List<string> GitCommands { get; } = [];
 
+        /// <summary>Every working directory passed to <see cref="RunGitCommandAsync"/>, in order.</summary>
+        public List<string> WorkDirs { get; } = [];
+
         public Task<(int ExitCode, string Stdout, string Stderr)> RunGitCommandAsync(
             string workDir, string args, CancellationToken ct)
         {
             GitCommands.Add(args);
+            WorkDirs.Add(workDir);
             var scripted = GitCommandResponder?.Invoke(args);
             return Task.FromResult(scripted ?? (0, "", ""));
         }
@@ -127,6 +131,12 @@ public sealed class TaskExecutorTests
         /// <summary>Captures the catalog passed to <see cref="SetSubAgentModels"/>, or null if never called.</summary>
         public IReadOnlyList<SubAgentModelDto>? CapturedSubAgentModels { get; private set; }
 
+        /// <summary>The working directory passed to the most recent <see cref="SendPromptAsync"/> call.</summary>
+        public string? LastWorkDir { get; private set; }
+
+        /// <summary>The prompt content passed to the most recent <see cref="SendPromptAsync"/> call.</summary>
+        public string? LastPrompt { get; private set; }
+
         public void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models) => CapturedSubAgentModels = models;
         public void SetSession(object? session) => _session = session;
         public object? GetSession() => _session;
@@ -140,6 +150,8 @@ public sealed class TaskExecutorTests
             // mock reports here so they are visible to the code that reads LastWorkerReport/LastTestReport.
             LastWorkerReport = WorkerReportToReturn;
             LastTestReport = TestReportToReturn;
+            LastWorkDir = workDir;
+            LastPrompt = prompt;
             return Task.FromResult("Mock agent response");
         }
 
@@ -610,9 +622,10 @@ public sealed class TaskExecutorTests
     public async Task ExecuteAsync_WithNoReports_SummaryIsEmpty()
     {
         // Arrange
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
         var git = new MockGitOperations { FilesChanged = 0 };
         var agentRunner = new MockAgentRunner(); // No reports set
-        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+        var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: configRepoDir);
 
         var task = new WorkTask
         {
@@ -629,6 +642,11 @@ public sealed class TaskExecutorTests
 
         // Assert
         Assert.Equal("", result.Metrics!.Summary);
+
+        // Path-resolution assertions: improver working directory and context header resolve to the injected agents path.
+        var expectedAgentsDir = Path.Combine(configRepoDir, "agents");
+        Assert.Equal(expectedAgentsDir, agentRunner.LastWorkDir);
+        Assert.Contains($"Working directory: {expectedAgentsDir}", agentRunner.LastPrompt);
     }
 
     // ── Missing report tool tests ──────────────────────────────────────────────
@@ -707,9 +725,10 @@ public sealed class TaskExecutorTests
     public async Task ExecuteAsync_ImproverWithoutReport_Passes()
     {
         // Arrange
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
         var git = new MockGitOperations { FilesChanged = 0 };
         var agentRunner = new MockAgentRunner(); // No reports set
-        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+        var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: configRepoDir);
 
         var task = new WorkTask
         {
@@ -727,28 +746,27 @@ public sealed class TaskExecutorTests
         // Assert
         Assert.Equal("PASS", result.Metrics!.Verdict);
         Assert.Empty(result.Metrics.Issues);
+
+        // Path-resolution assertions: improver working directory and context header resolve to the injected agents path.
+        var expectedAgentsDir = Path.Combine(configRepoDir, "agents");
+        Assert.Equal(expectedAgentsDir, agentRunner.LastWorkDir);
+        Assert.Contains($"Working directory: {expectedAgentsDir}", agentRunner.LastPrompt);
     }
 
     // ── Improver config-repo changed-file paths ───────────────────────────────
 
     /// <summary>
-    /// The improver path only runs when the config repo looks like a git clone. Ensures the
-    /// <c>/config-repo/.git</c> marker exists and returns a disposable that removes it again
-    /// only if this call created it, so ambient container state is left untouched.
+    /// Creates a fresh per-test config-repo directory (with a <c>.git</c> marker and an
+    /// <c>agents</c> subfolder) and returns a disposable that removes it. All improver
+    /// tests use this instead of the hardcoded <c>/config-repo</c> path so they can run
+    /// in CI environments that do not mount the Docker config repo.
     /// </summary>
-    private static IDisposable EnsureConfigRepoMarker()
+    private static IDisposable EnsureConfigRepoMarker(out string configRepoDir)
     {
-        const string gitMarker = "/config-repo/.git";
-        if (Directory.Exists(gitMarker))
-            return new NoopDisposable();
-
-        Directory.CreateDirectory(gitMarker);
-        return new DirectoryRemover(gitMarker);
-    }
-
-    private sealed class NoopDisposable : IDisposable
-    {
-        public void Dispose() { }
+        configRepoDir = Path.Combine(Path.GetTempPath(), $"copilothive-test-config-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(configRepoDir, ".git"));
+        Directory.CreateDirectory(Path.Combine(configRepoDir, "agents"));
+        return new DirectoryRemover(configRepoDir);
     }
 
     private sealed class DirectoryRemover(string path) : IDisposable
@@ -800,14 +818,15 @@ public sealed class TaskExecutorTests
     [Fact]
     public async Task ExecuteAsync_ImproverPushSucceeds_ReportsConfigRepoChangedPaths()
     {
-        using var marker = EnsureConfigRepoMarker();
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
 
         string[] staged = ["agents/reviewer.agents.md", "agents/coder.agents.md"];
+        var agentRunner = new MockAgentRunner();
         var git = new MockGitOperations
         {
             GitCommandResponder = ConfigRepoResponder(staged, pushFails: false),
         };
-        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+        var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: configRepoDir);
 
         var result = await executor.ExecuteAsync(
             BuildImproverTask("improver-push-ok"), TestContext.Current.CancellationToken);
@@ -816,6 +835,12 @@ public sealed class TaskExecutorTests
         Assert.True(result.GitStatus!.Pushed);
         Assert.Equal(2, result.GitStatus.FilesChanged);
         Assert.Equal(staged, result.GitStatus.ChangedFiles);
+
+        // Path-resolution assertions: git work dir, agent work dir, and prompt context all resolve to the injected agents path.
+        var expectedAgentsDir = Path.Combine(configRepoDir, "agents");
+        Assert.Contains(configRepoDir, git.WorkDirs);
+        Assert.Equal(expectedAgentsDir, agentRunner.LastWorkDir);
+        Assert.Contains($"Working directory: {expectedAgentsDir}", agentRunner.LastPrompt);
     }
 
     /// <summary>
@@ -826,14 +851,15 @@ public sealed class TaskExecutorTests
     [Fact]
     public async Task ExecuteAsync_ImproverPushFails_StillReportsConfigRepoChangedPaths()
     {
-        using var marker = EnsureConfigRepoMarker();
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
 
         string[] staged = ["agents/reviewer.agents.md", "agents/tester.agents.md"];
+        var agentRunner = new MockAgentRunner();
         var git = new MockGitOperations
         {
             GitCommandResponder = ConfigRepoResponder(staged, pushFails: true),
         };
-        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+        var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: configRepoDir);
 
         var result = await executor.ExecuteAsync(
             BuildImproverTask("improver-push-fail"), TestContext.Current.CancellationToken);
@@ -845,6 +871,12 @@ public sealed class TaskExecutorTests
         Assert.Equal(2, result.GitStatus.FilesChanged);
         Assert.Equal(staged, result.GitStatus.ChangedFiles);
         Assert.NotEmpty(result.GitStatus.ChangedFiles);
+
+        // Path-resolution assertions: git work dir, agent work dir, and prompt context all resolve to the injected agents path.
+        var expectedAgentsDir = Path.Combine(configRepoDir, "agents");
+        Assert.Contains(configRepoDir, git.WorkDirs);
+        Assert.Equal(expectedAgentsDir, agentRunner.LastWorkDir);
+        Assert.Contains($"Working directory: {expectedAgentsDir}", agentRunner.LastPrompt);
     }
 
     /// <summary>
@@ -853,10 +885,11 @@ public sealed class TaskExecutorTests
     [Fact]
     public async Task ExecuteAsync_ImproverCommitFails_StillReportsConfigRepoChangedPaths()
     {
-        using var marker = EnsureConfigRepoMarker();
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
 
         string[] staged = ["agents/improver.agents.md"];
         var stagedOut = string.Concat(staged.Select(p => p + "\0"));
+        var agentRunner = new MockAgentRunner();
         var git = new MockGitOperations
         {
             GitCommandResponder = args =>
@@ -868,7 +901,7 @@ public sealed class TaskExecutorTests
                 return null;
             },
         };
-        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+        var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: configRepoDir);
 
         var result = await executor.ExecuteAsync(
             BuildImproverTask("improver-commit-fail"), TestContext.Current.CancellationToken);
@@ -877,6 +910,12 @@ public sealed class TaskExecutorTests
         Assert.False(result.GitStatus!.Pushed);
         Assert.Equal(1, result.GitStatus.FilesChanged);
         Assert.Equal(staged, result.GitStatus.ChangedFiles);
+
+        // Path-resolution assertions: git work dir, agent work dir, and prompt context all resolve to the injected agents path.
+        var expectedAgentsDir = Path.Combine(configRepoDir, "agents");
+        Assert.Contains(configRepoDir, git.WorkDirs);
+        Assert.Equal(expectedAgentsDir, agentRunner.LastWorkDir);
+        Assert.Contains($"Working directory: {expectedAgentsDir}", agentRunner.LastPrompt);
     }
 
     /// <summary>
@@ -886,15 +925,16 @@ public sealed class TaskExecutorTests
     [Fact]
     public async Task ExecuteAsync_ImproverManyFiles_AppliesCapAndKeepsPathsPlain()
     {
-        using var marker = EnsureConfigRepoMarker();
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
 
         const int total = GitOperations.ChangedFilesMaxPaths + 12;
         var staged = Enumerable.Range(0, total).Select(i => $"agents/file{i}.agents.md").ToArray();
+        var agentRunner = new MockAgentRunner();
         var git = new MockGitOperations
         {
             GitCommandResponder = ConfigRepoResponder(staged, pushFails: true),
         };
-        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+        var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: configRepoDir);
 
         var result = await executor.ExecuteAsync(
             BuildImproverTask("improver-cap"), TestContext.Current.CancellationToken);
@@ -907,6 +947,12 @@ public sealed class TaskExecutorTests
         // No repo-qualification prefix and no synthetic truncation marker.
         Assert.DoesNotContain(result.GitStatus.ChangedFiles, p => p.Contains(':'));
         Assert.DoesNotContain(result.GitStatus.ChangedFiles, p => p.Contains("more"));
+
+        // Path-resolution assertions: git work dir, agent work dir, and prompt context all resolve to the injected agents path.
+        var expectedAgentsDir = Path.Combine(configRepoDir, "agents");
+        Assert.Contains(configRepoDir, git.WorkDirs);
+        Assert.Equal(expectedAgentsDir, agentRunner.LastWorkDir);
+        Assert.Contains($"Working directory: {expectedAgentsDir}", agentRunner.LastPrompt);
     }
 
     /// <summary>
@@ -916,18 +962,25 @@ public sealed class TaskExecutorTests
     [Fact]
     public async Task ExecuteAsync_Improver_UsesNulDelimitedStagedFileQuery()
     {
-        using var marker = EnsureConfigRepoMarker();
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
 
+        var agentRunner = new MockAgentRunner();
         var git = new MockGitOperations
         {
             GitCommandResponder = ConfigRepoResponder(["agents/coder.agents.md"], pushFails: false),
         };
-        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+        var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: configRepoDir);
 
         await executor.ExecuteAsync(
             BuildImproverTask("improver-z-flag"), TestContext.Current.CancellationToken);
 
         Assert.Contains("diff --cached --name-only -z", git.GitCommands);
+
+        // Path-resolution assertions: git work dir, agent work dir, and prompt context all resolve to the injected agents path.
+        var expectedAgentsDir = Path.Combine(configRepoDir, "agents");
+        Assert.Contains(configRepoDir, git.WorkDirs);
+        Assert.Equal(expectedAgentsDir, agentRunner.LastWorkDir);
+        Assert.Contains($"Working directory: {expectedAgentsDir}", agentRunner.LastPrompt);
     }
 
     /// <summary>
@@ -937,20 +990,27 @@ public sealed class TaskExecutorTests
     [Fact]
     public async Task ExecuteAsync_ImproverSpecialCharacterFilename_IsReportedVerbatim()
     {
-        using var marker = EnsureConfigRepoMarker();
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
 
         string[] staged = ["agents/we ird\"name.agents.md", "agents/normal.agents.md"];
+        var agentRunner = new MockAgentRunner();
         var git = new MockGitOperations
         {
             GitCommandResponder = ConfigRepoResponder(staged, pushFails: true),
         };
-        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+        var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: configRepoDir);
 
         var result = await executor.ExecuteAsync(
             BuildImproverTask("improver-special"), TestContext.Current.CancellationToken);
 
         Assert.Equal(staged, result.GitStatus!.ChangedFiles);
         Assert.DoesNotContain(result.GitStatus.ChangedFiles, p => p.StartsWith('"'));
+
+        // Path-resolution assertions: git work dir, agent work dir, and prompt context all resolve to the injected agents path.
+        var expectedAgentsDir = Path.Combine(configRepoDir, "agents");
+        Assert.Contains(configRepoDir, git.WorkDirs);
+        Assert.Equal(expectedAgentsDir, agentRunner.LastWorkDir);
+        Assert.Contains($"Working directory: {expectedAgentsDir}", agentRunner.LastPrompt);
     }
 
     // ── Improver worker-side log safety ───────────────────────────────────────
@@ -959,16 +1019,17 @@ public sealed class TaskExecutorTests
     /// Runs the improver with the given staged paths while capturing <see cref="Console.Out"/>,
     /// and returns the single worker log line that reports the changed filenames.
     /// </summary>
-    private static async Task<string> CaptureImproverChangedFilesLogAsync(
+    private static async Task<(string LogLine, string ConfigRepoDir, MockAgentRunner AgentRunner)> CaptureImproverChangedFilesLogAsync(
         string taskId, IReadOnlyCollection<string> staged)
     {
-        using var marker = EnsureConfigRepoMarker();
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
 
+        var agentRunner = new MockAgentRunner();
         var git = new MockGitOperations
         {
             GitCommandResponder = ConfigRepoResponder(staged, pushFails: false),
         };
-        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+        var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: configRepoDir);
 
         var originalOut = Console.Out;
         using var captured = new StringWriter();
@@ -990,7 +1051,7 @@ public sealed class TaskExecutorTests
         var lines = output.Split(['\n', '\r', '\u0085', '\u2028', '\u2029']);
         var logLine = Array.Find(lines, l => l.Contains("Improver changed"));
         Assert.NotNull(logLine);
-        return logLine!;
+        return (logLine!, configRepoDir, agentRunner);
     }
 
     /// <summary>
@@ -1004,7 +1065,7 @@ public sealed class TaskExecutorTests
         const int total = 62;
         var staged = Enumerable.Range(0, total).Select(i => $"agents/file{i:D3}.agents.md").ToArray();
 
-        var logLine = await CaptureImproverChangedFilesLogAsync("improver-log-bounded", staged);
+        var (logLine, configRepoDir, agentRunner) = await CaptureImproverChangedFilesLogAsync("improver-log-bounded", staged);
 
         // The true total is reported.
         Assert.Contains($"Improver changed {total} file(s)", logLine);
@@ -1020,6 +1081,11 @@ public sealed class TaskExecutorTests
         // The first path is present and a path beyond the cap is NOT.
         Assert.Contains("agents/file000.agents.md", logLine);
         Assert.DoesNotContain("agents/file061.agents.md", logLine);
+
+        // Path-resolution assertion: the improver's working directory resolves to the injected agents path.
+        var expectedAgentsDir = Path.Combine(configRepoDir, "agents");
+        Assert.Equal(expectedAgentsDir, agentRunner.LastWorkDir);
+        Assert.Contains($"Working directory: {expectedAgentsDir}", agentRunner.LastPrompt);
     }
 
     /// <summary>
@@ -1031,12 +1097,17 @@ public sealed class TaskExecutorTests
     {
         string[] staged = ["agents/coder.agents.md", "agents/tester.agents.md"];
 
-        var logLine = await CaptureImproverChangedFilesLogAsync("improver-log-few", staged);
+        var (logLine, configRepoDir, agentRunner) = await CaptureImproverChangedFilesLogAsync("improver-log-few", staged);
 
         Assert.Contains("Improver changed 2 file(s)", logLine);
         Assert.Contains("agents/coder.agents.md", logLine);
         Assert.Contains("agents/tester.agents.md", logLine);
         Assert.DoesNotContain("more)", logLine);
+
+        // Path-resolution assertion: the improver's working directory resolves to the injected agents path.
+        var expectedAgentsDir = Path.Combine(configRepoDir, "agents");
+        Assert.Equal(expectedAgentsDir, agentRunner.LastWorkDir);
+        Assert.Contains($"Working directory: {expectedAgentsDir}", agentRunner.LastPrompt);
     }
 
     /// <summary>
@@ -1058,7 +1129,7 @@ public sealed class TaskExecutorTests
             "agents/normal.agents.md",
         ];
 
-        var logLine = await CaptureImproverChangedFilesLogAsync("improver-log-sanitized", staged);
+        var (logLine, configRepoDir, agentRunner) = await CaptureImproverChangedFilesLogAsync("improver-log-sanitized", staged);
 
         // No raw control character of ANY kind survived into the log line.
         Assert.DoesNotContain(logLine, char.IsControl);
@@ -1071,6 +1142,11 @@ public sealed class TaskExecutorTests
         Assert.Contains("forged.agents.md", logLine);
         Assert.Contains("agents/normal.agents.md", logLine);
         Assert.Contains("Improver changed 4 file(s)", logLine);
+
+        // Path-resolution assertion: the improver's working directory resolves to the injected agents path.
+        var expectedAgentsDir = Path.Combine(configRepoDir, "agents");
+        Assert.Equal(expectedAgentsDir, agentRunner.LastWorkDir);
+        Assert.Contains($"Working directory: {expectedAgentsDir}", agentRunner.LastPrompt);
     }
 
     /// <summary>
@@ -1080,14 +1156,15 @@ public sealed class TaskExecutorTests
     [Fact]
     public async Task ExecuteAsync_ImproverInjectedLogLine_ProducesNoExtraLogEntry()
     {
-        using var marker = EnsureConfigRepoMarker();
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
 
         string[] staged = ["agents/a\n[Task] ERROR totally forged failure.agents.md"];
+        var agentRunner = new MockAgentRunner();
         var git = new MockGitOperations
         {
             GitCommandResponder = ConfigRepoResponder(staged, pushFails: false),
         };
-        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+        var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: configRepoDir);
 
         var originalOut = Console.Out;
         using var captured = new StringWriter();
@@ -1115,6 +1192,12 @@ public sealed class TaskExecutorTests
         Assert.NotNull(changedLine);
         Assert.Contains("totally forged failure.agents.md", changedLine!);
         Assert.DoesNotContain(changedLine!, char.IsControl);
+
+        // Path-resolution assertions: git work dir, agent work dir, and prompt context all resolve to the injected agents path.
+        var expectedAgentsDir = Path.Combine(configRepoDir, "agents");
+        Assert.Contains(configRepoDir, git.WorkDirs);
+        Assert.Equal(expectedAgentsDir, agentRunner.LastWorkDir);
+        Assert.Contains($"Working directory: {expectedAgentsDir}", agentRunner.LastPrompt);
     }
 
     /// <summary>
@@ -1125,15 +1208,16 @@ public sealed class TaskExecutorTests
     [Fact]
     public async Task ExecuteAsync_ImproverLogCap_DoesNotAffectDomainChangedFiles()
     {
-        using var marker = EnsureConfigRepoMarker();
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
 
         const int total = 62;
         var staged = Enumerable.Range(0, total).Select(i => $"agents/file{i:D3}.agents.md").ToArray();
+        var agentRunner = new MockAgentRunner();
         var git = new MockGitOperations
         {
             GitCommandResponder = ConfigRepoResponder(staged, pushFails: true),
         };
-        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+        var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: configRepoDir);
 
         var result = await executor.ExecuteAsync(
             BuildImproverTask("improver-log-vs-domain"), TestContext.Current.CancellationToken);
@@ -1144,6 +1228,42 @@ public sealed class TaskExecutorTests
         Assert.Equal(total, result.GitStatus.FilesChanged);
         // And it still contains no synthetic truncation marker.
         Assert.DoesNotContain(result.GitStatus.ChangedFiles, p => p.Contains("more"));
+
+        // Path-resolution assertions: git work dir, agent work dir, and prompt context all resolve to the injected agents path.
+        var expectedAgentsDir = Path.Combine(configRepoDir, "agents");
+        Assert.Contains(configRepoDir, git.WorkDirs);
+        Assert.Equal(expectedAgentsDir, agentRunner.LastWorkDir);
+        Assert.Contains($"Working directory: {expectedAgentsDir}", agentRunner.LastPrompt);
+    }
+
+    /// <summary>
+    /// NON-MUTATING regression: when no custom config-repo path is injected, the improver's
+    /// working directory and context header must resolve to the default /config-repo/agents path.
+    /// This test inspects the captured SendPromptAsync workDir/prompt only — it never creates
+    /// or modifies anything under /config-repo.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ImproverDefaultPath_ResolvesToDefaultConfigRepoAgentsDir()
+    {
+        var git = new MockGitOperations { FilesChanged = 0 };
+        var agentRunner = new MockAgentRunner();
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        var task = new WorkTask
+        {
+            TaskId = "test-improver-default-path",
+            GoalId = "goal-improver-default-path",
+            GoalDescription = "Test goal",
+            Prompt = "Test prompt",
+            Role = WorkerRole.Improver,
+            Repositories = [new TargetRepository { Name = "test-repo", Url = "https://github.com/test/test.git", DefaultBranch = "main" }],
+        };
+
+        var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.Equal("/config-repo/agents", agentRunner.LastWorkDir);
+        Assert.Contains("Working directory: /config-repo/agents", agentRunner.LastPrompt);
     }
 
     // ── Changed-file path aggregation ─────────────────────────────────────────

@@ -15,11 +15,13 @@ namespace CopilotHive.Worker;
 public sealed class WorkerService(
     string orchestratorUrl,
     string workerId,
-    string[] capabilities) : IToolCallBridge, ISessionClient, IDisposable
+    string[] capabilities,
+    string configRepoDir = "/config-repo") : IToolCallBridge, ISessionClient, IDisposable
 {
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(30);
 
-    private readonly IAgentRunner _agentRunner = new SharpCoderRunner();
+    private readonly IAgentRunner _agentRunner = new SharpCoderRunner(configRepoDir);
+    private readonly string _configRepoDir = configRepoDir;
     private readonly WorkerLogger _log = new("Worker");
 
     // Pending tool calls awaiting orchestrator responses, keyed by request_id
@@ -139,7 +141,7 @@ public sealed class WorkerService(
                     {
                         try
                         {
-                            var executor = new TaskExecutor(_agentRunner, this, sessionClient: this);
+                            var executor = new TaskExecutor(_agentRunner, this, sessionClient: this, configRepoDir: _configRepoDir);
                             var result = await executor.ExecuteAsync(domainTask, localCts.Token);
 
                             await stream.RequestStream.WriteAsync(new WorkerMessage

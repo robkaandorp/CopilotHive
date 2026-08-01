@@ -16,11 +16,12 @@ public sealed class TaskExecutor(
     IAgentRunner agentRunner,
     IToolCallBridge? toolBridge = null,
     IGitOperations? gitOperations = null,
-    ISessionClient? sessionClient = null)
+    ISessionClient? sessionClient = null,
+    string configRepoDir = "/config-repo")
 {
     private const string WorkRoot = "/copilot-home";
-    private const string ConfigRepoDir = "/config-repo";
-    private const string ConfigAgentsDir = "/config-repo/agents";
+    private readonly string _configRepoDir = configRepoDir;
+    private readonly string _configAgentsDir = Path.Combine(configRepoDir, "agents");
 
     /// <summary>
     /// Maximum number of changed-file paths rendered into the worker-side Improver log line.
@@ -192,7 +193,7 @@ public sealed class TaskExecutor(
             // Determine working directory for Copilot
             // Improver works in the config-repo/agents folder; others in the first cloned repo
             var primaryWorkDir = isImprover
-                ? ConfigAgentsDir
+                ? _configAgentsDir
                 : (repoDirectories.Count > 0 ? repoDirectories[0].Dir : WorkRoot);
 
             // Build context header with branch and repo info for the Copilot agent
@@ -210,7 +211,7 @@ public sealed class TaskExecutor(
 
             if (isImprover)
             {
-                contextLines.Add($"Working directory: {ConfigAgentsDir}");
+                contextLines.Add($"Working directory: {_configAgentsDir}");
                 contextLines.Add("Files: *.agents.md (edit these directly)");
             }
 
@@ -599,7 +600,7 @@ public sealed class TaskExecutor(
     /// </summary>
     private async Task<string> EnsureAgentsMdWithinLimitsAsync(string previousOutput, CancellationToken ct)
     {
-        if (!Directory.Exists(ConfigAgentsDir))
+        if (!Directory.Exists(_configAgentsDir))
             return previousOutput;
 
         for (var attempt = 0; attempt < WorkerConstants.AgentsMdMaxRetries; attempt++)
@@ -623,7 +624,7 @@ public sealed class TaskExecutor(
                 Do NOT add new content — only condense what is there.
                 """;
 
-            var condenseOutput = await agentRunner.SendPromptAsync(condensePrompt, ConfigAgentsDir, ct);
+            var condenseOutput = await agentRunner.SendPromptAsync(condensePrompt, _configAgentsDir, ct);
             previousOutput += "\n\n[Agents.md size enforcement]\n" + condenseOutput;
         }
 
@@ -635,7 +636,7 @@ public sealed class TaskExecutor(
             _log.Error($"Agents.md still over limit after {WorkerConstants.AgentsMdMaxRetries} retries: {fileNames}. Discarding all changes.");
 
             // Discard all agents.md changes to keep config repo clean
-            await _git.RunGitCommandAsync(ConfigRepoDir, "checkout -- agents/", ct);
+            await _git.RunGitCommandAsync(_configRepoDir, "checkout -- agents/", ct);
             previousOutput += $"\n\n[Agents.md changes discarded — files still over {WorkerConstants.AgentsMdMaxCharacters}-char limit after {WorkerConstants.AgentsMdMaxRetries} retries: {fileNames}]";
         }
 
@@ -645,11 +646,11 @@ public sealed class TaskExecutor(
     /// <summary>
     /// Returns a list of *.agents.md files that exceed the character limit.
     /// </summary>
-    private static List<(string FileName, int CharCount)> GetAgentsMdViolations()
+    private List<(string FileName, int CharCount)> GetAgentsMdViolations()
     {
         var violations = new List<(string FileName, int CharCount)>();
 
-        foreach (var file in Directory.GetFiles(ConfigAgentsDir, "*.agents.md"))
+        foreach (var file in Directory.GetFiles(_configAgentsDir, "*.agents.md"))
         {
             var content = File.ReadAllText(file);
             if (content.Length > WorkerConstants.AgentsMdMaxCharacters)
@@ -665,7 +666,7 @@ public sealed class TaskExecutor(
     /// </summary>
     private async Task PullConfigRepoAsync(CancellationToken ct)
     {
-        if (!Directory.Exists(Path.Combine(ConfigRepoDir, ".git")))
+        if (!Directory.Exists(Path.Combine(_configRepoDir, ".git")))
         {
             _log.Info("Config repo not found — improver will work without it");
             return;
@@ -673,7 +674,7 @@ public sealed class TaskExecutor(
 
         _log.Info("Pulling latest config repo for improver...");
         var (exitCode, stdout, stderr) = await _git.RunGitCommandAsync(
-            ConfigRepoDir, "pull --ff-only", ct);
+            _configRepoDir, "pull --ff-only", ct);
 
         if (exitCode == 0)
             _log.Info($"Config repo up to date: {stdout.Trim()}");
@@ -687,12 +688,12 @@ public sealed class TaskExecutor(
     /// </summary>
     private async Task<GitChangeSummary> CommitAndPushConfigRepoAsync(CancellationToken ct)
     {
-        if (!Directory.Exists(Path.Combine(ConfigRepoDir, ".git")))
+        if (!Directory.Exists(Path.Combine(_configRepoDir, ".git")))
             return new GitChangeSummary();
 
         // Only stage agents/*.agents.md — defense-in-depth to prevent touching other files
         var (addExit, _, addErr) = await _git.RunGitCommandAsync(
-            ConfigRepoDir, "add agents/*.agents.md", ct);
+            _configRepoDir, "add agents/*.agents.md", ct);
         if (addExit != 0)
         {
             _log.Error($"git add failed: {addErr.Trim()}");
@@ -702,7 +703,7 @@ public sealed class TaskExecutor(
         // Check if there are staged changes.
         // `-z` gives NUL-delimited, UNQUOTED paths so filenames with unusual characters survive.
         var (diffExit, diffOut, _) = await _git.RunGitCommandAsync(
-            ConfigRepoDir, "diff --cached --name-only -z", ct);
+            _configRepoDir, "diff --cached --name-only -z", ct);
         if (diffExit != 0 || string.IsNullOrWhiteSpace(diffOut))
         {
             _log.Info("No agents.md changes to commit");
@@ -731,7 +732,7 @@ public sealed class TaskExecutor(
 
         // Commit
         var (commitExit, commitOut, commitErr) = await _git.RunGitCommandAsync(
-            ConfigRepoDir, "commit -m \"Improve agents.md files (automated by CopilotHive Improver)\"", ct);
+            _configRepoDir, "commit -m \"Improve agents.md files (automated by CopilotHive Improver)\"", ct);
         if (commitExit != 0)
         {
             _log.Error($"git commit failed: {commitErr.Trim()}");
@@ -745,16 +746,16 @@ public sealed class TaskExecutor(
         try
         {
             var (pullExit, pullOut, pullErr) = await _git.RunGitCommandAsync(
-                ConfigRepoDir, "pull --no-rebase", ct);
+                _configRepoDir, "pull --no-rebase", ct);
             if (pullExit != 0)
             {
                 _log.Error($"git pull failed: {pullErr.Trim()}");
                 // Abort any in-progress merge and try force-pushing our commit
-                await _git.RunGitCommandAsync(ConfigRepoDir, "merge --abort", ct);
+                await _git.RunGitCommandAsync(_configRepoDir, "merge --abort", ct);
             }
 
             var (pushExit, _, pushErr) = await _git.RunGitCommandAsync(
-                ConfigRepoDir, "push", ct);
+                _configRepoDir, "push", ct);
             if (pushExit != 0)
             {
                 _log.Error($"git push failed: {pushErr.Trim()}");

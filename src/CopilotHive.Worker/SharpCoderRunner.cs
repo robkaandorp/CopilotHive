@@ -25,11 +25,17 @@ public sealed class SharpCoderRunner : IAgentRunner
     private string _currentModel = "(default)";
     private ReasoningEffort? _currentReasoning;
 
+    private readonly string _configRepoDir;
+
     /// <summary>
     /// Initializes a new <see cref="SharpCoderRunner"/>. Call <see cref="ConnectAsync"/>
     /// before invoking <see cref="SendPromptAsync"/> to create the chat client.
     /// </summary>
-    public SharpCoderRunner() { }
+    /// <param name="configRepoDir">Directory containing the agent instruction repository. Defaults to <c>/config-repo</c>.</param>
+    public SharpCoderRunner(string configRepoDir = "/config-repo")
+    {
+        _configRepoDir = configRepoDir;
+    }
 
     /// <summary>
     /// Internal constructor for unit testing: injects a pre-created <see cref="IChatClient"/>
@@ -38,8 +44,10 @@ public sealed class SharpCoderRunner : IAgentRunner
     /// </summary>
     /// <param name="chatClient">The chat client to use for agent execution.</param>
     /// <param name="model">The model identifier to record in log output.</param>
-    internal SharpCoderRunner(IChatClient chatClient, string model)
+    /// <param name="configRepoDir">Directory containing the agent instruction repository. Defaults to <c>/config-repo</c>.</param>
+    internal SharpCoderRunner(IChatClient chatClient, string model, string configRepoDir = "/config-repo")
     {
+        _configRepoDir = configRepoDir;
         _chatClient = chatClient;
         _currentModel = model;
         _clientFactory = _ => chatClient;
@@ -790,7 +798,7 @@ public sealed class SharpCoderRunner : IAgentRunner
                 var searchOption = searchPattern.Contains("**") ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
                 var normalizedPattern = searchPattern.Replace("**/", "");
 
-                var files = Directory.GetFiles("/config-repo/agents", normalizedPattern, searchOption);
+                var files = Directory.GetFiles(Path.Combine(_configRepoDir, "agents"), normalizedPattern, searchOption);
                 if (files.Length == 0)
                     return "No files matched the pattern.";
 
