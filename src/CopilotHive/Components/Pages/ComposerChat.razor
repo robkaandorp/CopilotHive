@@ -175,19 +175,22 @@ else
             <div class="chat-input-area">
                 @if (_pending is not null)
                 {
-                    <div class="chat-attachment-chip">
-                        <span class="chat-attachment-name">@_pending.DisplayName</span>
-                        <button class="chat-attachment-remove" @onclick="RemoveAttachment" disabled="@Composer.IsStreaming" title="Remove attachment">×</button>
+                    <div class="chat-attach-chip">
+                        <span class="chat-attach-chip-name">@_pending.DisplayName</span>
+                        <button class="chat-attach-chip-remove" @onclick="RemoveAttachment" disabled="@Composer.IsStreaming" title="Remove attachment">×</button>
                     </div>
                 }
                 @if (!string.IsNullOrEmpty(_attachmentError))
                 {
-                    <div class="chat-attachment-error">@_attachmentError</div>
+                    <div class="chat-attach-error">@_attachmentError</div>
                 }
-                <InputFile OnChange="HandleFileSelected"
-                          accept=".png,.jpg,.jpeg,.gif,.webp,.pdf,image/*,application/pdf"
-                          disabled="@(_pending is not null || _uploading || Composer.IsStreaming)"
-                          class="chat-attachment-picker" />
+                <label class="chat-attach-btn">
+                    📎
+                    <InputFile OnChange="HandleFileSelected"
+                               accept=".png,.jpg,.jpeg,.gif,.webp,.pdf,image/*,application/pdf"
+                               disabled="@(_pending is not null || _uploading || Composer.IsStreaming)"
+                               class="chat-attach-input" />
+                </label>
                 <textarea @bind="_inputText" @bind:event="oninput"
                           @onkeydown="HandleKeyDown"
                           placeholder="Describe what you want to build…"
