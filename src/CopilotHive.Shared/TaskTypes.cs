@@ -131,7 +131,7 @@ public sealed record GitChangeSummary
     public int Insertions { get; init; }
     /// <summary>Total lines deleted.</summary>
     public int Deletions { get; init; }
-    /// <summary>Whether the changes were pushed to the remote.</summary>
+    /// <summary>Whether the changes were pushed to the remote OR — for a read-only role — no Class-B condition (a net HEAD move or capture-failure on a repo with a nonzero branch diff) was detected AND at least one repository had a usable baseline pair.</summary>
     public bool Pushed { get; init; }
     /// <summary>
     /// Repository-relative paths of the changed files. Never null. When more than one

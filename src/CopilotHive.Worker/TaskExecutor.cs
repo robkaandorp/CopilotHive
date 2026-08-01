@@ -95,6 +95,7 @@ public sealed class TaskExecutor(
         try
         {
             var isImprover = task.Role == WorkerRole.Improver;
+            var isReviewer = task.Role == WorkerRole.Reviewer;
 
             // Clone each repository (skip for improver — it works on the config repo agents folder)
             var repoDirectories = new List<(TargetRepository Repo, string Dir)>();
@@ -190,6 +191,37 @@ public sealed class TaskExecutor(
                 }
             }
 
+            // For read-only roles (reviewer): capture the per-repository HEAD SHA immediately
+            // before the agent runs. This baseline is compared against the final HEAD after the
+            // run to classify whether the role moved HEAD, so a spurious "not pushed" warning can
+            // be suppressed when the role left no net branch diff. A null value means the baseline
+            // could not be captured for that repository.
+            Dictionary<string, string?> repoStartShas = [];
+            if (isReviewer)
+            {
+                foreach (var (repo, dir) in repoDirectories)
+                {
+                    try
+                    {
+                        var (exitCode, stdout, _) = await _git.RunGitCommandAsync(dir, "rev-parse HEAD", ct);
+                        repoStartShas[repo.Name] = exitCode == 0 && !string.IsNullOrWhiteSpace(stdout)
+                            ? stdout.Trim()
+                            : null;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception)
+                    {
+                        // Capture failure is recorded silently: a repository whose baseline could
+                        // not be captured must contribute neither a note nor pushed intent unless
+                        // it also has a nonzero branch diff, which the classification decides later.
+                        repoStartShas[repo.Name] = null;
+                    }
+                }
+            }
+
             // Determine working directory for Copilot
             // Improver works in the config-repo/agents folder; others in the first cloned repo
             var primaryWorkDir = isImprover
@@ -277,8 +309,6 @@ public sealed class TaskExecutor(
             }
             else
             {
-                var isReviewer = task.Role == WorkerRole.Reviewer;
-
                 // Accumulate counts and changed-file paths across ALL repositories that
                 // have changes. Paths are repo-qualified only when more than one repo changed.
                 var totalFilesChanged = 0;
@@ -288,10 +318,57 @@ public sealed class TaskExecutor(
                 var allPushed = true;
                 List<(string RepoName, GitChangeSummary Status)> changedRepos = [];
 
+                // Read-only role classification (reviewer only). Compares the per-repository
+                // baseline HEAD captured before the run against the final HEAD:
+                //   Class A — HEAD net unmoved (both SHAs captured and equal).
+                //   Class B — a nonzero branch diff combined with a moved HEAD or a failed capture.
+                //   Class C — HEAD moved but the branch diff is empty (a note-worthy anomaly).
+                var anyClassB = false;
+                var anyUsableBaseline = false;
+                List<string> classCRepos = [];
+
                 foreach (var (repo, dir) in repoDirectories)
                 {
                     var baseBranch = task.BranchInfo?.BaseBranch ?? repo.DefaultBranch;
                     var status = await _git.GetGitStatusAsync(dir, baseBranch, ct);
+
+                    if (isReviewer)
+                    {
+                        string? finalSha = null;
+                        try
+                        {
+                            var (exitCode, stdout, _) = await _git.RunGitCommandAsync(dir, "rev-parse HEAD", ct);
+                            if (exitCode == 0 && !string.IsNullOrWhiteSpace(stdout))
+                                finalSha = stdout.Trim();
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                        catch (Exception)
+                        {
+                            // Silent capture failure — the classification below treats a missing
+                            // final SHA as "no usable baseline" without emitting a note.
+                            finalSha = null;
+                        }
+
+                        repoStartShas.TryGetValue(repo.Name, out var startSha);
+
+                        var usableBaseline = !string.IsNullOrEmpty(startSha) && !string.IsNullOrEmpty(finalSha);
+                        if (usableBaseline)
+                            anyUsableBaseline = true;
+
+                        var headMoved = usableBaseline && finalSha != startSha;
+
+                        if (status.FilesChanged > 0 && (!usableBaseline || headMoved))
+                        {
+                            anyClassB = true;
+                        }
+                        else if (headMoved && status.FilesChanged == 0)
+                        {
+                            classCRepos.Add(repo.Name);
+                        }
+                    }
 
                     // Push if there are changes, we have a feature branch, and the role is allowed to push.
                     // Reviewer is read-only — it must never push changes to the coder's branch.
@@ -328,6 +405,17 @@ public sealed class TaskExecutor(
                     }
                 }
 
+                if (isReviewer)
+                {
+                    foreach (var repoName in classCRepos)
+                        _log.Warn($"Task {task.TaskId}: read-only role moved HEAD during its run in repository {repoName} (no net diff vs base)");
+                }
+
+                // For read-only roles the aggregate Pushed flag reports "no unexpected write
+                // activity" rather than an actual push: a Class-B repository dominates and keeps
+                // it false; otherwise at least one usable baseline pair suppresses the warning.
+                var reviewerPushed = !anyClassB && anyUsableBaseline;
+
                 if (anyChanges)
                 {
                     List<string> allChangedFiles = [];
@@ -346,8 +434,21 @@ public sealed class TaskExecutor(
                         FilesChanged = totalFilesChanged,
                         Insertions = totalInsertions,
                         Deletions = totalDeletions,
-                        Pushed = allPushed,
+                        Pushed = isReviewer ? reviewerPushed : allPushed,
                         ChangedFiles = allChangedFiles,
+                    };
+                }
+                else if (isReviewer)
+                {
+                    // Read-only roles always report an aggregate summary so the orchestrator can
+                    // observe the suppression decision even when nothing changed at all.
+                    aggregatedStatus = new GitChangeSummary
+                    {
+                        FilesChanged = 0,
+                        Insertions = 0,
+                        Deletions = 0,
+                        Pushed = reviewerPushed,
+                        ChangedFiles = [],
                     };
                 }
 

@@ -75,6 +75,15 @@ public sealed class TaskExecutorTests
         /// </summary>
         public Func<string, (int ExitCode, string Stdout, string Stderr)?>? GitCommandResponder { get; set; }
 
+        /// <summary>
+        /// Optional thrower for <see cref="RunGitCommandAsync"/>, keyed on the raw argument
+        /// string. When it returns a non-null <see cref="Exception"/>, the mock throws that
+        /// exception instead of consulting <see cref="GitCommandResponder"/>. This simulates
+        /// a git command failing with an exception (e.g. git binary not found) rather than a
+        /// non-zero exit code. Checked BEFORE <see cref="GitCommandResponder"/>.
+        /// </summary>
+        public Func<string, Exception?>? GitCommandThrower { get; set; }
+
         /// <summary>Every argument string passed to <see cref="RunGitCommandAsync"/>, in order.</summary>
         public List<string> GitCommands { get; } = [];
 
@@ -86,6 +95,8 @@ public sealed class TaskExecutorTests
         {
             GitCommands.Add(args);
             WorkDirs.Add(workDir);
+            if (GitCommandThrower?.Invoke(args) is { } ex)
+                throw ex;
             var scripted = GitCommandResponder?.Invoke(args);
             return Task.FromResult(scripted ?? (0, "", ""));
         }
@@ -1419,5 +1430,649 @@ public sealed class TaskExecutorTests
         Assert.Equal("src/File0.cs", result.GitStatus.ChangedFiles[0]);
         // No synthetic truncation marker is ever placed in the list itself
         Assert.DoesNotContain(result.GitStatus.ChangedFiles, p => p.Contains("more"));
+    }
+
+    // ── Read-only role classification (reviewer baseline + aggregate Pushed) ────
+
+    /// <summary>
+    /// Builds a <see cref="MockGitOperations.GitCommandResponder"/> that returns successive
+    /// SHA values for successive <c>rev-parse HEAD</c> calls. A null SHA simulates a capture
+    /// failure (non-zero exit code). Call order is deterministic: all start captures first
+    /// (in repo order), then all final captures (in repo order).
+    /// </summary>
+    private static Func<string, (int ExitCode, string Stdout, string Stderr)?> RevParseResponder(
+        params string?[] shas)
+    {
+        var idx = 0;
+        return args =>
+        {
+            if (args != "rev-parse HEAD")
+                return null;
+            var sha = idx < shas.Length ? shas[idx] : null;
+            idx++;
+            if (sha is null)
+                return (1, "", "fatal: not a git repository");
+            return (0, sha + "\n", "");
+        };
+    }
+
+    /// <summary>
+    /// Builds a reviewer <see cref="WorkTask"/> with a checkout branch action.
+    /// </summary>
+    private static WorkTask BuildReviewerTask(string id, params TargetRepository[] repos) => new()
+    {
+        TaskId = id,
+        GoalId = $"goal-{id}",
+        GoalDescription = "Test goal",
+        Prompt = "Review the changes",
+        Role = WorkerRole.Reviewer,
+        Repositories = [.. repos],
+        BranchInfo = new BranchSpec { Action = BranchAction.Checkout, BaseBranch = "main", FeatureBranch = "feature-branch" },
+    };
+
+    /// <summary>
+    /// Executes the task while capturing <see cref="Console.Out"/>, returning the result
+    /// and the captured output string.
+    /// </summary>
+    private static async Task<(TaskResult Result, string Output)> ExecuteWithConsoleCaptureAsync(
+        TaskExecutor executor, WorkTask task)
+    {
+        var originalOut = Console.Out;
+        using var sw = new StringWriter();
+        TaskResult result;
+        try
+        {
+            Console.SetOut(sw);
+            result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+        }
+        return (result, sw.ToString());
+    }
+
+    /// <summary>
+    /// Counts the number of fully-prefixed <c>[Task] WARN:</c> occurrences in the captured
+    /// console output.
+    /// </summary>
+    private static int CountTaskWarns(string output) =>
+        output.Split("[Task] WARN:").Length - 1;
+
+    /// <summary>
+    /// Class A (suppress): reviewer, one repo — HEAD unmoved, FilesChanged > 0.
+    /// The aggregate Pushed is true (no Class-B, usable baseline) and the changed-file
+    /// paths are still accumulated. No Class-C note.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerClassA_SuppressesPushWarning_AndKeepsChangedPaths()
+    {
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = RevParseResponder("aaa111", "aaa111"), // start == final (unmoved)
+        };
+        git.StatusByRepoName["repoA"] = new GitChangeSummary
+        {
+            FilesChanged = 2,
+            Insertions = 10,
+            Deletions = 3,
+            ChangedFiles = ["src/Foo.cs", "tests/FooTests.cs"],
+        };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildReviewerTask("task-classA-changes", Repo("repoA")));
+
+        Assert.NotNull(result.GitStatus);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.Equal(2, result.GitStatus.FilesChanged);
+        Assert.Contains("src/Foo.cs", result.GitStatus.ChangedFiles);
+        Assert.Contains("tests/FooTests.cs", result.GitStatus.ChangedFiles);
+        Assert.Equal(0, CountTaskWarns(output));
+    }
+
+    /// <summary>
+    /// Class A (suppress): reviewer, one repo — HEAD unmoved, FilesChanged == 0.
+    /// Pushed is true, no changed files, no Class-C note.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerClassA_NoChanges_PushesTrueAndNoWarn()
+    {
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = RevParseResponder("aaa111", "aaa111"),
+        };
+        git.StatusByRepoName["repoA"] = new GitChangeSummary { FilesChanged = 0, ChangedFiles = [] };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildReviewerTask("task-classA-nochange", Repo("repoA")));
+
+        Assert.NotNull(result.GitStatus);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.Empty(result.GitStatus.ChangedFiles);
+        Assert.Equal(0, CountTaskWarns(output));
+    }
+
+    /// <summary>
+    /// Class B (dominates): reviewer, one repo — HEAD moved, FilesChanged > 0.
+    /// Pushed is false, changed paths are present. No Class-C note (it's Class B, not C).
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerClassB_Dominates_PushesFalseAndNoClassCNote()
+    {
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = RevParseResponder("aaa111", "bbb222"), // moved
+        };
+        git.StatusByRepoName["repoA"] = new GitChangeSummary
+        {
+            FilesChanged = 1,
+            Insertions = 5,
+            Deletions = 2,
+            ChangedFiles = ["src/Bar.cs"],
+        };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildReviewerTask("task-classB", Repo("repoA")));
+
+        Assert.NotNull(result.GitStatus);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(1, result.GitStatus.FilesChanged);
+        Assert.Contains("src/Bar.cs", result.GitStatus.ChangedFiles);
+        Assert.Equal(0, CountTaskWarns(output));
+    }
+
+    /// <summary>
+    /// Class C: reviewer, one repo — HEAD moved, FilesChanged == 0.
+    /// Pushed is true, no files changed, and the fully-prefixed rendered
+    /// <c>[Task] WARN: Task {id}: read-only role moved HEAD ...</c> note appears EXACTLY ONCE.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerClassC_PushesTrueAndEmitsWarnNoteOnce()
+    {
+        const string taskId = "task-classC";
+        const string repoName = "repoA";
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = RevParseResponder("aaa111", "bbb222"), // moved
+        };
+        git.StatusByRepoName[repoName] = new GitChangeSummary { FilesChanged = 0, ChangedFiles = [] };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildReviewerTask(taskId, Repo(repoName)));
+
+        Assert.NotNull(result.GitStatus);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+
+        // Assert the FULLY-PREFIXED rendered string, not just the unprefixed message.
+        var expectedNote =
+            $"[Task] WARN: Task {taskId}: read-only role moved HEAD during its run in repository {repoName} (no net diff vs base)";
+        Assert.Contains(expectedNote, output);
+        Assert.Equal(1, CountTaskWarns(output));
+    }
+
+    /// <summary>
+    /// Class C with B present: reviewer, two repos — Repo1 is Class B (moved, FilesChanged > 0),
+    /// Repo2 is Class C (moved, FilesChanged == 0). Pushed is false (B dominates), but the
+    /// Class-C note for Repo2 still fires EXACTLY ONCE. ChangedFiles contains Repo1's paths.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerClassBWithC_BDominates_CNoteStillFires()
+    {
+        const string taskId = "task-BwithC";
+        var git = new MockGitOperations
+        {
+            // Repo1 start, Repo2 start, Repo1 final, Repo2 final
+            GitCommandResponder = RevParseResponder("aaa111", "ccc333", "bbb222", "ddd444"),
+        };
+        git.StatusByRepoName["repo1"] = new GitChangeSummary
+        {
+            FilesChanged = 1,
+            Insertions = 3,
+            Deletions = 0,
+            ChangedFiles = ["src/B1.cs"],
+        };
+        git.StatusByRepoName["repo2"] = new GitChangeSummary { FilesChanged = 0, ChangedFiles = [] };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildReviewerTask(taskId, Repo("repo1"), Repo("repo2")));
+
+        Assert.NotNull(result.GitStatus);
+        Assert.False(result.GitStatus!.Pushed); // B dominates
+        Assert.Contains("src/B1.cs", result.GitStatus.ChangedFiles);
+
+        var expectedNote =
+            $"[Task] WARN: Task {taskId}: read-only role moved HEAD during its run in repository repo2 (no net diff vs base)";
+        Assert.Contains(expectedNote, output);
+        Assert.Equal(1, CountTaskWarns(output)); // Only the Class-C note for repo2
+    }
+
+    /// <summary>
+    /// Mixed A+C: reviewer, two repos — Repo1 is Class A (unmoved, FilesChanged == 0),
+    /// Repo2 is Class C (moved, FilesChanged == 0). Pushed is true (no B, at least 1 usable
+    /// baseline). Class-C note fires for Repo2 ONCE. No note for Repo1.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerMixedA_C_PushesTrue_CNoteForRepo2Only()
+    {
+        const string taskId = "task-mixedAC";
+        var git = new MockGitOperations
+        {
+            // Repo1 start, Repo2 start, Repo1 final, Repo2 final
+            GitCommandResponder = RevParseResponder("aaa111", "ccc333", "aaa111", "ddd444"),
+        };
+        git.StatusByRepoName["repo1"] = new GitChangeSummary { FilesChanged = 0, ChangedFiles = [] };
+        git.StatusByRepoName["repo2"] = new GitChangeSummary { FilesChanged = 0, ChangedFiles = [] };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildReviewerTask(taskId, Repo("repo1"), Repo("repo2")));
+
+        Assert.NotNull(result.GitStatus);
+        Assert.True(result.GitStatus!.Pushed); // no B, at least 1 usable baseline
+
+        var expectedNote =
+            $"[Task] WARN: Task {taskId}: read-only role moved HEAD during its run in repository repo2 (no net diff vs base)";
+        Assert.Contains(expectedNote, output);
+        Assert.Equal(1, CountTaskWarns(output)); // Only for repo2, not repo1
+    }
+
+    /// <summary>
+    /// Capture-failure precedence: reviewer, one repo — start capture succeeds, final capture
+    /// fails, FilesChanged > 0. Treated as Class B (Pushed == false). No Class-C note
+    /// (not Class C because FilesChanged > 0).
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerCaptureFailsWithChanges_PushesFalse_NoClassCNote()
+    {
+        var git = new MockGitOperations
+        {
+            // start succeeds, final fails
+            GitCommandResponder = RevParseResponder("aaa111", null),
+        };
+        git.StatusByRepoName["repoA"] = new GitChangeSummary
+        {
+            FilesChanged = 2,
+            Insertions = 8,
+            Deletions = 1,
+            ChangedFiles = ["src/A.cs", "src/B.cs"],
+        };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildReviewerTask("task-capfail-changes", Repo("repoA")));
+
+        Assert.NotNull(result.GitStatus);
+        Assert.False(result.GitStatus!.Pushed); // Class B
+        Assert.Equal(2, result.GitStatus.FilesChanged);
+        Assert.Contains("src/A.cs", result.GitStatus.ChangedFiles);
+        Assert.Equal(0, CountTaskWarns(output)); // No Class-C note
+    }
+
+    /// <summary>
+    /// Capture-failure with no diff: reviewer, one repo — both captures fail, FilesChanged == 0.
+    /// Pushed is false (no usable baseline, no FilesChanged). No Class-C note. No manufactured paths.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerCaptureFailsNoDiff_PushesFalse_NoClassCNote()
+    {
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = RevParseResponder(null, null), // both fail
+        };
+        git.StatusByRepoName["repoA"] = new GitChangeSummary { FilesChanged = 0, ChangedFiles = [] };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildReviewerTask("task-capfail-nodiff", Repo("repoA")));
+
+        Assert.NotNull(result.GitStatus);
+        Assert.False(result.GitStatus!.Pushed); // no usable baseline, no FilesChanged
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.Empty(result.GitStatus.ChangedFiles); // no manufactured paths
+        Assert.Equal(0, CountTaskWarns(output)); // No Class-C note
+    }
+
+    /// <summary>
+    /// Fully-unavailable one-sided: reviewer, two repos — both start captures fail, final
+    /// captures succeed, FilesChanged == 0 for both. Pushed is false (no usable baseline
+    /// pair anywhere, no FilesChanged). No Class-C notes.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerFullyUnavailableOneSided_PushesFalse_NoClassCNotes()
+    {
+        var git = new MockGitOperations
+        {
+            // Repo1 start (fail), Repo2 start (fail), Repo1 final (ok), Repo2 final (ok)
+            GitCommandResponder = RevParseResponder(null, null, "bbb222", "ddd444"),
+        };
+        git.StatusByRepoName["repo1"] = new GitChangeSummary { FilesChanged = 0, ChangedFiles = [] };
+        git.StatusByRepoName["repo2"] = new GitChangeSummary { FilesChanged = 0, ChangedFiles = [] };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildReviewerTask("task-unavail-one-sided", Repo("repo1"), Repo("repo2")));
+
+        Assert.NotNull(result.GitStatus);
+        Assert.False(result.GitStatus!.Pushed); // no usable baseline pair anywhere
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.Equal(0, CountTaskWarns(output)); // No Class-C notes
+    }
+
+    /// <summary>
+    /// Fully-unavailable two-sided: reviewer, two repos — all captures fail, FilesChanged == 0
+    /// for both. Pushed is false. No Class-C notes.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerFullyUnavailableTwoSided_PushesFalse_NoClassCNotes()
+    {
+        var git = new MockGitOperations
+        {
+            // All four captures fail
+            GitCommandResponder = RevParseResponder(null, null, null, null),
+        };
+        git.StatusByRepoName["repo1"] = new GitChangeSummary { FilesChanged = 0, ChangedFiles = [] };
+        git.StatusByRepoName["repo2"] = new GitChangeSummary { FilesChanged = 0, ChangedFiles = [] };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildReviewerTask("task-unavail-two-sided", Repo("repo1"), Repo("repo2")));
+
+        Assert.NotNull(result.GitStatus);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.Equal(0, CountTaskWarns(output)); // No Class-C notes
+    }
+
+    /// <summary>
+    /// Mixed A/C + capture-failure-with-no-diff: reviewer, three repos — Repo1 Class A (unmoved,
+    /// FilesChanged == 0), Repo2 Class C (moved, FilesChanged == 0), Repo3 both captures fail
+    /// (FilesChanged == 0). Pushed is true (no B, at least 1 usable baseline from A or C).
+    /// Class-C note fires for Repo2 only ONCE. No note for Repo3.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerMixedAC_WithCaptureFailure_PushesTrue_CNoteForRepo2Only()
+    {
+        const string taskId = "task-mixedAC-capfail";
+        var git = new MockGitOperations
+        {
+            // Repo1 start, Repo2 start, Repo3 start, Repo1 final, Repo2 final, Repo3 final
+            GitCommandResponder = RevParseResponder("aaa111", "ccc333", null, "aaa111", "ddd444", null),
+        };
+        git.StatusByRepoName["repo1"] = new GitChangeSummary { FilesChanged = 0, ChangedFiles = [] };
+        git.StatusByRepoName["repo2"] = new GitChangeSummary { FilesChanged = 0, ChangedFiles = [] };
+        git.StatusByRepoName["repo3"] = new GitChangeSummary { FilesChanged = 0, ChangedFiles = [] };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildReviewerTask(taskId, Repo("repo1"), Repo("repo2"), Repo("repo3")));
+
+        Assert.NotNull(result.GitStatus);
+        Assert.True(result.GitStatus!.Pushed); // no B, at least 1 usable baseline
+
+        var expectedNote =
+            $"[Task] WARN: Task {taskId}: read-only role moved HEAD during its run in repository repo2 (no net diff vs base)";
+        Assert.Contains(expectedNote, output);
+        Assert.Equal(1, CountTaskWarns(output)); // Only repo2, not repo1 or repo3
+    }
+
+    /// <summary>
+    /// Push-allowed role regression: coder, one repo, FilesChanged > 0, push throws.
+    /// Pushed is false, changed paths present. This is existing behavior — no change.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_CoderPushFails_PushesFalse_AndHasChangedPaths()
+    {
+        var git = new MockGitOperations
+        {
+            PushShouldFail = true,
+            PushErrorMessage = "Failed to push branch 'feature-branch': Permission denied",
+        };
+        git.StatusByRepoName["repoA"] = new GitChangeSummary
+        {
+            FilesChanged = 3,
+            Insertions = 10,
+            Deletions = 2,
+            ChangedFiles = ["src/A.cs", "src/B.cs", "src/C.cs"],
+        };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var result = await executor.ExecuteAsync(
+            BuildTask("task-coder-push-fail", Repo("repoA")),
+            TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result.GitStatus);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.True(result.GitStatus.FilesChanged > 0);
+        Assert.NotEmpty(result.GitStatus.ChangedFiles);
+    }
+
+    /// <summary>
+    /// Push-allowed role regression: coder, one repo, FilesChanged > 0, push succeeds.
+    /// Pushed is true, FilesChanged > 0. No [Task] WARN: note.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_CoderPushSucceeds_PushesTrue_NoWarnNote()
+    {
+        var git = new MockGitOperations
+        {
+            PushShouldFail = false,
+        };
+        git.StatusByRepoName["repoA"] = new GitChangeSummary
+        {
+            FilesChanged = 2,
+            Insertions = 5,
+            Deletions = 1,
+            ChangedFiles = ["src/X.cs", "src/Y.cs"],
+        };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildTask("task-coder-push-ok", Repo("repoA")));
+
+        Assert.NotNull(result.GitStatus);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.True(result.GitStatus.FilesChanged > 0);
+        Assert.Equal(0, CountTaskWarns(output));
+    }
+
+    /// <summary>
+    /// Non-reviewer regression: coder, one repo, FilesChanged == 0. GitStatus is a default
+    /// GitChangeSummary with Pushed == false (existing behavior — default bool). No baseline
+    /// capture happened (no [Task] WARN: notes).
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_CoderNoChanges_DefaultGitStatus_PushesFalse_NoWarnNotes()
+    {
+        var git = new MockGitOperations
+        {
+            FilesChanged = 0,
+        };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildTask("task-coder-nochange", Repo("repoA")));
+
+        // No changes → aggregatedStatus is null → default GitChangeSummary (Pushed = false)
+        Assert.NotNull(result.GitStatus);
+        Assert.False(result.GitStatus!.Pushed); // default bool
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.Empty(result.GitStatus.ChangedFiles);
+        Assert.Equal(0, CountTaskWarns(output)); // No baseline capture for non-reviewer
+    }
+
+    // ── Thrown SHA-capture exception tests (iteration 2: silent catch) ──────────
+
+    /// <summary>
+    /// Builds a <see cref="MockGitOperations.GitCommandThrower"/> that throws on the Nth
+    /// <c>rev-parse HEAD</c> call (1-based) and returns null for all other rev-parse calls.
+    /// </summary>
+    private static Func<string, Exception?> RevParseThrower(int throwOnCall, Exception ex)
+    {
+        var revParseCount = 0;
+        return args =>
+        {
+            if (args != "rev-parse HEAD")
+                return null;
+            revParseCount++;
+            return revParseCount == throwOnCall ? ex : null;
+        };
+    }
+
+    /// <summary>
+    /// Test 1: Start baseline capture THROWS, final capture succeeds, FilesChanged > 0.
+    /// The coder's iteration 2 fix removed <c>_log.Warn</c> from the catch block — the capture
+    /// failure must be silent. Classification: capture failed + files changed → Class B.
+    /// Assert: Pushed == false, no [Task] WARN: in captured Console.Out, changed paths present.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerStartCaptureThrows_FilesChanged_PushesFalse_SilentCatch()
+    {
+        var git = new MockGitOperations
+        {
+            GitCommandThrower = RevParseThrower(1, new InvalidOperationException("git not found")),
+            GitCommandResponder = RevParseResponder(null, "bbb222"), // call 1 throws, call 2 succeeds
+        };
+        git.StatusByRepoName["repoA"] = new GitChangeSummary
+        {
+            FilesChanged = 2,
+            Insertions = 8,
+            Deletions = 1,
+            ChangedFiles = ["src/A.cs", "src/B.cs"],
+        };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildReviewerTask("task-start-throw-changes", Repo("repoA")));
+
+        Assert.NotNull(result.GitStatus);
+        Assert.False(result.GitStatus!.Pushed); // Class B: capture failed + files changed
+        Assert.Equal(2, result.GitStatus.FilesChanged);
+        Assert.Contains("src/A.cs", result.GitStatus.ChangedFiles);
+        Assert.Contains("src/B.cs", result.GitStatus.ChangedFiles);
+        // The coder removed _log.Warn from the catch — capture failure must be SILENT.
+        Assert.Equal(0, CountTaskWarns(output));
+    }
+
+    /// <summary>
+    /// Test 2: Final SHA capture THROWS, start capture succeeds, FilesChanged == 0.
+    /// Classification: capture-failure-with-no-diff → Pushed == false, no note, no paths.
+    /// Assert: no [Task] WARN: in captured output (silent catch for final capture too).
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerFinalCaptureThrows_NoChanges_PushesFalse_SilentCatch()
+    {
+        var git = new MockGitOperations
+        {
+            GitCommandThrower = RevParseThrower(2, new InvalidOperationException("git not found")),
+            GitCommandResponder = RevParseResponder("aaa111", null), // call 1 succeeds, call 2 throws
+        };
+        git.StatusByRepoName["repoA"] = new GitChangeSummary { FilesChanged = 0, ChangedFiles = [] };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildReviewerTask("task-final-throw-nochange", Repo("repoA")));
+
+        Assert.NotNull(result.GitStatus);
+        Assert.False(result.GitStatus!.Pushed); // no usable baseline pair, no FilesChanged
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.Empty(result.GitStatus.ChangedFiles);
+        // Silent catch — no warning for capture-failure-with-no-diff.
+        Assert.Equal(0, CountTaskWarns(output));
+    }
+
+    /// <summary>
+    /// Test 3: Start baseline capture THROWS, final capture succeeds, FilesChanged == 0.
+    /// The KEY test the reviewer demanded: a capture-failed repo with FilesChanged == 0 must
+    /// NOT produce any worker warning. Assert: Pushed == false, no [Task] WARN:, empty ChangedFiles.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerStartCaptureThrows_NoChanges_PushesFalse_NoWarn()
+    {
+        var git = new MockGitOperations
+        {
+            GitCommandThrower = RevParseThrower(1, new InvalidOperationException("git not found")),
+            GitCommandResponder = RevParseResponder(null, "bbb222"), // call 1 throws, call 2 succeeds
+        };
+        git.StatusByRepoName["repoA"] = new GitChangeSummary { FilesChanged = 0, ChangedFiles = [] };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var (result, output) = await ExecuteWithConsoleCaptureAsync(
+            executor, BuildReviewerTask("task-start-throw-nochange", Repo("repoA")));
+
+        Assert.NotNull(result.GitStatus);
+        Assert.False(result.GitStatus!.Pushed); // no usable baseline pair
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.Empty(result.GitStatus.ChangedFiles);
+        // The critical assertion: capture-failed + no diff must NOT produce any warning.
+        Assert.Equal(0, CountTaskWarns(output));
+    }
+
+    // ── Cancellation during SHA capture (iteration 2: OperationCanceledException re-throw) ──
+
+    /// <summary>
+    /// Test 4: Cancellation during start baseline capture — the mock throws
+    /// <see cref="OperationCanceledException"/> for the START rev-parse call. The production
+    /// code's inner <c>catch (OperationCanceledException) { throw; }</c> guard must re-throw it
+    /// so the generic <c>catch (Exception)</c> does NOT swallow it. The outer
+    /// <see cref="TaskExecutor.ExecuteAsync"/> handler then catches it and returns a
+    /// <see cref="TaskOutcome.Failed"/> (or <see cref="TaskOutcome.Cancelled"/>) result —
+    /// the task must NOT silently complete with a <c>Pushed</c> value.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerStartCaptureCancelled_DoesNotSilentlyComplete()
+    {
+        using var cts = new CancellationTokenSource();
+        var git = new MockGitOperations
+        {
+            GitCommandThrower = RevParseThrower(1, new OperationCanceledException(cts.Token)),
+            GitCommandResponder = RevParseResponder(null, "bbb222"),
+        };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var result = await executor.ExecuteAsync(
+            BuildReviewerTask("task-start-cancel", Repo("repoA")),
+            TestContext.Current.CancellationToken);
+
+        // The OperationCanceledException was re-thrown by the inner guard and caught by the
+        // outer ExecuteAsync handler — the task did NOT silently complete as Completed with
+        // a Pushed value. It must be either Cancelled or Failed.
+        Assert.NotEqual(TaskOutcome.Completed, result.Status);
+        // No GitStatus was computed — the cancellation happened before classification.
+        Assert.Null(result.GitStatus);
+    }
+
+    /// <summary>
+    /// Test 5: Cancellation during final SHA capture — the mock throws
+    /// <see cref="OperationCanceledException"/> for the FINAL rev-parse call. The production
+    /// code's inner <c>catch (OperationCanceledException) { throw; }</c> guard must re-throw it.
+    /// The task must NOT silently complete with a wrong <c>Pushed</c> value.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ReviewerFinalCaptureCancelled_DoesNotSilentlyComplete()
+    {
+        using var cts = new CancellationTokenSource();
+        var git = new MockGitOperations
+        {
+            GitCommandThrower = RevParseThrower(2, new OperationCanceledException(cts.Token)),
+            GitCommandResponder = RevParseResponder("aaa111", null), // call 1 succeeds, call 2 throws OCE
+        };
+        var executor = new TaskExecutor(new MockAgentRunner(), gitOperations: git);
+
+        var result = await executor.ExecuteAsync(
+            BuildReviewerTask("task-final-cancel", Repo("repoA")),
+            TestContext.Current.CancellationToken);
+
+        // The OperationCanceledException was re-thrown by the inner guard and caught by the
+        // outer ExecuteAsync handler — the task did NOT silently complete as Completed with
+        // a Pushed value. It must be either Cancelled or Failed.
+        Assert.NotEqual(TaskOutcome.Completed, result.Status);
+        Assert.Null(result.GitStatus);
     }
 }
