@@ -96,6 +96,10 @@ public sealed class Program
             builder.Services.AddSingleton<IBrainRepoManager>(sp =>
                 new BrainRepoManager(stateDir, sp.GetRequiredService<ILogger<BrainRepoManager>>()));
 
+            // Composer attachments: singleton store for chat file attachments
+            builder.Services.AddSingleton(sp =>
+                new ComposerAttachmentService(stateDir, sp.GetRequiredService<ILogger<ComposerAttachmentService>>()));
+
             builder.Services.AddSingleton(sp =>
                 new GoalPipelineManager(sp.GetRequiredService<PipelineStore>()));
 
