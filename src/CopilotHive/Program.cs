@@ -277,7 +277,8 @@ public sealed class Program
                     knowledgeGraph: sp.GetService<KnowledgeGraph>(),
                     goalReviewService: sp.GetService<GoalReviewService>(),
                     sessionRegistry: sp.GetService<LlmSessionRegistry>(),
-                    goalReadyNotifier: sp.GetService<GoalReadyNotifier>());
+                    goalReadyNotifier: sp.GetService<GoalReadyNotifier>(),
+                    attachmentService: sp.GetService<ComposerAttachmentService>());
             });
             builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 

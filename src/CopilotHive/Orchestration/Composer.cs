@@ -51,6 +51,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly LlmSessionRegistry? _sessionRegistry;
 
     private readonly GoalReadyNotifier? _goalReadyNotifier;
+    private readonly ComposerAttachmentService? _attachmentService;
 
     /// <summary>Models the Composer can switch between at runtime.</summary>
     public IReadOnlyList<string> AvailableModels => _agentService.AvailableModels;
@@ -219,7 +220,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         Only a summary of the sub-session's work returns to you — your own context stays lean.
 
         Sub-agent tools:
-        - start_sub_agent(prompt, model?, timeout_seconds?) — launch a background sub-session with a self-contained prompt
+        - start_sub_agent(task, model?, timeout_seconds?, image_paths?) — launch a background sub-session with a self-contained task
         - await_sub_agents() — wait for all running sub-agents to complete and receive their summaries
         - get_sub_agent_status(sub_agent_id) — check the status of a specific sub-agent
         - list_sub_agent_models() — list the models available to sub-agents
@@ -228,6 +229,12 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - Prefer start_sub_agent over many sequential read/grep/glob calls when you need a thorough digest of a codebase area
         - Use them for verification sweeps (e.g. "check all callers of method X") — the summary returns findings without bloating your context
         - Keep sub-agent prompts self-contained — sub-sessions cannot see your conversation history
+
+        Vision delegation:
+        - When a user has attached an image or PDF, delegate visual analysis to a vision-capable sub-agent
+        - Use: start_sub_agent(task: "Analyze this attachment and describe what you see", image_paths: ["<attachment path>"])
+        - Only the textual summary returns to you — the image content stays in the sub-agent's context
+        - Check list_sub_agent_models for models with supports_vision: true
 
         Sub-agent limitations (read-only):
         - Sub-sessions have file read/grep/glob tools ONLY — no bash, no writes, no composer tools (web search, git, knowledge graph)
@@ -289,7 +296,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         KnowledgeGraph? knowledgeGraph = null,
         GoalReviewService? goalReviewService = null,
         LlmSessionRegistry? sessionRegistry = null,
-        GoalReadyNotifier? goalReadyNotifier = null)
+        GoalReadyNotifier? goalReadyNotifier = null,
+        ComposerAttachmentService? attachmentService = null)
     {
         _logger = logger;
         _goalStore = goalStore;
@@ -304,6 +312,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _goalReviewService = goalReviewService;
         _sessionRegistry = sessionRegistry;
         _goalReadyNotifier = goalReadyNotifier;
+        _attachmentService = attachmentService;
 
         var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
 
@@ -368,7 +377,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 OnCompacted?.Invoke();
             },
             subAgentsEnabled,
-            subAgentModels);
+            subAgentModels,
+            attachmentService?.AttachmentsRootPath);
 
         _handleSubAgentChanged = info => OnSubAgentChanged?.Invoke(info);
         _agentService.OnSubAgentChanged += _handleSubAgentChanged;
@@ -474,6 +484,10 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     public async Task ResetSessionAsync(CancellationToken ct = default)
     {
         await _agentService.ResetSessionAsync();
+
+        if (_attachmentService is not null)
+            await _attachmentService.ClearAllAsync();
+
         IsCompacting = false;
         WasCompacted = false;
 

@@ -34,7 +34,8 @@ internal sealed class ComposerAgentService(
     Action? onCompacting,
     Action<CompactionResult>? onCompacted,
     bool subAgentsEnabled,
-    IReadOnlyList<ModelEntry> subAgentModels) : IAsyncDisposable
+    IReadOnlyList<ModelEntry> subAgentModels,
+    string? additionalImagesRoot = null) : IAsyncDisposable
 {
     private string _model = model;
     private int _maxContextTokens = maxContextTokens;
@@ -53,6 +54,7 @@ internal sealed class ComposerAgentService(
     private readonly Action? _onCompacting = onCompacting;
     private readonly Action<CompactionResult>? _onCompacted = onCompacted;
     private readonly bool _subAgentsEnabled = subAgentsEnabled;
+    private readonly string? _additionalImagesRoot = additionalImagesRoot;
 
     /// <summary>
     /// Immutable construction-time snapshot of the sub-agent model catalog. Deliberately NOT read
@@ -547,6 +549,7 @@ internal sealed class ComposerAgentService(
             DefaultEnableFileOps = true,
             DefaultEnableFileWrites = false,
             DefaultEnableSkills = false,
+            AdditionalImagesRoot = _additionalImagesRoot,
         };
 
         foreach (var entry in _subAgentModels)

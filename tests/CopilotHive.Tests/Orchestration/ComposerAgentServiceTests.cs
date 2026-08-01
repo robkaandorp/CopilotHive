@@ -38,7 +38,8 @@ public sealed class ComposerAgentServiceTests
         Action<CompactionResult>? onCompacted = null,
         bool subAgentsEnabled = false,
         IReadOnlyList<ModelEntry>? subAgentModels = null,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        string? additionalImagesRoot = null)
     {
         return new ComposerAgentService(
             model,
@@ -59,7 +60,8 @@ public sealed class ComposerAgentServiceTests
             onCompacted,
             subAgentsEnabled,
             // Default mirrors production: a construction-time snapshot taken from the config.
-            subAgentModels ?? hiveConfig?.Models?.AvailableModels?.ToList().AsReadOnly() ?? []);
+            subAgentModels ?? hiveConfig?.Models?.AvailableModels?.ToList().AsReadOnly() ?? [],
+            additionalImagesRoot);
     }
 
     private static string CreateTempDir()
@@ -949,6 +951,55 @@ public sealed class ComposerAgentServiceTests
     }
 
     [Fact]
+    public void Composer_SubAgentsSystemPromptSection_UsesTaskParameterAndDocumentsVisionDelegation()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var hiveConfig = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels =
+                    [
+                        new ModelEntry { Name = "gpt-4o", SupportsVision = true },
+                    ]
+                }
+            };
+
+            var repoManager = new Mock<IBrainRepoManager>();
+            repoManager.SetupGet(r => r.WorkDirectory).Returns(stateDir);
+
+            using var dbContext = CopilotHive.Persistence.CopilotHiveDbContext.CreateInMemory();
+            var store = new CopilotHive.Goals.GoalStore(dbContext, Microsoft.Extensions.Logging.Abstractions.NullLogger<CopilotHive.Goals.GoalStore>.Instance);
+
+            var composer = new Composer(
+                "test-model",
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<Composer>.Instance,
+                store,
+                repoManager: repoManager.Object,
+                stateDir: stateDir,
+                hiveConfig: hiveConfig);
+
+            var prompt = composer.GetSystemPrompt();
+
+            // The first parameter is task, not prompt (bug fix from the previous doc).
+            Assert.Contains("start_sub_agent(task, model?, timeout_seconds?, image_paths?)", prompt);
+            Assert.DoesNotContain("start_sub_agent(prompt, model?, timeout_seconds?)", prompt);
+
+            // Vision delegation guidance must be present with a valid example.
+            Assert.Contains("Vision delegation:", prompt);
+            Assert.Contains("image_paths:", prompt);
+            Assert.Contains("supports_vision: true", prompt);
+            Assert.Contains("start_sub_agent(task: \"Analyze this attachment and describe what you see\", image_paths: [\"<attachment path>\"])", prompt);
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
     public void Composer_SubAgentsSystemPromptSection_AbsentWhenDisabled()
     {
         var stateDir = CreateTempDir();
@@ -1646,6 +1697,211 @@ public sealed class ComposerAgentServiceTests
         }
         finally
         {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── AdditionalImagesRoot wiring ───────────────────────────────────────
+
+    [Fact]
+    public async Task BuildSubAgentOptions_WithAttachmentServiceRoot_SetsAdditionalImagesRootAndKeepsWorkDirectory()
+    {
+        var stateDir = CreateTempDir();
+        var attachmentRoot = Path.Combine(stateDir, "composer-attachments");
+        Directory.CreateDirectory(attachmentRoot);
+
+        try
+        {
+            var repoManager = new Mock<IBrainRepoManager>();
+            repoManager.SetupGet(r => r.WorkDirectory).Returns(stateDir);
+
+            var mockClient = new Mock<IChatClient>();
+
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => mockClient.Object,
+                repoManager: repoManager.Object,
+                subAgentsEnabled: true,
+                subAgentModels:
+                [
+                    new ModelEntry { Name = "vision-model", SupportsVision = true }
+                ],
+                additionalImagesRoot: attachmentRoot);
+
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var subAgents = service.AgentOptions.SubAgents;
+            Assert.NotNull(subAgents);
+            Assert.Equal(attachmentRoot, subAgents!.AdditionalImagesRoot);
+            Assert.Equal(stateDir, service.AgentOptions.WorkDirectory);
+
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task BuildSubAgentOptions_WhenDisabled_IgnoresAdditionalImagesRootAndReturnsNull()
+    {
+        var stateDir = CreateTempDir();
+        var attachmentRoot = Path.Combine(stateDir, "composer-attachments");
+        Directory.CreateDirectory(attachmentRoot);
+
+        try
+        {
+            var repoManager = new Mock<IBrainRepoManager>();
+            repoManager.SetupGet(r => r.WorkDirectory).Returns(stateDir);
+
+            var mockClient = new Mock<IChatClient>();
+
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => mockClient.Object,
+                repoManager: repoManager.Object,
+                subAgentsEnabled: false,
+                subAgentModels:
+                [
+                    new ModelEntry { Name = "vision-model", SupportsVision = true }
+                ],
+                additionalImagesRoot: attachmentRoot);
+
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+            Assert.Null(service.AgentOptions.SubAgents);
+
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task BuildSubAgentOptions_WhenRepoManagerNull_IgnoresAdditionalImagesRootAndReturnsNull()
+    {
+        var stateDir = CreateTempDir();
+        var attachmentRoot = Path.Combine(stateDir, "composer-attachments");
+        Directory.CreateDirectory(attachmentRoot);
+
+        try
+        {
+            var mockClient = new Mock<IChatClient>();
+
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => mockClient.Object,
+                repoManager: null,
+                subAgentsEnabled: true,
+                subAgentModels:
+                [
+                    new ModelEntry { Name = "vision-model", SupportsVision = true }
+                ],
+                additionalImagesRoot: attachmentRoot);
+
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+            Assert.Null(service.AgentOptions.SubAgents);
+
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── Composer reset and attachment service integration ─────────────────
+
+    [Fact]
+    public async Task Composer_ResetSessionAsync_ClearsAttachmentsAfterAgentReset_AfterDisposalAndAllFilesRemoved()
+    {
+        var stateDir = CreateTempDir();
+        Composer? composer = null;
+        CopilotHive.Persistence.CopilotHiveDbContext? dbContext = null;
+        try
+        {
+            var hiveConfig = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels =
+                    [
+                        new ModelEntry { Name = "gpt-4" },
+                    ]
+                }
+            };
+
+            var repoManager = new Mock<IBrainRepoManager>();
+            repoManager.SetupGet(r => r.WorkDirectory).Returns(stateDir);
+
+            dbContext = CopilotHive.Persistence.CopilotHiveDbContext.CreateInMemory();
+            var store = new CopilotHive.Goals.GoalStore(
+                dbContext,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<CopilotHive.Goals.GoalStore>.Instance);
+
+            var attachmentService = new CopilotHive.Services.ComposerAttachmentService(
+                stateDir,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<CopilotHive.Services.ComposerAttachmentService>.Instance);
+
+            // Seed two attachment files so a single ClearAllAsync removes both; partial deletion
+            // would leave at least one behind. Exactly-once is proven by path exclusion: the
+            // overflow-recovery test (RunStreamingAsync_ContextOverflow_DoesNotClearComposerAttachments)
+            // proves the only other reset path does NOT clear attachments.
+            var first = await attachmentService.SaveAsync(
+                "diagram.png",
+                new System.IO.MemoryStream(new byte[] { 0x01, 0x02, 0x03 }),
+                TestContext.Current.CancellationToken);
+            var second = await attachmentService.SaveAsync(
+                "report.pdf",
+                new System.IO.MemoryStream(new byte[] { 0x04, 0x05, 0x06 }),
+                TestContext.Current.CancellationToken);
+            Assert.True(first.Success);
+            Assert.True(second.Success);
+
+            var mockClient = new Mock<IChatClient>();
+            composer = new Composer(
+                "test-model",
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<Composer>.Instance,
+                store,
+                repoManager: repoManager.Object,
+                stateDir: stateDir,
+                hiveConfig: hiveConfig,
+                chatClientFactory: _ => mockClient.Object,
+                attachmentService: attachmentService);
+
+            await composer.ConnectAsync(TestContext.Current.CancellationToken);
+            Assert.True(composer.IsConnected);
+
+            var agentService = GetField<ComposerAgentService>(composer, "_agentService")!;
+            var seededFilesBeforeDisposal = Array.Empty<string>();
+            agentService.OnAgentDisposing = _ =>
+            {
+                // Capture the directory contents at the moment agent disposal begins.
+                // ClearAllAsync must NOT have run yet, so both seeded files must still be present.
+                seededFilesBeforeDisposal = Directory.GetFiles(attachmentService.AttachmentsRootPath);
+            };
+
+            await composer.ResetSessionAsync(TestContext.Current.CancellationToken);
+
+            Assert.Equal(2, seededFilesBeforeDisposal.Length);
+            Assert.Contains(Path.Combine(attachmentService.AttachmentsRootPath, first.Attachment!.SavedRelativePath), seededFilesBeforeDisposal);
+            Assert.Contains(Path.Combine(attachmentService.AttachmentsRootPath, second.Attachment!.SavedRelativePath), seededFilesBeforeDisposal);
+
+            var remainingFiles = Directory.GetFiles(attachmentService.AttachmentsRootPath);
+            Assert.Empty(remainingFiles);
+        }
+        finally
+        {
+            if (composer is not null)
+            {
+                try { await composer.DisposeAsync(); }
+                catch (Exception) { /* best effort */ }
+            }
+            dbContext?.Dispose();
             TryDeleteDir(stateDir);
         }
     }

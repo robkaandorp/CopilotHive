@@ -2,6 +2,7 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
+using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
@@ -412,6 +413,91 @@ public sealed class ComposerStreamingServiceTests
 
             // OnStreamingUpdate should have fired (at least once for the finally block).
             Assert.True(updateCount > 0, "OnStreamingUpdate should have been invoked");
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task RunStreamingAsync_ContextOverflow_DoesNotClearComposerAttachments()
+    {
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        var tmpDir = CreateTempDir();
+        try
+        {
+            var hiveConfig = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels =
+                    [
+                        new ModelEntry { Name = "gpt-4" },
+                    ]
+                }
+            };
+
+            var repoManager = new Mock<IBrainRepoManager>();
+            repoManager.SetupGet(r => r.WorkDirectory).Returns(tmpDir);
+
+            dbContext = CopilotHiveDbContext.CreateInMemory();
+            var store = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
+
+            var attachmentService = new CopilotHive.Services.ComposerAttachmentService(
+                tmpDir,
+                NullLogger<CopilotHive.Services.ComposerAttachmentService>.Instance);
+
+            var saveResult = await attachmentService.SaveAsync(
+                "diagram.png",
+                new MemoryStream(new byte[] { 0x01, 0x02, 0x03 }),
+                TestContext.Current.CancellationToken);
+            Assert.True(saveResult.Success);
+
+            var mockConnectClient = new Mock<IChatClient>();
+            composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                store,
+                repoManager: repoManager.Object,
+                stateDir: tmpDir,
+                hiveConfig: hiveConfig,
+                chatClientFactory: _ => mockConnectClient.Object,
+                attachmentService: attachmentService);
+
+            await composer.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var overflowEx = new InvalidOperationException("model_max_prompt_tokens_exceeded");
+            var mockClient = new Mock<IChatClient>();
+            mockClient
+                .Setup(c => c.GetStreamingResponseAsync(
+                    It.IsAny<IEnumerable<ChatMessage>>(),
+                    It.IsAny<ChatOptions?>(),
+                    It.IsAny<CancellationToken>()))
+                .Throws(overflowEx);
+            mockClient
+                .Setup(c => c.GetResponseAsync(
+                    It.IsAny<IEnumerable<ChatMessage>>(),
+                    It.IsAny<ChatOptions?>(),
+                    It.IsAny<CancellationToken>()))
+                .ThrowsAsync(overflowEx);
+
+            await InjectFakeChatClient(composer, mockClient.Object);
+
+            var streamingService = GetStreamingService(composer);
+            streamingService.SendMessage("hello");
+
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (streamingService.IsStreaming && DateTime.UtcNow < deadline)
+                await Task.Delay(20, CancellationToken.None);
+
+            Assert.False(streamingService.IsStreaming, "Streaming should have finished after overflow");
+
+            // Overflow recovery resets the agent session but must NOT clear the Composer's attachments.
+            var remainingFiles = Directory.GetFiles(attachmentService.AttachmentsRootPath);
+            Assert.Single(remainingFiles);
+            Assert.Contains(saveResult.Attachment!.SavedRelativePath, remainingFiles[0]);
         }
         finally
         {
