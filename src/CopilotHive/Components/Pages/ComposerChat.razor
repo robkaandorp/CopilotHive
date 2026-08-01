@@ -1,10 +1,14 @@
 @page "/composer"
 @using CopilotHive.Dashboard
 @using CopilotHive.Orchestration
+@using CopilotHive.Services
 @using Markdig
+@using Microsoft.AspNetCore.Components.Forms
 @using SharpCoder.SubAgents
+@using System.IO
 @implements IDisposable
 @inject Composer Composer
+@inject ComposerAttachmentService AttachmentService
 @inject IJSRuntime JS
 @inject PageHeaderState PageHeader
 @inject HttpClient HttpClient
@@ -169,13 +173,28 @@ else
             </div>
 
             <div class="chat-input-area">
+                @if (_pending is not null)
+                {
+                    <div class="chat-attachment-chip">
+                        <span class="chat-attachment-name">@_pending.DisplayName</span>
+                        <button class="chat-attachment-remove" @onclick="RemoveAttachment" disabled="@Composer.IsStreaming" title="Remove attachment">×</button>
+                    </div>
+                }
+                @if (!string.IsNullOrEmpty(_attachmentError))
+                {
+                    <div class="chat-attachment-error">@_attachmentError</div>
+                }
+                <InputFile OnChange="HandleFileSelected"
+                          accept=".png,.jpg,.jpeg,.gif,.webp,.pdf,image/*,application/pdf"
+                          disabled="@(_pending is not null || _uploading || Composer.IsStreaming)"
+                          class="chat-attachment-picker" />
                 <textarea @bind="_inputText" @bind:event="oninput"
                           @onkeydown="HandleKeyDown"
                           placeholder="Describe what you want to build…"
                           disabled="@Composer.IsStreaming"
                           rows="2"
                           class="chat-input"></textarea>
-                <button @onclick="SendMessage" disabled="@(Composer.IsStreaming || string.IsNullOrWhiteSpace(_inputText))"
+                <button @onclick="SendMessage" disabled="@(!CanSend)"
                         class="chat-send">
                     @if (Composer.IsStreaming)
                     {
@@ -272,6 +291,9 @@ else
     private List<string> _availableModels = [];
     private string _selectedModel = "";
     private bool _subAgentsExpanded = true;
+    private ComposerAttachment? _pending;
+    private bool _uploading;
+    private string? _attachmentError;
 
     protected override async Task OnInitializedAsync()
     {
@@ -320,12 +342,113 @@ else
 
     private void SendMessage()
     {
-        var text = _inputText.Trim();
-        if (string.IsNullOrEmpty(text) || Composer.IsStreaming) return;
+        if (!CanSend) return;
+
+        string text;
+        if (_pending is not null)
+        {
+            var ext = Path.GetExtension(_pending.SavedRelativePath);
+            var absPath = Path.Combine(AttachmentService.AttachmentsRootPath, _pending.SavedRelativePath);
+            text = BuildAttachmentMessage(_inputText, _pending.DisplayName, ext, absPath);
+        }
+        else
+        {
+            text = _inputText.Trim();
+        }
 
         _messages.Add(new ChatMessage { Role = "user", Content = text });
-        _inputText = "";
+
+        // Call Composer.SendMessage first. Only after it returns without throwing do we
+        // perform destructive state transitions (MarkAsSent, clear pending/input/error).
+        // This keeps _pending and _inputText intact for retry if the call fails.
         Composer.SendMessage(text);
+
+        if (_pending is not null)
+        {
+            AttachmentService.MarkAsSent(_pending);
+            _pending = null;
+        }
+
+        _inputText = "";
+        _attachmentError = null;
+        StateHasChanged();
+    }
+
+    internal static string BuildAttachmentMessage(string? userText, string displayName, string extension, string savedAbsPath)
+    {
+        var kind = extension.TrimStart('.').Equals("pdf", StringComparison.OrdinalIgnoreCase) ? "pdf" : "image";
+        var encodedPath = System.Text.Json.JsonSerializer.Serialize(savedAbsPath);
+        var encodedName = System.Text.Json.JsonSerializer.Serialize(displayName);
+        var block = " [Attached " + kind + " file " + encodedName + "; saved at " + encodedPath
+            + ". To analyze it, delegate to a vision-capable sub-agent with start_sub_agent(task: \"Analyze this attachment\", image_paths: ["
+            + encodedPath + "]).]";
+        if (string.IsNullOrWhiteSpace(userText))
+            return "The user attached a file with no accompanying text." + block;
+        return userText.TrimEnd() + block;
+    }
+
+    internal static bool ComputeCanSend(bool isStreaming, bool uploading, string inputText, object? pending)
+        => !isStreaming && !uploading && (!string.IsNullOrWhiteSpace(inputText) || pending is not null);
+
+    private bool CanSend => ComputeCanSend(Composer.IsStreaming, _uploading, _inputText, _pending);
+
+    private async Task HandleFileSelected(InputFileChangeEventArgs e)
+    {
+        _attachmentError = null;
+        var file = e.File;
+        if (file is null || file.Size == 0)
+        {
+            _attachmentError = "No file selected or file is empty.";
+            StateHasChanged();
+            return;
+        }
+
+        _uploading = true;
+        try
+        {
+            // maxAllowedSize is MaxAttachmentBytes + 1 so files at exactly the cap pass
+            // and files exceeding it throw IOException (Blazor throws IOException, NOT FileLoadException)
+            await using var stream = file.OpenReadStream(
+                maxAllowedSize: ComposerAttachmentService.MaxAttachmentBytes + 1);
+            var result = await AttachmentService.SaveAsync(file.Name, stream);
+            if (result.Success && result.Attachment is not null)
+            {
+                _pending = result.Attachment;
+            }
+            else
+            {
+                _attachmentError = result.Error ?? "Failed to save attachment.";
+            }
+        }
+        catch (IOException ex)
+        {
+            _attachmentError = ex.Message; // includes oversize rejection
+        }
+        catch (Exception ex)
+        {
+            _attachmentError = ex.Message;
+        }
+        finally
+        {
+            _uploading = false;
+            StateHasChanged();
+        }
+    }
+
+    private void RemoveAttachment()
+    {
+        if (_pending is null) return;
+        var result = AttachmentService.Remove(_pending);
+        if (result.Success)
+        {
+            _pending = null;
+            _attachmentError = null;
+        }
+        else
+        {
+            // Keep the chip, show the error
+            _attachmentError = result.Error ?? "Failed to remove attachment.";
+        }
         StateHasChanged();
     }
 
@@ -334,6 +457,8 @@ else
         if (Composer.IsStreaming) return;
         await Composer.ResetSessionAsync();
         _messages.Clear();
+        _pending = null;        // Composer's reset calls ClearAllAsync which may delete the file
+        _attachmentError = null; // clear any pending-related error note
         StateHasChanged();
     }
 
