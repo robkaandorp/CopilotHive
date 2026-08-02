@@ -6,7 +6,7 @@
 @using Microsoft.AspNetCore.Components.Forms
 @using SharpCoder.SubAgents
 @using System.IO
-@implements IDisposable
+@implements IAsyncDisposable
 @inject Composer Composer
 @inject ComposerAttachmentService AttachmentService
 @inject IJSRuntime JS
@@ -191,7 +191,8 @@ else
                                disabled="@(_pending is not null || _uploading || Composer.IsStreaming)"
                                class="chat-attach-input" />
                 </label>
-                <textarea @bind="_inputText" @bind:event="oninput"
+                <textarea id="composer-input"
+                          @bind="_inputText" @bind:event="oninput"
                           @onkeydown="HandleKeyDown"
                           placeholder="Describe what you want to build…"
                           disabled="@Composer.IsStreaming"
@@ -297,6 +298,8 @@ else
     private ComposerAttachment? _pending;
     private bool _uploading;
     private string? _attachmentError;
+    private IJSObjectReference? _pasteModule;
+    private DotNetObjectReference<ComposerChat>? _pasteDotNetRef;
 
     protected override async Task OnInitializedAsync()
     {
@@ -319,7 +322,37 @@ else
     {
         await JS.InvokeVoidAsync("eval",
             "document.getElementById('chat-anchor')?.scrollIntoView()");
+
+        if (firstRender)
+        {
+            _pasteModule = await JS.InvokeAsync<IJSObjectReference>("import", "./js/composer-paste.js");
+            _pasteDotNetRef = DotNetObjectReference.Create(this);
+            await _pasteModule.InvokeVoidAsync("install", "composer-input", _pasteDotNetRef);
+            await SyncPasteAllowedAsync();
+        }
     }
+
+    /// <summary>
+    /// Mirrors the authoritative .NET paste-allowed state into the JS module so a paste that can
+    /// never be accepted is not intercepted in the first place. The .NET side still re-validates.
+    /// </summary>
+    private async Task SyncPasteAllowedAsync()
+    {
+        if (_pasteModule is null) return;
+        await _pasteModule.InvokeVoidAsync("setAllowed", ComputePasteAllowed(Composer.IsStreaming, _uploading, _pending));
+    }
+
+    /// <summary>
+    /// Whether a clipboard paste may currently produce a pending attachment. A paste is refused
+    /// while another attachment is pending, while an upload is running and while the Composer is
+    /// streaming, so an existing pending attachment can never be replaced or orphaned.
+    /// </summary>
+    /// <param name="isStreaming">Whether the Composer is streaming.</param>
+    /// <param name="uploading">Whether an attachment upload is already in flight.</param>
+    /// <param name="pending">The current pending attachment, if any.</param>
+    internal static bool ComputePasteAllowed(bool isStreaming, bool uploading, object? pending)
+        => !isStreaming && !uploading && pending is null;
+
 
     private void LoadHistory()
     {
@@ -332,7 +365,7 @@ else
 
     private void HandleStreamingUpdate()
     {
-        InvokeAsync(() =>
+        InvokeAsync(async () =>
         {
             // When streaming finishes, reload history to get the final message
             if (!Composer.IsStreaming)
@@ -340,10 +373,14 @@ else
                 LoadHistory();
             }
             StateHasChanged();
+
+            // CRITICAL: streaming toggles paste availability. Without this the JS mirror would
+            // stay allowed=false forever once a stream ends, permanently killing paste.
+            await SyncPasteAllowedAsync();
         });
     }
 
-    private void SendMessage()
+    private async Task SendMessage()
     {
         if (!CanSend) return;
 
@@ -375,6 +412,7 @@ else
         _inputText = "";
         _attachmentError = null;
         StateHasChanged();
+        await SyncPasteAllowedAsync();
     }
 
     internal static string BuildAttachmentMessage(string? userText, string displayName, string extension, string savedAbsPath)
@@ -407,21 +445,20 @@ else
         }
 
         _uploading = true;
+
+        // Mirrored BEFORE the first await: while the picker upload runs, a paste must be left
+        // alone by JS rather than intercepted and then silently dropped by the .NET guard —
+        // that would swallow the user's clipboard content with no feedback. Best-effort: a
+        // failing mirror update must not abort the upload and strand the _uploading claim.
+        await TrySyncPasteAllowedAsync(PasteHost);
+
         try
         {
             // maxAllowedSize is MaxAttachmentBytes + 1 so files at exactly the cap pass
             // and files exceeding it throw IOException (Blazor throws IOException, NOT FileLoadException)
             await using var stream = file.OpenReadStream(
                 maxAllowedSize: ComposerAttachmentService.MaxAttachmentBytes + 1);
-            var result = await AttachmentService.SaveAsync(file.Name, stream);
-            if (result.Success && result.Attachment is not null)
-            {
-                _pending = result.Attachment;
-            }
-            else
-            {
-                _attachmentError = result.Error ?? "Failed to save attachment.";
-            }
+            await SaveAttachmentAsync(file.Name, stream);
         }
         catch (IOException ex)
         {
@@ -435,10 +472,306 @@ else
         {
             _uploading = false;
             StateHasChanged();
+
+            // Best-effort: a failing mirror update must not mask the upload's own outcome.
+            await TrySyncPasteAllowedAsync(PasteHost);
         }
     }
 
-    private void RemoveAttachment()
+    /// <summary>
+    /// Narrow seam over the component state the paste flow touches, so the PRODUCTION handler
+    /// body (<see cref="HandlePasteCoreAsync"/> and <see cref="SaveAttachmentAsync(IPasteHost, string, Stream)"/>)
+    /// can be exercised by tests without a live Blazor circuit. The component itself is the only
+    /// production implementation.
+    /// </summary>
+    internal interface IPasteHost
+    {
+        /// <summary>The currently staged attachment, if any.</summary>
+        ComposerAttachment? Pending { get; set; }
+
+        /// <summary>Whether an attachment upload is in flight.</summary>
+        bool Uploading { get; set; }
+
+        /// <summary>Error surfaced under the input area, if any.</summary>
+        string? AttachmentError { get; set; }
+
+        /// <summary>Whether the Composer is currently streaming a response.</summary>
+        bool IsStreaming { get; }
+
+        /// <summary>Streams the content into the attachment store.</summary>
+        /// <param name="originalName">Display name recorded for the attachment.</param>
+        /// <param name="content">Content stream; never fully buffered.</param>
+        Task<AttachmentSaveResult> SaveAsync(string originalName, Stream content);
+
+        /// <summary>Requests a re-render (the component's <c>StateHasChanged</c>).</summary>
+        void Notify();
+
+        /// <summary>Mirrors the authoritative paste-allowed state into the JS module.</summary>
+        Task SyncPasteAllowedAsync();
+    }
+
+    /// <summary>Binds <see cref="IPasteHost"/> to this component's own fields and services.</summary>
+    private sealed class ComponentPasteHost(ComposerChat owner) : IPasteHost
+    {
+        /// <inheritdoc />
+        public ComposerAttachment? Pending
+        {
+            get => owner._pending;
+            set => owner._pending = value;
+        }
+
+        /// <inheritdoc />
+        public bool Uploading
+        {
+            get => owner._uploading;
+            set => owner._uploading = value;
+        }
+
+        /// <inheritdoc />
+        public string? AttachmentError
+        {
+            get => owner._attachmentError;
+            set => owner._attachmentError = value;
+        }
+
+        /// <inheritdoc />
+        public bool IsStreaming => owner.Composer.IsStreaming;
+
+        /// <inheritdoc />
+        public Task<AttachmentSaveResult> SaveAsync(string originalName, Stream content)
+            => owner.AttachmentService.SaveAsync(originalName, content);
+
+        /// <inheritdoc />
+        public void Notify() => owner.StateHasChanged();
+
+        /// <inheritdoc />
+        public Task SyncPasteAllowedAsync() => owner.SyncPasteAllowedAsync();
+    }
+
+    private IPasteHost? _pasteHost;
+
+    private IPasteHost PasteHost => _pasteHost ??= new ComponentPasteHost(this);
+
+    /// <summary>
+    /// Shared save path for BOTH the file picker and a clipboard paste: streams the content into
+    /// <see cref="ComposerAttachmentService.SaveAsync"/> and reflects the outcome in the pending
+    /// attachment / error state. The caller owns the stream, its size guard and its exception
+    /// handling (the picker's <see cref="IOException"/> oversize contract is picker-specific).
+    /// </summary>
+    /// <param name="host">State seam the outcome is written to.</param>
+    /// <param name="originalName">Display name recorded for the attachment.</param>
+    /// <param name="stream">Content stream; never fully buffered.</param>
+    internal static async Task SaveAttachmentAsync(IPasteHost host, string originalName, Stream stream)
+    {
+        host.Uploading = true;
+        try
+        {
+            var result = await host.SaveAsync(originalName, stream);
+            if (result.Success && result.Attachment is not null)
+            {
+                host.Pending = result.Attachment;
+            }
+            else
+            {
+                host.AttachmentError = result.Error ?? "Failed to save attachment.";
+            }
+        }
+        finally
+        {
+            host.Uploading = false;
+        }
+    }
+
+    /// <summary>Runs the shared save path against this component's own state.</summary>
+    /// <param name="originalName">Display name recorded for the attachment.</param>
+    /// <param name="stream">Content stream; never fully buffered.</param>
+    private Task SaveAttachmentAsync(string originalName, Stream stream)
+        => SaveAttachmentAsync(PasteHost, originalName, stream);
+
+    /// <summary>
+    /// Maps a supported clipboard MIME type to the extension used for the generated file name.
+    /// Any other value is an unsupported clipboard item and is rejected before any save.
+    /// </summary>
+    internal static readonly IReadOnlyDictionary<string, string> PasteMimeExtensions =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["image/png"] = "png",
+            ["image/jpeg"] = "jpg",
+            ["image/gif"] = "gif",
+            ["image/webp"] = "webp",
+            ["application/pdf"] = "pdf",
+        };
+
+    /// <summary>Error surfaced when a clipboard item's MIME type is missing or unsupported.</summary>
+    internal const string UnsupportedClipboardItemError = "Unsupported clipboard item.";
+
+    /// <summary>Error surfaced when a clipboard item declares no bytes (matches the picker's empty-file error).</summary>
+    internal const string EmptyAttachmentError = "No file selected or file is empty.";
+
+    /// <summary>
+    /// Authoritative validation for a pasted clipboard item, mirroring the JS-side filter.
+    /// Returns the extension to use when the paste is acceptable; otherwise <c>null</c> and the
+    /// error to surface, and NO save must be attempted.
+    /// </summary>
+    /// <param name="mimeType">MIME type reported by the clipboard item.</param>
+    /// <param name="declaredLength">Declared byte length of the clipboard blob.</param>
+    /// <param name="error">Error to surface when the paste is rejected; otherwise <c>null</c>.</param>
+    internal static string? ValidatePaste(string? mimeType, long declaredLength, out string? error)
+    {
+        if (string.IsNullOrWhiteSpace(mimeType) || !PasteMimeExtensions.TryGetValue(mimeType, out var ext))
+        {
+            error = UnsupportedClipboardItemError;
+            return null;
+        }
+
+        if (declaredLength <= 0)
+        {
+            error = EmptyAttachmentError;
+            return null;
+        }
+
+        error = null;
+        return ext;
+    }
+
+    /// <summary>
+    /// Builds the generated name for a pasted attachment: <c>paste-{yyyyMMdd-HHmmss}.{ext}</c>.
+    /// </summary>
+    /// <param name="extension">Extension without a leading dot (for example <c>png</c>).</param>
+    /// <param name="utcNow">Timestamp used for the name (UTC).</param>
+    internal static string BuildPasteFileName(string extension, DateTime utcNow)
+        => $"paste-{utcNow:yyyyMMdd-HHmmss}.{extension}";
+
+    /// <summary>
+    /// Receives a pasted image/PDF blob streamed from the browser and funnels it into the SAME
+    /// pending-attachment flow the file picker uses.
+    /// </summary>
+    /// <remarks>
+    /// The JS <c>allowed</c> flag is only a mirror: this method re-validates state, MIME and size
+    /// authoritatively. A stale mirror that let a paste through is dropped silently so an existing
+    /// pending attachment is never replaced or orphaned.
+    /// </remarks>
+    /// <param name="streamRef">JS stream reference over the pasted blob.</param>
+    /// <param name="mimeType">MIME type reported by the clipboard item.</param>
+    /// <param name="declaredLength">Declared byte length of the blob.</param>
+    [JSInvokable]
+    public Task HandlePasteAsync(IJSStreamReference streamRef, string mimeType, long declaredLength)
+        => HandlePasteCoreAsync(PasteHost, streamRef, mimeType, declaredLength);
+
+    /// <summary>
+    /// The PRODUCTION paste body, written against <see cref="IPasteHost"/> so tests exercise this
+    /// exact code rather than a re-implementation.
+    /// </summary>
+    /// <remarks>
+    /// Two invariants are enforced by the outer <c>finally</c>, on EVERY path (accepted, rejected
+    /// or faulted): the <paramref name="streamRef"/> is disposed (it is owned by this call and
+    /// leaks otherwise) and the JS allowed-state is re-synced (JS set <c>allowed = false</c>
+    /// synchronously before invoking, so a rejection that skipped the sync would permanently
+    /// disable paste).
+    /// </remarks>
+    /// <param name="host">State seam the outcome is written to.</param>
+    /// <param name="streamRef">JS stream reference over the pasted blob; disposed here.</param>
+    /// <param name="mimeType">MIME type reported by the clipboard item.</param>
+    /// <param name="declaredLength">Declared byte length of the blob.</param>
+    internal static async Task HandlePasteCoreAsync(
+        IPasteHost host, IJSStreamReference streamRef, string? mimeType, long declaredLength)
+    {
+        ArgumentNullException.ThrowIfNull(host);
+        ArgumentNullException.ThrowIfNull(streamRef);
+
+        try
+        {
+            // Stale-mirror guard: .NET state changed after setAllowed(true) was mirrored. Drop the
+            // paste silently — never save over / orphan the existing pending attachment.
+            if (!ComputePasteAllowed(host.IsStreaming, host.Uploading, host.Pending))
+                return;
+
+            host.AttachmentError = null;
+
+            var ext = ValidatePaste(mimeType, declaredLength, out var validationError);
+            if (ext is null)
+            {
+                host.AttachmentError = validationError;
+                host.Notify();
+                return;
+            }
+
+            // Claimed BEFORE the first await so a second paste (or a picker upload) starting
+            // while the stream is being opened is refused by the guard above rather than racing
+            // this one. SaveAttachmentAsync re-sets it (harmlessly) and clears it in its finally.
+            host.Uploading = true;
+
+            // Accepting the paste is itself a transition .NET must mirror: JS set allowed = false
+            // for THIS paste only, and the authoritative upload-in-progress state is ours.
+            await TrySyncPasteAllowedAsync(host);
+
+            var generatedName = BuildPasteFileName(ext, DateTime.UtcNow);
+
+            try
+            {
+                // The declared length is used verbatim: the framework default is far below the
+                // attachment cap. SaveAsync is the bounded reader and the size authority — it
+                // rejects oversize content with "attachment exceeds 20 MiB".
+                await using var stream = await streamRef.OpenReadStreamAsync(maxAllowedSize: declaredLength);
+                await SaveAttachmentAsync(host, generatedName, stream);
+            }
+            catch (Exception ex)
+            {
+                host.AttachmentError = ex.Message;
+            }
+            finally
+            {
+                // Released even when the stream could never be opened (SaveAttachmentAsync,
+                // which normally clears it, was never reached).
+                host.Uploading = false;
+            }
+
+            host.Notify();
+        }
+        finally
+        {
+            // Two INDEPENDENT cleanup steps. The stream reference is owned by this invocation and
+            // must be disposed on every path; the allowed-state mirror must be restored on every
+            // path too (JS set allowed = false synchronously before invoking, so even a silent
+            // stale-mirror drop has to restore it). The nested finally guarantees the sync runs
+            // even when disposal throws something other than JSDisconnectedException.
+            try
+            {
+                await streamRef.DisposeAsync();
+            }
+            catch (JSDisconnectedException)
+            {
+                // Circuit teardown: the browser-side reference is already gone.
+            }
+            finally
+            {
+                // Best-effort: a failing mirror update must not mask the paste's own outcome
+                // (or a disposal fault that is propagating out of the try above).
+                await TrySyncPasteAllowedAsync(host);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Mirrors the allowed-state to JS without ever throwing. The mirror is an optimisation —
+    /// .NET re-validates every paste authoritatively — so a failed update must never mask the
+    /// outcome of the operation that triggered it, nor a fault already propagating out of a
+    /// cleanup path. Unexpected failures are logged rather than silently discarded.
+    /// </summary>
+    /// <param name="host">State seam whose mirror is updated.</param>
+    private static async Task TrySyncPasteAllowedAsync(IPasteHost host)
+    {
+        try
+        {
+            await host.SyncPasteAllowedAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ComposerChat] Paste allowed-state sync failed: {ex.Message}");
+        }
+    }
+
+    private async Task RemoveAttachment()
     {
         if (_pending is null) return;
         var result = AttachmentService.Remove(_pending);
@@ -453,6 +786,7 @@ else
             _attachmentError = result.Error ?? "Failed to remove attachment.";
         }
         StateHasChanged();
+        await SyncPasteAllowedAsync();
     }
 
     private async Task ResetSession()
@@ -463,6 +797,7 @@ else
         _pending = null;        // Composer's reset calls ClearAllAsync which may delete the file
         _attachmentError = null; // clear any pending-related error note
         StateHasChanged();
+        await SyncPasteAllowedAsync();
     }
 
     private async Task CompactSession()
@@ -571,11 +906,11 @@ else
         }
     }
 
-    private void HandleKeyDown(KeyboardEventArgs e)
+    private async Task HandleKeyDown(KeyboardEventArgs e)
     {
         if (e.Key == "Enter" && !e.ShiftKey)
         {
-            SendMessage();
+            await SendMessage();
         }
     }
 
@@ -596,13 +931,50 @@ else
         return Markdown.ToHtml(content, MarkdownPipeline);
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
         Composer.OnStreamingUpdate -= HandleStreamingUpdate;
         Composer.OnQuestionAsked -= HandleQuestionAsked;
         Composer.OnCompactingStarted -= HandleCompactingStarted;
         Composer.OnCompacted -= HandleCompacted;
         Composer.OnSubAgentChanged -= HandleSubAgentChanged;
+
+        if (_pasteModule is not null)
+        {
+            // Independently attempted: an uninstall fault must not skip the module disposal.
+            try
+            {
+                await _pasteModule.InvokeVoidAsync("uninstall");
+            }
+            catch (JSDisconnectedException)
+            {
+                // Circuit teardown / navigation: the browser is already gone — expected, not a fault.
+            }
+            catch (Exception ex)
+            {
+                // Never silently swallowed: re-throwing here would mask whatever triggered
+                // disposal, so an unexpected teardown fault is surfaced in the logs instead.
+                Console.Error.WriteLine($"[ComposerChat] Paste module uninstall failed: {ex.Message}");
+            }
+
+            try
+            {
+                await _pasteModule.DisposeAsync();
+            }
+            catch (JSDisconnectedException)
+            {
+                // Circuit teardown / navigation: the module reference dies with the circuit.
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[ComposerChat] Paste module disposal failed: {ex.Message}");
+            }
+
+            _pasteModule = null;
+        }
+
+        _pasteDotNetRef?.Dispose();
+        _pasteDotNetRef = null;
     }
 
     private void HandleSubAgentChanged(SubAgentInfo info)
@@ -649,12 +1021,20 @@ else
 
     private void HandleCompactingStarted()
     {
-        InvokeAsync(StateHasChanged);
+        InvokeAsync(async () =>
+        {
+            StateHasChanged();
+            await SyncPasteAllowedAsync();
+        });
     }
 
     private void HandleCompacted()
     {
-        InvokeAsync(StateHasChanged);
+        InvokeAsync(async () =>
+        {
+            StateHasChanged();
+            await SyncPasteAllowedAsync();
+        });
     }
 
     private void HandleQuestionAsked()
