@@ -583,6 +583,89 @@ public sealed class GitOperationsTests : IAsyncLifetime
         Assert.Equal(summary.FilesChanged, summary.ChangedFiles.Count);
     }
 
+    // ── CloneRepositoryAsync ──────────────────────────────────────────────────
+
+    [Fact]
+    public async Task CloneRepositoryAsync_SetsLocalIdentityAndAllowsCommit()
+    {
+        // Arrange — create a bare remote repo with at least one commit.
+        var bareDir = Path.Combine(Path.GetTempPath(), $"GitOpsBareClone_{Guid.NewGuid():N}");
+        var cloneDir = Path.Combine(Path.GetTempPath(), $"GitOpsClone_{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(bareDir);
+            await RunAsync(bareDir, "init --bare");
+
+            // Seed the bare remote by creating a working repo, committing, and pushing.
+            var seedDir = Path.Combine(Path.GetTempPath(), $"GitOpsSeed_{Guid.NewGuid():N}");
+            try
+            {
+                Directory.CreateDirectory(seedDir);
+                await RunAsync(seedDir, "init");
+                await RunAsync(seedDir, "config user.email \"seed@example.com\"");
+                await RunAsync(seedDir, "config user.name \"Seed\"");
+                await File.WriteAllTextAsync(
+                    Path.Combine(seedDir, "seed.txt"), "seed content", TestContext.Current.CancellationToken);
+                await RunAsync(seedDir, "add seed.txt");
+                await RunAsync(seedDir, "commit -m \"seed\"");
+                await RunAsync(seedDir, $"remote add origin {bareDir}");
+                await RunAsync(seedDir, "push origin HEAD");
+            }
+            finally
+            {
+                await GitOperations.ForceDeleteDirectoryAsync(seedDir);
+            }
+
+            // Act — clone the bare repo via the public API.
+            await GitOperations.CloneRepositoryAsync(bareDir, cloneDir, CancellationToken.None);
+
+            // Assert — local identity is set as expected.
+            var (_, nameOut, _) = await GitOperations.RunGitCommandAsync(
+                cloneDir, "config --local user.name", CancellationToken.None);
+            Assert.Equal("CopilotHive", nameOut.Trim());
+
+            var (_, emailOut, _) = await GitOperations.RunGitCommandAsync(
+                cloneDir, "config --local user.email", CancellationToken.None);
+            Assert.Equal("copilothive@local", emailOut.Trim());
+
+            // Assert — we can make a commit in the clone without a global identity.
+            await File.WriteAllTextAsync(
+                Path.Combine(cloneDir, "file.txt"), "content", TestContext.Current.CancellationToken);
+            var (addExit, _, addStderr) = await GitOperations.RunGitCommandAsync(
+                cloneDir, "add -A", CancellationToken.None);
+            Assert.Equal(0, addExit);
+
+            var (commitExit, _, commitStderr) = await GitOperations.RunGitCommandAsync(
+                cloneDir, "commit -m \"test\"", CancellationToken.None);
+            Assert.Equal(0, commitExit);
+        }
+        finally
+        {
+            await GitOperations.ForceDeleteDirectoryAsync(cloneDir);
+            await GitOperations.ForceDeleteDirectoryAsync(bareDir);
+        }
+    }
+
+    [Fact]
+    public async Task ConfigureLocalIdentity_NonexistentRepo_ThrowsGitOperationException()
+    {
+        var nonexistentDir = Path.Combine(Path.GetTempPath(), $"GitOpsMissing_{Guid.NewGuid():N}");
+
+        var ex = await Assert.ThrowsAsync<GitOperationException>(
+            () => GitOperations.ConfigureLocalIdentity(nonexistentDir, CancellationToken.None));
+
+        Assert.Contains("Failed to set local user.email", ex.Message);
+    }
+
+    [Fact]
+    public async Task ConfigureLocalIdentity_CancelledToken_ThrowsOperationCanceledException()
+    {
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => GitOperations.ConfigureLocalIdentity(_repoDir, cts.Token));
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private async Task CommitFileAsync(string fileName, string content)

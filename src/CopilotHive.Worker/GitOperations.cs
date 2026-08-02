@@ -30,6 +30,54 @@ public static class GitOperations
             ct);
         if (exitCode != 0)
             throw new GitOperationException($"Failed to clone '{url}': {stderr.Trim()}");
+
+        await ConfigureLocalIdentity(targetDir, ct);
+    }
+
+    /// <summary>
+    /// Configures a local git identity in the specified repository directory.
+    /// Throws <see cref="GitOperationException"/> on failure.
+    /// </summary>
+    /// <param name="repoDir">Path to the local git repository.</param>
+    /// <param name="ct">Cancellation token.</param>
+    internal static async Task ConfigureLocalIdentity(string repoDir, CancellationToken ct)
+    {
+        (int ExitCode, string _, string Stderr) emailResult;
+        (int ExitCode, string _, string Stderr) nameResult;
+
+        try
+        {
+            emailResult = await RunGitCommandAsync(
+                repoDir, "config user.email \"copilothive@local\"", ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new GitOperationException($"Failed to set local user.email: {ex.Message}");
+        }
+
+        if (emailResult.ExitCode != 0)
+            throw new GitOperationException($"Failed to set local user.email: {emailResult.Stderr.Trim()}");
+
+        try
+        {
+            nameResult = await RunGitCommandAsync(
+                repoDir, "config user.name \"CopilotHive\"", ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new GitOperationException($"Failed to set local user.name: {ex.Message}");
+        }
+
+        if (nameResult.ExitCode != 0)
+            throw new GitOperationException($"Failed to set local user.name: {nameResult.Stderr.Trim()}");
     }
 
     /// <summary>
