@@ -1209,6 +1209,15 @@ tr:last-child td { border-bottom: none; }
     flex: 0 0 auto;
 }
 
+.releases-grid > .release-toggle-inline {
+    display: inline-block;
+    width: auto;
+    margin: 0;
+    padding: 0.4rem 0.75rem;
+    white-space: nowrap;
+    align-self: center;
+}
+
 .release-create-form {
     max-width: 600px;
 }
