@@ -1,3 +1,26 @@
+## [0.25.0] — 2026-08-02
+
+### Added
+
+- **Composer-chat image/PDF attachments** — File picker and clipboard paste support for attaching images (PNG/JPG/JPEG/GIF/WEBP) and PDFs to Composer messages, with vision-capable sub-agent delegation via `start_sub_agent image_paths`. Singleton `ComposerAttachmentService` with single-gate lifecycle, 20-MiB cap, extension allowlist. Compact inline 📎 attachment trigger and pending chip. Clipboard paste streams JS→.NET blobs via `IJSStreamReference`. (`copilothive-composer-attach-service`, `copilothive-composer-attach-wiring`, `copilothive-composer-attach-ui`, `copilothive-attach-paste-image`, `copilothive-attach-picker-compact`)
+- **Releases page redesign** — Older released releases collapse to a default window (always showing Planning); each repo's releases display on a single horizontally-scrollable row (fixing orphaned-card wrapping); compact "Show older" toggle button. (`copilothive-releases-collapse-older`, `copilothive-releases-horizontal-strip`, `copilothive-releases-toggle-size`)
+- **Background-tasks panel UX** — Sub-agent result area is scrollable with markdown rendering; task text spans full header width. Panel defaults to collapsed on page load. (`copilothive-bg-tasks-scrollable`, `copilothive-bg-tasks-default-collapsed`)
+- **Conditional Improve in planner** — The Brain's planning prompt now recommends the Improve phase only for retries or iterations with prior issues (review/test failures, rejections), instead of unconditionally. (`copilothive-brain-improve-conditional`)
+
+### Changed
+
+- **SharpCoder updated to 0.16.0** — Adds `SubAgentOptions.AdditionalImagesRoot` for resolving image paths outside the primary working directory.
+
+### Removed
+
+- **`always_improve` config property** — The dead `OrchestratorConfig.AlwaysImprove` property and its dashboard checkbox have been removed. The Improve phase behavior is governed by the Brain's R3/R4 prompt guidance, not this toggle. (`copilothive-remove-always-improve`)
+
+### Fixed
+
+- **CI improver config-repo path** — The worker improver config-repo path is now injectable (default `/config-repo`) so CI/non-Docker environments can run improver tests against per-test temp directories. (`copilothive-fix-config-repo-path-ci`)
+- **Push-fail warning includes changed-file paths** — When a worker push fails, the orchestrator warning now includes repository-relative changed-file paths (NUL-delimited `git diff` parsing), not just a count. (`copilothive-push-fail-file-names`)
+- **Read-only role push-fail false positive** — The misleading "push failed" warning is now suppressed for read-only roles (reviewer) that didn't change the branch. A moved-repo-with-zero-diff note warns instead. (`copilothive-readonly-no-push-warn`)
+
 ## [0.24.0] - 2026-08-01
 
 ### Breaking Changes
@@ -269,8 +292,6 @@
 - **Code Quality: Split HiveConfigFile.cs** — Config section classes (`RepositoryConfig`, `WorkerConfig`, `OrchestratorConfig`, `ModelsConfig`, `ComposerConfig`) extracted into separate files. (`copilothive-split-hiveconfigfile`)
 
 - **Code Quality: Split DashboardStateService** — Progress report methods extracted into `ProgressReportService`. (`copilothive-split-dashboard-state-service`)
-
-## [Unreleased]
 
 ## [0.11.0] - 2026-04-14
 
