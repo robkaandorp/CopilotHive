@@ -92,24 +92,20 @@
                 {
                     @ReleaseCard(release)
                 }
-            </div>
-
-            @if (partition.HiddenCount > 0)
-            {
-                <button class="release-toggle" @onclick="() => ToggleGroup(groupKey)">
-                    @(isExpanded ? "Hide older releases" : $"Show older releases ({partition.HiddenCount})")
-                </button>
-
                 @if (isExpanded)
                 {
-                    <div class="releases-grid">
-                        @foreach (var release in partition.CollapsedReleases)
-                        {
-                            @ReleaseCard(release)
-                        }
-                    </div>
+                    @foreach (var release in partition.CollapsedReleases)
+                    {
+                        @ReleaseCard(release)
+                    }
                 }
-            }
+                @if (partition.HiddenCount > 0)
+                {
+                    <button class="release-toggle release-toggle-inline" @onclick="() => ToggleGroup(groupKey)">
+                        @(isExpanded ? "Hide older releases" : $"Show older releases ({partition.HiddenCount})")
+                    </button>
+                }
+            </div>
         </div>
     }
 }

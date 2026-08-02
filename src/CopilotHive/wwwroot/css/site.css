@@ -1138,9 +1138,15 @@ tr:last-child td { border-bottom: none; }
 /* ── Release Pages ───────────────────────────────────────────────── */
 
 .releases-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    display: flex;
+    flex-wrap: nowrap;
+    overflow-x: auto;
     gap: 1rem;
+}
+
+.releases-grid > .release-card {
+    flex: 0 0 auto;
+    width: 280px;
 }
 
 .release-card {
@@ -1198,6 +1204,10 @@ tr:last-child td { border-bottom: none; }
 }
 
 .release-toggle:active { opacity: 0.7; }
+
+.release-toggle-inline {
+    flex: 0 0 auto;
+}
 
 .release-create-form {
     max-width: 600px;
