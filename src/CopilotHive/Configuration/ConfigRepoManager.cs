@@ -201,7 +201,10 @@ public class ConfigRepoManager
             await RunGitAsync(_localPath, ["add", filePath], ct);
             var exitCode = await RunGitOptionalAsync(_localPath, ["diff", "--cached", "--quiet"], ct);
             if (exitCode == 0)
+            {
+                await PushOnlyAsync(ct);
                 return;
+            }
             await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
             await PushWithConflictRecoveryAsync(ct);
         }
@@ -222,10 +225,13 @@ public class ConfigRepoManager
         await _gitLock.WaitAsync(ct);
         try
         {
-            await RunGitAsync(_localPath, ["rm", "--cached", filePath], ct);
+            await RunGitAsync(_localPath, ["rm", "--cached", "--ignore-unmatch", filePath], ct);
             var exitCode = await RunGitOptionalAsync(_localPath, ["diff", "--cached", "--quiet"], ct);
             if (exitCode == 0)
+            {
+                await PushOnlyAsync(ct);
                 return;
+            }
             await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
             await PushWithConflictRecoveryAsync(ct);
         }
@@ -257,6 +263,15 @@ public class ConfigRepoManager
         {
             _gitLock.Release();
         }
+    }
+
+    /// <summary>
+    /// Attempts a plain git push without pull/conflict recovery. Does NOT acquire _gitLock
+    /// (caller must already hold it). Propagates on failure — no reset --hard.
+    /// </summary>
+    private async Task PushOnlyAsync(CancellationToken ct)
+    {
+        await RunGitAsync(_localPath, ["push"], ct);
     }
 
     /// <summary>

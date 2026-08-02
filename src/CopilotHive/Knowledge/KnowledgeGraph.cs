@@ -13,16 +13,20 @@ public sealed class KnowledgeGraph
     private readonly ConfigRepoManager? _configRepo;
     private readonly ILogger<KnowledgeGraph>? _logger;
 
-    private Dictionary<string, KnowledgeDocument> _documents = [];
+    private Dictionary<string, KnowledgeDocument> _documents = new(StringComparer.OrdinalIgnoreCase);
 
     // targetId → list of (sourceId, LinkType) for inverse queries
-    private Dictionary<string, List<(string SourceId, LinkType Type)>> _reverseIndex = [];
+    private Dictionary<string, List<(string SourceId, LinkType Type)>> _reverseIndex =
+        new(StringComparer.OrdinalIgnoreCase);
 
     // IDs of documents modified since the last load (need to be written back)
-    private HashSet<string> _dirtyDocuments = [];
+    private HashSet<string> _dirtyDocuments = new(StringComparer.OrdinalIgnoreCase);
 
     // File paths (relative to config repo root) for documents deleted since the last load
-    private HashSet<string> _deletedDocumentPaths = [];
+    private HashSet<string> _deletedDocumentPaths = new(StringComparer.OrdinalIgnoreCase);
+
+    // Lock ordering: always acquired BEFORE ConfigRepoManager._gitLock.
+    private readonly SemaphoreSlim _graphLock = new(1, 1);
 
     /// <summary>
     /// Initialises a new <see cref="KnowledgeGraph"/>.
@@ -34,6 +38,11 @@ public sealed class KnowledgeGraph
         _configRepo = configRepo;
         _logger = logger;
     }
+
+    /// <summary>
+    /// The local filesystem path of the config repo clone, or null when no config repo manager is attached.
+    /// </summary>
+    public string? ConfigRepoPath => _configRepo?.LocalPath;
 
     // ── CRUD ──────────────────────────────────────────────────────────────────
 
@@ -50,7 +59,7 @@ public sealed class KnowledgeGraph
     /// <param name="author">Author of the document.</param>
     /// <param name="tags">Optional tags.</param>
     /// <param name="ct">Cancellation token.</param>
-    public Task<KnowledgeDocument> CreateDocumentAsync(
+    public async Task<KnowledgeDocument> CreateDocumentAsync(
         string id,
         string title,
         DocumentType type,
@@ -60,6 +69,27 @@ public sealed class KnowledgeGraph
         string? author = null,
         IEnumerable<string>? tags = null,
         CancellationToken ct = default)
+    {
+        await _graphLock.WaitAsync(ct);
+        try
+        {
+            return await CreateDocumentInternal(id, title, type, content, topic, subtopic, author, tags);
+        }
+        finally
+        {
+            _graphLock.Release();
+        }
+    }
+
+    private Task<KnowledgeDocument> CreateDocumentInternal(
+        string id,
+        string title,
+        DocumentType type,
+        string content,
+        string? topic,
+        string? subtopic,
+        string? author,
+        IEnumerable<string>? tags)
     {
         if (string.IsNullOrWhiteSpace(id))
             throw new ArgumentException("Document ID cannot be empty.", nameof(id));
@@ -99,12 +129,19 @@ public sealed class KnowledgeGraph
 
     /// <summary>Returns the document with the given ID, or null if not found.</summary>
     public KnowledgeDocument? GetDocument(string id)
+    {
+        _graphLock.Wait();
+        try { return GetDocumentInternal(id); }
+        finally { _graphLock.Release(); }
+    }
+
+    private KnowledgeDocument? GetDocumentInternal(string id)
         => _documents.TryGetValue(id, out var doc) ? doc : null;
 
     /// <summary>
     /// Updates the content and/or metadata of an existing document.
     /// </summary>
-    public Task UpdateDocumentAsync(
+    public async Task UpdateDocumentAsync(
         string id,
         string? content = null,
         string? title = null,
@@ -113,6 +150,26 @@ public sealed class KnowledgeGraph
         IEnumerable<string>? tags = null,
         string? author = null,
         CancellationToken ct = default)
+    {
+        await _graphLock.WaitAsync(ct);
+        try
+        {
+            await UpdateDocumentInternal(id, content, title, type, status, tags, author);
+        }
+        finally
+        {
+            _graphLock.Release();
+        }
+    }
+
+    private Task UpdateDocumentInternal(
+        string id,
+        string? content,
+        string? title,
+        DocumentType? type,
+        DocumentStatus? status,
+        IEnumerable<string>? tags,
+        string? author)
     {
         if (!_documents.TryGetValue(id, out var doc))
             throw new KeyNotFoundException($"Document '{id}' not found.");
@@ -131,14 +188,33 @@ public sealed class KnowledgeGraph
 
     /// <summary>
     /// Removes a document from the graph. Also removes it from the reverse index and
-    /// strips all incoming links that point to it.
+    /// strips all incoming reverse-index entries that point to it.
+    /// Does NOT remove forward links from other documents that point to this document.
     /// The file on disk will be deleted on the next <see cref="CommitToConfigRepoAsync"/>.
     /// </summary>
-    public Task DeleteDocumentAsync(string id, CancellationToken ct = default)
+    public async Task DeleteDocumentAsync(string id, CancellationToken ct = default)
     {
-        if (!_documents.TryGetValue(id, out var doc))
-            throw new KeyNotFoundException($"Document '{id}' not found.");
+        await _graphLock.WaitAsync(ct);
+        try
+        {
+            if (!_documents.TryGetValue(id, out var doc))
+                throw new KeyNotFoundException($"Document '{id}' not found.");
 
+            DeleteDocumentInternal(id, doc);
+        }
+        finally
+        {
+            _graphLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Removes <paramref name="doc"/> from the in-memory graph, the reverse index, and dirty
+    /// tracking, and records its file path for deletion on the next commit.
+    /// The caller must hold <c>_graphLock</c> and must have resolved <paramref name="doc"/> already.
+    /// </summary>
+    private void DeleteDocumentInternal(string id, KnowledgeDocument doc)
+    {
         // Remove outgoing links from the reverse index
         foreach (var link in doc.Links)
             RemoveFromReverseIndex(id, link.TargetId, link.Type);
@@ -149,7 +225,7 @@ public sealed class KnowledgeGraph
         // Remove this doc's ID from every other doc's reverse-index entry
         foreach (var targetId in _reverseIndex.Keys.ToList())
         {
-            _reverseIndex[targetId].RemoveAll(e => e.SourceId == id);
+            _reverseIndex[targetId].RemoveAll(e => StringComparer.OrdinalIgnoreCase.Equals(e.SourceId, id));
             if (_reverseIndex[targetId].Count == 0)
                 _reverseIndex.Remove(targetId);
         }
@@ -159,7 +235,44 @@ public sealed class KnowledgeGraph
 
         _documents.Remove(id);
         _dirtyDocuments.Remove(id);
-        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Deletes a batch of documents from the graph and persists the result in a single
+    /// serialized operation. When <paramref name="configRepoPath"/> is null the deletions
+    /// are applied in memory only and pending deletion tracking for the newly deleted
+    /// documents is cleared.
+    /// </summary>
+    /// <param name="documentIds">IDs of the documents to delete. Unknown IDs are ignored.</param>
+    /// <param name="configRepoPath">Config repo path to persist to, or null for in-memory only.</param>
+    /// <param name="commitMessage">Commit message used when persisting.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<DeleteAndCommitResult> DeleteDocumentsAndCommitAsync(
+        IReadOnlyList<string> documentIds, string? configRepoPath, string commitMessage,
+        CancellationToken ct = default)
+    {
+        await _graphLock.WaitAsync(ct);
+        try
+        {
+            var preExistingDeletions = new HashSet<string>(_deletedDocumentPaths, StringComparer.OrdinalIgnoreCase);
+            var count = 0;
+            foreach (var id in documentIds)
+            {
+                if (!_documents.TryGetValue(id, out var doc)) continue;
+                DeleteDocumentInternal(id, doc);
+                count++;
+            }
+            if (configRepoPath is null)
+            {
+                foreach (var p in _deletedDocumentPaths.ToList())
+                    if (!preExistingDeletions.Contains(p)) _deletedDocumentPaths.Remove(p);
+                return new DeleteAndCommitResult(count, true, null);
+            }
+            try { await CommitInternal(configRepoPath, commitMessage, ct); return new(count, true, null); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { return new(count, false, ex); }
+        }
+        finally { _graphLock.Release(); }
     }
 
     // ── Links ──────────────────────────────────────────────────────────────────
@@ -170,11 +283,18 @@ public sealed class KnowledgeGraph
     /// </summary>
     public void AddLink(string documentId, DocumentLink link)
     {
+        _graphLock.Wait();
+        try { AddLinkInternal(documentId, link); }
+        finally { _graphLock.Release(); }
+    }
+
+    private void AddLinkInternal(string documentId, DocumentLink link)
+    {
         if (!_documents.TryGetValue(documentId, out var doc))
             throw new KeyNotFoundException($"Document '{documentId}' not found.");
 
         // Remove any existing link with the same TargetId+Type pair
-        doc.Links.RemoveAll(l => l.TargetId == link.TargetId && l.Type == link.Type);
+        doc.Links.RemoveAll(l => StringComparer.OrdinalIgnoreCase.Equals(l.TargetId, link.TargetId) && l.Type == link.Type);
         doc.Links.Add(link);
 
         AddToReverseIndex(documentId, link.TargetId, link.Type);
@@ -188,10 +308,17 @@ public sealed class KnowledgeGraph
     /// </summary>
     public void RemoveLink(string documentId, string targetId, LinkType type)
     {
+        _graphLock.Wait();
+        try { RemoveLinkInternal(documentId, targetId, type); }
+        finally { _graphLock.Release(); }
+    }
+
+    private void RemoveLinkInternal(string documentId, string targetId, LinkType type)
+    {
         if (!_documents.TryGetValue(documentId, out var doc))
             throw new KeyNotFoundException($"Document '{documentId}' not found.");
 
-        doc.Links.RemoveAll(l => l.TargetId == targetId && l.Type == type);
+        doc.Links.RemoveAll(l => StringComparer.OrdinalIgnoreCase.Equals(l.TargetId, targetId) && l.Type == type);
         RemoveFromReverseIndex(documentId, targetId, type);
         doc.UpdatedAt = DateTime.UtcNow;
         _dirtyDocuments.Add(documentId);
@@ -204,6 +331,13 @@ public sealed class KnowledgeGraph
     /// All query tokens must match (AND logic); each token is checked as a substring against any field.
     /// </summary>
     public List<KnowledgeDocument> Search(string query)
+    {
+        _graphLock.Wait();
+        try { return SearchInternal(query); }
+        finally { _graphLock.Release(); }
+    }
+
+    private List<KnowledgeDocument> SearchInternal(string query)
     {
         if (string.IsNullOrWhiteSpace(query))
             return [.. _documents.Values];
@@ -232,26 +366,61 @@ public sealed class KnowledgeGraph
 
     /// <summary>Returns all documents whose Topic matches the given topic (case-insensitive).</summary>
     public List<KnowledgeDocument> FindByTopic(string topic)
+    {
+        _graphLock.Wait();
+        try { return FindByTopicInternal(topic); }
+        finally { _graphLock.Release(); }
+    }
+
+    private List<KnowledgeDocument> FindByTopicInternal(string topic)
         => _documents.Values
             .Where(d => string.Equals(d.Topic, topic, StringComparison.OrdinalIgnoreCase))
             .ToList();
 
     /// <summary>Returns all documents of the given type.</summary>
     public List<KnowledgeDocument> FindByType(DocumentType type)
+    {
+        _graphLock.Wait();
+        try { return FindByTypeInternal(type); }
+        finally { _graphLock.Release(); }
+    }
+
+    private List<KnowledgeDocument> FindByTypeInternal(DocumentType type)
         => _documents.Values.Where(d => d.Type == type).ToList();
 
     /// <summary>Returns all documents that include the given tag (case-insensitive).</summary>
     public List<KnowledgeDocument> FindByTag(string tag)
+    {
+        _graphLock.Wait();
+        try { return FindByTagInternal(tag); }
+        finally { _graphLock.Release(); }
+    }
+
+    private List<KnowledgeDocument> FindByTagInternal(string tag)
         => _documents.Values
             .Where(d => d.Tags.Any(t => string.Equals(t, tag, StringComparison.OrdinalIgnoreCase)))
             .ToList();
 
     /// <summary>Returns all documents with the given status.</summary>
     public List<KnowledgeDocument> FindByStatus(DocumentStatus status)
+    {
+        _graphLock.Wait();
+        try { return FindByStatusInternal(status); }
+        finally { _graphLock.Release(); }
+    }
+
+    private List<KnowledgeDocument> FindByStatusInternal(DocumentStatus status)
         => _documents.Values.Where(d => d.Status == status).ToList();
 
     /// <summary>Returns all documents in the graph.</summary>
     public List<KnowledgeDocument> GetAllDocuments()
+    {
+        _graphLock.Wait();
+        try { return GetAllDocumentsInternal(); }
+        finally { _graphLock.Release(); }
+    }
+
+    private List<KnowledgeDocument> GetAllDocumentsInternal()
         => [.. _documents.Values];
 
     /// <summary>
@@ -259,6 +428,13 @@ public sealed class KnowledgeGraph
     /// Returns an empty list if the document is not found.
     /// </summary>
     public List<DocumentLink> GetOutgoingLinks(string id)
+    {
+        _graphLock.Wait();
+        try { return GetOutgoingLinksInternal(id); }
+        finally { _graphLock.Release(); }
+    }
+
+    private List<DocumentLink> GetOutgoingLinksInternal(string id)
         => _documents.TryGetValue(id, out var doc) ? [.. doc.Links] : [];
 
     /// <summary>
@@ -269,6 +445,13 @@ public sealed class KnowledgeGraph
     /// </summary>
     public List<IncomingLink> GetIncomingLinks(string id)
     {
+        _graphLock.Wait();
+        try { return GetIncomingLinksInternal(id); }
+        finally { _graphLock.Release(); }
+    }
+
+    private List<IncomingLink> GetIncomingLinksInternal(string id)
+    {
         if (!_reverseIndex.TryGetValue(id, out var entries))
             return [];
 
@@ -278,7 +461,8 @@ public sealed class KnowledgeGraph
             if (!_documents.TryGetValue(sourceId, out var sourceDoc))
                 continue;
 
-            var outgoing = sourceDoc.Links.FirstOrDefault(l => l.TargetId == id && l.Type == type);
+            var outgoing = sourceDoc.Links.FirstOrDefault(
+                l => StringComparer.OrdinalIgnoreCase.Equals(l.TargetId, id) && l.Type == type);
             result.Add(new IncomingLink(sourceId, type.Inverse(), outgoing?.Description));
         }
         return result;
@@ -291,40 +475,47 @@ public sealed class KnowledgeGraph
     /// These are the "children" of the document — documents that declared this one as their parent.
     /// </summary>
     public List<KnowledgeDocument> GetChildren(string id)
-        => GetInverseDocuments(id, LinkType.Parent);
+        => GetInverseDocumentsLocked(id, LinkType.Parent);
 
     /// <summary>
     /// Returns all documents that have a <see cref="LinkType.Supersedes"/> link pointing to <paramref name="id"/>.
     /// These are the newer documents that have superseded the given document.
     /// </summary>
     public List<KnowledgeDocument> GetSupersededBy(string id)
-        => GetInverseDocuments(id, LinkType.Supersedes);
+        => GetInverseDocumentsLocked(id, LinkType.Supersedes);
 
     /// <summary>
     /// Returns all documents that have a <see cref="LinkType.DependsOn"/> link pointing to <paramref name="id"/>.
     /// These are the documents that depend on the given document.
     /// </summary>
     public List<KnowledgeDocument> GetDependedOnBy(string id)
-        => GetInverseDocuments(id, LinkType.DependsOn);
+        => GetInverseDocumentsLocked(id, LinkType.DependsOn);
 
     /// <summary>
     /// Returns all documents that have a <see cref="LinkType.Implements"/> link pointing to <paramref name="id"/>.
     /// These are the documents that implement the given document (e.g. spec → implementation).
     /// </summary>
     public List<KnowledgeDocument> GetImplementedBy(string id)
-        => GetInverseDocuments(id, LinkType.Implements);
+        => GetInverseDocumentsLocked(id, LinkType.Implements);
 
     /// <summary>
     /// Returns all documents that have a <see cref="LinkType.Related"/> link pointing to <paramref name="id"/>.
     /// </summary>
     public List<KnowledgeDocument> GetRelatedBy(string id)
-        => GetInverseDocuments(id, LinkType.Related);
+        => GetInverseDocumentsLocked(id, LinkType.Related);
 
     /// <summary>
     /// Returns all documents that have a <see cref="LinkType.References"/> link pointing to <paramref name="id"/>.
     /// </summary>
     public List<KnowledgeDocument> GetReferencedBy(string id)
-        => GetInverseDocuments(id, LinkType.References);
+        => GetInverseDocumentsLocked(id, LinkType.References);
+
+    private List<KnowledgeDocument> GetInverseDocumentsLocked(string id, LinkType type)
+    {
+        _graphLock.Wait();
+        try { return GetInverseDocuments(id, type); }
+        finally { _graphLock.Release(); }
+    }
 
     /// <summary>
     /// Performs a BFS traversal of forward links up to <paramref name="maxDepth"/> hops.
@@ -332,10 +523,17 @@ public sealed class KnowledgeGraph
     /// </summary>
     public List<KnowledgeDocument> GetRelated(string id, int maxDepth = 1)
     {
+        _graphLock.Wait();
+        try { return GetRelatedInternal(id, maxDepth); }
+        finally { _graphLock.Release(); }
+    }
+
+    private List<KnowledgeDocument> GetRelatedInternal(string id, int maxDepth)
+    {
         if (!_documents.ContainsKey(id))
             return [];
 
-        var visited = new HashSet<string> { id };
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { id };
         var queue = new Queue<(string Id, int Depth)>();
         queue.Enqueue((id, 0));
         var result = new List<KnowledgeDocument>();
@@ -370,31 +568,47 @@ public sealed class KnowledgeGraph
     /// parses their YAML frontmatter and markdown body, and rebuilds the in-memory
     /// document dictionary and reverse link index. Clears dirty tracking.
     /// </summary>
-    public Task ReloadFromConfigRepoAsync(string configRepoPath, CancellationToken ct = default)
+    public async Task ReloadFromConfigRepoAsync(string configRepoPath, CancellationToken ct = default)
+    {
+        await _graphLock.WaitAsync(ct);
+        try { await ReloadInternal(configRepoPath); }
+        finally { _graphLock.Release(); }
+    }
+
+    private Task ReloadInternal(string configRepoPath)
     {
         var knowledgePath = Path.Combine(configRepoPath, "knowledge");
         if (!Directory.Exists(knowledgePath))
         {
             _logger?.LogInformation("Knowledge directory not found at {KnowledgePath} — starting with empty graph", knowledgePath);
-            _documents = [];
-            _reverseIndex = [];
-            _dirtyDocuments = [];
-            _deletedDocumentPaths = [];
+            _documents = new Dictionary<string, KnowledgeDocument>(StringComparer.OrdinalIgnoreCase);
+            _reverseIndex = new Dictionary<string, List<(string SourceId, LinkType Type)>>(StringComparer.OrdinalIgnoreCase);
+            _dirtyDocuments = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            _deletedDocumentPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             return Task.CompletedTask;
         }
 
         var newDocuments = new Dictionary<string, KnowledgeDocument>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var filePath in Directory.EnumerateFiles(knowledgePath, "*.md", SearchOption.AllDirectories))
+        var files = Directory.EnumerateFiles(knowledgePath, "*.md", SearchOption.AllDirectories)
+            .Select(f => (FullPath: f, RelativePath: Path.GetRelativePath(configRepoPath, f).Replace('\\', '/')))
+            .OrderBy(f => f.RelativePath, StringComparer.Ordinal)
+            .ToList();
+
+        foreach (var (filePath, relativePath) in files)
         {
             try
             {
-                var relativePath = Path.GetRelativePath(configRepoPath, filePath)
-                    .Replace('\\', '/');
-
                 var doc = ParseMarkdownFile(filePath, relativePath);
                 if (doc is not null)
+                {
+                    if (newDocuments.ContainsKey(doc.Id))
+                    {
+                        _logger?.LogWarning("Duplicate document ID '{DocId}' from {FilePath} — already loaded from an earlier file; skipping", doc.Id, relativePath);
+                        continue;
+                    }
                     newDocuments[doc.Id] = doc;
+                }
             }
             catch (Exception ex)
             {
@@ -403,9 +617,9 @@ public sealed class KnowledgeGraph
         }
 
         _documents = newDocuments;
-        _reverseIndex = [];
-        _dirtyDocuments = [];
-        _deletedDocumentPaths = [];
+        _reverseIndex = new Dictionary<string, List<(string SourceId, LinkType Type)>>(StringComparer.OrdinalIgnoreCase);
+        _dirtyDocuments = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _deletedDocumentPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // Rebuild reverse index from all loaded documents
         foreach (var doc in _documents.Values)
@@ -424,10 +638,30 @@ public sealed class KnowledgeGraph
     /// </summary>
     public async Task CommitToConfigRepoAsync(string configRepoPath, string message, CancellationToken ct = default)
     {
+        await _graphLock.WaitAsync(ct);
+        try { await CommitInternal(configRepoPath, message, ct); }
+        finally { _graphLock.Release(); }
+    }
+
+    private async Task CommitInternal(string configRepoPath, string message, CancellationToken ct)
+    {
         var dirty = _dirtyDocuments.ToList();
         var toDelete = _deletedDocumentPaths.ToList();
 
         if (dirty.Count == 0 && toDelete.Count == 0) return;
+
+        foreach (var filePath in toDelete)
+        {
+            var fullPath = Path.Combine(configRepoPath, filePath);
+            if (File.Exists(fullPath))
+                File.Delete(fullPath);
+
+            if (_configRepo is not null)
+            {
+                await _configRepo.DeleteFileAsync(filePath, message, ct);
+                _logger?.LogInformation("Deleted knowledge document file {FilePath} from config repo", filePath);
+            }
+        }
 
         foreach (var docId in dirty)
         {
@@ -445,19 +679,6 @@ public sealed class KnowledgeGraph
             {
                 await _configRepo.CommitFileAsync(doc.FilePath, message, ct);
                 _logger?.LogInformation("Committed knowledge document {DocId} to config repo", docId);
-            }
-        }
-
-        foreach (var filePath in toDelete)
-        {
-            var fullPath = Path.Combine(configRepoPath, filePath);
-            if (File.Exists(fullPath))
-                File.Delete(fullPath);
-
-            if (_configRepo is not null)
-            {
-                await _configRepo.DeleteFileAsync(filePath, message, ct);
-                _logger?.LogInformation("Deleted knowledge document file {FilePath} from config repo", filePath);
             }
         }
 
@@ -515,10 +736,10 @@ public sealed class KnowledgeGraph
             if (leaf.StartsWith(subtopicPrefix, StringComparison.OrdinalIgnoreCase))
                 leaf = leaf[subtopicPrefix.Length..];
 
-            return $"knowledge/{topic}/{subtopic}/{leaf}.md";
+            return $"knowledge/{topic}/{subtopic}/{leaf}.md".ToLowerInvariant();
         }
 
-        return $"knowledge/{topic}/{leaf}.md";
+        return $"knowledge/{topic}/{leaf}.md".ToLowerInvariant();
     }
 
     private static (string Topic, string? Subtopic) DeriveTopicSubtopicFromPath(string relativePath)
@@ -829,7 +1050,7 @@ public sealed class KnowledgeGraph
         }
 
         // Deduplicate
-        if (!entries.Any(e => e.SourceId == sourceId && e.Type == type))
+        if (!entries.Any(e => StringComparer.OrdinalIgnoreCase.Equals(e.SourceId, sourceId) && e.Type == type))
             entries.Add((sourceId, type));
     }
 
@@ -837,7 +1058,7 @@ public sealed class KnowledgeGraph
     {
         if (_reverseIndex.TryGetValue(targetId, out var entries))
         {
-            entries.RemoveAll(e => e.SourceId == sourceId && e.Type == type);
+            entries.RemoveAll(e => StringComparer.OrdinalIgnoreCase.Equals(e.SourceId, sourceId) && e.Type == type);
             if (entries.Count == 0)
                 _reverseIndex.Remove(targetId);
         }

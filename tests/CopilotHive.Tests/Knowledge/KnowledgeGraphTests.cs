@@ -1187,3 +1187,759 @@ public sealed class KnowledgeGraphDeletePersistenceTests : IDisposable
         Assert.Null(graph2.GetDocument("features-spy-delete"));
     }
 }
+
+/// <summary>
+/// A spy <see cref="ConfigRepoManager"/> that records the order of commit/delete calls.
+/// </summary>
+internal sealed class OrderRecordingConfigRepoManager : ConfigRepoManager
+{
+    private static string NewDummyPath() => Path.Combine(Path.GetTempPath(), $"OrderCRM_{Guid.NewGuid():N}");
+
+    public readonly List<(string Operation, string Path)> Operations = [];
+
+    public OrderRecordingConfigRepoManager() : base("https://example.com/order.git", NewDummyPath()) { }
+
+    public override Task CommitFileAsync(string filePath, string commitMessage, CancellationToken ct = default)
+    {
+        Operations.Add(("commit", filePath));
+        return Task.CompletedTask;
+    }
+
+    public override Task DeleteFileAsync(string filePath, string commitMessage, CancellationToken ct = default)
+    {
+        Operations.Add(("delete", filePath));
+        return Task.CompletedTask;
+    }
+}
+
+/// <summary>Captures log messages emitted by the graph.</summary>
+internal sealed class CapturingKnowledgeLogger<T> : Microsoft.Extensions.Logging.ILogger<T>
+{
+    public readonly List<string> Messages = [];
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+    public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+    public void Log<TState>(
+        Microsoft.Extensions.Logging.LogLevel logLevel,
+        Microsoft.Extensions.Logging.EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        lock (Messages)
+            Messages.Add(formatter(state, exception));
+    }
+}
+
+/// <summary>
+/// Tests for the graph-wide lock, batch deletion, case-insensitive tracking,
+/// and deletion-before-write commit ordering.
+/// </summary>
+public sealed class KnowledgeGraphLockingAndBatchDeleteTests : IDisposable
+{
+    private readonly string _tempDir;
+
+    public KnowledgeGraphLockingAndBatchDeleteTests()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), $"KGLockTest_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_tempDir);
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            if (Directory.Exists(_tempDir))
+                Directory.Delete(_tempDir, recursive: true);
+        }
+        catch
+        {
+            // best-effort cleanup
+        }
+    }
+
+    // ── Reflection helpers ────────────────────────────────────────────────────
+
+    private static HashSet<string> GetDeletedPaths(KnowledgeGraph graph)
+    {
+        var field = typeof(KnowledgeGraph).GetField(
+            "_deletedDocumentPaths",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(field);
+        var set = field!.GetValue(graph) as HashSet<string>;
+        Assert.NotNull(set);
+        return set!;
+    }
+
+    private static SemaphoreSlim GetGraphLock(KnowledgeGraph graph)
+    {
+        var field = typeof(KnowledgeGraph).GetField(
+            "_graphLock",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(field);
+        var semaphore = field!.GetValue(graph) as SemaphoreSlim;
+        Assert.NotNull(semaphore);
+        return semaphore!;
+    }
+
+    private static HashSet<string> GetDirtyDocuments(KnowledgeGraph graph)
+    {
+        var field = typeof(KnowledgeGraph).GetField(
+            "_dirtyDocuments",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(field);
+        var set = field!.GetValue(graph) as HashSet<string>;
+        Assert.NotNull(set);
+        return set!;
+    }
+
+    private static Dictionary<string, List<(string SourceId, LinkType Type)>> GetReverseIndex(KnowledgeGraph graph)
+    {
+        var field = typeof(KnowledgeGraph).GetField(
+            "_reverseIndex",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(field);
+        var dict = field!.GetValue(graph) as Dictionary<string, List<(string SourceId, LinkType Type)>>;
+        Assert.NotNull(dict);
+        return dict!;
+    }
+
+    /// <summary>Probes at runtime whether the filesystem under the temp dir is case-insensitive.</summary>
+    private bool IsFileSystemCaseInsensitive()
+    {
+        var probeDir = Path.Combine(_tempDir, "case-probe");
+        Directory.CreateDirectory(probeDir);
+        var lower = Path.Combine(probeDir, "test.tmp");
+        File.WriteAllText(lower, "probe");
+        return File.Exists(Path.Combine(probeDir, "TEST.TMP"));
+    }
+
+    /// <summary>Returns a path whose parent is a regular file, so directory creation fails.</summary>
+    private string CreateUnusablePath()
+    {
+        var blocker = Path.Combine(_tempDir, $"blocker-{Guid.NewGuid():N}.txt");
+        File.WriteAllText(blocker, "not a directory");
+        return Path.Combine(blocker, "repo");
+    }
+
+    // ── 1. Batch delete, in-memory only ───────────────────────────────────────
+
+    [Fact]
+    public async Task DeleteDocumentsAndCommitAsync_NullConfigRepoPath_DeletesInMemoryAndClearsOnlyNewTracking()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        await graph.CreateDocumentAsync("features-alpha", "Alpha", DocumentType.Feature, "a", ct: ct);
+        await graph.CreateDocumentAsync("features-beta", "Beta", DocumentType.Feature, "b", ct: ct);
+
+        // Seed a pre-existing pending deletion that must survive the call.
+        var deleted = GetDeletedPaths(graph);
+        deleted.Add("knowledge/features/pre-existing.md");
+
+        var result = await graph.DeleteDocumentsAndCommitAsync(
+            ["features-alpha", "features-beta"], configRepoPath: null, "batch delete", ct);
+
+        Assert.True(result.Persisted);
+        Assert.Equal(2, result.DeletedCount);
+        Assert.Null(result.PersistError);
+        Assert.Null(graph.GetDocument("features-alpha"));
+        Assert.Null(graph.GetDocument("features-beta"));
+
+        var remaining = GetDeletedPaths(graph);
+        Assert.Single(remaining);
+        Assert.Contains("knowledge/features/pre-existing.md", remaining);
+    }
+
+    // ── 2. Batch delete against a plain directory (no ConfigRepoManager) ───────
+
+    [Fact]
+    public async Task DeleteDocumentsAndCommitAsync_DiskOnly_DeletesFilesAndClearsTracking()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        var alpha = await graph.CreateDocumentAsync("features-alpha", "Alpha", DocumentType.Feature, "a", ct: ct);
+        var beta = await graph.CreateDocumentAsync("features-beta", "Beta", DocumentType.Feature, "b", ct: ct);
+        await graph.CommitToConfigRepoAsync(_tempDir, "create", ct);
+
+        var alphaPath = Path.Combine(_tempDir, alpha.FilePath);
+        var betaPath = Path.Combine(_tempDir, beta.FilePath);
+        Assert.True(File.Exists(alphaPath));
+        Assert.True(File.Exists(betaPath));
+
+        var result = await graph.DeleteDocumentsAndCommitAsync(
+            ["features-alpha", "features-beta"], _tempDir, "batch delete", ct);
+
+        Assert.True(result.Persisted);
+        Assert.Equal(2, result.DeletedCount);
+        Assert.Null(result.PersistError);
+        Assert.False(File.Exists(alphaPath));
+        Assert.False(File.Exists(betaPath));
+        Assert.Empty(GetDeletedPaths(graph));
+    }
+
+    // ── 3. Batch delete with a persistence failure ────────────────────────────
+
+    [Fact]
+    public async Task DeleteDocumentsAndCommitAsync_PersistFails_ReturnsErrorAndRetainsTracking()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        // A dirty document forces a disk write during the commit, which fails on a bad path.
+        await graph.CreateDocumentAsync("features-keep", "Keep", DocumentType.Feature, "keep", ct: ct);
+        var doomed = await graph.CreateDocumentAsync("features-doomed", "Doomed", DocumentType.Feature, "x", ct: ct);
+
+        var badPath = CreateUnusablePath();
+
+        var result = await graph.DeleteDocumentsAndCommitAsync(["features-doomed"], badPath, "batch delete", ct);
+
+        Assert.False(result.Persisted);
+        Assert.NotNull(result.PersistError);
+        Assert.Equal(1, result.DeletedCount);
+        Assert.Null(graph.GetDocument("features-doomed"));
+
+        // Tracking is retained so the operation can be retried idempotently.
+        Assert.Contains(doomed.FilePath, GetDeletedPaths(graph));
+    }
+
+    // ── 4. Retry after a failed persist ───────────────────────────────────────
+
+    [Fact]
+    public async Task DeleteDocumentsAndCommitAsync_RetryAfterFailure_PersistsRemainingWork()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        var keep = await graph.CreateDocumentAsync("features-keep", "Keep", DocumentType.Feature, "keep", ct: ct);
+        var doomed = await graph.CreateDocumentAsync("features-doomed", "Doomed", DocumentType.Feature, "x", ct: ct);
+
+        var firstResult = await graph.DeleteDocumentsAndCommitAsync(
+            ["features-doomed"], CreateUnusablePath(), "batch delete", ct);
+        Assert.False(firstResult.Persisted);
+
+        // Retry with an empty ID list and a good path — the pending work is flushed.
+        var retry = await graph.DeleteDocumentsAndCommitAsync([], _tempDir, "batch delete retry", ct);
+
+        Assert.True(retry.Persisted);
+        Assert.Equal(0, retry.DeletedCount);
+        Assert.Null(retry.PersistError);
+        Assert.Empty(GetDeletedPaths(graph));
+        Assert.False(File.Exists(Path.Combine(_tempDir, doomed.FilePath)));
+        Assert.True(File.Exists(Path.Combine(_tempDir, keep.FilePath)));
+    }
+
+    // ── 5. ConfigRepoPath ─────────────────────────────────────────────────────
+
+    [Fact]
+    public void ConfigRepoPath_NoConfigRepoManager_ReturnsNull()
+    {
+        var graph = new KnowledgeGraph();
+        Assert.Null(graph.ConfigRepoPath);
+    }
+
+    [Fact]
+    public void ConfigRepoPath_WithConfigRepoManager_ReturnsLocalPath()
+    {
+        var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
+        var graph = new KnowledgeGraph(manager);
+        Assert.Equal(manager.LocalPath, graph.ConfigRepoPath);
+    }
+
+    // ── 6. Atomicity: reload cannot interleave with a deletion ────────────────
+
+    [Fact]
+    public async Task ReloadAndDelete_AreSerialized_DeletionIsNotLost()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        var doc = await graph.CreateDocumentAsync("features-serialized", "Serialized",
+            DocumentType.Feature, "content", ct: ct);
+        await graph.CommitToConfigRepoAsync(_tempDir, "create", ct);
+
+        var graphLock = GetGraphLock(graph);
+        await graphLock.WaitAsync(ct);
+
+        // Queue the reload first, then the deletion — both must block on the lock.
+        var reloadTask = Task.Run(() => graph.ReloadFromConfigRepoAsync(_tempDir, ct), ct);
+        await Task.Delay(150, ct);
+        var deleteTask = Task.Run(() => graph.DeleteDocumentAsync(doc.Id, ct), ct);
+        await Task.Delay(150, ct);
+
+        Assert.False(reloadTask.IsCompleted, "Reload must block while the graph lock is held");
+        Assert.False(deleteTask.IsCompleted, "Delete must block while the graph lock is held");
+
+        graphLock.Release();
+
+        await reloadTask;
+        await deleteTask;
+
+        // The deletion ran to completion after the reload — it was not lost or corrupted.
+        Assert.Null(graph.GetDocument(doc.Id));
+        Assert.Contains(doc.FilePath, GetDeletedPaths(graph));
+    }
+
+    // ── 7. Atomicity: same-ID recreation after deletion ───────────────────────
+
+    [Fact]
+    public async Task DeleteThenCreateSameId_CreateBlocksUntilGraphLockReleased_AndPersistsAfterCommit()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        await graph.CreateDocumentAsync("features-recycle", "First", DocumentType.Feature,
+            "original content", topic: "features", ct: ct);
+        await graph.DeleteDocumentAsync("features-recycle", ct);
+
+        // Hold the graph lock so the recreation cannot proceed.
+        var graphLock = GetGraphLock(graph);
+        await graphLock.WaitAsync(ct);
+
+        var createTask = Task.Run(() => graph.CreateDocumentAsync(
+            "features-recycle", "Second", DocumentType.Feature, "new content",
+            topic: "features", ct: ct), ct);
+
+        // The create must be serialized behind the lock — it cannot complete yet.
+        await Assert.ThrowsAsync<TimeoutException>(
+            () => createTask.WaitAsync(TimeSpan.FromMilliseconds(200), ct));
+        Assert.False(createTask.IsCompleted, "CreateDocumentAsync must block while the graph lock is held");
+
+        graphLock.Release();
+
+        var recreated = await createTask;
+        Assert.Equal("Second", recreated.Title);
+        Assert.Equal("new content", recreated.Content);
+        Assert.Equal("Second", graph.GetDocument("features-recycle")!.Title);
+
+        // Persistence: commit to disk (no ConfigRepoManager), then reload into a fresh graph.
+        await graph.CommitToConfigRepoAsync(_tempDir, "recreate commit", ct);
+
+        var graph2 = new KnowledgeGraph();
+        await graph2.ReloadFromConfigRepoAsync(_tempDir, ct);
+
+        var reloaded = graph2.GetDocument("features-recycle");
+        Assert.NotNull(reloaded);
+        Assert.Equal("Second", reloaded!.Title);
+        Assert.Equal("new content", reloaded.Content);
+    }
+
+    // ── 8. Deletion runs before writes for the same path ──────────────────────
+
+    [Fact]
+    public async Task CommitToConfigRepoAsync_DeleteThenRecreateSamePath_NewContentSurvives()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        var original = await graph.CreateDocumentAsync(
+            "features-reborn", "Original", DocumentType.Feature, "old body", ct: ct);
+        await graph.CommitToConfigRepoAsync(_tempDir, "create", ct);
+
+        var fullPath = Path.Combine(_tempDir, original.FilePath);
+        Assert.True(File.Exists(fullPath));
+
+        await graph.DeleteDocumentAsync("features-reborn", ct);
+        var recreated = await graph.CreateDocumentAsync(
+            "features-reborn", "Reborn", DocumentType.Feature, "new body", ct: ct);
+        Assert.Equal(original.FilePath, recreated.FilePath);
+
+        await graph.CommitToConfigRepoAsync(_tempDir, "recreate", ct);
+
+        // Deletions run first, so the recreated file is the surviving state on disk.
+        Assert.True(File.Exists(fullPath), "The recreated file must exist after the commit");
+        var contents = await File.ReadAllTextAsync(fullPath, ct);
+        Assert.Contains("new body", contents);
+        Assert.DoesNotContain("old body", contents);
+    }
+
+    // ── 9. Deletion/recreation on a case-insensitive filesystem ───────────────
+
+    [Fact]
+    public async Task CommitToConfigRepoAsync_CaseInsensitiveFileSystem_DeleteThenWriteKeepsNewContent()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        if (!IsFileSystemCaseInsensitive())
+        {
+            Assert.Skip("Filesystem is case-sensitive — the delete/write collision cannot occur.");
+            return;
+        }
+
+        // Seed an existing file with mixed-case path, then load it.
+        var mixedRelative = "knowledge/Reborn/Doc.md";
+        var mixedFull = Path.Combine(_tempDir, "knowledge", "Reborn", "Doc.md");
+        Directory.CreateDirectory(Path.GetDirectoryName(mixedFull)!);
+        await File.WriteAllTextAsync(mixedFull,
+            "---\ntitle: Old\ntype: feature\nstatus: active\ntags: []\nlinks: []\n---\n\nold body\n", ct);
+
+        var graph = new KnowledgeGraph();
+        await graph.ReloadFromConfigRepoAsync(_tempDir, ct);
+
+        var loaded = graph.GetDocument("Reborn-Doc");
+        Assert.NotNull(loaded);
+        Assert.Equal(mixedRelative, loaded!.FilePath);
+
+        await graph.DeleteDocumentAsync(loaded.Id, ct);
+
+        // Create a new document that maps to the same file path in lowercase.
+        var recreated = await graph.CreateDocumentAsync(
+            "Reborn-Doc", "New", DocumentType.Feature, "new body", topic: "Reborn", ct: ct);
+        Assert.Equal("knowledge/reborn/doc.md", recreated.FilePath);
+
+        await graph.CommitToConfigRepoAsync(_tempDir, "recreate", ct);
+
+        var lowerFull = Path.Combine(_tempDir, "knowledge", "reborn", "doc.md");
+        Assert.True(File.Exists(lowerFull), "The recreated file must exist on a case-insensitive filesystem");
+        var contents = await File.ReadAllTextAsync(lowerFull, ct);
+        Assert.Contains("new body", contents);
+        Assert.DoesNotContain("old body", contents);
+    }
+
+    // ── 10. Commit order: deletions before writes ─────────────────────────────
+
+    [Fact]
+    public async Task CommitToConfigRepoAsync_ProcessesDeletionsBeforeWrites()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var spy = new OrderRecordingConfigRepoManager();
+        var graph = new KnowledgeGraph(spy);
+
+        var doomed = await graph.CreateDocumentAsync("features-doomed", "Doomed", DocumentType.Feature, "x", ct: ct);
+        await graph.CommitToConfigRepoAsync(_tempDir, "create", ct);
+        spy.Operations.Clear();
+
+        await graph.DeleteDocumentAsync("features-doomed", ct);
+        var fresh = await graph.CreateDocumentAsync("features-fresh", "Fresh", DocumentType.Feature, "y", ct: ct);
+
+        await graph.CommitToConfigRepoAsync(_tempDir, "delete and write", ct);
+
+        var deleteIndex = spy.Operations.FindIndex(o => o.Operation == "delete");
+        var commitIndex = spy.Operations.FindIndex(o => o.Operation == "commit");
+        Assert.True(deleteIndex >= 0, "A delete operation should have been recorded");
+        Assert.True(commitIndex >= 0, "A commit operation should have been recorded");
+        Assert.True(deleteIndex < commitIndex, "Deletions must be processed before writes");
+
+        Assert.False(File.Exists(Path.Combine(_tempDir, doomed.FilePath)));
+        Assert.True(File.Exists(Path.Combine(_tempDir, fresh.FilePath)));
+    }
+
+    // ── 11. Graph lock blocks queries ─────────────────────────────────────────
+
+    [Fact]
+    public async Task GetDocument_BlocksWhileGraphLockIsHeld()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+        await graph.CreateDocumentAsync("features-locked", "Locked", DocumentType.Feature, "body", ct: ct);
+
+        var graphLock = GetGraphLock(graph);
+        await graphLock.WaitAsync(ct);
+
+        var queryTask = Task.Run(() => graph.GetDocument("features-locked"), ct);
+
+        var completedEarly = await Task.WhenAny(queryTask, Task.Delay(200, ct)) == queryTask;
+        Assert.False(completedEarly, "GetDocument must block while the graph lock is held");
+
+        graphLock.Release();
+
+        var doc = await queryTask;
+        Assert.NotNull(doc);
+    }
+
+    // ── 12. Case-insensitive IDs ──────────────────────────────────────────────
+
+    [Fact]
+    public async Task Documents_AreTrackedCaseInsensitively()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        await graph.CreateDocumentAsync("Architecture-Core", "Core", DocumentType.Implementation,
+            "body", topic: "Architecture", ct: ct);
+        await graph.CreateDocumentAsync("Other-Doc", "Other", DocumentType.Feature,
+            "body", topic: "Other", ct: ct);
+
+        // Lookups ignore case.
+        Assert.NotNull(graph.GetDocument("architecture-core"));
+        Assert.NotNull(graph.GetDocument("ARCHITECTURE-CORE"));
+
+        // The reverse index resolves case-differing target IDs.
+        graph.AddLink("Other-Doc", new DocumentLink("ARCHITECTURE-CORE", LinkType.DependsOn, "depends"));
+
+        var incoming = graph.GetIncomingLinks("Architecture-Core");
+        var entry = Assert.Single(incoming);
+        Assert.Equal("Other-Doc", entry.SourceId);
+        Assert.Equal("depends", entry.Description);
+
+        Assert.Single(graph.GetDependedOnBy("architecture-core"));
+
+        // Creating a case-differing duplicate is rejected.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => graph.CreateDocumentAsync("ARCHITECTURE-CORE", "Dup", DocumentType.Feature, "x", ct: ct));
+        Assert.Contains("already exists", ex.Message);
+    }
+
+    // ── 12a. AddLink deduplicates case-differing target IDs ───────────────────
+
+    [Fact]
+    public async Task AddLink_MixedCaseTargetId_ReplacesExistingLinkInsteadOfDuplicating()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        await graph.CreateDocumentAsync("doc-a", "A", DocumentType.Feature, "a", topic: "doc", ct: ct);
+        await graph.CreateDocumentAsync("doc-b", "B", DocumentType.Feature, "b", topic: "doc", ct: ct);
+
+        graph.AddLink("doc-a", new DocumentLink("doc-b", LinkType.Related, "first"));
+        graph.AddLink("doc-a", new DocumentLink("DOC-B", LinkType.Related, "second"));
+
+        // Deduplication is case-insensitive: only the newest link survives.
+        var links = graph.GetOutgoingLinks("doc-a");
+        Assert.Single(links);
+        Assert.Equal("DOC-B", links[0].TargetId);
+        Assert.Equal("second", links[0].Description);
+
+        // The reverse index likewise holds a single entry.
+        var incoming = graph.GetIncomingLinks("doc-b");
+        var entry = Assert.Single(incoming);
+        Assert.Equal("doc-a", entry.SourceId);
+        Assert.Equal("second", entry.Description);
+    }
+
+    // ── 12b. RemoveLink matches case-differing target IDs ─────────────────────
+
+    [Fact]
+    public async Task RemoveLink_MixedCaseTargetId_RemovesForwardLinkAndReverseIndexEntry()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        await graph.CreateDocumentAsync("doc-a", "A", DocumentType.Feature, "a", topic: "doc", ct: ct);
+        await graph.CreateDocumentAsync("doc-b", "B", DocumentType.Feature, "b", topic: "doc", ct: ct);
+
+        graph.AddLink("doc-a", new DocumentLink("doc-b", LinkType.Related, "linked"));
+        Assert.Single(graph.GetOutgoingLinks("doc-a"));
+
+        // The target ID differs only by case — the removal must still match.
+        graph.RemoveLink("doc-a", "DOC-B", LinkType.Related);
+
+        Assert.Empty(graph.GetOutgoingLinks("doc-a"));
+        Assert.Empty(graph.GetIncomingLinks("doc-b"));
+        Assert.DoesNotContain("doc-b", GetReverseIndex(graph).Keys);
+    }
+
+    // ── 12c. DeleteDocumentInternal sweeps case-differing source IDs ──────────
+
+    [Fact]
+    public async Task DeleteDocumentAsync_MixedCaseId_SweepsStaleReverseIndexEntries()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        await graph.CreateDocumentAsync("Doc-A", "A", DocumentType.Feature, "a", topic: "Doc", ct: ct);
+        await graph.CreateDocumentAsync("doc-b", "B", DocumentType.Feature, "b", topic: "doc", ct: ct);
+
+        graph.AddLink("Doc-A", new DocumentLink("doc-b", LinkType.Related, "linked"));
+
+        // Drop A's forward link directly so the reverse-index entry for A becomes stale.
+        // Only DeleteDocumentInternal's reverse-index sweep can clean it up, and that
+        // sweep must match the stored source ID "Doc-A" against the deletion ID "DOC-A".
+        graph.GetDocument("Doc-A")!.Links.Clear();
+
+        var reverseIndex = GetReverseIndex(graph);
+        Assert.Contains("doc-b", reverseIndex.Keys);
+        Assert.Contains(reverseIndex["doc-b"], e => e.SourceId == "Doc-A");
+
+        await graph.DeleteDocumentAsync("DOC-A", ct);
+
+        // The stale entry must be gone — a case-sensitive sweep would leave it behind.
+        Assert.DoesNotContain("doc-b", GetReverseIndex(graph).Keys);
+        Assert.Empty(graph.GetIncomingLinks("doc-b"));
+        Assert.Empty(graph.GetRelatedBy("doc-b"));
+    }
+
+    // ── 12d. GetRelated uses a case-insensitive visited set ───────────────────
+
+    [Fact]
+    public async Task GetRelated_MixedCaseBackLink_DoesNotRevisitStartingDocument()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        await graph.CreateDocumentAsync("Doc-A", "A", DocumentType.Feature, "a", topic: "Doc", ct: ct);
+        await graph.CreateDocumentAsync("doc-b", "B", DocumentType.Feature, "b", topic: "doc", ct: ct);
+        await graph.CreateDocumentAsync("doc-c", "C", DocumentType.Feature, "c", topic: "doc", ct: ct);
+
+        graph.AddLink("Doc-A", new DocumentLink("doc-b", LinkType.Related));
+        graph.AddLink("doc-b", new DocumentLink("doc-c", LinkType.Related));
+        // Back link to the starting document, spelled with different casing.
+        graph.AddLink("doc-b", new DocumentLink("DOC-A", LinkType.Related));
+
+        var related = graph.GetRelated("Doc-A", maxDepth: 2);
+
+        // B and C are reachable; the starting document must not be revisited via the
+        // case-differing back link (a default-comparer visited set would re-add it).
+        Assert.Equal(2, related.Count);
+        Assert.Contains(related, d => d.Id == "doc-b");
+        Assert.Contains(related, d => d.Id == "doc-c");
+        Assert.DoesNotContain(related, d => StringComparer.OrdinalIgnoreCase.Equals(d.Id, "Doc-A"));
+    }
+
+    // ── 12e. Dirty tracking is case-insensitive ───────────────────────────────
+
+    [Fact]
+    public async Task UpdateDocumentAsync_MixedCaseId_DoesNotAddDuplicateDirtyEntry()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        await graph.CreateDocumentAsync("Test-Doc", "Test", DocumentType.Feature, "body", topic: "Test", ct: ct);
+
+        var dirty = GetDirtyDocuments(graph);
+        Assert.Single(dirty);
+
+        await graph.UpdateDocumentAsync("TEST-DOC", content: "updated", ct: ct);
+
+        // A default-comparer set would now hold both "Test-Doc" and "TEST-DOC".
+        dirty = GetDirtyDocuments(graph);
+        Assert.Single(dirty);
+        Assert.Contains("Test-Doc", dirty);
+        Assert.Contains("TEST-DOC", dirty);
+        Assert.Equal("updated", graph.GetDocument("Test-Doc")!.Content);
+    }
+
+    // ── 12f. Deleted-path tracking is case-insensitive ────────────────────────
+
+    [Fact]
+    public async Task DeleteDocumentAsync_MixedCaseId_TracksFilePathCaseInsensitivelyAndDeletesFile()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        var doc = await graph.CreateDocumentAsync(
+            "Test-Doc", "Test", DocumentType.Feature, "body", topic: "Test", ct: ct);
+        Assert.Equal("knowledge/test/doc.md", doc.FilePath);
+
+        await graph.CommitToConfigRepoAsync(_tempDir, "create", ct);
+        var fullPath = Path.Combine(_tempDir, doc.FilePath);
+        Assert.True(File.Exists(fullPath));
+
+        await graph.DeleteDocumentAsync("TEST-DOC", ct);
+
+        var deleted = GetDeletedPaths(graph);
+        Assert.Single(deleted);
+        Assert.Contains(doc.FilePath, deleted);
+        // Only an OrdinalIgnoreCase-backed set resolves the upper-cased spelling.
+        Assert.Contains(doc.FilePath.ToUpperInvariant(), deleted);
+
+        await graph.CommitToConfigRepoAsync(_tempDir, "delete", ct);
+
+        Assert.False(File.Exists(fullPath), "The tracked file must be deleted from disk");
+        Assert.Empty(GetDeletedPaths(graph));
+    }
+
+    // ── 13. BuildFilePath lowercases new documents ────────────────────────────
+
+    [Fact]
+    public async Task CreateDocumentAsync_MixedCaseTopicAndId_ProducesLowercaseFilePath()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+
+        var doc = await graph.CreateDocumentAsync("Architecture-Core", "Core",
+            DocumentType.Implementation, "body", topic: "Architecture", ct: ct);
+
+        Assert.Equal("knowledge/architecture/core.md", doc.FilePath);
+    }
+
+    // ── 14. Loaded documents preserve their original path casing ──────────────
+
+    [Fact]
+    public async Task ReloadFromConfigRepoAsync_PreservesOriginalFilePathCasing_AndDeletesThatFile()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var fullPath = Path.Combine(_tempDir, "knowledge", "Architecture", "Core.md");
+        Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+        await File.WriteAllTextAsync(fullPath,
+            "---\ntitle: Core\ntype: implementation\nstatus: active\ntags: []\nlinks: []\n---\n\nbody\n", ct);
+
+        var graph = new KnowledgeGraph();
+        await graph.ReloadFromConfigRepoAsync(_tempDir, ct);
+
+        var doc = graph.GetDocument("Architecture-Core");
+        Assert.NotNull(doc);
+        Assert.Equal("knowledge/Architecture/Core.md", doc!.FilePath);
+
+        await graph.DeleteDocumentAsync(doc.Id, ct);
+        await graph.CommitToConfigRepoAsync(_tempDir, "delete", ct);
+
+        Assert.False(File.Exists(fullPath), "The original-cased file must be deleted from disk");
+    }
+
+    // ── 15. Duplicate case-differing files ────────────────────────────────────
+
+    [Fact]
+    public async Task ReloadFromConfigRepoAsync_DuplicateCaseDifferingFiles_FirstSortedPathWins()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        if (IsFileSystemCaseInsensitive())
+        {
+            Assert.Skip("Filesystem is case-insensitive — two case-differing files cannot coexist.");
+            return;
+        }
+
+        var dir = Path.Combine(_tempDir, "knowledge", "test");
+        Directory.CreateDirectory(dir);
+        await File.WriteAllTextAsync(Path.Combine(dir, "Dup.md"),
+            "---\ntitle: Upper\ntype: feature\nstatus: active\ntags: []\nlinks: []\n---\n\nupper body\n", ct);
+        await File.WriteAllTextAsync(Path.Combine(dir, "dup.md"),
+            "---\ntitle: Lower\ntype: feature\nstatus: active\ntags: []\nlinks: []\n---\n\nlower body\n", ct);
+
+        var logger = new CapturingKnowledgeLogger<KnowledgeGraph>();
+        var graph = new KnowledgeGraph(logger: logger);
+        await graph.ReloadFromConfigRepoAsync(_tempDir, ct);
+
+        var doc = graph.GetDocument("test-dup");
+        Assert.NotNull(doc);
+
+        // "knowledge/test/Dup.md" sorts before "knowledge/test/dup.md" in ordinal order.
+        Assert.Equal("knowledge/test/Dup.md", doc!.FilePath);
+        Assert.Equal("Upper", doc.Title);
+
+        Assert.Contains(logger.Messages, m =>
+            m.Contains("Duplicate document ID", StringComparison.Ordinal) &&
+            m.Contains("knowledge/test/dup.md", StringComparison.Ordinal));
+    }
+
+    // ── 16. DeleteDocumentAsync XML documentation ─────────────────────────────
+
+    [Fact]
+    public void DeleteDocumentAsync_XmlDoc_ClarifiesForwardLinksAreNotRemoved()
+    {
+        var sourcePath = FindRepoFile(Path.Combine("src", "CopilotHive", "Knowledge", "KnowledgeGraph.cs"));
+        Assert.NotNull(sourcePath);
+
+        var source = File.ReadAllText(sourcePath!);
+        Assert.Contains("Does NOT remove forward links from other documents that point to this document.", source, StringComparison.Ordinal);
+        Assert.Contains("strips all incoming reverse-index entries that point to it.", source, StringComparison.Ordinal);
+    }
+
+    private static string? FindRepoFile(string relativePath)
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            var candidate = Path.Combine(dir.FullName, relativePath);
+            if (File.Exists(candidate))
+                return candidate;
+            dir = dir.Parent;
+        }
+        return null;
+    }
+}
