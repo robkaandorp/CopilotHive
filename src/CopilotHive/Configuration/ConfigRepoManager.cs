@@ -242,6 +242,42 @@ public class ConfigRepoManager
     }
 
     /// <summary>
+    /// Stages a batch of file deletions and commits/pushes them as a SINGLE commit.
+    /// The files should already be deleted from the working tree before calling this method.
+    /// Uses one <c>git rm --cached</c> invocation scoped to all of <paramref name="filePaths"/>,
+    /// so the removals land in exactly one commit instead of one commit per file.
+    /// </summary>
+    /// <param name="filePaths">Relative paths of the files to remove from the index. Must not be null.</param>
+    /// <param name="commitMessage">Commit message used for the single commit.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public virtual async Task DeleteFilesAsync(IReadOnlyList<string> filePaths, string commitMessage, CancellationToken ct = default)
+    {
+        if (filePaths is null)
+            throw new ArgumentNullException(nameof(filePaths));
+        if (filePaths.Count == 0)
+            return;
+
+        await _gitLock.WaitAsync(ct);
+        try
+        {
+            string[] args = ["rm", "--cached", "--ignore-unmatch", .. filePaths];
+            await RunGitAsync(_localPath, args, ct);
+            var exitCode = await RunGitOptionalAsync(_localPath, ["diff", "--cached", "--quiet"], ct);
+            if (exitCode == 0)
+            {
+                await PushOnlyAsync(ct);
+                return;
+            }
+            await RunGitAsync(_localPath, ["commit", "-m", commitMessage], ct);
+            await PushWithConflictRecoveryAsync(ct);
+        }
+        finally
+        {
+            _gitLock.Release();
+        }
+    }
+
+    /// <summary>
     /// Stages all changes, commits with the given message, and pushes to the remote.
     /// Used by the Composer to persist AGENTS.md updates made via config repo tools.
     /// </summary>

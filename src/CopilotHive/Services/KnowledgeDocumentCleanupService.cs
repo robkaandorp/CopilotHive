@@ -1,5 +1,6 @@
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace CopilotHive.Services;
@@ -119,8 +120,12 @@ public sealed class KnowledgeDocumentCleanupService
     /// A document is a candidate for deletion when its (topic, id-prefix) pair matches
     /// (<c>progress</c>, <c>progress-</c>) or (<c>review</c>, <c>review-</c>) AND its goal ID is
     /// either absent from <paramref name="allGoals"/> (orphaned) or belongs to a release whose
-    /// status is <see cref="ReleaseStatus.Released"/>. Documents with an empty goal ID
-    /// (e.g. a bare <c>progress-</c> id) are always kept.
+    /// status is <see cref="ReleaseStatus.Released"/>. The topic is matched case-insensitively
+    /// but the ID prefix is matched with <see cref="StringComparison.Ordinal"/>, so a
+    /// mixed-case id such as <c>Progress-orphan</c> is never a candidate. Documents with an
+    /// empty goal ID (e.g. a bare <c>progress-</c> id) are always kept.
+    /// Evaluation of each document is best-effort: a non-cancellation failure on one document
+    /// is logged and skipped rather than aborting the whole sweep.
     /// </summary>
     /// <param name="allGoals">All known goals. A document whose goal is absent from this list is orphaned.</param>
     /// <param name="allReleases">All known releases. Goals whose release is <see cref="ReleaseStatus.Released"/> have their documents removed.</param>
@@ -152,27 +157,42 @@ public sealed class KnowledgeDocumentCleanupService
         var candidates = new List<string>();
         foreach (var doc in _knowledgeGraph.GetAllDocuments())
         {
-            string? goalId = null;
-            if (string.Equals(doc.Topic, "progress", StringComparison.OrdinalIgnoreCase) &&
-                doc.Id.StartsWith("progress-", StringComparison.OrdinalIgnoreCase))
+            // Per-document best-effort: one malformed document must not abort the sweep.
+            // Cancellation still propagates.
+            try
             {
-                goalId = doc.Id["progress-".Length..];
-            }
-            else if (string.Equals(doc.Topic, "review", StringComparison.OrdinalIgnoreCase) &&
-                     doc.Id.StartsWith("review-", StringComparison.OrdinalIgnoreCase))
-            {
-                goalId = doc.Id["review-".Length..];
-            }
-            else
-            {
-                continue;
-            }
+                string? goalId = null;
+                if (string.Equals(doc.Topic, "progress", StringComparison.OrdinalIgnoreCase) &&
+                    doc.Id.StartsWith("progress-", StringComparison.Ordinal))
+                {
+                    goalId = doc.Id["progress-".Length..];
+                }
+                else if (string.Equals(doc.Topic, "review", StringComparison.OrdinalIgnoreCase) &&
+                         doc.Id.StartsWith("review-", StringComparison.Ordinal))
+                {
+                    goalId = doc.Id["review-".Length..];
+                }
+                else
+                {
+                    continue;
+                }
 
-            if (string.IsNullOrEmpty(goalId))
-                continue;
+                if (string.IsNullOrEmpty(goalId))
+                    continue;
 
-            if (!liveGoalIds.Contains(goalId) || releasedGoalIds.Contains(goalId))
-                candidates.Add(doc.Id);
+                if (!liveGoalIds.Contains(goalId) || releasedGoalIds.Contains(goalId))
+                    candidates.Add(doc.Id);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Failed to evaluate knowledge document '{DocumentId}' during startup sweep; skipping it",
+                    doc.Id);
+            }
         }
 
         var distinctCandidates = candidates.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
@@ -189,5 +209,46 @@ public sealed class KnowledgeDocumentCleanupService
                 result.PersistError);
 
         return result.DeletedCount;
+    }
+
+    /// <summary>
+    /// Runs the startup sweep of stale progress/review knowledge documents against the
+    /// services registered in <paramref name="services"/>. Resolves the cleanup service and
+    /// the goal store; when either is unavailable the sweep is skipped and 0 is returned.
+    /// This method never throws — a failed sweep must never block application startup.
+    /// Exposed as <c>internal</c> for unit testing via <c>InternalsVisibleTo</c>.
+    /// </summary>
+    /// <param name="services">Root service provider used to resolve the sweep dependencies.</param>
+    /// <param name="logger">Logger used for the outcome message. Must not be null.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The number of documents deleted, or 0 when the sweep was skipped or failed.</returns>
+    internal static async Task<int> ExecuteStartupSweepAsync(IServiceProvider services, ILogger logger, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(logger);
+
+        try
+        {
+            var cleanupService = services.GetService<KnowledgeDocumentCleanupService>();
+            var goalStore = services.GetService<IGoalStore>();
+            if (cleanupService is null || goalStore is null)
+            {
+                logger.LogDebug(
+                    "Startup sweep skipped — cleanup service or goal store is not registered");
+                return 0;
+            }
+
+            var allGoals = await goalStore.GetAllGoalsAsync(ct);
+            var allReleases = await goalStore.GetReleasesAsync(ct);
+            var deleted = await cleanupService.SweepOrphanedDocumentsAsync(allGoals, allReleases, ct);
+
+            logger.LogInformation("Startup sweep removed {DeletedCount} stale knowledge documents", deleted);
+            return deleted;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Startup sweep of stale knowledge documents failed; continuing startup");
+            return 0;
+        }
     }
 }

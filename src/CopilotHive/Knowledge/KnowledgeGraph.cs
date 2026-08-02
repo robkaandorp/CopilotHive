@@ -655,12 +655,20 @@ public sealed class KnowledgeGraph
             var fullPath = Path.Combine(configRepoPath, filePath);
             if (File.Exists(fullPath))
                 File.Delete(fullPath);
+        }
 
-            if (_configRepo is not null)
-            {
-                await _configRepo.DeleteFileAsync(filePath, message, ct);
-                _logger?.LogInformation("Deleted knowledge document file {FilePath} from config repo", filePath);
-            }
+        if (_configRepo is not null && toDelete.Count >= 2)
+        {
+            // Batch the removals into a single path-scoped git commit.
+            await _configRepo.DeleteFilesAsync(toDelete, message, ct);
+            _logger?.LogInformation(
+                "Deleted {Count} knowledge document files from config repo in a single commit", toDelete.Count);
+        }
+        else if (_configRepo is not null && toDelete.Count == 1)
+        {
+            var filePath = toDelete[0];
+            await _configRepo.DeleteFileAsync(filePath, message, ct);
+            _logger?.LogInformation("Deleted knowledge document file {FilePath} from config repo", filePath);
         }
 
         foreach (var docId in dirty)

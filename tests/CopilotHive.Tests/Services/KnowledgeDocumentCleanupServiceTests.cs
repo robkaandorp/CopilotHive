@@ -3,8 +3,10 @@ using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
 using CopilotHive.Services;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
 
 namespace CopilotHive.Tests.Services;
 
@@ -493,7 +495,7 @@ public sealed class KnowledgeDocumentCleanupServiceTests : IDisposable
         await CreateDocAsync(graph, "review-gA");
         // (g) review in Released release → DELETED
         await CreateDocAsync(graph, "review-gB");
-        // (h) mixed-case Progress-MyGoal orphaned → DELETED
+        // (h) mixed-case Progress-MyGoal orphaned → KEPT (Ordinal prefix mismatch)
         await CreateDocAsync(graph, "Progress-MyGoal");
         // (i) empty goal ID (progress-) → KEPT
         await CreateDocAsync(graph, "progress-");
@@ -514,21 +516,145 @@ public sealed class KnowledgeDocumentCleanupServiceTests : IDisposable
 
         var count = await service.SweepOrphanedDocumentsAsync(goals, releases, TestContext.Current.CancellationToken);
 
-        Assert.Equal(4, count); // (b), (c), (g), (h)
+        Assert.Equal(3, count); // (b), (c), (g)
 
         // Deleted
         Assert.Null(graph.GetDocument("progress-gB"));
         Assert.Null(graph.GetDocument("review-gC"));
         Assert.Null(graph.GetDocument("review-gB"));
-        Assert.Null(graph.GetDocument("Progress-MyGoal"));
 
         // Kept
         Assert.NotNull(graph.GetDocument("progress-gA"));
         Assert.NotNull(graph.GetDocument("features-whatever"));
         Assert.NotNull(graph.GetDocument("review-mismatch"));
         Assert.NotNull(graph.GetDocument("review-gA"));
+        Assert.NotNull(graph.GetDocument("Progress-MyGoal"));
         Assert.NotNull(graph.GetDocument("progress-"));
         Assert.NotNull(graph.GetDocument("progress-gD"));
+    }
+
+    [Fact]
+    public async Task SweepOrphanedDocumentsAsync_MixedCasePrefix_KeptNotDeleted()
+    {
+        var graph = new KnowledgeGraph();
+        // Topic matches case-insensitively, but the ID prefix "Progress-" does not match
+        // "progress-" under StringComparison.Ordinal, so the document is never a candidate
+        // even though its goal is orphaned.
+        await CreateDocAsync(graph, "Progress-orphan", topic: "progress");
+        var service = CreateService(graph);
+
+        var count = await service.SweepOrphanedDocumentsAsync([], [], TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, count);
+        Assert.NotNull(graph.GetDocument("Progress-orphan"));
+    }
+
+    [Fact]
+    public async Task SweepOrphanedDocumentsAsync_WithRealGitRemote_DeletesAllStaleDocsInSingleCommit()
+    {
+        var (bareDir, cloneDir) = await CreateGitRemoteAsync();
+        var manager = new ConfigRepoManager(bareDir, cloneDir);
+        var graph = new KnowledgeGraph(manager);
+
+        // Stale docs (deleted by sweep):
+        //  - progress-gX: orphaned (goal not in store)
+        //  - review-gY: orphaned (goal not in store)
+        //  - progress-gZ: goal is in a Released release
+        // Kept doc:
+        //  - progress-gA: live, unreleased goal
+        await CreateDocAsync(graph, "progress-gX");
+        await CreateDocAsync(graph, "review-gY");
+        await CreateDocAsync(graph, "progress-gZ");
+        await CreateDocAsync(graph, "progress-gA");
+
+        // Write the docs to disk and commit them so the deletion has real files to remove.
+        await graph.CommitToConfigRepoAsync(cloneDir, "create docs", TestContext.Current.CancellationToken);
+
+        // Note: BuildFilePath lowercases the on-disk paths (e.g. knowledge/progress/gx.md).
+        var gXPath = Path.Combine(cloneDir, "knowledge", "progress", "gx.md");
+        var gYPath = Path.Combine(cloneDir, "knowledge", "review", "gy.md");
+        var gZPath = Path.Combine(cloneDir, "knowledge", "progress", "gz.md");
+        var gAPath = Path.Combine(cloneDir, "knowledge", "progress", "ga.md");
+        Assert.True(File.Exists(gXPath));
+        Assert.True(File.Exists(gYPath));
+        Assert.True(File.Exists(gZPath));
+        Assert.True(File.Exists(gAPath));
+
+        var logBefore = int.Parse((await RunGitOutputAsync(cloneDir, ["rev-list", "--count", "HEAD"])).Trim());
+
+        var goals = new List<Goal>
+        {
+            new() { Id = "gA", Description = "Live unreleased" },
+            new() { Id = "gZ", Description = "In released release", ReleaseId = "r1" },
+        };
+        var releases = new List<Release>
+        {
+            new() { Id = "r1", Tag = "v1.0.0", Status = ReleaseStatus.Released },
+        };
+        var service = CreateService(graph);
+
+        var count = await service.SweepOrphanedDocumentsAsync(goals, releases, TestContext.Current.CancellationToken);
+
+        Assert.Equal(3, count);
+        Assert.Null(graph.GetDocument("progress-gX"));
+        Assert.Null(graph.GetDocument("review-gY"));
+        Assert.Null(graph.GetDocument("progress-gZ"));
+        Assert.NotNull(graph.GetDocument("progress-gA"));
+        Assert.False(File.Exists(gXPath));
+        Assert.False(File.Exists(gYPath));
+        Assert.False(File.Exists(gZPath));
+        Assert.True(File.Exists(gAPath));
+
+        // Deletions must be persisted to git in exactly ONE commit.
+        // CommitInternal batches 2+ deleted paths into a single path-scoped
+        // ConfigRepoManager.DeleteFilesAsync call, so the log grows by exactly 1.
+        var logAfter = int.Parse((await RunGitOutputAsync(cloneDir, ["rev-list", "--count", "HEAD"])).Trim());
+        Assert.True(logAfter > logBefore, $"Git log must grow after sweep (before: {logBefore}, after: {logAfter})");
+        Assert.Equal(1, logAfter - logBefore);
+    }
+
+    [Fact]
+    public async Task SweepOrphanedDocumentsAsync_DocumentEvaluationThrows_LogsWarningAndSweepsTheRest()
+    {
+        var graph = new KnowledgeGraph();
+        await CreateDocAsync(graph, "progress-gOrphan");
+
+        // A malformed document whose Id is null makes the prefix check throw. The sweep
+        // must log it, skip it, and still process the remaining documents.
+        InjectDocument(graph, "broken", new KnowledgeDocument
+        {
+            Id = null!,
+            Title = "Broken",
+            Topic = "progress",
+            Type = DocumentType.Scratch,
+            Status = DocumentStatus.Draft,
+            FilePath = "knowledge/progress/broken.md",
+        });
+
+        var logger = new RecordingLogger<KnowledgeDocumentCleanupService>();
+        var service = CreateService(graph, logger);
+
+        var count = await service.SweepOrphanedDocumentsAsync([], [], TestContext.Current.CancellationToken);
+
+        // The healthy orphan was still swept despite the broken sibling.
+        Assert.Equal(1, count);
+        Assert.Null(graph.GetDocument("progress-gOrphan"));
+        Assert.Contains(logger.LogEntries,
+            e => e.LogLevel == LogLevel.Warning &&
+                 e.Message.Contains("Failed to evaluate knowledge document", StringComparison.Ordinal) &&
+                 e.Exception is not null);
+    }
+
+    /// <summary>Injects a document directly into the graph's private store, bypassing validation.</summary>
+    private static void InjectDocument(KnowledgeGraph graph, string key, KnowledgeDocument document)
+    {
+        var field = typeof(KnowledgeGraph).GetField(
+            "_documents",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(field);
+        var documents = field!.GetValue(graph) as Dictionary<string, KnowledgeDocument>;
+        Assert.NotNull(documents);
+        documents![key] = document;
     }
 
     // ── 11. Sweep zero ───────────────────────────────────────────────────────
@@ -583,6 +709,153 @@ public sealed class KnowledgeDocumentCleanupServiceTests : IDisposable
                  e.Message.Contains("Failed to persist startup sweep", StringComparison.Ordinal));
     }
 
+    // ── 12. ExecuteStartupSweepAsync (startup wiring) ────────────────────────
+
+    /// <summary>Builds a graph seeded with the standard stale/live document mix.</summary>
+    private static async Task<KnowledgeGraph> CreateSeededGraphAsync()
+    {
+        var graph = new KnowledgeGraph();
+        await CreateDocAsync(graph, "progress-gX"); // orphaned → deleted
+        await CreateDocAsync(graph, "review-gY");   // orphaned → deleted
+        await CreateDocAsync(graph, "progress-gZ"); // released → deleted
+        await CreateDocAsync(graph, "progress-gA"); // live, unreleased → kept
+        return graph;
+    }
+
+    [Fact]
+    public async Task ExecuteStartupSweepAsync_ServicesRegistered_SweepsAndReturnsDeletedCount()
+    {
+        var graph = await CreateSeededGraphAsync();
+        var goalStore = new Mock<IGoalStore>();
+        goalStore.Setup(s => s.GetAllGoalsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync((IReadOnlyList<Goal>)
+            [
+                new Goal { Id = "gA", Description = "Live unreleased" },
+                new Goal { Id = "gZ", Description = "In released release", ReleaseId = "r1" },
+            ]);
+        goalStore.Setup(s => s.GetReleasesAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync((IReadOnlyList<Release>)
+            [
+                new Release { Id = "r1", Tag = "v1.0.0", Status = ReleaseStatus.Released },
+            ]);
+
+        var services = new ServiceCollection();
+        services.AddSingleton(CreateService(graph));
+        services.AddSingleton(goalStore.Object);
+        using var provider = services.BuildServiceProvider();
+        var logger = new RecordingLogger<KnowledgeDocumentCleanupService>();
+
+        var deleted = await KnowledgeDocumentCleanupService.ExecuteStartupSweepAsync(
+            provider, logger, TestContext.Current.CancellationToken);
+
+        Assert.Equal(3, deleted);
+        Assert.Null(graph.GetDocument("progress-gX"));
+        Assert.Null(graph.GetDocument("review-gY"));
+        Assert.Null(graph.GetDocument("progress-gZ"));
+        Assert.NotNull(graph.GetDocument("progress-gA"));
+        Assert.Contains(logger.LogEntries,
+            e => e.LogLevel == LogLevel.Information &&
+                 e.Message.Contains("Startup sweep removed 3 stale knowledge documents", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task ExecuteStartupSweepAsync_CleanupServiceNotRegistered_ReturnsZeroWithoutTouchingGoalStore()
+    {
+        var goalStore = new Mock<IGoalStore>(MockBehavior.Strict);
+
+        var services = new ServiceCollection();
+        services.AddSingleton(goalStore.Object);
+        using var provider = services.BuildServiceProvider();
+        var logger = new RecordingLogger<KnowledgeDocumentCleanupService>();
+
+        var deleted = await KnowledgeDocumentCleanupService.ExecuteStartupSweepAsync(
+            provider, logger, TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, deleted);
+        goalStore.Verify(s => s.GetAllGoalsAsync(It.IsAny<CancellationToken>()), Times.Never);
+        Assert.DoesNotContain(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task ExecuteStartupSweepAsync_GoalStoreNotRegistered_ReturnsZeroAndKeepsDocuments()
+    {
+        var graph = await CreateSeededGraphAsync();
+
+        var services = new ServiceCollection();
+        services.AddSingleton(CreateService(graph));
+        using var provider = services.BuildServiceProvider();
+        var logger = new RecordingLogger<KnowledgeDocumentCleanupService>();
+
+        var deleted = await KnowledgeDocumentCleanupService.ExecuteStartupSweepAsync(
+            provider, logger, TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, deleted);
+        // Nothing was swept — the orphaned documents survive.
+        Assert.NotNull(graph.GetDocument("progress-gX"));
+        Assert.NotNull(graph.GetDocument("progress-gA"));
+        Assert.DoesNotContain(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task ExecuteStartupSweepAsync_NoServicesRegistered_ReturnsZero()
+    {
+        var services = new ServiceCollection();
+        using var provider = services.BuildServiceProvider();
+        var logger = new RecordingLogger<KnowledgeDocumentCleanupService>();
+
+        var deleted = await KnowledgeDocumentCleanupService.ExecuteStartupSweepAsync(
+            provider, logger, TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, deleted);
+    }
+
+    [Fact]
+    public async Task ExecuteStartupSweepAsync_GoalStoreThrows_LogsWarningAndReturnsZero()
+    {
+        var graph = await CreateSeededGraphAsync();
+        var goalStore = new Mock<IGoalStore>();
+        goalStore.Setup(s => s.GetAllGoalsAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("database unavailable"));
+
+        var services = new ServiceCollection();
+        services.AddSingleton(CreateService(graph));
+        services.AddSingleton(goalStore.Object);
+        using var provider = services.BuildServiceProvider();
+        var logger = new RecordingLogger<KnowledgeDocumentCleanupService>();
+
+        // Must not rethrow — a failed sweep never blocks startup.
+        var deleted = await KnowledgeDocumentCleanupService.ExecuteStartupSweepAsync(
+            provider, logger, TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, deleted);
+        Assert.Contains(logger.LogEntries,
+            e => e.LogLevel == LogLevel.Warning &&
+                 e.Message.Contains("Startup sweep of stale knowledge documents failed", StringComparison.Ordinal) &&
+                 e.Exception is InvalidOperationException);
+        // The documents are untouched because the sweep never ran.
+        Assert.NotNull(graph.GetDocument("progress-gX"));
+    }
+
+    [Fact]
+    public async Task ExecuteStartupSweepAsync_NullServices_ThrowsArgumentNullException()
+    {
+        await Assert.ThrowsAsync<ArgumentNullException>(
+            () => KnowledgeDocumentCleanupService.ExecuteStartupSweepAsync(
+                null!, NullLogger.Instance, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task ExecuteStartupSweepAsync_NullLogger_ThrowsArgumentNullException()
+    {
+        var services = new ServiceCollection();
+        using var provider = services.BuildServiceProvider();
+
+        await Assert.ThrowsAsync<ArgumentNullException>(
+            () => KnowledgeDocumentCleanupService.ExecuteStartupSweepAsync(
+                provider, null!, TestContext.Current.CancellationToken));
+    }
+
     // ── Test doubles ─────────────────────────────────────────────────────────
 
     /// <summary>Captures log entries for verification.</summary>
@@ -628,7 +901,11 @@ public sealed class KnowledgeDocumentCleanupServiceTests : IDisposable
         System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 
-    /// <summary>A ConfigRepoManager whose first DeleteFileAsync call fails, then succeeds.</summary>
+    /// <summary>
+    /// A ConfigRepoManager whose first delete call fails, then succeeds.
+    /// Both the single-file and the batch delete paths share the same counter so the
+    /// double behaves identically regardless of how many paths the graph persists.
+    /// </summary>
     private sealed class FlakyDeleteConfigRepoManager : ConfigRepoManager
     {
         private int _deleteCalls;
@@ -636,6 +913,12 @@ public sealed class KnowledgeDocumentCleanupServiceTests : IDisposable
         public FlakyDeleteConfigRepoManager(string localPath) : base("https://example.com/flaky.git", localPath) { }
 
         public override Task DeleteFileAsync(string filePath, string commitMessage, CancellationToken ct = default)
+            => FailFirstCall();
+
+        public override Task DeleteFilesAsync(IReadOnlyList<string> filePaths, string commitMessage, CancellationToken ct = default)
+            => FailFirstCall();
+
+        private Task FailFirstCall()
         {
             _deleteCalls++;
             if (_deleteCalls == 1)

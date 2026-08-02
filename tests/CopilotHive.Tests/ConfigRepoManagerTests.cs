@@ -1335,6 +1335,173 @@ public class ConfigRepoManagerTests : IDisposable
         }
     }
 
+    // ── DeleteFilesAsync (batch delete, single commit) ────────────────────────
+
+    [Fact]
+    public async Task DeleteFileAsync_TrackedFile_CommitsAndPushesTheRemoval()
+    {
+        var (bareDir, cloneDir) = await CreateRemoteAndCloneAsync();
+        try
+        {
+            var ct = TestContext.Current.CancellationToken;
+
+            // The caller removes the file from the working tree first.
+            File.Delete(Path.Combine(cloneDir, "tracked.txt"));
+
+            var manager = new ConfigRepoManager(bareDir, cloneDir);
+
+            await manager.DeleteFileAsync("tracked.txt", "single deletion", ct);
+
+            // The removal was committed locally…
+            var (tracked, _) = await RunGitCommandRawAsync(cloneDir, ["ls-files"]);
+            Assert.DoesNotContain("tracked.txt", tracked, StringComparison.Ordinal);
+            Assert.Contains("other.txt", tracked, StringComparison.Ordinal);
+
+            // …and pushed to the remote.
+            var (remoteLog, _) = await RunGitCommandRawAsync(bareDir, ["log", "--oneline"]);
+            Assert.Contains("single deletion", remoteLog);
+        }
+        finally
+        {
+            CleanupDirs(bareDir, cloneDir);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteFilesAsync_NullPaths_ThrowsArgumentNullException()
+    {
+        var (bareDir, cloneDir) = await CreateRemoteAndCloneAsync();
+        try
+        {
+            var manager = new ConfigRepoManager(bareDir, cloneDir);
+
+            await Assert.ThrowsAsync<ArgumentNullException>(
+                () => manager.DeleteFilesAsync(null!, "batch deletion", TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            CleanupDirs(bareDir, cloneDir);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteFilesAsync_EmptyPaths_ReturnsWithoutCommittingOrPushing()
+    {
+        // A repo without a remote makes any push fail — the early return must avoid git entirely.
+        var repoDir = await CreateRepoWithoutRemoteAsync();
+        try
+        {
+            var ct = TestContext.Current.CancellationToken;
+            var (logBefore, _) = await RunGitCommandRawAsync(repoDir, ["rev-list", "--count", "HEAD"]);
+
+            var manager = new ConfigRepoManager("https://example.com/config.git", repoDir);
+
+            // Act — an empty batch is a no-op; it must not throw despite the missing remote.
+            await manager.DeleteFilesAsync([], "batch deletion", ct);
+
+            // Assert — no commit was created and the working tree is untouched.
+            var (logAfter, _) = await RunGitCommandRawAsync(repoDir, ["rev-list", "--count", "HEAD"]);
+            Assert.Equal(logBefore.Trim(), logAfter.Trim());
+            Assert.True(File.Exists(Path.Combine(repoDir, "tracked.txt")));
+            Assert.True(File.Exists(Path.Combine(repoDir, "other.txt")));
+        }
+        finally
+        {
+            CleanupDirs(repoDir);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteFilesAsync_NothingToCommit_PushesPendingCommits()
+    {
+        var (bareDir, cloneDir) = await CreateRemoteAndCloneAsync();
+        try
+        {
+            var ct = TestContext.Current.CancellationToken;
+
+            // A local commit that has not yet been pushed.
+            await File.WriteAllTextAsync(Path.Combine(cloneDir, "other.txt"), "changed\n", ct);
+            await RunGitCommandAsync(cloneDir, ["add", "other.txt"]);
+            await RunGitCommandAsync(cloneDir, ["commit", "-m", "unpushed batch local commit"]);
+
+            var logBefore = (await RunGitCommandRawAsync(cloneDir, ["rev-list", "--count", "HEAD"])).output.Trim();
+
+            var manager = new ConfigRepoManager(bareDir, cloneDir);
+
+            // Act — none of the paths are tracked → nothing staged → PushOnlyAsync.
+            await manager.DeleteFilesAsync(["missing-a.txt", "missing-b.txt"], "no-op batch deletion", ct);
+
+            // Assert — the pending commit was pushed and no new commit was created.
+            var (remoteLog, _) = await RunGitCommandRawAsync(bareDir, ["log", "--oneline"]);
+            Assert.Contains("unpushed batch local commit", remoteLog);
+            var logAfter = (await RunGitCommandRawAsync(cloneDir, ["rev-list", "--count", "HEAD"])).output.Trim();
+            Assert.Equal(logBefore, logAfter);
+        }
+        finally
+        {
+            CleanupDirs(bareDir, cloneDir);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteFilesAsync_MultipleTrackedFiles_RemovesAllInASingleCommit()
+    {
+        var (bareDir, cloneDir) = await CreateRemoteAndCloneAsync();
+        try
+        {
+            var ct = TestContext.Current.CancellationToken;
+
+            // The caller removes the files from the working tree first.
+            File.Delete(Path.Combine(cloneDir, "tracked.txt"));
+            File.Delete(Path.Combine(cloneDir, "other.txt"));
+
+            var logBefore = int.Parse(
+                (await RunGitCommandRawAsync(cloneDir, ["rev-list", "--count", "HEAD"])).output.Trim());
+
+            var manager = new ConfigRepoManager(bareDir, cloneDir);
+
+            await manager.DeleteFilesAsync(["tracked.txt", "other.txt"], "batch deletion", ct);
+
+            // Exactly ONE commit for both removals.
+            var logAfter = int.Parse(
+                (await RunGitCommandRawAsync(cloneDir, ["rev-list", "--count", "HEAD"])).output.Trim());
+            Assert.Equal(1, logAfter - logBefore);
+
+            // Both paths are gone from the index.
+            var (tracked, _) = await RunGitCommandRawAsync(cloneDir, ["ls-files"]);
+            Assert.DoesNotContain("tracked.txt", tracked, StringComparison.Ordinal);
+            Assert.DoesNotContain("other.txt", tracked, StringComparison.Ordinal);
+
+            // And the single commit was pushed to the remote.
+            var (remoteLog, _) = await RunGitCommandRawAsync(bareDir, ["log", "--oneline"]);
+            Assert.Contains("batch deletion", remoteLog);
+        }
+        finally
+        {
+            CleanupDirs(bareDir, cloneDir);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteFilesAsync_PreCancelledToken_ThrowsOperationCanceled()
+    {
+        var (bareDir, cloneDir) = await CreateRemoteAndCloneAsync();
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            await cts.CancelAsync();
+
+            var manager = new ConfigRepoManager(bareDir, cloneDir);
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => manager.DeleteFilesAsync(["missing.txt"], "no-op batch deletion", cts.Token));
+        }
+        finally
+        {
+            CleanupDirs(bareDir, cloneDir);
+        }
+    }
+
     // ── Git helper for tests ──────────────────────────────────────────────────
 
     private static SemaphoreSlim GetGitLock(ConfigRepoManager manager)

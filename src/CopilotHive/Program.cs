@@ -361,6 +361,12 @@ public sealed class Program
                     sp.GetRequiredService<IBrainRepoManager>(),
                     sp.GetRequiredService<ILogger<ReleaseExecutionService>>()));
 
+                // Startup sweep of stale progress/review knowledge documents.
+                // Registered even when knowledgeGraph is null — the service handles
+                // a null graph gracefully by returning 0 from all methods.
+                builder.Services.AddSingleton(sp => new KnowledgeDocumentCleanupService(
+                    knowledgeGraph, sp.GetRequiredService<ILogger<KnowledgeDocumentCleanupService>>()));
+
                 // Enable debug logging if verbose_logging is set in config
                 if (hiveConfigFile.Orchestrator.VerboseLogging)
                 {
@@ -524,6 +530,12 @@ public sealed class Program
                             "chore: migrate reasoning suffixes out of available model names");
                     }
                 }
+
+                // Startup sweep: remove stale progress/review knowledge documents whose
+                // owning goal no longer exists or belongs to a released release.
+                // The helper is best-effort — it never throws, so startup is never blocked.
+                await KnowledgeDocumentCleanupService.ExecuteStartupSweepAsync(
+                    app.Services, logger, CancellationToken.None);
             }
 
             // Wire up Brain and completion event
