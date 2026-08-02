@@ -297,6 +297,15 @@ public sealed class SharpCoderRunner : IAgentRunner
                 iteration and add them as guidance rules (e.g., "Always check X before Y", "When doing Z, prefer approach
                 A over B"). If a lesson was already captured in a previous iteration, do not duplicate it.
 
+                Guidance rules added to agents.md files must be GENERAL, broadly-applicable software-development patterns
+                and coding-style conventions that apply across the codebase, across goals, and across different files and
+                contexts. Positive examples include "Always verify a resource is released in every code path",
+                "Prefer try/finally over manual cleanup", and "Use a shared helper instead of duplicating logic". Negative
+                examples that must NOT be added include "never do X in ServiceY.cs", "when handling paste state for Z", or
+                "the TCS-block in ClassB". Those are too narrow: they are tied to a specific file, class, method, past
+                iteration, or incident and do not generalize. Existing general rules are fine; do not rewrite them into one-off
+                incident advice.
+
                 **Never remove or weaken safety constraints** — do not remove instructions about git workflow,
                 test requirements or output format compliance.
 

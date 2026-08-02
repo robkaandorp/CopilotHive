@@ -149,6 +149,10 @@ public sealed class BuildRoleSystemPromptTests
         Assert.Contains("\"Always check X before Y\"", prompt);
         Assert.Contains("\"When doing Z, prefer approach", prompt);
         Assert.Contains("do not duplicate it", prompt);
+        Assert.Contains("broadly-applicable software-development patterns", prompt);
+        Assert.Contains("\"the TCS-block in ClassB\"", prompt);
+        Assert.Contains("do not rewrite them into one-off", prompt);
+        Assert.Contains("incident advice.", prompt);
     }
 
     // ── Learned heuristics appendix ───────────────────────────────────────────
