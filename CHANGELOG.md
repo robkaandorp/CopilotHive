@@ -1,3 +1,17 @@
+## [0.25.1] — 2026-08-02
+
+### Fixed
+
+- **Per-clone git identity for worker target-repo clones** — `GitOperations.CloneRepositoryAsync` now configures `user.email` and `user.name` locally after each fresh clone, preventing commit failures from missing git identity.
+
+### Changed
+
+- **Improver system prompt drops "tool call contracts" from the safety-constraints list** — The hardcoded Improver prompt now reads "git workflow, test requirements or output format compliance" instead of "git workflow, test requirements, output format compliance, or tool call contracts."
+
+### Added
+
+- **Improver general-guidance rule** — agents.md edits must contain GENERAL, broadly-applicable software-development patterns and coding-style conventions, not incident-specific lessons tied to particular files, classes, or past iterations.
+
 ## [0.25.0] — 2026-08-02
 
 ### Added
