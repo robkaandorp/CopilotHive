@@ -934,7 +934,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
         var update = new OrchestratorSettingsUpdate(
             MaxIterations: 99, MaxRetriesPerTask: 7, MaxParallelGoals: 4,
-            AlwaysImprove: true, VerboseLogging: true,
+            VerboseLogging: true,
             BrainMaxSteps: 120,
             BranchCleanupDelayHours: 12);
 
@@ -943,7 +943,6 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.Equal(99, config.Orchestrator.MaxIterations);
         Assert.Equal(7, config.Orchestrator.MaxRetriesPerTask);
         Assert.Equal(4, config.Orchestrator.MaxParallelGoals);
-        Assert.True(config.Orchestrator.AlwaysImprove);
         Assert.True(config.Orchestrator.VerboseLogging);
         Assert.Equal(120, config.Orchestrator.BrainMaxSteps);
         Assert.Equal(12, config.Orchestrator.BranchCleanupDelayHours);
@@ -958,7 +957,6 @@ public sealed class ConfigModelServiceTests : IDisposable
             {
                 MaxIterations = 10,
                 MaxRetriesPerTask = 3,
-                AlwaysImprove = false,
                 VerboseLogging = false
             }
         };
@@ -966,14 +964,13 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
         var update = new OrchestratorSettingsUpdate(
             MaxIterations: 50, MaxRetriesPerTask: null, MaxParallelGoals: null,
-            AlwaysImprove: true, VerboseLogging: null,
+            VerboseLogging: null,
             BrainMaxSteps: null,
             BranchCleanupDelayHours: null);
 
         await svc.UpdateOrchestratorSettingsAsync(update, TestContext.Current.CancellationToken);
 
         Assert.Equal(50, config.Orchestrator.MaxIterations);
-        Assert.True(config.Orchestrator.AlwaysImprove);
         // Unchanged
         Assert.Equal(3, config.Orchestrator.MaxRetriesPerTask);
         Assert.False(config.Orchestrator.VerboseLogging);
@@ -987,7 +984,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
         var update = new OrchestratorSettingsUpdate(
             MaxIterations: 5, MaxRetriesPerTask: null, MaxParallelGoals: null,
-            AlwaysImprove: null, VerboseLogging: null,
+            VerboseLogging: null,
             BrainMaxSteps: null,
             BranchCleanupDelayHours: null);
 
@@ -1140,7 +1137,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
         var update = new OrchestratorSettingsUpdate(
             MaxIterations: 15, MaxRetriesPerTask: 5, MaxParallelGoals: 3,
-            AlwaysImprove: true, VerboseLogging: true,
+            VerboseLogging: true,
             BrainMaxSteps: 75,
             BranchCleanupDelayHours: 24);
 
@@ -1150,7 +1147,6 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.Contains("max_iterations: 15", yaml);
         Assert.Contains("max_retries_per_task: 5", yaml);
         Assert.Contains("max_parallel_goals: 3", yaml);
-        Assert.Contains("always_improve: true", yaml);
         Assert.Contains("verbose_logging: true", yaml);
         Assert.Contains("brain_max_steps: 75", yaml);
         Assert.Contains("branch_cleanup_delay_hours: 24", yaml);

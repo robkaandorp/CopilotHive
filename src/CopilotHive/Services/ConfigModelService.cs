@@ -43,13 +43,12 @@ public sealed record ModelConfigUpdate(
 /// <param name="MaxIterations">New maximum number of goal iterations.</param>
 /// <param name="MaxRetriesPerTask">New maximum retries per task.</param>
 /// <param name="MaxParallelGoals">New maximum number of parallel goals.</param>
-/// <param name="AlwaysImprove">Whether the improver runs after every iteration.</param>
 /// <param name="VerboseLogging">Whether verbose logging is enabled.</param>
 /// <param name="BrainMaxSteps">New maximum Brain tool-call steps.</param>
 /// <param name="BranchCleanupDelayHours">New branch cleanup delay in hours.</param>
 public sealed record OrchestratorSettingsUpdate(
     int? MaxIterations, int? MaxRetriesPerTask, int? MaxParallelGoals,
-    bool? AlwaysImprove, bool? VerboseLogging,
+    bool? VerboseLogging,
     int? BrainMaxSteps,
     int? BranchCleanupDelayHours);
 
@@ -562,8 +561,6 @@ public sealed class ConfigModelService
             _config.Orchestrator.MaxRetriesPerTask = update.MaxRetriesPerTask.Value;
         if (update.MaxParallelGoals is not null)
             _config.Orchestrator.MaxParallelGoals = update.MaxParallelGoals.Value;
-        if (update.AlwaysImprove is not null)
-            _config.Orchestrator.AlwaysImprove = update.AlwaysImprove.Value;
         if (update.VerboseLogging is not null)
             _config.Orchestrator.VerboseLogging = update.VerboseLogging.Value;
         if (update.BrainMaxSteps is not null)

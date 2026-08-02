@@ -179,7 +179,6 @@ public sealed class HiveConfigFileTests
                 MaxIterations = 42,
                 MaxRetriesPerTask = 7,
                 MaxParallelGoals = 3,
-                AlwaysImprove = true,
                 VerboseLogging = true,
                 BrainMaxSteps = 50,
                 BranchCleanupDelayHours = 24
@@ -232,7 +231,6 @@ public sealed class HiveConfigFileTests
         Assert.Equal(42, receiver.Orchestrator.MaxIterations);
         Assert.Equal(7, receiver.Orchestrator.MaxRetriesPerTask);
         Assert.Equal(3, receiver.Orchestrator.MaxParallelGoals);
-        Assert.True(receiver.Orchestrator.AlwaysImprove);
         Assert.True(receiver.Orchestrator.VerboseLogging);
         Assert.Equal(50, receiver.Orchestrator.BrainMaxSteps);
         Assert.Equal(24, receiver.Orchestrator.BranchCleanupDelayHours);
@@ -318,7 +316,6 @@ public sealed class HiveConfigFileTests
                 MaxIterations = 10,
                 MaxRetriesPerTask = 3,
                 MaxParallelGoals = 1,
-                AlwaysImprove = false,
                 VerboseLogging = false,
                 BrainMaxSteps = 30,
                 BranchCleanupDelayHours = 48
@@ -436,7 +433,6 @@ public sealed class HiveConfigFileTests
                 MaxIterations = 99,
                 MaxRetriesPerTask = 5,
                 MaxParallelGoals = 4,
-                AlwaysImprove = true,
                 VerboseLogging = false,
                 BrainMaxSteps = 100,
                 BranchCleanupDelayHours = 12
@@ -1027,6 +1023,23 @@ public sealed class HiveConfigFileTests
         Assert.NotNull(config.Composer);
         Assert.Equal("copilot/composer-model", config.Composer.Model);
         Assert.Equal(25, config.Composer.MaxSteps);
+    }
+
+    [Fact]
+    public void Deserialize_OrchestratorAlwaysImprove_IgnoredWithoutError()
+    {
+        // Stale `always_improve` key must be silently dropped by IgnoreUnmatchedProperties().
+        const string yaml = """
+            version: "1.0"
+            orchestrator:
+              model: copilot/test-model
+              always_improve: true
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        Assert.NotNull(config);
+        Assert.Equal("copilot/test-model", config.Orchestrator.Model);
     }
 
     // ── TryGetContextWindowForModel: reasoning suffix stripping ─────────────────

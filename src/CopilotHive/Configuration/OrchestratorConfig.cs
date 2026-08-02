@@ -17,8 +17,6 @@ public sealed class OrchestratorConfig
     /// run in parallel, each has its own Brain session forked from the master.
     /// </summary>
     public int MaxParallelGoals { get; set; } = 1;
-    /// <summary>When <c>true</c>, the improver runs after every iteration even on success.</summary>
-    public bool AlwaysImprove { get; set; }
     /// <summary>When <c>true</c>, enables verbose logging of prompts, worker output, and Brain reasoning.</summary>
     public bool VerboseLogging { get; set; }
     /// <summary>Maximum tool-call steps the Brain agent may take per request.</summary>

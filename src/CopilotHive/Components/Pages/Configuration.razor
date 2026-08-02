@@ -867,9 +867,6 @@ else
                         <input type="number" min="1" @bind="_orchMaxParallelGoals"
                                style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
 
-                        <label style="color:var(--text-muted);font-size:0.9rem">Always Improve</label>
-                        <input type="checkbox" @bind="_orchAlwaysImprove" style="width:1.1rem;height:1.1rem;cursor:pointer" />
-
                         <label style="color:var(--text-muted);font-size:0.9rem">Verbose Logging</label>
                         <input type="checkbox" @bind="_orchVerboseLogging" style="width:1.1rem;height:1.1rem;cursor:pointer" />
 
@@ -1056,7 +1053,6 @@ else
         [property: JsonPropertyName("maxIterations")] int MaxIterations,
         [property: JsonPropertyName("maxRetriesPerTask")] int MaxRetriesPerTask,
         [property: JsonPropertyName("maxParallelGoals")] int MaxParallelGoals,
-        [property: JsonPropertyName("alwaysImprove")] bool AlwaysImprove,
         [property: JsonPropertyName("verboseLogging")] bool VerboseLogging,
         [property: JsonPropertyName("brainMaxSteps")] int BrainMaxSteps,
         [property: JsonPropertyName("branchCleanupDelayHours")] int BranchCleanupDelayHours);
@@ -1169,7 +1165,6 @@ else
     private int _orchMaxIterations;
     private int _orchMaxRetriesPerTask;
     private int _orchMaxParallelGoals;
-    private bool _orchAlwaysImprove;
     private bool _orchVerboseLogging;
     private int _orchBrainMaxSteps;
     private int _orchBranchCleanupDelayHours;
@@ -1427,7 +1422,6 @@ else
                 _orchMaxIterations = _orchestratorData.MaxIterations;
                 _orchMaxRetriesPerTask = _orchestratorData.MaxRetriesPerTask;
                 _orchMaxParallelGoals = _orchestratorData.MaxParallelGoals;
-                _orchAlwaysImprove = _orchestratorData.AlwaysImprove;
                 _orchVerboseLogging = _orchestratorData.VerboseLogging;
                 _orchBrainMaxSteps = _orchestratorData.BrainMaxSteps;
                 _orchBranchCleanupDelayHours = _orchestratorData.BranchCleanupDelayHours;
@@ -1498,7 +1492,6 @@ else
                     maxIterations = _orchMaxIterations,
                     maxRetriesPerTask = _orchMaxRetriesPerTask,
                     maxParallelGoals = _orchMaxParallelGoals,
-                    alwaysImprove = _orchAlwaysImprove,
                     verboseLogging = _orchVerboseLogging,
                     brainMaxSteps = _orchBrainMaxSteps,
                     branchCleanupDelayHours = _orchBranchCleanupDelayHours,

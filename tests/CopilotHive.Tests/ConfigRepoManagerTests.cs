@@ -43,7 +43,6 @@ public class ConfigRepoManagerTests : IDisposable
               model: gpt-5.4
               max_iterations: 5
               max_retries_per_task: 2
-              always_improve: true
             """;
 
         var config = ConfigRepoManager.ParseConfig(yaml);
@@ -63,7 +62,6 @@ public class ConfigRepoManagerTests : IDisposable
         Assert.Equal("gpt-5.4", config.Orchestrator.Model);
         Assert.Equal(5, config.Orchestrator.MaxIterations);
         Assert.Equal(2, config.Orchestrator.MaxRetriesPerTask);
-        Assert.True(config.Orchestrator.AlwaysImprove);
     }
 
     [Fact]
@@ -81,7 +79,6 @@ public class ConfigRepoManagerTests : IDisposable
         Assert.Equal("claude-sonnet-4.6", config.Orchestrator.Model);
         Assert.Equal(10, config.Orchestrator.MaxIterations);
         Assert.Equal(3, config.Orchestrator.MaxRetriesPerTask);
-        Assert.False(config.Orchestrator.AlwaysImprove);
     }
 
     [Fact]

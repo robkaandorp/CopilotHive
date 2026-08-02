@@ -246,7 +246,6 @@ public sealed class HiveConfigFile
             MaxIterations = source.Orchestrator.MaxIterations,
             MaxRetriesPerTask = source.Orchestrator.MaxRetriesPerTask,
             MaxParallelGoals = source.Orchestrator.MaxParallelGoals,
-            AlwaysImprove = source.Orchestrator.AlwaysImprove,
             VerboseLogging = source.Orchestrator.VerboseLogging,
             BrainMaxSteps = source.Orchestrator.BrainMaxSteps,
             BranchCleanupDelayHours = source.Orchestrator.BranchCleanupDelayHours
