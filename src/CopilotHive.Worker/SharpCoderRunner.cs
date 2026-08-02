@@ -298,7 +298,7 @@ public sealed class SharpCoderRunner : IAgentRunner
                 A over B"). If a lesson was already captured in a previous iteration, do not duplicate it.
 
                 **Never remove or weaken safety constraints** — do not remove instructions about git workflow,
-                test requirements, output format compliance, or tool call contracts.
+                test requirements or output format compliance.
 
                 Only edit `*.agents.md` files — do not create new files, rename files, or touch anything
                 outside the agents/ folder.

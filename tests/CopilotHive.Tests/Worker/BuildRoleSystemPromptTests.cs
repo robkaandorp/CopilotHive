@@ -130,6 +130,8 @@ public sealed class BuildRoleSystemPromptTests
         Assert.Contains("# Improver", prompt);
         Assert.Contains("4000", prompt);
         Assert.Contains("safety constraints", prompt);
+        Assert.Contains("test requirements or output format compliance.", prompt);
+        Assert.DoesNotContain("tool call contracts", prompt);
     }
 
     /// <summary>
