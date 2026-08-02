@@ -4,6 +4,8 @@ using System.Text.Json;
 using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
+using CopilotHive.Knowledge;
+using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -595,7 +597,20 @@ public sealed class ReleaseStatusApiEndpointTests
     /// <see cref="HiveConfigFile"/>, and a configurable fake
     /// <see cref="IBrainRepoManager"/> registered.
     /// </summary>
-    private static WebApplicationFactory<Program> CreateFactory(ConfigurableFakeRepoManager fake)
+    /// <param name="fake">The fake repo manager to register.</param>
+    /// <param name="registerKnowledgeCleanup">
+    /// When true, registers a real in-memory <see cref="KnowledgeGraph"/> and
+    /// <see cref="KnowledgeDocumentCleanupService"/> so the Released-status cleanup
+    /// hook runs against real transient knowledge documents.
+    /// </param>
+    /// <param name="goalStoreFactory">
+    /// Optional factory that replaces the <see cref="IGoalStore"/> registration
+    /// (e.g. a stateful fake that throws on cleanup).
+    /// </param>
+    private static WebApplicationFactory<Program> CreateFactory(
+        ConfigurableFakeRepoManager fake,
+        bool registerKnowledgeCleanup = false,
+        Func<IServiceProvider, IGoalStore>? goalStoreFactory = null)
     {
         var config = CreateApiConfig();
         var baseFactory = new HiveTestFactory { MockRepoManager = fake };
@@ -609,12 +624,39 @@ public sealed class ReleaseStatusApiEndpointTests
                     services.Remove(existingConfig);
                 services.AddSingleton(config);
 
+                if (goalStoreFactory is not null)
+                {
+                    var existingStore = services.SingleOrDefault(d => d.ServiceType == typeof(IGoalStore));
+                    if (existingStore is not null)
+                        services.Remove(existingStore);
+                    services.AddSingleton<IGoalStore>(goalStoreFactory);
+                }
+
                 // Register ReleaseExecutionService using the same config and the mock repo manager.
                 services.AddSingleton(sp => new ReleaseExecutionService(
                     sp.GetRequiredService<IGoalStore>(),
                     config,
                     sp.GetRequiredService<IBrainRepoManager>(),
                     sp.GetRequiredService<ILogger<ReleaseExecutionService>>()));
+
+                if (registerKnowledgeCleanup)
+                {
+                    // HiveTestFactory boots without --config-repo so KnowledgeGraph is not
+                    // registered; add a real in-memory graph plus the cleanup service wired
+                    // to it. The last registration wins, overriding Program.cs's singleton.
+                    var existingGraph = services.SingleOrDefault(d => d.ServiceType == typeof(KnowledgeGraph));
+                    if (existingGraph is not null)
+                        services.Remove(existingGraph);
+                    services.AddSingleton<KnowledgeGraph>(_ => new KnowledgeGraph());
+
+                    var existingCleanup = services.SingleOrDefault(d => d.ServiceType == typeof(KnowledgeDocumentCleanupService));
+                    if (existingCleanup is not null)
+                        services.Remove(existingCleanup);
+                    services.AddSingleton<KnowledgeDocumentCleanupService>(sp =>
+                        new KnowledgeDocumentCleanupService(
+                            sp.GetRequiredService<KnowledgeGraph>(),
+                            sp.GetRequiredService<ILogger<KnowledgeDocumentCleanupService>>()));
+                }
             });
         });
     }
@@ -969,6 +1011,127 @@ public sealed class ReleaseStatusApiEndpointTests
 
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
     }
+
+    // ── API test: Released cleanup deletes progress/review knowledge docs ──
+
+    [Fact]
+    public async Task PatchReleaseStatus_Released_CleansUpTransientKnowledgeDocs()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+        using var factory = CreateFactory(fake, registerKnowledgeCleanup: true);
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        var goalId = UniqueId();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId, Tag = "v1.0.0", RepositoryNames = ["repo1"],
+            }, ct);
+            await store.CreateGoalAsync(
+                new Goal { Id = goalId, Description = "Test", ReleaseId = releaseId, Status = GoalStatus.Completed }, ct);
+
+            // Seed transient progress/review docs plus a non-transient doc that must survive.
+            var graph = scope.ServiceProvider.GetRequiredService<KnowledgeGraph>();
+            await graph.CreateDocumentAsync(
+                $"progress-{goalId}", $"Progress {goalId}", DocumentType.Scratch, "content", topic: "progress", ct: ct);
+            await graph.CreateDocumentAsync(
+                $"review-{goalId}", $"Review {goalId}", DocumentType.Scratch, "content", topic: "review", ct: ct);
+            await graph.CreateDocumentAsync(
+                "architecture-something", "Architecture", DocumentType.Implementation, "content", topic: "architecture", ct: ct);
+        }
+
+        var response = await client.PatchAsync(
+            $"/api/releases/{releaseId}/status", StatusJson("Released"), ct);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // Transient docs removed, non-transient doc preserved.
+        using (var scope = factory.Services.CreateScope())
+        {
+            var graph = scope.ServiceProvider.GetRequiredService<KnowledgeGraph>();
+            Assert.Null(graph.GetDocument($"progress-{goalId}"));
+            Assert.Null(graph.GetDocument($"review-{goalId}"));
+            Assert.NotNull(graph.GetDocument("architecture-something"));
+        }
+    }
+
+    // ── API test: Released with no transient docs still succeeds ──────────
+
+    [Fact]
+    public async Task PatchReleaseStatus_Released_NoTransientDocs_Succeeds()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+        using var factory = CreateFactory(fake, registerKnowledgeCleanup: true);
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId, Tag = "v1.0.0", RepositoryNames = ["repo1"],
+            }, ct);
+            await store.CreateGoalAsync(
+                new Goal { Id = UniqueId(), Description = "Test", ReleaseId = releaseId, Status = GoalStatus.Completed }, ct);
+        }
+
+        var response = await client.PatchAsync(
+            $"/api/releases/{releaseId}/status", StatusJson("Released"), ct);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // The release is Released with ExecutionState = Completed.
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            var stored = await store.GetReleaseAsync(releaseId, ct);
+            Assert.NotNull(stored);
+            Assert.Equal(ReleaseStatus.Released, stored!.Status);
+            Assert.Equal(ReleaseExecutionState.Completed, stored.ExecutionState);
+        }
+    }
+
+    // ── API test: cleanup failure must NOT fail the release ───────────────
+
+    [Fact]
+    public async Task PatchReleaseStatus_Released_CleanupFailure_StillReturns200()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager { CreateTagResult = true };
+
+        var releaseId = UniqueId();
+        var goalId = UniqueId();
+        var release = new Release { Id = releaseId, Tag = "v1.0.0", RepositoryNames = ["repo1"] };
+        var goals = new List<Goal>
+        {
+            new() { Id = goalId, Description = "Test", ReleaseId = releaseId, Status = GoalStatus.Completed },
+        };
+        var fakeStore = new ThrowingCleanupGoalStore(release, goals);
+
+        using var factory = CreateFactory(fake, registerKnowledgeCleanup: true, goalStoreFactory: _ => fakeStore);
+        using var client = factory.CreateClient();
+
+        var response = await client.PatchAsync(
+            $"/api/releases/{releaseId}/status", StatusJson("Released"), ct);
+
+        // Cleanup failure is best-effort — the release must still succeed.
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var body = await response.Content.ReadAsStringAsync(ct);
+        using var doc = JsonDocument.Parse(body);
+        Assert.Equal(ReleaseStatus.Released, ReadStatus(doc.RootElement.GetProperty("release")));
+        Assert.True(doc.RootElement.GetProperty("result").GetProperty("success").GetBoolean());
+
+        // The store still reflects Released even though the cleanup hook threw.
+        Assert.Equal(ReleaseStatus.Released, release.Status);
+        Assert.Equal(ReleaseExecutionState.Completed, release.ExecutionState);
+    }
 }
 
 /// <summary>
@@ -1151,4 +1314,97 @@ public sealed class ReleaseValidateApiEndpointTests
         Assert.Equal(JsonValueKind.Array, errors.ValueKind);
         Assert.Equal(0, errors.GetArrayLength());
     }
+}
+
+/// <summary>
+/// Stateful fake <see cref="IGoalStore"/> used to prove that a failure in the endpoint
+/// cleanup hook (the SECOND <see cref="GetGoalsByReleaseAsync"/> call, after Released is
+/// persisted) never fails the release. The FIRST call (inside
+/// <see cref="ReleaseExecutionService.ValidateReleaseAsync"/>) returns the goals normally.
+/// </summary>
+internal sealed class ThrowingCleanupGoalStore : IGoalStore
+{
+    private readonly Release _release;
+    private readonly IReadOnlyList<Goal> _goals;
+    private int _getGoalsByReleaseCalls;
+
+    public ThrowingCleanupGoalStore(Release release, IReadOnlyList<Goal> goals)
+    {
+        _release = release;
+        _goals = goals;
+    }
+
+    public string Name => "throwing-cleanup-store";
+
+    public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>([]);
+
+    public Task UpdateGoalStatusAsync(
+        string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<IReadOnlyList<Goal>> GetAllGoalsAsync(CancellationToken ct = default) =>
+        Task.FromResult(_goals);
+
+    public Task<Goal?> GetGoalAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult(_goals.FirstOrDefault(g => g.Id == goalId));
+
+    public Task<Goal> CreateGoalAsync(Goal goal, CancellationToken ct = default) => Task.FromResult(goal);
+
+    public Task UpdateGoalAsync(Goal goal, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<bool> DeleteGoalAsync(string goalId, CancellationToken ct = default) => Task.FromResult(false);
+
+    public Task<IReadOnlyList<Goal>> SearchGoalsAsync(
+        string query, GoalStatus? statusFilter = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>([]);
+
+    public Task<IReadOnlyList<Goal>> GetGoalsByStatusAsync(GoalStatus status, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>([]);
+
+    public Task AddIterationAsync(string goalId, IterationSummary summary, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<IterationSummary>>([]);
+
+    public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default) =>
+        Task.FromResult(release);
+
+    public Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default) =>
+        Task.FromResult<Release?>(releaseId == _release.Id ? _release : null);
+
+    public Task<IReadOnlyList<Release>> GetReleasesAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Release>>([_release]);
+
+    public Task UpdateReleaseAsync(Release release, CancellationToken ct = default)
+    {
+        _release.Status = release.Status;
+        _release.ExecutionState = release.ExecutionState;
+        _release.ReleasedAt = release.ReleasedAt;
+        return Task.CompletedTask;
+    }
+
+    public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default) => Task.FromResult(false);
+
+    public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default)
+    {
+        Interlocked.Increment(ref _getGoalsByReleaseCalls);
+        if (_getGoalsByReleaseCalls > 1)
+            throw new InvalidOperationException("simulated cleanup failure");
+        return Task.FromResult(_goals);
+    }
+
+    public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(
+        string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
+
+    public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(
+        int? limit = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<(string, PersistedClarification)>>([]);
 }

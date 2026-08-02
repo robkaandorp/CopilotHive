@@ -391,6 +391,27 @@ public static class ApiEndpoints
                 updated!.Status = ReleaseStatus.Released;
                 updated.ReleasedAt = DateTime.UtcNow;
                 await store.UpdateReleaseAsync(updated);
+
+                // Best-effort cleanup of transient progress/review knowledge documents for
+                // every goal in the release. Failures are logged and must never fail the release.
+                var docCleanup = services.GetService<KnowledgeDocumentCleanupService>();
+                if (docCleanup is not null)
+                {
+                    try
+                    {
+                        var goals = await store.GetGoalsByReleaseAsync(id);
+                        await docCleanup.CleanupGoalsDocumentsAsync(
+                            goals.Select(g => g.Id),
+                            $"Cleanup progress/review docs for release '{updated.Tag}'",
+                            HttpContext.RequestAborted);
+                    }
+                    catch (Exception ex)
+                    {
+                        services.GetRequiredService<ILogger<Program>>().LogWarning(
+                            ex, "Failed to clean up knowledge documents for release {Tag}", updated.Tag);
+                    }
+                }
+
                 dashboardNotifier.NotifyStateChanged();
                 return Results.Ok(new { release = updated, result = result });
             }

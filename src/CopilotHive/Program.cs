@@ -369,6 +369,15 @@ public sealed class Program
                     builder.Logging.AddFilter("Grpc", LogLevel.Warning);
                 }
             }
+
+            // Knowledge document cleanup: best-effort deletion of transient progress/review
+            // docs for released goals. Registered unconditionally — the KnowledgeGraph is
+            // resolved lazily and may be null when no config repo is configured.
+            builder.Services.AddSingleton<KnowledgeDocumentCleanupService>(sp =>
+                new KnowledgeDocumentCleanupService(
+                    sp.GetService<KnowledgeGraph>(),
+                    sp.GetRequiredService<ILogger<KnowledgeDocumentCleanupService>>()));
+
             // Goals: EF Core-backed goal store (primary source of truth)
             builder.Services.AddSingleton<IGoalStore>(sp =>
                 new GoalStore(
