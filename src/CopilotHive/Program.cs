@@ -352,6 +352,7 @@ public sealed class Program
                     // Best-effort: graph starts empty if knowledge/ directory doesn't exist yet
                 }
                 builder.Services.AddSingleton(knowledgeGraph);
+                builder.Services.AddSingleton<KnowledgeDocumentCleanupService>();
 
                 builder.Services.AddSingleton<ConfigModelService>();
                 builder.Services.AddSingleton<ModelDiscoveryService>();

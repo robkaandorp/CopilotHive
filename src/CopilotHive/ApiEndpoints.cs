@@ -170,7 +170,7 @@ public static class ApiEndpoints
             }
         });
 
-        goalsApi.MapDelete("/{id}", async (string id, IGoalStore store, [FromServices] IBrainRepoManager? repoManager, ILogger<Program> logger, [FromServices] DashboardNotifier dashboardNotifier) =>
+        goalsApi.MapDelete("/{id}", async (string id, IGoalStore store, [FromServices] IBrainRepoManager? repoManager, ILogger<Program> logger, [FromServices] DashboardNotifier dashboardNotifier, [FromServices] KnowledgeDocumentCleanupService? docCleanup) =>
         {
             var goal = await store.GetGoalAsync(id);
             if (goal is null)
@@ -182,6 +182,19 @@ public static class ApiEndpoints
             var deleted = await store.DeleteGoalAsync(id);
             if (!deleted)
                 return Results.NotFound(new { error = $"Goal '{id}' not found." });
+
+            // Best-effort cleanup of knowledge documents
+            if (docCleanup is not null)
+            {
+                try
+                {
+                    await docCleanup.CleanupGoalDocumentsAsync(id, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Failed to cleanup knowledge documents for deleted goal '{GoalId}'", id);
+                }
+            }
 
             // Best-effort cleanup of remote feature branches for Failed goals
             if (goal.Status == GoalStatus.Failed)

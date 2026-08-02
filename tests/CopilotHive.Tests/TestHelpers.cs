@@ -1,5 +1,6 @@
 namespace CopilotHive.Tests;
 
+using CopilotHive.Configuration;
 using Microsoft.Extensions.AI;
 
 /// <summary>Shared test utilities.</summary>
@@ -58,4 +59,20 @@ internal sealed class FakeChatClient : IChatClient
     public object? GetService(Type serviceType, object? serviceKey = null) => null;
 
     public void Dispose() { }
+}
+
+/// <summary>
+/// <see cref="ConfigRepoManager"/> whose <see cref="ConfigRepoManager.DeleteFileAsync"/>
+/// always throws <see cref="OperationCanceledException"/>. Used to verify that knowledge
+/// document cleanup failures are best-effort and never fail goal deletion.
+/// </summary>
+internal sealed class ThrowingConfigRepoManager : ConfigRepoManager
+{
+    public ThrowingConfigRepoManager(string localPath)
+        : base("http://localhost/invalid-config-repo", localPath)
+    {
+    }
+
+    public override Task DeleteFileAsync(string filePath, string commitMessage, CancellationToken ct = default)
+        => throw new OperationCanceledException("Simulated knowledge document cleanup failure");
 }

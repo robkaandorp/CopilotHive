@@ -157,6 +157,21 @@ public sealed partial class Composer
 
         _logger.LogInformation("Composer deleted goal '{GoalId}'", id);
 
+        // Best-effort cleanup of knowledge documents
+        if (_serviceProvider is not null)
+        {
+            try
+            {
+                var docCleanup = _serviceProvider.GetService<KnowledgeDocumentCleanupService>();
+                if (docCleanup is not null)
+                    await docCleanup.CleanupGoalDocumentsAsync(id, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to cleanup knowledge documents for deleted goal '{GoalId}'", id);
+            }
+        }
+
         // Best-effort cleanup of remote feature branches for Failed goals
         if (_repoManager is not null && goal.Status == GoalStatus.Failed)
         {

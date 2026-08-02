@@ -1,6 +1,7 @@
 using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
+using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
@@ -1757,6 +1758,112 @@ public sealed class ComposerToolTests : IDisposable
 
         // Verify that the cleanup was attempted (even though it returned Failed)
         mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-a", "copilothive/failed-cleanup", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task DeleteGoal_RemovesKnowledgeDocuments()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goalId = "del-doc-cleanup";
+        await _composer.CreateGoalAsync(goalId, "Goal with knowledge docs");
+
+        // Create a knowledge graph with progress/review docs and register the cleanup service
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
+        await kg.CreateDocumentAsync(
+            $"progress-{goalId}", "Progress", DocumentType.Scratch, "progress content",
+            topic: "progress", ct: ct);
+        await kg.CreateDocumentAsync(
+            $"review-{goalId}", "Review", DocumentType.Scratch, "review content",
+            topic: "review", ct: ct);
+
+        var services = new ServiceCollection();
+        services.AddSingleton(kg);
+        services.AddSingleton<KnowledgeDocumentCleanupService>();
+        services.AddSingleton<ILogger<KnowledgeDocumentCleanupService>>(NullLogger<KnowledgeDocumentCleanupService>.Instance);
+        using var sp = services.BuildServiceProvider();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            serviceProvider: sp,
+            knowledgeGraph: kg);
+
+        var result = await composer.DeleteGoalAsync(goalId);
+
+        Assert.Contains("✅", result);
+        var goal = await _store.GetGoalAsync(goalId, ct);
+        Assert.Null(goal);
+        Assert.Null(kg.GetDocument($"progress-{goalId}"));
+        Assert.Null(kg.GetDocument($"review-{goalId}"));
+    }
+
+    [Fact]
+    public async Task DeleteGoal_CleanupThrows_StillSucceeds()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goalId = "del-doc-throw";
+        await _composer.CreateGoalAsync(goalId, "Goal whose doc cleanup throws");
+
+        // Graph backed by a config repo whose DeleteFileAsync always throws OCE
+        var throwingRepo = new ThrowingConfigRepoManager(Path.GetTempPath());
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph(throwingRepo, logger: null);
+        await kg.CreateDocumentAsync(
+            $"progress-{goalId}", "Progress", DocumentType.Scratch, "progress content",
+            topic: "progress", ct: ct);
+
+        var services = new ServiceCollection();
+        services.AddSingleton(kg);
+        services.AddSingleton<KnowledgeDocumentCleanupService>();
+        services.AddSingleton<ILogger<KnowledgeDocumentCleanupService>>(NullLogger<KnowledgeDocumentCleanupService>.Instance);
+        using var sp = services.BuildServiceProvider();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            serviceProvider: sp,
+            knowledgeGraph: kg);
+
+        // Cleanup throws, but goal deletion must still succeed (best-effort)
+        var result = await composer.DeleteGoalAsync(goalId);
+
+        Assert.Contains("✅", result);
+        Assert.Contains("deleted", result);
+        var goal = await _store.GetGoalAsync(goalId, ct);
+        Assert.Null(goal);
+    }
+
+    [Fact]
+    public async Task DeleteGoal_NoDocuments_SucceedsAsNoop()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goalId = "del-no-docs";
+        await _composer.CreateGoalAsync(goalId, "Goal without knowledge docs");
+
+        var kg = new CopilotHive.Knowledge.KnowledgeGraph(configRepo: null, logger: null);
+        var services = new ServiceCollection();
+        services.AddSingleton(kg);
+        services.AddSingleton<KnowledgeDocumentCleanupService>();
+        services.AddSingleton<ILogger<KnowledgeDocumentCleanupService>>(NullLogger<KnowledgeDocumentCleanupService>.Instance);
+        using var sp = services.BuildServiceProvider();
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            serviceProvider: sp,
+            knowledgeGraph: kg);
+
+        var result = await composer.DeleteGoalAsync(goalId);
+
+        Assert.Contains("✅", result);
+        Assert.Contains("deleted", result);
+        var goal = await _store.GetGoalAsync(goalId, ct);
+        Assert.Null(goal);
     }
 
     // ── cancel_goal ──

@@ -2,8 +2,10 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Git;
+using CopilotHive.Knowledge;
 using CopilotHive.Services;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -697,6 +699,100 @@ public class GoalsApiEndpointTests
         var expectedBranchName = $"copilothive/{id}";
         mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-a", expectedBranchName, It.IsAny<CancellationToken>()), Times.Once);
         mockRepoManager.Verify(r => r.DeleteRemoteBranchAsync("repo-b", expectedBranchName, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task DeleteGoal_RemovesKnowledgeDocuments()
+    {
+        var id = UniqueId();
+        using var factory = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                services.AddSingleton(new KnowledgeGraph());
+                services.AddSingleton<KnowledgeDocumentCleanupService>();
+            });
+        });
+        using var client = factory.CreateClient();
+
+        // Create goal and patch to Draft so deletion is allowed
+        await client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+        await client.PatchAsync($"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Draft" }, JsonOpts), Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        // Seed progress and review knowledge documents
+        using (var scope = factory.Services.CreateScope())
+        {
+            var graph = scope.ServiceProvider.GetRequiredService<KnowledgeGraph>();
+            await graph.CreateDocumentAsync(
+                $"progress-{id}", $"Progress {id}", DocumentType.Scratch, "progress content",
+                topic: "progress", ct: TestContext.Current.CancellationToken);
+            await graph.CreateDocumentAsync(
+                $"review-{id}", $"Review {id}", DocumentType.Scratch, "review content",
+                topic: "review", ct: TestContext.Current.CancellationToken);
+        }
+
+        var response = await client.DeleteAsync($"/api/goals/{id}",
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+            Assert.Null(goal);
+
+            var graph = scope.ServiceProvider.GetRequiredService<KnowledgeGraph>();
+            Assert.Null(graph.GetDocument($"progress-{id}"));
+            Assert.Null(graph.GetDocument($"review-{id}"));
+        }
+    }
+
+    [Fact]
+    public async Task DeleteGoal_CleanupThrows_StillReturns204()
+    {
+        var id = UniqueId();
+        using var factory = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                // A KnowledgeGraph backed by a config repo whose DeleteFileAsync always throws
+                var throwingRepo = new ThrowingConfigRepoManager(Path.GetTempPath());
+                services.AddSingleton(new KnowledgeGraph(throwingRepo));
+                services.AddSingleton<KnowledgeDocumentCleanupService>();
+            });
+        });
+        using var client = factory.CreateClient();
+
+        // Create goal and patch to Draft so deletion is allowed
+        await client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
+        await client.PatchAsync($"/api/goals/{id}/status",
+            new StringContent(JsonSerializer.Serialize(new { status = "Draft" }, JsonOpts), Encoding.UTF8, "application/json"),
+            TestContext.Current.CancellationToken);
+
+        // Seed a progress doc so the cleanup actually attempts deletion and hits the throw
+        using (var scope = factory.Services.CreateScope())
+        {
+            var graph = scope.ServiceProvider.GetRequiredService<KnowledgeGraph>();
+            await graph.CreateDocumentAsync(
+                $"progress-{id}", $"Progress {id}", DocumentType.Scratch, "progress content",
+                topic: "progress", ct: TestContext.Current.CancellationToken);
+        }
+
+        var response = await client.DeleteAsync($"/api/goals/{id}",
+            TestContext.Current.CancellationToken);
+
+        // Cleanup exception must NOT fail the goal deletion
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            var goal = await store.GetGoalAsync(id, TestContext.Current.CancellationToken);
+            Assert.Null(goal);
+        }
     }
 
     // ── GET /api/goals/{id} returns ReviewStatus ─────────────────────────
