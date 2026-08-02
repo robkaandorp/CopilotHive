@@ -1,6 +1,7 @@
 @page "/releases"
 @using CopilotHive.Dashboard
 @using CopilotHive.Goals
+@using CopilotHive.Services
 @inject IGoalStore GoalStore
 @inject NavigationManager Nav
 @inject HttpClient HttpClient
@@ -70,6 +71,10 @@
 {
     @foreach (var repoGroup in GetGroupedReleases())
     {
+        var isExpanded = _expandedGroups.Contains(repoGroup.Key);
+        var partition = ReleaseVisibilityService.PartitionGroup(repoGroup);
+        var groupKey = repoGroup.Key;
+
         <div style="margin-bottom:1.5rem">
             @if (!string.IsNullOrEmpty(repoGroup.Key))
             {
@@ -83,52 +88,28 @@
             }
 
             <div class="releases-grid">
-                @foreach (var release in repoGroup)
+                @foreach (var release in partition.VisibleReleases)
                 {
-                    var goalCounts = _goalCountsByRelease.TryGetValue(release.Id, out var counts) ? counts : (Breaking: 0, Feature: 0, Patch: 0);
-                    <div class="release-card @(release.Status == ReleaseStatus.Released ? "release-card--released" : "")"
-                         @onclick="() => NavigateToRelease(release.Id)">
-                        <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.5rem">
-                            <span class="release-version">@release.Tag</span>
-                            <span class="badge @ReleaseBadge(release.Status)">@release.Status</span>
-                        </div>
-                        @if (release.RepositoryNames.Count > 0)
-                        {
-                            <div class="goal-repos" style="margin-bottom:0.5rem">
-                                @foreach (var repo in release.RepositoryNames)
-                                {
-                                    <span class="repo-tag">@repo</span>
-                                }
-                            </div>
-                        }
-                        <div class="release-scope-counts">
-                            @if (goalCounts.Breaking > 0)
-                            {
-                                <span title="Breaking Changes">💥 @goalCounts.Breaking</span>
-                            }
-                            @if (goalCounts.Feature > 0)
-                            {
-                                <span title="Features">✨ @goalCounts.Feature</span>
-                            }
-                            @if (goalCounts.Patch > 0)
-                            {
-                                <span title="Fixes">🔧 @goalCounts.Patch</span>
-                            }
-                            @if (goalCounts.Breaking == 0 && goalCounts.Feature == 0 && goalCounts.Patch == 0)
-                            {
-                                <span style="color:var(--text-muted);font-size:0.8rem">No goals assigned</span>
-                            }
-                        </div>
-                        <div style="margin-top:0.5rem;font-size:0.75rem;color:var(--text-muted)">
-                            Created @release.CreatedAt.ToString("yyyy-MM-dd")
-                            @if (release.ReleasedAt.HasValue)
-                            {
-                                <span style="margin-left:0.75rem">Released @release.ReleasedAt.Value.ToString("yyyy-MM-dd")</span>
-                            }
-                        </div>
-                    </div>
+                    @ReleaseCard(release)
                 }
             </div>
+
+            @if (partition.HiddenCount > 0)
+            {
+                <button class="release-toggle" @onclick="() => ToggleGroup(groupKey)">
+                    @(isExpanded ? "Hide older releases" : $"Show older releases ({partition.HiddenCount})")
+                </button>
+
+                @if (isExpanded)
+                {
+                    <div class="releases-grid">
+                        @foreach (var release in partition.CollapsedReleases)
+                        {
+                            @ReleaseCard(release)
+                        }
+                    </div>
+                }
+            }
         </div>
     }
 }
@@ -138,6 +119,52 @@ else if (_loaded)
 }
 
 @code {
+    private RenderFragment ReleaseCard(Release release) => __builder =>
+    {
+        var goalCounts = _goalCountsByRelease.TryGetValue(release.Id, out var counts) ? counts : (Breaking: 0, Feature: 0, Patch: 0);
+        <div class="release-card @(release.Status == ReleaseStatus.Released ? "release-card--released" : "")"
+             @onclick="() => NavigateToRelease(release.Id)">
+            <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.5rem">
+                <span class="release-version">@release.Tag</span>
+                <span class="badge @ReleaseBadge(release.Status)">@release.Status</span>
+            </div>
+            @if (release.RepositoryNames.Count > 0)
+            {
+                <div class="goal-repos" style="margin-bottom:0.5rem">
+                    @foreach (var repo in release.RepositoryNames)
+                    {
+                        <span class="repo-tag">@repo</span>
+                    }
+                </div>
+            }
+            <div class="release-scope-counts">
+                @if (goalCounts.Breaking > 0)
+                {
+                    <span title="Breaking Changes">💥 @goalCounts.Breaking</span>
+                }
+                @if (goalCounts.Feature > 0)
+                {
+                    <span title="Features">✨ @goalCounts.Feature</span>
+                }
+                @if (goalCounts.Patch > 0)
+                {
+                    <span title="Fixes">🔧 @goalCounts.Patch</span>
+                }
+                @if (goalCounts.Breaking == 0 && goalCounts.Feature == 0 && goalCounts.Patch == 0)
+                {
+                    <span style="color:var(--text-muted);font-size:0.8rem">No goals assigned</span>
+                }
+            </div>
+            <div style="margin-top:0.5rem;font-size:0.75rem;color:var(--text-muted)">
+                Created @release.CreatedAt.ToString("yyyy-MM-dd")
+                @if (release.ReleasedAt.HasValue)
+                {
+                    <span style="margin-left:0.75rem">Released @release.ReleasedAt.Value.ToString("yyyy-MM-dd")</span>
+                }
+            </div>
+        </div>
+    };
+
     private List<Release> _allReleases = [];
     private List<Release> _filtered = [];
     private Dictionary<string, IReadOnlyList<Goal>> _goalsByRelease = new();
@@ -149,6 +176,15 @@ else if (_loaded)
     private string _createVersion = "";
     private string _createRepo = "";
     private string? _createError;
+
+    /// <summary>Repo-group keys whose older releases are currently expanded.</summary>
+    private readonly HashSet<string> _expandedGroups = new(StringComparer.OrdinalIgnoreCase);
+
+    private void ToggleGroup(string groupKey)
+    {
+        if (!_expandedGroups.Add(groupKey))
+            _expandedGroups.Remove(groupKey);
+    }
 
     private List<string> _allRepoNames => _allReleases
         .SelectMany(r => r.RepositoryNames)
@@ -186,6 +222,9 @@ else if (_loaded)
 
     private void ApplyFilters()
     {
+        // A filter change re-scopes every group, so all groups return to collapsed.
+        _expandedGroups.Clear();
+
         var query = _allReleases.AsEnumerable();
 
         if (!string.IsNullOrWhiteSpace(_repoFilter))

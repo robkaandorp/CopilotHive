@@ -1176,6 +1176,29 @@ tr:last-child td { border-bottom: none; }
     flex-wrap: wrap;
 }
 
+/* Per-group "Show/Hide older releases" toggle */
+.release-toggle {
+    display: block;
+    width: 100%;
+    text-align: center;
+    padding: 0.5rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 0.85rem;
+    margin: 0.75rem 0 0.5rem;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.release-toggle:hover {
+    color: var(--text);
+    border-color: var(--text-muted);
+}
+
+.release-toggle:active { opacity: 0.7; }
+
 .release-create-form {
     max-width: 600px;
 }
