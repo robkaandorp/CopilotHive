@@ -334,8 +334,10 @@ public static class BrainPromptBuilder
             documentation updates (e.g. "update README", "add changelog entry", "update docs").
             Skip docwriting for purely internal changes (refactors, bug fixes, test additions)
             unless the goal description specifically calls for it.
-            Include the improve phase to let the improver refine agents.md guidance based on
-            how the iteration went — especially when steps needed retries or produced issues.
+            Include the improve phase ONLY when this iteration had previous issues — a retry
+            (second-or-later iteration with prior feedback), a review or test failure, or a
+            previous rejection. For a clean first iteration with no prior failures, do NOT
+            include Improve — a clean plan should omit it.
 
             Available phases: coding, testing, docwriting, review, improve, merging
 
@@ -360,7 +362,7 @@ public static class BrainPromptBuilder
             R7 (Ordering-dependency): when the submitted plan contains both Coding and DocWriting, and exactly one of their first occurrences comes after the first Testing, the plan is invalid because that Testing would inspect the not-yet-produced artifact. Preferred fix: put both content phases in a single block before that Testing, e.g. `Coding -> DocWriting -> Testing` if DocWriting is the late type, or `DocWriting -> Coding -> Testing` if Coding is the late type. This rule examines only the FIRST type-vs-Testing interleaving; it is NOT a blanket "never interleave" prohibition.
 
             For large or complex coding tasks, you may plan multiple coding+testing rounds before review:
-              ["coding", "testing", "coding", "testing", "review", "improve", "merging"]
+              ["coding", "testing", "coding", "testing", "review", "merging"]
 
             Use multiple coding rounds when:
             - The change involves a large file (>500 lines) that risks LLM response timeouts

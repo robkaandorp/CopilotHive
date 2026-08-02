@@ -24,6 +24,21 @@ public sealed class BrainPlanningPromptTests
         return BrainPromptBuilder.BuildPlanningPrompt(pipeline);
     }
 
+    private static string BuildRetryPrompt()
+    {
+        var pipeline = new GoalPipeline(new Goal
+        {
+            Id = "test-goal",
+            Description = "Test goal",
+            RepositoryNames = ["repo"],
+        });
+
+        // Iteration is computed from IterationBudget.Used + 1. Consume one use so Iteration == 2.
+        pipeline.IterationBudget.TryConsume();
+
+        return BrainPromptBuilder.BuildPlanningPrompt(pipeline);
+    }
+
     [Fact]
     public void BuildPlanningPrompt_ContainsR1OccupancyRule()
     {
@@ -55,6 +70,59 @@ public sealed class BrainPlanningPromptTests
         var prompt = BuildPrompt();
         Assert.Contains("R4 (Improve)", prompt);
         Assert.Contains("at most one Improve", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_FirstIterationDoesNotRecommendImprove()
+    {
+        var prompt = BuildPrompt();
+
+        // The old unconditional recommendation is gone.
+        Assert.DoesNotContain("Include the improve phase to let the improver refine", prompt);
+
+        // The conditional guidance is present for clean first iterations.
+        Assert.Contains("Include the improve phase ONLY when this iteration had previous issues", prompt);
+        Assert.Contains("For a clean first iteration with no prior failures, do NOT", prompt);
+        Assert.Contains("a clean plan should omit it", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_RetryIterationRecommendsImprove()
+    {
+        var prompt = BuildRetryPrompt();
+
+        // The shared prompt body still contains the conditional Improve guidance,
+        // which now applies because this is a retry iteration.
+        Assert.Contains("Include the improve phase ONLY when this iteration had previous issues", prompt);
+        Assert.Contains("second-or-later iteration with prior feedback", prompt);
+
+        // The retry-context block fires for Iteration > 1.
+        Assert.Contains("This is a retry — use the feedback above", prompt);
+        Assert.Contains("iteration 2", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_R4ImproveRulePreserved()
+    {
+        var prompt = BuildPrompt();
+        Assert.Contains("R4 (Improve)", prompt);
+        Assert.Contains("at most one Improve is allowed, positioned after the Review and before Merging", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_MultiRoundExampleDoesNotIncludeImprove()
+    {
+        var prompt = BuildPrompt();
+
+        Assert.Contains("[\"coding\", \"testing\", \"coding\", \"testing\", \"review\", \"merging\"]", prompt);
+        Assert.DoesNotContain("[\"coding\", \"testing\", \"coding\", \"testing\", \"review\", \"improve\", \"merging\"]", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_ImproveRemainsInAvailablePhases()
+    {
+        var prompt = BuildPrompt();
+        Assert.Contains("Available phases: coding, testing, docwriting, review, improve, merging", prompt);
     }
 
     [Fact]
