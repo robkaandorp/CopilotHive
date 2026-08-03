@@ -63,7 +63,8 @@ public interface IGoalStore : IGoalSource
     /// <param name="ct">Cancellation token.</param>
     Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default);
 
-    /// <summary>Deletes a release. Returns <c>false</c> if not found.</summary>
+    /// <summary>Deletes a release. Returns <c>false</c> if the release is not found,
+    /// is not in Planning status, is currently executing, or has goals attached.</summary>
     Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default);
 
     /// <summary>Returns all goals assigned to the given release.</summary>

@@ -433,6 +433,36 @@ public sealed class DashboardNotifierApiWiringTests
         Assert.Equal(1, count[0]);
     }
 
+    // ── API release delete → 1 ──────────────────────────────────────────────
+
+    [Fact]
+    public async Task ApiReleaseDelete_NotifiesOnce()
+    {
+        var (factory, _, count) = CreateFactoryWithNotifier();
+        using var client = factory.CreateClient();
+        var releaseId = UniqueId();
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId,
+                Tag = "v1.0.0",
+                Status = ReleaseStatus.Planning,
+                ExecutionState = ReleaseExecutionState.None,
+                RepositoryNames = [],
+            }, TestContext.Current.CancellationToken);
+        }
+        count[0] = 0;
+
+        var response = await client.DeleteAsync(
+            $"/api/releases/{releaseId}", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+        Assert.Equal(1, count[0]);
+    }
+
     // ── API not-found → 0 (criterion 44) ────────────────────────────────────
 
     [Theory]
@@ -444,6 +474,7 @@ public sealed class DashboardNotifierApiWiringTests
     [InlineData("PATCH",  "/api/releases/nonexistent-xyz/notes")]
     [InlineData("PATCH",  "/api/releases/nonexistent-xyz/tag")]
     [InlineData("PATCH",  "/api/releases/nonexistent-xyz/repositories")]
+    [InlineData("DELETE", "/api/releases/nonexistent-xyz")]
     public async Task ApiNotFound_DoesNotNotify(string method, string path)
     {
         var (factory, _, count) = CreateFactoryWithNotifier();

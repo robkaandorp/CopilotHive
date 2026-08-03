@@ -490,6 +490,32 @@ public static class ApiEndpoints
             return Results.Ok(updated);
         });
 
+        releasesApi.MapDelete("/{id}", async (string id, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier, CancellationToken ct) =>
+        {
+            var release = await store.GetReleaseAsync(id, ct);
+            if (release is null)
+                return Results.NotFound(new { error = $"Release '{id}' not found." });
+
+            if (release.Status != ReleaseStatus.Planning)
+                return Results.BadRequest(new { error = "Only Planning releases can be deleted." });
+
+            if (release.ExecutionState == ReleaseExecutionState.Executing)
+                return Results.Conflict(new { error = "Release is currently executing — cannot delete." });
+
+            var goals = await store.GetGoalsByReleaseAsync(id, ct);
+            if (goals.Count > 0)
+                return Results.BadRequest(new { error = $"Release has {goals.Count} goal(s) attached — remove or reassign them before deleting." });
+
+            // The store re-validates every precondition atomically. A false result here means a
+            // concurrent state change slipped between the pre-checks above and the delete.
+            var deleted = await store.DeleteReleaseAsync(id, ct);
+            if (!deleted)
+                return Results.Conflict(new { error = "Release could not be deleted due to a concurrent state change. Refresh and try again." });
+
+            dashboardNotifier.NotifyStateChanged();
+            return Results.NoContent();
+        });
+
         releasesApi.MapGet("/{id}/validate", async (string id, IGoalStore store, IServiceProvider sp, CancellationToken ct) =>
         {
             var release = await store.GetReleaseAsync(id, ct);

@@ -1,7 +1,12 @@
+using System.Data.Common;
+
 using CopilotHive.Goals;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
 
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests.Goals;
@@ -804,6 +809,235 @@ public sealed class GoalStoreIntegrationTests
     }
 
     [Fact]
+    public async Task DeleteReleaseAsync_PlanningReleaseNoGoalsExecutionStateNone_DeletesAndReturnsTrue()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var release = new Release
+        {
+            Id = "rel-delete-clean",
+            Tag = "v1.0.0",
+            Status = ReleaseStatus.Planning,
+            ExecutionState = ReleaseExecutionState.None,
+        };
+        await store.CreateReleaseAsync(release, TestContext.Current.CancellationToken);
+
+        // An unrelated goal (assigned to another release) must not block the delete.
+        await store.CreateGoalAsync(
+            new Goal { Id = "goal-other-release", Description = "Other", ReleaseId = "rel-unrelated" },
+            TestContext.Current.CancellationToken);
+
+        var deleted = await store.DeleteReleaseAsync("rel-delete-clean", TestContext.Current.CancellationToken);
+
+        Assert.True(deleted);
+        Assert.Null(await store.GetReleaseAsync("rel-delete-clean", TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task DeleteReleaseAsync_PlanningReleaseWithGoals_ReturnsFalseAndKeepsRelease()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var release = new Release
+        {
+            Id = "rel-delete-with-goals",
+            Tag = "v1.0.0",
+            Status = ReleaseStatus.Planning,
+            ExecutionState = ReleaseExecutionState.None,
+        };
+        await store.CreateReleaseAsync(release, TestContext.Current.CancellationToken);
+        await store.CreateGoalAsync(
+            new Goal { Id = "goal-attached", Description = "Attached", ReleaseId = "rel-delete-with-goals" },
+            TestContext.Current.CancellationToken);
+
+        var deleted = await store.DeleteReleaseAsync("rel-delete-with-goals", TestContext.Current.CancellationToken);
+
+        Assert.False(deleted);
+        // The goals-attached precondition must live in the ExecuteDeleteAsync WHERE clause.
+        // If it were dropped (or done as a separate check-then-delete that races), the DELETE
+        // would remove the row and both assertions below would fail.
+        Assert.NotNull(await store.GetReleaseAsync("rel-delete-with-goals", TestContext.Current.CancellationToken));
+        // Exactly one release row remains — nothing was partially deleted.
+        Assert.Equal(1, await db.Releases.CountAsync(TestContext.Current.CancellationToken));
+        // The attached goal is untouched as well.
+        var remainingGoals = await store.GetGoalsByReleaseAsync("rel-delete-with-goals", TestContext.Current.CancellationToken);
+        Assert.Single(remainingGoals);
+    }
+
+    [Fact]
+    public async Task DeleteReleaseAsync_ExecutingRelease_ReturnsFalseAndKeepsRelease()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var release = new Release
+        {
+            Id = "rel-delete-executing",
+            Tag = "v1.0.0",
+            Status = ReleaseStatus.Planning,
+            ExecutionState = ReleaseExecutionState.Executing,
+        };
+        await store.CreateReleaseAsync(release, TestContext.Current.CancellationToken);
+
+        var deleted = await store.DeleteReleaseAsync("rel-delete-executing", TestContext.Current.CancellationToken);
+
+        Assert.False(deleted);
+        // The not-Executing precondition must live in the ExecuteDeleteAsync WHERE clause.
+        // Removing it would delete this Planning release and fail the assertions below.
+        var stored = await store.GetReleaseAsync("rel-delete-executing", TestContext.Current.CancellationToken);
+        Assert.NotNull(stored);
+        Assert.Equal(ReleaseExecutionState.Executing, stored!.ExecutionState);
+        Assert.Equal(ReleaseStatus.Planning, stored.Status);
+        Assert.Equal(1, await db.Releases.CountAsync(TestContext.Current.CancellationToken));
+    }
+
+    // ── Atomicity: preconditions must live INSIDE the DELETE statement ───────
+    //
+    // The tests above establish the outcome for a stable, sequential arrangement, but they
+    // cannot by themselves distinguish an atomic conditional DELETE from a check-then-delete
+    // (read the precondition, then unconditionally delete) — under a stable arrangement both
+    // shapes return false. The tests below close that gap by mutating the database at the
+    // exact instant between "when a pre-check would have run" and "when the DELETE executes",
+    // which is precisely the TOCTOU window a check-then-delete implementation leaves open.
+
+    [Fact]
+    public async Task DeleteReleaseAsync_GoalInsertedRacingTheDelete_DoesNotDeleteRelease()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // A goal row is INSERTed on the same connection immediately before the release DELETE
+        // is executed. At the moment any pre-check would have run the release had NO goals, so
+        // a check-then-delete implementation would see "no goals attached", proceed, and drop
+        // the release. Only a DELETE that carries the NOT EXISTS predicate in its own WHERE
+        // clause observes the racing goal and deletes nothing.
+        using var db = CreateInMemoryWithInterceptor(
+            new MidDeleteSqlInjector(releaseId: "rel-race-goal", injectGoal: true),
+            out var connection);
+        using var _ = connection;
+        var store = CreateStore(db);
+
+        await store.CreateReleaseAsync(new Release
+        {
+            Id = "rel-race-goal",
+            Tag = "v1.0.0",
+            Status = ReleaseStatus.Planning,
+            ExecutionState = ReleaseExecutionState.None,
+        }, ct);
+
+        // Precondition: the release genuinely has no goals before the delete begins, so every
+        // precondition a pre-check could evaluate is satisfied at that point.
+        Assert.Empty(await store.GetGoalsByReleaseAsync("rel-race-goal", ct));
+
+        var deleted = await store.DeleteReleaseAsync("rel-race-goal", ct);
+
+        Assert.False(deleted);
+        Assert.Equal(1, await CountReleasesAsync(connection, "rel-race-goal", ct));
+    }
+
+    [Fact]
+    public async Task DeleteReleaseAsync_ExecutionStateFlippedRacingTheDelete_DoesNotDeleteRelease()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Same idea for the execution-state guard: the release is Planning/None when the delete
+        // starts, and is flipped to Executing on the same connection immediately before the
+        // DELETE runs. A check-then-delete would have already read "not executing" and would
+        // delete a release that is now mid-execution.
+        using var db = CreateInMemoryWithInterceptor(
+            new MidDeleteSqlInjector(releaseId: "rel-race-exec", injectGoal: false),
+            out var connection);
+        using var _ = connection;
+        var store = CreateStore(db);
+
+        await store.CreateReleaseAsync(new Release
+        {
+            Id = "rel-race-exec",
+            Tag = "v1.0.0",
+            Status = ReleaseStatus.Planning,
+            ExecutionState = ReleaseExecutionState.None,
+        }, ct);
+
+        var before = await store.GetReleaseAsync("rel-race-exec", ct);
+        Assert.Equal(ReleaseExecutionState.None, before!.ExecutionState);
+
+        var deleted = await store.DeleteReleaseAsync("rel-race-exec", ct);
+
+        Assert.False(deleted);
+        Assert.Equal(1, await CountReleasesAsync(connection, "rel-race-exec", ct));
+    }
+
+    [Fact]
+    public async Task DeleteReleaseAsync_EligibleRelease_IssuesExactlyOneDeleteStatementWithAllPredicates()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Command-level proof that the three preconditions are compiled into a single DELETE
+        // rather than executed as separate reads: the recorder captures every command the store
+        // issues during the delete.
+        var recorder = new DeleteCommandRecorder();
+        using var db = CreateInMemoryWithInterceptor(recorder, out var connection);
+        using var _ = connection;
+        var store = CreateStore(db);
+
+        await store.CreateReleaseAsync(new Release
+        {
+            Id = "rel-sql-shape",
+            Tag = "v1.0.0",
+            Status = ReleaseStatus.Planning,
+            ExecutionState = ReleaseExecutionState.None,
+        }, ct);
+
+        recorder.Start();
+        var deleted = await store.DeleteReleaseAsync("rel-sql-shape", ct);
+        recorder.Stop();
+
+        Assert.True(deleted);
+
+        // Exactly one round-trip: no separate existence/state pre-query, no SELECT-then-DELETE.
+        var command = Assert.Single(recorder.Commands);
+        Assert.StartsWith("DELETE", command.TrimStart(), StringComparison.OrdinalIgnoreCase);
+
+        // …and that single statement carries all three preconditions plus the id filter.
+        Assert.Contains("\"status\" = 'planning'", command, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("\"execution_state\" <> 'executing'", command, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("NOT EXISTS", command, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("\"goals\"", command, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Creates an in-memory SQLite context wired with <paramref name="interceptor"/>. The
+    /// underlying connection is returned so the test can assert against the raw database
+    /// without going through EF Core's change tracker.
+    /// </summary>
+    private static CopilotHiveDbContext CreateInMemoryWithInterceptor(
+        IInterceptor interceptor, out SqliteConnection connection)
+    {
+        connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+
+        var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+            .UseSqlite(connection)
+            .AddInterceptors(interceptor)
+            .Options;
+
+        var context = new CopilotHiveDbContext(options);
+        context.Database.EnsureCreated();
+        return context;
+    }
+
+    /// <summary>Counts release rows with the given id straight from SQLite.</summary>
+    private static async Task<long> CountReleasesAsync(
+        SqliteConnection connection, string releaseId, CancellationToken ct)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM releases WHERE id = $id";
+        command.Parameters.AddWithValue("$id", releaseId);
+        return (long)(await command.ExecuteScalarAsync(ct))!;
+    }
+
+    [Fact]
     public async Task GetGoalsByReleaseAsync_ReturnsOnlyGoalsAssignedToRelease()
     {
         using var db = CopilotHiveDbContext.CreateInMemory();
@@ -1034,5 +1268,182 @@ public sealed class GoalStoreIntegrationTests
 
         await Assert.ThrowsAsync<KeyNotFoundException>(() =>
             store.ResetGoalIterationDataAsync("no-such-goal", TestContext.Current.CancellationToken));
+    }
+}
+/// <summary>
+/// Mutates the database on the store's own connection at the exact instant the release DELETE
+/// is about to execute — i.e. inside the window a check-then-delete implementation would leave
+/// between reading a precondition and issuing the delete.
+/// </summary>
+/// <remarks>
+/// Running on the same connection and transaction guarantees the mutation is visible to the
+/// DELETE that follows, making the race deterministic instead of timing-dependent.
+/// </remarks>
+internal sealed class MidDeleteSqlInjector : DbCommandInterceptor
+{
+    private readonly string _releaseId;
+    private readonly bool _injectGoal;
+    private bool _done;
+
+    /// <param name="releaseId">Release the competing write targets.</param>
+    /// <param name="injectGoal">
+    /// When true a goal row is attached to the release; when false the release's
+    /// <c>execution_state</c> is flipped to <c>executing</c>.
+    /// </param>
+    public MidDeleteSqlInjector(string releaseId, bool injectGoal)
+    {
+        _releaseId = releaseId;
+        _injectGoal = injectGoal;
+    }
+
+    private void InjectBefore(DbCommand command)
+    {
+        if (_done || !command.CommandText.TrimStart().StartsWith("DELETE", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        _done = true;
+
+        using var competing = command.Connection!.CreateCommand();
+        competing.Transaction = command.Transaction;
+        if (_injectGoal)
+        {
+            competing.CommandText =
+                """
+                INSERT INTO goals (id, description, priority, scope, status, repositories, depends_on,
+                                   metadata, created_at, notes, documents, branch_cleaned_up,
+                                   review_status, release_id)
+                VALUES ($gid, 'racing goal', 'medium', 'feature', 'pending', '[]', '[]', '{}',
+                        '2024-01-01T00:00:00Z', '[]', '[]', 0, 'none', $rid)
+                """;
+            AddParameter(competing, "$gid", "racing-goal-" + _releaseId);
+        }
+        else
+        {
+            competing.CommandText = "UPDATE releases SET execution_state = 'executing' WHERE id = $rid";
+        }
+
+        AddParameter(competing, "$rid", _releaseId);
+        competing.ExecuteNonQuery();
+    }
+
+    private static void AddParameter(DbCommand command, string name, string value)
+    {
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = name;
+        parameter.Value = value;
+        command.Parameters.Add(parameter);
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<int> NonQueryExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+    {
+        InjectBefore(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result,
+        CancellationToken cancellationToken = default)
+    {
+        InjectBefore(command);
+        return ValueTask.FromResult(result);
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<DbDataReader> ReaderExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+    {
+        InjectBefore(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result,
+        CancellationToken cancellationToken = default)
+    {
+        InjectBefore(command);
+        return ValueTask.FromResult(result);
+    }
+}
+
+/// <summary>
+/// Records the SQL a store operation issues between <see cref="Start"/> and <see cref="Stop"/>,
+/// so a test can assert how many round-trips were made and what the statements contain.
+/// </summary>
+internal sealed class DeleteCommandRecorder : DbCommandInterceptor
+{
+    private bool _recording;
+
+    /// <summary>Commands captured while recording was enabled.</summary>
+    public List<string> Commands { get; } = [];
+
+    /// <summary>Begins capturing SQL.</summary>
+    public void Start()
+    {
+        Commands.Clear();
+        _recording = true;
+    }
+
+    /// <summary>Stops capturing SQL.</summary>
+    public void Stop() => _recording = false;
+
+    private void Record(DbCommand command)
+    {
+        if (_recording)
+            Commands.Add(command.CommandText);
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<int> NonQueryExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+    {
+        Record(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result,
+        CancellationToken cancellationToken = default)
+    {
+        Record(command);
+        return ValueTask.FromResult(result);
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<DbDataReader> ReaderExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+    {
+        Record(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result,
+        CancellationToken cancellationToken = default)
+    {
+        Record(command);
+        return ValueTask.FromResult(result);
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<object> ScalarExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<object> result)
+    {
+        Record(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<object>> ScalarExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<object> result,
+        CancellationToken cancellationToken = default)
+    {
+        Record(command);
+        return ValueTask.FromResult(result);
     }
 }

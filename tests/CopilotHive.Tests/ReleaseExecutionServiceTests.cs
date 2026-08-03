@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
@@ -607,10 +608,15 @@ public sealed class ReleaseStatusApiEndpointTests
     /// Optional factory that replaces the <see cref="IGoalStore"/> registration
     /// (e.g. a stateful fake that throws on cleanup).
     /// </param>
+    /// <param name="dashboardNotifier">
+    /// Optional <see cref="DashboardNotifier"/> replacing the registered singleton so a test
+    /// can count <c>NotifyStateChanged</c> invocations.
+    /// </param>
     private static WebApplicationFactory<Program> CreateFactory(
         ConfigurableFakeRepoManager fake,
         bool registerKnowledgeCleanup = false,
-        Func<IServiceProvider, IGoalStore>? goalStoreFactory = null)
+        Func<IServiceProvider, IGoalStore>? goalStoreFactory = null,
+        DashboardNotifier? dashboardNotifier = null)
     {
         var config = CreateApiConfig();
         var baseFactory = new HiveTestFactory { MockRepoManager = fake };
@@ -623,6 +629,14 @@ public sealed class ReleaseStatusApiEndpointTests
                 if (existingConfig is not null)
                     services.Remove(existingConfig);
                 services.AddSingleton(config);
+
+                if (dashboardNotifier is not null)
+                {
+                    var existingNotifier = services.SingleOrDefault(d => d.ServiceType == typeof(DashboardNotifier));
+                    if (existingNotifier is not null)
+                        services.Remove(existingNotifier);
+                    services.AddSingleton(dashboardNotifier);
+                }
 
                 if (goalStoreFactory is not null)
                 {
@@ -1132,6 +1146,315 @@ public sealed class ReleaseStatusApiEndpointTests
         Assert.Equal(ReleaseStatus.Released, release.Status);
         Assert.Equal(ReleaseExecutionState.Completed, release.ExecutionState);
     }
+
+    // ── DELETE /api/releases/{id}: Planning + no goals + None → 204 ────────
+
+    [Fact]
+    public async Task DeleteRelease_PlanningNoGoals_Returns204AndRemovesRelease()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager();
+        using var factory = CreateFactory(fake);
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId,
+                Tag = "v1.0.0",
+                Status = ReleaseStatus.Planning,
+                ExecutionState = ReleaseExecutionState.None,
+                RepositoryNames = [],
+            }, ct);
+        }
+
+        var response = await client.DeleteAsync($"/api/releases/{releaseId}", ct);
+
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            Assert.Null(await store.GetReleaseAsync(releaseId, ct));
+        }
+    }
+
+    // ── DELETE /api/releases/{id}: goals attached → 400 ───────────────────
+
+    [Fact]
+    public async Task DeleteRelease_WithGoalsAttached_Returns400AndKeepsRelease()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager();
+        using var factory = CreateFactory(fake);
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId, Tag = "v1.0.0", Status = ReleaseStatus.Planning, RepositoryNames = [],
+            }, ct);
+            await store.CreateGoalAsync(
+                new Goal { Id = UniqueId(), Description = "Attached", ReleaseId = releaseId }, ct);
+        }
+
+        var response = await client.DeleteAsync($"/api/releases/{releaseId}", ct);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+
+        var body = await response.Content.ReadAsStringAsync(ct);
+        using var doc = JsonDocument.Parse(body);
+        var error = doc.RootElement.GetProperty("error").GetString();
+        Assert.False(string.IsNullOrWhiteSpace(error));
+        Assert.Contains("1 goal(s)", error);
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            Assert.NotNull(await store.GetReleaseAsync(releaseId, ct));
+        }
+    }
+
+    // ── DELETE /api/releases/{id}: mid-execution → 409 ────────────────────
+
+    [Fact]
+    public async Task DeleteRelease_Executing_Returns409AndKeepsRelease()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager();
+        using var factory = CreateFactory(fake);
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId,
+                Tag = "v1.0.0",
+                Status = ReleaseStatus.Planning,
+                ExecutionState = ReleaseExecutionState.Executing,
+                RepositoryNames = [],
+            }, ct);
+        }
+
+        var response = await client.DeleteAsync($"/api/releases/{releaseId}", ct);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            Assert.NotNull(await store.GetReleaseAsync(releaseId, ct));
+        }
+    }
+
+    // ── DELETE /api/releases/{id}: Released status → 400 ──────────────────
+
+    [Fact]
+    public async Task DeleteRelease_ReleasedRelease_Returns400AndKeepsRelease()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager();
+        using var factory = CreateFactory(fake);
+        using var client = factory.CreateClient();
+
+        var releaseId = UniqueId();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            await store.CreateReleaseAsync(new Release
+            {
+                Id = releaseId,
+                Tag = "v1.0.0",
+                Status = ReleaseStatus.Released,
+                ReleasedAt = DateTime.UtcNow,
+                RepositoryNames = [],
+            }, ct);
+        }
+
+        var response = await client.DeleteAsync($"/api/releases/{releaseId}", ct);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IGoalStore>();
+            Assert.NotNull(await store.GetReleaseAsync(releaseId, ct));
+        }
+    }
+
+    // ── DELETE /api/releases/{id}: unknown id → 404 ───────────────────────
+
+    [Fact]
+    public async Task DeleteRelease_NonExistentRelease_Returns404()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager();
+        using var factory = CreateFactory(fake);
+        using var client = factory.CreateClient();
+
+        var response = await client.DeleteAsync($"/api/releases/{UniqueId()}", ct);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+
+        var body = await response.Content.ReadAsStringAsync(ct);
+        using var doc = JsonDocument.Parse(body);
+        var error = doc.RootElement.GetProperty("error").GetString();
+        Assert.Contains("not found", error!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // ── DELETE /api/releases/{id}: concurrent state change → 409, no notify ──
+
+    [Fact]
+    public async Task DeleteRelease_PreChecksPassButStoreReturnsFalse_Returns409AndDoesNotNotify()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var fake = new ConfigurableFakeRepoManager();
+
+        // A release that satisfies every endpoint pre-check: Planning, not Executing, no goals.
+        // The fake store nevertheless returns false from DeleteReleaseAsync, exactly as the real
+        // atomic ExecuteDeleteAsync would when a concurrent change invalidates a precondition
+        // between the pre-checks and the delete.
+        var releaseId = UniqueId();
+        var fakeStore = new DeleteTrackingGoalStore(new Release
+        {
+            Id = releaseId,
+            Tag = "v1.0.0",
+            Status = ReleaseStatus.Planning,
+            ExecutionState = ReleaseExecutionState.None,
+            RepositoryNames = [],
+        })
+        {
+            DeleteResult = false,
+        };
+
+        var notifier = new DashboardNotifier();
+        var notifyCount = 0;
+        notifier.OnStateChanged += () => Interlocked.Increment(ref notifyCount);
+
+        using var factory = CreateFactory(fake, goalStoreFactory: _ => fakeStore, dashboardNotifier: notifier);
+        using var client = factory.CreateClient();
+
+        var response = await client.DeleteAsync($"/api/releases/{releaseId}", ct);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+
+        var body = await response.Content.ReadAsStringAsync(ct);
+        using var doc = JsonDocument.Parse(body);
+        var error = doc.RootElement.GetProperty("error").GetString();
+        Assert.False(string.IsNullOrWhiteSpace(error));
+        Assert.Contains("concurrent state change", error, StringComparison.OrdinalIgnoreCase);
+
+        // The pre-checks all passed, so the endpoint really did reach the store delete.
+        Assert.Equal(1, fakeStore.DeleteCallCount);
+        // The release is NOT deleted and the dashboard is NOT notified on this branch.
+        Assert.NotNull(await fakeStore.GetReleaseAsync(releaseId, ct));
+        Assert.Equal(0, Volatile.Read(ref notifyCount));
+    }
+
+    // ── DELETE /api/releases/{id}: request CancellationToken is forwarded ────
+
+    [Fact]
+    public async Task DeleteRelease_ForwardsRequestCancellationTokenToStoreCalls()
+    {
+        var fake = new ConfigurableFakeRepoManager();
+
+        var releaseId = UniqueId();
+        var fakeStore = new DeleteTrackingGoalStore(new Release
+        {
+            Id = releaseId,
+            Tag = "v1.0.0",
+            Status = ReleaseStatus.Planning,
+            ExecutionState = ReleaseExecutionState.None,
+            RepositoryNames = [],
+        });
+
+        using var factory = CreateFactory(fake, goalStoreFactory: _ => fakeStore);
+        using var client = factory.CreateClient();
+
+        var response = await client.DeleteAsync($"/api/releases/{releaseId}", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        // Every store call must have received the request's CancellationToken. When a handler
+        // omits the argument the store is invoked with the parameter default, CancellationToken.None,
+        // which is the only non-cancellable token — so CanBeCanceled pins the forwarding down.
+        var getToken = Assert.Single(fakeStore.GetReleaseTokens);
+        Assert.NotEqual(CancellationToken.None, getToken);
+        Assert.True(getToken.CanBeCanceled);
+
+        var goalsToken = Assert.Single(fakeStore.GetGoalsByReleaseTokens);
+        Assert.NotEqual(CancellationToken.None, goalsToken);
+        Assert.True(goalsToken.CanBeCanceled);
+
+        var deleteToken = Assert.Single(fakeStore.DeleteReleaseTokens);
+        Assert.NotEqual(CancellationToken.None, deleteToken);
+        Assert.True(deleteToken.CanBeCanceled);
+
+        // All three calls share the one request-scoped token (HttpContext.RequestAborted),
+        // proving they were forwarded from the same source rather than fabricated per call.
+        Assert.Equal(getToken, goalsToken);
+        Assert.Equal(getToken, deleteToken);
+    }
+
+    // ── DELETE /api/releases/{id}: in-flight cancellation is observed ────────
+
+    [Fact]
+    public async Task DeleteRelease_CancelledWhileHandlerRunning_AbortsWithoutDeletingOrNotifying()
+    {
+        var fake = new ConfigurableFakeRepoManager();
+
+        // The request starts with a LIVE token and is cancelled only after the store confirms the
+        // handler is executing inside it. This is what makes the test meaningful: the previous
+        // version cancelled before HttpClient dispatched, so the store was never reached and the
+        // assertions held even if the endpoint ignored cancellation entirely.
+        var releaseId = UniqueId();
+        var fakeStore = new DeleteTrackingGoalStore(new Release
+        {
+            Id = releaseId,
+            Tag = "v1.0.0",
+            Status = ReleaseStatus.Planning,
+            ExecutionState = ReleaseExecutionState.None,
+            RepositoryNames = [],
+        })
+        {
+            BlockGetReleaseUntilCancelled = true,
+        };
+
+        var notifier = new DashboardNotifier();
+        var notifyCount = 0;
+        notifier.OnStateChanged += () => Interlocked.Increment(ref notifyCount);
+
+        using var factory = CreateFactory(fake, goalStoreFactory: _ => fakeStore, dashboardNotifier: notifier);
+        using var client = factory.CreateClient();
+
+        using var cts = new CancellationTokenSource();
+        var requestTask = client.DeleteAsync($"/api/releases/{releaseId}", cts.Token);
+
+        // Only cancel once the handler is provably inside the store's first call.
+        await fakeStore.GetReleaseEntered.Task.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<Exception>(() => requestTask);
+
+        // The store was actually reached, and the token it received became cancelled — proving the
+        // endpoint forwarded the live request token rather than CancellationToken.None.
+        Assert.True(fakeStore.ObservedCancellation);
+        var observed = Assert.Single(fakeStore.GetReleaseTokens);
+        Assert.True(observed.IsCancellationRequested);
+
+        // Cancellation stopped the pipeline before any mutation or notification.
+        Assert.Equal(0, fakeStore.DeleteCallCount);
+        Assert.Equal(0, Volatile.Read(ref notifyCount));
+    }
 }
 
 /// <summary>
@@ -1397,6 +1720,150 @@ internal sealed class ThrowingCleanupGoalStore : IGoalStore
             throw new InvalidOperationException("simulated cleanup failure");
         return Task.FromResult(_goals);
     }
+
+    public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(
+        string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
+
+    public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(
+        int? limit = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<(string, PersistedClarification)>>([]);
+}
+/// <summary>
+/// Fake <see cref="IGoalStore"/> for the DELETE /api/releases/{id} endpoint tests. It records
+/// the <see cref="CancellationToken"/> handed to every store call the endpoint makes, and lets a
+/// test force <see cref="DeleteReleaseAsync"/> to return <c>false</c> while all endpoint
+/// pre-checks succeed — simulating a concurrent state change that the real atomic
+/// <c>ExecuteDeleteAsync</c> would detect between the pre-checks and the delete.
+/// </summary>
+internal sealed class DeleteTrackingGoalStore : IGoalStore
+{
+    private Release? _release;
+
+    public DeleteTrackingGoalStore(Release release) => _release = release;
+
+    /// <summary>Value returned by <see cref="DeleteReleaseAsync"/>.</summary>
+    public bool DeleteResult { get; init; } = true;
+
+    /// <summary>
+    /// When true, <see cref="GetReleaseAsync"/> signals <see cref="GetReleaseEntered"/> and then
+    /// blocks on the token it was handed until that token is cancelled, letting a test cancel the
+    /// in-flight request only after the handler is confirmed to be running inside the store.
+    /// </summary>
+    public bool BlockGetReleaseUntilCancelled { get; init; }
+
+    /// <summary>
+    /// Upper bound on the <see cref="BlockGetReleaseUntilCancelled"/> wait, so a non-forwarding
+    /// endpoint makes the test fail quickly rather than hang.
+    /// </summary>
+    public TimeSpan BlockTimeout { get; init; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>Completes when <see cref="GetReleaseAsync"/> has been entered.</summary>
+    public TaskCompletionSource GetReleaseEntered { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>True when the token supplied to <see cref="GetReleaseAsync"/> was observed cancelled.</summary>
+    public bool ObservedCancellation { get; private set; }
+
+    /// <summary>Goals reported by <see cref="GetGoalsByReleaseAsync"/>.</summary>
+    public IReadOnlyList<Goal> Goals { get; init; } = [];
+
+    public List<CancellationToken> GetReleaseTokens { get; } = [];
+
+    public List<CancellationToken> GetGoalsByReleaseTokens { get; } = [];
+
+    public List<CancellationToken> DeleteReleaseTokens { get; } = [];
+
+    public int DeleteCallCount => DeleteReleaseTokens.Count;
+
+    public string Name => "delete-tracking-store";
+
+    public async Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default)
+    {
+        GetReleaseTokens.Add(ct);
+
+        if (BlockGetReleaseUntilCancelled)
+        {
+            GetReleaseEntered.TrySetResult();
+            try
+            {
+                // Wait on the token the endpoint forwarded. The bounded delay is a safety net:
+                // if the endpoint failed to forward the token (passing CancellationToken.None),
+                // this wait is never cancelled, it expires, ObservedCancellation stays false and
+                // the test fails fast instead of hanging.
+                await Task.Delay(BlockTimeout, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                ObservedCancellation = ct.IsCancellationRequested;
+                throw;
+            }
+        }
+
+        return _release is not null && _release.Id == releaseId ? _release : null;
+    }
+
+    public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default)
+    {
+        GetGoalsByReleaseTokens.Add(ct);
+        return Task.FromResult(Goals);
+    }
+
+    public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default)
+    {
+        DeleteReleaseTokens.Add(ct);
+        if (DeleteResult && _release is not null && _release.Id == releaseId)
+        {
+            _release = null;
+            return Task.FromResult(true);
+        }
+
+        return Task.FromResult(false);
+    }
+
+    public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>([]);
+
+    public Task UpdateGoalStatusAsync(
+        string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<IReadOnlyList<Goal>> GetAllGoalsAsync(CancellationToken ct = default) => Task.FromResult(Goals);
+
+    public Task<Goal?> GetGoalAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult(Goals.FirstOrDefault(g => g.Id == goalId));
+
+    public Task<Goal> CreateGoalAsync(Goal goal, CancellationToken ct = default) => Task.FromResult(goal);
+
+    public Task UpdateGoalAsync(Goal goal, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<bool> DeleteGoalAsync(string goalId, CancellationToken ct = default) => Task.FromResult(false);
+
+    public Task<IReadOnlyList<Goal>> SearchGoalsAsync(
+        string query, GoalStatus? statusFilter = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>([]);
+
+    public Task<IReadOnlyList<Goal>> GetGoalsByStatusAsync(GoalStatus status, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>([]);
+
+    public Task AddIterationAsync(string goalId, IterationSummary summary, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<IterationSummary>>([]);
+
+    public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default) =>
+        Task.FromResult(release);
+
+    public Task<IReadOnlyList<Release>> GetReleasesAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Release>>(_release is null ? [] : [_release]);
+
+    public Task UpdateReleaseAsync(Release release, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default) =>
+        Task.CompletedTask;
 
     public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(
         string goalId, CancellationToken ct = default) =>

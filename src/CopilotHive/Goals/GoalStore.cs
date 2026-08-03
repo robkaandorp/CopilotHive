@@ -646,18 +646,20 @@ public sealed class GoalStore : IGoalStore
         var (db, ownsContext) = ResolveDbContext();
         try
         {
-            var release = await db.Releases.FirstOrDefaultAsync(r => r.Id == releaseId, ct);
-            if (release is null)
-                return false; // not found
+            // Atomic conditional delete: every precondition lives in the WHERE clause so
+            // there is no check-then-delete (TOCTOU) window. If any precondition fails,
+            // zero rows are affected and the method returns false.
+            var affected = await db.Releases
+                .Where(r => r.Id == releaseId
+                    && r.Status == ReleaseStatus.Planning
+                    && r.ExecutionState != ReleaseExecutionState.Executing
+                    && !db.Goals.Any(g => g.ReleaseId == releaseId))
+                .ExecuteDeleteAsync(ct);
 
-            if (release.Status != ReleaseStatus.Planning)
-                return false; // only Planning releases may be deleted
+            if (affected > 0)
+                _logger.LogInformation("Deleted release {ReleaseId}", releaseId);
 
-            db.Releases.Remove(release);
-            await db.SaveChangesAsync(ct);
-
-            _logger.LogInformation("Deleted release {ReleaseId}", releaseId);
-            return true;
+            return affected > 0;
         }
         finally
         {
