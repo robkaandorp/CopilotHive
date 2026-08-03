@@ -132,6 +132,10 @@ public sealed class BuildRoleSystemPromptTests
         Assert.Contains("safety constraints", prompt);
         Assert.Contains("test requirements or output format compliance.", prompt);
         Assert.DoesNotContain("tool call contracts", prompt);
+        Assert.Contains("enable_file_writes=true", prompt);
+        Assert.Contains("sub-agents", prompt);
+        Assert.Contains("Do not ask the orchestrator to apply file", prompt);
+        Assert.Contains("file reading and editing only", prompt);
     }
 
     /// <summary>

@@ -289,6 +289,12 @@ public sealed class SharpCoderRunner : IAgentRunner
                 You have direct access to the `agents/` folder containing `*.agents.md` files.
                 Use the file tools (view, edit) to read and modify these files directly.
                 You **cannot** run shell commands — file reading and editing only.
+                If you delegate work to sub-agents, they can request file-write access by passing
+                `enable_file_writes=true` in the `start_sub_agent` call. Your file-write capability
+                is enabled, so sub-agents that request it will be granted write access. Only bash
+                is disabled for you and your sub-agents. Do not ask the orchestrator to apply file
+                edits on your behalf — use your own file tools or delegate to a sub-agent with
+                `enable_file_writes=true`.
 
                 The updated agents.md file MUST NOT exceed 4000 characters. Count characters before finalising.
 
