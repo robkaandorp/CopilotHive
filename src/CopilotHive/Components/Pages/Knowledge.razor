@@ -57,10 +57,20 @@
             @foreach (var group in groups)
             {
                 var topic = group.Key;
-                var isExpanded = hasSearch || !_collapsedTopics.Contains(topic);
+                var isExpanded = hasSearch || !_collapsedFolders.Contains(topic);
+                var rootDocs = group
+                    .Where(d => string.IsNullOrEmpty(d.Subtopic))
+                    .OrderBy(d => d.Title)
+                    .ToList();
+                var subtopicGroups = group
+                    .Where(d => !string.IsNullOrEmpty(d.Subtopic))
+                    .GroupBy(d => d.Subtopic!, StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
                 <div style="margin-bottom:0.5rem">
                     <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:0.5rem 0.75rem;cursor:pointer;font-weight:600;display:flex;align-items:center;gap:0.5rem"
-                         @onclick="() => ToggleTopic(topic)">
+                         @onclick="() => ToggleFolder(topic)">
                         <span>@(isExpanded ? "▾" : "▸")</span>
                         <span>@topic</span>
                         <span class="repo-tag">@group.Count()</span>
@@ -69,38 +79,32 @@
                     @if (isExpanded)
                     {
                         <div style="margin-left:1rem">
-                            <table class="goals-table">
-                                <thead>
-                                    <tr>
-                                        <th>Title</th>
-                                        <th>Type</th>
-                                        <th>Status</th>
-                                        <th>Tags</th>
-                                        <th>Updated</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    @foreach (var doc in group)
+                            @if (rootDocs.Count > 0)
+                            {
+                                @DocTable(rootDocs)
+                            }
+
+                            @foreach (var subGroup in subtopicGroups)
+                            {
+                                var subtopic = subGroup.Key;
+                                var subKey = $"{topic}/{subtopic}";
+                                var subExpanded = hasSearch || !_collapsedFolders.Contains(subKey);
+                                <div style="margin-bottom:0.5rem">
+                                    <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:0.35rem 0.6rem;margin-left:0.5rem;cursor:pointer;font-size:0.9rem;font-weight:500;display:flex;align-items:center;gap:0.5rem"
+                                         @onclick="() => ToggleFolder(subKey)">
+                                        <span>@(subExpanded ? "▾" : "▸")</span>
+                                        <span>@subtopic</span>
+                                        <span class="repo-tag">@subGroup.Count()</span>
+                                    </div>
+
+                                    @if (subExpanded)
                                     {
-                                        var docId = doc.Id;
-                                        <tr style="cursor:pointer" @onclick="() => NavigateTo(docId)">
-                                            <td>
-                                                <a href="/knowledge/@doc.Id" class="goal-link" @onclick:stopPropagation="true">@doc.Title</a>
-                                                <div style="font-family:monospace;font-size:0.75rem;color:var(--text-muted)">@doc.Id</div>
-                                            </td>
-                                            <td><span class="badge @TypeBadge(doc.Type)">@doc.Type</span></td>
-                                            <td><span class="badge @StatusBadge(doc.Status)">@doc.Status</span></td>
-                                            <td>
-                                                @foreach (var tag in doc.Tags)
-                                                {
-                                                    <span class="repo-tag" style="margin-right:0.3rem">@tag</span>
-                                                }
-                                            </td>
-                                            <td style="color:var(--text-muted);white-space:nowrap">@doc.UpdatedAt.ToString("yyyy-MM-dd")</td>
-                                        </tr>
+                                        <div style="margin-left:1.5rem">
+                                            @DocTable(subGroup.OrderBy(d => d.Title))
+                                        </div>
                                     }
-                                </tbody>
-                            </table>
+                                </div>
+                            }
                         </div>
                     }
                 </div>
@@ -121,7 +125,7 @@
     private List<KnowledgeDocument> _filtered = [];
     private bool _loaded;
 
-    private HashSet<string> _collapsedTopics = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> _collapsedFolders = new(StringComparer.OrdinalIgnoreCase);
 
     private string _searchText = "";
     private string _typeFilter = "";
@@ -157,7 +161,7 @@
                 var saved = JsonSerializer.Deserialize<List<string>>(json);
                 if (saved is not null)
                 {
-                    _collapsedTopics = new HashSet<string>(saved, StringComparer.OrdinalIgnoreCase);
+                    _collapsedFolders = new HashSet<string>(saved, StringComparer.OrdinalIgnoreCase);
                 }
             }
         }
@@ -170,12 +174,12 @@
         StateHasChanged();
     }
 
-    private async Task ToggleTopic(string topic)
+    private async Task ToggleFolder(string folderKey)
     {
-        if (!_collapsedTopics.Add(topic))
-            _collapsedTopics.Remove(topic);
+        if (!_collapsedFolders.Add(folderKey))
+            _collapsedFolders.Remove(folderKey);
 
-        await JS.InvokeVoidAsync("localStorage.setItem", "knowledge-folders-collapsed", JsonSerializer.Serialize(_collapsedTopics));
+        await JS.InvokeVoidAsync("localStorage.setItem", "knowledge-folders-collapsed", JsonSerializer.Serialize(_collapsedFolders));
     }
 
     private void ApplyFilters()
@@ -251,5 +255,41 @@
         DocumentStatus.Archived => "badge-muted",
         DocumentStatus.Superseded => "badge-muted",
         _ => "badge-muted",
+    };
+
+    private RenderFragment DocTable(IEnumerable<KnowledgeDocument> docs) => __builder =>
+    {
+        <table class="goals-table">
+            <thead>
+                <tr>
+                    <th>Title</th>
+                    <th>Type</th>
+                    <th>Status</th>
+                    <th>Tags</th>
+                    <th>Updated</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var doc in docs)
+                {
+                    var docId = doc.Id;
+                    <tr style="cursor:pointer" @onclick="() => NavigateTo(docId)">
+                        <td>
+                            <a href="/knowledge/@doc.Id" class="goal-link" @onclick:stopPropagation="true">@doc.Title</a>
+                            <div style="font-family:monospace;font-size:0.75rem;color:var(--text-muted)">@doc.Id</div>
+                        </td>
+                        <td><span class="badge @TypeBadge(doc.Type)">@doc.Type</span></td>
+                        <td><span class="badge @StatusBadge(doc.Status)">@doc.Status</span></td>
+                        <td>
+                            @foreach (var tag in doc.Tags)
+                            {
+                                <span class="repo-tag" style="margin-right:0.3rem">@tag</span>
+                            }
+                        </td>
+                        <td style="color:var(--text-muted);white-space:nowrap">@doc.UpdatedAt.ToString("yyyy-MM-dd")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>;
     };
 }
