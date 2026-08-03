@@ -1248,22 +1248,24 @@ public sealed class TaskExecutorTests
     }
 
     /// <summary>
-    /// NON-MUTATING regression: when no custom config-repo path is injected, the improver's
-    /// working directory and context header must resolve to the default /config-repo/agents path.
-    /// This test inspects the captured SendPromptAsync workDir/prompt only — it never creates
-    /// or modifies anything under /config-repo.
+    /// Regression: the improver's working directory and context header resolve to
+    /// {configRepoDir}/agents. Uses a non-existent temp path so the test never reads
+    /// real agents.md files from the CI/test environment.
     /// </summary>
     [Fact]
-    public async Task ExecuteAsync_ImproverDefaultPath_ResolvesToDefaultConfigRepoAgentsDir()
+    public async Task ExecuteAsync_ImproverInjectedPath_ResolvesToAgentsDir()
     {
         var git = new MockGitOperations { FilesChanged = 0 };
         var agentRunner = new MockAgentRunner();
-        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+        // Use a non-existent config repo dir so EnsureAgentsMdWithinLimitsAsync returns
+        // early (Directory.Exists check) — no real agents.md files are read.
+        var tempConfigRepo = Path.Combine(Path.GetTempPath(), $"test-config-repo-{Guid.NewGuid():N}");
+        var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: tempConfigRepo);
 
         var task = new WorkTask
         {
-            TaskId = "test-improver-default-path",
-            GoalId = "goal-improver-default-path",
+            TaskId = "test-improver-injected-path",
+            GoalId = "goal-improver-injected-path",
             GoalDescription = "Test goal",
             Prompt = "Test prompt",
             Role = WorkerRole.Improver,
@@ -1273,8 +1275,9 @@ public sealed class TaskExecutorTests
         var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
 
         Assert.Equal("PASS", result.Metrics!.Verdict);
-        Assert.Equal("/config-repo/agents", agentRunner.LastWorkDir);
-        Assert.Contains("Working directory: /config-repo/agents", agentRunner.LastPrompt);
+        var expectedAgentsDir = Path.Combine(tempConfigRepo, "agents");
+        Assert.Equal(expectedAgentsDir, agentRunner.LastWorkDir);
+        Assert.Contains($"Working directory: {expectedAgentsDir}", agentRunner.LastPrompt);
     }
 
     // ── Changed-file path aggregation ─────────────────────────────────────────
