@@ -2,7 +2,7 @@
 FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG TARGETARCH
 ARG RID=${TARGETARCH/amd64/x64}
-ARG VERSION=0.1.0-local
+ARG VERSION=
 
 WORKDIR /src
 
@@ -21,12 +21,17 @@ RUN dotnet restore CopilotHive.slnx
 COPY src/ src/
 COPY agents/ agents/
 
-RUN dotnet publish src/CopilotHive/CopilotHive.csproj \
-    -c Release \
-    -r linux-${RID} \
-    --self-contained \
-    -p:Version=${VERSION} \
-    -o /app/publish
+RUN if [ -n "$VERSION" ]; then \
+      dotnet publish src/CopilotHive/CopilotHive.csproj \
+        -c Release -r linux-${RID} --self-contained \
+        -p:Version=${VERSION} \
+        -o /app/publish; \
+    else \
+      dotnet publish src/CopilotHive/CopilotHive.csproj \
+        -c Release -r linux-${RID} --self-contained \
+        -p:VersionSuffix=local \
+        -o /app/publish; \
+    fi
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime

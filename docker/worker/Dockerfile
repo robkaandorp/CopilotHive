@@ -2,7 +2,7 @@
 FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG TARGETARCH
 ARG RID=${TARGETARCH/amd64/x64}
-ARG VERSION=0.1.0-local
+ARG VERSION=
 
 WORKDIR /src
 
@@ -18,12 +18,17 @@ RUN dotnet restore src/CopilotHive.Worker/CopilotHive.Worker.csproj
 
 COPY src/ src/
 
-RUN dotnet publish src/CopilotHive.Worker/CopilotHive.Worker.csproj \
-    -c Release \
-    -r linux-${RID} \
-    --self-contained \
-    -p:Version=${VERSION} \
-    -o /worker/publish
+RUN if [ -n "$VERSION" ]; then \
+      dotnet publish src/CopilotHive.Worker/CopilotHive.Worker.csproj \
+        -c Release -r linux-${RID} --self-contained \
+        -p:Version=${VERSION} \
+        -o /worker/publish; \
+    else \
+      dotnet publish src/CopilotHive.Worker/CopilotHive.Worker.csproj \
+        -c Release -r linux-${RID} --self-contained \
+        -p:VersionSuffix=local \
+        -o /worker/publish; \
+    fi
 
 # ── Runtime stage: slim worker with SharpCoder agent engine ───────────────────
 FROM ubuntu:24.04
