@@ -79,11 +79,6 @@
                     @if (isExpanded)
                     {
                         <div style="margin-left:1rem">
-                            @if (rootDocs.Count > 0)
-                            {
-                                @DocTable(rootDocs)
-                            }
-
                             @foreach (var subGroup in subtopicGroups)
                             {
                                 var subtopic = subGroup.Key;
@@ -104,6 +99,11 @@
                                         </div>
                                     }
                                 </div>
+                            }
+
+                            @if (rootDocs.Count > 0)
+                            {
+                                @DocTable(rootDocs)
                             }
                         </div>
                     }
