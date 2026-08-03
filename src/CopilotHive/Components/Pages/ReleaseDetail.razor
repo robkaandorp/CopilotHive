@@ -38,6 +38,16 @@
             {
                 <span style="color:var(--text-muted);font-size:0.85rem">Releasing...</span>
             }
+            @if (_goals.Count == 0 && _release.ExecutionState != ReleaseExecutionState.Executing)
+            {
+                <button class="danger-btn" @onclick="DeleteReleaseAsync" disabled="@_isDeleting">
+                    @(_isDeleting ? "Deleting..." : "🗑 Delete Release")
+                </button>
+                @if (!string.IsNullOrEmpty(_deleteError))
+                {
+                    <span class="error-msg" style="margin-left:0.5rem">@_deleteError</span>
+                }
+            }
         }
         else if (_release.Status == ReleaseStatus.Released)
         {
@@ -316,6 +326,10 @@ else if (_loaded)
     private bool _repositoriesSaved;
     private string? _repositoriesError;
 
+    // Delete state
+    private bool _isDeleting;
+    private string? _deleteError;
+
     protected override async Task OnInitializedAsync()
     {
         var decoded = Uri.UnescapeDataString(ReleaseId);
@@ -417,6 +431,80 @@ else if (_loaded)
         }
         catch (Exception ex) { _releaseError = ex.Message; }
         finally { _isReleasing = false; }
+    }
+
+    private async Task DeleteReleaseAsync()
+    {
+        _deleteError = null;
+        bool confirmed;
+        try
+        {
+            confirmed = await JS.InvokeAsync<bool>("confirm",
+                $"Are you sure you want to delete release '{_release?.Tag}' ({_release?.Id})? This cannot be undone.");
+        }
+        catch (Exception ex)
+        {
+            _deleteError = $"Failed to show confirmation dialog: {ex.Message}";
+            return;
+        }
+
+        if (!confirmed) return;
+
+        _isDeleting = true;
+        try
+        {
+            var id = Uri.EscapeDataString(_release!.Id);
+            var response = await HttpClient.DeleteAsync($"/api/releases/{id}");
+            if (response.IsSuccessStatusCode)
+            {
+                Nav.NavigateTo("/releases");
+            }
+            else
+            {
+                var raw = await response.Content.ReadAsStringAsync();
+                _deleteError = ExtractErrorMessage(raw, response.StatusCode);
+            }
+        }
+        catch (Exception ex)
+        {
+            _deleteError = $"Failed to delete release: {ex.Message}";
+        }
+        finally
+        {
+            _isDeleting = false;
+        }
+    }
+
+    private static string ExtractErrorMessage(string raw, HttpStatusCode statusCode)
+    {
+        var generic = $"Failed to delete release (HTTP {(int)statusCode}).";
+        if (string.IsNullOrWhiteSpace(raw))
+            return generic;
+
+        JsonDocument doc;
+        try
+        {
+            doc = JsonDocument.Parse(raw);
+        }
+        catch (JsonException)
+        {
+            return raw;
+        }
+
+        using (doc)
+        {
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                return generic;
+
+            if (!doc.RootElement.TryGetProperty("error", out var errEl))
+                return generic;
+
+            if (errEl.ValueKind != JsonValueKind.String)
+                return generic;
+
+            var msg = errEl.GetString();
+            return !string.IsNullOrWhiteSpace(msg) ? msg : generic;
+        }
     }
 
     private async Task SaveNotes()
