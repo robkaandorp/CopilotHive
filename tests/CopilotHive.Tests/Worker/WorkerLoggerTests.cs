@@ -7,7 +7,7 @@ namespace CopilotHive.Tests.Worker;
 /// Defines the "ConsoleOutput" collection so xUnit serializes all tests that
 /// redirect Console.Out / Console.Error, preventing cross-test output leakage.
 /// </summary>
-[CollectionDefinition("ConsoleOutput")]
+[CollectionDefinition("ConsoleOutput", DisableParallelization = true)]
 public sealed class ConsoleOutputCollection { }
 
 /// <summary>

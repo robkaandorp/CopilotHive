@@ -623,7 +623,9 @@ public sealed class Program
 
         static void PrintBanner()
         {
-            Console.WriteLine("""
+            try
+            {
+                Console.WriteLine("""
 
          ██████╗ ██████╗ ██████╗ ██╗██╗      ██████╗ ████████╗
         ██╔════╝██╔═══██╗██╔══██╗██║██║     ██╔═══██╗╚══██╔══╝
@@ -638,9 +640,16 @@ public sealed class Program
                              ██║  ██║██║ ╚████╔╝ ███████╗
                              ╚═╝  ╚═╝╚═╝  ╚═══╝  ╚══════╝
         """);
-            var version = VersionHelper.InformationalVersion;
-            Console.WriteLine($"CopilotHive v{version}");
-            Console.WriteLine($"Started at {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC");
+                var version = VersionHelper.InformationalVersion;
+                Console.WriteLine($"CopilotHive v{version}");
+                Console.WriteLine($"Started at {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC");
+            }
+            catch (ObjectDisposedException)
+            {
+                // Console.Out may be closed by the test runner during WebApplicationFactory
+                // host creation. Banner output is cosmetic — never crash startup if the
+                // console is unavailable.
+            }
         }
     }
 }

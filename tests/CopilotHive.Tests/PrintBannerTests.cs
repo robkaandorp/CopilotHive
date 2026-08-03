@@ -58,4 +58,36 @@ public sealed class PrintBannerTests
 
         Assert.True(parsed > DateTime.MinValue, "Timestamp must be a valid non-default DateTime.");
     }
+
+    /// <summary>
+    /// Verifies that <c>PrintBanner()</c> does not throw when <see cref="Console.Out"/>
+    /// has been disposed — e.g. by the test runner during <c>WebApplicationFactory</c>
+    /// host creation. Banner output is cosmetic, so startup must never crash on an
+    /// unavailable console.
+    /// </summary>
+    [Fact]
+    public void PrintBanner_WithDisposedConsoleOut_DoesNotThrow()
+    {
+        // Arrange — capture the original writer and substitute a disposed one.
+        var originalOut = Console.Out;
+        var sw = new StringWriter();
+        sw.Dispose();
+        Console.SetOut(sw);
+
+        try
+        {
+            // Act — invoke the compiler-generated local function via reflection.
+            var method = typeof(Program).GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
+                .FirstOrDefault(m => m.Name.Contains("PrintBanner", StringComparison.Ordinal));
+
+            Assert.NotNull(method);
+
+            // Must not throw, even though Console.Out is disposed.
+            method!.Invoke(null, null);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+        }
+    }
 }
