@@ -1,6 +1,8 @@
 @page "/knowledge"
 @using CopilotHive.Dashboard
 @using CopilotHive.Knowledge
+@using System.Text.Json
+@inject IJSRuntime JS
 @inject DashboardStateService State
 @inject PageHeaderState PageHeader
 
@@ -15,15 +17,6 @@
         <div class="filter-bar">
             <input type="text" placeholder="Search documents…" @bind="_searchText" @bind:event="oninput" @bind:after="ApplyFilters" />
 
-            <select @bind="_topicFilter" @bind:after="ApplyFilters">
-                <option value="">All topics</option>
-                @foreach (var t in _allTopics)
-                {
-                    var count = _allDocs.Count(d => string.Equals(d.Topic, t, StringComparison.OrdinalIgnoreCase));
-                    <option value="@t">@t (@count)</option>
-                }
-            </select>
-
             <select @bind="_typeFilter" @bind:after="ApplyFilters">
                 <option value="">All types</option>
                 @foreach (var t in Enum.GetValues<DocumentType>())
@@ -33,7 +26,7 @@
             </select>
 
             <select @bind="_statusFilter" @bind:after="ApplyFilters">
-                <option value="">All statuses</option>
+                <option value="">All (excl. archived)</option>
                 @foreach (var s in Enum.GetValues<DocumentStatus>())
                 {
                     <option value="@s">@s</option>
@@ -42,7 +35,7 @@
 
             <input type="text" placeholder="Filter by tag…" @bind="_tagFilter" @bind:event="oninput" @bind:after="ApplyFilters" />
 
-            @if (!string.IsNullOrWhiteSpace(_searchText) || !string.IsNullOrWhiteSpace(_topicFilter) ||
+            @if (!string.IsNullOrWhiteSpace(_searchText) ||
                  !string.IsNullOrWhiteSpace(_typeFilter) || !string.IsNullOrWhiteSpace(_statusFilter) ||
                  !string.IsNullOrWhiteSpace(_tagFilter))
             {
@@ -52,51 +45,66 @@
             <span class="filter-count">@_filtered.Count document(s)</span>
         </div>
 
-        <!-- Documents Table -->
+        <!-- Folder View -->
         @if (_filtered.Count > 0)
         {
-            <div class="goals-table-wrap">
-                <table class="goals-table">
-                    <thead>
-                        <tr>
-                            <th>Title</th>
-                            <th>Type</th>
-                            <th>Status</th>
-                            <th>Topic</th>
-                            <th>Tags</th>
-                            <th>Updated</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        @foreach (var doc in _filtered)
-                        {
-                            var docId = doc.Id;
-                            <tr style="cursor:pointer" @onclick="() => NavigateTo(docId)">
-                                <td>
-                                    <a href="/knowledge/@doc.Id" class="goal-link" @onclick:stopPropagation="true">@doc.Title</a>
-                                    <div style="font-family:monospace;font-size:0.75rem;color:var(--text-muted)">@doc.Id</div>
-                                </td>
-                                <td><span class="badge @TypeBadge(doc.Type)">@doc.Type</span></td>
-                                <td><span class="badge @StatusBadge(doc.Status)">@doc.Status</span></td>
-                                <td>
-                                    @doc.Topic
-                                    @if (!string.IsNullOrEmpty(doc.Subtopic))
+            var hasSearch = !string.IsNullOrWhiteSpace(_searchText);
+            var groups = _filtered
+                .GroupBy(d => d.Topic, StringComparer.OrdinalIgnoreCase)
+                .OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            @foreach (var group in groups)
+            {
+                var topic = group.Key;
+                var isExpanded = hasSearch || !_collapsedTopics.Contains(topic);
+                <div style="margin-bottom:0.5rem">
+                    <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:0.5rem 0.75rem;cursor:pointer;font-weight:600;display:flex;align-items:center;gap:0.5rem"
+                         @onclick="() => ToggleTopic(topic)">
+                        <span>@(isExpanded ? "▾" : "▸")</span>
+                        <span>@topic</span>
+                        <span class="repo-tag">@group.Count()</span>
+                    </div>
+
+                    @if (isExpanded)
+                    {
+                        <div style="margin-left:1rem">
+                            <table class="goals-table">
+                                <thead>
+                                    <tr>
+                                        <th>Title</th>
+                                        <th>Type</th>
+                                        <th>Status</th>
+                                        <th>Tags</th>
+                                        <th>Updated</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var doc in group)
                                     {
-                                        <span style="color:var(--text-muted)"> / @doc.Subtopic</span>
+                                        var docId = doc.Id;
+                                        <tr style="cursor:pointer" @onclick="() => NavigateTo(docId)">
+                                            <td>
+                                                <a href="/knowledge/@doc.Id" class="goal-link" @onclick:stopPropagation="true">@doc.Title</a>
+                                                <div style="font-family:monospace;font-size:0.75rem;color:var(--text-muted)">@doc.Id</div>
+                                            </td>
+                                            <td><span class="badge @TypeBadge(doc.Type)">@doc.Type</span></td>
+                                            <td><span class="badge @StatusBadge(doc.Status)">@doc.Status</span></td>
+                                            <td>
+                                                @foreach (var tag in doc.Tags)
+                                                {
+                                                    <span class="repo-tag" style="margin-right:0.3rem">@tag</span>
+                                                }
+                                            </td>
+                                            <td style="color:var(--text-muted);white-space:nowrap">@doc.UpdatedAt.ToString("yyyy-MM-dd")</td>
+                                        </tr>
                                     }
-                                </td>
-                                <td>
-                                    @foreach (var tag in doc.Tags)
-                                    {
-                                        <span class="repo-tag" style="margin-right:0.3rem">@tag</span>
-                                    }
-                                </td>
-                                <td style="color:var(--text-muted);white-space:nowrap">@doc.UpdatedAt.ToString("yyyy-MM-dd")</td>
-                            </tr>
-                        }
-                    </tbody>
-                </table>
-            </div>
+                                </tbody>
+                            </table>
+                        </div>
+                    }
+                </div>
+            }
         }
         else if (_loaded)
         {
@@ -111,11 +119,11 @@
     private KnowledgeGraph? _knowledgeGraph;
     private List<KnowledgeDocument> _allDocs = [];
     private List<KnowledgeDocument> _filtered = [];
-    private List<string> _allTopics = [];
     private bool _loaded;
 
+    private HashSet<string> _collapsedTopics = new(StringComparer.OrdinalIgnoreCase);
+
     private string _searchText = "";
-    private string _topicFilter = "";
     private string _typeFilter = "";
     private string _statusFilter = "";
     private string _tagFilter = "";
@@ -131,16 +139,43 @@
                 .OrderBy(d => d.Topic)
                 .ThenBy(d => d.Title)
                 .ToList();
-
-            _allTopics = _allDocs
-                .Select(d => d.Topic)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .OrderBy(t => t, StringComparer.OrdinalIgnoreCase)
-                .ToList();
         }
 
         _loaded = true;
         ApplyFilters();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        try
+        {
+            var json = await JS.InvokeAsync<string>("localStorage.getItem", "knowledge-folders-collapsed");
+            if (!string.IsNullOrEmpty(json))
+            {
+                var saved = JsonSerializer.Deserialize<List<string>>(json);
+                if (saved is not null)
+                {
+                    _collapsedTopics = new HashSet<string>(saved, StringComparer.OrdinalIgnoreCase);
+                }
+            }
+        }
+        catch (Exception)
+        {
+            // Fall back to empty set (all expanded) if the localStorage key is missing,
+            // the JSON is malformed, or JS interop is unavailable. Never crash the page.
+        }
+
+        StateHasChanged();
+    }
+
+    private async Task ToggleTopic(string topic)
+    {
+        if (!_collapsedTopics.Add(topic))
+            _collapsedTopics.Remove(topic);
+
+        await JS.InvokeVoidAsync("localStorage.setItem", "knowledge-folders-collapsed", JsonSerializer.Serialize(_collapsedTopics));
     }
 
     private void ApplyFilters()
@@ -163,14 +198,18 @@
             query = _allDocs;
         }
 
-        if (!string.IsNullOrWhiteSpace(_topicFilter))
-            query = query.Where(d => string.Equals(d.Topic, _topicFilter, StringComparison.OrdinalIgnoreCase));
-
         if (!string.IsNullOrWhiteSpace(_typeFilter) && Enum.TryParse<DocumentType>(_typeFilter, out var type))
             query = query.Where(d => d.Type == type);
 
-        if (!string.IsNullOrWhiteSpace(_statusFilter) && Enum.TryParse<DocumentStatus>(_statusFilter, out var status))
+        if (string.IsNullOrWhiteSpace(_statusFilter))
+        {
+            // Archived documents are hidden by default; only shown when explicitly selected.
+            query = query.Where(d => d.Status != DocumentStatus.Archived);
+        }
+        else if (Enum.TryParse<DocumentStatus>(_statusFilter, out var status))
+        {
             query = query.Where(d => d.Status == status);
+        }
 
         if (!string.IsNullOrWhiteSpace(_tagFilter))
         {
@@ -179,7 +218,7 @@
         }
 
         _filtered = query
-            .OrderBy(d => d.Topic)
+            .OrderBy(d => d.Topic, StringComparer.OrdinalIgnoreCase)
             .ThenBy(d => d.Title)
             .ToList();
     }
@@ -187,7 +226,6 @@
     private void ResetFilters()
     {
         _searchText = "";
-        _topicFilter = "";
         _typeFilter = "";
         _statusFilter = "";
         _tagFilter = "";
