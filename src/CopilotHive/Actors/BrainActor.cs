@@ -123,7 +123,9 @@ internal sealed class BrainActor : Actor<IBrainMessage>
                 }
 
                 // Affects future children only; existing children keep their original model.
-                _reasoningEffort = ChatClientFactory.ParseProviderModelAndReasoning(m.Model).reasoning;
+                // An explicit reasoning effort wins; otherwise fall back to legacy suffix parsing.
+                _reasoningEffort = m.ReasoningEffort
+                    ?? ChatClientFactory.ParseProviderModelAndReasoning(m.Model).reasoning;
 
                 m.Reply.TrySetResult(true);
                 break;

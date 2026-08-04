@@ -872,6 +872,70 @@ public class BrainActorChildTests
         finally { DeleteTempPath(dir); }
     }
 
+    [Fact]
+    public async Task UpdateModel_WithExplicitReasoningEffort_OverridesSuffix()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var client = new FakeChatClient();
+            await using var actor = CreateActor(dir, FakeFactory(client));
+            actor.Start();
+            await ConnectAsync(actor);
+
+            // The model suffix says 'low' but the message carries an explicit 'ExtraHigh'.
+            var update = BrainActorMessages.CreateUpdateModelMessage(
+                "copilot/claude-sonnet-4.6:low", 50_000, ReasoningEffort.ExtraHigh);
+            Assert.True(actor.Tell(update));
+            Assert.True(await AwaitReplyAsync(update.Reply));
+
+            Assert.Equal(ReasoningEffort.ExtraHigh, GetField<ReasoningEffort?>(actor, "_reasoningEffort"));
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task UpdateModel_WithNullReasoningEffort_FallsBackToSuffixParsing()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var client = new FakeChatClient();
+            await using var actor = CreateActor(dir, FakeFactory(client));
+            actor.Start();
+            await ConnectAsync(actor);
+
+            var update = BrainActorMessages.CreateUpdateModelMessage(
+                "copilot/claude-sonnet-4.6:medium", 50_000, reasoningEffort: null);
+            Assert.True(actor.Tell(update));
+            Assert.True(await AwaitReplyAsync(update.Reply));
+
+            Assert.Equal(ReasoningEffort.Medium, GetField<ReasoningEffort?>(actor, "_reasoningEffort"));
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task UpdateModel_WithExplicitReasoningEffort_AndNoSuffix_UsesExplicitValue()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var client = new FakeChatClient();
+            await using var actor = CreateActor(dir, FakeFactory(client));
+            actor.Start();
+            await ConnectAsync(actor);
+
+            var update = BrainActorMessages.CreateUpdateModelMessage(
+                "copilot/claude-sonnet-4.6", 50_000, ReasoningEffort.None);
+            Assert.True(actor.Tell(update));
+            Assert.True(await AwaitReplyAsync(update.Reply));
+
+            Assert.Equal(ReasoningEffort.None, GetField<ReasoningEffort?>(actor, "_reasoningEffort"));
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
     // ── Criterion 17/18: Existing tests still compile and pass ──
 
     [Fact]

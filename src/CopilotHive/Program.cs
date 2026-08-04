@@ -141,7 +141,8 @@ public sealed class Program
                         knowledgeGraph: sp.GetService<KnowledgeGraph>(),
                         hiveConfig: config,
                         sessionRegistry: sp.GetService<LlmSessionRegistry>(),
-                        configRepo: sp.GetService<ConfigRepoManager>());
+                        configRepo: sp.GetService<ConfigRepoManager>(),
+                        reasoningEffort: ReasoningEffortConverter.Parse(config?.Orchestrator?.ReasoningEffort));
                 });
             }
 
@@ -279,7 +280,8 @@ public sealed class Program
                     goalReviewService: sp.GetService<GoalReviewService>(),
                     sessionRegistry: sp.GetService<LlmSessionRegistry>(),
                     goalReadyNotifier: sp.GetService<GoalReadyNotifier>(),
-                    attachmentService: sp.GetService<ComposerAttachmentService>());
+                    attachmentService: sp.GetService<ComposerAttachmentService>(),
+                    reasoningEffort: ReasoningEffortConverter.Parse(config?.Composer?.ReasoningEffort));
             });
             builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 

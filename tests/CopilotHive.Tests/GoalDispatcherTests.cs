@@ -315,6 +315,9 @@ file sealed class FakeDispatcherBrain : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
+    public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+        UpdateModelAsync(model, maxContextTokens, ct);
+
     public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) => Task.CompletedTask;
 
     public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
@@ -2624,6 +2627,9 @@ file sealed class FirstPhasePlanningBrain : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
+    public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+        UpdateModelAsync(model, maxContextTokens, ct);
+
     public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) =>
         Task.CompletedTask;
 
@@ -2817,6 +2823,9 @@ public sealed class GoalDispatcherDocWritingPhaseTests
         public List<GoalPhase> CraftPromptPhases { get; } = [];
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+            UpdateModelAsync(model, maxContextTokens, ct);
 
         public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) =>
             Task.CompletedTask;
@@ -3067,6 +3076,9 @@ public sealed class GoalDispatcherParallelDispatchTests
     {
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
+        public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+            UpdateModelAsync(model, maxContextTokens, ct);
+
         public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) =>
             Task.CompletedTask;
 
@@ -3115,6 +3127,9 @@ public sealed class GoalDispatcherParallelDispatchTests
         public List<string> ForkCalls { get; } = [];
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+            UpdateModelAsync(model, maxContextTokens, ct);
 
         public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) =>
             Task.CompletedTask;
@@ -3735,6 +3750,9 @@ file sealed class CancellationTokenTrackingBrain : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
+    public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+        UpdateModelAsync(model, maxContextTokens, ct);
+
     public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) => Task.CompletedTask;
 
     public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
@@ -3804,6 +3822,9 @@ file sealed class PlanningGateBrain : IDistributedBrain
     public PlanningGateBrain(Func<CancellationToken, Task<PlanResult>> plan) => _plan = plan;
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+        UpdateModelAsync(model, maxContextTokens, ct);
 
     public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) => Task.CompletedTask;
 
@@ -4504,6 +4525,9 @@ file sealed class TrackingEnsureBrain : IDistributedBrain
     public List<(string RepoName, DateTime Timestamp)> EnsureRepoCalls { get; } = [];
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+        UpdateModelAsync(model, maxContextTokens, ct);
 
     public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) =>
         Task.CompletedTask;
