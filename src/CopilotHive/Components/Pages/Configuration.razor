@@ -49,48 +49,55 @@ else
             {
                 var models = _modelsData.AvailableModels;
 
-                <div style="display:grid;grid-template-columns:14rem 1fr;gap:0.75rem 1rem;align-items:center;max-width:600px">
+                <div style="display:grid;grid-template-columns:14rem 1fr 8rem;gap:0.75rem 1rem;align-items:center;max-width:700px">
+
+                    <div></div>
+                    <div></div>
+                    <label style="color:var(--text-muted);font-size:0.85rem;font-weight:600">Reasoning</label>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Orchestrator / Brain</label>
                     <select @bind="_orchestratorModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
                         @foreach (var m in models)
                         {
-                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name} ({m.ReasoningEffort})";
-                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name}:{m.ReasoningEffort}";
-                            <option value="@optionValue">@displayText</option>
+                            <option value="@m.Name">@m.Name</option>
                         }
+                    </select>
+                    <select @bind="_orchestratorReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="none">None</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="extra_high">Extra High</option>
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Composer</label>
                     <select @bind="_composerModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
                         @foreach (var m in models)
                         {
-                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name} ({m.ReasoningEffort})";
-                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name}:{m.ReasoningEffort}";
-                            <option value="@optionValue">@displayText</option>
+                            <option value="@m.Name">@m.Name</option>
                         }
+                    </select>
+                    <select @bind="_composerReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="none">None</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="extra_high">Extra High</option>
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Coder</label>
                     <select @bind="_coderModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
                         @foreach (var m in models)
                         {
-                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name} ({m.ReasoningEffort})";
-                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name}:{m.ReasoningEffort}";
-                            <option value="@optionValue">@displayText</option>
+                            <option value="@m.Name">@m.Name</option>
                         }
+                    </select>
+                    <select @bind="_coderReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="none">None</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="extra_high">Extra High</option>
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Premium Coder</label>
@@ -98,28 +105,30 @@ else
                         <option value="">(none)</option>
                         @foreach (var m in models)
                         {
-                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name} ({m.ReasoningEffort})";
-                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name}:{m.ReasoningEffort}";
-                            <option value="@optionValue">@displayText</option>
+                            <option value="@m.Name">@m.Name</option>
                         }
+                    </select>
+                    <select @bind="_coderPremiumReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="none">None</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="extra_high">Extra High</option>
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Tester</label>
                     <select @bind="_testerModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
                         @foreach (var m in models)
                         {
-                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name} ({m.ReasoningEffort})";
-                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name}:{m.ReasoningEffort}";
-                            <option value="@optionValue">@displayText</option>
+                            <option value="@m.Name">@m.Name</option>
                         }
+                    </select>
+                    <select @bind="_testerReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="none">None</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="extra_high">Extra High</option>
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Premium Tester</label>
@@ -127,28 +136,30 @@ else
                         <option value="">(none)</option>
                         @foreach (var m in models)
                         {
-                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name} ({m.ReasoningEffort})";
-                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name}:{m.ReasoningEffort}";
-                            <option value="@optionValue">@displayText</option>
+                            <option value="@m.Name">@m.Name</option>
                         }
+                    </select>
+                    <select @bind="_testerPremiumReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="none">None</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="extra_high">Extra High</option>
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Reviewer</label>
                     <select @bind="_reviewerModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
                         @foreach (var m in models)
                         {
-                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name} ({m.ReasoningEffort})";
-                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name}:{m.ReasoningEffort}";
-                            <option value="@optionValue">@displayText</option>
+                            <option value="@m.Name">@m.Name</option>
                         }
+                    </select>
+                    <select @bind="_reviewerReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="none">None</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="extra_high">Extra High</option>
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Premium Reviewer</label>
@@ -156,28 +167,30 @@ else
                         <option value="">(none)</option>
                         @foreach (var m in models)
                         {
-                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name} ({m.ReasoningEffort})";
-                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name}:{m.ReasoningEffort}";
-                            <option value="@optionValue">@displayText</option>
+                            <option value="@m.Name">@m.Name</option>
                         }
+                    </select>
+                    <select @bind="_reviewerPremiumReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="none">None</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="extra_high">Extra High</option>
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Doc Writer</label>
                     <select @bind="_docwriterModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
                         @foreach (var m in models)
                         {
-                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name} ({m.ReasoningEffort})";
-                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name}:{m.ReasoningEffort}";
-                            <option value="@optionValue">@displayText</option>
+                            <option value="@m.Name">@m.Name</option>
                         }
+                    </select>
+                    <select @bind="_docwriterReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="none">None</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="extra_high">Extra High</option>
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Premium Doc Writer</label>
@@ -185,28 +198,30 @@ else
                         <option value="">(none)</option>
                         @foreach (var m in models)
                         {
-                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name} ({m.ReasoningEffort})";
-                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name}:{m.ReasoningEffort}";
-                            <option value="@optionValue">@displayText</option>
+                            <option value="@m.Name">@m.Name</option>
                         }
+                    </select>
+                    <select @bind="_docwriterPremiumReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="none">None</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="extra_high">Extra High</option>
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Improver</label>
                     <select @bind="_improverModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
                         @foreach (var m in models)
                         {
-                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name} ({m.ReasoningEffort})";
-                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name}:{m.ReasoningEffort}";
-                            <option value="@optionValue">@displayText</option>
+                            <option value="@m.Name">@m.Name</option>
                         }
+                    </select>
+                    <select @bind="_improverReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="none">None</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="extra_high">Extra High</option>
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Premium Improver</label>
@@ -214,14 +229,15 @@ else
                         <option value="">(none)</option>
                         @foreach (var m in models)
                         {
-                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name} ({m.ReasoningEffort})";
-                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name}:{m.ReasoningEffort}";
-                            <option value="@optionValue">@displayText</option>
+                            <option value="@m.Name">@m.Name</option>
                         }
+                    </select>
+                    <select @bind="_improverPremiumReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="none">None</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="extra_high">Extra High</option>
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Compaction model</label>
@@ -229,15 +245,10 @@ else
                         <option value="">(use main model)</option>
                         @foreach (var m in models)
                         {
-                            var displayText = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name} ({m.ReasoningEffort})";
-                            var optionValue = string.IsNullOrEmpty(m.ReasoningEffort)
-                                ? m.Name
-                                : $"{m.Name}:{m.ReasoningEffort}";
-                            <option value="@optionValue">@displayText</option>
+                            <option value="@m.Name">@m.Name</option>
                         }
                     </select>
+                    <div></div>
 
                 </div>
 
@@ -289,16 +300,6 @@ else
                             <input type="number" @bind="_newModelContextWindow" placeholder="optional"
                                    style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
 
-                            <label style="color:var(--text-muted);font-size:0.9rem">Reasoning Effort</label>
-                            <select @bind="_newModelReasoningEffort"
-                                    style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
-                                <option value="">none</option>
-                                <option value="low">low</option>
-                                <option value="medium">medium</option>
-                                <option value="high">high</option>
-                                <option value="extra_high">extra_high</option>
-                            </select>
-
                             <label style="color:var(--text-muted);font-size:0.9rem">Description</label>
                             <input @bind="_newModelDescription" placeholder="e.g. Fast and cheap, good for simple tasks"
                                    style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
@@ -335,7 +336,6 @@ else
                             <tr style="border-bottom:1px solid var(--border)">
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Name</th>
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Context Window</th>
-                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Reasoning Effort</th>
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Description</th>
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Supports Vision</th>
                                 <th style="text-align:right;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Actions</th>
@@ -351,16 +351,6 @@ else
                                         <td style="padding:0.5rem">
                                             <input type="number" @bind="_editModelContextWindow" placeholder="optional"
                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:8rem" />
-                                        </td>
-                                        <td style="padding:0.5rem">
-                                            <select @bind="_editModelReasoningEffort"
-                                                    style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;cursor:pointer">
-                                                <option value="">none</option>
-                                                <option value="low">low</option>
-                                                <option value="medium">medium</option>
-                                                <option value="high">high</option>
-                                                <option value="extra_high">extra_high</option>
-                                            </select>
                                         </td>
                                         <td style="padding:0.5rem">
                                             <input @bind="_editModelDescription" placeholder="optional"
@@ -384,7 +374,6 @@ else
                                     {
                                         <td style="white-space:nowrap;padding:0.5rem;font-size:0.9rem">@model.Name</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(model.ContextWindow?.ToString() ?? "—")</td>
-                                        <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(model.ReasoningEffort) ? "—" : model.ReasoningEffort)</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(model.Description) ? "—" : model.Description)</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(model.SupportsVision.HasValue ? (model.SupportsVision.Value ? "true" : "false") : "—")</td>
                                         <td style="white-space:nowrap;padding:0.5rem;text-align:right">
@@ -493,11 +482,11 @@ else
                             <label style="color:var(--text-muted);font-size:0.9rem">Reasoning Effort</label>
                             <select @bind="_newSubAgentModelReasoningEffort"
                                     style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
-                                <option value="">none</option>
-                                <option value="low">low</option>
-                                <option value="medium">medium</option>
-                                <option value="high">high</option>
-                                <option value="extra_high">extra_high</option>
+                                <option value="none">None</option>
+                                <option value="low">Low</option>
+                                <option value="medium">Medium</option>
+                                <option value="high">High</option>
+                                <option value="extra_high">Extra High</option>
                             </select>
 
                             <label style="color:var(--text-muted);font-size:0.9rem">Description</label>
@@ -556,11 +545,11 @@ else
                                         <td style="padding:0.5rem">
                                             <select @bind="_editSubAgentModelReasoningEffort"
                                                     style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;cursor:pointer">
-                                                <option value="">none</option>
-                                                <option value="low">low</option>
-                                                <option value="medium">medium</option>
-                                                <option value="high">high</option>
-                                                <option value="extra_high">extra_high</option>
+                                                <option value="none">None</option>
+                                                <option value="low">Low</option>
+                                                <option value="medium">Medium</option>
+                                                <option value="high">High</option>
+                                                <option value="extra_high">Extra High</option>
                                             </select>
                                         </td>
                                         <td style="padding:0.5rem">
@@ -585,7 +574,7 @@ else
                                     {
                                         <td style="white-space:nowrap;padding:0.5rem;font-size:0.9rem">@sam.Name</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(sam.ContextWindow?.ToString() ?? "—")</td>
-                                        <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(sam.ReasoningEffort) ? "—" : sam.ReasoningEffort)</td>
+                                        <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(sam.ReasoningEffort) ? "none" : sam.ReasoningEffort)</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(sam.Description) ? "—" : sam.Description)</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(sam.SupportsVision.HasValue ? (sam.SupportsVision.Value ? "true" : "false") : "—")</td>
                                         <td style="white-space:nowrap;padding:0.5rem;text-align:right">
@@ -1013,7 +1002,11 @@ else
         [property: JsonPropertyName("compaction")]      string? Compaction,
         [property: JsonPropertyName("workers")]         Dictionary<string, WorkerConfigDto>? Workers,
         [property: JsonPropertyName("availableModels")] List<ModelEntryDto>? AvailableModels,
-        [property: JsonPropertyName("subAgentModels")]  List<ModelEntryDto>? SubAgentModels);
+        [property: JsonPropertyName("subAgentModels")]  List<ModelEntryDto>? SubAgentModels,
+        [property: JsonPropertyName("orchestratorReasoningEffort")] string? OrchestratorReasoningEffort,
+        [property: JsonPropertyName("composerReasoningEffort")] string? ComposerReasoningEffort,
+        [property: JsonPropertyName("workerReasoningEffort")] Dictionary<string, string?>? WorkerReasoningEffort,
+        [property: JsonPropertyName("workerPremiumReasoningEffort")] Dictionary<string, string?>? WorkerPremiumReasoningEffort);
 
     private sealed record WorkerConfigDto(
         [property: JsonPropertyName("model")] string? Model,
@@ -1093,6 +1086,20 @@ else
     private string _docwriterPremiumModel = "";
     private string _improverPremiumModel = "";
 
+    // Per-assignment reasoning effort
+    private string _orchestratorReasoningEffort = "none";
+    private string _composerReasoningEffort = "none";
+    private string _coderReasoningEffort = "none";
+    private string _testerReasoningEffort = "none";
+    private string _reviewerReasoningEffort = "none";
+    private string _docwriterReasoningEffort = "none";
+    private string _improverReasoningEffort = "none";
+    private string _coderPremiumReasoningEffort = "none";
+    private string _testerPremiumReasoningEffort = "none";
+    private string _reviewerPremiumReasoningEffort = "none";
+    private string _docwriterPremiumReasoningEffort = "none";
+    private string _improverPremiumReasoningEffort = "none";
+
     private List<BackupInfoResponse> _backups = [];
     private bool _backupsLoading;
     private bool _backupCreating;
@@ -1107,12 +1114,10 @@ else
     private bool _showAddModelForm;
     private string _newModelName = "";
     private int? _newModelContextWindow;
-    private string _newModelReasoningEffort = "";
     private string _newModelDescription = "";
     private bool? _newModelSupportsVision;
     private string? _editingModelName;
     private int? _editModelContextWindow;
-    private string _editModelReasoningEffort = "";
     private string _editModelDescription = "";
     private bool? _editModelSupportsVision;
     private string? _availableModelsError;
@@ -1122,12 +1127,12 @@ else
     private bool _showAddSubAgentModelForm;
     private string _newSubAgentModelName = "";
     private int? _newSubAgentModelContextWindow;
-    private string _newSubAgentModelReasoningEffort = "";
+    private string _newSubAgentModelReasoningEffort = "none";
     private string _newSubAgentModelDescription = "";
     private bool? _newSubAgentModelSupportsVision;
     private string? _editingSubAgentModelName;
     private int? _editSubAgentModelContextWindow;
-    private string _editSubAgentModelReasoningEffort = "";
+    private string _editSubAgentModelReasoningEffort = "none";
     private string _editSubAgentModelDescription = "";
     private bool? _editSubAgentModelSupportsVision;
     private string? _subAgentModelsError;
@@ -1269,6 +1274,19 @@ else
                 _reviewerPremiumModel     = _modelsData.Workers?.GetValueOrDefault("reviewer")?.PremiumModel ?? "";
                 _docwriterPremiumModel    = _modelsData.Workers?.GetValueOrDefault("docwriter")?.PremiumModel ?? "";
                 _improverPremiumModel     = _modelsData.Workers?.GetValueOrDefault("improver")?.PremiumModel ?? "";
+
+                _orchestratorReasoningEffort = _modelsData.OrchestratorReasoningEffort ?? "none";
+                _composerReasoningEffort     = _modelsData.ComposerReasoningEffort ?? "none";
+                _coderReasoningEffort        = _modelsData.WorkerReasoningEffort?.GetValueOrDefault("coder") ?? "none";
+                _testerReasoningEffort       = _modelsData.WorkerReasoningEffort?.GetValueOrDefault("tester") ?? "none";
+                _reviewerReasoningEffort     = _modelsData.WorkerReasoningEffort?.GetValueOrDefault("reviewer") ?? "none";
+                _docwriterReasoningEffort    = _modelsData.WorkerReasoningEffort?.GetValueOrDefault("docwriter") ?? "none";
+                _improverReasoningEffort     = _modelsData.WorkerReasoningEffort?.GetValueOrDefault("improver") ?? "none";
+                _coderPremiumReasoningEffort     = _modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("coder") ?? "none";
+                _testerPremiumReasoningEffort    = _modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("tester") ?? "none";
+                _reviewerPremiumReasoningEffort  = _modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("reviewer") ?? "none";
+                _docwriterPremiumReasoningEffort = _modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("docwriter") ?? "none";
+                _improverPremiumReasoningEffort  = _modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("improver") ?? "none";
             }
         }
         catch (Exception ex)
@@ -1310,6 +1328,24 @@ else
                         ["improver"]   = _improverPremiumModel,
                     },
                     compactionModel = _compactionModel,
+                    orchestratorReasoningEffort = _orchestratorReasoningEffort,
+                    composerReasoningEffort = _composerReasoningEffort,
+                    workerReasoningEffort = new Dictionary<string, string?>
+                    {
+                        ["coder"]     = _coderReasoningEffort,
+                        ["tester"]    = _testerReasoningEffort,
+                        ["reviewer"]  = _reviewerReasoningEffort,
+                        ["docwriter"] = _docwriterReasoningEffort,
+                        ["improver"]  = _improverReasoningEffort,
+                    },
+                    workerPremiumReasoningEffort = new Dictionary<string, string?>
+                    {
+                        ["coder"]     = _coderPremiumReasoningEffort,
+                        ["tester"]    = _testerPremiumReasoningEffort,
+                        ["reviewer"]  = _reviewerPremiumReasoningEffort,
+                        ["docwriter"] = _docwriterPremiumReasoningEffort,
+                        ["improver"]  = _improverPremiumReasoningEffort,
+                    },
                 }),
                 System.Text.Encoding.UTF8,
                 "application/json");
@@ -1796,7 +1832,7 @@ else
         {
             foreach (var dm in _discoveredModels.Where(m => _selectedDiscoveredIds.Contains(m.Id)))
             {
-                var response = await PostAvailableModelAsync(dm.Id, dm.ContextWindow, null, null);
+                var response = await PostAvailableModelAsync(dm.Id, dm.ContextWindow, null);
                 if (!response.IsSuccessStatusCode)
                 {
                     var error = await response.Content.ReadAsStringAsync();
@@ -1830,14 +1866,12 @@ else
         }
         try
         {
-            var reasoning = string.IsNullOrEmpty(_newModelReasoningEffort) ? null : _newModelReasoningEffort;
             var newDescription = string.IsNullOrWhiteSpace(_newModelDescription) ? null : _newModelDescription;
-            var response = await PostAvailableModelAsync(_newModelName, _newModelContextWindow, reasoning, newDescription, _newModelSupportsVision);
+            var response = await PostAvailableModelAsync(_newModelName, _newModelContextWindow, newDescription, _newModelSupportsVision);
             if (response.IsSuccessStatusCode)
             {
                 _newModelName = "";
                 _newModelContextWindow = null;
-                _newModelReasoningEffort = "";
                 _newModelDescription = "";
                 _newModelSupportsVision = null;
                 _showAddModelForm = false;
@@ -1864,7 +1898,6 @@ else
     {
         _editingModelName = model.Name;
         _editModelContextWindow = model.ContextWindow;
-        _editModelReasoningEffort = model.ReasoningEffort ?? "";
         _editModelDescription = model.Description ?? "";
         _editModelSupportsVision = model.SupportsVision;
         _availableModelsError = null;
@@ -1884,14 +1917,12 @@ else
         _availableModelsSuccess = null;
         try
         {
-            var reasoning = string.IsNullOrEmpty(_editModelReasoningEffort) ? null : _editModelReasoningEffort;
             var editDescription = string.IsNullOrWhiteSpace(_editModelDescription) ? null : _editModelDescription;
             var body = new StringContent(
                 System.Text.Json.JsonSerializer.Serialize(new
                 {
                     name = _editingModelName,
                     contextWindow = _editModelContextWindow,
-                    reasoningEffort = reasoning,
                     description = editDescription,
                     supportsVision = _editModelSupportsVision,
                 }),
@@ -1969,14 +2000,13 @@ else
         _ => null,
     };
 
-    private Task<HttpResponseMessage> PostAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, bool? supportsVision = null)
+    private Task<HttpResponseMessage> PostAvailableModelAsync(string name, int? contextWindow, string? description = null, bool? supportsVision = null)
     {
         var body = new StringContent(
             System.Text.Json.JsonSerializer.Serialize(new
             {
                 name,
                 contextWindow,
-                reasoningEffort,
                 description,
                 supportsVision,
             }),
@@ -2012,14 +2042,14 @@ else
         }
         try
         {
-            var reasoning = string.IsNullOrEmpty(_newSubAgentModelReasoningEffort) ? null : _newSubAgentModelReasoningEffort;
+            var reasoning = _newSubAgentModelReasoningEffort;
             var description = string.IsNullOrWhiteSpace(_newSubAgentModelDescription) ? null : _newSubAgentModelDescription;
             var response = await PostSubAgentModelAsync(_newSubAgentModelName, _newSubAgentModelContextWindow, reasoning, description, _newSubAgentModelSupportsVision);
             if (response.IsSuccessStatusCode)
             {
                 _newSubAgentModelName = "";
                 _newSubAgentModelContextWindow = null;
-                _newSubAgentModelReasoningEffort = "";
+                _newSubAgentModelReasoningEffort = "none";
                 _newSubAgentModelDescription = "";
                 _newSubAgentModelSupportsVision = null;
                 _showAddSubAgentModelForm = false;
@@ -2046,7 +2076,7 @@ else
     {
         _editingSubAgentModelName = model.Name;
         _editSubAgentModelContextWindow = model.ContextWindow;
-        _editSubAgentModelReasoningEffort = model.ReasoningEffort ?? "";
+        _editSubAgentModelReasoningEffort = model.ReasoningEffort ?? "none";
         _editSubAgentModelDescription = model.Description ?? "";
         _editSubAgentModelSupportsVision = model.SupportsVision;
         _subAgentModelsError = null;
@@ -2066,7 +2096,7 @@ else
         _subAgentModelsSuccess = null;
         try
         {
-            var reasoning = string.IsNullOrEmpty(_editSubAgentModelReasoningEffort) ? null : _editSubAgentModelReasoningEffort;
+            var reasoning = _editSubAgentModelReasoningEffort;
             var description = string.IsNullOrWhiteSpace(_editSubAgentModelDescription) ? null : _editSubAgentModelDescription;
             var body = new StringContent(
                 System.Text.Json.JsonSerializer.Serialize(new
