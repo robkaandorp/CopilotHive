@@ -1,3 +1,18 @@
+## [0.26.0] — 2026-08-04
+
+### Added
+
+- **Knowledge graph document lifecycle cleanup** — Automatic deletion of transient `progress-{goalId}` and `review-{goalId}` knowledge documents when they are no longer needed. Three cleanup triggers: release completion (deletes docs for all goals in a released release), goal deletion (deletes docs when a Draft or Failed goal is deleted), and a one-time startup sweep (deletes docs for orphaned goals or goals in already-Released releases). The `KnowledgeGraph` now has graph-wide method serialization (`_graphLock`), an atomic batch delete+commit API (`DeleteDocumentsAndCommitAsync`), case-insensitive ID/collection semantics, and a `ConfigRepoPath` property. `ConfigRepoManager` gains `PushOnlyAsync` for non-destructive push-on-no-diff and `--ignore-unmatch` for idempotent retry. (`copilothive-kg-graph-sync-and-persistence`, `copilothive-kg-doc-cleanup-service`, `copilothive-kg-doc-cleanup-on-release`, `copilothive-kg-doc-cleanup-on-goal-delete`, `copilothive-kg-doc-cleanup-startup-sweep`)
+- **Knowledge dashboard folder view** — Documents are now grouped by topic in collapsible folder sections with per-folder document counts. Sub-topic folders nest inside topic folders. Expand/collapse state persists via localStorage. Archived documents are hidden by default and only shown when the status filter explicitly selects "Archived". (`copilothive-knowledge-folder-view`, `copilothive-knowledge-subtopic-folders`, `copilothive-knowledge-folder-order`)
+- **Release deletion** — Planning releases with no attached goals can be deleted via a "Delete Release" button on the release detail page. `DELETE /api/releases/{id}` endpoint with atomic conditional delete (all preconditions in one `ExecuteDeleteAsync` — no TOCTOU race). Three checks: Planning status, no goals attached, not Executing. (`copilothive-release-delete-api`, `copilothive-release-delete-ui`)
+- **Improver sub-agent file-write clarification** — The improver's hardcoded system prompt now explains that sub-agents can request file-write access via `enable_file_writes=true`, preventing the improver from unnecessarily asking the orchestrator to apply file edits. (`copilothive-improver-prompt-and-agents-edits`)
+
+### Fixed
+
+- **Banner print crash on closed console** — `PrintBanner()` in `Program.cs` no longer throws `ObjectDisposedException` when `Console.Out` is closed during `WebApplicationFactory` host creation in tests. The `ConsoleOutput` test collection now has `DisableParallelization = true` to prevent cross-collection console interference. (`copilothive-fix-banner-objectdisposed`)
+- **Improver test environment dependency** — The former `ExecuteAsync_ImproverDefaultPath_ResolvesToDefaultConfigRepoAgentsDir` test no longer reads real agents.md files from the CI environment. Renamed to `ExecuteAsync_ImproverInjectedPath_ResolvesToAgentsDir` using an injected non-existent temp path. (`copilothive-fix-improver-test-env-dependency`)
+- **Local Docker version display** — Local Docker builds now show `v<VersionPrefix>-local` (e.g. `v0.26.0-local`) in the dashboard footer instead of `v0.1.0-local`. Uses MSBuild's `VersionSuffix=local` mechanism instead of a hardcoded Dockerfile default. (`copilothive-fix-local-version-default`)
+
 ## [0.25.1] — 2026-08-02
 
 ### Fixed
