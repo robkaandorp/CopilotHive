@@ -9,7 +9,7 @@ namespace CopilotHive.Tests.Worker;
 
 /// <summary>
 /// Unit tests for reasoning-effort handling in <see cref="SharpCoderRunner"/>:
-/// the explicit <c>ResetSessionAsync(model, reasoningEffort, ct)</c> overload, the guarantee
+/// the <c>ResetSessionAsync(model, reasoningEffort, ct)</c> method, the guarantee
 /// that reasoning effort is never derived from a model-name suffix, and that
 /// <c>CreateChatClient</c> never mutates the already-resolved reasoning effort.
 /// </summary>
@@ -127,23 +127,7 @@ public sealed class SharpCoderRunnerReasoningTests
         Assert.Null(GetCurrentReasoning(runner));
     }
 
-    // ── Old overload delegates to the new one ─────────────────────────────────
-
-    /// <summary>
-    /// The preserved single-model overload must behave exactly like passing a null effort:
-    /// no reasoning effort is derived from the model name.
-    /// </summary>
-    [Fact]
-    public async Task ResetSessionAsync_LegacyOverload_LeavesReasoningUnset()
-    {
-        var runner = CreateRunner();
-
-        await runner.ResetSessionAsync("test-model:medium", TestContext.Current.CancellationToken);
-
-        Assert.Null(GetCurrentReasoning(runner));
-    }
-
-    // ── Session clearing still happens on the new overload ────────────────────
+    // ── Session clearing still happens on ResetSessionAsync ──────────────────
 
     [Fact]
     public async Task ResetSessionAsync_WithReasoningEffort_ClearsSession()

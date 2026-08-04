@@ -120,8 +120,6 @@ public sealed class TaskExecutorSessionTests
         public int GetContextUsagePercent() => 0;
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
-        public Task ResetSessionAsync(string? model = null, CancellationToken ct = default) => Task.CompletedTask;
-
         public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default) => Task.CompletedTask;
 
         public Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
@@ -432,8 +430,6 @@ public sealed class TaskExecutorSessionTests
         public object? GetSession() => null;
         public int GetContextUsagePercent() => 0;
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
-        public Task ResetSessionAsync(string? model = null, CancellationToken ct = default) => Task.CompletedTask;
-
         public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default) => Task.CompletedTask;
 
         public Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)

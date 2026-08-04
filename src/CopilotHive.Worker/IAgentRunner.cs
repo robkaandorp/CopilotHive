@@ -95,9 +95,6 @@ public interface IAgentRunner : IAsyncDisposable
     /// <summary>Connects to the underlying AI agent engine.</summary>
     Task ConnectAsync(CancellationToken ct = default);
 
-    /// <summary>Resets the current session, optionally switching to a different model.</summary>
-    Task ResetSessionAsync(string? model = null, CancellationToken ct = default);
-
     /// <summary>Resets the current session, optionally switching model and setting reasoning effort.</summary>
     Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default);
 

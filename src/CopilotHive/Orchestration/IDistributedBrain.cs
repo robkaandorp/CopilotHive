@@ -188,12 +188,6 @@ public interface IDistributedBrain
     Task<BrainResponse> AskQuestionAsync(string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default);
 
     /// <summary>
-    /// Updates the Brain model and optionally the context window, recreating the underlying
-    /// chat client and CodingAgent so subsequent calls use the new configuration.
-    /// </summary>
-    Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default);
-
-    /// <summary>
     /// Updates the Brain model, optionally the context window, and the explicitly configured
     /// reasoning effort, recreating the underlying chat client and CodingAgent so subsequent
     /// calls use the new configuration.

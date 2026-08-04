@@ -387,10 +387,6 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <inheritdoc />
-    public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default)
-        => UpdateModelAsync(model, maxContextTokens, reasoningEffort: null, ct);
-
-    /// <inheritdoc />
     public async Task UpdateModelAsync(string model, int? maxContextTokens, ReasoningEffort? reasoningEffort, CancellationToken ct)
     {
         EnsureConnected();

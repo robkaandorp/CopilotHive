@@ -275,9 +275,6 @@ public sealed class DashboardNotifierWiringTests
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
         public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
-            UpdateModelAsync(model, maxContextTokens, ct);
-
-        public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) =>
             Task.CompletedTask;
 
         public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)

@@ -139,7 +139,7 @@ public sealed class SharpCoderRunnerSessionTests
     }
 
     /// <summary>
-    /// <see cref="SharpCoderRunner.ResetSessionAsync(string, System.Threading.CancellationToken)"/> must clear <c>_session</c> to <c>null</c>
+    /// <see cref="SharpCoderRunner.ResetSessionAsync(string, ReasoningEffort?, CancellationToken)"/> must clear <c>_session</c> to <c>null</c>
     /// so that subsequent prompts start with a fresh session instead of leaking stale context.
     /// </summary>
     [Fact]
@@ -153,7 +153,7 @@ public sealed class SharpCoderRunnerSessionTests
         Assert.NotNull(runner.GetSession());
 
         // Act
-        await runner.ResetSessionAsync(ct: TestContext.Current.CancellationToken);
+        await runner.ResetSessionAsync(null, null, TestContext.Current.CancellationToken);
 
         // Assert: session must be null after reset
         Assert.Null(runner.GetSession());

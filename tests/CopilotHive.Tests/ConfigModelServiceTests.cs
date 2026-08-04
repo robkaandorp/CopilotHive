@@ -272,7 +272,7 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
-        Assert.Equal(1, brain.NewOverloadCalls);
+        Assert.Equal(1, brain.ReasoningCaptureCalls);
         Assert.Equal(Microsoft.Extensions.AI.ReasoningEffort.High, brain.LastReasoningEffort);
         // The model string carries no reasoning suffix — reasoning travels as a separate argument.
         Assert.Equal("new-orch", brain.LastModel);
@@ -292,7 +292,7 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
-        Assert.Equal(1, brain.NewOverloadCalls);
+        Assert.Equal(1, brain.ReasoningCaptureCalls);
         Assert.Null(brain.LastReasoningEffort);
     }
 
@@ -1918,7 +1918,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
         Assert.Equal(1, brain.UpdateModelCalls);
-        Assert.Equal(1, brain.NewOverloadCalls);
+        Assert.Equal(1, brain.ReasoningCaptureCalls);
         Assert.Equal("new-orch", brain.LastModel);
         Assert.Equal(256000, brain.LastMaxContextTokens);
         Assert.Equal(Microsoft.Extensions.AI.ReasoningEffort.High, brain.LastReasoningEffort);
@@ -2524,13 +2524,13 @@ file sealed class FakeDistributedBrain : IDistributedBrain
     public string? LastModel { get; private set; }
     public int? LastMaxContextTokens { get; private set; }
 
-    /// <summary>Reasoning effort captured from the enum-carrying overload.</summary>
+    /// <summary>Reasoning effort captured from UpdateModelAsync.</summary>
     public Microsoft.Extensions.AI.ReasoningEffort? LastReasoningEffort { get; private set; }
 
-    /// <summary>Number of calls that went through the enum-carrying overload.</summary>
-    public int NewOverloadCalls { get; private set; }
+    /// <summary>Number of UpdateModelAsync calls that captured reasoning effort.</summary>
+    public int ReasoningCaptureCalls { get; private set; }
 
-    /// <summary>Total number of UpdateModelAsync calls across both overloads.</summary>
+    /// <summary>Total number of UpdateModelAsync calls.</summary>
     public int UpdateModelCalls { get; private set; }
 
     /// <summary>When set, UpdateModelAsync throws this exception.</summary>
@@ -2540,13 +2540,8 @@ file sealed class FakeDistributedBrain : IDistributedBrain
 
     public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct)
     {
-        NewOverloadCalls++;
+        ReasoningCaptureCalls++;
         LastReasoningEffort = reasoningEffort;
-        return UpdateModelAsync(model, maxContextTokens, ct);
-    }
-
-    public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default)
-    {
         UpdateModelCalls++;
         LastModel = model;
         LastMaxContextTokens = maxContextTokens;
@@ -2663,7 +2658,7 @@ file sealed class GatedCommitConfigRepoManager(string url, string path) : Config
 }
 
 /// <summary>
-/// Brain fake whose enum-carrying <see cref="GatedBrain.UpdateModelAsync(string, int?, Microsoft.Extensions.AI.ReasoningEffort?, CancellationToken)"/>
+/// Brain fake whose reasoning-aware <see cref="GatedBrain.UpdateModelAsync(string, int?, Microsoft.Extensions.AI.ReasoningEffort?, CancellationToken)"/>
 /// blocks until the test cancels the live token, enabling live-token cancellation to race the live-update step.
 /// </summary>
 file sealed class GatedBrain : IDistributedBrain
@@ -2683,9 +2678,6 @@ file sealed class GatedBrain : IDistributedBrain
         // throws OperationCanceledException on cancellation.
         await Task.Delay(Timeout.InfiniteTimeSpan, ct);
     }
-
-    public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default)
-        => UpdateModelAsync(model, maxContextTokens, null, ct);
 
     public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
         => Task.FromResult(PlanResult.Success(IterationPlan.Default()));

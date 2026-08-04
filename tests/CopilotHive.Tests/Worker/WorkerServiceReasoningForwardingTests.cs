@@ -18,7 +18,7 @@ namespace CopilotHive.Tests.Worker;
 /// <summary>
 /// Regression tests proving that <see cref="WorkerService"/> forwards the reasoning effort it
 /// receives on a <see cref="TaskAssignment"/> to the
-/// <c>ResetSessionAsync(string?, ReasoningEffort?, CancellationToken)</c> overload.
+/// <c>ResetSessionAsync(string?, ReasoningEffort?, CancellationToken)</c> method.
 /// <para>
 /// These tests drive the real private <c>ProcessMessagesAsync</c> loop over fake gRPC streams and
 /// swap <c>_agentRunner</c> for a capturing fake via reflection. That is deliberate: asserting on a
@@ -88,7 +88,7 @@ public sealed class WorkerServiceReasoningForwardingTests
     /// corresponding enum, alongside the model.
     /// </summary>
     [Fact]
-    public async Task WorkerService_ForwardsReasoningEffort_ToNewResetSessionOverload()
+    public async Task WorkerService_ForwardsReasoningEffort_ToResetSession()
     {
         var assignment = BuildAssignment("test-model", "high");
 
@@ -149,7 +149,7 @@ public sealed class WorkerServiceReasoningForwardingTests
 
     // ── Fakes ─────────────────────────────────────────────────────────────────
 
-    /// <summary>Captures the arguments passed to the reasoning-aware ResetSessionAsync overload.</summary>
+    /// <summary>Captures the arguments passed to ResetSessionAsync.</summary>
     private sealed class CapturingAgentRunner : IAgentRunner
     {
         public (string? Model, ReasoningEffort? ReasoningEffort)? CapturedResetArgs { get; private set; }
@@ -171,15 +171,6 @@ public sealed class WorkerServiceReasoningForwardingTests
         public void SetCompactionMaxTokens(int? maxTokens) { }
         public void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models) { }
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
-
-        /// <summary>Legacy overload — must NOT be the one WorkerService calls.</summary>
-        public Task ResetSessionAsync(string? model = null, CancellationToken ct = default)
-        {
-            // Record with a null effort so a regression to the old overload is visible as a
-            // null reasoning effort rather than silently passing.
-            CapturedResetArgs = (model, null);
-            return Task.CompletedTask;
-        }
 
         public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
         {

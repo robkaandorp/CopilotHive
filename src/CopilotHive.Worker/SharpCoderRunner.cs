@@ -355,9 +355,6 @@ public sealed class SharpCoderRunner : IAgentRunner
         return Task.CompletedTask;
     }
 
-    public Task ResetSessionAsync(string? model = null, CancellationToken ct = default)
-        => ResetSessionAsync(model, null, ct);
-
     public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
     {
         // Reasoning effort is transported explicitly by the orchestrator; it is never derived

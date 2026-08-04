@@ -1763,7 +1763,7 @@ public sealed class DistributedBrainTests
 
             Assert.Equal("copilot/old-model", modelField.GetValue(brain));
 
-            await brain.UpdateModelAsync("copilot/new-model", null, TestContext.Current.CancellationToken);
+            await brain.UpdateModelAsync("copilot/new-model", null, null, TestContext.Current.CancellationToken);
 
             Assert.Equal("copilot/new-model", modelField.GetValue(brain));
 
@@ -1796,7 +1796,7 @@ public sealed class DistributedBrainTests
 
             Assert.Equal(64000, maxCtxField.GetValue(brain));
 
-            await brain.UpdateModelAsync("copilot/other-model", 128000, TestContext.Current.CancellationToken);
+            await brain.UpdateModelAsync("copilot/other-model", 128000, null, TestContext.Current.CancellationToken);
 
             Assert.Equal(128000, maxCtxField.GetValue(brain));
 
@@ -1829,7 +1829,7 @@ public sealed class DistributedBrainTests
 
             Assert.Equal(64000, maxCtxField.GetValue(brain));
 
-            await brain.UpdateModelAsync("copilot/other-model", null, TestContext.Current.CancellationToken);
+            await brain.UpdateModelAsync("copilot/other-model", null, null, TestContext.Current.CancellationToken);
 
             Assert.Equal(64000, maxCtxField.GetValue(brain));
 
@@ -1863,7 +1863,7 @@ public sealed class DistributedBrainTests
             // swap; each goal context creates its own client lazily when forked.
             Assert.Equal(0, disposableClient.DisposeCount);
 
-            await brain.UpdateModelAsync("copilot/other-model", null, TestContext.Current.CancellationToken);
+            await brain.UpdateModelAsync("copilot/other-model", null, null, TestContext.Current.CancellationToken);
 
             // The injected client must NOT be disposed by a model update.
             Assert.Equal(0, disposableClient.DisposeCount);
@@ -1877,38 +1877,6 @@ public sealed class DistributedBrainTests
             // Disposal — and only disposal — releases the injected client, exactly once.
             await brain.DisposeAsync();
             Assert.Equal(1, disposableClient.DisposeCount);
-        }
-        finally
-        {
-            if (Directory.Exists(tempDir))
-                Directory.Delete(tempDir, recursive: true);
-        }
-    }
-
-    /// <summary>
-    /// The legacy two-argument overload never derives reasoning effort from the model name:
-    /// a ':high' segment is part of the name and the effort stays unset.
-    /// </summary>
-    [Fact]
-    public async Task UpdateModelAsync_LegacyOverload_DoesNotDeriveReasoningFromModelName()
-    {
-        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        try
-        {
-            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
-                stateDir: tempDir, chatClient: new FakeChatClient(),
-                chatClientFactory: _ => new FakeChatClient());
-            await brain.ConnectAsync(TestContext.Current.CancellationToken);
-
-            var reasoningField = typeof(DistributedBrain)
-                .GetField("_reasoningEffort", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-
-            Assert.Null(reasoningField.GetValue(brain));
-
-            await brain.UpdateModelAsync("copilot/gpt-5.4:high", null, TestContext.Current.CancellationToken);
-
-            Assert.Null(reasoningField.GetValue(brain));
         }
         finally
         {
@@ -2042,9 +2010,9 @@ public sealed class DistributedBrainTests
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
-                // Old overload → null reasoning. The configured value must not be cleared, and it
+                // Null reasoning → the configured value must not be cleared, and it
                 // must beat the ':high' suffix of the new model both locally and in the actor.
-                await brain.UpdateModelAsync("copilot/gpt-5.4:high", null, TestContext.Current.CancellationToken);
+                await brain.UpdateModelAsync("copilot/gpt-5.4:high", null, null, TestContext.Current.CancellationToken);
 
                 Assert.Equal(ReasoningEffort.Medium, ConfiguredReasoning(brain));
                 Assert.Equal(ReasoningEffort.Medium, EffectiveReasoning(brain));
@@ -2644,10 +2612,7 @@ file sealed class FakeDistributedBrain : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) { Connected = true; return Task.CompletedTask; }
 
-    public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
-        UpdateModelAsync(model, maxContextTokens, ct);
-
-    public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default)
+    public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct)
     {
         LastModel = model;
         LastMaxContextTokens = maxContextTokens;
@@ -3005,7 +2970,7 @@ file sealed class ThrowingStubClient : IChatClient
 
 /// <summary>
 /// IChatClient stub that counts how many times <see cref="Dispose"/> is called,
-/// used to verify that <see cref="DistributedBrain.UpdateModelAsync(string, int?, CancellationToken)"/> disposes the old client.
+/// used to verify that <see cref="DistributedBrain.UpdateModelAsync(string, int?, Microsoft.Extensions.AI.ReasoningEffort?, CancellationToken)"/> disposes the old client.
 /// </summary>
 file sealed class DisposableCountingChatClient : IChatClient
 {

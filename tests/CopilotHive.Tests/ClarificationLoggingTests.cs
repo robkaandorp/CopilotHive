@@ -711,10 +711,7 @@ public sealed class ClarificationLoggingTests
         public void SetNextResponse(BrainResponse response) => _response = response;
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
-        public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
-            UpdateModelAsync(model, maxContextTokens, ct);
-
-        public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) => Task.CompletedTask;
+        public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) => Task.CompletedTask;
         public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
             Task.FromResult(PlanResult.Success(IterationPlan.Default()));
         public Task<PromptResult> CraftPromptAsync(GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>

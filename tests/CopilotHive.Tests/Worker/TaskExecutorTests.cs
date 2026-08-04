@@ -156,8 +156,6 @@ public sealed class TaskExecutorTests
         public int GetContextUsagePercent() => 0;
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
-        public Task ResetSessionAsync(string? model = null, CancellationToken ct = default) => Task.CompletedTask;
-
         public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default) => Task.CompletedTask;
         public Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
         {

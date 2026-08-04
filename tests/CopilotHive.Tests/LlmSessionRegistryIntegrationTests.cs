@@ -751,7 +751,7 @@ public sealed class LlmSessionRegistryIntegrationTests
             var originalMaxTokens = originalGoal!.MaxTokens;
             Assert.Equal(originalModel, originalGoal.Model);
 
-            await brain.UpdateModelAsync("copilot/new-model", 99999, TestContext.Current.CancellationToken);
+            await brain.UpdateModelAsync("copilot/new-model", 99999, null, TestContext.Current.CancellationToken);
 
             // Master session registry entry reflects the new model/context window.
             var master = FindSession(registry, "brain-master");
@@ -942,7 +942,7 @@ public sealed class LlmSessionRegistryIntegrationTests
 
             // The remaining EnsureConnected-guarded public operations must also throw pre-connect.
             await Assert.ThrowsAsync<InvalidOperationException>(
-                () => brain.UpdateModelAsync("copilot/other-model", null, TestContext.Current.CancellationToken));
+                () => brain.UpdateModelAsync("copilot/other-model", null, null, TestContext.Current.CancellationToken));
             await Assert.ThrowsAsync<InvalidOperationException>(
                 () => brain.InjectSystemNoteAsync(pipeline, "note", TestContext.Current.CancellationToken));
             await Assert.ThrowsAsync<InvalidOperationException>(
@@ -1998,10 +1998,7 @@ file sealed class RegisterTrackingBrain(bool sessionExists) : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
-    public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
-        UpdateModelAsync(model, maxContextTokens, ct);
-
-    public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) => Task.CompletedTask;
+    public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) => Task.CompletedTask;
 
     public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
         Task.FromResult(PlanResult.Success(IterationPlan.Default()));
