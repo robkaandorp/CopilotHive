@@ -691,7 +691,7 @@ public class DistributedBrainShadowTests
             var sessionRegistry = new LlmSessionRegistry();
 
             var brain = new DistributedBrain(
-                "copilot/test-model:high",
+                "copilot/test-model",
                 NullLogger<DistributedBrain>.Instance,
                 maxSteps: 42,
                 repoManager: repoManager,
@@ -701,7 +701,8 @@ public class DistributedBrainShadowTests
                 compactionModel: null,
                 knowledgeGraph: knowledgeGraph,
                 hiveConfig: hiveConfig,
-                sessionRegistry: sessionRegistry);
+                sessionRegistry: sessionRegistry,
+                reasoningEffort: ReasoningEffort.High);
             await using (brain)
             {
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
@@ -738,7 +739,7 @@ public class DistributedBrainShadowTests
                 var actorSystemPrompt = GetField<string?>(a, "_systemPrompt");
                 Assert.NotNull(actorSystemPrompt);
 
-                // _reasoningEffort should be High (from "copilot/test-model:high").
+                // _reasoningEffort should be High (from the explicitly configured value).
                 var actorReasoning = GetField<ReasoningEffort?>(a, "_reasoningEffort");
                 Assert.Equal(ReasoningEffort.High, actorReasoning);
 

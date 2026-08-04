@@ -277,7 +277,7 @@ public sealed class ComposerAgentServiceTests
     };
 
     [Fact]
-    public async Task ConfiguredReasoningEffort_OverridesModelSuffix_AtConstruction()
+    public async Task ConfiguredReasoningEffort_IsUsed_AtConstruction()
     {
         var stateDir = CreateTempDir();
         try
@@ -293,7 +293,7 @@ public sealed class ComposerAgentServiceTests
 
             await using (service)
             {
-                // The effective value is the configured one, not the ':low' suffix.
+                // The effective value is the configured one; the ':low' colon segment is part of the name.
                 Assert.Equal(ReasoningEffort.High, service.ReasoningEffort);
                 Assert.Equal(ReasoningEffort.High, GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
             }
@@ -304,8 +304,12 @@ public sealed class ComposerAgentServiceTests
         }
     }
 
+    /// <summary>
+    /// Without a configured value the reasoning effort stays unset — a ':low' segment in the
+    /// model name is never a source of reasoning effort.
+    /// </summary>
     [Fact]
-    public async Task NoConfiguredReasoningEffort_UsesModelSuffix_AtConstruction()
+    public async Task NoConfiguredReasoningEffort_LeavesReasoningUnset_AtConstruction()
     {
         var stateDir = CreateTempDir();
         try
@@ -320,7 +324,7 @@ public sealed class ComposerAgentServiceTests
 
             await using (service)
             {
-                Assert.Equal(ReasoningEffort.Low, service.ReasoningEffort);
+                Assert.Null(service.ReasoningEffort);
                 Assert.Null(GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
             }
         }
@@ -350,7 +354,7 @@ public sealed class ComposerAgentServiceTests
                 await service.ConnectAsync(TestContext.Current.CancellationToken);
                 Assert.Equal(ReasoningEffort.High, service.ReasoningEffort);
 
-                // The new model carries a ':low' suffix, but the configured value must survive.
+                // The new model name ends in ':low', but the configured value must survive.
                 await service.SwitchModelAsync("model-b:low");
 
                 Assert.Equal(ReasoningEffort.High, service.ReasoningEffort);
@@ -364,7 +368,7 @@ public sealed class ComposerAgentServiceTests
     }
 
     [Fact]
-    public async Task SwitchModelAsync_WithoutConfiguredReasoningEffort_FallsBackToSuffixParsing()
+    public async Task SwitchModelAsync_WithoutConfiguredReasoningEffort_StaysUnset()
     {
         var stateDir = CreateTempDir();
         try
@@ -384,8 +388,8 @@ public sealed class ComposerAgentServiceTests
 
                 await service.SwitchModelAsync("model-b:low");
 
-                Assert.Equal(ReasoningEffort.Low, service.ReasoningEffort);
-                // Suffix-derived reasoning is never promoted to "configured".
+                // No suffix parsing: the reasoning effort remains unset.
+                Assert.Null(service.ReasoningEffort);
                 Assert.Null(GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
             }
         }
@@ -396,7 +400,7 @@ public sealed class ComposerAgentServiceTests
     }
 
     [Fact]
-    public async Task SwitchModelAsync_SuffixReasoning_NotRetainedAcrossSubsequentSwitch()
+    public async Task SwitchModelAsync_NoReasoningDerivedFromModelName_AcrossSwitches()
     {
         var stateDir = CreateTempDir();
         try
@@ -412,11 +416,9 @@ public sealed class ComposerAgentServiceTests
             await using (service)
             {
                 await service.ConnectAsync(TestContext.Current.CancellationToken);
-                // Suffix-derived at construction.
-                Assert.Equal(ReasoningEffort.Low, service.ReasoningEffort);
+                // No configured value → unset, even though the model name ends in ':low'.
+                Assert.Null(service.ReasoningEffort);
 
-                // Switching to a suffix-free model clears the reasoning: the suffix-derived value
-                // was never "configured" and must not be carried over.
                 await service.SwitchModelAsync("model-a");
 
                 Assert.Null(service.ReasoningEffort);
@@ -532,8 +534,11 @@ public sealed class ComposerAgentServiceTests
 
     // ── 8. AvailableModels live config projection ──
 
+    /// <summary>
+    /// The catalog exposes plain model names only — <c>reasoning_effort</c> is never appended.
+    /// </summary>
     [Fact]
-    public void AvailableModels_WithHiveConfig_ProjectsCompositeStrings()
+    public void AvailableModels_WithHiveConfig_ProjectsPlainModelNames()
     {
         var stateDir = CreateTempDir();
         try
@@ -556,7 +561,7 @@ public sealed class ComposerAgentServiceTests
             var models = service.AvailableModels;
 
             Assert.Equal(3, models.Count);
-            Assert.Equal("model-with-effort:high", models[0]);
+            Assert.Equal("model-with-effort", models[0]);
             Assert.Equal("model-without-effort", models[1]);
             Assert.Equal("model-empty-effort", models[2]);
         }

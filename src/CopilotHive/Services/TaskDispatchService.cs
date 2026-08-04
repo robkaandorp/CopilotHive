@@ -92,10 +92,9 @@ internal sealed class TaskDispatchService
         //   1. WorkerConfig.PremiumReasoningEffort — when the phase requested the premium tier AND
         //      a premium model is actually configured for this role.
         //   2. WorkerConfig.ReasoningEffort — otherwise.
-        //   3. Legacy per-model lookup (available_models entry) when neither is set.
         //
         // The parsed enum is transported on the WorkTask and is authoritative for the worker.
-        // The legacy ":suffix" mechanism still runs, but receives a canonicalized (lowercase) value.
+        // The model name always stays plain — reasoning is never baked into it.
         ReasoningEffort? effectiveReasoning = null;
         if (_config is not null && model is not null)
         {
@@ -106,13 +105,20 @@ internal sealed class TaskDispatchService
                 ? workerConfig?.PremiumReasoningEffort
                 : workerConfig?.ReasoningEffort;
 
-            if (string.IsNullOrWhiteSpace(effortString))
-                effortString = _config.TryGetReasoningEffortForModel(model);
-
-            effectiveReasoning = ReasoningEffortConverter.Parse(effortString);
-
-            // Canonicalize before applying the suffix so " High " becomes "high".
-            model = HiveConfigFile.ApplyReasoningSuffix(model, ReasoningEffortConverter.Format(effectiveReasoning));
+            // Startup validates reasoning efforts, but dynamic config reloads deliberately do
+            // not re-validate. An invalid value must degrade to "unset" rather than fail the
+            // dispatch (and the goal) with an unhandled ArgumentException.
+            try
+            {
+                effectiveReasoning = ReasoningEffortConverter.Parse(effortString);
+            }
+            catch (ArgumentException)
+            {
+                _logger.LogWarning(
+                    "Invalid reasoning_effort '{Effort}' configured for role {Role}; dispatching with reasoning effort unset.",
+                    effortString, roleName);
+                effectiveReasoning = null;
+            }
         }
 
         _logger.LogDebug("Model for {Role}: {Model} (tier={Tier}, configLoaded={ConfigLoaded})",

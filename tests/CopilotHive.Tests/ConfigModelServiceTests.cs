@@ -394,10 +394,14 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.Null(model.ReasoningEffort);
     }
 
-    // ── AddAvailableModelAsync suffix-stripping tests ─────────────────────────
+    // ── AddAvailableModelAsync plain-name tests ───────────────────────────────
 
+    /// <summary>
+    /// Model names are stored verbatim — a trailing <c>:high</c> is no longer stripped,
+    /// and no reasoning effort is ever persisted on an available model.
+    /// </summary>
     [Fact]
-    public async Task AddAvailableModelAsync_StripsKnownSuffix_FromName_WithoutStoringReasoningEffort()
+    public async Task AddAvailableModelAsync_LegacySuffix_StoredVerbatim_WithoutReasoningEffort()
     {
         var config = new HiveConfigFile
         {
@@ -410,7 +414,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         await svc.AddAvailableModelAsync("copilot/claude-sonnet-4.6:high", null, null, ct: TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.AvailableModels!);
-        Assert.Equal("copilot/claude-sonnet-4.6", model.Name);
+        Assert.Equal("copilot/claude-sonnet-4.6:high", model.Name);
         Assert.Null(model.ReasoningEffort);
     }
 
@@ -446,7 +450,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         await svc.AddAvailableModelAsync("model:high", null, "low", ct: TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.AvailableModels!);
-        Assert.Equal("model", model.Name);
+        Assert.Equal("model:high", model.Name);
         // The reasoningEffort argument is accepted for signature compatibility but not persisted.
         Assert.Null(model.ReasoningEffort);
     }
@@ -1430,14 +1434,18 @@ public sealed class ConfigModelServiceTests : IDisposable
         await File.ReadAllTextAsync(
             Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
 
+    /// <summary>
+    /// The reasoning effort comes exclusively from the explicit request field, and the model
+    /// name is persisted plain. A name carrying a legacy suffix is NOT a source of reasoning.
+    /// </summary>
     [Fact]
-    public async Task AddSubAgentModelAsync_StripsReasoningSuffix_AndPersistsToYaml()
+    public async Task AddSubAgentModelAsync_UsesExplicitReasoningEffort_AndPersistsToYaml()
     {
         var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddSubAgentModelAsync("copilot/test-model:high", 64000, null, "Research helper",
+        await svc.AddSubAgentModelAsync("copilot/test-model", 64000, "high", "Research helper",
             TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.SubAgentModels!);
@@ -1450,6 +1458,68 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.DoesNotContain("copilot/test-model:high", yaml, StringComparison.Ordinal);
         Assert.Contains("reasoning_effort: high", yaml, StringComparison.Ordinal);
         Assert.Contains("Research helper", yaml, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A model name carrying a legacy <c>:high</c> suffix is stored verbatim and, with no
+    /// explicit reasoning effort supplied, no reasoning effort is persisted.
+    /// </summary>
+    [Fact]
+    public async Task AddSubAgentModelAsync_LegacySuffixInName_NotUsedAsReasoningSource()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddSubAgentModelAsync("copilot/test-model:high", 64000, null, "Research helper",
+            TestContext.Current.CancellationToken);
+
+        var model = Assert.Single(config.Models!.SubAgentModels!);
+        Assert.Equal("copilot/test-model:high", model.Name);
+        Assert.Null(model.ReasoningEffort);
+    }
+
+    /// <summary>
+    /// A sloppy explicit value is canonicalized before persistence.
+    /// </summary>
+    [Fact]
+    public async Task AddSubAgentModelAsync_CanonicalizesExplicitReasoningEffort()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddSubAgentModelAsync("copilot/test-model", 64000, "  High ", null,
+            TestContext.Current.CancellationToken);
+
+        var model = Assert.Single(config.Models!.SubAgentModels!);
+        Assert.Equal("high", model.ReasoningEffort);
+    }
+
+    /// <summary>
+    /// An unrecognised reasoning effort is rejected with an <see cref="ArgumentException"/>
+    /// (which the ConfigHub endpoint maps to a 400), and nothing is persisted or committed.
+    /// </summary>
+    [Theory]
+    [InlineData("turbo")]
+    [InlineData("HIGHEST")]
+    [InlineData("1")]
+    public async Task AddSubAgentModelAsync_InvalidReasoningEffort_ThrowsArgumentException(string effort)
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            svc.AddSubAgentModelAsync("copilot/test-model", 64000, effort, null,
+                TestContext.Current.CancellationToken));
+
+        // The message names the rejected value and the allowed set.
+        Assert.Contains(effort, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("extra_high", ex.Message, StringComparison.Ordinal);
+
+        // Validation happens before mutation — no entry was added.
+        Assert.True(config.Models?.SubAgentModels is null or { Count: 0 });
     }
 
     [Fact]

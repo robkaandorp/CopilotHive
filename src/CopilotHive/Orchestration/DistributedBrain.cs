@@ -32,8 +32,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private ReasoningEffort? _reasoningEffort;
 
     /// <summary>
-    /// The explicitly configured reasoning effort (from configuration, not derived from a model
-    /// name suffix). When non-null it takes precedence over <see cref="_reasoningEffort"/>.
+    /// The explicitly configured reasoning effort. Mirrors <see cref="_reasoningEffort"/>,
+    /// which is kept in sync with it.
     /// </summary>
     private ReasoningEffort? _configuredReasoningEffort;
     private readonly ILogger<DistributedBrain> _logger;
@@ -120,9 +120,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _sessionRegistry = sessionRegistry;
         _configRepo = configRepo;
         _configuredReasoningEffort = reasoningEffort;
-
-        var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(modelOverride);
-        _reasoningEffort = reasoning;
+        _reasoningEffort = reasoningEffort;
 
         var subAgentCatalog = _hiveConfig?.GetSubAgentModels() ?? [];
         _subAgentModels = subAgentCatalog.Count == 0
@@ -423,8 +421,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             if (maxContextTokens.HasValue)
                 _maxContextTokens = maxContextTokens.Value;
 
-            _reasoningEffort = _configuredReasoningEffort
-                ?? ChatClientFactory.ParseProviderModelAndReasoning(model).reasoning;
+            _reasoningEffort = _configuredReasoningEffort;
 
             _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
             {

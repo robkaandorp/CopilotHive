@@ -360,18 +360,9 @@ public sealed class SharpCoderRunner : IAgentRunner
 
     public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
     {
-        if (reasoningEffort.HasValue)
-        {
-            // Explicit reasoning effort from the orchestrator is authoritative — it overrides
-            // any reasoning suffix embedded in the model name.
-            _currentReasoning = reasoningEffort;
-        }
-        else
-        {
-            // Legacy fallback: derive reasoning effort from the model-name suffix.
-            var (_, _, parsedReasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
-            _currentReasoning = parsedReasoning;
-        }
+        // Reasoning effort is transported explicitly by the orchestrator; it is never derived
+        // from the model name.
+        _currentReasoning = reasoningEffort;
 
         _log.Info($"Resetting session. Requested model: {model ?? "default"}" +
             (_currentReasoning.HasValue ? $", reasoning={_currentReasoning.Value}" : ", reasoning=(none)"));
@@ -616,7 +607,7 @@ public sealed class SharpCoderRunner : IAgentRunner
 
     private IChatClient CreateChatClient(string? modelOverride = null)
     {
-        var (provider, model, _) = ChatClientFactory.ParseProviderModelAndReasoning(modelOverride);
+        var (provider, model) = ChatClientFactory.ParseProviderAndModel(modelOverride);
         _currentModel = model ?? "(default)";
         _log.Info($"Creating chat client: provider={provider}, model={_currentModel}" +
             (_currentReasoning.HasValue ? $", reasoning={_currentReasoning.Value}" : ""));

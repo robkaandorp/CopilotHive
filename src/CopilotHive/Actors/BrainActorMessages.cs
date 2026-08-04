@@ -27,8 +27,8 @@ internal sealed record UpdateModelMessage(
     : IBrainMessage
 {
     /// <summary>
-    /// The explicitly configured reasoning effort. When <c>null</c>, the actor falls back to
-    /// legacy suffix parsing of <see cref="Model"/>.
+    /// The explicitly configured reasoning effort. When <c>null</c>, the actor clears its
+    /// reasoning effort (unset).
     /// </summary>
     public ReasoningEffort? ReasoningEffort { get; init; }
 }

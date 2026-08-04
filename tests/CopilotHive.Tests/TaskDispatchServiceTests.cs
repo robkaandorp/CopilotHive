@@ -140,10 +140,14 @@ public sealed class TaskDispatchServiceTests
         Assert.Equal("standard-coder-model", capturedTask!.Model);
     }
 
-    // ── DispatchToRole: reasoning suffix ──────────────────────────────────
+    // ── DispatchToRole: model names are always plain ──────────────────────
 
+    /// <summary>
+    /// An <c>available_models</c> reasoning effort is never appended to the dispatched model
+    /// name, and it is no longer used as a fallback source for the transported effort.
+    /// </summary>
     [Fact]
-    public async Task DispatchToRole_WhenModelHasReasoningEffort_AppliesSuffixToDispatchedModel()
+    public async Task DispatchToRole_WhenAvailableModelHasReasoningEffort_DispatchesPlainModelName()
     {
         var config = CreateConfig();
         config.Workers["coder"] = new WorkerConfig { Model = "standard-coder-model" };
@@ -164,7 +168,8 @@ public sealed class TaskDispatchServiceTests
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
 
         Assert.NotNull(capturedTask);
-        Assert.Equal("standard-coder-model:high", capturedTask!.Model);
+        Assert.Equal("standard-coder-model", capturedTask!.Model);
+        Assert.Null(capturedTask.ReasoningEffort);
     }
 
     [Fact]
@@ -195,8 +200,8 @@ public sealed class TaskDispatchServiceTests
     // ── DispatchToRole: reasoning effort transport ────────────────────────
 
     /// <summary>
-    /// A per-role <c>reasoning_effort</c> in WorkerConfig must both be transported as an enum on
-    /// the WorkTask (authoritative for the worker) and applied as a legacy model-name suffix.
+    /// A per-role <c>reasoning_effort</c> in WorkerConfig is transported as an enum on the
+    /// WorkTask (authoritative for the worker); the model name stays plain.
     /// </summary>
     [Fact]
     public async Task DispatchToRole_WhenWorkerConfigReasoningEffortSet_TransportsEnum()
@@ -218,7 +223,7 @@ public sealed class TaskDispatchServiceTests
 
         Assert.NotNull(capturedTask);
         Assert.Equal(ReasoningEffort.High, capturedTask!.ReasoningEffort);
-        Assert.Equal("standard-coder-model:high", capturedTask.Model);
+        Assert.Equal("standard-coder-model", capturedTask.Model);
     }
 
     /// <summary>
@@ -247,7 +252,7 @@ public sealed class TaskDispatchServiceTests
 
         Assert.NotNull(capturedTask);
         Assert.Equal(ReasoningEffort.Medium, capturedTask!.ReasoningEffort);
-        Assert.Equal("premium-coder-model:medium", capturedTask.Model);
+        Assert.Equal("premium-coder-model", capturedTask.Model);
     }
 
     /// <summary>
@@ -276,7 +281,7 @@ public sealed class TaskDispatchServiceTests
 
         Assert.NotNull(capturedTask);
         Assert.Equal(ReasoningEffort.Low, capturedTask!.ReasoningEffort);
-        Assert.Equal("standard-coder-model:low", capturedTask.Model);
+        Assert.Equal("standard-coder-model", capturedTask.Model);
     }
 
     /// <summary>
@@ -306,7 +311,7 @@ public sealed class TaskDispatchServiceTests
 
         Assert.NotNull(capturedTask);
         // The dispatched model must be the standard model — never the whitespace premium value.
-        Assert.Equal("standard-coder-model:low", capturedTask!.Model);
+        Assert.Equal("standard-coder-model", capturedTask!.Model);
         Assert.False(string.IsNullOrWhiteSpace(capturedTask.Model));
         // And the standard effort applies, not the premium one.
         Assert.Equal(ReasoningEffort.Low, capturedTask.ReasoningEffort);
@@ -340,11 +345,11 @@ public sealed class TaskDispatchServiceTests
     }
 
     /// <summary>
-    /// With no per-role effort configured, the legacy per-model <c>available_models</c> lookup
-    /// still supplies the effort — and it is now also transported as an enum.
+    /// With no per-role effort configured, nothing is transported — the per-model
+    /// <c>available_models</c> reasoning effort is no longer a fallback source.
     /// </summary>
     [Fact]
-    public async Task DispatchToRole_WhenWorkerConfigEffortNull_FallsBackToTryGetReasoningEffortForModel()
+    public async Task DispatchToRole_WhenWorkerConfigEffortNull_TransportsNullAndDoesNotUseAvailableModels()
     {
         var config = CreateConfig();
         config.Workers["coder"] = new WorkerConfig
@@ -369,15 +374,15 @@ public sealed class TaskDispatchServiceTests
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
 
         Assert.NotNull(capturedTask);
-        Assert.Equal(ReasoningEffort.High, capturedTask!.ReasoningEffort);
-        Assert.Equal("standard-coder-model:high", capturedTask.Model);
+        Assert.Null(capturedTask!.ReasoningEffort);
+        Assert.Equal("standard-coder-model", capturedTask.Model);
     }
 
     /// <summary>
-    /// A whitespace-only per-role effort is treated as unset and falls through to the model lookup.
+    /// A whitespace-only per-role effort is treated as unset; no fallback source exists.
     /// </summary>
     [Fact]
-    public async Task DispatchToRole_WhenWorkerConfigEffortWhitespace_FallsBackToTryGetReasoningEffortForModel()
+    public async Task DispatchToRole_WhenWorkerConfigEffortWhitespace_TransportsNull()
     {
         var config = CreateConfig();
         config.Workers["coder"] = new WorkerConfig
@@ -402,16 +407,16 @@ public sealed class TaskDispatchServiceTests
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
 
         Assert.NotNull(capturedTask);
-        Assert.Equal(ReasoningEffort.High, capturedTask!.ReasoningEffort);
-        Assert.Equal("standard-coder-model:high", capturedTask.Model);
+        Assert.Null(capturedTask!.ReasoningEffort);
+        Assert.Equal("standard-coder-model", capturedTask.Model);
     }
 
     /// <summary>
-    /// The configured effort string is parsed then re-formatted before being appended as a suffix,
-    /// so sloppy YAML values like <c>"  High "</c> never leak into the dispatched model name.
+    /// A sloppy YAML value like <c>"  High "</c> is parsed into the canonical enum and the
+    /// dispatched model name stays plain.
     /// </summary>
     [Fact]
-    public async Task DispatchToRole_CanonicalizesEffortBeforeSuffix()
+    public async Task DispatchToRole_CanonicalizesEffort_AndKeepsModelNamePlain()
     {
         var config = CreateConfig();
         config.Workers["coder"] = new WorkerConfig
@@ -430,17 +435,16 @@ public sealed class TaskDispatchServiceTests
 
         Assert.NotNull(capturedTask);
         Assert.Equal(ReasoningEffort.High, capturedTask!.ReasoningEffort);
-        Assert.Equal("standard-coder-model:high", capturedTask.Model);
-        Assert.DoesNotContain("High", capturedTask.Model, StringComparison.Ordinal);
+        Assert.Equal("standard-coder-model", capturedTask.Model);
+        Assert.DoesNotContain(":", capturedTask.Model, StringComparison.Ordinal);
     }
 
     /// <summary>
-    /// <see cref="HiveConfigFile.ApplyReasoningSuffix"/> preserves an explicit suffix already present
-    /// on the model name, so the dispatched model keeps <c>:low</c>. The transported enum, however,
-    /// reflects the configured per-role effort — and that is what the worker actually applies.
+    /// A colon in the configured model name is part of the name (e.g. an Ollama tag) and is
+    /// dispatched verbatim. The configured per-role effort is transported separately.
     /// </summary>
     [Fact]
-    public async Task DispatchToRole_WhenModelHasExistingSuffixAndConfigEffortDiffers_TransportedValueWins()
+    public async Task DispatchToRole_WhenModelNameContainsColon_DispatchedVerbatim()
     {
         var config = CreateConfig();
         config.Workers["coder"] = new WorkerConfig
@@ -465,9 +469,7 @@ public sealed class TaskDispatchServiceTests
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
 
         Assert.NotNull(capturedTask);
-        // Existing suffix is preserved by ApplyReasoningSuffix...
         Assert.Equal("test-model:low", capturedTask!.Model);
-        // ...but the explicitly transported effort is authoritative for the worker.
         Assert.Equal(ReasoningEffort.High, capturedTask.ReasoningEffort);
     }
 
@@ -494,7 +496,7 @@ public sealed class TaskDispatchServiceTests
 
     /// <summary>
     /// When no model is resolved for the role, the effort-derivation block is skipped entirely and
-    /// the WorkTask carries <c>null</c> — the worker then falls back to model-suffix behaviour.
+    /// the WorkTask carries <c>null</c>.
     /// </summary>
     [Fact]
     public async Task DispatchToRole_WhenNoModelForRole_TransportsNullReasoningEffort()
@@ -520,7 +522,7 @@ public sealed class TaskDispatchServiceTests
 
     /// <summary>
     /// A role with no WorkerConfig entry at all must not throw — both effort fields are treated
-    /// as unset and the legacy model lookup applies.
+    /// as unset and nothing is transported.
     /// </summary>
     [Fact]
     public async Task DispatchToRole_WhenRoleMissingFromWorkersConfig_TransportsNullReasoningEffort()
@@ -565,6 +567,67 @@ public sealed class TaskDispatchServiceTests
         Assert.NotNull(capturedTask);
         Assert.Null(capturedTask!.ReasoningEffort);
         Assert.Equal("standard-coder-model", capturedTask.Model);
+    }
+
+    /// <summary>
+    /// Startup validates reasoning efforts, but dynamic config reloads deliberately do not
+    /// re-validate. An invalid value must therefore degrade to "unset" and still dispatch,
+    /// rather than throwing an unhandled <see cref="ArgumentException"/> and failing the goal.
+    /// </summary>
+    [Theory]
+    [InlineData("turbo")]
+    [InlineData("HIGHEST")]
+    [InlineData("1")]
+    public async Task DispatchToRole_WhenConfiguredEffortInvalid_DispatchesWithNullEffort(string effort)
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig
+        {
+            Model = "standard-coder-model",
+            ReasoningEffort = effort,
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        // The dispatch succeeded (no exception) and the invalid effort was treated as unset.
+        Assert.NotNull(capturedTask);
+        Assert.Null(capturedTask!.ReasoningEffort);
+        Assert.Equal("standard-coder-model", capturedTask.Model);
+        Assert.NotEqual(GoalPhase.Failed, pipeline.Phase);
+    }
+
+    /// <summary>
+    /// The same leniency applies to an invalid premium reasoning effort on the premium tier.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenPremiumEffortInvalid_DispatchesWithNullEffort()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig
+        {
+            Model = "standard-coder-model",
+            PremiumModel = "premium-coder-model",
+            PremiumReasoningEffort = "turbo",
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Premium);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Null(capturedTask!.ReasoningEffort);
+        Assert.Equal("premium-coder-model", capturedTask.Model);
+        Assert.NotEqual(GoalPhase.Failed, pipeline.Phase);
     }
 
     // ── DispatchToRole: compaction model metadata ─────────────────────────
@@ -1253,7 +1316,9 @@ public sealed class TaskDispatchServiceTests
 
         Assert.NotNull(capturedTask);
         Assert.Single(capturedTask!.SubAgentModels);
-        // The dispatched model gets the reasoning suffix, but the catalog ID must NOT.
+        // Model names are always plain — neither the dispatched model nor the catalog ID
+        // carries a reasoning suffix.
+        Assert.Equal("my-model", capturedTask.Model);
         Assert.Equal("my-model", capturedTask.SubAgentModels[0].Id);
     }
 

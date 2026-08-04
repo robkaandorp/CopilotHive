@@ -2,6 +2,8 @@ using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Orchestration;
 
+using Microsoft.Extensions.AI;
+
 namespace CopilotHive.Services;
 
 /// <summary>
@@ -128,32 +130,6 @@ public sealed class ConfigModelService
     private readonly SemaphoreSlim _saveLock = new(1, 1);
 
     /// <summary>
-    /// Known reasoning effort levels recognised as model-name suffixes (e.g. <c>:high</c>).
-    /// Mirrors the set in <see cref="HiveConfigFile"/> (which is private there).
-    /// </summary>
-    private static readonly HashSet<string> KnownReasoningLevels = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "none", "low", "medium", "high", "extra_high"
-    };
-
-    /// <summary>
-    /// Strips a known reasoning-effort suffix (e.g. <c>:high</c>) from a model name.
-    /// Returns the cleaned name and the extracted suffix (or <c>null</c> when no known suffix exists).
-    /// </summary>
-    /// <param name="name">Model name that may carry a reasoning suffix.</param>
-    private static (string CleanName, string? Suffix) StripReasoningSuffix(string name)
-    {
-        var lastColon = name.LastIndexOf(':');
-        if (lastColon > 0 && lastColon < name.Length - 1)
-        {
-            var suffix = name.Substring(lastColon + 1);
-            if (KnownReasoningLevels.Contains(suffix))
-                return (name.Substring(0, lastColon), suffix);
-        }
-        return (name, null);
-    }
-
-    /// <summary>
     /// Initialises a new <see cref="ConfigModelService"/>.
     /// </summary>
     /// <param name="config">The live <see cref="HiveConfigFile"/> singleton.</param>
@@ -219,6 +195,27 @@ public sealed class ConfigModelService
         if (string.IsNullOrWhiteSpace(value))
             return null;
         return ReasoningEffortConverter.Format(ReasoningEffortConverter.Parse(value));
+    }
+
+    /// <summary>
+    /// Parses a reasoning-effort value leniently for non-validating paths: an unrecognised
+    /// value degrades to <c>null</c> (unset) instead of throwing. Used after persistence has
+    /// already succeeded, where an exception would surface as a misleading client error.
+    /// </summary>
+    /// <param name="value">Raw reasoning-effort value.</param>
+    /// <returns>The parsed effort, or <c>null</c> when unset or invalid.</returns>
+    private ReasoningEffort? TryParseReasoning(string? value)
+    {
+        try
+        {
+            return ReasoningEffortConverter.Parse(value);
+        }
+        catch (ArgumentException)
+        {
+            _logger.LogWarning(
+                "Invalid reasoning effort '{Effort}' in configuration; treating it as unset.", value);
+            return null;
+        }
     }
 
     /// <summary>
@@ -439,9 +436,12 @@ public sealed class ConfigModelService
                 if (finalContextWindow is null or <= 0)
                     finalContextWindow = Constants.DefaultBrainContextWindow;
 
-                var finalReasoning = update.OrchestratorReasoningEffort is not null
-                    ? ReasoningEffortConverter.Parse(update.OrchestratorReasoningEffort)
-                    : ReasoningEffortConverter.Parse(_config.Orchestrator.ReasoningEffort);
+                // Persistence already succeeded, so nothing here may throw back to the caller —
+                // an ArgumentException would surface as a misleading 400 for a saved config.
+                // The update value was validated in step 1; the fallback reads persisted config,
+                // which a dynamic reload can leave unvalidated, so parse it leniently.
+                var finalReasoning = TryParseReasoning(
+                    update.OrchestratorReasoningEffort ?? _config.Orchestrator.ReasoningEffort);
 
                 try
                 {
@@ -486,9 +486,6 @@ public sealed class ConfigModelService
     {
         _config.Models ??= new ModelsConfig();
         _config.Models.AvailableModels ??= new List<ModelEntry>();
-
-        var (cleanName, _) = StripReasoningSuffix(name);
-        name = cleanName;
 
         if (_config.Models.AvailableModels.Any(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)))
             throw new InvalidOperationException($"Model '{name}' already exists in available_models");
@@ -598,9 +595,22 @@ public sealed class ConfigModelService
         _config.Models ??= new ModelsConfig();
         _config.Models.SubAgentModels ??= new List<ModelEntry>();
 
-        var (cleanName, extractedSuffix) = StripReasoningSuffix(name);
-        name = cleanName;
-        var effectiveReasoningEffort = reasoningEffort ?? extractedSuffix;
+        // Reasoning effort comes exclusively from the explicit request field; the model
+        // name is stored plain. An unrecognised value is a client error, so it is reported
+        // as an ArgumentException the endpoint turns into a 400 (never an unhandled 500).
+        string? effectiveReasoningEffort;
+        try
+        {
+            effectiveReasoningEffort = ReasoningEffortConverter.Format(
+                ReasoningEffortConverter.Parse(reasoningEffort));
+        }
+        catch (ArgumentException)
+        {
+            throw new ArgumentException(
+                $"Invalid reasoning effort value: '{reasoningEffort}'. " +
+                "Allowed values are: none, low, medium, high, extra_high (or empty to clear).",
+                nameof(reasoningEffort));
+        }
 
         if (_config.Models.SubAgentModels.Any(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)))
             throw new InvalidOperationException($"Model '{name}' already exists in sub_agent_models");

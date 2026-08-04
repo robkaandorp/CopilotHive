@@ -702,151 +702,6 @@ public sealed class HiveConfigFileTests
         Assert.Equal("global-only-model", result[0]);
     }
 
-    // ── TryGetReasoningEffortForModel tests ──────────────────────────────────
-
-    [Fact]
-    public void TryGetReasoningEffortForModel_ModelWithReasoningEffort_ReturnsValue()
-    {
-        var config = new HiveConfigFile
-        {
-            Models = new ModelsConfig
-            {
-                AvailableModels =
-                [
-                    new ModelEntry { Name = "copilot/claude-sonnet-4.6", ReasoningEffort = "high" }
-                ]
-            }
-        };
-
-        Assert.Equal("high", config.TryGetReasoningEffortForModel("copilot/claude-sonnet-4.6"));
-    }
-
-    [Fact]
-    public void TryGetReasoningEffortForModel_CaseInsensitive_ReturnsValue()
-    {
-        var config = new HiveConfigFile
-        {
-            Models = new ModelsConfig
-            {
-                AvailableModels =
-                [
-                    new ModelEntry { Name = "copilot/claude-sonnet-4.6", ReasoningEffort = "medium" }
-                ]
-            }
-        };
-
-        Assert.Equal("medium", config.TryGetReasoningEffortForModel("COPILOT/CLAUDE-SONNET-4.6"));
-    }
-
-    [Fact]
-    public void TryGetReasoningEffortForModel_NullInput_ReturnsNull()
-    {
-        var config = new HiveConfigFile
-        {
-            Models = new ModelsConfig
-            {
-                AvailableModels = [new ModelEntry { Name = "model-a", ReasoningEffort = "high" }]
-            }
-        };
-
-        Assert.Null(config.TryGetReasoningEffortForModel(null));
-    }
-
-    [Fact]
-    public void TryGetReasoningEffortForModel_ModelNotFound_ReturnsNull()
-    {
-        var config = new HiveConfigFile
-        {
-            Models = new ModelsConfig
-            {
-                AvailableModels = [new ModelEntry { Name = "model-a", ReasoningEffort = "high" }]
-            }
-        };
-
-        Assert.Null(config.TryGetReasoningEffortForModel("model-b"));
-    }
-
-    [Fact]
-    public void TryGetReasoningEffortForModel_ModelsNull_ReturnsNull()
-    {
-        var config = new HiveConfigFile { Models = null };
-
-        Assert.Null(config.TryGetReasoningEffortForModel("any-model"));
-    }
-
-    [Fact]
-    public void TryGetReasoningEffortForModel_NoReasoningEffortSet_ReturnsNull()
-    {
-        var config = new HiveConfigFile
-        {
-            Models = new ModelsConfig
-            {
-                AvailableModels = [new ModelEntry { Name = "model-a", ReasoningEffort = null }]
-            }
-        };
-
-        Assert.Null(config.TryGetReasoningEffortForModel("model-a"));
-    }
-
-    // ── ApplyReasoningSuffix tests ───────────────────────────────────────────
-
-    [Fact]
-    public void ApplyReasoningSuffix_WithReasoningEffort_AppendsSuffix()
-    {
-        var result = HiveConfigFile.ApplyReasoningSuffix("copilot/claude-sonnet-4.6", "high");
-
-        Assert.Equal("copilot/claude-sonnet-4.6:high", result);
-    }
-
-    [Fact]
-    public void ApplyReasoningSuffix_NullReasoningEffort_ReturnsUnchanged()
-    {
-        var result = HiveConfigFile.ApplyReasoningSuffix("copilot/claude-sonnet-4.6", null);
-
-        Assert.Equal("copilot/claude-sonnet-4.6", result);
-    }
-
-    [Fact]
-    public void ApplyReasoningSuffix_EmptyReasoningEffort_ReturnsUnchanged()
-    {
-        var result = HiveConfigFile.ApplyReasoningSuffix("copilot/claude-sonnet-4.6", "");
-
-        Assert.Equal("copilot/claude-sonnet-4.6", result);
-    }
-
-    [Fact]
-    public void ApplyReasoningSuffix_ModelAlreadyHasKnownSuffix_DoesNotOverride()
-    {
-        // Explicit :suffix takes precedence over configured reasoning effort
-        var result = HiveConfigFile.ApplyReasoningSuffix("copilot/claude-sonnet-4.6:low", "high");
-
-        Assert.Equal("copilot/claude-sonnet-4.6:low", result);
-    }
-
-    [Fact]
-    public void ApplyReasoningSuffix_ModelHasUnknownSuffix_AppendsReasoning()
-    {
-        // A colon that is not a known reasoning level (e.g. a tag) should still get the reasoning suffix appended
-        var result = HiveConfigFile.ApplyReasoningSuffix("ollama/llama3.2:latest", "high");
-
-        Assert.Equal("ollama/llama3.2:latest:high", result);
-    }
-
-    [Theory]
-    [InlineData("none")]
-    [InlineData("low")]
-    [InlineData("medium")]
-    [InlineData("high")]
-    [InlineData("extra_high")]
-    public void ApplyReasoningSuffix_ExistingKnownSuffix_AllLevels_NotOverridden(string level)
-    {
-        var model = $"copilot/some-model:{level}";
-
-        var result = HiveConfigFile.ApplyReasoningSuffix(model, "high");
-
-        Assert.Equal(model, result);
-    }
-
     // ── TryGetContextWindowForModel tests (Brain & Composer resolution) ─────────
 
     [Fact]
@@ -1042,14 +897,14 @@ public sealed class HiveConfigFileTests
         Assert.Equal("copilot/test-model", config.Orchestrator.Model);
     }
 
-    // ── TryGetContextWindowForModel: reasoning suffix stripping ─────────────────
+    // ── TryGetContextWindowForModel: plain model-name lookup ───────────────────
 
     /// <summary>
-    /// A model name with a <c>:high</c> suffix should resolve to the same context
-    /// window as the bare name — the suffix is stripped before matching.
+    /// Model names are matched verbatim: a legacy <c>:high</c> suffix is no longer stripped,
+    /// so a suffixed name does not resolve to the bare entry.
     /// </summary>
     [Fact]
-    public void TryGetContextWindowForModel_HighSuffix_ReturnsContextWindow()
+    public void TryGetContextWindowForModel_LegacySuffix_NotStripped_ReturnsNull()
     {
         var config = new HiveConfigFile
         {
@@ -1062,45 +917,15 @@ public sealed class HiveConfigFileTests
             }
         };
 
-        Assert.Equal(200_000, config.TryGetContextWindowForModel("copilot/claude-sonnet-4.6:high"));
-        // Must equal the bare-name lookup
-        Assert.Equal(
-            config.TryGetContextWindowForModel("copilot/claude-sonnet-4.6"),
-            config.TryGetContextWindowForModel("copilot/claude-sonnet-4.6:high"));
+        Assert.Null(config.TryGetContextWindowForModel("copilot/claude-sonnet-4.6:high"));
+        Assert.Equal(200_000, config.TryGetContextWindowForModel("copilot/claude-sonnet-4.6"));
     }
 
     /// <summary>
-    /// Every known reasoning level suffix should be stripped and the correct context
-    /// window returned.
-    /// </summary>
-    [Theory]
-    [InlineData(":none")]
-    [InlineData(":low")]
-    [InlineData(":medium")]
-    [InlineData(":high")]
-    [InlineData(":extra_high")]
-    public void TryGetContextWindowForModel_AllKnownSuffixes_ReturnsContextWindow(string suffix)
-    {
-        const string modelName = "copilot/claude-sonnet-4.6";
-        var config = new HiveConfigFile
-        {
-            Models = new ModelsConfig
-            {
-                AvailableModels =
-                [
-                    new ModelEntry { Name = modelName, ContextWindow = 200_000 }
-                ]
-            }
-        };
-
-        Assert.Equal(200_000, config.TryGetContextWindowForModel(modelName + suffix));
-    }
-
-    /// <summary>
-    /// No suffix at all — existing behaviour must remain intact (regression check).
+    /// Plain model names resolve exactly, case-insensitively.
     /// </summary>
     [Fact]
-    public void TryGetContextWindowForModel_NoSuffix_ReturnsContextWindow()
+    public void TryGetContextWindowForModel_PlainName_ReturnsContextWindow()
     {
         var config = new HiveConfigFile
         {
@@ -1114,39 +939,14 @@ public sealed class HiveConfigFileTests
         };
 
         Assert.Equal(200_000, config.TryGetContextWindowForModel("copilot/claude-sonnet-4.6"));
+        Assert.Equal(200_000, config.TryGetContextWindowForModel("COPILOT/CLAUDE-SONNET-4.6"));
     }
 
     /// <summary>
-    /// Case-insensitive suffix stripping — <c>:HIGH</c>, <c>:High</c>, etc. should
-    /// all be stripped and resolve correctly.
-    /// </summary>
-    [Theory]
-    [InlineData(":HIGH")]
-    [InlineData(":High")]
-    public void TryGetContextWindowForModel_CaseInsensitiveSuffix_ReturnsContextWindow(string suffix)
-    {
-        const string modelName = "copilot/claude-sonnet-4.6";
-        var config = new HiveConfigFile
-        {
-            Models = new ModelsConfig
-            {
-                AvailableModels =
-                [
-                    new ModelEntry { Name = modelName, ContextWindow = 200_000 }
-                ]
-            }
-        };
-
-        Assert.Equal(200_000, config.TryGetContextWindowForModel(modelName + suffix));
-    }
-
-    /// <summary>
-    /// A non-reasoning colon suffix (e.g. a model tag like <c>:120b</c>) must NOT be
-    /// stripped — the lookup should fail and return null because the full name is not
-    /// in AvailableModels.
+    /// A model tag such as <c>:120b</c> is part of the name and must be matched verbatim.
     /// </summary>
     [Fact]
-    public void TryGetContextWindowForModel_NonReasoningColonSuffix_NotStripped()
+    public void TryGetContextWindowForModel_ModelTag_MatchedVerbatim()
     {
         var config = new HiveConfigFile
         {
@@ -1154,21 +954,20 @@ public sealed class HiveConfigFileTests
             {
                 AvailableModels =
                 [
-                    new ModelEntry { Name = "ollama-cloud/gpt-oss", ContextWindow = 128_000 }
+                    new ModelEntry { Name = "ollama-cloud/gpt-oss:120b", ContextWindow = 128_000 }
                 ]
             }
         };
 
-        // The full name with :120b is not in AvailableModels and :120b is not a
-        // reasoning level, so it should not be stripped → null.
-        Assert.Null(config.TryGetContextWindowForModel("ollama-cloud/gpt-oss:120b"));
+        Assert.Equal(128_000, config.TryGetContextWindowForModel("ollama-cloud/gpt-oss:120b"));
+        Assert.Null(config.TryGetContextWindowForModel("ollama-cloud/gpt-oss"));
     }
 
     /// <summary>
-    /// An unknown model carrying a reasoning suffix should still return null.
+    /// An unknown model returns null.
     /// </summary>
     [Fact]
-    public void TryGetContextWindowForModel_UnknownModelWithSuffix_ReturnsNull()
+    public void TryGetContextWindowForModel_UnknownModel_ReturnsNull()
     {
         var config = new HiveConfigFile
         {
@@ -1181,149 +980,7 @@ public sealed class HiveConfigFileTests
             }
         };
 
-        Assert.Null(config.TryGetContextWindowForModel("copilot/unknown-model:high"));
-    }
-
-    // ── TryGetReasoningEffortForModel: reasoning suffix stripping ───────────────
-
-    /// <summary>
-    /// A model name with a <c>:high</c> suffix should resolve to the same reasoning
-    /// effort as the bare name — the suffix is stripped before matching.
-    /// </summary>
-    [Fact]
-    public void TryGetReasoningEffortForModel_HighSuffix_ReturnsReasoningEffort()
-    {
-        var config = new HiveConfigFile
-        {
-            Models = new ModelsConfig
-            {
-                AvailableModels =
-                [
-                    new ModelEntry { Name = "copilot/claude-sonnet-4.6", ReasoningEffort = "high" }
-                ]
-            }
-        };
-
-        Assert.Equal("high", config.TryGetReasoningEffortForModel("copilot/claude-sonnet-4.6:high"));
-        // Must equal the bare-name lookup
-        Assert.Equal(
-            config.TryGetReasoningEffortForModel("copilot/claude-sonnet-4.6"),
-            config.TryGetReasoningEffortForModel("copilot/claude-sonnet-4.6:high"));
-    }
-
-    /// <summary>
-    /// Every known reasoning level suffix should be stripped and the correct reasoning
-    /// effort returned.
-    /// </summary>
-    [Theory]
-    [InlineData(":none")]
-    [InlineData(":low")]
-    [InlineData(":medium")]
-    [InlineData(":high")]
-    [InlineData(":extra_high")]
-    public void TryGetReasoningEffortForModel_AllKnownSuffixes_ReturnsReasoningEffort(string suffix)
-    {
-        const string modelName = "copilot/claude-sonnet-4.6";
-        var config = new HiveConfigFile
-        {
-            Models = new ModelsConfig
-            {
-                AvailableModels =
-                [
-                    new ModelEntry { Name = modelName, ReasoningEffort = "high" }
-                ]
-            }
-        };
-
-        Assert.Equal("high", config.TryGetReasoningEffortForModel(modelName + suffix));
-    }
-
-    /// <summary>
-    /// No suffix at all — existing behaviour must remain intact (regression check).
-    /// </summary>
-    [Fact]
-    public void TryGetReasoningEffortForModel_NoSuffix_ReturnsReasoningEffort()
-    {
-        var config = new HiveConfigFile
-        {
-            Models = new ModelsConfig
-            {
-                AvailableModels =
-                [
-                    new ModelEntry { Name = "copilot/claude-sonnet-4.6", ReasoningEffort = "medium" }
-                ]
-            }
-        };
-
-        Assert.Equal("medium", config.TryGetReasoningEffortForModel("copilot/claude-sonnet-4.6"));
-    }
-
-    /// <summary>
-    /// Case-insensitive suffix stripping — <c>:HIGH</c>, <c>:High</c>, etc. should
-    /// all be stripped and resolve correctly.
-    /// </summary>
-    [Theory]
-    [InlineData(":HIGH")]
-    [InlineData(":High")]
-    public void TryGetReasoningEffortForModel_CaseInsensitiveSuffix_ReturnsReasoningEffort(string suffix)
-    {
-        const string modelName = "copilot/claude-sonnet-4.6";
-        var config = new HiveConfigFile
-        {
-            Models = new ModelsConfig
-            {
-                AvailableModels =
-                [
-                    new ModelEntry { Name = modelName, ReasoningEffort = "high" }
-                ]
-            }
-        };
-
-        Assert.Equal("high", config.TryGetReasoningEffortForModel(modelName + suffix));
-    }
-
-    /// <summary>
-    /// A non-reasoning colon suffix (e.g. a model tag like <c>:120b</c>) must NOT be
-    /// stripped — the lookup should fail and return null because the full name is not
-    /// in AvailableModels.
-    /// </summary>
-    [Fact]
-    public void TryGetReasoningEffortForModel_NonReasoningColonSuffix_NotStripped()
-    {
-        var config = new HiveConfigFile
-        {
-            Models = new ModelsConfig
-            {
-                AvailableModels =
-                [
-                    new ModelEntry { Name = "ollama-cloud/gpt-oss", ReasoningEffort = "high" }
-                ]
-            }
-        };
-
-        // The full name with :120b is not in AvailableModels and :120b is not a
-        // reasoning level, so it should not be stripped → null.
-        Assert.Null(config.TryGetReasoningEffortForModel("ollama-cloud/gpt-oss:120b"));
-    }
-
-    /// <summary>
-    /// An unknown model carrying a reasoning suffix should still return null.
-    /// </summary>
-    [Fact]
-    public void TryGetReasoningEffortForModel_UnknownModelWithSuffix_ReturnsNull()
-    {
-        var config = new HiveConfigFile
-        {
-            Models = new ModelsConfig
-            {
-                AvailableModels =
-                [
-                    new ModelEntry { Name = "copilot/claude-sonnet-4.6", ReasoningEffort = "high" }
-                ]
-            }
-        };
-
-        Assert.Null(config.TryGetReasoningEffortForModel("copilot/unknown-model:high"));
+        Assert.Null(config.TryGetContextWindowForModel("copilot/unknown-model"));
     }
 
     // ── Description / SubAgentModels ─────────────────────────────────────────

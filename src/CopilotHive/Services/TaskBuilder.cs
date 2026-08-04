@@ -24,7 +24,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
     /// <param name="model">Optional model ID for this task (e.g., "claude-sonnet-4.6").</param>
     /// <param name="maxContextTokens">Context window size in tokens for the worker's agent.</param>
     /// <param name="subAgentModels">Model catalog for sub-agent delegation, or <c>null</c> for none.</param>
-    /// <param name="reasoningEffort">Explicit reasoning effort for this task, or <c>null</c> to use the model suffix fallback.</param>
+    /// <param name="reasoningEffort">Explicit reasoning effort for this task, or <c>null</c> when reasoning effort is unset.</param>
     /// <returns>A fully constructed <see cref="WorkTask"/>.</returns>
     public WorkTask Build(
         string goalId,

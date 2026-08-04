@@ -85,7 +85,7 @@ message TaskAssignment {
   string session_id = 10;         // Session identifier: "goalId:roleName"
   int32 max_context_tokens = 11;  // Context window size for worker (tokens)
   repeated SubAgentModel sub_agent_models = 12;  // Model catalog for sub-agent delegation
-  string reasoning_effort = 13;   // Reasoning effort for this task ("" = unset, use model suffix fallback)
+  string reasoning_effort = 13;   // Reasoning effort for this task ("" = unset)
 }
 
 // A model available for sub-agent delegation

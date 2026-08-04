@@ -821,7 +821,7 @@ public class BrainActorChildTests
     // ── Criterion 11: UpdateModel updates _reasoningEffort ──
 
     [Fact]
-    public async Task UpdateModel_WithReasoningSuffix_UpdatesReasoningEffort()
+    public async Task UpdateModel_WithExplicitReasoningEffort_UpdatesReasoningEffort()
     {
         var dir = CreateTempDir();
         try
@@ -831,7 +831,8 @@ public class BrainActorChildTests
             actor.Start();
             await ConnectAsync(actor);
 
-            var update = BrainActorMessages.CreateUpdateModelMessage("copilot/claude-sonnet-4.6:high", 50_000);
+            var update = BrainActorMessages.CreateUpdateModelMessage(
+                "copilot/claude-sonnet-4.6", 50_000, ReasoningEffort.High);
             Assert.True(actor.Tell(update));
             Assert.True(await AwaitReplyAsync(update.Reply));
 
@@ -858,7 +859,8 @@ public class BrainActorChildTests
             var childModelBefore = child.Model;
 
             // Update model to a different one.
-            var update = BrainActorMessages.CreateUpdateModelMessage("copilot/new-model:low", 50_000);
+            var update = BrainActorMessages.CreateUpdateModelMessage(
+                "copilot/new-model", 50_000, ReasoningEffort.Low);
             Assert.True(actor.Tell(update));
             Assert.True(await AwaitReplyAsync(update.Reply));
 
@@ -873,7 +875,7 @@ public class BrainActorChildTests
     }
 
     [Fact]
-    public async Task UpdateModel_WithExplicitReasoningEffort_OverridesSuffix()
+    public async Task UpdateModel_ExplicitReasoningEffort_IgnoresModelNameColonSegment()
     {
         var dir = CreateTempDir();
         try
@@ -883,7 +885,8 @@ public class BrainActorChildTests
             actor.Start();
             await ConnectAsync(actor);
 
-            // The model suffix says 'low' but the message carries an explicit 'ExtraHigh'.
+            // A ':low' segment in the model name is part of the name — only the explicit
+            // 'ExtraHigh' value determines the reasoning effort.
             var update = BrainActorMessages.CreateUpdateModelMessage(
                 "copilot/claude-sonnet-4.6:low", 50_000, ReasoningEffort.ExtraHigh);
             Assert.True(actor.Tell(update));
@@ -894,8 +897,11 @@ public class BrainActorChildTests
         finally { DeleteTempPath(dir); }
     }
 
+    /// <summary>
+    /// A null reasoning effort clears the value — there is no model-name suffix fallback.
+    /// </summary>
     [Fact]
-    public async Task UpdateModel_WithNullReasoningEffort_FallsBackToSuffixParsing()
+    public async Task UpdateModel_WithNullReasoningEffort_ClearsReasoningEffort()
     {
         var dir = CreateTempDir();
         try
@@ -905,12 +911,18 @@ public class BrainActorChildTests
             actor.Start();
             await ConnectAsync(actor);
 
+            var seed = BrainActorMessages.CreateUpdateModelMessage(
+                "copilot/claude-sonnet-4.6", 50_000, ReasoningEffort.High);
+            Assert.True(actor.Tell(seed));
+            Assert.True(await AwaitReplyAsync(seed.Reply));
+            Assert.Equal(ReasoningEffort.High, GetField<ReasoningEffort?>(actor, "_reasoningEffort"));
+
             var update = BrainActorMessages.CreateUpdateModelMessage(
                 "copilot/claude-sonnet-4.6:medium", 50_000, reasoningEffort: null);
             Assert.True(actor.Tell(update));
             Assert.True(await AwaitReplyAsync(update.Reply));
 
-            Assert.Equal(ReasoningEffort.Medium, GetField<ReasoningEffort?>(actor, "_reasoningEffort"));
+            Assert.Null(GetField<ReasoningEffort?>(actor, "_reasoningEffort"));
         }
         finally { DeleteTempPath(dir); }
     }

@@ -124,6 +124,12 @@ public static class ConfigHub
                 await svc.AddSubAgentModelAsync(req.Name, req.ContextWindow, req.ReasoningEffort, req.Description, req.SupportsVision);
                 return Results.Ok(new { saved = true });
             }
+            catch (ArgumentException ex)
+            {
+                // Invalid client input (e.g. an unknown reasoning effort like "turbo") — 400,
+                // never an unhandled 500.
+                return Results.BadRequest(new { error = ex.Message });
+            }
             catch (InvalidOperationException ex)
             {
                 return Results.Conflict(new { error = ex.Message });

@@ -41,15 +41,12 @@ internal sealed class ComposerAgentService(
     private int _maxContextTokens = maxContextTokens;
     private readonly int _maxSteps = maxSteps;
     /// <summary>
-    /// The explicitly configured reasoning effort (from configuration, not derived from a model
-    /// name suffix). When non-null it wins over legacy suffix parsing and is retained across
-    /// model switches.
+    /// The explicitly configured reasoning effort. Retained across model switches.
     /// </summary>
     private readonly ReasoningEffort? _configuredReasoningEffort = configuredReasoningEffort;
 
-    /// <summary>The effective reasoning effort: the configured value, else the model-name suffix.</summary>
-    private ReasoningEffort? _reasoningEffort =
-        configuredReasoningEffort ?? ChatClientFactory.ParseProviderModelAndReasoning(model).reasoning;
+    /// <summary>The effective reasoning effort — always the configured value.</summary>
+    private ReasoningEffort? _reasoningEffort = configuredReasoningEffort;
     private readonly HiveConfigFile? _hiveConfig = hiveConfig;
     private readonly string _systemPrompt = systemPrompt;
     private readonly List<AITool> _composerTools = composerTools;
@@ -164,9 +161,7 @@ internal sealed class ComposerAgentService(
     /// <summary>Models the Composer can switch between at runtime.</summary>
     public IReadOnlyList<string> AvailableModels =>
         _hiveConfig?.Models?.AvailableModels is { Count: > 0 } available
-            ? available.Select(m => string.IsNullOrEmpty(m.ReasoningEffort)
-                ? m.Name
-                : $"{m.Name}:{m.ReasoningEffort}").ToList().AsReadOnly()
+            ? available.Select(m => m.Name).ToList().AsReadOnly()
             : _startupAvailableModels;
 
     private IChatClient CreateClient(string modelId) => (_chatClientFactory ?? ChatClientFactory.Create)(modelId);
@@ -415,22 +410,12 @@ internal sealed class ComposerAgentService(
         await DisposeClientsAndClearStateAsync();
 
         _model = newModel;
-        var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(newModel);
 
-        // An explicitly configured reasoning effort survives model switches; suffix-derived
-        // reasoning is never promoted to "configured" and is re-parsed from the new model.
-        _reasoningEffort = _configuredReasoningEffort ?? reasoning;
+        // The explicitly configured reasoning effort survives model switches — reasoning is
+        // never derived from the model name.
+        _reasoningEffort = _configuredReasoningEffort;
 
-        // Strip only the reasoning suffix (if present) while preserving the provider prefix and any
-        // tag so the lookup matches ModelEntry.Name.
-        var modelForLookup = newModel;
-        if (reasoning is not null)
-        {
-            var lastColon = newModel.LastIndexOf(':');
-            if (lastColon > 0)
-                modelForLookup = newModel[..lastColon];
-        }
-        var modelCtx = _hiveConfig?.TryGetContextWindowForModel(modelForLookup);
+        var modelCtx = _hiveConfig?.TryGetContextWindowForModel(newModel);
         if (modelCtx.HasValue && modelCtx.Value > 0 && _maxContextTokens != modelCtx.Value)
         {
             _logger.LogInformation(

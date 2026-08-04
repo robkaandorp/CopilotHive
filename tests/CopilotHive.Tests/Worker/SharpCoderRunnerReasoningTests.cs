@@ -9,9 +9,9 @@ namespace CopilotHive.Tests.Worker;
 
 /// <summary>
 /// Unit tests for reasoning-effort handling in <see cref="SharpCoderRunner"/>:
-/// the explicit <c>ResetSessionAsync(model, reasoningEffort, ct)</c> overload, the legacy
-/// model-suffix fallback, and the guarantee that <c>CreateChatClient</c> never mutates the
-/// already-resolved reasoning effort.
+/// the explicit <c>ResetSessionAsync(model, reasoningEffort, ct)</c> overload, the guarantee
+/// that reasoning effort is never derived from a model-name suffix, and that
+/// <c>CreateChatClient</c> never mutates the already-resolved reasoning effort.
 /// </summary>
 public sealed class SharpCoderRunnerReasoningTests
 {
@@ -58,11 +58,11 @@ public sealed class SharpCoderRunnerReasoningTests
     }
 
     /// <summary>
-    /// The explicit value must override a conflicting suffix embedded in the model name —
-    /// this is the whole point of transporting the effort separately.
+    /// A colon segment in the model name is part of the name and never affects the effort —
+    /// only the explicitly transported value matters.
     /// </summary>
     [Fact]
-    public async Task ResetSessionAsync_ExplicitEffortOverridesModelSuffix()
+    public async Task ResetSessionAsync_ExplicitEffortIgnoresModelNameColonSegment()
     {
         var runner = CreateRunner();
 
@@ -71,36 +71,34 @@ public sealed class SharpCoderRunnerReasoningTests
         Assert.Equal(ReasoningEffort.ExtraHigh, GetCurrentReasoning(runner));
     }
 
-    // ── Legacy model-suffix fallback ──────────────────────────────────────────
+    // ── No model-suffix fallback ──────────────────────────────────────────────
 
     /// <summary>
-    /// With no explicit effort, the legacy behaviour applies: the effort is parsed from the
-    /// model-name suffix.
+    /// With no explicit effort the value stays unset — the model-name suffix fallback is gone.
     /// </summary>
     [Fact]
-    public async Task ResetSessionAsync_WithNullReasoningEffort_FallsBackToModelSuffix()
+    public async Task ResetSessionAsync_WithNullReasoningEffort_DoesNotParseModelSuffix()
     {
         var runner = CreateRunner();
 
         await runner.ResetSessionAsync("test-model:low", null, TestContext.Current.CancellationToken);
 
-        Assert.Equal(ReasoningEffort.Low, GetCurrentReasoning(runner));
+        Assert.Null(GetCurrentReasoning(runner));
     }
 
     [Theory]
-    [InlineData("test-model:none", ReasoningEffort.None)]
-    [InlineData("test-model:low", ReasoningEffort.Low)]
-    [InlineData("test-model:medium", ReasoningEffort.Medium)]
-    [InlineData("test-model:high", ReasoningEffort.High)]
-    [InlineData("test-model:extra_high", ReasoningEffort.ExtraHigh)]
-    public async Task ResetSessionAsync_WithNullReasoningEffort_ParsesEachSuffix(
-        string model, ReasoningEffort expected)
+    [InlineData("test-model:none")]
+    [InlineData("test-model:low")]
+    [InlineData("test-model:medium")]
+    [InlineData("test-model:high")]
+    [InlineData("test-model:extra_high")]
+    public async Task ResetSessionAsync_WithNullReasoningEffort_NoSuffixIsEverParsed(string model)
     {
         var runner = CreateRunner();
 
         await runner.ResetSessionAsync(model, null, TestContext.Current.CancellationToken);
 
-        Assert.Equal(expected, GetCurrentReasoning(runner));
+        Assert.Null(GetCurrentReasoning(runner));
     }
 
     [Fact]
@@ -132,16 +130,17 @@ public sealed class SharpCoderRunnerReasoningTests
     // ── Old overload delegates to the new one ─────────────────────────────────
 
     /// <summary>
-    /// The preserved single-model overload must behave exactly like passing a null effort.
+    /// The preserved single-model overload must behave exactly like passing a null effort:
+    /// no reasoning effort is derived from the model name.
     /// </summary>
     [Fact]
-    public async Task ResetSessionAsync_LegacyOverload_ParsesSuffix()
+    public async Task ResetSessionAsync_LegacyOverload_LeavesReasoningUnset()
     {
         var runner = CreateRunner();
 
         await runner.ResetSessionAsync("test-model:medium", TestContext.Current.CancellationToken);
 
-        Assert.Equal(ReasoningEffort.Medium, GetCurrentReasoning(runner));
+        Assert.Null(GetCurrentReasoning(runner));
     }
 
     // ── Session clearing still happens on the new overload ────────────────────

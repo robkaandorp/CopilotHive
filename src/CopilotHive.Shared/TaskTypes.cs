@@ -45,7 +45,7 @@ public sealed record WorkTask
     public int MaxContextTokens { get; init; } = SharedConstants.DefaultBrainContextWindow;
     /// <summary>Model catalog for sub-agent delegation. Empty when sub-agents are disabled.</summary>
     public IReadOnlyList<SubAgentModelDto> SubAgentModels { get; init; } = [];
-    /// <summary>Reasoning effort for this task, or null to use the model suffix fallback.</summary>
+    /// <summary>Reasoning effort for this task, or null when reasoning effort is unset.</summary>
     public ReasoningEffort? ReasoningEffort { get; init; }
 }
 

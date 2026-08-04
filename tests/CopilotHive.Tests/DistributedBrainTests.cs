@@ -1885,8 +1885,12 @@ public sealed class DistributedBrainTests
         }
     }
 
+    /// <summary>
+    /// The legacy two-argument overload never derives reasoning effort from the model name:
+    /// a ':high' segment is part of the name and the effort stays unset.
+    /// </summary>
     [Fact]
-    public async Task UpdateModelAsync_ReparsesReasoningEffort()
+    public async Task UpdateModelAsync_LegacyOverload_DoesNotDeriveReasoningFromModelName()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
@@ -1902,12 +1906,9 @@ public sealed class DistributedBrainTests
 
             Assert.Null(reasoningField.GetValue(brain));
 
-            // Model with reasoning suffix
             await brain.UpdateModelAsync("copilot/gpt-5.4:high", null, TestContext.Current.CancellationToken);
 
-            var effort = reasoningField.GetValue(brain);
-            Assert.NotNull(effort);
-            Assert.Equal(Microsoft.Extensions.AI.ReasoningEffort.High, effort);
+            Assert.Null(reasoningField.GetValue(brain));
         }
         finally
         {
@@ -1937,14 +1938,14 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task Constructor_ConfiguredReasoningEffort_OverridesSuffixParsedValue()
+    public async Task Constructor_ConfiguredReasoningEffort_IsTheOnlySource()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
         try
         {
-            // The model name carries a ':low' suffix but the configured value is High — the
-            // configured enum wins and is what reaches the BrainActor.
+            // The ':low' colon segment is part of the model name — only the configured
+            // enum determines the reasoning effort, and it is what reaches the BrainActor.
             var brain = new DistributedBrain("copilot/gpt-5.4:low", NullLogger<DistributedBrain>.Instance,
                 stateDir: tempDir, chatClient: new FakeChatClient(),
                 chatClientFactory: _ => new FakeChatClient(),
@@ -1952,12 +1953,10 @@ public sealed class DistributedBrainTests
             await using (brain)
             {
                 Assert.Equal(ReasoningEffort.High, ConfiguredReasoning(brain));
-                // Suffix parsing still populates the legacy field at construction time.
-                Assert.Equal(ReasoningEffort.Low, EffectiveReasoning(brain));
+                Assert.Equal(ReasoningEffort.High, EffectiveReasoning(brain));
 
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
-                // The actor receives the configured value, not the suffix-derived one.
                 Assert.Equal(ReasoningEffort.High, ActorReasoning(brain));
             }
         }
@@ -1969,7 +1968,7 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task Constructor_NoConfiguredReasoningEffort_UsesSuffixParsedValue()
+    public async Task Constructor_NoConfiguredReasoningEffort_LeavesReasoningUnset()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
@@ -1981,11 +1980,11 @@ public sealed class DistributedBrainTests
             await using (brain)
             {
                 Assert.Null(ConfiguredReasoning(brain));
-                Assert.Equal(ReasoningEffort.Low, EffectiveReasoning(brain));
+                Assert.Null(EffectiveReasoning(brain));
 
                 await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
-                Assert.Equal(ReasoningEffort.Low, ActorReasoning(brain));
+                Assert.Null(ActorReasoning(brain));
             }
         }
         finally
@@ -2060,7 +2059,7 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public async Task UpdateModelAsync_WithNullReasoningEffort_AndNoConfiguredValue_FallsBackToSuffix()
+    public async Task UpdateModelAsync_WithNullReasoningEffort_AndNoConfiguredValue_LeavesReasoningUnset()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
@@ -2075,10 +2074,10 @@ public sealed class DistributedBrainTests
 
                 await brain.UpdateModelAsync("copilot/gpt-5.4:high", null, null, TestContext.Current.CancellationToken);
 
-                // Suffix-derived reasoning is never promoted to "configured".
+                // No configured value and no suffix fallback — reasoning stays unset everywhere.
                 Assert.Null(ConfiguredReasoning(brain));
-                Assert.Equal(ReasoningEffort.High, EffectiveReasoning(brain));
-                Assert.Equal(ReasoningEffort.High, ActorReasoning(brain));
+                Assert.Null(EffectiveReasoning(brain));
+                Assert.Null(ActorReasoning(brain));
             }
         }
         finally

@@ -113,7 +113,7 @@ public sealed class Program
                 builder.Services.AddSingleton<IDistributedBrain>(sp =>
                 {
                     var config = sp.GetService<HiveConfigFile>();
-                    // Config file model takes precedence over env var default (includes reasoning suffix)
+                    // Config file model takes precedence over env var default
                     var effectiveModel = !string.IsNullOrEmpty(config?.Orchestrator.Model)
                         ? config.Orchestrator.Model
                         : brainModel;
@@ -124,10 +124,6 @@ public sealed class Program
                     var maxSteps = int.TryParse(brainMaxStepsEnv, out var envSteps)
                         ? envSteps
                         : config?.Orchestrator.BrainMaxSteps ?? Constants.DefaultBrainMaxSteps;
-
-                    // Apply configured reasoning effort as a model suffix (explicit :suffix takes precedence)
-                    var reasoningEffort = config?.TryGetReasoningEffortForModel(effectiveModel);
-                    effectiveModel = HiveConfigFile.ApplyReasoningSuffix(effectiveModel, reasoningEffort);
 
                     return new DistributedBrain(effectiveModel, sp.GetRequiredService<ILogger<DistributedBrain>>(),
                         sp.GetRequiredService<MetricsTracker>(),
@@ -142,7 +138,10 @@ public sealed class Program
                         hiveConfig: config,
                         sessionRegistry: sp.GetService<LlmSessionRegistry>(),
                         configRepo: sp.GetService<ConfigRepoManager>(),
-                        reasoningEffort: ReasoningEffortConverter.Parse(config?.Orchestrator?.ReasoningEffort));
+                        reasoningEffort: ParseConfiguredReasoningEffort(
+                            config?.Orchestrator?.ReasoningEffort,
+                            "orchestrator.reasoning_effort",
+                            sp.GetService<ILogger<DistributedBrain>>()));
                 });
             }
 
@@ -260,10 +259,6 @@ public sealed class Program
                 var maxSteps = composerConfig?.MaxSteps ?? config?.Orchestrator.BrainMaxSteps ?? Constants.DefaultBrainMaxSteps;
                 var availableModels = config?.GetComposerAvailableModels(model) ?? [model];
 
-                // Apply configured reasoning effort as a model suffix (explicit :suffix takes precedence)
-                var composerReasoningEffort = config?.TryGetReasoningEffortForModel(model);
-                model = HiveConfigFile.ApplyReasoningSuffix(model, composerReasoningEffort);
-
                 return new Composer(model, sp.GetRequiredService<ILogger<Composer>>(),
                     sp.GetRequiredService<IGoalStore>(),
                     maxCtx, maxSteps,
@@ -281,7 +276,10 @@ public sealed class Program
                     sessionRegistry: sp.GetService<LlmSessionRegistry>(),
                     goalReadyNotifier: sp.GetService<GoalReadyNotifier>(),
                     attachmentService: sp.GetService<ComposerAttachmentService>(),
-                    reasoningEffort: ReasoningEffortConverter.Parse(config?.Composer?.ReasoningEffort));
+                    reasoningEffort: ParseConfiguredReasoningEffort(
+                        config?.Composer?.ReasoningEffort,
+                        "composer.reasoning_effort",
+                        sp.GetService<ILogger<Composer>>()));
             });
             builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 
@@ -600,6 +598,27 @@ public sealed class Program
 
             await app.RunAsync();
             return 0;
+        }
+
+        // Parses a configured reasoning effort leniently: an unrecognised value degrades to
+        // null (unset) instead of throwing. Startup validation
+        // (HiveConfigFile.ValidateReasoningEffort) is the authority for rejecting bad values;
+        // these DI factories resolve lazily and must never crash the host — or a later dynamic
+        // config reload — over an invalid string.
+        static Microsoft.Extensions.AI.ReasoningEffort? ParseConfiguredReasoningEffort(
+            string? value, string field, ILogger? logger)
+        {
+            try
+            {
+                return ReasoningEffortConverter.Parse(value);
+            }
+            catch (ArgumentException)
+            {
+                logger?.LogWarning(
+                    "Invalid {Field} '{Effort}' in configuration; using reasoning effort unset.",
+                    field, value);
+                return null;
+            }
         }
 
         static void PrintBanner()

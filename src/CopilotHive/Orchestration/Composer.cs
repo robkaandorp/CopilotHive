@@ -322,10 +322,6 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _attachmentService = attachmentService;
         _configuredReasoningEffort = reasoningEffort;
 
-        // Kept for reference: legacy suffix parsing. The effective reasoning effort is computed
-        // by ComposerAgentService from the configured value plus this fallback.
-        var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
-
         _systemPrompt = DefaultSystemPrompt;
         if (_ollamaApiKey is not null)
             _systemPrompt += "\n- Research information on the web (web_search, web_fetch)";

@@ -380,18 +380,85 @@ public class AvailableModelsEndpointTests : IDisposable
         Assert.Null(await FindSubAgentModelAsync(name));
     }
 
+    /// <summary>
+    /// The endpoint stores the posted model name verbatim: a trailing <c>:high</c> is part of the
+    /// name and is never promoted to a reasoning effort.
+    /// </summary>
     [Fact]
-    public async Task PostSubAgentModel_StripsReasoningSuffixFromName()
+    public async Task PostSubAgentModel_StoresNameVerbatim_WithoutInferringReasoningEffort()
     {
         await _client.PostAsJsonAsync(
             "/api/config/sub-agent-models",
             new { name = "suffix-model:high", contextWindow = (int?)null, reasoningEffort = (string?)null, description = (string?)null },
             TestContext.Current.CancellationToken);
 
-        var entry = await FindSubAgentModelAsync("suffix-model");
+        var entry = await FindSubAgentModelAsync("suffix-model:high");
+        Assert.NotNull(entry);
+        Assert.Null(await FindSubAgentModelAsync("suffix-model"));
+    }
+
+    /// <summary>
+    /// The explicit <c>reasoningEffort</c> request field is the only source of reasoning effort.
+    /// </summary>
+    [Fact]
+    public async Task PostSubAgentModel_UsesExplicitReasoningEffortField()
+    {
+        await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name = "explicit-effort-model", contextWindow = (int?)null, reasoningEffort = "high", description = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        var entry = await FindSubAgentModelAsync("explicit-effort-model");
         Assert.NotNull(entry);
         Assert.Equal("high", entry!.Value.GetProperty("reasoningEffort").GetString());
-        Assert.Null(await FindSubAgentModelAsync("suffix-model:high"));
+    }
+
+    /// <summary>
+    /// An unrecognised reasoning effort is invalid client input and must produce a 400
+    /// Bad Request — not an unhandled 500 from the <c>ReasoningEffortConverter.Parse</c>
+    /// <see cref="ArgumentException"/> escaping the endpoint. The model must not be persisted.
+    /// </summary>
+    [Theory]
+    [InlineData("turbo")]
+    [InlineData("HIGHEST")]
+    [InlineData("very-high")]
+    [InlineData("1")]
+    public async Task PostSubAgentModel_InvalidReasoningEffort_Returns400(string effort)
+    {
+        var response = await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name = $"invalid-effort-{effort}", contextWindow = (int?)null, reasoningEffort = effort, description = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.NotEqual(HttpStatusCode.InternalServerError, response.StatusCode);
+
+        // The error message names the rejected value so the client can correct it.
+        var content = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.Contains(effort, content, StringComparison.Ordinal);
+
+        // A rejected request must not persist anything.
+        Assert.Null(await FindSubAgentModelAsync($"invalid-effort-{effort}"));
+    }
+
+    /// <summary>
+    /// An empty/whitespace reasoning effort means "unset" and is accepted, not rejected.
+    /// </summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task PostSubAgentModel_EmptyReasoningEffort_IsAcceptedAsUnset(string effort)
+    {
+        var name = $"empty-effort-{effort.Length}";
+        var response = await _client.PostAsJsonAsync(
+            "/api/config/sub-agent-models",
+            new { name, contextWindow = (int?)null, reasoningEffort = effort, description = (string?)null },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var entry = await FindSubAgentModelAsync(name);
+        Assert.NotNull(entry);
     }
 
     // ── GET /api/config/models/discover — 200 success (empty when no tokens) ──
@@ -445,12 +512,12 @@ public class AvailableModelsEndpointTests : IDisposable
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 
-    // ── POST /api/config/available-models — suffix stripped via endpoint ─────
+    // ── POST /api/config/available-models — model names stored verbatim ──────
 
     [Fact]
-    public async Task PostAvailableModel_WithSuffix_StripsAndStoresReasoningEffort()
+    public async Task PostAvailableModel_WithColonSegment_StoresNameVerbatim()
     {
-        // POST a model whose name carries a known reasoning suffix
+        // POST a model whose name carries a legacy reasoning-looking suffix
         var postResponse = await _client.PostAsJsonAsync(
             "/api/config/available-models",
             new { name = "test-model:high", contextWindow = 128000, reasoningEffort = (string?)null },
@@ -458,7 +525,7 @@ public class AvailableModelsEndpointTests : IDisposable
 
         Assert.Equal(HttpStatusCode.OK, postResponse.StatusCode);
 
-        // GET /api/config/models and verify the suffix was stripped
+        // GET /api/config/models and verify the name was stored verbatim
         var getResponse = await _client.GetAsync("/api/config/models", TestContext.Current.CancellationToken);
         getResponse.EnsureSuccessStatusCode();
         using var doc = await System.Text.Json.JsonDocument.ParseAsync(
@@ -470,17 +537,17 @@ public class AvailableModelsEndpointTests : IDisposable
         foreach (var entry in availableModels.EnumerateArray())
         {
             var entryName = entry.GetProperty("name").GetString();
-            if (entryName == "test-model")
+            if (entryName == "test-model:high")
             {
-                // The suffix is stripped from the stored name, and the available-models API
-                // contract no longer exposes reasoningEffort (intentional goal behavior change).
+                // The name is stored verbatim, and the available-models API contract
+                // does not expose reasoningEffort.
                 Assert.False(entry.TryGetProperty("reasoningEffort", out _),
                     "availableModels entries must not expose 'reasoningEffort'");
                 found = true;
                 break;
             }
         }
-        Assert.True(found, "Expected a model with Name='test-model' in availableModels");
+        Assert.True(found, "Expected a model with Name='test-model:high' in availableModels");
     }
 
     // ── SupportsVision tri-state REST round-trip (available models) ──────────

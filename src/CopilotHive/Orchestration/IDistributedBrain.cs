@@ -198,11 +198,11 @@ public interface IDistributedBrain
     /// reasoning effort, recreating the underlying chat client and CodingAgent so subsequent
     /// calls use the new configuration.
     /// </summary>
-    /// <param name="model">The model identifier (may still carry a legacy <c>:effort</c> suffix).</param>
+    /// <param name="model">The model identifier.</param>
     /// <param name="maxContextTokens">Optional new context window.</param>
     /// <param name="reasoningEffort">
     /// The explicitly configured reasoning effort. When <c>null</c>, the previously configured
-    /// value (if any) is retained and legacy suffix parsing applies.
+    /// value (if any) is retained.
     /// </param>
     /// <param name="ct">Cancellation token.</param>
     Task UpdateModelAsync(string model, int? maxContextTokens, ReasoningEffort? reasoningEffort, CancellationToken ct);

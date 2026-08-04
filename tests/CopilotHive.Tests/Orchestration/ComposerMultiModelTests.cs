@@ -258,8 +258,12 @@ public sealed class ComposerMultiModelTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Without a configured reasoning effort the value stays unset — a ':low' colon segment
+    /// in the model name is never parsed as a reasoning level.
+    /// </summary>
     [Fact]
-    public async Task NoConfiguredReasoningEffort_AgentServiceUsesSuffixParsing()
+    public async Task NoConfiguredReasoningEffort_AgentServiceLeavesReasoningUnset()
     {
         var composer = new Composer(
             "claude-sonnet-4:low",
@@ -272,7 +276,7 @@ public sealed class ComposerMultiModelTests : IDisposable
         await using (composer)
         {
             var agentService = AgentServiceOf(composer);
-            Assert.Equal(ReasoningEffort.Low, agentService.ReasoningEffort);
+            Assert.Null(agentService.ReasoningEffort);
         }
     }
 
@@ -293,13 +297,13 @@ public sealed class ComposerMultiModelTests : IDisposable
             await composer.ConnectAsync(TestContext.Current.CancellationToken);
             await composer.SwitchModelAsync("claude-opus:low");
 
-            // The ':low' suffix of the new model must not override the configured effort.
+            // The ':low' colon segment of the new model name must not affect the configured effort.
             Assert.Equal(ReasoningEffort.High, AgentServiceOf(composer).ReasoningEffort);
         }
     }
 
     [Fact]
-    public async Task SwitchModelAsync_WithoutConfiguredReasoningEffort_ReparsesSuffix()
+    public async Task SwitchModelAsync_WithoutConfiguredReasoningEffort_StaysUnset()
     {
         var composer = new Composer(
             "claude-sonnet-4:high",
@@ -312,9 +316,9 @@ public sealed class ComposerMultiModelTests : IDisposable
         await using (composer)
         {
             await composer.ConnectAsync(TestContext.Current.CancellationToken);
-            Assert.Equal(ReasoningEffort.High, AgentServiceOf(composer).ReasoningEffort);
+            // No configured value → unset, despite the ':high' segment in the model name.
+            Assert.Null(AgentServiceOf(composer).ReasoningEffort);
 
-            // Suffix-derived reasoning is not retained as configured — it is re-parsed.
             await composer.SwitchModelAsync("claude-opus");
 
             Assert.Null(AgentServiceOf(composer).ReasoningEffort);
@@ -363,13 +367,11 @@ public sealed class ComposerMultiModelTests : IDisposable
     // ── Composite model context window regression tests ──
 
     /// <summary>
-    /// Regression test: when switching to a composite model string (e.g. "gpt-4:medium"),
-    /// SwitchModelAsync must look up the context window using the clean model name
-    /// ("gpt-4") — not the full composite string. TryGetContextWindowForModel matches
-    /// against ModelEntry.Name which does not include the reasoning effort suffix.
+    /// A model name containing a colon segment (e.g. "gpt-4:medium") is matched verbatim
+    /// against <c>ModelEntry.Name</c> — nothing is stripped before the context-window lookup.
     /// </summary>
     [Fact]
-    public async Task SwitchModelAsync_CompositeModel_UpdatesContextWindowFromConfig()
+    public async Task SwitchModelAsync_ColonSegmentModel_UpdatesContextWindowFromConfig()
     {
         // Arrange: global config with a ModelEntry that has an explicit ContextWindow
         var config = new HiveConfigFile
@@ -379,7 +381,7 @@ public sealed class ComposerMultiModelTests : IDisposable
                 AvailableModels =
                 [
                     new ModelEntry { Name = "claude-sonnet-4" },
-                    new ModelEntry { Name = "gpt-4", ReasoningEffort = "medium", ContextWindow = 32768 }
+                    new ModelEntry { Name = "gpt-4:medium", ContextWindow = 32768 }
                 ]
             }
         };
@@ -398,11 +400,10 @@ public sealed class ComposerMultiModelTests : IDisposable
         // Pre-condition: verify initial max context tokens
         Assert.Equal(64000, composer.GetStats()?.MaxContextTokens ?? 64000);
 
-        // Act: switch to the composite model string
+        // Act: switch to the model whose name contains a colon segment
         await composer.SwitchModelAsync("gpt-4:medium");
 
-        // Assert: the context window should have been updated to 32768 (from ModelEntry.ContextWindow)
-        // because the lookup used the clean model name "gpt-4", not "gpt-4:medium"
+        // Assert: the context window is 32768 because the lookup matched "gpt-4:medium" verbatim.
         var stats = composer.GetStats();
         Assert.NotNull(stats);
         Assert.Equal(32768, stats!.MaxContextTokens);
@@ -410,12 +411,12 @@ public sealed class ComposerMultiModelTests : IDisposable
     }
 
     /// <summary>
-    /// Regression test: when switching to a composite model whose ModelEntry has no
-    /// ContextWindow set, the existing max context tokens must be preserved (the lookup
-    /// returns null and the code skips the update).
+    /// Regression test: when switching to a model whose ModelEntry has no ContextWindow set,
+    /// the existing max context tokens must be preserved (the lookup returns null and the
+    /// code skips the update).
     /// </summary>
     [Fact]
-    public async Task SwitchModelAsync_CompositeModel_NoContextWindow_PreservesExistingMaxTokens()
+    public async Task SwitchModelAsync_ColonSegmentModel_NoContextWindow_PreservesExistingMaxTokens()
     {
         // Arrange: global config with a ModelEntry that has NO ContextWindow set
         var config = new HiveConfigFile
@@ -425,7 +426,7 @@ public sealed class ComposerMultiModelTests : IDisposable
                 AvailableModels =
                 [
                     new ModelEntry { Name = "claude-sonnet-4" },
-                    new ModelEntry { Name = "gpt-4", ReasoningEffort = "medium" }
+                    new ModelEntry { Name = "gpt-4:medium" }
                 ]
             }
         };
@@ -453,10 +454,8 @@ public sealed class ComposerMultiModelTests : IDisposable
     }
 
     /// <summary>
-    /// Regression test: when switching to a plain model name (no reasoning suffix)
-    /// with a configured ContextWindow, the context window should still be updated.
-    /// This verifies the cleanModel fallback (cleanModel ?? model) works correctly
-    /// when ParseProviderModelAndReasoning returns null for the model portion.
+    /// Regression test: when switching to a plain model name with a configured
+    /// ContextWindow, the context window should be updated.
     /// </summary>
     [Fact]
     public async Task SwitchModelAsync_PlainModel_UpdatesContextWindowFromConfig()
@@ -495,12 +494,11 @@ public sealed class ComposerMultiModelTests : IDisposable
     }
 
     /// <summary>
-    /// Regression test: switching from a model with a small context window to
-    /// a composite model with a larger context window correctly updates the value.
-    /// This verifies the fix works in both directions (shrinking and growing).
+    /// Regression test: switching between models with different context windows correctly
+    /// updates the value in both directions (shrinking and growing).
     /// </summary>
     [Fact]
-    public async Task SwitchModelAsync_CompositeModel_UpdatesContextWindowInBothDirections()
+    public async Task SwitchModelAsync_ColonSegmentModel_UpdatesContextWindowInBothDirections()
     {
         // Arrange: global config with two models having different context windows
         var config = new HiveConfigFile
@@ -509,8 +507,8 @@ public sealed class ComposerMultiModelTests : IDisposable
             {
                 AvailableModels =
                 [
-                    new ModelEntry { Name = "claude-sonnet-4", ReasoningEffort = "high", ContextWindow = 100000 },
-                    new ModelEntry { Name = "gpt-4", ReasoningEffort = "medium", ContextWindow = 32768 }
+                    new ModelEntry { Name = "claude-sonnet-4:high", ContextWindow = 100000 },
+                    new ModelEntry { Name = "gpt-4:medium", ContextWindow = 32768 }
                 ]
             }
         };
@@ -541,16 +539,12 @@ public sealed class ComposerMultiModelTests : IDisposable
     // ── Provider-prefixed composite model context window regression tests ──
 
     /// <summary>
-    /// Regression test: when switching to a provider-prefixed composite model string
-    /// (e.g. "copilot/claude-sonnet-4.6:high"), SwitchModelAsync must look up the context
-    /// window using a key that preserves the provider prefix ("copilot/claude-sonnet-4.6")
-    /// — not the ParseProviderModelAndReasoning output which strips the prefix
-    /// ("claude-sonnet-4.6") or the full composite string with suffix
-    /// ("copilot/claude-sonnet-4.6:high"). TryGetContextWindowForModel matches against
-    /// ModelEntry.Name which includes the provider prefix.
+    /// Regression test: a provider-prefixed model name with a colon segment
+    /// (e.g. "copilot/claude-sonnet-4.6:high") is matched verbatim against
+    /// <c>ModelEntry.Name</c> — neither the prefix nor the colon segment is stripped.
     /// </summary>
     [Fact]
-    public async Task SwitchModelAsync_ProviderPrefixedComposite_UpdatesContextWindow()
+    public async Task SwitchModelAsync_ProviderPrefixedColonSegment_UpdatesContextWindow()
     {
         // Arrange: global config with a ModelEntry whose Name includes the provider prefix
         var config = new HiveConfigFile
@@ -560,7 +554,7 @@ public sealed class ComposerMultiModelTests : IDisposable
                 AvailableModels =
                 [
                     new ModelEntry { Name = "claude-sonnet-4" },
-                    new ModelEntry { Name = "copilot/claude-sonnet-4.6", ReasoningEffort = "high", ContextWindow = 100000 }
+                    new ModelEntry { Name = "copilot/claude-sonnet-4.6:high", ContextWindow = 100000 }
                 ]
             }
         };
@@ -576,13 +570,11 @@ public sealed class ComposerMultiModelTests : IDisposable
             hiveConfig: config,
             chatClientFactory: _ => new Mock<IChatClient>().Object);
 
-        // Act: switch to the provider-prefixed composite model string
+        // Act: switch to the provider-prefixed model name
         await composer.SwitchModelAsync("copilot/claude-sonnet-4.6:high");
 
-        // Assert: the context window should have been updated to 100000 because the lookup
-        // used "copilot/claude-sonnet-4.6" (prefix preserved, suffix stripped), matching
-        // the configured ModelEntry.Name — NOT "claude-sonnet-4.6" (prefix stripped) or
-        // "copilot/claude-sonnet-4.6:high" (suffix not stripped), both of which would miss.
+        // Assert: the context window is 100000 because the lookup matched the full
+        // "copilot/claude-sonnet-4.6:high" name verbatim.
         var stats = composer.GetStats();
         Assert.NotNull(stats);
         Assert.Equal(100000, stats!.MaxContextTokens);
@@ -590,13 +582,11 @@ public sealed class ComposerMultiModelTests : IDisposable
     }
 
     /// <summary>
-    /// Regression test: when switching to an Ollama-style tagged model with a reasoning
-    /// suffix (e.g. "ollama-cloud/gpt-oss:120b:medium"), SwitchModelAsync must strip only
-    /// the known reasoning level (:medium), NOT the Ollama tag (:120b). The lookup key
-    /// becomes "ollama-cloud/gpt-oss:120b" which matches the configured ModelEntry.Name.
+    /// Regression test: an Ollama-style tagged model name (e.g. "ollama-cloud/gpt-oss:120b")
+    /// is matched verbatim — the tag is part of the name and is never stripped.
     /// </summary>
     [Fact]
-    public async Task SwitchModelAsync_OllamaTaggedComposite_UpdatesContextWindow()
+    public async Task SwitchModelAsync_OllamaTaggedModel_UpdatesContextWindow()
     {
         // Arrange: global config with an Ollama-style tagged model
         var config = new HiveConfigFile
@@ -606,7 +596,7 @@ public sealed class ComposerMultiModelTests : IDisposable
                 AvailableModels =
                 [
                     new ModelEntry { Name = "claude-sonnet-4" },
-                    new ModelEntry { Name = "ollama-cloud/gpt-oss:120b", ReasoningEffort = "medium", ContextWindow = 200000 }
+                    new ModelEntry { Name = "ollama-cloud/gpt-oss:120b", ContextWindow = 200000 }
                 ]
             }
         };
@@ -618,29 +608,27 @@ public sealed class ComposerMultiModelTests : IDisposable
             _store,
             maxContextTokens: 64000,
             stateDir: Path.GetTempPath(),
-            availableModels: ["claude-sonnet-4", "ollama-cloud/gpt-oss:120b:medium"],
+            availableModels: ["claude-sonnet-4", "ollama-cloud/gpt-oss:120b"],
             hiveConfig: config,
             chatClientFactory: _ => new Mock<IChatClient>().Object);
 
-        // Act: switch to the Ollama-style tagged composite model string
-        await composer.SwitchModelAsync("ollama-cloud/gpt-oss:120b:medium");
+        // Act: switch to the Ollama-style tagged model
+        await composer.SwitchModelAsync("ollama-cloud/gpt-oss:120b");
 
-        // Assert: the context window should have been updated to 200000 because the lookup
-        // used "ollama-cloud/gpt-oss:120b" (only :medium stripped, :120b tag preserved),
-        // matching the configured ModelEntry.Name.
+        // Assert: the context window is 200000 because the full tagged name matched verbatim.
         var stats = composer.GetStats();
         Assert.NotNull(stats);
         Assert.Equal(200000, stats!.MaxContextTokens);
-        Assert.Equal("ollama-cloud/gpt-oss:120b:medium", stats.Model);
+        Assert.Equal("ollama-cloud/gpt-oss:120b", stats.Model);
     }
 
     /// <summary>
-    /// Regression test: when switching to a provider-prefixed composite model whose
-    /// ModelEntry has no ContextWindow set, the existing max context tokens must be
-    /// preserved (the lookup returns null and the code skips the update).
+    /// Regression test: when switching to a provider-prefixed model whose ModelEntry has no
+    /// ContextWindow set, the existing max context tokens must be preserved (the lookup
+    /// returns null and the code skips the update).
     /// </summary>
     [Fact]
-    public async Task SwitchModelAsync_ProviderPrefixedComposite_NoContextWindow_PreservesExisting()
+    public async Task SwitchModelAsync_ProviderPrefixedColonSegment_NoContextWindow_PreservesExisting()
     {
         // Arrange: global config with a ModelEntry that has NO ContextWindow set
         var config = new HiveConfigFile
@@ -650,7 +638,7 @@ public sealed class ComposerMultiModelTests : IDisposable
                 AvailableModels =
                 [
                     new ModelEntry { Name = "claude-sonnet-4" },
-                    new ModelEntry { Name = "copilot/claude-sonnet-4.6", ReasoningEffort = "high" }
+                    new ModelEntry { Name = "copilot/claude-sonnet-4.6:high" }
                 ]
             }
         };
@@ -666,7 +654,7 @@ public sealed class ComposerMultiModelTests : IDisposable
             hiveConfig: config,
             chatClientFactory: _ => new Mock<IChatClient>().Object);
 
-        // Act: switch to the provider-prefixed composite model string
+        // Act: switch to the provider-prefixed model name
         await composer.SwitchModelAsync("copilot/claude-sonnet-4.6:high");
 
         // Assert: the max context tokens should be unchanged at 64000 because
@@ -1109,13 +1097,13 @@ public sealed class ComposerCompactionTests : IDisposable
 }
 
 /// <summary>
-/// Integration tests verifying that ComposerHub endpoints use composite model values
-/// (model:effort) when ReasoningEffort is set on ModelEntry, and plain names when it is not.
+/// Integration tests verifying that ComposerHub endpoints expose plain model names only —
+/// a <c>ModelEntry.ReasoningEffort</c> is never appended to the exposed name.
 /// </summary>
 public sealed class ComposerHubCompositeModelTests
 {
     [Fact]
-    public async Task GetModels_ReturnsCompositeValue_WhenReasoningEffortIsSet()
+    public async Task GetModels_ReturnsPlainName_EvenWhenReasoningEffortIsSet()
     {
         var config = new HiveConfigFile
         {
@@ -1139,7 +1127,7 @@ public sealed class ComposerHubCompositeModelTests
         var models = json.RootElement.GetProperty("models");
 
         Assert.Equal(1, models.GetArrayLength());
-        Assert.Equal("copilot/claude-sonnet-4.6:high", models.EnumerateArray().First().GetString());
+        Assert.Equal("copilot/claude-sonnet-4.6", models.EnumerateArray().First().GetString());
 
         await fixture.DisposeAsync();
     }
@@ -1175,7 +1163,7 @@ public sealed class ComposerHubCompositeModelTests
     }
 
     [Fact]
-    public async Task GetModels_ReturnsMixedCompositeAndPlainValues()
+    public async Task GetModels_ReturnsPlainNames_ForMixedReasoningEffortEntries()
     {
         var config = new HiveConfigFile
         {
@@ -1201,7 +1189,7 @@ public sealed class ComposerHubCompositeModelTests
 
         Assert.Equal(2, models.GetArrayLength());
         var modelsList = models.EnumerateArray().Select(m => m.GetString()!).ToList();
-        Assert.Equal("copilot/claude-sonnet-4.6:high", modelsList[0]);
+        Assert.Equal("copilot/claude-sonnet-4.6", modelsList[0]);
         Assert.Equal("gpt-4o", modelsList[1]);
 
         await fixture.DisposeAsync();
@@ -1237,8 +1225,44 @@ public sealed class ComposerHubCompositeModelTests
         await fixture.DisposeAsync();
     }
 
+    /// <summary>
+    /// The switch endpoint accepts the plain configured model name, even when the entry
+    /// carries a reasoning effort — the effort is never part of the accepted identifier.
+    /// </summary>
     [Fact]
-    public async Task SwitchModel_AcceptsCompositeModelString()
+    public async Task SwitchModel_AcceptsPlainName_WhenReasoningEffortIsSet()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "gpt-4", ReasoningEffort = "medium" }
+                ]
+            }
+        };
+
+        await using var fixture = new ComposerHubWithConfigFixture(config);
+        await fixture.InitializeAsync();
+
+        var response = await fixture.Client.PostAsync(
+            "/api/composer/models/switch?model=gpt-4", null, TestContext.Current.CancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        var json = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        var doc = JsonDocument.Parse(json);
+        Assert.Equal("gpt-4", doc.RootElement.GetProperty("model").GetString());
+
+        await fixture.DisposeAsync();
+    }
+
+    /// <summary>
+    /// A composite "model:effort" string is no longer a valid identifier — the endpoint
+    /// only accepts plain configured model names.
+    /// </summary>
+    [Fact]
+    public async Task SwitchModel_RejectsCompositeModelString()
     {
         var config = new HiveConfigFile
         {
@@ -1256,35 +1280,6 @@ public sealed class ComposerHubCompositeModelTests
 
         var response = await fixture.Client.PostAsync(
             "/api/composer/models/switch?model=gpt-4:medium", null, TestContext.Current.CancellationToken);
-        response.EnsureSuccessStatusCode();
-
-        var json = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
-        var doc = JsonDocument.Parse(json);
-        Assert.Equal("gpt-4:medium", doc.RootElement.GetProperty("model").GetString());
-
-        await fixture.DisposeAsync();
-    }
-
-    [Fact]
-    public async Task SwitchModel_RejectsPlainName_WhenCompositeIsRequired()
-    {
-        var config = new HiveConfigFile
-        {
-            Models = new ModelsConfig
-            {
-                AvailableModels =
-                [
-                    new ModelEntry { Name = "gpt-4", ReasoningEffort = "medium" }
-                ]
-            }
-        };
-
-        await using var fixture = new ComposerHubWithConfigFixture(config);
-        await fixture.InitializeAsync();
-
-        // "gpt-4" (without suffix) should be rejected because valid list contains "gpt-4:medium"
-        var response = await fixture.Client.PostAsync(
-            "/api/composer/models/switch?model=gpt-4", null, TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
 
@@ -1292,7 +1287,7 @@ public sealed class ComposerHubCompositeModelTests
     }
 
     [Fact]
-    public async Task SwitchModel_RejectsInvalidCompositeModel()
+    public async Task SwitchModel_RejectsUnknownModel()
     {
         var config = new HiveConfigFile
         {
@@ -1308,7 +1303,6 @@ public sealed class ComposerHubCompositeModelTests
         await using var fixture = new ComposerHubWithConfigFixture(config);
         await fixture.InitializeAsync();
 
-        // "gpt-4:high" is NOT in the valid list (only "gpt-4:medium" is)
         var response = await fixture.Client.PostAsync(
             "/api/composer/models/switch?model=gpt-4:high", null, TestContext.Current.CancellationToken);
 
@@ -1351,7 +1345,7 @@ public sealed class ComposerHubCompositeModelTests
     }
 
     [Fact]
-    public async Task SwitchModel_IsCaseInsensitive_ForCompositeModel()
+    public async Task SwitchModel_IsCaseInsensitive_ForPlainModelName()
     {
         var config = new HiveConfigFile
         {
@@ -1368,14 +1362,18 @@ public sealed class ComposerHubCompositeModelTests
         await fixture.InitializeAsync();
 
         var response = await fixture.Client.PostAsync(
-            "/api/composer/models/switch?model=GPT-4:MEDIUM", null, TestContext.Current.CancellationToken);
+            "/api/composer/models/switch?model=GPT-4", null, TestContext.Current.CancellationToken);
         response.EnsureSuccessStatusCode();
 
         await fixture.DisposeAsync();
     }
 
+    /// <summary>
+    /// Mutating <c>ModelEntry.ReasoningEffort</c> at runtime must never change the exposed
+    /// model name — the endpoint always returns the plain name.
+    /// </summary>
     [Fact]
-    public async Task GetModels_ReturnsComposite_ReflectsMutatedReasoningEffort()
+    public async Task GetModels_StaysPlain_WhenReasoningEffortIsMutated()
     {
         var config = new HiveConfigFile
         {
@@ -1391,7 +1389,6 @@ public sealed class ComposerHubCompositeModelTests
         await using var fixture = new ComposerHubWithConfigFixture(config);
         await fixture.InitializeAsync();
 
-        // Initially no reasoning effort → plain name
         var response1 = await fixture.Client.GetAsync("/api/composer/models", TestContext.Current.CancellationToken);
         response1.EnsureSuccessStatusCode();
         var content1 = await response1.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
@@ -1401,12 +1398,12 @@ public sealed class ComposerHubCompositeModelTests
         // Mutate: add reasoning effort
         config.Models!.AvailableModels![0].ReasoningEffort = "high";
 
-        // Now should return composite value
+        // The exposed name must stay plain.
         var response2 = await fixture.Client.GetAsync("/api/composer/models", TestContext.Current.CancellationToken);
         response2.EnsureSuccessStatusCode();
         var content2 = await response2.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
         var json2 = JsonDocument.Parse(content2);
-        Assert.Equal("claude-sonnet-4:high", json2.RootElement.GetProperty("models").EnumerateArray().First().GetString());
+        Assert.Equal("claude-sonnet-4", json2.RootElement.GetProperty("models").EnumerateArray().First().GetString());
 
         await fixture.DisposeAsync();
     }

@@ -116,8 +116,8 @@ public sealed class WorkerServiceReasoningForwardingTests
     }
 
     /// <summary>
-    /// Proto3 sends "" for an unset reasoning effort; the worker must receive <c>null</c> so it
-    /// falls back to the legacy model-suffix behaviour.
+    /// Proto3 sends "" for an unset reasoning effort; the worker must receive <c>null</c>,
+    /// meaning reasoning effort is unset (there is no model-name fallback).
     /// </summary>
     [Fact]
     public async Task WorkerService_ForwardsNullReasoningEffort_WhenProtoEmpty()

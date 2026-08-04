@@ -11,8 +11,7 @@ public sealed class ModelEntry
     public int? ContextWindow { get; set; }
     /// <summary>
     /// Reasoning effort for this model entry. Only meaningful for sub_agent_models entries.
-    /// For available_models, this field is transitional — it may still be read by legacy
-    /// TryGetReasoningEffortForModel until copilothive-reasoning-brain-composer removes that method.
+    /// For available_models, this field is informational only.
     /// </summary>
     public string? ReasoningEffort { get; set; }
 

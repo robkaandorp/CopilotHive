@@ -130,10 +130,13 @@ public class PremiumModelSelectionTests
         Assert.Equal("standard-tester-model", capturedModel);
     }
 
-    // -- GoalDispatcher reasoning effort suffix --
+    // -- GoalDispatcher dispatches plain model names --
 
+    /// <summary>
+    /// An <c>available_models</c> reasoning effort is never appended to the dispatched model name.
+    /// </summary>
     [Fact]
-    public async Task DispatchToRole_WhenModelHasReasoningEffort_AppliesSuffixToDispatchedModel()
+    public async Task DispatchToRole_WhenAvailableModelHasReasoningEffort_DispatchesPlainModelName()
     {
         var brain = new CapturingBrain(modelTierToReturn: "default");
         var capturedModel = (string?)null;
@@ -165,7 +168,7 @@ public class PremiumModelSelectionTests
             GitStatus = new GitChangeSummary { FilesChanged = 3 },
         }, TestContext.Current.CancellationToken);
 
-        Assert.Equal("standard-tester-model:high", capturedModel);
+        Assert.Equal("standard-tester-model", capturedModel);
     }
 
     [Fact]

@@ -1,3 +1,4 @@
+using CopilotHive.Services;
 using CopilotHive.Workers;
 
 namespace CopilotHive.Configuration;
@@ -47,78 +48,9 @@ public sealed class HiveConfigFile
     /// <returns>The configured context window, or <c>null</c> if the model is not found or has no value set.</returns>
     public int? TryGetContextWindowForModel(string? modelName)
     {
-        var strippedName = StripReasoningSuffix(modelName);
         var entry = Models?.AvailableModels?.FirstOrDefault(
-            m => string.Equals(m.Name, strippedName, StringComparison.OrdinalIgnoreCase));
+            m => string.Equals(m.Name, modelName, StringComparison.OrdinalIgnoreCase));
         return entry?.ContextWindow;
-    }
-
-    /// <summary>
-    /// Known reasoning effort levels recognised as model-name suffixes (e.g. <c>:high</c>).
-    /// </summary>
-    private static readonly HashSet<string> KnownReasoningLevels = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "none", "low", "medium", "high", "extra_high"
-    };
-
-    /// <summary>
-    /// Strips a known reasoning-effort suffix (e.g. <c>:high</c>) from a model name.
-    /// Returns the name unchanged if the suffix after the last colon is not a known
-    /// reasoning level, so provider prefixes like <c>ollama-cloud/gpt-oss:120b</c> are preserved.
-    /// </summary>
-    /// <param name="name">Model name that may carry a reasoning suffix.</param>
-    private static string StripReasoningSuffix(string? name)
-    {
-        if (string.IsNullOrEmpty(name))
-            return name ?? string.Empty;
-
-        var lastColon = name.LastIndexOf(':');
-        if (lastColon > 0 && lastColon < name.Length - 1)
-        {
-            var suffix = name.Substring(lastColon + 1);
-            if (KnownReasoningLevels.Contains(suffix))
-                return name.Substring(0, lastColon);
-        }
-        return name;
-    }
-
-    /// <summary>
-    /// Looks up the model in <see cref="ModelsConfig.AvailableModels"/> and returns its
-    /// <see cref="ModelEntry.ReasoningEffort"/> if set.
-    /// </summary>
-    /// <param name="modelName">Model identifier to look up.</param>
-    /// <returns>The configured reasoning effort, or <c>null</c> if the model is not found or has no value set.</returns>
-    public string? TryGetReasoningEffortForModel(string? modelName)
-    {
-        var strippedName = StripReasoningSuffix(modelName);
-        var entry = Models?.AvailableModels?.FirstOrDefault(
-            m => string.Equals(m.Name, strippedName, StringComparison.OrdinalIgnoreCase));
-        return entry?.ReasoningEffort;
-    }
-
-    /// <summary>
-    /// Appends a reasoning effort suffix (e.g. <c>:high</c>) to a model name when one is configured.
-    /// An explicit reasoning suffix already present on the model name takes precedence and is
-    /// preserved unchanged. A <c>null</c> or empty <paramref name="reasoningEffort"/> leaves the model unchanged.
-    /// </summary>
-    /// <param name="model">The model identifier.</param>
-    /// <param name="reasoningEffort">The reasoning effort to apply, or <c>null</c>/empty for none.</param>
-    /// <returns>The model name with the reasoning suffix applied (or unchanged).</returns>
-    public static string ApplyReasoningSuffix(string model, string? reasoningEffort)
-    {
-        if (string.IsNullOrEmpty(reasoningEffort))
-            return model;
-
-        // Check if model already ends with a known reasoning suffix — explicit suffix takes precedence
-        var lastColon = model.LastIndexOf(':');
-        if (lastColon > 0 && lastColon < model.Length - 1)
-        {
-            var suffix = model.Substring(lastColon + 1);
-            if (KnownReasoningLevels.Contains(suffix))
-                return model; // Already has a reasoning suffix, don't override
-        }
-
-        return $"{model}:{reasoningEffort}";
     }
 
     /// <summary>
@@ -227,7 +159,11 @@ public sealed class HiveConfigFile
             }
 
             var trimmed = effort!.Trim();
-            if (!KnownReasoningLevels.Contains(trimmed))
+            try
+            {
+                ReasoningEffortConverter.Parse(trimmed);
+            }
+            catch (ArgumentException)
             {
                 errors.Add(
                     $"{field}: invalid reasoning_effort '{effort}'. Valid values: none, low, medium, high, extra_high.");
