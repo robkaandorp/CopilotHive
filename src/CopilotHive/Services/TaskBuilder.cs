@@ -2,6 +2,8 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Workers;
 
+using Microsoft.Extensions.AI;
+
 namespace CopilotHive.Services;
 
 /// <summary>
@@ -22,6 +24,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
     /// <param name="model">Optional model ID for this task (e.g., "claude-sonnet-4.6").</param>
     /// <param name="maxContextTokens">Context window size in tokens for the worker's agent.</param>
     /// <param name="subAgentModels">Model catalog for sub-agent delegation, or <c>null</c> for none.</param>
+    /// <param name="reasoningEffort">Explicit reasoning effort for this task, or <c>null</c> to use the model suffix fallback.</param>
     /// <returns>A fully constructed <see cref="WorkTask"/>.</returns>
     public WorkTask Build(
         string goalId,
@@ -33,7 +36,8 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
         BranchAction branchAction,
         string? model = null,
         int maxContextTokens = Constants.DefaultBrainContextWindow,
-        IReadOnlyList<SubAgentModelDto>? subAgentModels = null)
+        IReadOnlyList<SubAgentModelDto>? subAgentModels = null,
+        ReasoningEffort? reasoningEffort = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(goalId);
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
@@ -60,6 +64,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
             Repositories = repoList,
             MaxContextTokens = maxContextTokens,
             SubAgentModels = subAgentModels ?? [],
+            ReasoningEffort = reasoningEffort,
         };
     }
 }

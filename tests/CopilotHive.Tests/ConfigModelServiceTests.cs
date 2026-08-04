@@ -253,6 +253,44 @@ public sealed class ConfigModelServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task SaveModelConfigAsync_PassesOrchestratorReasoningEffortEnum_ToBrain()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "old-model", ReasoningEffort = "high" },
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var brain = new FakeDistributedBrain();
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
+        var update = new ModelConfigUpdate("new-orch", null, null, null, null);
+
+        await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, brain.NewOverloadCalls);
+        Assert.Equal(Microsoft.Extensions.AI.ReasoningEffort.High, brain.LastReasoningEffort);
+        // The legacy suffix mechanism is still applied to the model string.
+        Assert.Equal("new-orch", brain.LastModel);
+    }
+
+    [Fact]
+    public async Task SaveModelConfigAsync_NoOrchestratorReasoningEffort_PassesNullEnum_ToBrain()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "old-model" },
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var brain = new FakeDistributedBrain();
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
+        var update = new ModelConfigUpdate("new-orch", null, null, null, null);
+
+        await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, brain.NewOverloadCalls);
+        Assert.Null(brain.LastReasoningEffort);
+    }
+
+    [Fact]
     public async Task SaveModelConfigAsync_ModelWithoutReasoningEffort_NoSuffixApplied()
     {
         var config = new HiveConfigFile
@@ -1618,7 +1656,20 @@ file sealed class FakeDistributedBrain : IDistributedBrain
     public string? LastModel { get; private set; }
     public int? LastMaxContextTokens { get; private set; }
 
+    /// <summary>Reasoning effort captured from the enum-carrying overload.</summary>
+    public Microsoft.Extensions.AI.ReasoningEffort? LastReasoningEffort { get; private set; }
+
+    /// <summary>Number of calls that went through the enum-carrying overload.</summary>
+    public int NewOverloadCalls { get; private set; }
+
     public Task ConnectAsync(CancellationToken ct = default) { Connected = true; return Task.CompletedTask; }
+
+    public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct)
+    {
+        NewOverloadCalls++;
+        LastReasoningEffort = reasoningEffort;
+        return UpdateModelAsync(model, maxContextTokens, ct);
+    }
 
     public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default)
     {

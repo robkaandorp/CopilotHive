@@ -1211,6 +1211,9 @@ file sealed class ScriptedPlanBrain : IDistributedBrain
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
+    public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+        UpdateModelAsync(model, maxContextTokens, ct);
+
     public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) =>
         Task.CompletedTask;
 
@@ -1279,6 +1282,9 @@ file sealed class ThrowingPlanBrain : IDistributedBrain
     internal List<string> DeletedSessions { get; } = [];
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+        UpdateModelAsync(model, maxContextTokens, ct);
 
     public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) =>
         Task.CompletedTask;
@@ -1376,6 +1382,9 @@ file sealed class CancellingOnPlanBrain : IDistributedBrain
     internal List<CancellationToken> DeleteSessionTokens { get; } = [];
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+        UpdateModelAsync(model, maxContextTokens, ct);
 
     public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default) =>
         Task.CompletedTask;

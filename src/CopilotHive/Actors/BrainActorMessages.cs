@@ -1,5 +1,7 @@
 using CopilotHive.Services;
 
+using Microsoft.Extensions.AI;
+
 namespace CopilotHive.Actors;
 
 /// <summary>Marker interface for all brain actor messages.</summary>
@@ -17,8 +19,19 @@ internal sealed record DeleteSessionMessage(string GoalId, TaskCompletionSource<
 /// <summary>Merges a goal summary into the master session.</summary>
 internal sealed record MergeSummaryMessage(string GoalId, string Summary, TaskCompletionSource<bool> Reply) : IBrainMessage;
 
-/// <summary>Updates the model and optionally the max context tokens.</summary>
-internal sealed record UpdateModelMessage(string Model, int? MaxContextTokens, TaskCompletionSource<bool> Reply) : IBrainMessage;
+/// <summary>Updates the model, optionally the max context tokens, and the reasoning effort.</summary>
+internal sealed record UpdateModelMessage(
+    string Model,
+    int? MaxContextTokens,
+    TaskCompletionSource<bool> Reply)
+    : IBrainMessage
+{
+    /// <summary>
+    /// The explicitly configured reasoning effort. When <c>null</c>, the actor falls back to
+    /// legacy suffix parsing of <see cref="Model"/>.
+    /// </summary>
+    public ReasoningEffort? ReasoningEffort { get; init; }
+}
 
 /// <summary>Registers an active pipeline. Fire-and-forget.</summary>
 internal sealed record RegisterPipelineMessage(string GoalId, GoalPipeline Pipeline) : IBrainMessage;
@@ -79,8 +92,9 @@ internal static class BrainActorMessages
         new(goalId, summary, NewReply<bool>());
 
     /// <summary>Creates an update-model message with an asynchronous reply source.</summary>
-    internal static UpdateModelMessage CreateUpdateModelMessage(string model, int? maxContextTokens) =>
-        new(model, maxContextTokens, NewReply<bool>());
+    internal static UpdateModelMessage CreateUpdateModelMessage(
+        string model, int? maxContextTokens, ReasoningEffort? reasoningEffort = null) =>
+        new(model, maxContextTokens, NewReply<bool>()) { ReasoningEffort = reasoningEffort };
 
     /// <summary>Creates a get-pipeline message with an asynchronous reply source.</summary>
     internal static GetPipelineMessage CreateGetPipelineMessage(string goalId) => new(goalId, NewReply<GoalPipeline?>());

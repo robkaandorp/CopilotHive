@@ -148,7 +148,11 @@ public sealed class ConfigModelService
             {
                 var reasoningEffort = _config.TryGetReasoningEffortForModel(model);
                 var modelWithReasoning = HiveConfigFile.ApplyReasoningSuffix(model, reasoningEffort);
-                await _brain.UpdateModelAsync(modelWithReasoning, contextWindow, ct);
+                await _brain.UpdateModelAsync(
+                    modelWithReasoning,
+                    contextWindow,
+                    ReasoningEffortConverter.Parse(_config.Orchestrator.ReasoningEffort),
+                    ct);
             }
         }
 

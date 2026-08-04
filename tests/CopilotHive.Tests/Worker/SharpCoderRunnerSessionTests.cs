@@ -139,7 +139,7 @@ public sealed class SharpCoderRunnerSessionTests
     }
 
     /// <summary>
-    /// <see cref="SharpCoderRunner.ResetSessionAsync"/> must clear <c>_session</c> to <c>null</c>
+    /// <see cref="SharpCoderRunner.ResetSessionAsync(string, System.Threading.CancellationToken)"/> must clear <c>_session</c> to <c>null</c>
     /// so that subsequent prompts start with a fresh session instead of leaking stale context.
     /// </summary>
     [Fact]

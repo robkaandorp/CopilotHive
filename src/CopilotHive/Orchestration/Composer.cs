@@ -53,6 +53,12 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly GoalReadyNotifier? _goalReadyNotifier;
     private readonly ComposerAttachmentService? _attachmentService;
 
+    /// <summary>
+    /// The explicitly configured reasoning effort (from configuration, not derived from a model
+    /// name suffix). When non-null it takes precedence over suffix-parsed values.
+    /// </summary>
+    private readonly ReasoningEffort? _configuredReasoningEffort;
+
     /// <summary>Models the Composer can switch between at runtime.</summary>
     public IReadOnlyList<string> AvailableModels => _agentService.AvailableModels;
 
@@ -297,7 +303,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         GoalReviewService? goalReviewService = null,
         LlmSessionRegistry? sessionRegistry = null,
         GoalReadyNotifier? goalReadyNotifier = null,
-        ComposerAttachmentService? attachmentService = null)
+        ComposerAttachmentService? attachmentService = null,
+        ReasoningEffort? reasoningEffort = null)
     {
         _logger = logger;
         _goalStore = goalStore;
@@ -313,7 +320,10 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _sessionRegistry = sessionRegistry;
         _goalReadyNotifier = goalReadyNotifier;
         _attachmentService = attachmentService;
+        _configuredReasoningEffort = reasoningEffort;
 
+        // Kept for reference: legacy suffix parsing. The effective reasoning effort is computed
+        // by ComposerAgentService from the configured value plus this fallback.
         var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
 
         _systemPrompt = DefaultSystemPrompt;
@@ -358,7 +368,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _composerTools = BuildComposerTools();
 
         _agentService = new ComposerAgentService(
-            model, maxContextTokens, maxSteps, reasoning,
+            model, maxContextTokens, maxSteps, _configuredReasoningEffort,
             _hiveConfig, _systemPrompt, _composerTools,
             _repoManager, _stateDir,
             compactionModel, _logger,

@@ -13,6 +13,13 @@ public sealed class ComposerConfig
     public int MaxSteps { get; set; } = Constants.DefaultBrainMaxSteps;
 
     /// <summary>
+    /// Reasoning effort for the Composer <see cref="Model"/> (one of:
+    /// none, low, medium, high, extra_high). Required when <see cref="Model"/> is set.
+    /// YAML key: <c>reasoning_effort</c>.
+    /// </summary>
+    public string? ReasoningEffort { get; set; }
+
+    /// <summary>
     /// Returns a merged, deduplicated list of available models, with <see cref="Model"/> as the first entry.
     /// Falls back to <paramref name="fallback"/> if neither <see cref="Model"/> nor <see cref="Models"/> is set.
     /// </summary>

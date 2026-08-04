@@ -1,5 +1,6 @@
 using System.Reflection;
 
+using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
@@ -1915,6 +1916,310 @@ public sealed class DistributedBrainTests
         }
     }
 
+    // ── Configured ReasoningEffort (explicit enum) tests ──────────────────────
+
+    private static readonly BindingFlags BrainNonPublic = BindingFlags.NonPublic | BindingFlags.Instance;
+
+    private static ReasoningEffort? ConfiguredReasoning(DistributedBrain brain) =>
+        (ReasoningEffort?)typeof(DistributedBrain)
+            .GetField("_configuredReasoningEffort", BrainNonPublic)!.GetValue(brain);
+
+    private static ReasoningEffort? EffectiveReasoning(DistributedBrain brain) =>
+        (ReasoningEffort?)typeof(DistributedBrain)
+            .GetField("_reasoningEffort", BrainNonPublic)!.GetValue(brain);
+
+    private static ReasoningEffort? ActorReasoning(DistributedBrain brain)
+    {
+        var actor = typeof(DistributedBrain).GetField("_brainActor", BrainNonPublic)!.GetValue(brain);
+        Assert.NotNull(actor);
+        return (ReasoningEffort?)typeof(CopilotHive.Actors.BrainActor)
+            .GetField("_reasoningEffort", BrainNonPublic)!.GetValue(actor);
+    }
+
+    [Fact]
+    public async Task Constructor_ConfiguredReasoningEffort_OverridesSuffixParsedValue()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            // The model name carries a ':low' suffix but the configured value is High — the
+            // configured enum wins and is what reaches the BrainActor.
+            var brain = new DistributedBrain("copilot/gpt-5.4:low", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient(),
+                chatClientFactory: _ => new FakeChatClient(),
+                reasoningEffort: ReasoningEffort.High);
+            await using (brain)
+            {
+                Assert.Equal(ReasoningEffort.High, ConfiguredReasoning(brain));
+                // Suffix parsing still populates the legacy field at construction time.
+                Assert.Equal(ReasoningEffort.Low, EffectiveReasoning(brain));
+
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                // The actor receives the configured value, not the suffix-derived one.
+                Assert.Equal(ReasoningEffort.High, ActorReasoning(brain));
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Constructor_NoConfiguredReasoningEffort_UsesSuffixParsedValue()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/gpt-5.4:low", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient(),
+                chatClientFactory: _ => new FakeChatClient());
+            await using (brain)
+            {
+                Assert.Null(ConfiguredReasoning(brain));
+                Assert.Equal(ReasoningEffort.Low, EffectiveReasoning(brain));
+
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                Assert.Equal(ReasoningEffort.Low, ActorReasoning(brain));
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task UpdateModelAsync_WithReasoningEffort_UpdatesConfiguredValueAndActor()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient(),
+                chatClientFactory: _ => new FakeChatClient());
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                Assert.Null(ConfiguredReasoning(brain));
+
+                // The suffix says 'low' but the explicit enum says 'ExtraHigh' — the enum wins
+                // both locally and in the actor.
+                await brain.UpdateModelAsync("copilot/gpt-5.4:low", null,
+                    ReasoningEffort.ExtraHigh, TestContext.Current.CancellationToken);
+
+                Assert.Equal(ReasoningEffort.ExtraHigh, ConfiguredReasoning(brain));
+                Assert.Equal(ReasoningEffort.ExtraHigh, EffectiveReasoning(brain));
+                Assert.Equal(ReasoningEffort.ExtraHigh, ActorReasoning(brain));
+                Assert.Equal("copilot/gpt-5.4:low", brain.GetStats()!.Model);
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task UpdateModelAsync_WithNullReasoningEffort_PreservesConfiguredValue()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient(),
+                chatClientFactory: _ => new FakeChatClient(),
+                reasoningEffort: ReasoningEffort.Medium);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                // Old overload → null reasoning. The configured value must not be cleared, and it
+                // must beat the ':high' suffix of the new model both locally and in the actor.
+                await brain.UpdateModelAsync("copilot/gpt-5.4:high", null, TestContext.Current.CancellationToken);
+
+                Assert.Equal(ReasoningEffort.Medium, ConfiguredReasoning(brain));
+                Assert.Equal(ReasoningEffort.Medium, EffectiveReasoning(brain));
+                Assert.Equal(ReasoningEffort.Medium, ActorReasoning(brain));
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task UpdateModelAsync_WithNullReasoningEffort_AndNoConfiguredValue_FallsBackToSuffix()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient(),
+                chatClientFactory: _ => new FakeChatClient());
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                await brain.UpdateModelAsync("copilot/gpt-5.4:high", null, null, TestContext.Current.CancellationToken);
+
+                // Suffix-derived reasoning is never promoted to "configured".
+                Assert.Null(ConfiguredReasoning(brain));
+                Assert.Equal(ReasoningEffort.High, EffectiveReasoning(brain));
+                Assert.Equal(ReasoningEffort.High, ActorReasoning(brain));
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task UpdateModelAsync_WithReasoningEffort_ActorFailure_DoesNotCommitConfiguredValue()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model:medium", NullLogger<DistributedBrain>.Instance,
+                stateDir: tempDir, chatClient: new FakeChatClient(),
+                chatClientFactory: _ => new FakeChatClient(),
+                reasoningEffort: ReasoningEffort.Medium);
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+            try
+            {
+                Assert.Equal(ReasoningEffort.Medium, ConfiguredReasoning(brain));
+                Assert.Equal(ReasoningEffort.Medium, EffectiveReasoning(brain));
+
+                // Dispose the brain so the actor is gone: the next AskActorAsync must throw,
+                // simulating a failed actor update (mailbox unavailable/closed).
+                await brain.DisposeAsync();
+
+                await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                    brain.UpdateModelAsync("copilot/gpt-5.4:low", null,
+                        ReasoningEffort.ExtraHigh, TestContext.Current.CancellationToken));
+
+                // The actor is the source of truth: a failed update must NOT commit the new value.
+                Assert.Equal(ReasoningEffort.Medium, ConfiguredReasoning(brain));
+                Assert.Equal(ReasoningEffort.Medium, EffectiveReasoning(brain));
+            }
+            finally
+            {
+                // DisposeAsync is idempotent — safe to await again for cleanup.
+                await brain.DisposeAsync();
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task UpdateModelAsync_ConcurrentCalls_AreSerialized_ActorAndLocalStateAgree()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"brain-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        // Gate that blocks the BrainActor's message loop: the first chat-client creation (triggered
+        // by the fork below) parks the loop, so a subsequent UpdateModelMessage sits unprocessed in
+        // the mailbox and both concurrent UpdateModelAsync calls are guaranteed to overlap.
+        var factoryEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gateArmed = 1;
+
+        // No injected chat client: the actor must go through the factory when forking.
+        var brain = new DistributedBrain("copilot/model-initial", NullLogger<DistributedBrain>.Instance,
+            stateDir: tempDir,
+            chatClientFactory: _ =>
+            {
+                if (Interlocked.Exchange(ref gateArmed, 0) == 1)
+                {
+                    factoryEntered.TrySetResult();
+                    releaseGate.Task.GetAwaiter().GetResult();
+                }
+
+                return new FakeChatClient();
+            },
+            reasoningEffort: ReasoningEffort.Medium);
+
+        try
+        {
+            await brain.ConnectAsync(TestContext.Current.CancellationToken);
+            Assert.Equal(ReasoningEffort.Medium, ConfiguredReasoning(brain));
+
+            var sessionLock = (SemaphoreSlim)typeof(DistributedBrain)
+                .GetField("_sessionLock", BrainNonPublic)!.GetValue(brain)!;
+
+            // Park the actor loop.
+            var forkTask = brain.ForkSessionForGoalAsync("gate-goal", TestContext.Current.CancellationToken);
+            await factoryEntered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            // Call A: explicit High. The uncontended lock is taken synchronously, so by the time the
+            // task is returned A has already published its message to the (parked) actor.
+            var taskA = brain.UpdateModelAsync("copilot/model-a", null,
+                ReasoningEffort.High, TestContext.Current.CancellationToken);
+
+            // A holds the session lock for the whole actor round-trip. Without the lock this is 1,
+            // which is exactly the window in which B could read stale state.
+            Assert.Equal(0, sessionLock.CurrentCount);
+
+            // Call B: model-only update (null reasoning) — its effective reasoning is whatever
+            // _configuredReasoningEffort holds when B runs. Serialization forces B to observe A's
+            // committed High; without it B would capture the stale Medium and send it to the actor
+            // after A, leaving the actor on Medium while the facade reports High.
+            var taskB = brain.UpdateModelAsync("copilot/model-b", null,
+                null, TestContext.Current.CancellationToken);
+
+            Assert.False(taskA.IsCompleted);
+            Assert.False(taskB.IsCompleted);
+
+            releaseGate.TrySetResult();
+
+            await taskA.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await taskB.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await forkTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            // The lock is released on every path.
+            Assert.Equal(1, sessionLock.CurrentCount);
+
+            var actorModel = (string)typeof(CopilotHive.Actors.BrainActor)
+                .GetField("_modelOverride", BrainNonPublic)!
+                .GetValue(typeof(DistributedBrain).GetField("_brainActor", BrainNonPublic)!.GetValue(brain))!;
+
+            // Last writer wins consistently: B is the last to complete, and the actor and the facade
+            // agree on both the model and the reasoning effort.
+            Assert.Equal("copilot/model-b", actorModel);
+            Assert.Equal("copilot/model-b", brain.GetStats()!.Model);
+            Assert.Equal(ReasoningEffort.High, ActorReasoning(brain));
+            Assert.Equal(ReasoningEffort.High, ConfiguredReasoning(brain));
+            Assert.Equal(ReasoningEffort.High, EffectiveReasoning(brain));
+        }
+        finally
+        {
+            // Never leave the actor loop parked, or disposal would hang.
+            releaseGate.TrySetResult();
+            await brain.DisposeAsync();
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
 
     // -- BrainActor lifecycle tests --
 
@@ -1991,6 +2296,76 @@ public sealed class DistributedBrainTests
             }
         }
         finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task ConnectAsync_PassesConfigRepoToBrainActor()
+    {
+        var dir = NewTempDir();
+        var configDir = Path.Combine(Path.GetTempPath(), $"config-repo-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(configDir);
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", configDir);
+
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(),
+                configRepo: configRepo);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                var actor = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
+                Assert.NotNull(actor);
+
+                var configRepoField = typeof(CopilotHive.Actors.BrainActor)
+                    .GetField("_configRepo", NonPublicInstance)!;
+                Assert.Same(configRepo, configRepoField.GetValue(actor));
+            }
+        }
+        finally
+        {
+            DeleteDir(dir);
+            try { Directory.Delete(configDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ForkSessionForGoalAsync_PassesConfigRepoToChildGoalBrainActor()
+    {
+        var dir = NewTempDir();
+        var configDir = Path.Combine(Path.GetTempPath(), $"config-repo-child-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(configDir);
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", configDir);
+
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(),
+                configRepo: configRepo);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("g-child-1", TestContext.Current.CancellationToken);
+
+                var actor = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
+                Assert.NotNull(actor);
+
+                var childActorsField = typeof(CopilotHive.Actors.BrainActor)
+                    .GetField("_childActors", NonPublicInstance)!;
+                var children = (Dictionary<string, CopilotHive.Actors.GoalBrainActor>)childActorsField.GetValue(actor)!;
+                Assert.True(children.TryGetValue("g-child-1", out var child));
+
+                var childConfigRepoField = typeof(CopilotHive.Actors.GoalBrainActor)
+                    .GetField("_configRepo", NonPublicInstance)!;
+                Assert.Same(configRepo, childConfigRepoField.GetValue(child));
+            }
+        }
+        finally
+        {
+            DeleteDir(dir);
+            try { Directory.Delete(configDir, recursive: true); } catch { }
+        }
     }
 
     [Fact]
@@ -2269,6 +2644,9 @@ file sealed class FakeDistributedBrain : IDistributedBrain
     public int? LastMaxContextTokens { get; private set; }
 
     public Task ConnectAsync(CancellationToken ct = default) { Connected = true; return Task.CompletedTask; }
+
+    public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+        UpdateModelAsync(model, maxContextTokens, ct);
 
     public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default)
     {
@@ -2628,7 +3006,7 @@ file sealed class ThrowingStubClient : IChatClient
 
 /// <summary>
 /// IChatClient stub that counts how many times <see cref="Dispose"/> is called,
-/// used to verify that <see cref="DistributedBrain.UpdateModelAsync"/> disposes the old client.
+/// used to verify that <see cref="DistributedBrain.UpdateModelAsync(string, int?, CancellationToken)"/> disposes the old client.
 /// </summary>
 file sealed class DisposableCountingChatClient : IChatClient
 {

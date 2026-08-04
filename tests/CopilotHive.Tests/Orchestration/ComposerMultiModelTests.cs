@@ -232,6 +232,95 @@ public sealed class ComposerMultiModelTests : IDisposable
         Assert.NotNull(stats);
     }
 
+    // ── Configured reasoning effort wiring ──
+
+    private static ComposerAgentService AgentServiceOf(Composer composer) =>
+        (ComposerAgentService)typeof(Composer)
+            .GetField("_agentService", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(composer)!;
+
+    [Fact]
+    public async Task ConfiguredReasoningEffort_IsPassedToAgentService_AndOverridesSuffix()
+    {
+        var composer = new Composer(
+            "claude-sonnet-4:low",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            availableModels: ["claude-sonnet-4:low", "claude-opus"],
+            chatClientFactory: _ => new Mock<IChatClient>().Object,
+            reasoningEffort: ReasoningEffort.High);
+
+        await using (composer)
+        {
+            var agentService = AgentServiceOf(composer);
+            Assert.Equal(ReasoningEffort.High, agentService.ReasoningEffort);
+        }
+    }
+
+    [Fact]
+    public async Task NoConfiguredReasoningEffort_AgentServiceUsesSuffixParsing()
+    {
+        var composer = new Composer(
+            "claude-sonnet-4:low",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            availableModels: ["claude-sonnet-4:low", "claude-opus"],
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+        await using (composer)
+        {
+            var agentService = AgentServiceOf(composer);
+            Assert.Equal(ReasoningEffort.Low, agentService.ReasoningEffort);
+        }
+    }
+
+    [Fact]
+    public async Task SwitchModelAsync_RetainsConfiguredReasoningEffort()
+    {
+        var composer = new Composer(
+            "claude-sonnet-4",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            availableModels: ["claude-sonnet-4", "claude-opus:low"],
+            chatClientFactory: _ => new Mock<IChatClient>().Object,
+            reasoningEffort: ReasoningEffort.High);
+
+        await using (composer)
+        {
+            await composer.ConnectAsync(TestContext.Current.CancellationToken);
+            await composer.SwitchModelAsync("claude-opus:low");
+
+            // The ':low' suffix of the new model must not override the configured effort.
+            Assert.Equal(ReasoningEffort.High, AgentServiceOf(composer).ReasoningEffort);
+        }
+    }
+
+    [Fact]
+    public async Task SwitchModelAsync_WithoutConfiguredReasoningEffort_ReparsesSuffix()
+    {
+        var composer = new Composer(
+            "claude-sonnet-4:high",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            availableModels: ["claude-sonnet-4:high", "claude-opus"],
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+        await using (composer)
+        {
+            await composer.ConnectAsync(TestContext.Current.CancellationToken);
+            Assert.Equal(ReasoningEffort.High, AgentServiceOf(composer).ReasoningEffort);
+
+            // Suffix-derived reasoning is not retained as configured — it is re-parsed.
+            await composer.SwitchModelAsync("claude-opus");
+
+            Assert.Null(AgentServiceOf(composer).ReasoningEffort);
+        }
+    }
+
     [Fact]
     public async Task AvailableModels_ReflectsLiveHiveConfigMutation()
     {

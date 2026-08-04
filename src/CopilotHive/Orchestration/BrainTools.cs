@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Text.Json;
 
+using CopilotHive.Configuration;
 using CopilotHive.Knowledge;
 using CopilotHive.Goals;
 using CopilotHive.Services;
@@ -85,13 +86,15 @@ internal static class BrainTools
 
     /// <summary>
     /// Builds the dependency-only Brain tools: <c>get_goal</c>, <c>search_knowledge</c>,
-    /// <c>read_document</c>, <c>traverse_graph</c> and <c>get_current_time</c>.
+    /// <c>read_document</c>, <c>traverse_graph</c>, <c>get_current_time</c>,
+    /// <c>list_config_files</c> and <c>read_config_file</c>.
     /// </summary>
     internal static List<AITool> BuildDependencyTools(
         IGoalStore? goalStore,
         Func<string, Task<GoalPipeline?>> pipelineResolver,
         KnowledgeGraph? knowledgeGraph,
-        ILogger logger)
+        ILogger logger,
+        ConfigRepoManager? configRepo = null)
     {
         ArgumentNullException.ThrowIfNull(pipelineResolver);
         ArgumentNullException.ThrowIfNull(logger);
@@ -366,6 +369,99 @@ internal static class BrainTools
                 },
                 "get_current_time",
                 "Get the current date and time in UTC. Use when you need to know the current date for changelog entries, release notes, or other date-sensitive content."),
+            AIFunctionFactory.Create(
+                ([Description("Subdirectory to list files under. Leave empty for the config repo root.")] string? path = null,
+                 CancellationToken cancellationToken = default) =>
+                {
+                    if (configRepo is null)
+                        return "❌ Config repo tools are not available — no config repo configured.";
+
+                    var baseDir = configRepo.LocalPath;
+                    string targetDir;
+
+                    if (string.IsNullOrWhiteSpace(path))
+                    {
+                        targetDir = baseDir;
+                    }
+                    else
+                    {
+                        var resolved = Path.GetFullPath(Path.Combine(baseDir, path));
+                        if (!resolved.StartsWith(baseDir + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+                            && !string.Equals(resolved, baseDir, StringComparison.Ordinal))
+                            return $"❌ Path '{path}' is outside the config repo. Access denied.";
+                        targetDir = resolved;
+                    }
+
+                    // SECURITY: Block .git directory access to prevent credential disclosure
+                    var targetSegments = targetDir.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
+                    if (targetSegments.Any(s => s.Equals(".git", StringComparison.OrdinalIgnoreCase)))
+                        return $"❌ Path '{path ?? "(root)"}' is inside a .git directory. Access denied.";
+
+                    if (!Directory.Exists(targetDir))
+                        return $"❌ Directory '{path ?? "(root)"}' not found in config repo.";
+
+                    var files = Directory.GetFiles(targetDir, "*", SearchOption.AllDirectories)
+                        .Where(f =>
+                        {
+                            var fileSegments = f.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
+                            return !fileSegments.Any(s => s.Equals(".git", StringComparison.OrdinalIgnoreCase));
+                        })
+                        .Select(f => Path.GetRelativePath(baseDir, f).Replace('\\', '/'))
+                        .OrderBy(f => f)
+                        .ToList();
+
+                    if (files.Count == 0)
+                        return "(no files found)";
+
+                    return string.Join('\n', files);
+                },
+                "list_config_files",
+                "List files under the config repo root or a subdirectory. Returns relative paths."),
+            AIFunctionFactory.Create(
+                async ([Description("Relative path to the file within the config repo.")] string path,
+                 [Description("Line number to start reading from (1-indexed). Default: 1")] int offset = 1,
+                 [Description("Maximum number of lines to read. Default: 200")] int limit = 200,
+                 CancellationToken cancellationToken = default) =>
+                {
+                    if (configRepo is null)
+                        return "❌ Config repo tools are not available — no config repo configured.";
+
+                    if (string.IsNullOrWhiteSpace(path))
+                        return "❌ path is required.";
+
+                    var baseDir = configRepo.LocalPath;
+                    var resolved = Path.GetFullPath(Path.Combine(baseDir, path));
+
+                    // SECURITY: Prevent path traversal
+                    if (!resolved.StartsWith(baseDir + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+                        && !string.Equals(resolved, baseDir, StringComparison.Ordinal))
+                        return $"❌ Path '{path}' is outside the config repo. Access denied.";
+
+                    // SECURITY: Block .git directory access to prevent credential disclosure
+                    var segments = resolved.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
+                    if (segments.Any(s => s.Equals(".git", StringComparison.OrdinalIgnoreCase)))
+                        return $"❌ Path '{path}' is inside a .git directory. Access denied.";
+
+                    if (!File.Exists(resolved))
+                        return $"❌ File '{path}' not found in config repo.";
+
+                    var lines = await File.ReadAllLinesAsync(resolved, cancellationToken);
+                    var startIndex = Math.Max(0, offset - 1);
+                    if (startIndex >= lines.Length)
+                        return $"❌ offset {offset} is beyond end of file ({lines.Length} lines total).";
+
+                    var sb = new System.Text.StringBuilder();
+                    var end = Math.Min(startIndex + limit, lines.Length);
+                    for (var i = startIndex; i < end; i++)
+                        sb.AppendLine($"{i + 1}: {lines[i]}");
+
+                    if (end < lines.Length)
+                        sb.AppendLine($"... ({lines.Length - end} more lines — use offset={end + 1} to continue)");
+
+                    return sb.ToString().TrimEnd();
+                },
+                "read_config_file",
+                "Read a config repo file with line numbers. Validates that the resolved path stays within the config repo root."),
         ];
     }
 }

@@ -17,22 +17,25 @@ repositories:
 workers:
   coder:
     model: claude-opus-4.6
+    reasoning_effort: high
     context_window: 150000
   reviewer:
     model: gpt-5.4
+    reasoning_effort: medium
   tester:
     model: claude-sonnet-4.6
+    reasoning_effort: high
   improver:
     model: claude-sonnet-4.6
+    reasoning_effort: medium
 
 # Orchestrator settings
 orchestrator:
   model: claude-sonnet-4.6
+  reasoning_effort: high
   max_iterations: 10
   max_retries_per_task: 3
   verbose_logging: false
-  worker_context_window: 150000
-  brain_context_window: 150000  # Max tokens for the Brain model's context
   brain_max_steps: 50           # Max tool-call steps per Brain request
 
 # Model-level configuration

@@ -3,6 +3,8 @@ using CopilotHive.Services;
 using CopilotHive.Worker;
 using CopilotHive.Workers;
 
+using Microsoft.Extensions.AI;
+
 namespace CopilotHive.Tests.Worker;
 
 /// <summary>
@@ -155,6 +157,8 @@ public sealed class TaskExecutorTests
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ResetSessionAsync(string? model = null, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default) => Task.CompletedTask;
         public Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
         {
             // After TaskExecutor clears reports (ClearWorkerReport/ClearTestReport), inject the

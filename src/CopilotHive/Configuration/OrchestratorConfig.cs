@@ -33,4 +33,11 @@ public sealed class OrchestratorConfig
     /// heartbeating while their LLM call hangs. Set to 0 to disable.
     /// </summary>
     public int WorkerTaskTimeoutMinutes { get; set; } = Services.CleanupDefaults.WorkerTaskTimeoutMinutes;
+
+    /// <summary>
+    /// Reasoning effort for the orchestrator <see cref="Model"/> (one of:
+    /// none, low, medium, high, extra_high). Always required because
+    /// <see cref="Model"/> always has a value. YAML key: <c>reasoning_effort</c>.
+    /// </summary>
+    public string? ReasoningEffort { get; set; }
 }

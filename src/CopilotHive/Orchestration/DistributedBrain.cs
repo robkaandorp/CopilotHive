@@ -30,6 +30,12 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private int _maxContextTokens;
     private readonly int _maxSteps;
     private ReasoningEffort? _reasoningEffort;
+
+    /// <summary>
+    /// The explicitly configured reasoning effort (from configuration, not derived from a model
+    /// name suffix). When non-null it takes precedence over <see cref="_reasoningEffort"/>.
+    /// </summary>
+    private ReasoningEffort? _configuredReasoningEffort;
     private readonly ILogger<DistributedBrain> _logger;
     private readonly MetricsTracker? _metricsTracker;
     private readonly IBrainRepoManager? _repoManager;
@@ -40,6 +46,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly Func<string, IChatClient> _chatClientFactory;
     private readonly HiveConfigFile? _hiveConfig;
     private readonly LlmSessionRegistry? _sessionRegistry;
+    private readonly ConfigRepoManager? _configRepo;
 
     /// <summary>
     /// Directory used for persistent Brain state (session files).
@@ -92,7 +99,9 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         KnowledgeGraph? knowledgeGraph = null,
         Func<string, IChatClient>? chatClientFactory = null,
         HiveConfigFile? hiveConfig = null,
-        LlmSessionRegistry? sessionRegistry = null)
+        LlmSessionRegistry? sessionRegistry = null,
+        ConfigRepoManager? configRepo = null,
+        ReasoningEffort? reasoningEffort = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -109,6 +118,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _chatClientFactory = chatClientFactory ?? ChatClientFactory.Create;
         _hiveConfig = hiveConfig;
         _sessionRegistry = sessionRegistry;
+        _configRepo = configRepo;
+        _configuredReasoningEffort = reasoningEffort;
 
         var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(modelOverride);
         _reasoningEffort = reasoning;
@@ -241,13 +252,14 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     hiveConfig: _hiveConfig,
                     maxSteps: _maxSteps,
                     systemPrompt: _systemPrompt,
-                    reasoningEffort: _reasoningEffort,
+                    reasoningEffort: _configuredReasoningEffort ?? _reasoningEffort,
                     workDirectory: _repoManager?.WorkDirectory,
                     goalStore: _goalStore,
                     knowledgeGraph: _knowledgeGraph,
                     sessionRegistry: _sessionRegistry,
                     subAgentModels: _subAgentModels,
-                    subAgentsEnabled: _subAgentsEnabled);
+                    subAgentsEnabled: _subAgentsEnabled,
+                    configRepo: _configRepo);
             actor.Start();
 
             var connectMsg = BrainActorMessages.CreateConnectMessage();
@@ -377,35 +389,60 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     }
 
     /// <inheritdoc />
-    public async Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default)
+    public Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default)
+        => UpdateModelAsync(model, maxContextTokens, reasoningEffort: null, ct);
+
+    /// <inheritdoc />
+    public async Task UpdateModelAsync(string model, int? maxContextTokens, ReasoningEffort? reasoningEffort, CancellationToken ct)
     {
         EnsureConnected();
         EnsureNotResetting();
 
-        // The actor is the source of truth: its update must succeed before any local or registry
-        // state is published, otherwise a failed update would leave the two permanently divergent.
-        var updateMsg = BrainActorMessages.CreateUpdateModelMessage(model, maxContextTokens);
-        await AskActorAsync(updateMsg, updateMsg.Reply, ct, TimeSpan.FromSeconds(3));
-
-        _modelOverride = model;
-        if (maxContextTokens.HasValue)
-            _maxContextTokens = maxContextTokens.Value;
-
-        var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(model);
-        _reasoningEffort = reasoning;
-
-        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+        // Serialized against every other model update (and connect/reset) so that reading the
+        // current configured effort, sending it to the actor and committing the local fields is
+        // one atomic step. Without this, an overlapping update could read a stale configured
+        // value and publish it to the actor after another call committed a newer one, leaving
+        // the actor and this facade permanently divergent.
+        await _sessionLock.WaitAsync(ct);
+        try
         {
-            SessionId = "brain-master",
-            SessionType = LlmSessionType.Brain,
-            Model = _modelOverride,
-            Status = "idle",
-            CurrentTokens = 0,
-            MaxTokens = _maxContextTokens,
-        });
+            // A null reasoning effort means "unspecified" — never clear an explicitly configured
+            // value. The actor is the source of truth: compute the candidate value the actor must
+            // receive BEFORE the call, but commit the local _configuredReasoningEffort only after
+            // the actor acknowledges success, otherwise a failed update would leave the two
+            // permanently divergent.
+            var effectiveReasoning = reasoningEffort ?? _configuredReasoningEffort;
 
-        _logger.LogInformation("Brain model updated to '{Model}' with context window {ContextWindow}",
-            model, _maxContextTokens);
+            var updateMsg = BrainActorMessages.CreateUpdateModelMessage(model, maxContextTokens, effectiveReasoning);
+            await AskActorAsync(updateMsg, updateMsg.Reply, ct, TimeSpan.FromSeconds(3));
+
+            if (reasoningEffort is not null)
+                _configuredReasoningEffort = reasoningEffort;
+
+            _modelOverride = model;
+            if (maxContextTokens.HasValue)
+                _maxContextTokens = maxContextTokens.Value;
+
+            _reasoningEffort = _configuredReasoningEffort
+                ?? ChatClientFactory.ParseProviderModelAndReasoning(model).reasoning;
+
+            _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+            {
+                SessionId = "brain-master",
+                SessionType = LlmSessionType.Brain,
+                Model = _modelOverride,
+                Status = "idle",
+                CurrentTokens = 0,
+                MaxTokens = _maxContextTokens,
+            });
+
+            _logger.LogInformation("Brain model updated to '{Model}' with context window {ContextWindow}",
+                model, _maxContextTokens);
+        }
+        finally
+        {
+            _sessionLock.Release();
+        }
     }
 
     /// <inheritdoc />

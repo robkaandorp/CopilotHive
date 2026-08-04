@@ -40,6 +40,7 @@ internal sealed class BrainActor : Actor<IBrainMessage>
     private readonly LlmSessionRegistry? _sessionRegistry;
     private readonly IReadOnlyList<SubAgentModelEntry>? _subAgentModels;
     private readonly bool _subAgentsEnabled;
+    private readonly ConfigRepoManager? _configRepo;
     private ReasoningEffort? _reasoningEffort;
 
     private AgentSession? _masterSession;
@@ -66,7 +67,8 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         KnowledgeGraph? knowledgeGraph = null,
         LlmSessionRegistry? sessionRegistry = null,
         IReadOnlyList<SubAgentModelEntry>? subAgentModels = null,
-        bool subAgentsEnabled = false)
+        bool subAgentsEnabled = false,
+        ConfigRepoManager? configRepo = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -85,6 +87,7 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         _sessionRegistry = sessionRegistry;
         _subAgentModels = subAgentModels;
         _subAgentsEnabled = subAgentsEnabled;
+        _configRepo = configRepo;
     }
 
     /// <inheritdoc />
@@ -120,7 +123,9 @@ internal sealed class BrainActor : Actor<IBrainMessage>
                 }
 
                 // Affects future children only; existing children keep their original model.
-                _reasoningEffort = ChatClientFactory.ParseProviderModelAndReasoning(m.Model).reasoning;
+                // An explicit reasoning effort wins; otherwise fall back to legacy suffix parsing.
+                _reasoningEffort = m.ReasoningEffort
+                    ?? ChatClientFactory.ParseProviderModelAndReasoning(m.Model).reasoning;
 
                 m.Reply.TrySetResult(true);
                 break;
@@ -432,7 +437,8 @@ internal sealed class BrainActor : Actor<IBrainMessage>
             _logger,
             goalStore: _goalStore,
             knowledgeGraph: _knowledgeGraph,
-            parentTell: Tell);
+            parentTell: Tell,
+            configRepo: _configRepo);
 
     private async Task DisposeChildQuietlyAsync(GoalBrainActor child)
     {

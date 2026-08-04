@@ -1,5 +1,6 @@
 using System.ComponentModel;
 
+using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
@@ -31,6 +32,7 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
     private readonly List<AITool> _brainTools;
     private readonly IGoalStore? _goalStore;
     private readonly KnowledgeGraph? _knowledgeGraph;
+    private readonly ConfigRepoManager? _configRepo;
     private readonly Func<IBrainMessage, bool>? _parentTell;
 
     private int _resourcesDisposed;
@@ -50,7 +52,8 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
         ILogger logger,
         IGoalStore? goalStore = null,
         KnowledgeGraph? knowledgeGraph = null,
-        Func<IBrainMessage, bool>? parentTell = null)
+        Func<IBrainMessage, bool>? parentTell = null,
+        ConfigRepoManager? configRepo = null)
     {
         ValidateGoalId(goalId);
 
@@ -66,6 +69,7 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
         _logger = logger;
         _goalStore = goalStore;
         _knowledgeGraph = knowledgeGraph;
+        _configRepo = configRepo;
         _parentTell = parentTell;
 
         try
@@ -173,7 +177,7 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
                 },
                 "report_iteration_plan",
                 "Report your iteration plan — which phases to run and in what order."),
-            .. BrainTools.BuildDependencyTools(_goalStore, pipelineResolver, _knowledgeGraph, _logger),
+            .. BrainTools.BuildDependencyTools(_goalStore, pipelineResolver, _knowledgeGraph, _logger, _configRepo),
         ];
     }
 

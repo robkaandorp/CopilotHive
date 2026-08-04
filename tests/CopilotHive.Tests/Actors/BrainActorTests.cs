@@ -305,6 +305,43 @@ public class BrainActorTests
     }
 
     [Fact]
+    public async Task UpdateModel_ReasoningEffort_ExplicitValueWins_NullFallsBackToSuffix()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            await using var actor = CreateActor(dir);
+            actor.Start();
+            await ConnectAsync(actor);
+
+            var reasoningField = typeof(BrainActor)
+                .GetField("_reasoningEffort", BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+            // Explicit value beats the ':low' suffix.
+            var explicitUpdate = BrainActorMessages.CreateUpdateModelMessage("new-model:low", 50_000, ReasoningEffort.High);
+            actor.Tell(explicitUpdate);
+            Assert.True(await AwaitReplyAsync(explicitUpdate.Reply));
+            Assert.Equal(ReasoningEffort.High, (ReasoningEffort?)reasoningField.GetValue(actor));
+
+            // Null explicit value → legacy suffix parsing of the new model.
+            var suffixUpdate = BrainActorMessages.CreateUpdateModelMessage("other-model:low", 50_000);
+            actor.Tell(suffixUpdate);
+            Assert.True(await AwaitReplyAsync(suffixUpdate.Reply));
+            Assert.Equal(ReasoningEffort.Low, (ReasoningEffort?)reasoningField.GetValue(actor));
+
+            // Null explicit value with a suffix-free model → no reasoning at all.
+            var plainUpdate = BrainActorMessages.CreateUpdateModelMessage("plain-model", 50_000);
+            actor.Tell(plainUpdate);
+            Assert.True(await AwaitReplyAsync(plainUpdate.Reply));
+            Assert.Null((ReasoningEffort?)reasoningField.GetValue(actor));
+        }
+        finally
+        {
+            DeleteTempPath(dir);
+        }
+    }
+
+    [Fact]
     public async Task ForkSession_BeforeConnect_Faults()
     {
         var dir = CreateTempDir();

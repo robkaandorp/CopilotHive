@@ -122,6 +122,8 @@ public sealed class TaskExecutorSessionTests
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ResetSessionAsync(string? model = null, CancellationToken ct = default) => Task.CompletedTask;
 
+        public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default) => Task.CompletedTask;
+
         public Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
         {
             // Simulate the runner updating the session after execution
@@ -431,6 +433,8 @@ public sealed class TaskExecutorSessionTests
         public int GetContextUsagePercent() => 0;
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ResetSessionAsync(string? model = null, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default) => Task.CompletedTask;
 
         public Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
         {

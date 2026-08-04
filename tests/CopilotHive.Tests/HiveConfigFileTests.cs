@@ -1529,7 +1529,7 @@ public sealed class HiveConfigFileTests
     }
 
     [Fact]
-    public void GetSubAgentModels_MergesNullReasoningEffortFromAvailable()
+    public void GetSubAgentModels_DoesNotInheritReasoningEffortFromAvailable()
     {
         var config = new HiveConfigFile
         {
@@ -1542,7 +1542,7 @@ public sealed class HiveConfigFileTests
         };
 
         var result = Assert.Single(config.GetSubAgentModels());
-        Assert.Equal("high", result.ReasoningEffort);
+        Assert.Null(result.ReasoningEffort);
     }
 
     [Fact]
@@ -1647,7 +1647,7 @@ public sealed class HiveConfigFileTests
             Models = new ModelsConfig
             {
                 AvailableModels = [new ModelEntry { Name = "m", ContextWindow = 976000, ReasoningEffort = "high", Description = "merged desc" }],
-                SubAgentModels = [new ModelEntry { Name = "m" }]
+                SubAgentModels = [new ModelEntry { Name = "m", ReasoningEffort = "low" }]
             }
         };
 
@@ -1655,7 +1655,7 @@ public sealed class HiveConfigFileTests
 
         var result = Assert.Single(target.GetSubAgentModels());
         Assert.Equal(976000, result.ContextWindow);
-        Assert.Equal("high", result.ReasoningEffort);
+        Assert.Equal("low", result.ReasoningEffort);
         Assert.Equal("merged desc", result.Description);
     }
 
@@ -1888,5 +1888,363 @@ public sealed class HiveConfigFileTests
 
         Assert.Null(curated.SupportsVision);
         Assert.True(available.SupportsVision);
+    }
+
+    // ── Reasoning effort: YAML round-trip of the new config fields ─────────────
+
+    [Fact]
+    public void Deserialize_ReasoningEffortFields_PopulateWorkersOrchestratorAndComposer()
+    {
+        const string yaml = """
+            version: "1.0"
+            workers:
+              coder:
+                model: claude-opus-4.6
+                reasoning_effort: high
+                premium_model: gpt-5.4
+                premium_reasoning_effort: extra_high
+              tester:
+                model: claude-sonnet-4.6
+                reasoning_effort: medium
+            orchestrator:
+              model: claude-sonnet-4.6
+              reasoning_effort: low
+            composer:
+              model: copilot/claude-sonnet-4.6
+              reasoning_effort: medium
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        Assert.Equal("high", config.Workers["coder"].ReasoningEffort);
+        Assert.Equal("extra_high", config.Workers["coder"].PremiumReasoningEffort);
+        Assert.Equal("medium", config.Workers["tester"].ReasoningEffort);
+        Assert.Null(config.Workers["tester"].PremiumReasoningEffort);
+        Assert.Equal("low", config.Orchestrator.ReasoningEffort);
+        Assert.Equal("medium", config.Composer!.ReasoningEffort);
+    }
+
+    [Fact]
+    public void Deserialize_ReasoningEffortKeysAbsent_AllNewFieldsDefaultToNull()
+    {
+        const string yaml = """
+            version: "1.0"
+            workers:
+              coder:
+                model: claude-opus-4.6
+              tester:
+                model: claude-sonnet-4.6
+            orchestrator:
+              model: claude-sonnet-4.6
+            composer:
+              model: copilot/claude-sonnet-4.6
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        // No reasoning_effort / premium_reasoning_effort keys present anywhere —
+        // every new field must stay null rather than picking up a default.
+        Assert.Null(config.Workers["coder"].ReasoningEffort);
+        Assert.Null(config.Workers["coder"].PremiumReasoningEffort);
+        Assert.Null(config.Workers["tester"].ReasoningEffort);
+        Assert.Null(config.Workers["tester"].PremiumReasoningEffort);
+        Assert.Null(config.Orchestrator.ReasoningEffort);
+        Assert.Null(config.Composer!.ReasoningEffort);
+    }
+
+    [Fact]
+    public async Task RoundTrip_ReasoningEffortFields_SurviveSerializeAndDeserialize()
+    {
+        var original = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "orch-model", ReasoningEffort = "high" },
+            Workers =
+            {
+                ["coder"] = new WorkerConfig
+                {
+                    Model = "coder-model",
+                    ReasoningEffort = "medium",
+                    PremiumModel = "coder-premium",
+                    PremiumReasoningEffort = "extra_high"
+                }
+            },
+            Composer = new ComposerConfig { Model = "composer-model", ReasoningEffort = "low" }
+        };
+
+        var yaml = await WriteThroughProductionSerializerAsync(original);
+
+        Assert.Contains("reasoning_effort: high", yaml, StringComparison.Ordinal);
+        Assert.Contains("premium_reasoning_effort: extra_high", yaml, StringComparison.Ordinal);
+
+        var reloaded = Deserializer.Deserialize<HiveConfigFile>(yaml);
+        Assert.Equal("high", reloaded.Orchestrator.ReasoningEffort);
+        Assert.Equal("medium", reloaded.Workers["coder"].ReasoningEffort);
+        Assert.Equal("extra_high", reloaded.Workers["coder"].PremiumReasoningEffort);
+        Assert.Equal("low", reloaded.Composer!.ReasoningEffort);
+    }
+
+    // ── ValidateReasoningEffort ────────────────────────────────────────────────
+
+    /// <summary>Builds a config where every model assignment carries a valid reasoning effort.</summary>
+    private static HiveConfigFile ValidReasoningConfig() => new()
+    {
+        Orchestrator = new OrchestratorConfig { Model = "orch-model", ReasoningEffort = "high" },
+        Workers =
+        {
+            ["coder"] = new WorkerConfig
+            {
+                Model = "coder-model",
+                ReasoningEffort = "medium",
+                PremiumModel = "coder-premium",
+                PremiumReasoningEffort = "extra_high"
+            },
+            ["tester"] = new WorkerConfig { Model = "tester-model", ReasoningEffort = "low" }
+        },
+        Composer = new ComposerConfig { Model = "composer-model", ReasoningEffort = "none" },
+        Models = new ModelsConfig
+        {
+            SubAgentModels = [new ModelEntry { Name = "sub-a", ReasoningEffort = "high" }]
+        }
+    };
+
+    [Fact]
+    public void ValidateReasoningEffort_FullyValidConfig_ReturnsEmptyList()
+    {
+        var errors = ValidReasoningConfig().ValidateReasoningEffort();
+
+        Assert.Empty(errors);
+    }
+
+    [Theory]
+    [InlineData("none")]
+    [InlineData("low")]
+    [InlineData("medium")]
+    [InlineData("high")]
+    [InlineData("extra_high")]
+    [InlineData("HIGH")]
+    [InlineData("  high  ")]
+    public void ValidateReasoningEffort_AcceptsKnownLevels_CaseInsensitiveAndTrimmed(string level)
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { ReasoningEffort = level }
+        };
+
+        Assert.Empty(config.ValidateReasoningEffort());
+        // Trimming is for comparison only — the stored value must be unchanged.
+        Assert.Equal(level, config.Orchestrator.ReasoningEffort);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void ValidateReasoningEffort_MissingOrchestratorReasoning_ReturnsError(string? value)
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { ReasoningEffort = value }
+        };
+
+        var errors = config.ValidateReasoningEffort();
+
+        var error = Assert.Single(errors);
+        Assert.Contains("orchestrator", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ValidateReasoningEffort_InvalidLevel_ReturnsError()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { ReasoningEffort = "ultra" }
+        };
+
+        var error = Assert.Single(config.ValidateReasoningEffort());
+        Assert.Contains("ultra", error, StringComparison.Ordinal);
+        Assert.Contains("orchestrator", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ValidateReasoningEffort_WorkerModelSetWithoutReasoning_ReturnsError()
+    {
+        var config = ValidReasoningConfig();
+        config.Workers["coder"].ReasoningEffort = null;
+
+        var error = Assert.Single(config.ValidateReasoningEffort());
+        Assert.Contains("workers.coder", error, StringComparison.Ordinal);
+        Assert.DoesNotContain("premium", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ValidateReasoningEffort_WorkerWithoutModel_NoReasoningRequired()
+    {
+        var config = ValidReasoningConfig();
+        config.Workers["tester"] = new WorkerConfig { Model = null, ReasoningEffort = null };
+
+        Assert.Empty(config.ValidateReasoningEffort());
+    }
+
+    [Fact]
+    public void ValidateReasoningEffort_PremiumModelSetWithoutPremiumReasoning_ReturnsError()
+    {
+        var config = ValidReasoningConfig();
+        config.Workers["coder"].PremiumReasoningEffort = null;
+
+        var error = Assert.Single(config.ValidateReasoningEffort());
+        Assert.Contains("workers.coder.premium_reasoning_effort", error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ValidateReasoningEffort_NoPremiumModel_PremiumReasoningNotRequired()
+    {
+        var config = ValidReasoningConfig();
+        config.Workers["coder"].PremiumModel = null;
+        config.Workers["coder"].PremiumReasoningEffort = null;
+
+        Assert.Empty(config.ValidateReasoningEffort());
+    }
+
+    [Fact]
+    public void ValidateReasoningEffort_ComposerModelSetWithoutReasoning_ReturnsError()
+    {
+        var config = ValidReasoningConfig();
+        config.Composer!.ReasoningEffort = null;
+
+        var error = Assert.Single(config.ValidateReasoningEffort());
+        Assert.Contains("composer", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ValidateReasoningEffort_ComposerWithoutModel_NoReasoningRequired()
+    {
+        var config = ValidReasoningConfig();
+        config.Composer = new ComposerConfig { Model = null, ReasoningEffort = null };
+
+        Assert.Empty(config.ValidateReasoningEffort());
+    }
+
+    [Fact]
+    public void ValidateReasoningEffort_SubAgentModelMissingReasoning_ReturnsErrorPerEntry()
+    {
+        var config = ValidReasoningConfig();
+        config.Models!.SubAgentModels =
+        [
+            new ModelEntry { Name = "sub-a", ReasoningEffort = "high" },
+            new ModelEntry { Name = "sub-b", ReasoningEffort = null },
+            new ModelEntry { Name = "sub-c", ReasoningEffort = "bogus" }
+        ];
+
+        var errors = config.ValidateReasoningEffort();
+
+        Assert.Equal(2, errors.Count);
+        Assert.Contains(errors, e => e.Contains("sub-b", StringComparison.Ordinal));
+        Assert.Contains(errors, e => e.Contains("sub-c", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ValidateReasoningEffort_DoesNotValidateCompactionOrAvailableOrComposerModelsList()
+    {
+        var config = ValidReasoningConfig();
+        config.Models!.CompactionModel = "compaction-model";
+        config.Models.AvailableModels =
+        [
+            new ModelEntry { Name = "available-a", ReasoningEffort = null },
+            new ModelEntry { Name = "available-b", ReasoningEffort = "bogus" }
+        ];
+        config.Composer!.Models = ["composer-model", "other-model"];
+
+        Assert.Empty(config.ValidateReasoningEffort());
+    }
+
+    [Fact]
+    public void ValidateReasoningEffort_AggregatesAllErrors_AndDoesNotThrow()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { ReasoningEffort = null },
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { Model = "m", PremiumModel = "pm" }
+            },
+            Composer = new ComposerConfig { Model = "composer-model" },
+            Models = new ModelsConfig
+            {
+                SubAgentModels = [new ModelEntry { Name = "sub-a" }]
+            }
+        };
+
+        // Must return a list rather than throwing, even when errors exist.
+        var errors = config.ValidateReasoningEffort();
+
+        Assert.Equal(5, errors.Count);
+    }
+
+    // ── GetSubAgentModels: duplicate available_models names ────────────────────
+
+    [Fact]
+    public void GetSubAgentModels_DuplicateAvailableNamesDifferingByCase_DoesNotThrow_LastWins()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "dup-model", ContextWindow = 1000, Description = "first" },
+                    new ModelEntry { Name = "DUP-MODEL", ContextWindow = 2000, Description = "second" }
+                ],
+                SubAgentModels = [new ModelEntry { Name = "dup-model", ReasoningEffort = "high" }]
+            }
+        };
+
+        var result = Assert.Single(config.GetSubAgentModels());
+
+        Assert.Equal(2000, result.ContextWindow);
+        Assert.Equal("second", result.Description);
+    }
+
+    // ── ReloadFrom: new fields and WorkerTaskTimeoutMinutes ────────────────────
+
+    [Fact]
+    public void ReloadFrom_CopiesReasoningEffortFieldsAndWorkerTaskTimeout()
+    {
+        var source = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig
+            {
+                Model = "orch-model",
+                ReasoningEffort = "extra_high",
+                WorkerTaskTimeoutMinutes = 77
+            },
+            Workers =
+            {
+                ["coder"] = new WorkerConfig
+                {
+                    Model = "coder-model",
+                    ReasoningEffort = "high",
+                    PremiumModel = "coder-premium",
+                    PremiumReasoningEffort = "medium",
+                    ContextWindow = 150000
+                }
+            },
+            Composer = new ComposerConfig { Model = "composer-model", ReasoningEffort = "low" }
+        };
+
+        var target = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        target.ReloadFrom(source);
+
+        Assert.Equal("extra_high", target.Orchestrator.ReasoningEffort);
+        Assert.Equal(77, target.Orchestrator.WorkerTaskTimeoutMinutes);
+
+        var coder = target.Workers["coder"];
+        Assert.NotSame(source.Workers["coder"], coder);
+        Assert.Equal("high", coder.ReasoningEffort);
+        Assert.Equal("medium", coder.PremiumReasoningEffort);
+        Assert.Equal(150000, coder.ContextWindow);
+
+        Assert.NotSame(source.Composer, target.Composer);
+        Assert.Equal("low", target.Composer!.ReasoningEffort);
     }
 }

@@ -9,6 +9,7 @@ using CopilotHive.Knowledge;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Workers;
+using Microsoft.Extensions.AI;
 using WorkerRole = CopilotHive.Workers.WorkerRole;
 
 namespace CopilotHive.Services;
@@ -81,15 +82,37 @@ internal sealed class TaskDispatchService
         if (phaseTier == ModelTier.Premium && _config is not null)
         {
             var premiumModel = _config.GetPremiumModelForRole(roleName);
-            if (premiumModel is not null)
+            if (!string.IsNullOrWhiteSpace(premiumModel))
                 model = premiumModel;
         }
 
-        // Apply configured reasoning effort as a model suffix (explicit :suffix takes precedence)
+        // Resolve the effective reasoning effort for this task.
+        //
+        // Precedence:
+        //   1. WorkerConfig.PremiumReasoningEffort — when the phase requested the premium tier AND
+        //      a premium model is actually configured for this role.
+        //   2. WorkerConfig.ReasoningEffort — otherwise.
+        //   3. Legacy per-model lookup (available_models entry) when neither is set.
+        //
+        // The parsed enum is transported on the WorkTask and is authoritative for the worker.
+        // The legacy ":suffix" mechanism still runs, but receives a canonicalized (lowercase) value.
+        ReasoningEffort? effectiveReasoning = null;
         if (_config is not null && model is not null)
         {
-            var reasoningEffort = _config.TryGetReasoningEffortForModel(model);
-            model = HiveConfigFile.ApplyReasoningSuffix(model, reasoningEffort);
+            var hasPremiumModel = !string.IsNullOrWhiteSpace(_config.GetPremiumModelForRole(roleName));
+            _config.Workers.TryGetValue(roleName.ToLowerInvariant(), out var workerConfig);
+
+            var effortString = phaseTier == ModelTier.Premium && hasPremiumModel
+                ? workerConfig?.PremiumReasoningEffort
+                : workerConfig?.ReasoningEffort;
+
+            if (string.IsNullOrWhiteSpace(effortString))
+                effortString = _config.TryGetReasoningEffortForModel(model);
+
+            effectiveReasoning = ReasoningEffortConverter.Parse(effortString);
+
+            // Canonicalize before applying the suffix so " High " becomes "high".
+            model = HiveConfigFile.ApplyReasoningSuffix(model, ReasoningEffortConverter.Format(effectiveReasoning));
         }
 
         _logger.LogDebug("Model for {Role}: {Model} (tier={Tier}, configLoaded={ConfigLoaded})",
@@ -127,7 +150,8 @@ internal sealed class TaskDispatchService
             branchAction: branchAction,
             model: model,
             maxContextTokens: maxContextTokens,
-            subAgentModels: subAgentModels);
+            subAgentModels: subAgentModels,
+            reasoningEffort: effectiveReasoning);
 
         // Improver operates read-only: it can see the feature branch but must not push.
         // Downgrade the action to Unspecified so the worker runtime skips push operations.

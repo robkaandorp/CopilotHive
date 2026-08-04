@@ -29,7 +29,7 @@ public sealed class ComposerAgentServiceTests
         string model = "test-model",
         int maxContextTokens = 64000,
         int maxSteps = 50,
-        ReasoningEffort? reasoningEffort = null,
+        ReasoningEffort? configuredReasoningEffort = null,
         string? compactionModel = null,
         LlmSessionRegistry? sessionRegistry = null,
         IReadOnlyList<string>? startupAvailableModels = null,
@@ -45,7 +45,7 @@ public sealed class ComposerAgentServiceTests
             model,
             maxContextTokens,
             maxSteps,
-            reasoningEffort,
+            configuredReasoningEffort,
             hiveConfig,
             "system prompt",
             new List<AITool>(),
@@ -254,6 +254,174 @@ public sealed class ComposerAgentServiceTests
             Assert.Equal(messageCount, service.Session.MessageHistory.Count);
             Assert.Contains(service.Session.MessageHistory, m => m.Text == "message-1");
             Assert.Contains(service.Session.MessageHistory, m => m.Text == "response-1");
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── 6b. Configured reasoning effort across model switches ──
+
+    private static HiveConfigFile TwoModelConfig() => new()
+    {
+        Models = new ModelsConfig
+        {
+            AvailableModels =
+            [
+                new ModelEntry { Name = "model-a" },
+                new ModelEntry { Name = "model-b" },
+                new ModelEntry { Name = "model-b:low" }
+            ]
+        }
+    };
+
+    [Fact]
+    public async Task ConfiguredReasoningEffort_OverridesModelSuffix_AtConstruction()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var mockClient = new Mock<IChatClient>();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => mockClient.Object,
+                hiveConfig: TwoModelConfig(),
+                model: "model-b:low",
+                configuredReasoningEffort: ReasoningEffort.High,
+                startupAvailableModels: ["model-b:low", "model-a"]);
+
+            await using (service)
+            {
+                // The effective value is the configured one, not the ':low' suffix.
+                Assert.Equal(ReasoningEffort.High, service.ReasoningEffort);
+                Assert.Equal(ReasoningEffort.High, GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task NoConfiguredReasoningEffort_UsesModelSuffix_AtConstruction()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var mockClient = new Mock<IChatClient>();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => mockClient.Object,
+                hiveConfig: TwoModelConfig(),
+                model: "model-b:low",
+                startupAvailableModels: ["model-b:low", "model-a"]);
+
+            await using (service)
+            {
+                Assert.Equal(ReasoningEffort.Low, service.ReasoningEffort);
+                Assert.Null(GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task SwitchModelAsync_RetainsConfiguredReasoningEffort_DoesNotReparse()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var mockClient = new Mock<IChatClient>();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => mockClient.Object,
+                hiveConfig: TwoModelConfig(),
+                model: "model-a",
+                configuredReasoningEffort: ReasoningEffort.High,
+                startupAvailableModels: ["model-a", "model-b:low"]);
+
+            await using (service)
+            {
+                await service.ConnectAsync(TestContext.Current.CancellationToken);
+                Assert.Equal(ReasoningEffort.High, service.ReasoningEffort);
+
+                // The new model carries a ':low' suffix, but the configured value must survive.
+                await service.SwitchModelAsync("model-b:low");
+
+                Assert.Equal(ReasoningEffort.High, service.ReasoningEffort);
+                Assert.Equal(ReasoningEffort.High, GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task SwitchModelAsync_WithoutConfiguredReasoningEffort_FallsBackToSuffixParsing()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var mockClient = new Mock<IChatClient>();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => mockClient.Object,
+                hiveConfig: TwoModelConfig(),
+                model: "model-a",
+                startupAvailableModels: ["model-a", "model-b:low"]);
+
+            await using (service)
+            {
+                await service.ConnectAsync(TestContext.Current.CancellationToken);
+                Assert.Null(service.ReasoningEffort);
+
+                await service.SwitchModelAsync("model-b:low");
+
+                Assert.Equal(ReasoningEffort.Low, service.ReasoningEffort);
+                // Suffix-derived reasoning is never promoted to "configured".
+                Assert.Null(GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task SwitchModelAsync_SuffixReasoning_NotRetainedAcrossSubsequentSwitch()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var mockClient = new Mock<IChatClient>();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => mockClient.Object,
+                hiveConfig: TwoModelConfig(),
+                model: "model-b:low",
+                startupAvailableModels: ["model-b:low", "model-a"]);
+
+            await using (service)
+            {
+                await service.ConnectAsync(TestContext.Current.CancellationToken);
+                // Suffix-derived at construction.
+                Assert.Equal(ReasoningEffort.Low, service.ReasoningEffort);
+
+                // Switching to a suffix-free model clears the reasoning: the suffix-derived value
+                // was never "configured" and must not be carried over.
+                await service.SwitchModelAsync("model-a");
+
+                Assert.Null(service.ReasoningEffort);
+                Assert.Null(GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
+            }
         }
         finally
         {

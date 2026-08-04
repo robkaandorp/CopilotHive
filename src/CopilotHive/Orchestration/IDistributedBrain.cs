@@ -1,5 +1,7 @@
 using CopilotHive.Services;
 
+using Microsoft.Extensions.AI;
+
 namespace CopilotHive.Orchestration;
 
 /// <summary>
@@ -190,6 +192,20 @@ public interface IDistributedBrain
     /// chat client and CodingAgent so subsequent calls use the new configuration.
     /// </summary>
     Task UpdateModelAsync(string model, int? maxContextTokens = null, CancellationToken ct = default);
+
+    /// <summary>
+    /// Updates the Brain model, optionally the context window, and the explicitly configured
+    /// reasoning effort, recreating the underlying chat client and CodingAgent so subsequent
+    /// calls use the new configuration.
+    /// </summary>
+    /// <param name="model">The model identifier (may still carry a legacy <c>:effort</c> suffix).</param>
+    /// <param name="maxContextTokens">Optional new context window.</param>
+    /// <param name="reasoningEffort">
+    /// The explicitly configured reasoning effort. When <c>null</c>, the previously configured
+    /// value (if any) is retained and legacy suffix parsing applies.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
+    Task UpdateModelAsync(string model, int? maxContextTokens, ReasoningEffort? reasoningEffort, CancellationToken ct);
 
     /// <summary>Returns current Brain context and usage statistics, or null if not connected.</summary>
     BrainStats? GetStats();

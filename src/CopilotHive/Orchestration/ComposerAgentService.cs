@@ -20,7 +20,7 @@ internal sealed class ComposerAgentService(
     string model,
     int maxContextTokens,
     int maxSteps,
-    ReasoningEffort? reasoningEffort,
+    ReasoningEffort? configuredReasoningEffort,
     HiveConfigFile? hiveConfig,
     string systemPrompt,
     List<AITool> composerTools,
@@ -40,7 +40,16 @@ internal sealed class ComposerAgentService(
     private string _model = model;
     private int _maxContextTokens = maxContextTokens;
     private readonly int _maxSteps = maxSteps;
-    private ReasoningEffort? _reasoningEffort = reasoningEffort;
+    /// <summary>
+    /// The explicitly configured reasoning effort (from configuration, not derived from a model
+    /// name suffix). When non-null it wins over legacy suffix parsing and is retained across
+    /// model switches.
+    /// </summary>
+    private readonly ReasoningEffort? _configuredReasoningEffort = configuredReasoningEffort;
+
+    /// <summary>The effective reasoning effort: the configured value, else the model-name suffix.</summary>
+    private ReasoningEffort? _reasoningEffort =
+        configuredReasoningEffort ?? ChatClientFactory.ParseProviderModelAndReasoning(model).reasoning;
     private readonly HiveConfigFile? _hiveConfig = hiveConfig;
     private readonly string _systemPrompt = systemPrompt;
     private readonly List<AITool> _composerTools = composerTools;
@@ -407,7 +416,10 @@ internal sealed class ComposerAgentService(
 
         _model = newModel;
         var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(newModel);
-        _reasoningEffort = reasoning;
+
+        // An explicitly configured reasoning effort survives model switches; suffix-derived
+        // reasoning is never promoted to "configured" and is re-parsed from the new model.
+        _reasoningEffort = _configuredReasoningEffort ?? reasoning;
 
         // Strip only the reasoning suffix (if present) while preserving the provider prefix and any
         // tag so the lookup matches ModelEntry.Name.

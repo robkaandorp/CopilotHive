@@ -4,6 +4,7 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging.Abstractions;
 
 using WorkerRole = CopilotHive.Workers.WorkerRole;
@@ -189,6 +190,381 @@ public sealed class TaskDispatchServiceTests
 
         Assert.NotNull(capturedTask);
         Assert.Equal("standard-coder-model", capturedTask!.Model);
+    }
+
+    // ── DispatchToRole: reasoning effort transport ────────────────────────
+
+    /// <summary>
+    /// A per-role <c>reasoning_effort</c> in WorkerConfig must both be transported as an enum on
+    /// the WorkTask (authoritative for the worker) and applied as a legacy model-name suffix.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenWorkerConfigReasoningEffortSet_TransportsEnum()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig
+        {
+            Model = "standard-coder-model",
+            ReasoningEffort = "high",
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Equal(ReasoningEffort.High, capturedTask!.ReasoningEffort);
+        Assert.Equal("standard-coder-model:high", capturedTask.Model);
+    }
+
+    /// <summary>
+    /// When the Brain requested the premium tier and a premium model is actually configured,
+    /// the premium reasoning effort must be selected instead of the standard one.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenPremiumTierAndPremiumReasoningEffort_TransportsPremiumEnum()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig
+        {
+            Model = "standard-coder-model",
+            ReasoningEffort = "low",
+            PremiumModel = "premium-coder-model",
+            PremiumReasoningEffort = "medium",
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Premium);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Equal(ReasoningEffort.Medium, capturedTask!.ReasoningEffort);
+        Assert.Equal("premium-coder-model:medium", capturedTask.Model);
+    }
+
+    /// <summary>
+    /// Premium tier without a configured premium model falls back to the standard model, so it
+    /// must also fall back to the standard reasoning effort — not the premium one.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenPremiumTierButNoPremiumModel_FallsBackToStandardReasoningEffort()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig
+        {
+            Model = "standard-coder-model",
+            ReasoningEffort = "low",
+            // No PremiumModel configured — premium effort must be ignored
+            PremiumReasoningEffort = "extra_high",
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Premium);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Equal(ReasoningEffort.Low, capturedTask!.ReasoningEffort);
+        Assert.Equal("standard-coder-model:low", capturedTask.Model);
+    }
+
+    /// <summary>
+    /// A whitespace-only premium model name is not a usable model. Both the model selection and
+    /// the reasoning-effort selection must reject it, so the standard model AND the standard
+    /// effort apply — a whitespace model name must never reach the worker.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenPremiumModelIsWhitespace_FallsBackToStandardModelAndStandardReasoning()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig
+        {
+            Model = "standard-coder-model",
+            ReasoningEffort = "low",
+            PremiumModel = "   ",
+            PremiumReasoningEffort = "extra_high",
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Premium);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        // The dispatched model must be the standard model — never the whitespace premium value.
+        Assert.Equal("standard-coder-model:low", capturedTask!.Model);
+        Assert.False(string.IsNullOrWhiteSpace(capturedTask.Model));
+        // And the standard effort applies, not the premium one.
+        Assert.Equal(ReasoningEffort.Low, capturedTask.ReasoningEffort);
+    }
+
+    /// <summary>
+    /// Same guard with no efforts configured at all: a whitespace premium model must not become
+    /// the dispatched model name.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenPremiumModelIsWhitespaceAndNoEfforts_DispatchesStandardModel()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig
+        {
+            Model = "standard-coder-model",
+            PremiumModel = "   ",
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Premium);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Equal("standard-coder-model", capturedTask!.Model);
+        Assert.Null(capturedTask.ReasoningEffort);
+    }
+
+    /// <summary>
+    /// With no per-role effort configured, the legacy per-model <c>available_models</c> lookup
+    /// still supplies the effort — and it is now also transported as an enum.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenWorkerConfigEffortNull_FallsBackToTryGetReasoningEffortForModel()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig
+        {
+            Model = "standard-coder-model",
+            ReasoningEffort = null,
+        };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels =
+            [
+                new ModelEntry { Name = "standard-coder-model", ReasoningEffort = "high" },
+            ],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Equal(ReasoningEffort.High, capturedTask!.ReasoningEffort);
+        Assert.Equal("standard-coder-model:high", capturedTask.Model);
+    }
+
+    /// <summary>
+    /// A whitespace-only per-role effort is treated as unset and falls through to the model lookup.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenWorkerConfigEffortWhitespace_FallsBackToTryGetReasoningEffortForModel()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig
+        {
+            Model = "standard-coder-model",
+            ReasoningEffort = "   ",
+        };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels =
+            [
+                new ModelEntry { Name = "standard-coder-model", ReasoningEffort = "high" },
+            ],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Equal(ReasoningEffort.High, capturedTask!.ReasoningEffort);
+        Assert.Equal("standard-coder-model:high", capturedTask.Model);
+    }
+
+    /// <summary>
+    /// The configured effort string is parsed then re-formatted before being appended as a suffix,
+    /// so sloppy YAML values like <c>"  High "</c> never leak into the dispatched model name.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_CanonicalizesEffortBeforeSuffix()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig
+        {
+            Model = "standard-coder-model",
+            ReasoningEffort = "  High ",
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Equal(ReasoningEffort.High, capturedTask!.ReasoningEffort);
+        Assert.Equal("standard-coder-model:high", capturedTask.Model);
+        Assert.DoesNotContain("High", capturedTask.Model, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <see cref="HiveConfigFile.ApplyReasoningSuffix"/> preserves an explicit suffix already present
+    /// on the model name, so the dispatched model keeps <c>:low</c>. The transported enum, however,
+    /// reflects the configured per-role effort — and that is what the worker actually applies.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenModelHasExistingSuffixAndConfigEffortDiffers_TransportedValueWins()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig
+        {
+            Model = "test-model:low",
+            ReasoningEffort = "high",
+        };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels =
+            [
+                new ModelEntry { Name = "test-model:low" },
+            ],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        // Existing suffix is preserved by ApplyReasoningSuffix...
+        Assert.Equal("test-model:low", capturedTask!.Model);
+        // ...but the explicitly transported effort is authoritative for the worker.
+        Assert.Equal(ReasoningEffort.High, capturedTask.ReasoningEffort);
+    }
+
+    /// <summary>
+    /// With no config loaded, repository resolution fails before any model or reasoning effort is
+    /// derived. The new reasoning block must not run (and must not NRE) — the goal simply fails
+    /// and nothing is enqueued.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenNoConfig_DoesNotDispatchAndDoesNotThrow()
+    {
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config: null, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        // Repository resolution failed → no task was ever built, so no reasoning effort was derived.
+        Assert.Null(capturedTask);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+    }
+
+    /// <summary>
+    /// When no model is resolved for the role, the effort-derivation block is skipped entirely and
+    /// the WorkTask carries <c>null</c> — the worker then falls back to model-suffix behaviour.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenNoModelForRole_TransportsNullReasoningEffort()
+    {
+        var config = CreateConfig();
+        // No Workers["coder"] entry → GetModelForRole returns null.
+        config.Models = new ModelsConfig
+        {
+            AvailableModels = [new ModelEntry { Name = "some-other-model", ReasoningEffort = "high" }],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Null(capturedTask!.ReasoningEffort);
+    }
+
+    /// <summary>
+    /// A role with no WorkerConfig entry at all must not throw — both effort fields are treated
+    /// as unset and the legacy model lookup applies.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenRoleMissingFromWorkersConfig_TransportsNullReasoningEffort()
+    {
+        var config = CreateConfig();
+        // Deliberately no config.Workers["coder"] entry.
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Null(capturedTask!.ReasoningEffort);
+    }
+
+    /// <summary>
+    /// With neither a per-role nor a per-model effort configured, nothing is transported and the
+    /// model name is left untouched.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenNoEffortAnywhere_TransportsNullAndLeavesModelUnchanged()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "standard-coder-model" };
+        config.Models = new ModelsConfig
+        {
+            AvailableModels = [new ModelEntry { Name = "standard-coder-model" }],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Null(capturedTask!.ReasoningEffort);
+        Assert.Equal("standard-coder-model", capturedTask.Model);
     }
 
     // ── DispatchToRole: compaction model metadata ─────────────────────────
@@ -939,9 +1315,12 @@ public sealed class TaskDispatchServiceTests
         GoalPipelineManager? pipelineManager = null,
         TaskQueue? taskQueue = null,
         IWorkerGateway? workerGateway = null,
-        Goal? goal = null)
+        Goal? goal = null,
+        bool useNullConfig = false)
     {
-        config ??= CreateConfig();
+        // useNullConfig models the "hive-config.yaml was never loaded" case, where the service
+        // receives a genuinely null config rather than a defaulted one.
+        config = useNullConfig ? null : (config ?? CreateConfig());
         pipelineManager ??= new GoalPipelineManager();
         taskQueue ??= new TaskQueue();
         workerGateway ??= new GrpcWorkerGateway(new WorkerPool());
@@ -982,8 +1361,9 @@ public sealed class TaskDispatchServiceTests
     /// DispatchToRole testing at the given phase with the given model tier.
     /// </summary>
     private static (TaskDispatchService service, GoalPipeline pipeline, TaskQueue taskQueue)
-        CreateServiceWithPipeline(GoalPhase phase, HiveConfigFile config, ModelTier tier)
+        CreateServiceWithPipeline(GoalPhase phase, HiveConfigFile? config, ModelTier tier)
     {
+        var useNullConfig = config is null;
         var pipelineManager = new GoalPipelineManager();
         var taskQueue = new TaskQueue();
 
@@ -1001,7 +1381,8 @@ public sealed class TaskDispatchServiceTests
             config: config,
             pipelineManager: pipelineManager,
             taskQueue: taskQueue,
-            goal: goal);
+            goal: goal,
+            useNullConfig: useNullConfig);
 
         return (service, pipeline, taskQueue);
     }

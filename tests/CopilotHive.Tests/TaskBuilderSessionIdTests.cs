@@ -3,6 +3,8 @@ using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 
+using Microsoft.Extensions.AI;
+
 namespace CopilotHive.Tests;
 
 /// <summary>
@@ -90,5 +92,65 @@ public sealed class TaskBuilderSessionIdTests
         Assert.NotEqual(coder.SessionId, tester.SessionId);
         Assert.Equal("g:coder", coder.SessionId);
         Assert.Equal("g:tester", tester.SessionId);
+    }
+
+    // ── ReasoningEffort ───────────────────────────────────────────────────────
+
+    [Fact]
+    public void Build_WithReasoningEffort_AssignsToWorkTask()
+    {
+        var builder = CreateBuilder();
+
+        var task = builder.Build(
+            goalId: "goal-re",
+            goalDescription: "desc",
+            role: WorkerRole.Coder,
+            iteration: 1,
+            repositories: Repos,
+            prompt: "prompt",
+            branchAction: BranchAction.Create,
+            reasoningEffort: ReasoningEffort.High);
+
+        Assert.Equal(ReasoningEffort.High, task.ReasoningEffort);
+    }
+
+    [Theory]
+    [InlineData(ReasoningEffort.None)]
+    [InlineData(ReasoningEffort.Low)]
+    [InlineData(ReasoningEffort.Medium)]
+    [InlineData(ReasoningEffort.High)]
+    [InlineData(ReasoningEffort.ExtraHigh)]
+    public void Build_WithEachReasoningEffort_AssignsToWorkTask(ReasoningEffort effort)
+    {
+        var builder = CreateBuilder();
+
+        var task = builder.Build(
+            goalId: "goal-re",
+            goalDescription: "desc",
+            role: WorkerRole.Coder,
+            iteration: 1,
+            repositories: Repos,
+            prompt: "prompt",
+            branchAction: BranchAction.Create,
+            reasoningEffort: effort);
+
+        Assert.Equal(effort, task.ReasoningEffort);
+    }
+
+    [Fact]
+    public void Build_WithoutReasoningEffort_DefaultsToNull()
+    {
+        var builder = CreateBuilder();
+
+        var task = builder.Build(
+            goalId: "goal-re",
+            goalDescription: "desc",
+            role: WorkerRole.Coder,
+            iteration: 1,
+            repositories: Repos,
+            prompt: "prompt",
+            branchAction: BranchAction.Create);
+
+        Assert.Null(task.ReasoningEffort);
     }
 }
