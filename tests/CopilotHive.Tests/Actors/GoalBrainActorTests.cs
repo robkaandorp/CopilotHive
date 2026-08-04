@@ -184,7 +184,8 @@ public class GoalBrainActorTests
         LlmSessionRegistry? sessionRegistry = null,
         CopilotHive.Goals.IGoalStore? goalStore = null,
         CopilotHive.Knowledge.KnowledgeGraph? knowledgeGraph = null,
-        Func<IBrainMessage, bool>? parentTell = null) =>
+        Func<IBrainMessage, bool>? parentTell = null,
+        CopilotHive.Configuration.ConfigRepoManager? configRepo = null) =>
         new(goalId,
             session ?? AgentSession.Create($"brain-goal-{goalId}"),
             chatClient,
@@ -198,7 +199,8 @@ public class GoalBrainActorTests
             NullLogger<GoalBrainActor>.Instance,
             goalStore,
             knowledgeGraph,
-            parentTell);
+            parentTell,
+            configRepo);
 
     private static AgentOptions GetConfiguredOptions(GoalBrainActor actor) =>
         (AgentOptions)typeof(CodingAgent)
@@ -369,7 +371,7 @@ public class GoalBrainActorTests
             Assert.Same(compaction, configured.CompactionClient);
             Assert.Equal(
                 ["escalate_to_composer", "report_iteration_plan", "get_goal", "search_knowledge",
-                 "read_document", "traverse_graph", "get_current_time"],
+                 "read_document", "traverse_graph", "get_current_time", "list_config_files", "read_config_file"],
                 configured.CustomTools.Select(tool => tool.Name));
             Assert.DoesNotContain(configured.CustomTools, tool => tool.Name == "original_tool");
         }
@@ -1107,14 +1109,14 @@ public class GoalBrainActorTests
         }
     }
     [Fact]
-    public async Task BuildTools_ReturnsSevenTools()
+    public async Task BuildTools_ReturnsNineTools()
     {
         var dir = CreateTempDir();
         try
         {
             await using var actor = CreateActor(dir, FakeChatClient.Text("unused"));
             var tools = GetConfiguredOptions(actor).CustomTools;
-            Assert.Equal(7, tools.Count);
+            Assert.Equal(9, tools.Count);
         }
         finally { DeleteTempPath(dir); }
     }
@@ -1302,6 +1304,41 @@ public class GoalBrainActorTests
 
             Assert.Contains("Goal ID: g1", result);
             Assert.Contains("Pipeline not active.", result);
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    [Fact]
+    public async Task Constructor_WithConfigRepo_ConfigRepoToolsReadFromRepo()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var agentsDir = Path.Combine(dir, "agents");
+            Directory.CreateDirectory(agentsDir);
+            File.WriteAllText(Path.Combine(agentsDir, "coder.agents.md"), "coder instructions");
+
+            var configRepo = new CopilotHive.Configuration.ConfigRepoManager(
+                "https://example.com/config.git", dir);
+
+            await using var actor = CreateActor(dir, FakeChatClient.Text("unused"), configRepo: configRepo);
+
+            var tools = GetConfiguredOptions(actor).CustomTools.Cast<AIFunction>().ToList();
+            Assert.Contains(tools, t => t.Name == "list_config_files");
+            Assert.Contains(tools, t => t.Name == "read_config_file");
+
+            // Removal-proof: invoke the tool and verify it actually reads from the threaded configRepo.
+            // If _configRepo were not forwarded to BuildDependencyTools, the tool would return
+            // "not available" instead of the file listing.
+            var listTool = tools.First(t => t.Name == "list_config_files");
+            var listResult = (await listTool.InvokeAsync(
+                new AIFunctionArguments { ["path"] = "agents" }, TestContext.Current.CancellationToken))?.ToString();
+            Assert.Contains("coder.agents.md", listResult);
+
+            var readTool = tools.First(t => t.Name == "read_config_file");
+            var readResult = (await readTool.InvokeAsync(
+                new AIFunctionArguments { ["path"] = "agents/coder.agents.md" }, TestContext.Current.CancellationToken))?.ToString();
+            Assert.Contains("1: coder instructions", readResult);
         }
         finally { DeleteTempPath(dir); }
     }

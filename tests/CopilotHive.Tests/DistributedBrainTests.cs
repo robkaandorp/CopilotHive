@@ -1,5 +1,6 @@
 using System.Reflection;
 
+using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
@@ -1991,6 +1992,76 @@ public sealed class DistributedBrainTests
             }
         }
         finally { DeleteDir(dir); }
+    }
+
+    [Fact]
+    public async Task ConnectAsync_PassesConfigRepoToBrainActor()
+    {
+        var dir = NewTempDir();
+        var configDir = Path.Combine(Path.GetTempPath(), $"config-repo-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(configDir);
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", configDir);
+
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(),
+                configRepo: configRepo);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                var actor = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
+                Assert.NotNull(actor);
+
+                var configRepoField = typeof(CopilotHive.Actors.BrainActor)
+                    .GetField("_configRepo", NonPublicInstance)!;
+                Assert.Same(configRepo, configRepoField.GetValue(actor));
+            }
+        }
+        finally
+        {
+            DeleteDir(dir);
+            try { Directory.Delete(configDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ForkSessionForGoalAsync_PassesConfigRepoToChildGoalBrainActor()
+    {
+        var dir = NewTempDir();
+        var configDir = Path.Combine(Path.GetTempPath(), $"config-repo-child-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(configDir);
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", configDir);
+
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(),
+                configRepo: configRepo);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("g-child-1", TestContext.Current.CancellationToken);
+
+                var actor = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
+                Assert.NotNull(actor);
+
+                var childActorsField = typeof(CopilotHive.Actors.BrainActor)
+                    .GetField("_childActors", NonPublicInstance)!;
+                var children = (Dictionary<string, CopilotHive.Actors.GoalBrainActor>)childActorsField.GetValue(actor)!;
+                Assert.True(children.TryGetValue("g-child-1", out var child));
+
+                var childConfigRepoField = typeof(CopilotHive.Actors.GoalBrainActor)
+                    .GetField("_configRepo", NonPublicInstance)!;
+                Assert.Same(configRepo, childConfigRepoField.GetValue(child));
+            }
+        }
+        finally
+        {
+            DeleteDir(dir);
+            try { Directory.Delete(configDir, recursive: true); } catch { }
+        }
     }
 
     [Fact]

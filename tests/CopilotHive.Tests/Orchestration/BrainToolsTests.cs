@@ -1,3 +1,4 @@
+using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
@@ -16,19 +17,19 @@ public class BrainToolsTests
     private static Func<string, Task<GoalPipeline?>> NoPipeline => _ => Task.FromResult<GoalPipeline?>(null);
 
     private static AIFunction Tool(string name, IGoalStore? store = null, KnowledgeGraph? graph = null,
-        Func<string, Task<GoalPipeline?>>? resolver = null) =>
-        BrainTools.BuildDependencyTools(store, resolver ?? NoPipeline, graph, NullLogger.Instance)
+        Func<string, Task<GoalPipeline?>>? resolver = null, ConfigRepoManager? configRepo = null) =>
+        BrainTools.BuildDependencyTools(store, resolver ?? NoPipeline, graph, NullLogger.Instance, configRepo)
             .Cast<AIFunction>().First(t => t.Name == name);
 
     private static async Task<string> InvokeAsync(AIFunction tool, AIFunctionArguments args) =>
         (await tool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
 
     [Fact]
-    public void BuildDependencyTools_ReturnsFiveNamedTools()
+    public void BuildDependencyTools_ReturnsSevenNamedTools()
     {
-        var tools = BrainTools.BuildDependencyTools(null, NoPipeline, null, NullLogger.Instance);
+        var tools = BrainTools.BuildDependencyTools(null, NoPipeline, null, NullLogger.Instance, null);
         Assert.Equal(
-            ["get_goal", "search_knowledge", "read_document", "traverse_graph", "get_current_time"],
+            ["get_goal", "search_knowledge", "read_document", "traverse_graph", "get_current_time", "list_config_files", "read_config_file"],
             tools.Cast<AIFunction>().Select(t => t.Name));
     }
 
@@ -202,6 +203,283 @@ public class BrainToolsTests
         Assert.True(json.RootElement.TryGetProperty("date", out _));
         Assert.True(json.RootElement.TryGetProperty("time", out _));
         Assert.True(json.RootElement.TryGetProperty("iso", out _));
+    }
+
+    [Fact]
+    public async Task ListConfigFiles_NullConfigRepo_ReturnsError()
+    {
+        var result = await InvokeAsync(Tool("list_config_files"), new AIFunctionArguments());
+        Assert.Contains("not available", result);
+    }
+
+    [Fact]
+    public async Task ListConfigFiles_WithConfigRepo_ListsAgentsFiles()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"config-repo-test-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dir, "agents"));
+            File.WriteAllText(Path.Combine(dir, "agents", "coder.agents.md"), "coder instructions");
+
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", dir);
+            var tool = Tool("list_config_files", configRepo: configRepo);
+
+            var result = await InvokeAsync(tool, new AIFunctionArguments { ["path"] = "agents" });
+            Assert.Contains("coder.agents.md", result);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_ReturnsContentWithLineNumbers()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"config-repo-test-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "test.txt"), "line one\nline two\nline three");
+
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", dir);
+            var tool = Tool("read_config_file", configRepo: configRepo);
+
+            var result = await InvokeAsync(tool, new AIFunctionArguments { ["path"] = "test.txt" });
+            Assert.Contains("1: line one", result);
+            Assert.Contains("2: line two", result);
+            Assert.Contains("3: line three", result);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_PathTraversal_ReturnsAccessDenied()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"config-repo-test-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(dir);
+
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", dir);
+            var tool = Tool("read_config_file", configRepo: configRepo);
+
+            var result = await InvokeAsync(tool, new AIFunctionArguments { ["path"] = "../../etc/passwd" });
+            Assert.Contains("Access denied", result);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_NotFound_ReturnsFileNotFound()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"config-repo-test-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(dir);
+
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", dir);
+            var tool = Tool("read_config_file", configRepo: configRepo);
+
+            var result = await InvokeAsync(tool, new AIFunctionArguments { ["path"] = "nonexistent.txt" });
+            Assert.Contains("not found", result);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_DotGitConfig_ReturnsAccessDenied()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"config-repo-test-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dir, ".git"));
+            File.WriteAllText(Path.Combine(dir, ".git", "config"), "url = https://x:token@example.com/repo.git");
+
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", dir);
+            var tool = Tool("read_config_file", configRepo: configRepo);
+
+            var result = await InvokeAsync(tool, new AIFunctionArguments { ["path"] = ".git/config" });
+            Assert.Contains("Access denied", result);
+            Assert.Contains(".git", result);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_ObfuscatedDotGitPath_ReturnsAccessDenied()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"config-repo-test-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dir, ".git"));
+            File.WriteAllText(Path.Combine(dir, ".git", "config"), "url = https://x:token@example.com/repo.git");
+
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", dir);
+            var tool = Tool("read_config_file", configRepo: configRepo);
+
+            var result = await InvokeAsync(tool, new AIFunctionArguments { ["path"] = "agents/../.git/config" });
+            Assert.Contains("Access denied", result);
+            Assert.Contains(".git", result);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ListConfigFiles_Root_ExcludesDotGitDirectory()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"config-repo-test-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dir, "agents"));
+            Directory.CreateDirectory(Path.Combine(dir, ".git"));
+            File.WriteAllText(Path.Combine(dir, "agents", "coder.agents.md"), "coder instructions");
+            File.WriteAllText(Path.Combine(dir, ".git", "config"), "url = https://x:token@example.com/repo.git");
+
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", dir);
+            var tool = Tool("list_config_files", configRepo: configRepo);
+
+            var result = await InvokeAsync(tool, new AIFunctionArguments());
+            Assert.Contains("agents/coder.agents.md", result);
+            Assert.DoesNotContain(".git", result);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ListConfigFiles_DotGitPath_ReturnsAccessDenied()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"config-repo-test-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dir, ".git"));
+
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", dir);
+            var tool = Tool("list_config_files", configRepo: configRepo);
+
+            var result = await InvokeAsync(tool, new AIFunctionArguments { ["path"] = ".git" });
+            Assert.Contains("Access denied", result);
+            Assert.Contains(".git", result);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_MixedCaseDotGit_ReturnsAccessDenied()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"config-repo-test-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dir, ".git"));
+            File.WriteAllText(Path.Combine(dir, ".git", "config"), "url = https://x:token@example.com/repo.git");
+
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", dir);
+            var tool = Tool("read_config_file", configRepo: configRepo);
+
+            var result = await InvokeAsync(tool, new AIFunctionArguments { ["path"] = ".GIT/config" });
+            Assert.Contains("Access denied", result);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ReadConfigFile_ObfuscatedMixedCaseDotGit_ReturnsAccessDenied()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"config-repo-test-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dir, ".git"));
+            File.WriteAllText(Path.Combine(dir, ".git", "config"), "url = https://x:token@example.com/repo.git");
+
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", dir);
+            var tool = Tool("read_config_file", configRepo: configRepo);
+
+            var result = await InvokeAsync(tool, new AIFunctionArguments { ["path"] = "agents/../.GIT/config" });
+            Assert.Contains("Access denied", result);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ListConfigFiles_MixedCaseDotGit_ReturnsAccessDenied()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"config-repo-test-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dir, ".git"));
+
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", dir);
+            var tool = Tool("list_config_files", configRepo: configRepo);
+
+            var result = await InvokeAsync(tool, new AIFunctionArguments { ["path"] = ".GIT" });
+            Assert.Contains("Access denied", result);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ListConfigFiles_Root_ExcludesMixedCaseDotGit()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"config-repo-test-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dir, "agents"));
+            Directory.CreateDirectory(Path.Combine(dir, ".GIT"));
+            File.WriteAllText(Path.Combine(dir, "agents", "coder.agents.md"), "coder instructions");
+            File.WriteAllText(Path.Combine(dir, ".GIT", "config"), "url = https://x:token@example.com/repo.git");
+
+            var configRepo = new ConfigRepoManager("https://example.com/config.git", dir);
+            var tool = Tool("list_config_files", configRepo: configRepo);
+
+            var result = await InvokeAsync(tool, new AIFunctionArguments());
+            Assert.Contains("agents/coder.agents.md", result);
+            Assert.DoesNotContain(".GIT", result);
+            Assert.DoesNotContain(".git", result);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void BrainTools_DoNotIncludeWriteTools()
+    {
+        var tools = BrainTools.BuildDependencyTools(null, NoPipeline, null, NullLogger.Instance, null);
+        var names = tools.Cast<AIFunction>().Select(t => t.Name);
+        Assert.DoesNotContain("edit_agents_md", names);
+        Assert.DoesNotContain("update_agents_md", names);
+        Assert.DoesNotContain("commit_config_changes", names);
     }
 
     [Theory]

@@ -40,6 +40,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly Func<string, IChatClient> _chatClientFactory;
     private readonly HiveConfigFile? _hiveConfig;
     private readonly LlmSessionRegistry? _sessionRegistry;
+    private readonly ConfigRepoManager? _configRepo;
 
     /// <summary>
     /// Directory used for persistent Brain state (session files).
@@ -92,7 +93,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         KnowledgeGraph? knowledgeGraph = null,
         Func<string, IChatClient>? chatClientFactory = null,
         HiveConfigFile? hiveConfig = null,
-        LlmSessionRegistry? sessionRegistry = null)
+        LlmSessionRegistry? sessionRegistry = null,
+        ConfigRepoManager? configRepo = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -109,6 +111,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _chatClientFactory = chatClientFactory ?? ChatClientFactory.Create;
         _hiveConfig = hiveConfig;
         _sessionRegistry = sessionRegistry;
+        _configRepo = configRepo;
 
         var (_, _, reasoning) = ChatClientFactory.ParseProviderModelAndReasoning(modelOverride);
         _reasoningEffort = reasoning;
@@ -247,7 +250,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     knowledgeGraph: _knowledgeGraph,
                     sessionRegistry: _sessionRegistry,
                     subAgentModels: _subAgentModels,
-                    subAgentsEnabled: _subAgentsEnabled);
+                    subAgentsEnabled: _subAgentsEnabled,
+                    configRepo: _configRepo);
             actor.Start();
 
             var connectMsg = BrainActorMessages.CreateConnectMessage();

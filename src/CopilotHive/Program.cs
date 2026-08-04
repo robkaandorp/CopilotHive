@@ -140,7 +140,8 @@ public sealed class Program
                         compactionModel: config?.Models?.CompactionModel,
                         knowledgeGraph: sp.GetService<KnowledgeGraph>(),
                         hiveConfig: config,
-                        sessionRegistry: sp.GetService<LlmSessionRegistry>());
+                        sessionRegistry: sp.GetService<LlmSessionRegistry>(),
+                        configRepo: sp.GetService<ConfigRepoManager>());
                 });
             }
 

@@ -47,6 +47,7 @@ public static class BrainPromptBuilder
         - Never include framework-specific build/test commands — workers use build and test skills
         - When planning iterations, use the search_knowledge, read_document, and traverse_graph tools to look up architecture documents related to the goal's target components. This gives you deeper context about WHY code is structured the way it is, not just WHAT it looks like.
         - When a goal has related docs, use `read_document` to read their full content before crafting worker prompts.
+        - You have read-only access to the config repo via `list_config_files` and `read_config_file` tools. The config repo contains `agents/*.agents.md` files and `hive-config.yaml`. Use these to read the actual agents.md content when planning improver phases.
         - Use `traverse_graph` to discover related documents by following links from documents you have found.
         - Use the get_current_time tool when you need to know the current date (e.g., for changelog entries or release dates).
         - Before planning a new iteration, read the goal's progress document via `read_document("progress-{goal-id}")` to see worker narratives from previous iterations. These narratives contain what workers tried, what worked, what they struggled with, and why they made their choices — valuable context for planning the next iteration that goes beyond the structured phase outputs.
@@ -57,7 +58,7 @@ public static class BrainPromptBuilder
         - Testers: Tell them to build, run test skill, write integration tests, call report_test_results. Never tell them to create report files.
         - Reviewers: Do NOT include git diff commands — the worker's workspace context provides the correct diff. Tell them to review using their workspace diff commands, focus on +/- lines, call report_review_verdict. Files to change is guidance, Files NOT to change is strict. Test changes are always acceptable. Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
         - DocWriters: Do NOT include git diff commands. Tell them to use workspace context diff, update only requested docs, build to verify, call report_doc_changes.
-        - Improvers: Tell them to analyze results and update *.agents.md files using file tools. No git commands.
+        - Improvers: Tell them to analyze results and update *.agents.md files using file tools. No git commands. Before crafting the improver prompt, use `list_config_files("agents")` and `read_config_file` to read the current agents.md content from the config repo — the improver works on the config repo's agents/ folder, not the project repos.
 
         WORKER CONTEXT BOUNDARY:
         - Workers have per-role, per-goal sessions. A coder can see its own previous coding rounds but CANNOT see the tester's, reviewer's, or improver's output from any iteration.

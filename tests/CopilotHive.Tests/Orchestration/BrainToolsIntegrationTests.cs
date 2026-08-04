@@ -487,11 +487,11 @@ public class BrainToolsIntegrationTests
     }
 
     // ──────────────────────────────────────────────────────────
-    //  #18 — GoalBrainActor.BuildTools() produces exactly 7 tools (via _brainTools reflection)
+    //  #18 — GoalBrainActor.BuildTools() produces exactly 9 tools (via _brainTools reflection)
     // ──────────────────────────────────────────────────────────
 
     [Fact]
-    public async Task GoalBrainActor_BuildTools_ProducesExactlySevenTools()
+    public async Task GoalBrainActor_BuildTools_ProducesExactlyNineTools()
     {
         var dir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
@@ -504,7 +504,7 @@ public class BrainToolsIntegrationTests
                 .GetField("_brainTools", BindingFlags.NonPublic | BindingFlags.Instance)!;
             var tools = (List<AITool>)field.GetValue(actor)!;
 
-            Assert.Equal(7, tools.Count);
+            Assert.Equal(9, tools.Count);
 
             var names = tools.OfType<AIFunction>().Select(t => t.Name).ToHashSet();
             Assert.Contains("escalate_to_composer", names);
@@ -514,6 +514,8 @@ public class BrainToolsIntegrationTests
             Assert.Contains("read_document", names);
             Assert.Contains("traverse_graph", names);
             Assert.Contains("get_current_time", names);
+            Assert.Contains("list_config_files", names);
+            Assert.Contains("read_config_file", names);
         }
         finally
         {
