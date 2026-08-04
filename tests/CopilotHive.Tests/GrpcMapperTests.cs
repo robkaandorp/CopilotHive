@@ -3,6 +3,8 @@ using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
 
+using Microsoft.Extensions.AI;
+
 using DomainBranchAction = CopilotHive.Services.BranchAction;
 using DomainTaskMetrics = CopilotHive.Services.TaskMetrics;
 using DomainWorkerRole = CopilotHive.Workers.WorkerRole;
@@ -893,5 +895,128 @@ public sealed class GrpcMapperTests
 
         Assert.Single(restored.SubAgentModels);
         Assert.False(restored.SubAgentModels[0].SupportsVision);
+    }
+
+    // ── reasoning_effort mapping ──────────────────────────────────────────────
+
+    [Fact]
+    public void ToGrpc_WithReasoningEffort_MapsToLowercaseString()
+    {
+        var task = BuildFullWorkTask() with { ReasoningEffort = ReasoningEffort.High };
+
+        var assignment = GrpcMapper.ToGrpc(task);
+
+        Assert.Equal("high", assignment.ReasoningEffort);
+    }
+
+    [Theory]
+    [InlineData(ReasoningEffort.None, "none")]
+    [InlineData(ReasoningEffort.Low, "low")]
+    [InlineData(ReasoningEffort.Medium, "medium")]
+    [InlineData(ReasoningEffort.High, "high")]
+    [InlineData(ReasoningEffort.ExtraHigh, "extra_high")]
+    public void ToGrpc_AllReasoningEfforts_MapToCanonicalStrings(ReasoningEffort effort, string expected)
+    {
+        var task = BuildFullWorkTask() with { ReasoningEffort = effort };
+
+        var assignment = GrpcMapper.ToGrpc(task);
+
+        Assert.Equal(expected, assignment.ReasoningEffort);
+    }
+
+    /// <summary>
+    /// Proto3 has no null string — an unset reasoning effort must serialize as the empty string,
+    /// never as a null that would throw when assigned to the generated message property.
+    /// </summary>
+    [Fact]
+    public void ToGrpc_WithNullReasoningEffort_MapsToEmptyString()
+    {
+        var task = BuildFullWorkTask();
+        Assert.Null(task.ReasoningEffort);
+
+        var assignment = GrpcMapper.ToGrpc(task);
+
+        Assert.Equal("", assignment.ReasoningEffort);
+    }
+
+    [Fact]
+    public void ToDomain_WithEmptyReasoningEffort_MapsToNull()
+    {
+        var assignment = new TaskAssignment
+        {
+            TaskId = "t",
+            GoalId = "g",
+            GoalDescription = "d",
+            Prompt = "p",
+            Role = GrpcWorkerRole.Coder,
+            ReasoningEffort = "",
+        };
+
+        var restored = GrpcMapper.ToDomain(assignment);
+
+        Assert.Null(restored.ReasoningEffort);
+    }
+
+    /// <summary>
+    /// A TaskAssignment that never sets reasoning_effort (proto3 default "") must decode as null.
+    /// </summary>
+    [Fact]
+    public void ToDomain_WithUnsetReasoningEffort_MapsToNull()
+    {
+        var assignment = new TaskAssignment
+        {
+            TaskId = "t",
+            GoalId = "g",
+            GoalDescription = "d",
+            Prompt = "p",
+            Role = GrpcWorkerRole.Coder,
+        };
+
+        var restored = GrpcMapper.ToDomain(assignment);
+
+        Assert.Null(restored.ReasoningEffort);
+    }
+
+    [Fact]
+    public void ToDomain_WithExtraHigh_MapsToEnum()
+    {
+        var assignment = new TaskAssignment
+        {
+            TaskId = "t",
+            GoalId = "g",
+            GoalDescription = "d",
+            Prompt = "p",
+            Role = GrpcWorkerRole.Coder,
+            ReasoningEffort = "extra_high",
+        };
+
+        var restored = GrpcMapper.ToDomain(assignment);
+
+        Assert.Equal(ReasoningEffort.ExtraHigh, restored.ReasoningEffort);
+    }
+
+    [Theory]
+    [InlineData(ReasoningEffort.None)]
+    [InlineData(ReasoningEffort.Low)]
+    [InlineData(ReasoningEffort.Medium)]
+    [InlineData(ReasoningEffort.High)]
+    [InlineData(ReasoningEffort.ExtraHigh)]
+    public void ReasoningEffort_RoundTrip_Preserved(ReasoningEffort effort)
+    {
+        var original = BuildFullWorkTask() with { ReasoningEffort = effort };
+
+        var restored = GrpcMapper.ToDomain(GrpcMapper.ToGrpc(original));
+
+        Assert.Equal(effort, restored.ReasoningEffort);
+    }
+
+    [Fact]
+    public void ReasoningEffort_NullRoundTrip_StaysNull()
+    {
+        var original = BuildFullWorkTask();
+
+        var restored = GrpcMapper.ToDomain(GrpcMapper.ToGrpc(original));
+
+        Assert.Null(restored.ReasoningEffort);
     }
 }

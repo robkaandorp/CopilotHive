@@ -25,6 +25,7 @@ public static class GrpcMapper
             Model = task.Model,
             SessionId = task.SessionId,
             MaxContextTokens = task.MaxContextTokens,
+            ReasoningEffort = ReasoningEffortConverter.Format(task.ReasoningEffort) ?? "",
         };
         foreach (var repo in task.Repositories)
         {
@@ -174,6 +175,7 @@ public static class GrpcMapper
                     Description = m.Description ?? "",
                     SupportsVision = m.SupportsVision,
                 })],
+            ReasoningEffort = ReasoningEffortConverter.Parse(assignment.ReasoningEffort),
         };
     }
 

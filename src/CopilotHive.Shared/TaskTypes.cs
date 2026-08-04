@@ -1,6 +1,8 @@
 using CopilotHive.Goals;
 using CopilotHive.Workers;
 
+using Microsoft.Extensions.AI;
+
 namespace CopilotHive.Services;
 
 /// <summary>
@@ -43,6 +45,8 @@ public sealed record WorkTask
     public int MaxContextTokens { get; init; } = SharedConstants.DefaultBrainContextWindow;
     /// <summary>Model catalog for sub-agent delegation. Empty when sub-agents are disabled.</summary>
     public IReadOnlyList<SubAgentModelDto> SubAgentModels { get; init; } = [];
+    /// <summary>Reasoning effort for this task, or null to use the model suffix fallback.</summary>
+    public ReasoningEffort? ReasoningEffort { get; init; }
 }
 
 /// <summary>

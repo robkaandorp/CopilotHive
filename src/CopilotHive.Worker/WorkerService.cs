@@ -132,7 +132,7 @@ public sealed class WorkerService(
                     // Reset Copilot session with per-task model (if specified by orchestrator)
                     var taskModel = string.IsNullOrEmpty(domainTask.Model) ? null : domainTask.Model;
                     _log.Info($"Task model from orchestrator: '{domainTask.Model}' → resolved: '{taskModel ?? "(SDK default)"}'");
-                    await _agentRunner.ResetSessionAsync(taskModel, ct);
+                    await _agentRunner.ResetSessionAsync(taskModel, domainTask.ReasoningEffort, ct);
 
                     // Run task execution concurrently so message loop can process
                     // ToolCallResponse messages from the orchestrator during execution

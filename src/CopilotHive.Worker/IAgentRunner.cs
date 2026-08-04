@@ -1,6 +1,8 @@
 using CopilotHive.Services;
 using CopilotHive.Workers;
 
+using Microsoft.Extensions.AI;
+
 namespace CopilotHive.Worker;
 
 /// <summary>
@@ -95,6 +97,9 @@ public interface IAgentRunner : IAsyncDisposable
 
     /// <summary>Resets the current session, optionally switching to a different model.</summary>
     Task ResetSessionAsync(string? model = null, CancellationToken ct = default);
+
+    /// <summary>Resets the current session, optionally switching model and setting reasoning effort.</summary>
+    Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default);
 
     /// <summary>Sends a prompt to the AI agent and returns its response.</summary>
     Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct);
