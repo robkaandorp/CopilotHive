@@ -472,12 +472,15 @@ public class AvailableModelsEndpointTests : IDisposable
             var entryName = entry.GetProperty("name").GetString();
             if (entryName == "test-model")
             {
-                Assert.Equal("high", entry.GetProperty("reasoningEffort").GetString());
+                // The suffix is stripped from the stored name, and the available-models API
+                // contract no longer exposes reasoningEffort (intentional goal behavior change).
+                Assert.False(entry.TryGetProperty("reasoningEffort", out _),
+                    "availableModels entries must not expose 'reasoningEffort'");
                 found = true;
                 break;
             }
         }
-        Assert.True(found, "Expected a model with Name='test-model' and ReasoningEffort='high' in availableModels");
+        Assert.True(found, "Expected a model with Name='test-model' in availableModels");
     }
 
     // ── SupportsVision tri-state REST round-trip (available models) ──────────

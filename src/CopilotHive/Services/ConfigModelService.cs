@@ -12,13 +12,42 @@ namespace CopilotHive.Services;
 /// <param name="WorkerModels">Per-role model overrides, keyed by role name. <c>null</c> to leave unchanged.</param>
 /// <param name="PremiumWorkerModels">Per-role premium model overrides, keyed by role name. <c>null</c> to leave unchanged.</param>
 /// <param name="CompactionModel">New compaction model, or <c>null</c> to leave unchanged.</param>
+/// <param name="OrchestratorReasoningEffort">
+/// New orchestrator reasoning effort. <c>null</c> leaves the persisted value unchanged.
+/// Empty string clears the persisted config. The running Brain retains its reasoning until
+/// restart (UpdateModelAsync null = retain).
+/// </param>
+/// <param name="ComposerReasoningEffort">
+/// New Composer reasoning effort. <c>null</c> leaves the persisted value unchanged; an empty
+/// string clears it. Persistence-only. The running Composer picks up on restart.
+/// </param>
+/// <param name="WorkerReasoningEffort">
+/// Per-role reasoning effort keyed by role name (case-insensitive). <c>null</c> leaves everything
+/// unchanged. A present key with a <c>null</c> value clears that role's reasoning effort; a present
+/// key with a non-empty value sets it. Unknown role keys are ignored entirely.
+/// </param>
+/// <param name="WorkerPremiumReasoningEffort">
+/// Per-role premium reasoning effort keyed by role name (case-insensitive). Same semantics as
+/// <paramref name="WorkerReasoningEffort"/>, mapped to <see cref="WorkerConfig.PremiumReasoningEffort"/>.
+/// </param>
+/// <param name="SubAgentModelReasoning">
+/// Per-sub-agent-model reasoning effort keyed by model name (case-insensitive). Only model names
+/// present in the current <c>sub_agent_models</c> list are applied; unknown keys are ignored entirely.
+/// </param>
 public sealed record ModelConfigUpdate(
     string? OrchestratorModel,
     string? ComposerModel,
     Dictionary<string, string>? WorkerModels,
     Dictionary<string, string>? PremiumWorkerModels,
-    string? CompactionModel)
+    string? CompactionModel,
+    string? OrchestratorReasoningEffort = null,
+    string? ComposerReasoningEffort = null,
+    Dictionary<string, string?>? WorkerReasoningEffort = null,
+    Dictionary<string, string?>? WorkerPremiumReasoningEffort = null,
+    Dictionary<string, string?>? SubAgentModelReasoning = null)
 {
+    private static string Show(string? value) => string.IsNullOrEmpty(value) ? "(cleared)" : value;
+
     /// <summary>
     /// Human-readable summary of the changes in this update (used as the git commit message body).
     /// </summary>
@@ -32,6 +61,17 @@ public sealed record ModelConfigUpdate(
             : null,
         PremiumWorkerModels?.Count > 0
             ? "premium: " + string.Join(", ", PremiumWorkerModels.Select(kv => $"{kv.Key}→{kv.Value}"))
+            : null,
+        OrchestratorReasoningEffort is not null ? $"orchestrator reasoning→{Show(OrchestratorReasoningEffort)}" : null,
+        ComposerReasoningEffort     is not null ? $"composer reasoning→{Show(ComposerReasoningEffort)}" : null,
+        WorkerReasoningEffort?.Count > 0
+            ? "worker reasoning: " + string.Join(", ", WorkerReasoningEffort.Select(kv => $"{kv.Key}→{Show(kv.Value)}"))
+            : null,
+        WorkerPremiumReasoningEffort?.Count > 0
+            ? "premium reasoning: " + string.Join(", ", WorkerPremiumReasoningEffort.Select(kv => $"{kv.Key}→{Show(kv.Value)}"))
+            : null,
+        SubAgentModelReasoning?.Count > 0
+            ? "sub-agent reasoning: " + string.Join(", ", SubAgentModelReasoning.Select(kv => $"{kv.Key}→{Show(kv.Value)}"))
             : null,
     }.Where(s => !string.IsNullOrEmpty(s)));
 }
@@ -78,6 +118,14 @@ public sealed class ConfigModelService
     private readonly ILogger<ConfigModelService> _logger;
     private readonly IDistributedBrain? _brain;
     private readonly IBrainRepoManager? _repoManager;
+
+    /// <summary>
+    /// Serialises the authoritative read-modify-write-commit transaction in
+    /// <see cref="SaveModelConfigAsync"/>. The shared <see cref="HiveConfigFile"/> singleton is the
+    /// runtime source of truth, so concurrent PATCH requests must not interleave validation,
+    /// mutation, file writes, commits or the live Brain update.
+    /// </summary>
+    private readonly SemaphoreSlim _saveLock = new(1, 1);
 
     /// <summary>
     /// Known reasoning effort levels recognised as model-name suffixes (e.g. <c>:high</c>).
@@ -128,79 +176,288 @@ public sealed class ConfigModelService
     }
 
     /// <summary>
+    /// The fixed set of worker role names for which per-role reasoning effort can be configured.
+    /// Keys outside this set are ignored entirely (neither validated nor applied).
+    /// </summary>
+    private static readonly string[] KnownWorkerRoleKeys =
+        ["coder", "tester", "reviewer", "improver", "docwriter"];
+
+    /// <summary>
+    /// Looks up a dictionary entry using case-insensitive key matching. Callers must first
+    /// reject case-insensitive duplicates (see <see cref="RejectCaseInsensitiveDuplicates"/>)
+    /// so at most one entry can ever match and the result is order-independent.
+    /// </summary>
+    /// <param name="dict">Dictionary to search (may be <c>null</c>).</param>
+    /// <param name="key">Key to look for, compared case-insensitively.</param>
+    /// <param name="value">The matched value when found.</param>
+    /// <returns><c>true</c> when a matching key exists.</returns>
+    private static bool TryGetIgnoreCase(Dictionary<string, string?>? dict, string key, out string? value)
+    {
+        value = null;
+        if (dict is null)
+            return false;
+        foreach (var kv in dict)
+        {
+            if (string.Equals(kv.Key, key, StringComparison.OrdinalIgnoreCase))
+            {
+                value = kv.Value;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Canonicalises a reasoning-effort value for persistence. Null, empty and whitespace-only
+    /// values all mean "clear" and map to <c>null</c>; every other (already validated) value is
+    /// normalised to its canonical lowercase wire form (e.g. <c>"High"</c> → <c>"high"</c>).
+    /// </summary>
+    /// <param name="value">Raw reasoning-effort value from the request.</param>
+    /// <returns>The canonical value, or <c>null</c> when the assignment clears the setting.</returns>
+    private static string? CanonicalizeReasoning(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+        return ReasoningEffortConverter.Format(ReasoningEffortConverter.Parse(value));
+    }
+
+    /// <summary>
+    /// Throws when the dictionary contains two or more keys that differ only by case and map to
+    /// the same known key. A plain <see cref="Dictionary{TKey,TValue}"/> uses ordinal comparison,
+    /// so <c>{"Coder":…,"coder":…}</c> are distinct entries; accepting them would make the applied
+    /// value depend on JSON property order and could leave one value unvalidated.
+    /// </summary>
+    /// <param name="dict">Dictionary from the request (may be <c>null</c>).</param>
+    /// <param name="knownKeys">The set of keys this dictionary is allowed to target.</param>
+    /// <param name="label">Field name used in the error message.</param>
+    private static void RejectCaseInsensitiveDuplicates(
+        Dictionary<string, string?>? dict, IEnumerable<string> knownKeys, string label)
+    {
+        if (dict is null || dict.Count < 2)
+            return;
+
+        foreach (var known in knownKeys)
+        {
+            var matches = dict.Keys
+                .Where(k => string.Equals(k, known, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (matches.Count > 1)
+                throw new ArgumentException(
+                    $"{label} contains duplicate case-insensitive key: " +
+                    string.Join("/", matches.Select(k => $"'{k}'")) + ".");
+        }
+    }
+
+    /// <summary>
+    /// Validates every reasoning-effort value carried by the update that targets a known key.
+    /// Case-insensitive duplicate keys are rejected first; remaining failures are collected and
+    /// reported together in a single <see cref="ArgumentException"/>, so no mutation happens
+    /// when any value is invalid.
+    /// </summary>
+    /// <param name="update">The pending model configuration update.</param>
+    private void ValidateReasoningEfforts(ModelConfigUpdate update)
+    {
+        var knownSubAgentNames = _config.Models?.SubAgentModels?
+            .Select(m => m.Name)
+            .Where(n => !string.IsNullOrEmpty(n))
+            .ToList() ?? [];
+
+        RejectCaseInsensitiveDuplicates(
+            update.WorkerReasoningEffort, KnownWorkerRoleKeys, "workerReasoningEffort");
+        RejectCaseInsensitiveDuplicates(
+            update.WorkerPremiumReasoningEffort, KnownWorkerRoleKeys, "workerPremiumReasoningEffort");
+        RejectCaseInsensitiveDuplicates(
+            update.SubAgentModelReasoning, knownSubAgentNames, "subAgentModelReasoning");
+
+        var invalid = new List<string>();
+
+        void Check(string? value, string label)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return;
+            try
+            {
+                ReasoningEffortConverter.Parse(value);
+            }
+            catch (ArgumentException)
+            {
+                invalid.Add($"{label}='{value}'");
+            }
+        }
+
+        Check(update.OrchestratorReasoningEffort, "orchestrator.reasoning_effort");
+        Check(update.ComposerReasoningEffort, "composer.reasoning_effort");
+
+        foreach (var role in KnownWorkerRoleKeys)
+        {
+            if (TryGetIgnoreCase(update.WorkerReasoningEffort, role, out var value))
+                Check(value, $"workers.{role}.reasoning_effort");
+            if (TryGetIgnoreCase(update.WorkerPremiumReasoningEffort, role, out var premium))
+                Check(premium, $"workers.{role}.premium_reasoning_effort");
+        }
+
+        if (update.SubAgentModelReasoning is not null)
+        {
+            foreach (var name in knownSubAgentNames)
+            {
+                if (TryGetIgnoreCase(update.SubAgentModelReasoning, name, out var value))
+                    Check(value, $"sub_agent_models.{name}.reasoning_effort");
+            }
+        }
+
+        if (invalid.Count > 0)
+            throw new ArgumentException(
+                $"Invalid reasoning effort value(s): {string.Join(", ", invalid)}. " +
+                "Allowed values are: none, low, medium, high, extra_high (or empty to clear).");
+    }
+
+    /// <summary>
+    /// Returns the <see cref="WorkerConfig"/> for a role, creating it when absent.
+    /// </summary>
+    /// <param name="role">Role name (normalized to lowercase).</param>
+    private WorkerConfig GetOrCreateWorker(string role)
+    {
+        var key = role.ToLowerInvariant();
+        if (!_config.Workers.TryGetValue(key, out var wc))
+        {
+            wc = new WorkerConfig();
+            _config.Workers[key] = wc;
+        }
+        return wc;
+    }
+
+    /// <summary>
     /// Applies the given model changes to the in-memory config, writes <c>hive-config.yaml</c>,
-    /// and commits the file to the config repository.
+    /// and commits the file to the config repository. The whole validate → mutate → write →
+    /// commit → live-update sequence is serialised so concurrent callers cannot interleave.
     /// </summary>
     /// <param name="update">The model changes to apply.</param>
     /// <param name="ct">Cancellation token.</param>
     public async Task SaveModelConfigAsync(ModelConfigUpdate update, CancellationToken ct = default)
     {
-        if (update.OrchestratorModel is not null)
+        await _saveLock.WaitAsync(ct);
+        try
         {
-            _config.Orchestrator.Model = update.OrchestratorModel;
+            // ── Step 1: validate everything before mutating anything ────────
+            ValidateReasoningEfforts(update);
 
-            var model = update.OrchestratorModel;
-            var contextWindow = _config.TryGetContextWindowForModel(model);
-            if (contextWindow is null or <= 0)
-                contextWindow = Constants.DefaultBrainContextWindow;
+            // ── Step 2: mutate the in-memory config ─────────────────────────
+            if (update.OrchestratorModel is not null)
+                _config.Orchestrator.Model = update.OrchestratorModel;
 
-            if (_brain is not null)
+            if (update.ComposerModel is not null)
             {
-                var reasoningEffort = _config.TryGetReasoningEffortForModel(model);
-                var modelWithReasoning = HiveConfigFile.ApplyReasoningSuffix(model, reasoningEffort);
-                await _brain.UpdateModelAsync(
-                    modelWithReasoning,
-                    contextWindow,
-                    ReasoningEffortConverter.Parse(_config.Orchestrator.ReasoningEffort),
-                    ct);
+                _config.Composer ??= new ComposerConfig();
+                _config.Composer.Model = update.ComposerModel;
             }
-        }
 
-        if (update.ComposerModel is not null)
-        {
-            _config.Composer ??= new ComposerConfig();
-            _config.Composer.Model = update.ComposerModel;
-        }
-
-        if (update.WorkerModels is not null)
-        {
-            foreach (var (role, model) in update.WorkerModels)
+            if (update.WorkerModels is not null)
             {
-                var key = role.ToLowerInvariant();
-                if (!_config.Workers.TryGetValue(key, out var wc))
+                foreach (var (role, model) in update.WorkerModels)
+                    GetOrCreateWorker(role).Model = model;
+            }
+
+            if (update.PremiumWorkerModels is not null)
+            {
+                foreach (var (role, model) in update.PremiumWorkerModels)
+                    GetOrCreateWorker(role).PremiumModel = model;
+            }
+
+            if (update.CompactionModel is not null)
+            {
+                _config.Models ??= new ModelsConfig();
+                _config.Models.CompactionModel = update.CompactionModel;
+            }
+
+            if (update.OrchestratorReasoningEffort is not null)
+                _config.Orchestrator.ReasoningEffort = CanonicalizeReasoning(update.OrchestratorReasoningEffort);
+
+            if (update.ComposerReasoningEffort is not null)
+            {
+                _config.Composer ??= new ComposerConfig();
+                _config.Composer.ReasoningEffort = CanonicalizeReasoning(update.ComposerReasoningEffort);
+            }
+
+            if (update.WorkerReasoningEffort is not null)
+            {
+                foreach (var role in KnownWorkerRoleKeys)
                 {
-                    wc = new WorkerConfig();
-                    _config.Workers[key] = wc;
+                    if (!TryGetIgnoreCase(update.WorkerReasoningEffort, role, out var value))
+                        continue;
+                    GetOrCreateWorker(role).ReasoningEffort = CanonicalizeReasoning(value);
                 }
-                wc.Model = model;
             }
-        }
 
-        if (update.PremiumWorkerModels is not null)
-        {
-            foreach (var (role, model) in update.PremiumWorkerModels)
+            if (update.WorkerPremiumReasoningEffort is not null)
             {
-                var key = role.ToLowerInvariant();
-                if (!_config.Workers.TryGetValue(key, out var wc))
+                foreach (var role in KnownWorkerRoleKeys)
                 {
-                    wc = new WorkerConfig();
-                    _config.Workers[key] = wc;
+                    if (!TryGetIgnoreCase(update.WorkerPremiumReasoningEffort, role, out var value))
+                        continue;
+                    GetOrCreateWorker(role).PremiumReasoningEffort = CanonicalizeReasoning(value);
                 }
-                wc.PremiumModel = model;
+            }
+
+            if (update.SubAgentModelReasoning is not null && _config.Models?.SubAgentModels is { } subAgentModels)
+            {
+                foreach (var entry in subAgentModels)
+                {
+                    if (!TryGetIgnoreCase(update.SubAgentModelReasoning, entry.Name, out var value))
+                        continue;
+                    entry.ReasoningEffort = CanonicalizeReasoning(value);
+                }
+            }
+
+            // ── Step 3: persist (write + commit) ────────────────────────────
+            var message = $"chore: update model configuration — {update.Description}";
+            _logger.LogInformation("Saving model config changes: {Description}", update.Description);
+
+            try
+            {
+                await _configRepo.WriteConfigAsync(_config, ct);
+                await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to persist model configuration changes");
+                throw;
+            }
+
+            // ── Step 4: live Brain update (only after persistence succeeded) ─
+            var brainUpdateNeeded =
+                update.OrchestratorReasoningEffort is not null || update.OrchestratorModel is not null;
+
+            if (brainUpdateNeeded && _brain is not null)
+            {
+                var finalModel = update.OrchestratorModel ?? _config.Orchestrator.Model;
+
+                var finalContextWindow = _config.TryGetContextWindowForModel(finalModel);
+                if (finalContextWindow is null or <= 0)
+                    finalContextWindow = Constants.DefaultBrainContextWindow;
+
+                var finalReasoning = update.OrchestratorReasoningEffort is not null
+                    ? ReasoningEffortConverter.Parse(update.OrchestratorReasoningEffort)
+                    : ReasoningEffortConverter.Parse(_config.Orchestrator.ReasoningEffort);
+
+                try
+                {
+                    await _brain.UpdateModelAsync(finalModel, finalContextWindow, finalReasoning, ct);
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Live Brain model update failed after successful config persistence");
+                }
             }
         }
-
-        if (update.CompactionModel is not null)
+        finally
         {
-            _config.Models ??= new ModelsConfig();
-            _config.Models.CompactionModel = update.CompactionModel;
+            _saveLock.Release();
         }
-
-        var message = $"chore: update model configuration — {update.Description}";
-        _logger.LogInformation("Saving model config changes: {Description}", update.Description);
-
-        await _configRepo.WriteConfigAsync(_config, ct);
-        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
     }
 
     /// <summary>
@@ -209,7 +466,7 @@ public sealed class ConfigModelService
     /// </summary>
     /// <param name="name">Model name.</param>
     /// <param name="contextWindow">Optional context window in tokens.</param>
-    /// <param name="reasoningEffort">Optional default reasoning effort.</param>
+    /// <param name="reasoningEffort">Ignored — available models no longer carry a reasoning effort.</param>
     /// <param name="description">Optional human-readable description.</param>
     /// <param name="ct">Cancellation token.</param>
     public Task AddAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
@@ -221,7 +478,7 @@ public sealed class ConfigModelService
     /// </summary>
     /// <param name="name">Model name.</param>
     /// <param name="contextWindow">Optional context window in tokens.</param>
-    /// <param name="reasoningEffort">Optional default reasoning effort.</param>
+    /// <param name="reasoningEffort">Ignored — available models no longer carry a reasoning effort.</param>
     /// <param name="description">Optional human-readable description.</param>
     /// <param name="supportsVision">Vision flag: <c>true</c>, <c>false</c>, or <c>null</c> for unset.</param>
     /// <param name="ct">Cancellation token.</param>
@@ -230,9 +487,8 @@ public sealed class ConfigModelService
         _config.Models ??= new ModelsConfig();
         _config.Models.AvailableModels ??= new List<ModelEntry>();
 
-        var (cleanName, extractedSuffix) = StripReasoningSuffix(name);
+        var (cleanName, _) = StripReasoningSuffix(name);
         name = cleanName;
-        var effectiveReasoningEffort = reasoningEffort ?? extractedSuffix;
 
         if (_config.Models.AvailableModels.Any(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)))
             throw new InvalidOperationException($"Model '{name}' already exists in available_models");
@@ -241,7 +497,7 @@ public sealed class ConfigModelService
         {
             Name = name,
             ContextWindow = contextWindow,
-            ReasoningEffort = effectiveReasoningEffort,
+            ReasoningEffort = null,
             Description = description,
             SupportsVision = supportsVision
         });
@@ -254,12 +510,12 @@ public sealed class ConfigModelService
     }
 
     /// <summary>
-    /// Updates an existing model's context window and/or reasoning effort.
+    /// Updates an existing model's context window, description and vision flag.
     /// Throws <see cref="InvalidOperationException"/> if the model is not found.
     /// </summary>
     /// <param name="name">Model name to update.</param>
     /// <param name="contextWindow">New context window (null clears it).</param>
-    /// <param name="reasoningEffort">New reasoning effort (null clears it).</param>
+    /// <param name="reasoningEffort">Ignored — the existing reasoning effort is preserved.</param>
     /// <param name="description">New description (null clears it).</param>
     /// <param name="ct">Cancellation token.</param>
     public Task UpdateAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
@@ -271,7 +527,7 @@ public sealed class ConfigModelService
     /// </summary>
     /// <param name="name">Model name to update.</param>
     /// <param name="contextWindow">New context window (null clears it).</param>
-    /// <param name="reasoningEffort">New reasoning effort (null clears it).</param>
+    /// <param name="reasoningEffort">Ignored — the existing reasoning effort is preserved.</param>
     /// <param name="description">New description (null clears it).</param>
     /// <param name="supportsVision">Vision flag: <c>true</c>, <c>false</c>, or <c>null</c> to clear/unset.</param>
     /// <param name="ct">Cancellation token.</param>
@@ -283,7 +539,6 @@ public sealed class ConfigModelService
             throw new InvalidOperationException($"Model '{name}' not found in available_models");
 
         model.ContextWindow = contextWindow;
-        model.ReasoningEffort = reasoningEffort;
         model.Description = description;
         model.SupportsVision = supportsVision;
 

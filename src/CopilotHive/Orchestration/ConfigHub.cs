@@ -29,20 +29,37 @@ public static class ConfigHub
                 workers        = config.Workers.ToDictionary(
                     kv => kv.Key,
                     kv => new { model = kv.Value.Model, premiumModel = kv.Value.PremiumModel }),
-                availableModels = config.Models?.AvailableModels,
+                orchestratorReasoningEffort = config.Orchestrator.ReasoningEffort,
+                composerReasoningEffort     = config.Composer?.ReasoningEffort,
+                workerReasoningEffort       = config.Workers.ToDictionary(
+                    kv => kv.Key,
+                    kv => kv.Value.ReasoningEffort),
+                workerPremiumReasoningEffort = config.Workers.ToDictionary(
+                    kv => kv.Key,
+                    kv => kv.Value.PremiumReasoningEffort),
+                availableModels = config.Models?.AvailableModels?
+                    .Select(m => new { m.Name, m.ContextWindow, m.Description, m.SupportsVision }),
                 subAgentModels = config.Models?.SubAgentModels,
             });
         });
 
         app.MapMethods("/api/config/models", ["PATCH"], async (
             ModelConfigUpdate update,
-            [FromServices] ConfigModelService? svc) =>
+            [FromServices] ConfigModelService? svc,
+            CancellationToken ct) =>
         {
             if (svc is null)
                 return Results.Problem("Config repo is not configured — model changes cannot be persisted.");
 
-            await svc.SaveModelConfigAsync(update);
-            return Results.Ok(new { saved = true, description = update.Description });
+            try
+            {
+                await svc.SaveModelConfigAsync(update, ct);
+                return Results.Ok(new { saved = true, description = update.Description });
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
         });
 
         // Discover available models from providers
@@ -61,7 +78,7 @@ public static class ConfigHub
                 return Results.Problem("Config service is not configured.");
             try
             {
-                await svc.AddAvailableModelAsync(req.Name, req.ContextWindow, req.ReasoningEffort, req.Description, req.SupportsVision);
+                await svc.AddAvailableModelAsync(req.Name, req.ContextWindow, null, req.Description, req.SupportsVision);
                 return Results.Ok(new { saved = true });
             }
             catch (InvalidOperationException ex)
@@ -78,7 +95,7 @@ public static class ConfigHub
             name = Uri.UnescapeDataString(name);
             try
             {
-                await svc.UpdateAvailableModelAsync(name, req.ContextWindow, req.ReasoningEffort, req.Description, req.SupportsVision);
+                await svc.UpdateAvailableModelAsync(name, req.ContextWindow, null, req.Description, req.SupportsVision);
                 return Results.Ok(new { saved = true });
             }
             catch (InvalidOperationException ex)
@@ -299,10 +316,9 @@ public static class ConfigHub
 /// </summary>
 /// <param name="Name">Model name (used for add; ignored for update where the route name is authoritative).</param>
 /// <param name="ContextWindow">Optional context window in tokens.</param>
-/// <param name="ReasoningEffort">Optional default reasoning effort.</param>
 /// <param name="Description">Optional human-readable description.</param>
 /// <param name="SupportsVision">Informational vision flag: <c>true</c>, <c>false</c>, or <c>null</c> for unset.</param>
-public sealed record AvailableModelRequest(string Name, int? ContextWindow, string? ReasoningEffort, string? Description = null, bool? SupportsVision = null);
+public sealed record AvailableModelRequest(string Name, int? ContextWindow, string? Description = null, bool? SupportsVision = null);
 
 /// <summary>
 /// Request body for adding or updating a sub-agent model.

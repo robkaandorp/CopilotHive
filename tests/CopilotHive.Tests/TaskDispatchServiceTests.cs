@@ -600,7 +600,7 @@ public sealed class TaskDispatchServiceTests
     }
 
     [Fact]
-    public async Task DispatchToRole_WhenCompactionModelHasReasoningEffort_AppliesSuffixToCompactionModel()
+    public async Task DispatchToRole_WhenCompactionModelHasReasoningEffort_UsesPlainModelNameWithoutSuffix()
     {
         var config = CreateConfig();
         config.Workers["coder"] = new WorkerConfig { Model = "standard-coder-model" };
@@ -623,7 +623,9 @@ public sealed class TaskDispatchServiceTests
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
 
         Assert.NotNull(capturedTask);
-        Assert.Equal("gpt-mini:low", capturedTask!.Metadata["compaction_model"]);
+        // Reasoning effort is no longer encoded as a model-name suffix — the plain name is sent.
+        Assert.Equal("gpt-mini", capturedTask!.Metadata["compaction_model"]);
+        Assert.DoesNotContain(":low", capturedTask.Metadata["compaction_model"], StringComparison.Ordinal);
     }
 
     [Fact]

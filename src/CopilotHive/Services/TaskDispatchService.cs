@@ -182,10 +182,6 @@ internal sealed class TaskDispatchService
         {
             var compactionCtx = _config?.TryGetContextWindowForModel(compactionModel);
 
-            // Apply configured reasoning effort as a model suffix (explicit :suffix takes precedence)
-            var compactionReasoningEffort = _config?.TryGetReasoningEffortForModel(compactionModel);
-            compactionModel = HiveConfigFile.ApplyReasoningSuffix(compactionModel, compactionReasoningEffort);
-
             task.Metadata["compaction_model"] = compactionModel;
             if (compactionCtx is int ctx && ctx > 0)
                 task.Metadata["compaction_max_tokens"] = ctx.ToString();
