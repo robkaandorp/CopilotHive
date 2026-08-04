@@ -10,9 +10,9 @@ public sealed class ModelEntry
     /// <summary>Maximum context window in tokens, or <c>null</c> to use the global default.</summary>
     public int? ContextWindow { get; set; }
     /// <summary>
-    /// Default reasoning effort for models that support extended thinking.
-    /// When set, this is used instead of the :suffix parsing in model names.
-    /// null = no reasoning configuration (use existing :suffix behavior).
+    /// Reasoning effort for this model entry. Only meaningful for sub_agent_models entries.
+    /// For available_models, this field is transitional — it may still be read by legacy
+    /// TryGetReasoningEffortForModel until copilothive-reasoning-brain-composer removes that method.
     /// </summary>
     public string? ReasoningEffort { get; set; }
 

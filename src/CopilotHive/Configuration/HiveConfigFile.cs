@@ -173,9 +173,14 @@ public sealed class HiveConfigFile
         }
 
         var curated = Models.SubAgentModels;
-        var availableByName = Models.AvailableModels is { Count: > 0 } availableModels
-            ? availableModels.ToDictionary(a => a.Name, StringComparer.OrdinalIgnoreCase)
-            : new Dictionary<string, ModelEntry>(StringComparer.OrdinalIgnoreCase);
+        // Last-wins by name (case-insensitive): duplicate names in available_models must
+        // not crash the merge path.
+        var availableByName = new Dictionary<string, ModelEntry>(StringComparer.OrdinalIgnoreCase);
+        if (Models.AvailableModels is { Count: > 0 } availableModels)
+        {
+            foreach (var a in availableModels)
+                availableByName[a.Name] = a;
+        }
 
         List<ModelEntry> merged = new(curated.Count);
         foreach (var entry in curated)
@@ -185,13 +190,81 @@ public sealed class HiveConfigFile
             {
                 Name = entry.Name,
                 ContextWindow = entry.ContextWindow ?? available?.ContextWindow,
-                ReasoningEffort = entry.ReasoningEffort ?? available?.ReasoningEffort,
+                // Reasoning effort is never inherited from available_models — it is an
+                // explicit per-entry assignment on sub_agent_models.
+                ReasoningEffort = entry.ReasoningEffort,
                 Description = entry.Description ?? available?.Description,
                 SupportsVision = entry.SupportsVision ?? available?.SupportsVision
             });
         }
 
         return merged;
+    }
+
+    /// <summary>
+    /// Validates that a reasoning effort is configured (and valid) for every model assignment
+    /// in this config: the orchestrator model, each worker model and premium model, the Composer
+    /// model, and every <c>sub_agent_models</c> entry.
+    /// <para>
+    /// Not validated: <c>models.compaction_model</c> (summarization only),
+    /// <c>models.available_models</c> entries (transitional legacy field), and
+    /// <c>composer.models</c> (model name references, not assignments).
+    /// </para>
+    /// </summary>
+    /// <returns>All validation errors found; an empty list when the config is valid. Never throws.</returns>
+    public List<string> ValidateReasoningEffort()
+    {
+        var errors = new List<string>();
+
+        static bool IsSet(string? value) => !string.IsNullOrWhiteSpace(value);
+
+        void Check(string? effort, string field)
+        {
+            if (!IsSet(effort))
+            {
+                errors.Add($"{field}: reasoning_effort is required but missing.");
+                return;
+            }
+
+            var trimmed = effort!.Trim();
+            if (!KnownReasoningLevels.Contains(trimmed))
+            {
+                errors.Add(
+                    $"{field}: invalid reasoning_effort '{effort}'. Valid values: none, low, medium, high, extra_high.");
+            }
+        }
+
+        // orchestrator.model always has a value, so reasoning effort is always required.
+        Check(Orchestrator.ReasoningEffort, "orchestrator.reasoning_effort");
+
+        foreach (var kv in Workers)
+        {
+            var worker = kv.Value;
+            if (worker is null)
+                continue;
+
+            if (IsSet(worker.Model))
+                Check(worker.ReasoningEffort, $"workers.{kv.Key}.reasoning_effort");
+
+            if (IsSet(worker.PremiumModel))
+                Check(worker.PremiumReasoningEffort, $"workers.{kv.Key}.premium_reasoning_effort");
+        }
+
+        if (Composer is not null && IsSet(Composer.Model))
+            Check(Composer.ReasoningEffort, "composer.reasoning_effort");
+
+        if (Models?.SubAgentModels is { Count: > 0 } subAgentModels)
+        {
+            for (var i = 0; i < subAgentModels.Count; i++)
+            {
+                var entry = subAgentModels[i];
+                if (entry is null)
+                    continue;
+                Check(entry.ReasoningEffort, $"models.sub_agent_models[{i}] ({entry.Name}).reasoning_effort");
+            }
+        }
+
+        return errors;
     }
 
     /// <summary>
@@ -237,7 +310,9 @@ public sealed class HiveConfigFile
                 {
                     Model = kv.Value.Model,
                     PremiumModel = kv.Value.PremiumModel,
-                    ContextWindow = kv.Value.ContextWindow
+                    ContextWindow = kv.Value.ContextWindow,
+                    ReasoningEffort = kv.Value.ReasoningEffort,
+                    PremiumReasoningEffort = kv.Value.PremiumReasoningEffort
                 })));
 
         Orchestrator = new OrchestratorConfig
@@ -248,7 +323,9 @@ public sealed class HiveConfigFile
             MaxParallelGoals = source.Orchestrator.MaxParallelGoals,
             VerboseLogging = source.Orchestrator.VerboseLogging,
             BrainMaxSteps = source.Orchestrator.BrainMaxSteps,
-            BranchCleanupDelayHours = source.Orchestrator.BranchCleanupDelayHours
+            BranchCleanupDelayHours = source.Orchestrator.BranchCleanupDelayHours,
+            WorkerTaskTimeoutMinutes = source.Orchestrator.WorkerTaskTimeoutMinutes,
+            ReasoningEffort = source.Orchestrator.ReasoningEffort
         };
 
         if (source.Models is not null)
@@ -285,7 +362,8 @@ public sealed class HiveConfigFile
             {
                 Model = source.Composer.Model,
                 Models = source.Composer.Models?.ToList(),
-                MaxSteps = source.Composer.MaxSteps
+                MaxSteps = source.Composer.MaxSteps,
+                ReasoningEffort = source.Composer.ReasoningEffort
             };
         }
         else
