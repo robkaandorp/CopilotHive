@@ -1,6 +1,6 @@
 # Agent Templates
 
-These `*.agents.md` files are **default templates** for a CopilotHive-style multi-agent
+These `*.agents.md.example` files are **default templates** for a CopilotHive-style multi-agent
 software development workflow. They define the behaviour of each worker role.
 
 ## Roles
@@ -16,7 +16,7 @@ software development workflow. They define the behaviour of each worker role.
 
 ## Customising for Your Project
 
-Copy these templates and edit them to match your project's conventions:
+Copy these templates rename them to `*.agents.md` and edit them to match your project's conventions:
 
 - **Tech stack**: Update the coder's documentation and thread-safety sections to match your language.
 - **Build & test tooling**: Update references to build/test skills to match your project's commands.
