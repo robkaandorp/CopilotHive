@@ -1077,8 +1077,11 @@ public sealed class PlanRejectContractTests
         Assert.Equal(pipeline.Iteration, newEntry.Iteration);
         Assert.Equal("rebase and fix the conflict", newEntry.WorkerPrompt);
 
-        // The prior Merging entry is untouched — its history was not overwritten.
-        Assert.Equal("merge attempt output", mergingEntry.WorkerOutput);
+        // The prior Merging entry is marked failed with the merge error so the
+        // iteration summary (and dashboard) shows the failed Merging phase.
+        Assert.Equal(PhaseOutcome.Fail, mergingEntry.Result);
+        Assert.Equal("conflict in Program.cs", mergingEntry.WorkerOutput);
+        Assert.NotNull(mergingEntry.CompletedAt);
         Assert.Equal(iterationBefore, mergingEntry.Iteration);
     }
 

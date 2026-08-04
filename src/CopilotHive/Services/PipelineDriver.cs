@@ -511,10 +511,26 @@ internal sealed class PipelineDriver
 
     public async Task HandleMergeFailureAsync(GoalPipeline pipeline, string errorMessage, CancellationToken ct)
     {
+        // Mark the current Merging PhaseResult as failed FIRST — before any budget checks and
+        // before any terminal exit — so the iteration summary (built here on the retry path, or
+        // by FinalizeGoalAsync on the terminal paths) includes the failed Merging phase with the
+        // merge error visible in the dashboard.
+        var mergingEntry = pipeline.PhaseLog
+            .LastOrDefault(e => e.Name == GoalPhase.Merging && e.Iteration == pipeline.Iteration);
+        if (mergingEntry is not null)
+        {
+            mergingEntry.Result = PhaseOutcome.Fail;
+            mergingEntry.CompletedAt = DateTime.UtcNow;
+            mergingEntry.WorkerOutput = errorMessage;
+        }
+
         // State machine already transitioned to Coding (NewIteration) before this is called.
         // Check retry/iteration limits.
         if (!pipeline.ReviewRetryBudget.TryConsume())
         {
+            // Terminal path: the Merging phase was marked failed above. Do NOT build/add/persist
+            // an iteration summary here — FinalizeGoalAsync builds and persists the terminal
+            // summary, so adding one here would create a duplicate.
             pipeline.StateMachine.Fail();
             pipeline.AdvanceTo(GoalPhase.Failed);
             await AppendToProgressDocumentAsync(pipeline.GoalId,
@@ -527,7 +543,11 @@ internal sealed class PipelineDriver
             "Merge conflict for goal {GoalId} — sending back to Coder for rebase (retry {Retry}/{Max})",
             pipeline.GoalId, pipeline.ReviewRetryBudget.Used, pipeline.ReviewRetryBudget.Allowed);
 
-        if (!pipeline.IterationBudget.TryConsume())
+        // If the iteration budget is exhausted there is no retry possible: fail the goal directly.
+        // The Merging phase was already marked failed above, so FinalizeGoalAsync's terminal
+        // summary includes it. Do NOT build/add/persist a snapshot here — that would create a
+        // duplicate summary when FinalizeGoalAsync runs.
+        if (pipeline.IterationBudget.IsExhausted)
         {
             pipeline.StateMachine.Fail();
             pipeline.AdvanceTo(GoalPhase.Failed);
@@ -536,6 +556,19 @@ internal sealed class PipelineDriver
             await _lifecycleService.MarkGoalFailedAsync(pipeline, "Exceeded max iterations during merge conflict resolution", ct);
             return;
         }
+
+        // Snapshot the ending (failed-merge) iteration BEFORE IterationBudget.TryConsume() —
+        // BuildIterationSummary filters PhaseLog by pipeline.Iteration, so calling it after
+        // TryConsume would snapshot the WRONG (new) iteration. Same pattern as HandleNewIterationAsync.
+        var iterationSummary = PipelineHelpers.BuildIterationSummary(pipeline);
+        pipeline.CompletedIterationSummaries.Add(iterationSummary);
+
+        // Persist the iteration summary to the goal source so the dashboard can read it.
+        var updateMeta = new GoalUpdateMetadata { IterationSummary = iterationSummary };
+        await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.InProgress, updateMeta, ct);
+
+        // Advance the iteration budget — guaranteed to succeed since IsExhausted was checked above.
+        pipeline.IterationBudget.TryConsume();
 
         // NOTE: the pipeline phase is deliberately NOT advanced here — see HandleNewIterationAsync.
         // It is set from newPlan.Phases[0] once planning succeeds.
