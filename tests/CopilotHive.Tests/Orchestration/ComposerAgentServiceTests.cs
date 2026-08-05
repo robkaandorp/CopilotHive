@@ -245,7 +245,7 @@ public sealed class ComposerAgentServiceTests
             var sessionRef = session;
 
             // Switch to model-b.
-            await service.SwitchModelAsync("model-b");
+            await service.SwitchModelAsync("model-b", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
 
             // Session reference should be the same object (preserved, not reloaded).
             Assert.Same(sessionRef, service.Session);
@@ -335,7 +335,7 @@ public sealed class ComposerAgentServiceTests
     }
 
     [Fact]
-    public async Task SwitchModelAsync_RetainsConfiguredReasoningEffort_DoesNotReparse()
+    public async Task SwitchModelAsync_AppliesSuppliedReasoningEffort_DoesNotReparseName()
     {
         var stateDir = CreateTempDir();
         try
@@ -354,11 +354,11 @@ public sealed class ComposerAgentServiceTests
                 await service.ConnectAsync(TestContext.Current.CancellationToken);
                 Assert.Equal(ReasoningEffort.High, service.ReasoningEffort);
 
-                // The new model name ends in ':low', but the configured value must survive.
-                await service.SwitchModelAsync("model-b:low");
+                // The new model name ends in ':low', but the explicitly supplied value wins.
+                await service.SwitchModelAsync("model-b:low", ReasoningEffort.ExtraHigh, TestContext.Current.CancellationToken);
 
-                Assert.Equal(ReasoningEffort.High, service.ReasoningEffort);
-                Assert.Equal(ReasoningEffort.High, GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
+                Assert.Equal(ReasoningEffort.ExtraHigh, service.ReasoningEffort);
+                Assert.Equal(ReasoningEffort.ExtraHigh, GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
             }
         }
         finally
@@ -368,7 +368,7 @@ public sealed class ComposerAgentServiceTests
     }
 
     [Fact]
-    public async Task SwitchModelAsync_WithoutConfiguredReasoningEffort_StaysUnset()
+    public async Task SwitchModelAsync_NoneReasoningEffort_IsAppliedNotTreatedAsUnset()
     {
         var stateDir = CreateTempDir();
         try
@@ -379,18 +379,18 @@ public sealed class ComposerAgentServiceTests
                 chatClientFactory: _ => mockClient.Object,
                 hiveConfig: TwoModelConfig(),
                 model: "model-a",
+                configuredReasoningEffort: ReasoningEffort.High,
                 startupAvailableModels: ["model-a", "model-b:low"]);
 
             await using (service)
             {
                 await service.ConnectAsync(TestContext.Current.CancellationToken);
-                Assert.Null(service.ReasoningEffort);
 
-                await service.SwitchModelAsync("model-b:low");
+                await service.SwitchModelAsync("model-b:low", ReasoningEffort.None, TestContext.Current.CancellationToken);
 
-                // No suffix parsing: the reasoning effort remains unset.
-                Assert.Null(service.ReasoningEffort);
-                Assert.Null(GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
+                // None is an explicit level, not "unset" — it replaces the previous value.
+                Assert.Equal(ReasoningEffort.None, service.ReasoningEffort);
+                Assert.Equal(ReasoningEffort.None, GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
             }
         }
         finally
@@ -419,10 +419,11 @@ public sealed class ComposerAgentServiceTests
                 // No configured value → unset, even though the model name ends in ':low'.
                 Assert.Null(service.ReasoningEffort);
 
-                await service.SwitchModelAsync("model-a");
+                // The name carries no reasoning: only the supplied value is applied.
+                await service.SwitchModelAsync("model-a", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
 
-                Assert.Null(service.ReasoningEffort);
-                Assert.Null(GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
+                Assert.Equal(ReasoningEffort.Medium, service.ReasoningEffort);
+                Assert.Equal(ReasoningEffort.Medium, GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
             }
         }
         finally
@@ -723,7 +724,7 @@ public sealed class ComposerAgentServiceTests
             await service.ConnectAsync(TestContext.Current.CancellationToken);
             Assert.True(service.IsConnected);
 
-            await Assert.ThrowsAsync<InvalidOperationException>(() => service.SwitchModelAsync("other-model"));
+            await Assert.ThrowsAsync<InvalidOperationException>(() => service.SwitchModelAsync("other-model", ReasoningEffort.Medium, TestContext.Current.CancellationToken));
 
             Assert.False(service.IsConnected);
             Assert.Null(GetField<IChatClient>(service, "_chatClient"));
@@ -1297,7 +1298,7 @@ public sealed class ComposerAgentServiceTests
             var capturedAgents = new List<CodingAgent>();
             service.OnAgentDisposing = agent => capturedAgents.Add(agent);
 
-            await service.SwitchModelAsync("model-b");
+            await service.SwitchModelAsync("model-b", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
 
             Assert.Single(capturedAgents);
             Assert.Same(oldAgent, capturedAgents[0]);
@@ -1505,7 +1506,7 @@ public sealed class ComposerAgentServiceTests
             // Record agent disposal via hook.
             service.OnAgentDisposing = _ => disposalOrder.Add("agent");
 
-            await service.SwitchModelAsync("model-b");
+            await service.SwitchModelAsync("model-b", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
 
             // Agent must be disposed BEFORE client.
             Assert.Equal(2, disposalOrder.Count);
@@ -1601,7 +1602,7 @@ public sealed class ComposerAgentServiceTests
             // The hook exception should propagate (non-failure path on SwitchModelAsync
             // calls DisposeClientsAndClearStateAsync directly, which rethrows).
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-                () => service.SwitchModelAsync("model-b"));
+                () => service.SwitchModelAsync("model-b", ReasoningEffort.Medium, TestContext.Current.CancellationToken));
             Assert.Equal("hook boom", ex.Message);
 
             // The hook saw the old agent…

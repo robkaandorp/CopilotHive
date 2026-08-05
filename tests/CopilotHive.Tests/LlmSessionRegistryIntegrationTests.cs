@@ -1228,7 +1228,7 @@ public sealed class LlmSessionRegistryIntegrationTests
                 sessionRegistry: registry);
             await composer.ConnectAsync(TestContext.Current.CancellationToken);
 
-            await composer.SwitchModelAsync("copilot/other-model");
+            await composer.SwitchModelAsync("copilot/other-model", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
 
             var entry = FindSession(registry, "composer");
             Assert.NotNull(entry);

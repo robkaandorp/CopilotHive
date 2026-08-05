@@ -1,4 +1,7 @@
 using CopilotHive.Configuration;
+using CopilotHive.Services;
+
+using Microsoft.Extensions.AI;
 
 namespace CopilotHive.Orchestration;
 
@@ -26,11 +29,36 @@ public static class ComposerHub
             var globalModelNames = config?.Models?.AvailableModels is { Count: > 0 } available
                 ? available.Select(m => m.Name).ToList()
                 : null;
-            return Results.Ok(new { models = globalModelNames ?? composer.AvailableModels });
+            // The reasoning effort is serialized snake_case by the global JSON enum converter
+            // (e.g. ReasoningEffort.ExtraHigh → "extra_high").
+            return Results.Ok(new
+            {
+                models = globalModelNames ?? composer.AvailableModels,
+                reasoningEffort = composer.ReasoningEffort,
+            });
         });
 
-        routes.MapPost("/api/composer/models/switch", async (string model) =>
+        routes.MapPost("/api/composer/models/switch", async (string? model, string? reasoning) =>
         {
+            // Both query parameters are required: a model switch always carries an explicit
+            // reasoning effort so the running Composer can never inherit a stale one.
+            if (string.IsNullOrWhiteSpace(model))
+                return Results.BadRequest(new { error = "The 'model' query parameter is required." });
+            if (string.IsNullOrWhiteSpace(reasoning))
+                return Results.BadRequest(new { error = "The 'reasoning' query parameter is required." });
+
+            ReasoningEffort parsedReasoning;
+            try
+            {
+                // Query strings are untyped, so the canonical wire form is parsed explicitly.
+                // Parse only returns null for null/empty/whitespace, already rejected above.
+                parsedReasoning = ReasoningEffortConverter.Parse(reasoning)!.Value;
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+
             try
             {
                 var globalModelNames = config?.Models?.AvailableModels is { Count: > 0 } available
@@ -44,8 +72,12 @@ public static class ComposerHub
                         nameof(model));
                 }
 
-                await composer.SwitchModelAsync(model);
-                return Results.Ok(new { model = composer.GetStats()?.Model ?? model });
+                await composer.SwitchModelAsync(model, parsedReasoning);
+                return Results.Ok(new
+                {
+                    model = composer.GetStats()?.Model ?? model,
+                    reasoningEffort = composer.ReasoningEffort,
+                });
             }
             catch (ArgumentException ex)
             {

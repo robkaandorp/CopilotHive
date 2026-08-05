@@ -6,6 +6,7 @@ using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -385,7 +386,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("copilot/claude-sonnet-4.6", 200000, "high", ct: TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("copilot/claude-sonnet-4.6", 200000, ct: TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.AvailableModels!);
         Assert.Equal("copilot/claude-sonnet-4.6", model.Name);
@@ -411,7 +412,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("copilot/claude-sonnet-4.6:high", null, null, ct: TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("copilot/claude-sonnet-4.6:high", null, ct: TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.AvailableModels!);
         Assert.Equal("copilot/claude-sonnet-4.6:high", model.Name);
@@ -429,7 +430,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("model:custom", null, null, ct: TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("model:custom", null, ct: TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.AvailableModels!);
         Assert.Equal("model:custom", model.Name);
@@ -437,7 +438,7 @@ public sealed class ConfigModelServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task AddAvailableModelAsync_ExplicitReasoningEffort_IsIgnored()
+    public async Task AddAvailableModelAsync_NeverPersistsReasoningEffort()
     {
         var config = new HiveConfigFile
         {
@@ -447,11 +448,11 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("model:high", null, "low", ct: TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("model:high", null, ct: TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.AvailableModels!);
         Assert.Equal("model:high", model.Name);
-        // The reasoningEffort argument is accepted for signature compatibility but not persisted.
+        // Available models carry no reasoning effort at all — there is no parameter to supply one.
         Assert.Null(model.ReasoningEffort);
     }
 
@@ -466,7 +467,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("plain-model", 100000, null, ct: TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("plain-model", 100000, ct: TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.AvailableModels!);
         Assert.Equal("plain-model", model.Name);
@@ -481,7 +482,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("model-a", null, null, ct: TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("model-a", null, ct: TestContext.Current.CancellationToken);
 
         Assert.NotNull(config.Models);
         var model = Assert.Single(config.Models!.AvailableModels!);
@@ -495,10 +496,10 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("model-a", null, null, ct: TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("model-a", null, ct: TestContext.Current.CancellationToken);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            svc.AddAvailableModelAsync("MODEL-A", null, null, ct: TestContext.Current.CancellationToken));
+            svc.AddAvailableModelAsync("MODEL-A", null, ct: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -508,7 +509,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("model-a", null, null, ct: TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("model-a", null, ct: TestContext.Current.CancellationToken);
 
         Assert.Single(repo.Commits);
         Assert.Equal("hive-config.yaml", repo.Commits[0].File);
@@ -531,33 +532,13 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateAvailableModelAsync("model-a", 256000, null, ct: TestContext.Current.CancellationToken);
+        await svc.UpdateAvailableModelAsync("model-a", 256000, ct: TestContext.Current.CancellationToken);
 
         Assert.Equal(256000, config.Models!.AvailableModels![0].ContextWindow);
     }
 
     [Fact]
-    public async Task UpdateAvailableModelAsync_IgnoresReasoningEffortArgument()
-    {
-        var config = new HiveConfigFile
-        {
-            Orchestrator = new OrchestratorConfig(),
-            Models = new ModelsConfig
-            {
-                AvailableModels = [new ModelEntry { Name = "model-a", ReasoningEffort = null }]
-            }
-        };
-        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
-        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
-
-        await svc.UpdateAvailableModelAsync("model-a", null, "high", ct: TestContext.Current.CancellationToken);
-
-        // The PUT no longer writes reasoning effort onto available models.
-        Assert.Null(config.Models!.AvailableModels![0].ReasoningEffort);
-    }
-
-    [Fact]
-    public async Task UpdateAvailableModelAsync_PreservesExistingReasoningEffort_WhenPassedNull()
+    public async Task UpdateAvailableModelAsync_PreservesExistingReasoningEffort()
     {
         var config = new HiveConfigFile
         {
@@ -570,9 +551,9 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateAvailableModelAsync("model-a", null, null, ct: TestContext.Current.CancellationToken);
+        await svc.UpdateAvailableModelAsync("model-a", null, ct: TestContext.Current.CancellationToken);
 
-        // The existing value is preserved — the PUT neither sets nor clears it.
+        // The PUT has no reasoning parameter — an existing value is neither set nor cleared.
         Assert.Equal("high", config.Models!.AvailableModels![0].ReasoningEffort);
     }
 
@@ -584,7 +565,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            svc.UpdateAvailableModelAsync("missing", 1000, null, ct: TestContext.Current.CancellationToken));
+            svc.UpdateAvailableModelAsync("missing", 1000, ct: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -601,7 +582,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateAvailableModelAsync("model-a", 256000, null, ct: TestContext.Current.CancellationToken);
+        await svc.UpdateAvailableModelAsync("model-a", 256000, ct: TestContext.Current.CancellationToken);
 
         Assert.Single(repo.Commits);
         Assert.Equal("hive-config.yaml", repo.Commits[0].File);
@@ -1308,7 +1289,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("model-a", 1000, null, "Fast and cheap", ct: TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("model-a", 1000, "Fast and cheap", ct: TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.AvailableModels!);
         Assert.Equal("Fast and cheap", model.Description);
@@ -1326,7 +1307,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateAvailableModelAsync("model-a", null, null, "Deep reasoning", ct: TestContext.Current.CancellationToken);
+        await svc.UpdateAvailableModelAsync("model-a", null, "Deep reasoning", ct: TestContext.Current.CancellationToken);
 
         Assert.Equal("Deep reasoning", config.Models!.AvailableModels![0].Description);
     }
@@ -1340,7 +1321,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddSubAgentModelAsync("model-a", 128000, "high", "Great for research", TestContext.Current.CancellationToken);
+        await svc.AddSubAgentModelAsync("model-a", 128000, ReasoningEffort.High, "Great for research", TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.SubAgentModels!);
         Assert.Equal("model-a", model.Name);
@@ -1374,7 +1355,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateSubAgentModelAsync("model-a", 256000, "low", "Cheap", TestContext.Current.CancellationToken);
+        await svc.UpdateSubAgentModelAsync("model-a", 256000, ReasoningEffort.Low, "Cheap", TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.SubAgentModels!);
         Assert.Equal(256000, model.ContextWindow);
@@ -1445,7 +1426,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddSubAgentModelAsync("copilot/test-model", 64000, "high", "Research helper",
+        await svc.AddSubAgentModelAsync("copilot/test-model", 64000, ReasoningEffort.High, "Research helper",
             TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.SubAgentModels!);
@@ -1480,46 +1461,42 @@ public sealed class ConfigModelServiceTests : IDisposable
     }
 
     /// <summary>
-    /// A sloppy explicit value is canonicalized before persistence.
+    /// The enum-valued reasoning effort is persisted in its canonical wire form.
     /// </summary>
-    [Fact]
-    public async Task AddSubAgentModelAsync_CanonicalizesExplicitReasoningEffort()
+    [Theory]
+    [InlineData(ReasoningEffort.None, "none")]
+    [InlineData(ReasoningEffort.Low, "low")]
+    [InlineData(ReasoningEffort.Medium, "medium")]
+    [InlineData(ReasoningEffort.High, "high")]
+    [InlineData(ReasoningEffort.ExtraHigh, "extra_high")]
+    public async Task AddSubAgentModelAsync_PersistsCanonicalWireForm(ReasoningEffort effort, string expected)
     {
         var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddSubAgentModelAsync("copilot/test-model", 64000, "  High ", null,
+        await svc.AddSubAgentModelAsync("copilot/test-model", 64000, effort, null,
             TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.SubAgentModels!);
-        Assert.Equal("high", model.ReasoningEffort);
+        Assert.Equal(expected, model.ReasoningEffort);
     }
 
     /// <summary>
-    /// An unrecognised reasoning effort is rejected with an <see cref="ArgumentException"/>
-    /// (which the ConfigHub endpoint maps to a 400), and nothing is persisted or committed.
+    /// A <c>null</c> reasoning effort persists as an absent (null) YAML value.
     /// </summary>
-    [Theory]
-    [InlineData("turbo")]
-    [InlineData("HIGHEST")]
-    [InlineData("1")]
-    public async Task AddSubAgentModelAsync_InvalidReasoningEffort_ThrowsArgumentException(string effort)
+    [Fact]
+    public async Task AddSubAgentModelAsync_NullReasoningEffort_PersistsNull()
     {
         var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
-            svc.AddSubAgentModelAsync("copilot/test-model", 64000, effort, null,
-                TestContext.Current.CancellationToken));
+        await svc.AddSubAgentModelAsync("copilot/test-model", 64000, null, null,
+            TestContext.Current.CancellationToken);
 
-        // The message names the rejected value and the allowed set.
-        Assert.Contains(effort, ex.Message, StringComparison.Ordinal);
-        Assert.Contains("extra_high", ex.Message, StringComparison.Ordinal);
-
-        // Validation happens before mutation — no entry was added.
-        Assert.True(config.Models?.SubAgentModels is null or { Count: 0 });
+        var model = Assert.Single(config.Models!.SubAgentModels!);
+        Assert.Null(model.ReasoningEffort);
     }
 
     [Fact]
@@ -1536,7 +1513,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateSubAgentModelAsync("model-a", 256000, "low", "new desc",
+        await svc.UpdateSubAgentModelAsync("model-a", 256000, ReasoningEffort.Low, "new desc",
             TestContext.Current.CancellationToken);
 
         var yaml = await ReadWrittenYamlAsync();
@@ -1583,7 +1560,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateAvailableModelAsync("model-a", null, null, "Deep reasoning workhorse",
+        await svc.UpdateAvailableModelAsync("model-a", null, "Deep reasoning workhorse",
             ct: TestContext.Current.CancellationToken);
 
         var yaml = await ReadWrittenYamlAsync();
@@ -1601,7 +1578,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("model-a", 1000, null, "Fast and cheap",
+        await svc.AddAvailableModelAsync("model-a", 1000, "Fast and cheap",
             ct: TestContext.Current.CancellationToken);
 
         var yaml = await ReadWrittenYamlAsync();
@@ -1624,7 +1601,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddAvailableModelAsync("vision-model", 1000, null, null, vision, TestContext.Current.CancellationToken);
+        await svc.AddAvailableModelAsync("vision-model", 1000, null, vision, TestContext.Current.CancellationToken);
 
         var model = Assert.Single(config.Models!.AvailableModels!);
         Assert.Equal(vision, model.SupportsVision);
@@ -1644,7 +1621,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateAvailableModelAsync("model-a", null, null, null, vision, TestContext.Current.CancellationToken);
+        await svc.UpdateAvailableModelAsync("model-a", null, null, vision, TestContext.Current.CancellationToken);
 
         Assert.Equal(vision, config.Models!.AvailableModels![0].SupportsVision);
     }
@@ -1661,7 +1638,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         // Update to explicit false
-        await svc.UpdateAvailableModelAsync("model-a", null, null, null, false, TestContext.Current.CancellationToken);
+        await svc.UpdateAvailableModelAsync("model-a", null, null, false, TestContext.Current.CancellationToken);
 
         Assert.False(config.Models!.AvailableModels![0].SupportsVision);
 
@@ -1749,11 +1726,11 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            OrchestratorReasoningEffort: "high",
-            ComposerReasoningEffort: "medium",
-            WorkerReasoningEffort: new Dictionary<string, string?> { ["coder"] = "extra_high", ["tester"] = "none" },
-            WorkerPremiumReasoningEffort: new Dictionary<string, string?> { ["coder"] = "medium" },
-            SubAgentModelReasoning: new Dictionary<string, string?> { ["sa-model"] = "high" });
+            OrchestratorReasoningEffort: ReasoningEffort.High,
+            ComposerReasoningEffort: ReasoningEffort.Medium,
+            WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = ReasoningEffort.ExtraHigh, ["tester"] = ReasoningEffort.None },
+            WorkerPremiumReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = ReasoningEffort.Medium },
+            SubAgentModelReasoning: new Dictionary<string, ReasoningEffort?> { ["sa-model"] = ReasoningEffort.High });
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
@@ -1785,52 +1762,29 @@ public sealed class ConfigModelServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task SaveModelConfigAsync_EmptyStringReasoning_ClearsConfigProperties()
+    public async Task SaveModelConfigAsync_PresentKeyWithNullValue_IsANoOp()
     {
         var config = CreateReasoningConfig();
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
+        // A present dictionary key whose value is null carries no level, so it must leave the
+        // persisted value untouched rather than clearing it.
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            OrchestratorReasoningEffort: "",
-            ComposerReasoningEffort: "",
-            WorkerReasoningEffort: new Dictionary<string, string?> { ["coder"] = null },
-            WorkerPremiumReasoningEffort: new Dictionary<string, string?> { ["coder"] = "" },
-            SubAgentModelReasoning: new Dictionary<string, string?> { ["sa-model"] = null });
+            WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = null },
+            WorkerPremiumReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = null },
+            SubAgentModelReasoning: new Dictionary<string, ReasoningEffort?> { ["sa-model"] = null });
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
-        Assert.Null(config.Orchestrator.ReasoningEffort);
-        Assert.Null(config.Composer!.ReasoningEffort);
-        Assert.Null(config.Workers["coder"].ReasoningEffort);
-        Assert.Null(config.Workers["coder"].PremiumReasoningEffort);
-        Assert.Null(config.Models!.SubAgentModels![0].ReasoningEffort);
+        Assert.Equal("low", config.Workers["coder"].ReasoningEffort);
+        Assert.Equal("low", config.Workers["coder"].PremiumReasoningEffort);
+        Assert.Equal("low", config.Models!.SubAgentModels![0].ReasoningEffort);
     }
 
     [Fact]
-    public async Task SaveModelConfigAsync_InvalidReasoningValue_ThrowsAndDoesNotMutate()
-    {
-        var config = CreateReasoningConfig();
-        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
-        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
-
-        var update = new ModelConfigUpdate(
-            "new-orch-model", null, null, null, null,
-            OrchestratorReasoningEffort: "turbo");
-
-        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
-            svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken));
-
-        Assert.Contains("turbo", ex.Message, StringComparison.Ordinal);
-        // No mutation and no persistence happened.
-        Assert.Equal("orch-model", config.Orchestrator.Model);
-        Assert.Equal("low", config.Orchestrator.ReasoningEffort);
-        Assert.Empty(repo.Commits);
-    }
-
-    [Fact]
-    public async Task SaveModelConfigAsync_MultipleInvalidReasoningValues_ListsAllInMessage()
+    public async Task SaveModelConfigAsync_NoneReasoning_PersistsTheExplicitNoneLevel()
     {
         var config = CreateReasoningConfig();
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
@@ -1838,22 +1792,20 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            OrchestratorReasoningEffort: "turbo",
-            ComposerReasoningEffort: "ludicrous",
-            WorkerReasoningEffort: new Dictionary<string, string?> { ["coder"] = "sideways" },
-            WorkerPremiumReasoningEffort: new Dictionary<string, string?> { ["coder"] = "upside-down" },
-            SubAgentModelReasoning: new Dictionary<string, string?> { ["sa-model"] = "backwards" });
+            OrchestratorReasoningEffort: ReasoningEffort.None,
+            ComposerReasoningEffort: ReasoningEffort.None,
+            WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = ReasoningEffort.None },
+            WorkerPremiumReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = ReasoningEffort.None },
+            SubAgentModelReasoning: new Dictionary<string, ReasoningEffort?> { ["sa-model"] = ReasoningEffort.None });
 
-        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
-            svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken));
+        await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
-        Assert.Contains("turbo", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("ludicrous", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("sideways", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("upside-down", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("backwards", ex.Message, StringComparison.Ordinal);
-        Assert.Empty(repo.Commits);
-        Assert.Equal("low", config.Workers["coder"].ReasoningEffort);
+        // None is an explicit level, NOT "unset" — it persists as the "none" wire string.
+        Assert.Equal("none", config.Orchestrator.ReasoningEffort);
+        Assert.Equal("none", config.Composer!.ReasoningEffort);
+        Assert.Equal("none", config.Workers["coder"].ReasoningEffort);
+        Assert.Equal("none", config.Workers["coder"].PremiumReasoningEffort);
+        Assert.Equal("none", config.Models!.SubAgentModels![0].ReasoningEffort);
     }
 
     [Fact]
@@ -1865,9 +1817,9 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            WorkerReasoningEffort: new Dictionary<string, string?> { ["merger"] = "not-a-level" },
-            WorkerPremiumReasoningEffort: new Dictionary<string, string?> { ["ghost"] = "also-invalid" },
-            SubAgentModelReasoning: new Dictionary<string, string?> { ["unknown-model"] = "nonsense" });
+            WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["merger"] = ReasoningEffort.High },
+            WorkerPremiumReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["ghost"] = ReasoningEffort.High },
+            SubAgentModelReasoning: new Dictionary<string, ReasoningEffort?> { ["unknown-model"] = ReasoningEffort.High });
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
@@ -1887,8 +1839,8 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            WorkerReasoningEffort: new Dictionary<string, string?> { ["DocWriter"] = "high" },
-            SubAgentModelReasoning: new Dictionary<string, string?> { ["SA-MODEL"] = "high" });
+            WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["DocWriter"] = ReasoningEffort.High },
+            SubAgentModelReasoning: new Dictionary<string, ReasoningEffort?> { ["SA-MODEL"] = ReasoningEffort.High });
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
@@ -1913,7 +1865,7 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         var update = new ModelConfigUpdate(
             "new-orch", null, null, null, null,
-            OrchestratorReasoningEffort: "high");
+            OrchestratorReasoningEffort: ReasoningEffort.High);
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
@@ -1940,7 +1892,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var brain = new FakeDistributedBrain();
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
 
-        var update = new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: "medium");
+        var update = new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.Medium);
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
@@ -1951,7 +1903,7 @@ public sealed class ConfigModelServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task SaveModelConfigAsync_EmptyOrchestratorReasoning_SendsNullReasoningToBrain()
+    public async Task SaveModelConfigAsync_NoneOrchestratorReasoning_SendsNoneReasoningToBrain()
     {
         var config = new HiveConfigFile
         {
@@ -1961,13 +1913,13 @@ public sealed class ConfigModelServiceTests : IDisposable
         var brain = new FakeDistributedBrain();
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
 
-        var update = new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: "");
+        var update = new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.None);
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
         Assert.Equal(1, brain.UpdateModelCalls);
-        Assert.Null(brain.LastReasoningEffort);
-        Assert.Null(config.Orchestrator.ReasoningEffort);
+        Assert.Equal(ReasoningEffort.None, brain.LastReasoningEffort);
+        Assert.Equal("none", config.Orchestrator.ReasoningEffort);
     }
 
     [Fact]
@@ -1981,7 +1933,7 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            ComposerReasoningEffort: "high");
+            ComposerReasoningEffort: ReasoningEffort.High);
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
@@ -2000,7 +1952,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var brain = new FakeDistributedBrain();
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
 
-        var update = new ModelConfigUpdate("new-orch", null, null, null, null, OrchestratorReasoningEffort: "high");
+        var update = new ModelConfigUpdate("new-orch", null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.High);
 
         await Assert.ThrowsAsync<IOException>(() =>
             svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken));
@@ -2038,7 +1990,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         using var cts = new CancellationTokenSource();
         await cts.CancelAsync();
 
-        var update = new ModelConfigUpdate("new-orch", null, null, null, null, OrchestratorReasoningEffort: "high");
+        var update = new ModelConfigUpdate("new-orch", null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.High);
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             svc.SaveModelConfigAsync(update, cts.Token));
@@ -2059,7 +2011,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var brain = new FakeDistributedBrain();
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
 
-        var update = new ModelConfigUpdate("new-orch", null, null, null, null, OrchestratorReasoningEffort: "high");
+        var update = new ModelConfigUpdate("new-orch", null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.High);
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken));
@@ -2079,7 +2031,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var brain = new FakeDistributedBrain();
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
 
-        var update = new ModelConfigUpdate("new-orch", null, null, null, null, OrchestratorReasoningEffort: "high");
+        var update = new ModelConfigUpdate("new-orch", null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.High);
 
         await Assert.ThrowsAnyAsync<IOException>(() =>
             svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken));
@@ -2098,7 +2050,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var brain = new FakeDistributedBrain { UpdateModelException = new OperationCanceledException("brain cancelled") };
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
 
-        var update = new ModelConfigUpdate("new-orch", null, null, null, null, OrchestratorReasoningEffort: "high");
+        var update = new ModelConfigUpdate("new-orch", null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.High);
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken));
@@ -2118,7 +2070,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
 
         using var cts = new CancellationTokenSource();
-        var update = new ModelConfigUpdate("new-orch", null, null, null, null, OrchestratorReasoningEffort: "high");
+        var update = new ModelConfigUpdate("new-orch", null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.High);
 
         var saveTask = svc.SaveModelConfigAsync(update, cts.Token);
 
@@ -2144,7 +2096,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
 
         using var cts = new CancellationTokenSource();
-        var update = new ModelConfigUpdate("new-orch", null, null, null, null, OrchestratorReasoningEffort: "high");
+        var update = new ModelConfigUpdate("new-orch", null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.High);
 
         var saveTask = svc.SaveModelConfigAsync(update, cts.Token);
 
@@ -2167,23 +2119,25 @@ public sealed class ConfigModelServiceTests : IDisposable
     {
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            OrchestratorReasoningEffort: "high",
-            ComposerReasoningEffort: "",
-            WorkerReasoningEffort: new Dictionary<string, string?> { ["coder"] = "low" });
+            OrchestratorReasoningEffort: ReasoningEffort.High,
+            ComposerReasoningEffort: ReasoningEffort.None,
+            WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = ReasoningEffort.Low });
 
         Assert.Contains("orchestrator reasoning→high", update.Description, StringComparison.Ordinal);
-        Assert.Contains("composer reasoning→(cleared)", update.Description, StringComparison.Ordinal);
+        Assert.Contains("composer reasoning→none", update.Description, StringComparison.Ordinal);
         Assert.Contains("worker reasoning: coder→low", update.Description, StringComparison.Ordinal);
     }
 
-    // ── Fix 1: canonicalization and whitespace-as-clear ──────────────────────
+    // ── Enum-typed API contract: no string parsing remains ───────────────────
 
     [Theory]
-    [InlineData("High", "high")]
-    [InlineData("EXTRA_HIGH", "extra_high")]
-    [InlineData("  Medium  ", "medium")]
-    [InlineData("None", "none")]
-    public async Task SaveModelConfigAsync_OrchestratorReasoning_IsCanonicalized(string input, string expected)
+    [InlineData(ReasoningEffort.None, "none")]
+    [InlineData(ReasoningEffort.Low, "low")]
+    [InlineData(ReasoningEffort.Medium, "medium")]
+    [InlineData(ReasoningEffort.High, "high")]
+    [InlineData(ReasoningEffort.ExtraHigh, "extra_high")]
+    public async Task SaveModelConfigAsync_OrchestratorReasoning_PersistsCanonicalWireForm(
+        ReasoningEffort input, string expected)
     {
         var config = CreateReasoningConfig();
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
@@ -2196,8 +2150,42 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.Equal(expected, config.Orchestrator.ReasoningEffort);
     }
 
+    // ── ParseLenient ─────────────────────────────────────────────────────────
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\t")]
+    public void ParseLenient_NullEmptyOrWhitespace_ReturnsNull(string? value)
+    {
+        Assert.Null(ConfigModelService.ParseLenient(value));
+    }
+
+    [Theory]
+    [InlineData("turbo")]
+    [InlineData("HIGHEST")]
+    [InlineData("1")]
+    public void ParseLenient_InvalidValue_ReturnsNullInsteadOfThrowing(string value)
+    {
+        Assert.Null(ConfigModelService.ParseLenient(value));
+    }
+
+    [Theory]
+    [InlineData("none", ReasoningEffort.None)]
+    [InlineData("low", ReasoningEffort.Low)]
+    [InlineData("medium", ReasoningEffort.Medium)]
+    [InlineData("High", ReasoningEffort.High)]
+    [InlineData("  EXTRA_HIGH ", ReasoningEffort.ExtraHigh)]
+    public void ParseLenient_ValidValue_ReturnsEnum(string value, ReasoningEffort expected)
+    {
+        Assert.Equal(expected, ConfigModelService.ParseLenient(value));
+    }
+
+    // ── Fix 1: every reasoning category persists in canonical wire form ──────
+
     [Fact]
-    public async Task SaveModelConfigAsync_AllReasoningCategories_AreCanonicalized()
+    public async Task SaveModelConfigAsync_AllReasoningCategories_PersistCanonicalWireForms()
     {
         var config = CreateReasoningConfig();
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
@@ -2205,11 +2193,11 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            OrchestratorReasoningEffort: "High",
-            ComposerReasoningEffort: "MEDIUM",
-            WorkerReasoningEffort: new Dictionary<string, string?> { ["coder"] = "Extra_High" },
-            WorkerPremiumReasoningEffort: new Dictionary<string, string?> { ["coder"] = "LOW" },
-            SubAgentModelReasoning: new Dictionary<string, string?> { ["sa-model"] = "None" });
+            OrchestratorReasoningEffort: ReasoningEffort.High,
+            ComposerReasoningEffort: ReasoningEffort.Medium,
+            WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = ReasoningEffort.ExtraHigh },
+            WorkerPremiumReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = ReasoningEffort.Low },
+            SubAgentModelReasoning: new Dictionary<string, ReasoningEffort?> { ["sa-model"] = ReasoningEffort.None });
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
@@ -2221,52 +2209,26 @@ public sealed class ConfigModelServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task SaveModelConfigAsync_WhitespaceOnlyReasoning_ClearsEveryCategory()
+    public async Task SaveModelConfigAsync_OuterNullReasoning_LeavesEveryCategoryUntouched()
     {
         var config = CreateReasoningConfig();
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        var update = new ModelConfigUpdate(
-            null, null, null, null, null,
-            OrchestratorReasoningEffort: "   ",
-            ComposerReasoningEffort: "\t",
-            WorkerReasoningEffort: new Dictionary<string, string?> { ["coder"] = "  " },
-            WorkerPremiumReasoningEffort: new Dictionary<string, string?> { ["coder"] = " " },
-            SubAgentModelReasoning: new Dictionary<string, string?> { ["sa-model"] = "   " });
-
-        await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
-
-        // Whitespace parses to null (unset), so it must clear rather than be stored verbatim.
-        Assert.Null(config.Orchestrator.ReasoningEffort);
-        Assert.Null(config.Composer!.ReasoningEffort);
-        Assert.Null(config.Workers["coder"].ReasoningEffort);
-        Assert.Null(config.Workers["coder"].PremiumReasoningEffort);
-        Assert.Null(config.Models!.SubAgentModels![0].ReasoningEffort);
-
-        // Nothing whitespace-ish may reach the file — it would be silently rejected later.
-        var yaml = await ReadWrittenYamlAsync();
-        Assert.DoesNotContain("reasoning_effort:", yaml, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public async Task SaveModelConfigAsync_WhitespaceOrchestratorReasoning_SendsNullToBrain()
-    {
-        var config = new HiveConfigFile
-        {
-            Orchestrator = new OrchestratorConfig { Model = "orch-model", ReasoningEffort = "high" }
-        };
-        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
-        var brain = new FakeDistributedBrain();
-        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, brain);
-
+        // Outer null (field absent) is a no-op for every category.
         await svc.SaveModelConfigAsync(
-            new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: "   "),
+            new ModelConfigUpdate(null, null, null, null, "compact-model"),
             TestContext.Current.CancellationToken);
 
-        Assert.Equal(1, brain.UpdateModelCalls);
-        Assert.Null(brain.LastReasoningEffort);
-        Assert.Null(config.Orchestrator.ReasoningEffort);
+        Assert.Equal("low", config.Orchestrator.ReasoningEffort);
+        Assert.Equal("low", config.Composer!.ReasoningEffort);
+        Assert.Equal("low", config.Workers["coder"].ReasoningEffort);
+        Assert.Equal("low", config.Workers["coder"].PremiumReasoningEffort);
+        Assert.Equal("low", config.Models!.SubAgentModels![0].ReasoningEffort);
+
+        // A no-op assignment writes nothing new — the pre-existing values survive the round trip.
+        var yaml = await ReadWrittenYamlAsync();
+        Assert.Contains("reasoning_effort: low", yaml, StringComparison.Ordinal);
     }
 
     // ── Fix 2: case-insensitive duplicate keys are rejected ──────────────────
@@ -2280,7 +2242,7 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            WorkerReasoningEffort: new Dictionary<string, string?> { ["Coder"] = "high", ["coder"] = "low" });
+            WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["Coder"] = ReasoningEffort.High, ["coder"] = ReasoningEffort.Low });
 
         var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
             svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken));
@@ -2300,7 +2262,7 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            WorkerPremiumReasoningEffort: new Dictionary<string, string?> { ["TESTER"] = "high", ["tester"] = "low" });
+            WorkerPremiumReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["TESTER"] = ReasoningEffort.High, ["tester"] = ReasoningEffort.Low });
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
             svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken));
@@ -2321,7 +2283,7 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            SubAgentModelReasoning: new Dictionary<string, string?> { ["Model-A"] = "high", ["model-a"] = "low" });
+            SubAgentModelReasoning: new Dictionary<string, ReasoningEffort?> { ["Model-A"] = ReasoningEffort.High, ["model-a"] = ReasoningEffort.Low });
 
         var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
             svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken));
@@ -2332,17 +2294,17 @@ public sealed class ConfigModelServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task SaveModelConfigAsync_DuplicateCaseKeysWithInvalidSecondValue_ThrowsInsteadOfSilentlySkipping()
+    public async Task SaveModelConfigAsync_DuplicateCaseKeysWithConflictingValues_ThrowsInsteadOfPickingOne()
     {
-        // Regression: the invalid value under the duplicate key must never be silently dropped,
-        // regardless of the order the JSON properties were inserted in.
+        // Regression: which of the two conflicting values wins must never depend on the order
+        // the JSON properties were inserted in — the whole update is rejected instead.
         var config = CreateReasoningConfig();
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            WorkerReasoningEffort: new Dictionary<string, string?> { ["coder"] = "high", ["CODER"] = "invalid" });
+            WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = ReasoningEffort.High, ["CODER"] = ReasoningEffort.Medium });
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
             svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken));
@@ -2361,7 +2323,7 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            WorkerReasoningEffort: new Dictionary<string, string?> { ["Ghost"] = "high", ["ghost"] = "bogus" });
+            WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["Ghost"] = ReasoningEffort.High, ["ghost"] = ReasoningEffort.Low });
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
@@ -2380,14 +2342,14 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         // First call enters the lock and parks inside CommitFileAsync until we release it.
         var first = svc.SaveModelConfigAsync(
-            new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: "high"),
+            new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.High),
             TestContext.Current.CancellationToken);
 
         await repo.CommitEntered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
         // Second call must block on the save lock — it cannot mutate or commit yet.
         var second = svc.SaveModelConfigAsync(
-            new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: "low"),
+            new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.Low),
             TestContext.Current.CancellationToken);
 
         var completedEarly = await Task.WhenAny(second, Task.Delay(500, TestContext.Current.CancellationToken));
@@ -2414,12 +2376,18 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         await Assert.ThrowsAsync<ArgumentException>(() => svc.SaveModelConfigAsync(
-            new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: "turbo"),
+            new ModelConfigUpdate(
+                null, null, null, null, null,
+                WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?>
+                {
+                    ["coder"] = ReasoningEffort.High,
+                    ["CODER"] = ReasoningEffort.Medium,
+                }),
             TestContext.Current.CancellationToken));
 
         // The finally block must have released the semaphore.
         await svc.SaveModelConfigAsync(
-            new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: "high"),
+            new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.High),
             TestContext.Current.CancellationToken).WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
         Assert.Equal("high", config.Orchestrator.ReasoningEffort);
@@ -2436,11 +2404,11 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            OrchestratorReasoningEffort: "High",
-            ComposerReasoningEffort: "medium",
-            WorkerReasoningEffort: new Dictionary<string, string?> { ["coder"] = "low" },
-            WorkerPremiumReasoningEffort: new Dictionary<string, string?> { ["coder"] = "extra_high" },
-            SubAgentModelReasoning: new Dictionary<string, string?> { ["sa-model"] = "none" });
+            OrchestratorReasoningEffort: ReasoningEffort.High,
+            ComposerReasoningEffort: ReasoningEffort.Medium,
+            WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = ReasoningEffort.Low },
+            WorkerPremiumReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = ReasoningEffort.ExtraHigh },
+            SubAgentModelReasoning: new Dictionary<string, ReasoningEffort?> { ["sa-model"] = ReasoningEffort.None });
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
@@ -2464,11 +2432,11 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            OrchestratorReasoningEffort: "High",
-            ComposerReasoningEffort: "MEDIUM",
-            WorkerReasoningEffort: new Dictionary<string, string?> { ["coder"] = "Low" },
-            WorkerPremiumReasoningEffort: new Dictionary<string, string?> { ["coder"] = "Extra_High" },
-            SubAgentModelReasoning: new Dictionary<string, string?> { ["sa-model"] = "None" });
+            OrchestratorReasoningEffort: ReasoningEffort.High,
+            ComposerReasoningEffort: ReasoningEffort.Medium,
+            WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = ReasoningEffort.Low },
+            WorkerPremiumReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = ReasoningEffort.ExtraHigh },
+            SubAgentModelReasoning: new Dictionary<string, ReasoningEffort?> { ["sa-model"] = ReasoningEffort.None });
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
@@ -2485,31 +2453,28 @@ public sealed class ConfigModelServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task SaveModelConfigAsync_ClearedReasoningValues_AreAbsentFromPersistedYaml()
+    public async Task SaveModelConfigAsync_NullReasoningValues_LeavePersistedYamlUntouched()
     {
         var config = CreateReasoningConfig();
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
+        // Null carries no level: neither the outer field nor a present-key-null entry may
+        // change what is persisted.
         var update = new ModelConfigUpdate(
             null, null, null, null, null,
-            OrchestratorReasoningEffort: "",
-            ComposerReasoningEffort: "   ",
-            WorkerReasoningEffort: new Dictionary<string, string?> { ["coder"] = null },
-            WorkerPremiumReasoningEffort: new Dictionary<string, string?> { ["coder"] = "" },
-            SubAgentModelReasoning: new Dictionary<string, string?> { ["sa-model"] = "  " });
+            WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = null },
+            WorkerPremiumReasoningEffort: new Dictionary<string, ReasoningEffort?> { ["coder"] = null },
+            SubAgentModelReasoning: new Dictionary<string, ReasoningEffort?> { ["sa-model"] = null });
 
         await svc.SaveModelConfigAsync(update, TestContext.Current.CancellationToken);
 
-        var yaml = await ReadWrittenYamlAsync();
-        Assert.DoesNotContain("reasoning_effort:", yaml, StringComparison.Ordinal);
-
-        var reloaded = ConfigRepoManager.ParseConfig(yaml);
-        Assert.Null(reloaded.Orchestrator.ReasoningEffort);
-        Assert.Null(reloaded.Composer?.ReasoningEffort);
-        Assert.Null(reloaded.Workers["coder"].ReasoningEffort);
-        Assert.Null(reloaded.Workers["coder"].PremiumReasoningEffort);
-        Assert.Null(reloaded.Models!.SubAgentModels![0].ReasoningEffort);
+        var reloaded = ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync());
+        Assert.Equal("low", reloaded.Orchestrator.ReasoningEffort);
+        Assert.Equal("low", reloaded.Composer!.ReasoningEffort);
+        Assert.Equal("low", reloaded.Workers["coder"].ReasoningEffort);
+        Assert.Equal("low", reloaded.Workers["coder"].PremiumReasoningEffort);
+        Assert.Equal("low", reloaded.Models!.SubAgentModels![0].ReasoningEffort);
     }
 }
 
@@ -2791,23 +2756,72 @@ public sealed class ConfigModelsPatchCancellationTests : IDisposable
     }
 
     [Fact]
-    public async Task PatchModels_InvalidReasoningValue_Returns400WithErrorBody()
+    public async Task PatchModels_InvalidReasoningValue_Returns400()
     {
-        // Goal contract: ArgumentException from SaveModelConfigAsync → 400 with {"error":"..."}.
+        // Goal contract: reasoning effort is a ReasoningEffort? enum, so an unknown wire value
+        // is rejected by the global JSON enum converter and produces a 400 — never a 500.
         var response = await _client.PatchAsJsonAsync(
             "/api/config/models",
             new { orchestratorReasoningEffort = "turbo" },
             TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.NotEqual(HttpStatusCode.InternalServerError, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PatchModels_IntegerReasoningValue_Returns400()
+    {
+        // allowIntegerValues: false — a numeric level can never be silently coerced.
+        var response = await _client.PatchAsJsonAsync(
+            "/api/config/models",
+            new { orchestratorReasoningEffort = 3 },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task GetModels_ProjectsReasoningEffortAsSnakeCaseEnum()
+    {
+        await _client.PatchAsJsonAsync(
+            "/api/config/models",
+            new { orchestratorReasoningEffort = "extra_high" },
+            TestContext.Current.CancellationToken);
+
+        var response = await _client.GetAsync("/api/config/models", TestContext.Current.CancellationToken);
+        response.EnsureSuccessStatusCode();
 
         using var doc = await System.Text.Json.JsonDocument.ParseAsync(
             await response.Content.ReadAsStreamAsync(TestContext.Current.CancellationToken),
             cancellationToken: TestContext.Current.CancellationToken);
-        Assert.True(doc.RootElement.TryGetProperty("error", out var errorProp),
-            "400 response must carry an 'error' property");
-        Assert.Contains("turbo", errorProp.GetString(), StringComparison.Ordinal);
-        Assert.Contains("Invalid reasoning effort", errorProp.GetString(), StringComparison.Ordinal);
+
+        Assert.Equal("extra_high",
+            doc.RootElement.GetProperty("orchestratorReasoningEffort").GetString());
+    }
+
+    [Fact]
+    public async Task GetModels_ExposesEveryReasoningDimension()
+    {
+        var response = await _client.GetAsync("/api/config/models", TestContext.Current.CancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        using var doc = await System.Text.Json.JsonDocument.ParseAsync(
+            await response.Content.ReadAsStreamAsync(TestContext.Current.CancellationToken),
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        foreach (var field in new[]
+                 {
+                     "orchestratorReasoningEffort",
+                     "composerReasoningEffort",
+                     "workerReasoningEffort",
+                     "workerPremiumReasoningEffort",
+                     "subAgentModelReasoning",
+                 })
+        {
+            Assert.True(doc.RootElement.TryGetProperty(field, out _),
+                $"GET /api/config/models must expose '{field}'");
+        }
     }
 
     [Fact]

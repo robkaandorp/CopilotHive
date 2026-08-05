@@ -191,7 +191,7 @@ public sealed class ComposerMultiModelTests : IDisposable
     [Fact]
     public async Task SwitchModelAsync_ToValidModel_Succeeds()
     {
-        await _composer.SwitchModelAsync("claude-opus");
+        await _composer.SwitchModelAsync("claude-opus", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
 
         // No exception means success - verify by checking stats
         var stats = _composer.GetStats();
@@ -202,7 +202,7 @@ public sealed class ComposerMultiModelTests : IDisposable
     public async Task SwitchModelAsync_ToInvalidModel_ThrowsArgumentException()
     {
         var exception = await Assert.ThrowsAsync<ArgumentException>(
-            () => _composer.SwitchModelAsync("unknown-model"));
+            () => _composer.SwitchModelAsync("unknown-model", ReasoningEffort.Medium, TestContext.Current.CancellationToken));
 
         Assert.Contains("unknown-model", exception.Message);
         Assert.Contains("Available models:", exception.Message);
@@ -212,7 +212,7 @@ public sealed class ComposerMultiModelTests : IDisposable
     public async Task SwitchModelAsync_IsCaseInsensitive()
     {
         // Should not throw - model matching is case-insensitive
-        await _composer.SwitchModelAsync("CLAUDE-OPUS");
+        await _composer.SwitchModelAsync("CLAUDE-OPUS", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
 
         var stats = _composer.GetStats();
         Assert.Equal("CLAUDE-OPUS", stats?.Model);
@@ -225,7 +225,7 @@ public sealed class ComposerMultiModelTests : IDisposable
         await _composer.ConnectAsync(TestContext.Current.CancellationToken);
         
         // Switch model
-        await _composer.SwitchModelAsync("claude-opus");
+        await _composer.SwitchModelAsync("claude-opus", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
 
         // Session should still exist (verified via stats)
         var stats = _composer.GetStats();
@@ -281,7 +281,7 @@ public sealed class ComposerMultiModelTests : IDisposable
     }
 
     [Fact]
-    public async Task SwitchModelAsync_RetainsConfiguredReasoningEffort()
+    public async Task SwitchModelAsync_AppliesSuppliedReasoningEffort_IgnoringColonSegment()
     {
         var composer = new Composer(
             "claude-sonnet-4",
@@ -295,15 +295,17 @@ public sealed class ComposerMultiModelTests : IDisposable
         await using (composer)
         {
             await composer.ConnectAsync(TestContext.Current.CancellationToken);
-            await composer.SwitchModelAsync("claude-opus:low");
+            await composer.SwitchModelAsync("claude-opus:low", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
 
-            // The ':low' colon segment of the new model name must not affect the configured effort.
-            Assert.Equal(ReasoningEffort.High, AgentServiceOf(composer).ReasoningEffort);
+            // The ':low' colon segment of the new model name is irrelevant — only the
+            // explicitly supplied effort is applied.
+            Assert.Equal(ReasoningEffort.Medium, AgentServiceOf(composer).ReasoningEffort);
+            Assert.Equal(ReasoningEffort.Medium, composer.ReasoningEffort);
         }
     }
 
     [Fact]
-    public async Task SwitchModelAsync_WithoutConfiguredReasoningEffort_StaysUnset()
+    public async Task SwitchModelAsync_FromUnsetReasoning_AdoptsSuppliedEffort()
     {
         var composer = new Composer(
             "claude-sonnet-4:high",
@@ -318,10 +320,12 @@ public sealed class ComposerMultiModelTests : IDisposable
             await composer.ConnectAsync(TestContext.Current.CancellationToken);
             // No configured value → unset, despite the ':high' segment in the model name.
             Assert.Null(AgentServiceOf(composer).ReasoningEffort);
+            Assert.Null(composer.ReasoningEffort);
 
-            await composer.SwitchModelAsync("claude-opus");
+            await composer.SwitchModelAsync("claude-opus", ReasoningEffort.None, TestContext.Current.CancellationToken);
 
-            Assert.Null(AgentServiceOf(composer).ReasoningEffort);
+            Assert.Equal(ReasoningEffort.None, AgentServiceOf(composer).ReasoningEffort);
+            Assert.Equal(ReasoningEffort.None, composer.ReasoningEffort);
         }
     }
 
@@ -352,14 +356,14 @@ public sealed class ComposerMultiModelTests : IDisposable
             chatClientFactory: _ => new Mock<IChatClient>().Object);
 
         // Act 1: "gpt-4" is not in the global list → should throw
-        var ex = await Assert.ThrowsAsync<ArgumentException>(() => composer.SwitchModelAsync("gpt-4"));
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() => composer.SwitchModelAsync("gpt-4", ReasoningEffort.Medium, TestContext.Current.CancellationToken));
         Assert.Contains("gpt-4", ex.Message);
 
         // Act 2: mutate the global config to add "gpt-4"
         liveConfig.Models!.AvailableModels!.Add(new ModelEntry { Name = "gpt-4" });
 
         // Act 3: "gpt-4" is now in the global list → should succeed
-        await composer.SwitchModelAsync("gpt-4");
+        await composer.SwitchModelAsync("gpt-4", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
         var stats = composer.GetStats();
         Assert.Equal("gpt-4", stats?.Model);
     }
@@ -401,7 +405,7 @@ public sealed class ComposerMultiModelTests : IDisposable
         Assert.Equal(64000, composer.GetStats()?.MaxContextTokens ?? 64000);
 
         // Act: switch to the model whose name contains a colon segment
-        await composer.SwitchModelAsync("gpt-4:medium");
+        await composer.SwitchModelAsync("gpt-4:medium", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
 
         // Assert: the context window is 32768 because the lookup matched "gpt-4:medium" verbatim.
         var stats = composer.GetStats();
@@ -443,7 +447,7 @@ public sealed class ComposerMultiModelTests : IDisposable
             chatClientFactory: _ => new Mock<IChatClient>().Object);
 
         // Act: switch to the composite model string
-        await composer.SwitchModelAsync("gpt-4:medium");
+        await composer.SwitchModelAsync("gpt-4:medium", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
 
         // Assert: the max context tokens should be unchanged at 64000 because
         // the ModelEntry has no ContextWindow (lookup returns null)
@@ -484,7 +488,7 @@ public sealed class ComposerMultiModelTests : IDisposable
             chatClientFactory: _ => new Mock<IChatClient>().Object);
 
         // Act: switch to the plain model name (no suffix)
-        await composer.SwitchModelAsync("gpt-4");
+        await composer.SwitchModelAsync("gpt-4", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
 
         // Assert: the context window should have been updated to 32768
         var stats = composer.GetStats();
@@ -524,13 +528,13 @@ public sealed class ComposerMultiModelTests : IDisposable
             chatClientFactory: _ => new Mock<IChatClient>().Object);
 
         // Act 1: switch to gpt-4:medium (smaller context window)
-        await composer.SwitchModelAsync("gpt-4:medium");
+        await composer.SwitchModelAsync("gpt-4:medium", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
         var stats1 = composer.GetStats();
         Assert.NotNull(stats1);
         Assert.Equal(32768, stats1!.MaxContextTokens);
 
         // Act 2: switch back to claude-sonnet-4:high (larger context window)
-        await composer.SwitchModelAsync("claude-sonnet-4:high");
+        await composer.SwitchModelAsync("claude-sonnet-4:high", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
         var stats2 = composer.GetStats();
         Assert.NotNull(stats2);
         Assert.Equal(100000, stats2!.MaxContextTokens);
@@ -571,7 +575,7 @@ public sealed class ComposerMultiModelTests : IDisposable
             chatClientFactory: _ => new Mock<IChatClient>().Object);
 
         // Act: switch to the provider-prefixed model name
-        await composer.SwitchModelAsync("copilot/claude-sonnet-4.6:high");
+        await composer.SwitchModelAsync("copilot/claude-sonnet-4.6:high", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
 
         // Assert: the context window is 100000 because the lookup matched the full
         // "copilot/claude-sonnet-4.6:high" name verbatim.
@@ -613,7 +617,7 @@ public sealed class ComposerMultiModelTests : IDisposable
             chatClientFactory: _ => new Mock<IChatClient>().Object);
 
         // Act: switch to the Ollama-style tagged model
-        await composer.SwitchModelAsync("ollama-cloud/gpt-oss:120b");
+        await composer.SwitchModelAsync("ollama-cloud/gpt-oss:120b", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
 
         // Assert: the context window is 200000 because the full tagged name matched verbatim.
         var stats = composer.GetStats();
@@ -655,7 +659,7 @@ public sealed class ComposerMultiModelTests : IDisposable
             chatClientFactory: _ => new Mock<IChatClient>().Object);
 
         // Act: switch to the provider-prefixed model name
-        await composer.SwitchModelAsync("copilot/claude-sonnet-4.6:high");
+        await composer.SwitchModelAsync("copilot/claude-sonnet-4.6:high", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
 
         // Assert: the max context tokens should be unchanged at 64000 because
         // the ModelEntry has no ContextWindow (lookup returns null)
@@ -696,6 +700,9 @@ public sealed class ComposerHubTests : IAsyncLifetime
         Environment.SetEnvironmentVariable("ASPNETCORE_URLS", "http://127.0.0.1:0");
         var builder = WebApplication.CreateBuilder();
         builder.Services.AddSingleton<Composer>(_composer);
+        // Wire the production global JSON options so enum payloads (reasoningEffort) are
+        // serialized exactly as the real host does, rather than with framework defaults.
+        Program.AddHiveJsonOptions(builder.Services);
         _app = builder.Build();
         _app.MapComposerEndpoints(_composer, config: null);
         await _app.StartAsync(TestContext.Current.CancellationToken);
@@ -741,12 +748,46 @@ public sealed class ComposerHubTests : IAsyncLifetime
         Assert.Equal("application/json", response.Content.Headers.ContentType?.MediaType);
     }
 
+    [Fact]
+    public async Task GetModels_IncludesReasoningEffortField()
+    {
+        var response = await _client.GetAsync("/api/composer/models", TestContext.Current.CancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        var json = JsonDocument.Parse(
+            await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken));
+
+        Assert.True(json.RootElement.TryGetProperty("reasoningEffort", out var effort),
+            "GET /api/composer/models must expose the current reasoning effort");
+        // No configured effort on this fixture → null, which the client maps to None.
+        Assert.Equal(JsonValueKind.Null, effort.ValueKind);
+    }
+
+    [Fact]
+    public async Task GetModels_SerializesReasoningEffortAsSnakeCase()
+    {
+        // Switch to ExtraHigh first, then read it back through the GET projection.
+        var switchResponse = await _client.PostAsync(
+            "/api/composer/models/switch?model=claude-opus&reasoning=extra_high",
+            null, TestContext.Current.CancellationToken);
+        switchResponse.EnsureSuccessStatusCode();
+
+        var response = await _client.GetAsync("/api/composer/models", TestContext.Current.CancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        var json = JsonDocument.Parse(
+            await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken));
+
+        // The global converter renders the enum snake_case, never "ExtraHigh".
+        Assert.Equal("extra_high", json.RootElement.GetProperty("reasoningEffort").GetString());
+    }
+
     // ── POST /api/composer/models/switch ──
 
     [Fact]
     public async Task SwitchModel_ToValidModel_ReturnsOk()
     {
-        var response = await _client.PostAsync("/api/composer/models/switch?model=claude-opus", null, TestContext.Current.CancellationToken);
+        var response = await _client.PostAsync("/api/composer/models/switch?model=claude-opus&reasoning=medium", null, TestContext.Current.CancellationToken);
         response.EnsureSuccessStatusCode();
 
         var json = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
@@ -755,9 +796,69 @@ public sealed class ComposerHubTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task SwitchModel_MissingReasoning_ReturnsBadRequest()
+    {
+        // Both query parameters are required — a switch always carries an explicit effort.
+        var response = await _client.PostAsync(
+            "/api/composer/models/switch?model=claude-opus", null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+
+        var doc = JsonDocument.Parse(
+            await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken));
+        Assert.Contains("reasoning", doc.RootElement.GetProperty("error").GetString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task SwitchModel_MissingModel_ReturnsBadRequest()
+    {
+        var response = await _client.PostAsync(
+            "/api/composer/models/switch?reasoning=medium", null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+
+        var doc = JsonDocument.Parse(
+            await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken));
+        Assert.Contains("model", doc.RootElement.GetProperty("error").GetString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("turbo")]
+    [InlineData("ExtraHigh")]
+    [InlineData("3")]
+    public async Task SwitchModel_InvalidReasoning_ReturnsBadRequest(string reasoning)
+    {
+        var response = await _client.PostAsync(
+            $"/api/composer/models/switch?model=claude-opus&reasoning={reasoning}",
+            null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.NotEqual(HttpStatusCode.InternalServerError, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData("none")]
+    [InlineData("low")]
+    [InlineData("medium")]
+    [InlineData("high")]
+    [InlineData("extra_high")]
+    public async Task SwitchModel_EveryValidReasoning_ReturnsOkAndEchoesEffort(string reasoning)
+    {
+        var response = await _client.PostAsync(
+            $"/api/composer/models/switch?model=claude-opus&reasoning={reasoning}",
+            null, TestContext.Current.CancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        var doc = JsonDocument.Parse(
+            await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken));
+        Assert.Equal("claude-opus", doc.RootElement.GetProperty("model").GetString());
+        Assert.Equal(reasoning, doc.RootElement.GetProperty("reasoningEffort").GetString());
+    }
+
+    [Fact]
     public async Task SwitchModel_ToInvalidModel_ReturnsBadRequest()
     {
-        var response = await _client.PostAsync("/api/composer/models/switch?model=unknown-model", null, TestContext.Current.CancellationToken);
+        var response = await _client.PostAsync("/api/composer/models/switch?model=unknown-model&reasoning=medium", null, TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
 
@@ -770,7 +871,7 @@ public sealed class ComposerHubTests : IAsyncLifetime
     [Fact]
     public async Task SwitchModel_IsCaseInsensitive()
     {
-        var response = await _client.PostAsync("/api/composer/models/switch?model=CLAUDE-OPUS", null, TestContext.Current.CancellationToken);
+        var response = await _client.PostAsync("/api/composer/models/switch?model=CLAUDE-OPUS&reasoning=medium", null, TestContext.Current.CancellationToken);
         response.EnsureSuccessStatusCode();
 
         var json = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
@@ -782,10 +883,10 @@ public sealed class ComposerHubTests : IAsyncLifetime
     public async Task SwitchModel_PreservesModelAfterSwitch()
     {
         // Switch to claude-opus
-        await _client.PostAsync("/api/composer/models/switch?model=claude-opus", null, TestContext.Current.CancellationToken);
+        await _client.PostAsync("/api/composer/models/switch?model=claude-opus&reasoning=medium", null, TestContext.Current.CancellationToken);
 
         // Verify it's still switched after subsequent request
-        var response = await _client.PostAsync("/api/composer/models/switch?model=claude-sonnet-4", null, TestContext.Current.CancellationToken);
+        var response = await _client.PostAsync("/api/composer/models/switch?model=claude-sonnet-4&reasoning=medium", null, TestContext.Current.CancellationToken);
         response.EnsureSuccessStatusCode();
 
         var json = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
@@ -884,7 +985,7 @@ public sealed class ComposerHubTests : IAsyncLifetime
         await fixture.InitializeAsync();
 
         // Act — switch to a model that IS in the global list
-        var response = await fixture.Client.PostAsync("/api/composer/models/switch?model=gpt-4", null, TestContext.Current.CancellationToken);
+        var response = await fixture.Client.PostAsync("/api/composer/models/switch?model=gpt-4&reasoning=medium", null, TestContext.Current.CancellationToken);
         response.EnsureSuccessStatusCode();
 
         var json = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
@@ -915,7 +1016,7 @@ public sealed class ComposerHubTests : IAsyncLifetime
 
         // Act — try to switch to a model that is NOT in the global list, even though
         // it IS in composer.AvailableModels
-        var response = await fixture.Client.PostAsync("/api/composer/models/switch?model=claude-sonnet-4", null, TestContext.Current.CancellationToken);
+        var response = await fixture.Client.PostAsync("/api/composer/models/switch?model=claude-sonnet-4&reasoning=medium", null, TestContext.Current.CancellationToken);
 
         // Assert — should fail because "claude-sonnet-4" is not in the global model list
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
@@ -993,14 +1094,14 @@ public sealed class ComposerHubTests : IAsyncLifetime
         await fixture.InitializeAsync();
 
         // Act 1: "gpt-4" is NOT in global list → should be rejected
-        var response1 = await fixture.Client.PostAsync("/api/composer/models/switch?model=gpt-4", null, TestContext.Current.CancellationToken);
+        var response1 = await fixture.Client.PostAsync("/api/composer/models/switch?model=gpt-4&reasoning=medium", null, TestContext.Current.CancellationToken);
         Assert.Equal(HttpStatusCode.BadRequest, response1.StatusCode);
 
         // Act 2: mutate config to add "gpt-4" to the global list
         globalConfig.Models!.AvailableModels!.Add(new ModelEntry { Name = "gpt-4" });
 
         // Act 3: "gpt-4" IS now in the global list → should succeed
-        var response2 = await fixture.Client.PostAsync("/api/composer/models/switch?model=gpt-4", null, TestContext.Current.CancellationToken);
+        var response2 = await fixture.Client.PostAsync("/api/composer/models/switch?model=gpt-4&reasoning=medium", null, TestContext.Current.CancellationToken);
         response2.EnsureSuccessStatusCode();
         var json = await response2.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
         var doc = JsonDocument.Parse(json);
@@ -1247,7 +1348,7 @@ public sealed class ComposerHubCompositeModelTests
         await fixture.InitializeAsync();
 
         var response = await fixture.Client.PostAsync(
-            "/api/composer/models/switch?model=gpt-4", null, TestContext.Current.CancellationToken);
+            "/api/composer/models/switch?model=gpt-4&reasoning=medium", null, TestContext.Current.CancellationToken);
         response.EnsureSuccessStatusCode();
 
         var json = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
@@ -1279,7 +1380,7 @@ public sealed class ComposerHubCompositeModelTests
         await fixture.InitializeAsync();
 
         var response = await fixture.Client.PostAsync(
-            "/api/composer/models/switch?model=gpt-4:medium", null, TestContext.Current.CancellationToken);
+            "/api/composer/models/switch?model=gpt-4:medium&reasoning=medium", null, TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
 
@@ -1304,7 +1405,7 @@ public sealed class ComposerHubCompositeModelTests
         await fixture.InitializeAsync();
 
         var response = await fixture.Client.PostAsync(
-            "/api/composer/models/switch?model=gpt-4:high", null, TestContext.Current.CancellationToken);
+            "/api/composer/models/switch?model=gpt-4:high&reasoning=medium", null, TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
 
@@ -1334,7 +1435,7 @@ public sealed class ComposerHubCompositeModelTests
         await fixture.InitializeAsync();
 
         var response = await fixture.Client.PostAsync(
-            "/api/composer/models/switch?model=gpt-4", null, TestContext.Current.CancellationToken);
+            "/api/composer/models/switch?model=gpt-4&reasoning=medium", null, TestContext.Current.CancellationToken);
         response.EnsureSuccessStatusCode();
 
         var json = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
@@ -1362,7 +1463,7 @@ public sealed class ComposerHubCompositeModelTests
         await fixture.InitializeAsync();
 
         var response = await fixture.Client.PostAsync(
-            "/api/composer/models/switch?model=GPT-4", null, TestContext.Current.CancellationToken);
+            "/api/composer/models/switch?model=GPT-4&reasoning=medium", null, TestContext.Current.CancellationToken);
         response.EnsureSuccessStatusCode();
 
         await fixture.DisposeAsync();
@@ -1446,6 +1547,9 @@ public sealed class ComposerHubWithConfigFixture : IAsyncDisposable
         Environment.SetEnvironmentVariable("ASPNETCORE_URLS", "http://127.0.0.1:0");
         var builder = WebApplication.CreateBuilder();
         builder.Services.AddSingleton<Composer>(_composer);
+        // Wire the production global JSON options so enum payloads (reasoningEffort) are
+        // serialized exactly as the real host does, rather than with framework defaults.
+        Program.AddHiveJsonOptions(builder.Services);
         _app = builder.Build();
         _app.MapComposerEndpoints(_composer, Config);
         await _app.StartAsync(TestContext.Current.CancellationToken);

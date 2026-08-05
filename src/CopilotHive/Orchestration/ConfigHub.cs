@@ -2,6 +2,7 @@ using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Services;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.AI;
 
 namespace CopilotHive.Orchestration;
 
@@ -21,6 +22,10 @@ public static class ConfigHub
             if (config is null)
                 return Results.NotFound(new { error = "Config repo not configured." });
 
+            // Reasoning effort is stored as string? in the YAML-bound config classes but is
+            // projected here as the ReasoningEffort enum. The global JsonStringEnumConverter
+            // renders it snake_case (e.g. "extra_high"). A value a dynamic reload left
+            // unrecognised degrades to null rather than failing the whole response.
             return Results.Ok(new
             {
                 orchestrator   = config.Orchestrator.Model,
@@ -29,17 +34,35 @@ public static class ConfigHub
                 workers        = config.Workers.ToDictionary(
                     kv => kv.Key,
                     kv => new { model = kv.Value.Model, premiumModel = kv.Value.PremiumModel }),
-                orchestratorReasoningEffort = config.Orchestrator.ReasoningEffort,
-                composerReasoningEffort     = config.Composer?.ReasoningEffort,
+                orchestratorReasoningEffort = ConfigModelService.ParseLenient(config.Orchestrator.ReasoningEffort),
+                composerReasoningEffort     = ConfigModelService.ParseLenient(config.Composer?.ReasoningEffort),
                 workerReasoningEffort       = config.Workers.ToDictionary(
                     kv => kv.Key,
-                    kv => kv.Value.ReasoningEffort),
+                    kv => ConfigModelService.ParseLenient(kv.Value.ReasoningEffort)),
                 workerPremiumReasoningEffort = config.Workers.ToDictionary(
                     kv => kv.Key,
-                    kv => kv.Value.PremiumReasoningEffort),
+                    kv => ConfigModelService.ParseLenient(kv.Value.PremiumReasoningEffort)),
+                subAgentModelReasoning = config.Models?.SubAgentModels?
+                    .Where(m => !string.IsNullOrEmpty(m.Name))
+                    .GroupBy(m => m.Name, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(
+                        g => g.Key,
+                        g => ConfigModelService.ParseLenient(g.First().ReasoningEffort)),
                 availableModels = config.Models?.AvailableModels?
                     .Select(m => new { m.Name, m.ContextWindow, m.Description, m.SupportsVision }),
-                subAgentModels = config.Models?.SubAgentModels,
+                // Projected entry-by-entry rather than returned as raw ModelEntry objects:
+                // ModelEntry.ReasoningEffort is deliberately string? at the YAML boundary, so
+                // serializing the entity directly would leak a raw string (and an unrecognised
+                // stored value such as "turbo" verbatim) into an otherwise enum-typed response.
+                subAgentModels = config.Models?.SubAgentModels?
+                    .Select(m => new
+                    {
+                        m.Name,
+                        m.ContextWindow,
+                        reasoningEffort = ConfigModelService.ParseLenient(m.ReasoningEffort),
+                        m.Description,
+                        m.SupportsVision
+                    }),
             });
         });
 
@@ -78,7 +101,7 @@ public static class ConfigHub
                 return Results.Problem("Config service is not configured.");
             try
             {
-                await svc.AddAvailableModelAsync(req.Name, req.ContextWindow, null, req.Description, req.SupportsVision);
+                await svc.AddAvailableModelAsync(req.Name, req.ContextWindow, req.Description, req.SupportsVision);
                 return Results.Ok(new { saved = true });
             }
             catch (InvalidOperationException ex)
@@ -95,7 +118,7 @@ public static class ConfigHub
             name = Uri.UnescapeDataString(name);
             try
             {
-                await svc.UpdateAvailableModelAsync(name, req.ContextWindow, null, req.Description, req.SupportsVision);
+                await svc.UpdateAvailableModelAsync(name, req.ContextWindow, req.Description, req.SupportsVision);
                 return Results.Ok(new { saved = true });
             }
             catch (InvalidOperationException ex)
@@ -123,12 +146,6 @@ public static class ConfigHub
             {
                 await svc.AddSubAgentModelAsync(req.Name, req.ContextWindow, req.ReasoningEffort, req.Description, req.SupportsVision);
                 return Results.Ok(new { saved = true });
-            }
-            catch (ArgumentException ex)
-            {
-                // Invalid client input (e.g. an unknown reasoning effort like "turbo") — 400,
-                // never an unhandled 500.
-                return Results.BadRequest(new { error = ex.Message });
             }
             catch (InvalidOperationException ex)
             {
@@ -331,7 +348,11 @@ public sealed record AvailableModelRequest(string Name, int? ContextWindow, stri
 /// </summary>
 /// <param name="Name">Model name (used for add; ignored for update where the route name is authoritative).</param>
 /// <param name="ContextWindow">Optional context window in tokens.</param>
-/// <param name="ReasoningEffort">Optional default reasoning effort.</param>
+/// <param name="ReasoningEffort">
+/// Optional default reasoning effort. Wire values are snake_case (<c>none</c>, <c>low</c>,
+/// <c>medium</c>, <c>high</c>, <c>extra_high</c>); an unknown value is rejected with a 400 by
+/// the global JSON enum converter.
+/// </param>
 /// <param name="Description">Optional human-readable description.</param>
 /// <param name="SupportsVision">Informational vision flag: <c>true</c>, <c>false</c>, or <c>null</c> for unset (inherit).</param>
-public sealed record SubAgentModelRequest(string Name, int? ContextWindow, string? ReasoningEffort, string? Description = null, bool? SupportsVision = null);
+public sealed record SubAgentModelRequest(string Name, int? ContextWindow, ReasoningEffort? ReasoningEffort, string? Description = null, bool? SupportsVision = null);

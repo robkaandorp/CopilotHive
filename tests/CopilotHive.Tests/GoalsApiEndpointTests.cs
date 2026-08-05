@@ -1246,13 +1246,15 @@ public class GoalsApiEndpointTests
     /// <c>reviewStatus</c> field. There is no Blazor component test host in this project,
     /// so this verifies the underlying data contract: after PATCHing the review status to
     /// each non-None value, GET <c>/api/goals/{id}</c> returns the matching value that the
-    /// badge would render.
+    /// badge would render. <c>ReviewStatus</c> declares no type-level converter, so the global
+    /// <c>JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower)</c> renders it snake_case.
     /// </summary>
     [Theory]
-    [InlineData("Pending")]
-    [InlineData("Approved")]
-    [InlineData("NeedsChanges")]
-    public async Task GetGoalById_AfterPatchReviewStatus_ReturnsUpdatedReviewStatus(string reviewStatus)
+    [InlineData("Pending", "pending")]
+    [InlineData("Approved", "approved")]
+    [InlineData("NeedsChanges", "needs_changes")]
+    public async Task GetGoalById_AfterPatchReviewStatus_ReturnsUpdatedReviewStatus(
+        string reviewStatus, string expectedJson)
     {
         var id = UniqueId();
         await _client.PostAsync("/api/goals", GoalJson(id), TestContext.Current.CancellationToken);
@@ -1277,8 +1279,8 @@ public class GoalsApiEndpointTests
         var expected = Enum.Parse<ReviewStatus>(reviewStatus);
         var matches = reviewStatusElement.ValueKind == JsonValueKind.Number
             ? reviewStatusElement.GetInt32() == (int)expected
-            : string.Equals(reviewStatusElement.GetString(), reviewStatus, StringComparison.OrdinalIgnoreCase);
-        Assert.True(matches, $"Expected reviewStatus to be {reviewStatus} but got: {reviewStatusElement}");
+            : string.Equals(reviewStatusElement.GetString(), expectedJson, StringComparison.Ordinal);
+        Assert.True(matches, $"Expected reviewStatus to be {expectedJson} but got: {reviewStatusElement}");
     }
 
     // ── POST /api/goals/{id}/review ──────────────────────────────────────

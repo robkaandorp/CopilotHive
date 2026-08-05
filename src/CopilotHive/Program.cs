@@ -17,6 +17,8 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.EntityFrameworkCore;
 
 using System.Reflection;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace CopilotHive;
 
@@ -25,6 +27,59 @@ namespace CopilotHive;
 /// </summary>
 public sealed class Program
 {
+    /// <summary>
+    /// The global enum converter applied to every minimal-API payload: enums serialize as
+    /// snake_case (<c>ReasoningEffort.ExtraHigh</c> → <c>"extra_high"</c>) and integer wire values
+    /// are rejected, so an unknown level produces a 400 instead of a silently coerced enum.
+    /// <para>
+    /// System.Text.Json ranks converters in <see cref="JsonSerializerOptions.Converters"/> ABOVE a
+    /// type-level <c>[JsonConverter]</c> attribute, so a plain
+    /// <c>JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower, allowIntegerValues: false)</c>
+    /// would silently rename enums that deliberately declare their own converter
+    /// (<c>LlmSessionType</c>, <c>ModelTier</c>, <c>TaskVerdict</c>, <c>ReviewVerdict</c> — all
+    /// PascalCase on the wire). This subclass therefore declines those types so their own
+    /// converter keeps winning.
+    /// </para>
+    /// </summary>
+    internal sealed class GlobalStringEnumConverter : JsonConverterFactory
+    {
+        private readonly JsonStringEnumConverter _inner =
+            new(JsonNamingPolicy.SnakeCaseLower, allowIntegerValues: false);
+
+        /// <inheritdoc />
+        public override bool CanConvert(Type typeToConvert)
+            => _inner.CanConvert(typeToConvert) && !DeclaresOwnConverter(typeToConvert);
+
+        /// <inheritdoc />
+        public override JsonConverter CreateConverter(Type typeToConvert, JsonSerializerOptions options)
+            => _inner.CreateConverter(typeToConvert, options);
+
+        /// <summary>
+        /// Whether the enum type carries its own type-level <c>[JsonConverter]</c> attribute,
+        /// which is the authority for its wire representation.
+        /// </summary>
+        internal static bool DeclaresOwnConverter(Type typeToConvert)
+        {
+            var underlying = Nullable.GetUnderlyingType(typeToConvert) ?? typeToConvert;
+            return underlying.GetCustomAttribute<JsonConverterAttribute>(inherit: false) is not null;
+        }
+    }
+
+    /// <summary>
+    /// Registers the hive's global HTTP JSON options. Kept as a named helper (rather than an
+    /// inline lambda at the single call site) so hosts that build their own
+    /// <see cref="WebApplication"/> — notably endpoint tests — wire the exact same converter
+    /// instead of re-declaring it and drifting from production behaviour.
+    /// </summary>
+    /// <param name="services">The service collection to configure.</param>
+    internal static void AddHiveJsonOptions(IServiceCollection services)
+    {
+        services.ConfigureHttpJsonOptions(options =>
+        {
+            options.SerializerOptions.Converters.Add(new GlobalStringEnumConverter());
+        });
+    }
+
     private static async Task<int> Main(string[] args)
     {
         // ── Server mode (only mode) ──────────────────────────────────────────────────
@@ -51,6 +106,14 @@ public sealed class Program
             builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning);
             builder.Logging.AddFilter("Microsoft.AspNetCore.Routing.EndpointMiddleware", LogLevel.Warning);
             builder.Logging.AddFilter("Microsoft.AspNetCore.Http.Result", LogLevel.Warning);
+
+            // Global JSON serialization for minimal-API endpoints: every enum that does NOT
+            // carry its own type-level [JsonConverter] serializes as snake_case (e.g.
+            // ReasoningEffort.ExtraHigh → "extra_high"). Integer values are rejected so an
+            // unknown or numeric wire value produces a 400 rather than a silently coerced enum.
+            // Type-level converters (LlmSessionType, ModelTier, TaskVerdict, ReviewVerdict)
+            // take precedence and keep their PascalCase representation.
+            AddHiveJsonOptions(builder.Services);
 
             builder.Services.AddGrpc();
             builder.Services.AddSingleton<WorkerPool>();
@@ -277,7 +340,11 @@ public sealed class Program
                     goalReadyNotifier: sp.GetService<GoalReadyNotifier>(),
                     attachmentService: sp.GetService<ComposerAttachmentService>(),
                     reasoningEffort: ParseConfiguredReasoningEffort(
-                        config?.Composer?.ReasoningEffort,
+                        // Composer-specific override → orchestrator reasoning effort, mirroring
+                        // the model fallback chain above.
+                        !string.IsNullOrWhiteSpace(composerConfig?.ReasoningEffort)
+                            ? composerConfig.ReasoningEffort
+                            : config?.Orchestrator?.ReasoningEffort,
                         "composer.reasoning_effort",
                         sp.GetService<ILogger<Composer>>()));
             });

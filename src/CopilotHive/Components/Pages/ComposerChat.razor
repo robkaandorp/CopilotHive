@@ -6,6 +6,9 @@
 @using Microsoft.AspNetCore.Components.Forms
 @using SharpCoder.SubAgents
 @using System.IO
+@using System.Text.Json
+@using System.Text.Json.Serialization
+@using Microsoft.Extensions.AI
 @implements IAsyncDisposable
 @inject Composer Composer
 @inject ComposerAttachmentService AttachmentService
@@ -215,17 +218,13 @@ else
                 <select disabled="@Composer.IsStreaming" class="chat-model-select" @onchange="HandleModelChange">
                     @foreach (var model in _availableModels)
                     {
-                        var display = model;
-                        var lastColon = model.LastIndexOf(':');
-                        if (lastColon > 0 && lastColon < model.Length - 1)
-                        {
-                            var suffix = model[(lastColon + 1)..];
-                            if (suffix is "none" or "low" or "medium" or "high" or "extra_high")
-                            {
-                                display = $"{model[..lastColon]} ({suffix})";
-                            }
-                        }
-                        <option value="@model" selected="@(_selectedModel == model)">@display</option>
+                        <option value="@model" selected="@(_selectedModel == model)">@model</option>
+                    }
+                </select>
+                <select disabled="@Composer.IsStreaming" class="chat-model-select" @onchange="HandleReasoningChange">
+                    @foreach (var effort in ReasoningOptions)
+                    {
+                        <option value="@ReasoningEffortConverter.Format(effort)" selected="@(_selectedReasoning == effort)">@ReasoningLabel(effort)</option>
                     }
                 </select>
                 <button @onclick="ResetSession" disabled="@Composer.IsStreaming" class="chat-action-btn">
@@ -294,12 +293,54 @@ else
     private string _questionFeedback = "";
     private List<string> _availableModels = [];
     private string _selectedModel = "";
+    private ReasoningEffort _selectedReasoning = ReasoningEffort.None;
     private bool _subAgentsExpanded = false;
     private ComposerAttachment? _pending;
     private bool _uploading;
     private string? _attachmentError;
     private IJSObjectReference? _pasteModule;
     private DotNetObjectReference<ComposerChat>? _pasteDotNetRef;
+
+    /// <summary>
+    /// The reasoning levels offered by the dropdown, in ascending order.
+    /// </summary>
+    internal static readonly ReasoningEffort[] ReasoningOptions =
+    [
+        ReasoningEffort.None,
+        ReasoningEffort.Low,
+        ReasoningEffort.Medium,
+        ReasoningEffort.High,
+        ReasoningEffort.ExtraHigh,
+    ];
+
+    /// <summary>
+    /// Human-readable dropdown label for a reasoning level. The wire value stays the canonical
+    /// snake_case form produced by <see cref="ReasoningEffortConverter.Format(ReasoningEffort?)"/>.
+    /// </summary>
+    internal static string ReasoningLabel(ReasoningEffort effort) => effort switch
+    {
+        ReasoningEffort.None => "None",
+        ReasoningEffort.Low => "Low",
+        ReasoningEffort.Medium => "Medium",
+        ReasoningEffort.High => "High",
+        ReasoningEffort.ExtraHigh => "Extra High",
+        _ => throw new InvalidOperationException($"Unhandled reasoning effort '{effort}'.")
+    };
+
+    /// <summary>
+    /// JSON options for the API calls this page makes. They MUST match the server's global
+    /// converter (<c>ConfigureHttpJsonOptions</c> in <c>Program.cs</c>) so snake_case enum
+    /// values such as <c>extra_high</c> deserialize back into <see cref="ReasoningEffort"/>.
+    /// </summary>
+    internal static readonly JsonSerializerOptions ApiJsonOptions = CreateApiJsonOptions();
+
+    private static JsonSerializerOptions CreateApiJsonOptions()
+    {
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        options.Converters.Add(
+            new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower, allowIntegerValues: false));
+        return options;
+    }
 
     protected override async Task OnInitializedAsync()
     {
@@ -840,11 +881,14 @@ else
     {
         try
         {
-            var response = await HttpClient.GetFromJsonAsync<ModelsResponse>("/api/composer/models");
+            var response = await HttpClient.GetFromJsonAsync<ModelsResponse>("/api/composer/models", ApiJsonOptions);
             if (response?.Models is { Count: > 0 })
             {
                 _availableModels = response.Models;
             }
+            // A Composer with no configured reasoning effort presents as "None" in the dropdown,
+            // so the value shown always matches what a subsequent switch would send.
+            _selectedReasoning = InitialReasoning(response?.ReasoningEffort);
         }
         catch (Exception ex)
         {
@@ -860,7 +904,7 @@ else
     {
         try
         {
-            var response = await HttpClient.GetFromJsonAsync<CurrentModelResponse>("/api/composer/current-model");
+            var response = await HttpClient.GetFromJsonAsync<CurrentModelResponse>("/api/composer/current-model", ApiJsonOptions);
             if (!string.IsNullOrWhiteSpace(response?.Model) && _availableModels.Contains(response.Model))
             {
                 _selectedModel = response.Model;
@@ -882,6 +926,38 @@ else
         }
     }
 
+    /// <summary>
+    /// Builds the switch request URI. Both parameters are always sent: the reasoning effort uses
+    /// its canonical wire form (<c>extra_high</c>, never <c>ExtraHigh</c>) so it round-trips
+    /// through <see cref="ReasoningEffortConverter.Parse(string?)"/> on the server.
+    /// </summary>
+    /// <param name="model">Model identifier to switch to.</param>
+    /// <param name="reasoning">Reasoning effort to switch to.</param>
+    internal static string BuildSwitchUri(string model, ReasoningEffort reasoning)
+        => $"/api/composer/models/switch?model={Uri.EscapeDataString(model)}" +
+           $"&reasoning={Uri.EscapeDataString(ReasoningEffortConverter.Format(reasoning)!)}";
+
+    /// <summary>
+    /// The reasoning level the dropdown starts on. A Composer with no configured effort reports
+    /// <c>null</c>, which presents as <see cref="ReasoningEffort.None"/> so the displayed value
+    /// always matches what a subsequent switch would send.
+    /// </summary>
+    /// <param name="fromResponse">The <c>reasoningEffort</c> field of the models response.</param>
+    internal static ReasoningEffort InitialReasoning(ReasoningEffort? fromResponse)
+        => fromResponse ?? ReasoningEffort.None;
+
+    /// <summary>
+    /// The reasoning level the dropdown must show after a switch attempt. A rejected switch left
+    /// the server on the previous level, so the dropdown is restored rather than left showing a
+    /// level that was never applied.
+    /// </summary>
+    /// <param name="previous">The level shown before the attempt.</param>
+    /// <param name="attempted">The level the user selected.</param>
+    /// <param name="succeeded">Whether the switch request succeeded.</param>
+    internal static ReasoningEffort ResolveReasoningAfterSwitch(
+        ReasoningEffort previous, ReasoningEffort attempted, bool succeeded)
+        => succeeded ? attempted : previous;
+
     private async Task HandleModelChange(ChangeEventArgs e)
     {
         if (e.Value is not string model || string.IsNullOrWhiteSpace(model)) return;
@@ -889,14 +965,17 @@ else
 
         try
         {
-            var response = await HttpClient.PostAsJsonAsync($"/api/composer/models/switch?model={Uri.EscapeDataString(model)}", (object?)null);
+            // The current reasoning selection travels with the new model — the server requires
+            // both and never infers reasoning from the model name.
+            var response = await HttpClient.PostAsJsonAsync(
+                BuildSwitchUri(model, _selectedReasoning), (object?)null, ApiJsonOptions);
             if (response.IsSuccessStatusCode)
             {
                 _selectedModel = model;
             }
             else
             {
-                var error = await response.Content.ReadFromJsonAsync<ErrorResponse>();
+                var error = await response.Content.ReadFromJsonAsync<ErrorResponse>(ApiJsonOptions);
                 Console.Error.WriteLine($"[ComposerChat] Model switch failed: {error?.Error ?? response.ReasonPhrase}");
             }
         }
@@ -904,6 +983,45 @@ else
         {
             Console.Error.WriteLine($"[ComposerChat] Model switch failed: {ex.Message}");
         }
+    }
+
+    private async Task HandleReasoningChange(ChangeEventArgs e)
+    {
+        if (e.Value is not string raw || string.IsNullOrWhiteSpace(raw)) return;
+
+        ReasoningEffort newReasoning;
+        try
+        {
+            newReasoning = ReasoningEffortConverter.Parse(raw)!.Value;
+        }
+        catch (ArgumentException)
+        {
+            return;
+        }
+
+        // Captured BEFORE the request so a rejected switch can restore exactly what was shown.
+        var previous = _selectedReasoning;
+        _selectedReasoning = newReasoning;
+
+        try
+        {
+            var response = await HttpClient.PostAsJsonAsync(
+                BuildSwitchUri(_selectedModel, newReasoning), (object?)null, ApiJsonOptions);
+            _selectedReasoning = ResolveReasoningAfterSwitch(previous, newReasoning, response.IsSuccessStatusCode);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var error = await response.Content.ReadFromJsonAsync<ErrorResponse>(ApiJsonOptions);
+                Console.Error.WriteLine($"[ComposerChat] Reasoning switch failed: {error?.Error ?? response.ReasonPhrase}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _selectedReasoning = ResolveReasoningAfterSwitch(previous, newReasoning, succeeded: false);
+            Console.Error.WriteLine($"[ComposerChat] Reasoning switch failed: {ex.Message}");
+        }
+
+        StateHasChanged();
     }
 
     private async Task HandleKeyDown(KeyboardEventArgs e)
@@ -1088,7 +1206,7 @@ else
         StateHasChanged();
     }
 
-    private sealed record ModelsResponse(List<string> Models);
+    private sealed record ModelsResponse(List<string> Models, ReasoningEffort? ReasoningEffort);
     private sealed record CurrentModelResponse(string Model);
     private sealed record ErrorResponse(string Error);
 }

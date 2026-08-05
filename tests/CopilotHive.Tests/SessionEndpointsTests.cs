@@ -114,6 +114,12 @@ public class SessionEndpointsTests : IDisposable
     /// Verifies that every <see cref="LlmSessionType"/> enum value serializes as a JSON
     /// string (e.g. "Brain") rather than its underlying integer (e.g. 0). This is the
     /// core regression guard for the JsonStringEnumConverter applied to the enum.
+    /// <para>
+    /// It is ALSO the regression guard for the global snake_case enum converter registered in
+    /// <c>Program.AddHiveJsonOptions</c>: the multi-word values would render as
+    /// <c>brain_goal</c> / <c>goal_review</c> if the global converter ever outranked this
+    /// enum's own type-level <c>[JsonConverter]</c> attribute.
+    /// </para>
     /// </summary>
     [Theory]
     [InlineData(LlmSessionType.Brain, "Brain")]

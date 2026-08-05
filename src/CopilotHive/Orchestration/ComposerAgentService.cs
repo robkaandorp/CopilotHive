@@ -1,6 +1,7 @@
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Git;
+using CopilotHive.Services;
 using CopilotHive.Shared.AI;
 
 using Microsoft.Extensions.AI;
@@ -41,9 +42,9 @@ internal sealed class ComposerAgentService(
     private int _maxContextTokens = maxContextTokens;
     private readonly int _maxSteps = maxSteps;
     /// <summary>
-    /// The explicitly configured reasoning effort. Retained across model switches.
+    /// The explicitly configured reasoning effort. Replaced by every explicit model switch.
     /// </summary>
-    private readonly ReasoningEffort? _configuredReasoningEffort = configuredReasoningEffort;
+    private ReasoningEffort? _configuredReasoningEffort = configuredReasoningEffort;
 
     /// <summary>The effective reasoning effort — always the configured value.</summary>
     private ReasoningEffort? _reasoningEffort = configuredReasoningEffort;
@@ -394,25 +395,35 @@ internal sealed class ComposerAgentService(
     }
 
     /// <summary>
-    /// Switches to a different model, disposing the old clients and recreating the agent.
-    /// The session is preserved.
+    /// Switches to a different model and reasoning effort, disposing the old clients and
+    /// recreating the agent. The session is preserved.
     /// </summary>
     /// <param name="newModel">The model identifier to switch to.</param>
+    /// <param name="reasoningEffort">
+    /// The reasoning effort to run with. Required — reasoning is never derived from the model name
+    /// and is never inherited implicitly from the previous selection.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
     /// <exception cref="ArgumentException">Thrown when the model is not available.</exception>
-    public async Task SwitchModelAsync(string newModel)
+    public async Task SwitchModelAsync(string newModel, ReasoningEffort reasoningEffort, CancellationToken ct = default)
     {
         if (!AvailableModels.Contains(newModel, StringComparer.OrdinalIgnoreCase))
             throw new ArgumentException($"Model '{newModel}' is not available. Available models: {string.Join(", ", AvailableModels)}.", nameof(newModel));
 
-        _logger.LogInformation("Switching Composer model from '{OldModel}' to '{NewModel}'", _model, newModel);
+        ct.ThrowIfCancellationRequested();
+
+        _logger.LogInformation(
+            "Switching Composer model from '{OldModel}' to '{NewModel}' (reasoning={Reasoning})",
+            _model, newModel, ReasoningEffortConverter.Format(reasoningEffort));
 
         // Model switch: dispose old agent + clients before creating new ones.
         await DisposeClientsAndClearStateAsync();
 
         _model = newModel;
 
-        // The explicitly configured reasoning effort survives model switches — reasoning is
+        // The caller-supplied reasoning effort becomes the configured value — reasoning is
         // never derived from the model name.
+        _configuredReasoningEffort = reasoningEffort;
         _reasoningEffort = _configuredReasoningEffort;
 
         var modelCtx = _hiveConfig?.TryGetContextWindowForModel(newModel);

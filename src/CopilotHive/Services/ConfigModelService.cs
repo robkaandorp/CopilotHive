@@ -16,17 +16,17 @@ namespace CopilotHive.Services;
 /// <param name="CompactionModel">New compaction model, or <c>null</c> to leave unchanged.</param>
 /// <param name="OrchestratorReasoningEffort">
 /// New orchestrator reasoning effort. <c>null</c> leaves the persisted value unchanged.
-/// Empty string clears the persisted config. The running Brain retains its reasoning until
-/// restart (UpdateModelAsync null = retain).
+/// <see cref="ReasoningEffort.None"/> persists the explicit <c>none</c> level. The running Brain
+/// retains its reasoning until restart (UpdateModelAsync null = retain).
 /// </param>
 /// <param name="ComposerReasoningEffort">
-/// New Composer reasoning effort. <c>null</c> leaves the persisted value unchanged; an empty
-/// string clears it. Persistence-only. The running Composer picks up on restart.
+/// New Composer reasoning effort. <c>null</c> leaves the persisted value unchanged.
+/// Persistence-only. The running Composer picks up on restart.
 /// </param>
 /// <param name="WorkerReasoningEffort">
 /// Per-role reasoning effort keyed by role name (case-insensitive). <c>null</c> leaves everything
-/// unchanged. A present key with a <c>null</c> value clears that role's reasoning effort; a present
-/// key with a non-empty value sets it. Unknown role keys are ignored entirely.
+/// unchanged. A present key with a <c>null</c> value is a no-op for that role. Unknown role keys
+/// are ignored entirely.
 /// </param>
 /// <param name="WorkerPremiumReasoningEffort">
 /// Per-role premium reasoning effort keyed by role name (case-insensitive). Same semantics as
@@ -42,13 +42,14 @@ public sealed record ModelConfigUpdate(
     Dictionary<string, string>? WorkerModels,
     Dictionary<string, string>? PremiumWorkerModels,
     string? CompactionModel,
-    string? OrchestratorReasoningEffort = null,
-    string? ComposerReasoningEffort = null,
-    Dictionary<string, string?>? WorkerReasoningEffort = null,
-    Dictionary<string, string?>? WorkerPremiumReasoningEffort = null,
-    Dictionary<string, string?>? SubAgentModelReasoning = null)
+    ReasoningEffort? OrchestratorReasoningEffort = null,
+    ReasoningEffort? ComposerReasoningEffort = null,
+    Dictionary<string, ReasoningEffort?>? WorkerReasoningEffort = null,
+    Dictionary<string, ReasoningEffort?>? WorkerPremiumReasoningEffort = null,
+    Dictionary<string, ReasoningEffort?>? SubAgentModelReasoning = null)
 {
-    private static string Show(string? value) => string.IsNullOrEmpty(value) ? "(cleared)" : value;
+    private static string Show(ReasoningEffort? value)
+        => ReasoningEffortConverter.Format(value) ?? "(unchanged)";
 
     /// <summary>
     /// Human-readable summary of the changes in this update (used as the git commit message body).
@@ -167,7 +168,8 @@ public sealed class ConfigModelService
     /// <param name="key">Key to look for, compared case-insensitively.</param>
     /// <param name="value">The matched value when found.</param>
     /// <returns><c>true</c> when a matching key exists.</returns>
-    private static bool TryGetIgnoreCase(Dictionary<string, string?>? dict, string key, out string? value)
+    private static bool TryGetIgnoreCase(
+        Dictionary<string, ReasoningEffort?>? dict, string key, out ReasoningEffort? value)
     {
         value = null;
         if (dict is null)
@@ -184,36 +186,23 @@ public sealed class ConfigModelService
     }
 
     /// <summary>
-    /// Canonicalises a reasoning-effort value for persistence. Null, empty and whitespace-only
-    /// values all mean "clear" and map to <c>null</c>; every other (already validated) value is
-    /// normalised to its canonical lowercase wire form (e.g. <c>"High"</c> → <c>"high"</c>).
+    /// Parses a reasoning-effort value leniently for non-validating paths: an unrecognised
+    /// value degrades to <c>null</c> (unset) instead of throwing. Used when projecting the
+    /// YAML-bound <c>string?</c> configuration into the enum-typed API surface, where a
+    /// dynamic reload can leave an unvalidated value behind.
     /// </summary>
-    /// <param name="value">Raw reasoning-effort value from the request.</param>
-    /// <returns>The canonical value, or <c>null</c> when the assignment clears the setting.</returns>
-    private static string? CanonicalizeReasoning(string? value)
+    /// <param name="value">Raw reasoning-effort value from YAML.</param>
+    /// <returns>The parsed effort, or <c>null</c> when unset, empty, whitespace or invalid.</returns>
+    internal static ReasoningEffort? ParseLenient(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))
             return null;
-        return ReasoningEffortConverter.Format(ReasoningEffortConverter.Parse(value));
-    }
-
-    /// <summary>
-    /// Parses a reasoning-effort value leniently for non-validating paths: an unrecognised
-    /// value degrades to <c>null</c> (unset) instead of throwing. Used after persistence has
-    /// already succeeded, where an exception would surface as a misleading client error.
-    /// </summary>
-    /// <param name="value">Raw reasoning-effort value.</param>
-    /// <returns>The parsed effort, or <c>null</c> when unset or invalid.</returns>
-    private ReasoningEffort? TryParseReasoning(string? value)
-    {
         try
         {
             return ReasoningEffortConverter.Parse(value);
         }
         catch (ArgumentException)
         {
-            _logger.LogWarning(
-                "Invalid reasoning effort '{Effort}' in configuration; treating it as unset.", value);
             return null;
         }
     }
@@ -228,7 +217,7 @@ public sealed class ConfigModelService
     /// <param name="knownKeys">The set of keys this dictionary is allowed to target.</param>
     /// <param name="label">Field name used in the error message.</param>
     private static void RejectCaseInsensitiveDuplicates(
-        Dictionary<string, string?>? dict, IEnumerable<string> knownKeys, string label)
+        Dictionary<string, ReasoningEffort?>? dict, IEnumerable<string> knownKeys, string label)
     {
         if (dict is null || dict.Count < 2)
             return;
@@ -246,10 +235,10 @@ public sealed class ConfigModelService
     }
 
     /// <summary>
-    /// Validates every reasoning-effort value carried by the update that targets a known key.
-    /// Case-insensitive duplicate keys are rejected first; remaining failures are collected and
-    /// reported together in a single <see cref="ArgumentException"/>, so no mutation happens
-    /// when any value is invalid.
+    /// Validates the reasoning-effort assignments carried by the update. The values are already
+    /// strongly typed <see cref="ReasoningEffort"/> enums (the JSON layer rejects unknown wire
+    /// values with a 400), so the only remaining structural failure is a case-insensitive
+    /// duplicate key, which would make the applied value depend on JSON property order.
     /// </summary>
     /// <param name="update">The pending model configuration update.</param>
     private void ValidateReasoningEfforts(ModelConfigUpdate update)
@@ -265,47 +254,6 @@ public sealed class ConfigModelService
             update.WorkerPremiumReasoningEffort, KnownWorkerRoleKeys, "workerPremiumReasoningEffort");
         RejectCaseInsensitiveDuplicates(
             update.SubAgentModelReasoning, knownSubAgentNames, "subAgentModelReasoning");
-
-        var invalid = new List<string>();
-
-        void Check(string? value, string label)
-        {
-            if (string.IsNullOrWhiteSpace(value))
-                return;
-            try
-            {
-                ReasoningEffortConverter.Parse(value);
-            }
-            catch (ArgumentException)
-            {
-                invalid.Add($"{label}='{value}'");
-            }
-        }
-
-        Check(update.OrchestratorReasoningEffort, "orchestrator.reasoning_effort");
-        Check(update.ComposerReasoningEffort, "composer.reasoning_effort");
-
-        foreach (var role in KnownWorkerRoleKeys)
-        {
-            if (TryGetIgnoreCase(update.WorkerReasoningEffort, role, out var value))
-                Check(value, $"workers.{role}.reasoning_effort");
-            if (TryGetIgnoreCase(update.WorkerPremiumReasoningEffort, role, out var premium))
-                Check(premium, $"workers.{role}.premium_reasoning_effort");
-        }
-
-        if (update.SubAgentModelReasoning is not null)
-        {
-            foreach (var name in knownSubAgentNames)
-            {
-                if (TryGetIgnoreCase(update.SubAgentModelReasoning, name, out var value))
-                    Check(value, $"sub_agent_models.{name}.reasoning_effort");
-            }
-        }
-
-        if (invalid.Count > 0)
-            throw new ArgumentException(
-                $"Invalid reasoning effort value(s): {string.Join(", ", invalid)}. " +
-                "Allowed values are: none, low, medium, high, extra_high (or empty to clear).");
     }
 
     /// <summary>
@@ -366,22 +314,28 @@ public sealed class ConfigModelService
                 _config.Models.CompactionModel = update.CompactionModel;
             }
 
+            // Reasoning effort travels the API as a strongly typed enum but the YAML-bound config
+            // classes remain string?, so each assignment is formatted to its canonical wire form.
+            // A null (absent) value is always a no-op — including a present dictionary key whose
+            // value is null — so an assignment can only ever set a level, never silently clear one.
             if (update.OrchestratorReasoningEffort is not null)
-                _config.Orchestrator.ReasoningEffort = CanonicalizeReasoning(update.OrchestratorReasoningEffort);
+                _config.Orchestrator.ReasoningEffort =
+                    ReasoningEffortConverter.Format(update.OrchestratorReasoningEffort);
 
             if (update.ComposerReasoningEffort is not null)
             {
                 _config.Composer ??= new ComposerConfig();
-                _config.Composer.ReasoningEffort = CanonicalizeReasoning(update.ComposerReasoningEffort);
+                _config.Composer.ReasoningEffort =
+                    ReasoningEffortConverter.Format(update.ComposerReasoningEffort);
             }
 
             if (update.WorkerReasoningEffort is not null)
             {
                 foreach (var role in KnownWorkerRoleKeys)
                 {
-                    if (!TryGetIgnoreCase(update.WorkerReasoningEffort, role, out var value))
+                    if (!TryGetIgnoreCase(update.WorkerReasoningEffort, role, out var value) || value is null)
                         continue;
-                    GetOrCreateWorker(role).ReasoningEffort = CanonicalizeReasoning(value);
+                    GetOrCreateWorker(role).ReasoningEffort = ReasoningEffortConverter.Format(value);
                 }
             }
 
@@ -389,9 +343,9 @@ public sealed class ConfigModelService
             {
                 foreach (var role in KnownWorkerRoleKeys)
                 {
-                    if (!TryGetIgnoreCase(update.WorkerPremiumReasoningEffort, role, out var value))
+                    if (!TryGetIgnoreCase(update.WorkerPremiumReasoningEffort, role, out var value) || value is null)
                         continue;
-                    GetOrCreateWorker(role).PremiumReasoningEffort = CanonicalizeReasoning(value);
+                    GetOrCreateWorker(role).PremiumReasoningEffort = ReasoningEffortConverter.Format(value);
                 }
             }
 
@@ -399,9 +353,9 @@ public sealed class ConfigModelService
             {
                 foreach (var entry in subAgentModels)
                 {
-                    if (!TryGetIgnoreCase(update.SubAgentModelReasoning, entry.Name, out var value))
+                    if (!TryGetIgnoreCase(update.SubAgentModelReasoning, entry.Name, out var value) || value is null)
                         continue;
-                    entry.ReasoningEffort = CanonicalizeReasoning(value);
+                    entry.ReasoningEffort = ReasoningEffortConverter.Format(value);
                 }
             }
 
@@ -436,12 +390,11 @@ public sealed class ConfigModelService
                 if (finalContextWindow is null or <= 0)
                     finalContextWindow = Constants.DefaultBrainContextWindow;
 
-                // Persistence already succeeded, so nothing here may throw back to the caller —
-                // an ArgumentException would surface as a misleading 400 for a saved config.
-                // The update value was validated in step 1; the fallback reads persisted config,
+                // Persistence already succeeded, so nothing here may throw back to the caller.
+                // The update value is a validated enum; the fallback reads persisted config,
                 // which a dynamic reload can leave unvalidated, so parse it leniently.
-                var finalReasoning = TryParseReasoning(
-                    update.OrchestratorReasoningEffort ?? _config.Orchestrator.ReasoningEffort);
+                var finalReasoning = update.OrchestratorReasoningEffort
+                    ?? ParseLenient(_config.Orchestrator.ReasoningEffort);
 
                 try
                 {
@@ -466,11 +419,10 @@ public sealed class ConfigModelService
     /// </summary>
     /// <param name="name">Model name.</param>
     /// <param name="contextWindow">Optional context window in tokens.</param>
-    /// <param name="reasoningEffort">Ignored — available models no longer carry a reasoning effort.</param>
     /// <param name="description">Optional human-readable description.</param>
     /// <param name="ct">Cancellation token.</param>
-    public Task AddAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
-        => AddAvailableModelAsync(name, contextWindow, reasoningEffort, description, supportsVision: null, ct);
+    public Task AddAvailableModelAsync(string name, int? contextWindow, string? description = null, CancellationToken ct = default)
+        => AddAvailableModelAsync(name, contextWindow, description, supportsVision: null, ct);
 
     /// <summary>
     /// Adds a model to the available_models list, including the informational vision flag.
@@ -478,11 +430,10 @@ public sealed class ConfigModelService
     /// </summary>
     /// <param name="name">Model name.</param>
     /// <param name="contextWindow">Optional context window in tokens.</param>
-    /// <param name="reasoningEffort">Ignored — available models no longer carry a reasoning effort.</param>
     /// <param name="description">Optional human-readable description.</param>
     /// <param name="supportsVision">Vision flag: <c>true</c>, <c>false</c>, or <c>null</c> for unset.</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task AddAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description, bool? supportsVision, CancellationToken ct = default)
+    public async Task AddAvailableModelAsync(string name, int? contextWindow, string? description, bool? supportsVision, CancellationToken ct = default)
     {
         _config.Models ??= new ModelsConfig();
         _config.Models.AvailableModels ??= new List<ModelEntry>();
@@ -512,11 +463,10 @@ public sealed class ConfigModelService
     /// </summary>
     /// <param name="name">Model name to update.</param>
     /// <param name="contextWindow">New context window (null clears it).</param>
-    /// <param name="reasoningEffort">Ignored — the existing reasoning effort is preserved.</param>
     /// <param name="description">New description (null clears it).</param>
     /// <param name="ct">Cancellation token.</param>
-    public Task UpdateAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
-        => UpdateAvailableModelAsync(name, contextWindow, reasoningEffort, description, supportsVision: null, ct);
+    public Task UpdateAvailableModelAsync(string name, int? contextWindow, string? description = null, CancellationToken ct = default)
+        => UpdateAvailableModelAsync(name, contextWindow, description, supportsVision: null, ct);
 
     /// <summary>
     /// Updates an existing model, including the informational vision flag.
@@ -524,11 +474,10 @@ public sealed class ConfigModelService
     /// </summary>
     /// <param name="name">Model name to update.</param>
     /// <param name="contextWindow">New context window (null clears it).</param>
-    /// <param name="reasoningEffort">Ignored — the existing reasoning effort is preserved.</param>
     /// <param name="description">New description (null clears it).</param>
     /// <param name="supportsVision">Vision flag: <c>true</c>, <c>false</c>, or <c>null</c> to clear/unset.</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task UpdateAvailableModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description, bool? supportsVision, CancellationToken ct = default)
+    public async Task UpdateAvailableModelAsync(string name, int? contextWindow, string? description, bool? supportsVision, CancellationToken ct = default)
     {
         var model = _config.Models?.AvailableModels?
             .FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
@@ -574,10 +523,10 @@ public sealed class ConfigModelService
     /// </summary>
     /// <param name="name">Model name.</param>
     /// <param name="contextWindow">Optional context window in tokens.</param>
-    /// <param name="reasoningEffort">Optional default reasoning effort.</param>
+    /// <param name="reasoningEffort">Optional default reasoning effort (<c>null</c> for unset).</param>
     /// <param name="description">Optional human-readable description.</param>
     /// <param name="ct">Cancellation token.</param>
-    public Task AddSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
+    public Task AddSubAgentModelAsync(string name, int? contextWindow, ReasoningEffort? reasoningEffort, string? description = null, CancellationToken ct = default)
         => AddSubAgentModelAsync(name, contextWindow, reasoningEffort, description, supportsVision: null, ct);
 
     /// <summary>
@@ -586,31 +535,19 @@ public sealed class ConfigModelService
     /// </summary>
     /// <param name="name">Model name.</param>
     /// <param name="contextWindow">Optional context window in tokens.</param>
-    /// <param name="reasoningEffort">Optional default reasoning effort.</param>
+    /// <param name="reasoningEffort">Optional default reasoning effort (<c>null</c> for unset).</param>
     /// <param name="description">Optional human-readable description.</param>
     /// <param name="supportsVision">Vision flag: <c>true</c>, <c>false</c>, or <c>null</c> for unset (inherit).</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task AddSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description, bool? supportsVision, CancellationToken ct = default)
+    public async Task AddSubAgentModelAsync(string name, int? contextWindow, ReasoningEffort? reasoningEffort, string? description, bool? supportsVision, CancellationToken ct = default)
     {
         _config.Models ??= new ModelsConfig();
         _config.Models.SubAgentModels ??= new List<ModelEntry>();
 
-        // Reasoning effort comes exclusively from the explicit request field; the model
-        // name is stored plain. An unrecognised value is a client error, so it is reported
-        // as an ArgumentException the endpoint turns into a 400 (never an unhandled 500).
-        string? effectiveReasoningEffort;
-        try
-        {
-            effectiveReasoningEffort = ReasoningEffortConverter.Format(
-                ReasoningEffortConverter.Parse(reasoningEffort));
-        }
-        catch (ArgumentException)
-        {
-            throw new ArgumentException(
-                $"Invalid reasoning effort value: '{reasoningEffort}'. " +
-                "Allowed values are: none, low, medium, high, extra_high (or empty to clear).",
-                nameof(reasoningEffort));
-        }
+        // Reasoning effort comes exclusively from the explicit request field (already a validated
+        // enum — the JSON layer rejects unknown wire values); the model name is stored plain.
+        // ModelEntry is YAML-bound and stays string?, so the enum is formatted to its wire form.
+        var effectiveReasoningEffort = ReasoningEffortConverter.Format(reasoningEffort);
 
         if (_config.Models.SubAgentModels.Any(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)))
             throw new InvalidOperationException($"Model '{name}' already exists in sub_agent_models");
@@ -639,7 +576,7 @@ public sealed class ConfigModelService
     /// <param name="reasoningEffort">New reasoning effort (null clears it).</param>
     /// <param name="description">New description (null clears it).</param>
     /// <param name="ct">Cancellation token.</param>
-    public Task UpdateSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description = null, CancellationToken ct = default)
+    public Task UpdateSubAgentModelAsync(string name, int? contextWindow, ReasoningEffort? reasoningEffort, string? description = null, CancellationToken ct = default)
         => UpdateSubAgentModelAsync(name, contextWindow, reasoningEffort, description, supportsVision: null, ct);
 
     /// <summary>
@@ -652,7 +589,7 @@ public sealed class ConfigModelService
     /// <param name="description">New description (null clears it).</param>
     /// <param name="supportsVision">Vision flag: <c>true</c>, <c>false</c>, or <c>null</c> to clear/unset (inherit).</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task UpdateSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description, bool? supportsVision, CancellationToken ct = default)
+    public async Task UpdateSubAgentModelAsync(string name, int? contextWindow, ReasoningEffort? reasoningEffort, string? description, bool? supportsVision, CancellationToken ct = default)
     {
         var model = _config.Models?.SubAgentModels?
             .FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
@@ -660,7 +597,8 @@ public sealed class ConfigModelService
             throw new InvalidOperationException($"Model '{name}' not found in sub_agent_models");
 
         model.ContextWindow = contextWindow;
-        model.ReasoningEffort = reasoningEffort;
+        // ModelEntry stays YAML-bound (string?): format the enum to its canonical wire form.
+        model.ReasoningEffort = ReasoningEffortConverter.Format(reasoningEffort);
         model.Description = description;
         model.SupportsVision = supportsVision;
 

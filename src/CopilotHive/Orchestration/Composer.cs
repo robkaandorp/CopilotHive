@@ -438,12 +438,18 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     }
 
     /// <summary>
-    /// Switches to a different model, disposing the old chat client and recreating the agent.
-    /// The session history is preserved.
+    /// Switches to a different model and reasoning effort, disposing the old chat client and
+    /// recreating the agent. The session history is preserved.
     /// </summary>
     /// <param name="model">The model identifier to switch to.</param>
+    /// <param name="reasoningEffort">The reasoning effort to run with (required).</param>
+    /// <param name="ct">Cancellation token.</param>
     /// <exception cref="ArgumentException">Thrown when <paramref name="model"/> is not in <see cref="AvailableModels"/>.</exception>
-    public Task SwitchModelAsync(string model) => _agentService.SwitchModelAsync(model);
+    public Task SwitchModelAsync(string model, ReasoningEffort reasoningEffort, CancellationToken ct = default)
+        => _agentService.SwitchModelAsync(model, reasoningEffort, ct);
+
+    /// <summary>The Composer's current reasoning effort, or <c>null</c> when unset.</summary>
+    public ReasoningEffort? ReasoningEffort => _agentService?.ReasoningEffort;
 
     /// <summary>
     /// Returns the current background sub-agent entries — running ones first (oldest first), then
