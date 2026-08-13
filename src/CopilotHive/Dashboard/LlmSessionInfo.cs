@@ -1,5 +1,7 @@
 using System.Text.Json.Serialization;
 
+using Microsoft.Extensions.AI;
+
 namespace CopilotHive.Dashboard;
 
 /// <summary>Classification of an LLM session tracked by the dashboard.</summary>
@@ -42,6 +44,9 @@ public sealed record LlmSessionInfo
 
     /// <summary>Maximum number of tokens allowed in the context window.</summary>
     public long MaxTokens { get; init; }
+
+    /// <summary>Reasoning effort configured for this session, if any.</summary>
+    public ReasoningEffort? ReasoningEffort { get; init; }
 
     /// <summary>Timestamp when the session was created. Defaults to UTC now.</summary>
     public DateTime CreatedAt { get; init; } = DateTime.UtcNow;

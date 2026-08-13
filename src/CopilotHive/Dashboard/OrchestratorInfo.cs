@@ -1,3 +1,5 @@
+using Microsoft.Extensions.AI;
+
 namespace CopilotHive.Dashboard;
 
 /// <summary>Orchestrator system info for the dashboard.</summary>
@@ -19,4 +21,14 @@ public sealed class OrchestratorInfo
     public Dictionary<string, string> RoleModels { get; init; } = [];
     /// <summary>Model configured for context compaction summaries, or null if using the main model.</summary>
     public string? CompactionModel { get; init; }
+    /// <summary>Reasoning effort configured for the Brain.</summary>
+    public ReasoningEffort? BrainReasoningEffort { get; init; }
+    /// <summary>Reasoning effort configured for the Composer.</summary>
+    public ReasoningEffort? ComposerReasoningEffort { get; init; }
+    /// <summary>Reasoning effort per worker role (lowercased role names).</summary>
+    public Dictionary<string, ReasoningEffort?> RoleReasoningEfforts { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Premium reasoning effort per worker role (lowercased role names).</summary>
+    public Dictionary<string, ReasoningEffort?> RolePremiumReasoningEfforts { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Premium model per worker role (lowercased role names).</summary>
+    public Dictionary<string, string?> RolePremiumModels { get; init; } = new(StringComparer.OrdinalIgnoreCase);
 }

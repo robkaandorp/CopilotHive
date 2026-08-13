@@ -531,6 +531,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             Status = status,
             CurrentTokens = currentTokens ?? _agentService.Session.EstimatedContextTokens,
             MaxTokens = _agentService.MaxContextTokens,
+            ReasoningEffort = _agentService?.ReasoningEffort,
         });
     }
 

@@ -5,6 +5,8 @@ using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
 
+using Microsoft.Extensions.AI;
+
 namespace CopilotHive.Dashboard;
 
 /// <summary>
@@ -277,17 +279,64 @@ public sealed class DashboardStateService : IDisposable
         var uptime = DateTime.UtcNow - _startTime;
         var roles = new[] { "coder", "tester", "reviewer", "docwriter", "improver" };
 
+        // Null-safe role model population: when config or config.Workers is null,
+        // fall back to the orchestrator model (or the default when there is no config).
+        var fallbackModel = _config?.Orchestrator?.Model ?? Constants.DefaultModel;
+        var roleModels = new Dictionary<string, string>(roles.Length);
+        foreach (var role in roles)
+        {
+            roleModels[role] = _config?.Workers is null
+                ? fallbackModel
+                : _config.GetModelForRole(role);
+        }
+
+        // Reasoning effort dictionaries (null-safe, lenient parse).
+        var roleReasoning = new Dictionary<string, ReasoningEffort?>(StringComparer.OrdinalIgnoreCase);
+        var rolePremiumReasoning = new Dictionary<string, ReasoningEffort?>(StringComparer.OrdinalIgnoreCase);
+        var rolePremiumModels = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+
+        if (_config?.Workers is not null)
+        {
+            foreach (var (roleName, workerCfg) in _config.Workers)
+            {
+                if (workerCfg is null) continue;
+                roleReasoning[roleName] = ParseLenient(workerCfg.ReasoningEffort);
+                rolePremiumReasoning[roleName] = ParseLenient(workerCfg.PremiumReasoningEffort);
+                rolePremiumModels[roleName] = workerCfg.PremiumModel;
+            }
+        }
+
         return new OrchestratorInfo
         {
             Uptime = uptime,
             Version = _version,
             SharpCoderVersion = _sharpCoderVersion,
             ServerTime = DateTime.UtcNow,
-            RoleModels = roles.ToDictionary(r => r, r => _config?.GetModelForRole(r) ?? Constants.DefaultModel),
+            RoleModels = roleModels,
             BrainModel = _brain?.GetStats()?.Model ?? "(not configured)",
             ComposerModel = _composer?.GetStats()?.Model ?? "(not configured)",
             CompactionModel = _config?.Models?.CompactionModel,
+            BrainReasoningEffort = ParseLenient(_config?.Orchestrator?.ReasoningEffort),
+            ComposerReasoningEffort = ParseLenient(
+                !string.IsNullOrWhiteSpace(_config?.Composer?.ReasoningEffort)
+                    ? _config.Composer.ReasoningEffort
+                    : _config?.Orchestrator?.ReasoningEffort),
+            RoleReasoningEfforts = roleReasoning,
+            RolePremiumReasoningEfforts = rolePremiumReasoning,
+            RolePremiumModels = rolePremiumModels,
         };
+    }
+
+    private static ReasoningEffort? ParseLenient(string? value)
+    {
+        try
+        {
+            return ReasoningEffortConverter.Parse(value);
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
     }
 
     /// <inheritdoc />

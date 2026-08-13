@@ -34,6 +34,7 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
     private readonly KnowledgeGraph? _knowledgeGraph;
     private readonly ConfigRepoManager? _configRepo;
     private readonly Func<IBrainMessage, bool>? _parentTell;
+    private readonly ReasoningEffort? _reasoningEffort;
 
     private int _resourcesDisposed;
 
@@ -71,6 +72,7 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
         _knowledgeGraph = knowledgeGraph;
         _configRepo = configRepo;
         _parentTell = parentTell;
+        _reasoningEffort = baseOptions.ReasoningEffort;
 
         try
         {
@@ -262,6 +264,7 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
             Status = status,
             CurrentTokens = sessionRef.EstimatedContextTokens,
             MaxTokens = _maxContextTokens,
+            ReasoningEffort = _reasoningEffort,
         });
 
     private void InjectNote(InjectNoteMessage message)

@@ -388,6 +388,7 @@ internal sealed class ComposerAgentService(
             Status = "idle",
             CurrentTokens = _session.EstimatedContextTokens,
             MaxTokens = _maxContextTokens,
+            ReasoningEffort = _reasoningEffort,
         });
 
         _logger.LogInformation("Composer connected (model={Model}, contextWindow={ContextWindow})",
@@ -460,6 +461,7 @@ internal sealed class ComposerAgentService(
             Status = "idle",
             CurrentTokens = _session.EstimatedContextTokens,
             MaxTokens = _maxContextTokens,
+            ReasoningEffort = _reasoningEffort,
         });
 
         _logger.LogInformation("Composer switched to model '{Model}'", _model);

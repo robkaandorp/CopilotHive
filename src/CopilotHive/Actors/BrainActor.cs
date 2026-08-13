@@ -539,6 +539,7 @@ internal sealed class BrainActor : Actor<IBrainMessage>
             Status = "idle",
             CurrentTokens = master.EstimatedContextTokens,
             MaxTokens = _maxContextTokens,
+            ReasoningEffort = _reasoningEffort,
         });
     }
 

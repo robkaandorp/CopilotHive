@@ -111,6 +111,17 @@ public class GoalReviewService
             var reviewerModel = _config?.GetModelForRole(WorkerRole.Reviewer) ?? Constants.DefaultWorkerModel;
             var maxContextTokens = _config?.TryGetContextWindowForModel(reviewerModel) ?? Constants.DefaultBrainContextWindow;
 
+            // Resolve the reviewer reasoning effort (lenient: invalid values fall back to unset).
+            ReasoningEffort? reviewerReasoning;
+            try
+            {
+                reviewerReasoning = ReasoningEffortConverter.Parse(_config?.Workers?.GetValueOrDefault("reviewer")?.ReasoningEffort);
+            }
+            catch (ArgumentException)
+            {
+                reviewerReasoning = null;
+            }
+
             // Register the review session now that the concurrency guards have passed. Rejected
             // concurrent reviews (which throw above) never reach this point, so no registration
             // happens for them.
@@ -125,6 +136,7 @@ public class GoalReviewService
                 MaxTokens = maxContextTokens,
                 Status = "reviewing",
                 LastActivity = DateTime.UtcNow,
+                ReasoningEffort = reviewerReasoning,
             });
 
             // Everything after setting Pending is wrapped so any failure — including the initial

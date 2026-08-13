@@ -7,6 +7,7 @@ using CopilotHive.Orchestration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 using CopilotHive.Persistence;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging.Abstractions;
 
 using WorkerRole = CopilotHive.Workers.WorkerRole;
@@ -1272,6 +1273,293 @@ public sealed class DashboardStateServiceTests : IDisposable
         var info = service.GetOrchestratorInfo();
 
         Assert.Null(info.CompactionModel);
+    }
+
+    // ── OrchestratorInfo reasoning effort fields ────────────────────────────
+
+    /// <summary>
+    /// Verifies that <see cref="OrchestratorInfo.BrainReasoningEffort"/> is populated
+    /// from <see cref="OrchestratorConfig.ReasoningEffort"/> when configured.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_BrainReasoningEffort_PopulatedFromConfig()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { ReasoningEffort = "high" },
+            Repositories = [],
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Equal(ReasoningEffort.High, info.BrainReasoningEffort);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="OrchestratorInfo.BrainReasoningEffort"/> is null when
+    /// no reasoning effort is configured on the orchestrator.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_BrainReasoningEffort_NullWhenNotConfigured()
+    {
+        var config = new HiveConfigFile
+        {
+            Repositories = [],
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Null(info.BrainReasoningEffort);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="OrchestratorInfo.ComposerReasoningEffort"/> uses the
+    /// Composer's own reasoning effort when it is non-blank, taking precedence over
+    /// the orchestrator's value.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_ComposerReasoningEffort_BlankAwareFallback()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { ReasoningEffort = "medium" },
+            Composer = new ComposerConfig { ReasoningEffort = "high" },
+            Repositories = [],
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Equal(ReasoningEffort.High, info.ComposerReasoningEffort);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="OrchestratorInfo.ComposerReasoningEffort"/> falls back
+    /// to the orchestrator's reasoning effort when the Composer's value is blank
+    /// (whitespace-only).
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_ComposerReasoningEffort_FallsBackToOrchestrator()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { ReasoningEffort = "medium" },
+            Composer = new ComposerConfig { ReasoningEffort = "  " },
+            Repositories = [],
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Equal(ReasoningEffort.Medium, info.ComposerReasoningEffort);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="OrchestratorInfo.ComposerReasoningEffort"/> is null when
+    /// neither the Composer nor the Orchestrator has a reasoning effort configured.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_ComposerReasoningEffort_NullWhenNeitherConfigured()
+    {
+        var config = new HiveConfigFile
+        {
+            Repositories = [],
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Null(info.ComposerReasoningEffort);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="OrchestratorInfo.RoleReasoningEfforts"/> is populated
+    /// from each worker role's <see cref="WorkerConfig.ReasoningEffort"/>.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_RoleReasoningEfforts_PopulatedFromWorkers()
+    {
+        var config = new HiveConfigFile
+        {
+            Workers = new Dictionary<string, WorkerConfig>
+            {
+                ["coder"] = new WorkerConfig { ReasoningEffort = "high" },
+                ["reviewer"] = new WorkerConfig { ReasoningEffort = "low" },
+            },
+            Repositories = [],
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Equal(ReasoningEffort.High, info.RoleReasoningEfforts["coder"]);
+        Assert.Equal(ReasoningEffort.Low, info.RoleReasoningEfforts["reviewer"]);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="OrchestratorInfo.RoleReasoningEfforts"/>,
+    /// <see cref="OrchestratorInfo.RolePremiumReasoningEfforts"/>, and
+    /// <see cref="OrchestratorInfo.RolePremiumModels"/> are empty (not null) when no
+    /// workers are configured.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_RoleReasoningEfforts_EmptyWhenWorkersNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Repositories = [],
+            Workers = null!,  // explicitly null — exercises the actual null-Workers path
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.NotNull(info.RoleReasoningEfforts);
+        Assert.Empty(info.RoleReasoningEfforts);
+        Assert.Empty(info.RolePremiumReasoningEfforts);
+        Assert.Empty(info.RolePremiumModels);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="OrchestratorInfo.RoleModels"/> falls back to the
+    /// orchestrator model for all five roles when no per-role worker configs exist.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_RoleModels_FallbackWhenWorkersNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "fallback-model" },
+            Repositories = [],
+            Workers = null!,  // explicitly null — exercises the actual null-Workers path
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Equal(5, info.RoleModels.Count);
+        foreach (var role in new[] { "coder", "tester", "reviewer", "docwriter", "improver" })
+        {
+            Assert.Equal("fallback-model", info.RoleModels[role]);
+        }
+    }
+
+    /// <summary>
+    /// Removal-proof guard test: with <see cref="HiveConfigFile.Workers"/> explicitly
+    /// <c>null</c>, every role model must fall back to the orchestrator model and all
+    /// role-keyed dictionaries must be empty. If the <c>_config?.Workers is null</c>
+    /// guard were removed, <c>GetModelForRole</c> would throw a
+    /// <see cref="NullReferenceException"/> and this test would fail.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_RoleModels_FallbackWhenWorkersExplicitlyNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "explicit-fallback" },
+            Repositories = [],
+            Workers = null!,
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        foreach (var role in new[] { "coder", "tester", "reviewer", "docwriter", "improver" })
+        {
+            Assert.True(info.RoleModels.ContainsKey(role));
+            Assert.Equal("explicit-fallback", info.RoleModels[role]);
+        }
+
+        Assert.Empty(info.RoleReasoningEfforts);
+        Assert.Empty(info.RolePremiumReasoningEfforts);
+        Assert.Empty(info.RolePremiumModels);
+    }
+
+    /// <summary>
+    /// Verifies that an invalid reasoning effort string in the config parses leniently
+    /// to null rather than throwing.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_InvalidReasoningString_ParsesToNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { ReasoningEffort = "INVALID_VALUE" },
+            Repositories = [],
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Null(info.BrainReasoningEffort);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="OrchestratorInfo.RolePremiumModels"/> is populated
+    /// from each worker role's <see cref="WorkerConfig.PremiumModel"/>.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_RolePremiumModels_PopulatedFromWorkers()
+    {
+        var config = new HiveConfigFile
+        {
+            Workers = new Dictionary<string, WorkerConfig>
+            {
+                ["coder"] = new WorkerConfig { PremiumModel = "premium-coder-model" },
+            },
+            Repositories = [],
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Equal("premium-coder-model", info.RolePremiumModels["coder"]);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="OrchestratorInfo.RolePremiumReasoningEfforts"/> is
+    /// populated from each worker role's <see cref="WorkerConfig.PremiumReasoningEffort"/>.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_RolePremiumReasoningEfforts_PopulatedFromWorkers()
+    {
+        var config = new HiveConfigFile
+        {
+            Workers = new Dictionary<string, WorkerConfig>
+            {
+                ["tester"] = new WorkerConfig { PremiumReasoningEffort = "extra_high" },
+            },
+            Repositories = [],
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Equal(ReasoningEffort.ExtraHigh, info.RolePremiumReasoningEfforts["tester"]);
+    }
+
+    /// <summary>
+    /// Verifies that an invalid per-role reasoning effort string parses leniently
+    /// to null rather than throwing.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_InvalidRoleReasoningString_ParsesToNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Workers = new Dictionary<string, WorkerConfig>
+            {
+                ["coder"] = new WorkerConfig { ReasoningEffort = "BOGUS" },
+            },
+            Repositories = [],
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Null(info.RoleReasoningEfforts["coder"]);
     }
 
     /// <summary>

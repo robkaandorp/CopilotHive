@@ -216,4 +216,94 @@ public class LlmSessionRegistryTests
 
         Assert.Equal(50, session.ContextUsagePercent);
     }
+
+    // ── Source-level verification: every LlmSessionInfo sets ReasoningEffort ──
+
+    /// <summary>
+    /// Verifies that every production <c>new LlmSessionInfo</c> initializer includes a
+    /// <c>ReasoningEffort =</c> assignment. This is a source-level assertion (following the
+    /// pattern in DistributedBrainTests.cs) that guards against future LlmSessionInfo
+    /// constructions silently omitting the reasoning effort field.
+    /// </summary>
+    [Fact]
+    public void AllLlmSessionInfoInitializers_IncludeReasoningEffort()
+    {
+        // Find the repo root by walking up from the test assembly location.
+        var repoRoot = AppContext.BaseDirectory;
+        while (repoRoot is not null
+               && !Directory.GetFiles(repoRoot, "*.slnx").Any()
+               && !Directory.Exists(Path.Combine(repoRoot, "src", "CopilotHive")))
+        {
+            repoRoot = Directory.GetParent(repoRoot)?.FullName;
+        }
+        Assert.NotNull(repoRoot);
+        Assert.True(Directory.Exists(Path.Combine(repoRoot, "src", "CopilotHive")),
+            $"Repo root not found from {AppContext.BaseDirectory}");
+
+        // (file, expected minimum ReasoningEffort occurrences)
+        var files = new (string RelativePath, int MinReasoningEffort)[]
+        {
+            (Path.Combine("src", "CopilotHive", "Orchestration", "DistributedBrain.cs"), 3),
+            (Path.Combine("src", "CopilotHive", "Actors", "BrainActor.cs"), 1),
+            (Path.Combine("src", "CopilotHive", "Actors", "GoalBrainActor.cs"), 1),
+            (Path.Combine("src", "CopilotHive", "Orchestration", "Composer.cs"), 1),
+            (Path.Combine("src", "CopilotHive", "Orchestration", "ComposerAgentService.cs"), 2),
+            (Path.Combine("src", "CopilotHive", "Services", "GoalReviewService.cs"), 1),
+        };
+
+        var totalInitializers = 0;
+        var totalReasoningAssignments = 0;
+
+        foreach (var (relativePath, minReasoning) in files)
+        {
+            var fullPath = Path.Combine(repoRoot, relativePath);
+            Assert.True(File.Exists(fullPath), $"Source file not found at {fullPath}");
+
+            var source = File.ReadAllText(fullPath);
+
+            // Count `new LlmSessionInfo` occurrences in this file.
+            var initializerCount = CountOccurrences(source, "new LlmSessionInfo");
+            totalInitializers += initializerCount;
+
+            // Count `ReasoningEffort =` assignments in this file.
+            var reasoningCount = CountOccurrences(source, "ReasoningEffort =");
+            totalReasoningAssignments += reasoningCount;
+
+            // Every `new LlmSessionInfo` initializer must include ReasoningEffort.
+            // Split on `new LlmSessionInfo`; each segment after the first represents one
+            // constructor call. The ReasoningEffort assignment must appear before the
+            // closing `};` of that initializer.
+            var segments = source.Split("new LlmSessionInfo", StringSplitOptions.None);
+            for (var i = 1; i < segments.Length; i++)
+            {
+                var segment = segments[i];
+                var closingBrace = segment.IndexOf("};", StringComparison.Ordinal);
+                var initializerBody = closingBrace >= 0 ? segment[..closingBrace] : segment;
+                Assert.True(initializerBody.Contains("ReasoningEffort =", StringComparison.Ordinal),
+                    $"{relativePath}: LlmSessionInfo initializer #{i} is missing ReasoningEffort =");
+            }
+
+            // The file must contain at least the expected number of ReasoningEffort assignments
+            // (one per LlmSessionInfo initializer, possibly more for other uses).
+            Assert.True(reasoningCount >= minReasoning,
+                $"{relativePath}: expected at least {minReasoning} 'ReasoningEffort =' occurrences, found {reasoningCount}");
+        }
+
+        // Exactly 9 LlmSessionInfo constructions across the 6 production files.
+        Assert.Equal(9, totalInitializers);
+        Assert.True(totalReasoningAssignments >= 9,
+            $"Expected at least 9 'ReasoningEffort =' assignments across all files, found {totalReasoningAssignments}");
+    }
+
+    private static int CountOccurrences(string text, string search)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = text.IndexOf(search, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += search.Length;
+        }
+        return count;
+    }
 }

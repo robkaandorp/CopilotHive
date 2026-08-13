@@ -196,6 +196,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Status = "idle",
             CurrentTokens = 0,
             MaxTokens = _maxContextTokens,
+            ReasoningEffort = _configuredReasoningEffort ?? _reasoningEffort,
         };
 
         try
@@ -427,6 +428,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                 Status = "idle",
                 CurrentTokens = 0,
                 MaxTokens = _maxContextTokens,
+                ReasoningEffort = _configuredReasoningEffort ?? _reasoningEffort,
             });
 
             _logger.LogInformation("Brain model updated to '{Model}' with context window {ContextWindow}",
@@ -720,6 +722,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             Status = "idle",
             CurrentTokens = 0,
             MaxTokens = _maxContextTokens,
+            ReasoningEffort = _configuredReasoningEffort ?? _reasoningEffort,
         });
 
         var mergeMsg = BrainActorMessages.CreateMergeSummaryMessage(pipeline.GoalId, summary);
