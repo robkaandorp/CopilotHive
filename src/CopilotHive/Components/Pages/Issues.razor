@@ -463,7 +463,7 @@ else if (_loaded)
         return string.Join(" · ", parts);
     }
 
-    private static string ToSnakeCase(Enum value) =>
+    private static string ToSnakeCase<T>(T value) where T : struct, Enum =>
         JsonSerializer.Serialize(value, ReasoningEffortOptions.JsonOptions).Trim('"');
 
     private static T ParseSnakeCase<T>(string value) where T : struct, Enum =>
