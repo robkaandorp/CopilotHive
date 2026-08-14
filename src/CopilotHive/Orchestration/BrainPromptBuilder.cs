@@ -50,6 +50,7 @@ public static class BrainPromptBuilder
         - You have read-only access to the config repo via `list_config_files` and `read_config_file` tools. The config repo contains `agents/*.agents.md` files and `hive-config.yaml`. Use these to read the actual agents.md content when planning improver phases.
         - Use `traverse_graph` to discover related documents by following links from documents you have found.
         - Use the get_current_time tool when you need to know the current date (e.g., for changelog entries or release dates).
+        - You have a raise_issue tool. Use it when you notice code quality problems, bugs, suggestions, concerns, or workflow issues during planning or review that are out of scope for the current goal.
         - Before planning a new iteration, read the goal's progress document via `read_document("progress-{goal-id}")` to see worker narratives from previous iterations. These narratives contain what workers tried, what worked, what they struggled with, and why they made their choices — valuable context for planning the next iteration that goes beyond the structured phase outputs.
 
         WORKER PROMPT RULES:

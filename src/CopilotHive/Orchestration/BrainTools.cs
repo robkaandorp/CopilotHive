@@ -87,14 +87,16 @@ internal static class BrainTools
     /// <summary>
     /// Builds the dependency-only Brain tools: <c>get_goal</c>, <c>search_knowledge</c>,
     /// <c>read_document</c>, <c>traverse_graph</c>, <c>get_current_time</c>,
-    /// <c>list_config_files</c> and <c>read_config_file</c>.
+    /// <c>list_config_files</c>, <c>read_config_file</c> and <c>raise_issue</c>.
     /// </summary>
     internal static List<AITool> BuildDependencyTools(
         IGoalStore? goalStore,
         Func<string, Task<GoalPipeline?>> pipelineResolver,
         KnowledgeGraph? knowledgeGraph,
         ILogger logger,
-        ConfigRepoManager? configRepo = null)
+        ConfigRepoManager? configRepo = null,
+        IIssueStore? issueStore = null,
+        string? sourceGoalId = null)
     {
         ArgumentNullException.ThrowIfNull(pipelineResolver);
         ArgumentNullException.ThrowIfNull(logger);
@@ -462,6 +464,92 @@ internal static class BrainTools
                 },
                 "read_config_file",
                 "Read a config repo file with line numbers. Validates that the resolved path stays within the config repo root."),
+            AIFunctionFactory.Create(
+                // `severity` MUST carry a default: Microsoft.Extensions.AI derives AIFunction
+                // argument optionality from parameter defaults, not nullable-reference
+                // annotations. Without `= null` it stays in the required schema/binding set and
+                // a call that omits it fails before the IssueSeverity.Low default can apply.
+                // The CancellationToken then needs a default too (C# requires every parameter
+                // after a defaulted one to be defaulted); the factory still injects the real
+                // invocation token.
+                async ([Description("Issue type: bug, suggestion, concern, code_quality, workflow")] string type,
+                       [Description("Short title for the issue")] string title,
+                       [Description("Detailed description of the issue")] string description,
+                       [Description("Severity: low, medium, high (defaults to low)")] string? severity = null,
+                       CancellationToken ct = default) =>
+                {
+                    if (issueStore is null)
+                        return "Issue tracking is not available.";
+
+                    if (string.IsNullOrWhiteSpace(type))
+                        return "Type is required.";
+
+                    IssueType parsedType;
+                    try
+                    {
+                        parsedType = IssueIdGenerator.ParseIssueType(type);
+                    }
+                    catch (ArgumentException ex)
+                    {
+                        return ex.Message;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(title))
+                        return "Title is required.";
+
+                    if (string.IsNullOrWhiteSpace(description))
+                        return "Description is required.";
+
+                    IssueSeverity parsedSeverity;
+                    if (severity is null)
+                    {
+                        parsedSeverity = IssueSeverity.Low;
+                    }
+                    else
+                    {
+                        try
+                        {
+                            parsedSeverity = IssueIdGenerator.ParseIssueSeverity(severity);
+                        }
+                        catch (ArgumentException ex)
+                        {
+                            return ex.Message;
+                        }
+                    }
+
+                    var generatedId = await IssueIdGenerator.GenerateAsync(title, issueStore, ct);
+
+                    Issue BuildIssue(string id) => new()
+                    {
+                        Id = id,
+                        Type = parsedType,
+                        Title = title,
+                        Description = description,
+                        Severity = parsedSeverity,
+                        SourceRole = "brain",
+                        SourceGoalId = sourceGoalId,
+                        SourceIteration = 0,
+                        RepositoryNames = [],
+                        CreatedAt = DateTime.UtcNow,
+                    };
+
+                    var issue = BuildIssue(generatedId);
+
+                    try
+                    {
+                        await issueStore.CreateIssueAsync(issue, ct);
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        // Duplicate ID (race): retry with a GUID-suffixed ID.
+                        issue = BuildIssue($"{generatedId}-{Guid.NewGuid():N}");
+                        await issueStore.CreateIssueAsync(issue, ct);
+                    }
+
+                    return $"Issue created: {issue.Id}";
+                },
+                "raise_issue",
+                "Raise an issue for code quality problems, bugs, suggestions, concerns, or workflow issues noticed during planning or review that are out of scope for the current goal."),
         ];
     }
 }

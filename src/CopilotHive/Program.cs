@@ -204,7 +204,8 @@ public sealed class Program
                         reasoningEffort: ParseConfiguredReasoningEffort(
                             config?.Orchestrator?.ReasoningEffort,
                             "orchestrator.reasoning_effort",
-                            sp.GetService<ILogger<DistributedBrain>>()));
+                            sp.GetService<ILogger<DistributedBrain>>()),
+                        issueStore: sp.GetService<IIssueStore>());
                 });
             }
 

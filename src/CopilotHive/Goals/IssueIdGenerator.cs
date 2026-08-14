@@ -43,4 +43,42 @@ public static class IssueIdGenerator
         }
         return slug.ToString().Trim('-');
     }
+
+    /// <summary>
+    /// Parses an issue type string into an <see cref="IssueType"/>. Null-safe:
+    /// null or empty input throws <see cref="ArgumentException"/> instead of
+    /// <see cref="NullReferenceException"/>.
+    /// </summary>
+    internal static IssueType ParseIssueType(string? value)
+    {
+        var normalized = value?.ToLowerInvariant().Trim() ?? "";
+        return normalized switch
+        {
+            "code_quality" or "codequality" => IssueType.CodeQuality,
+            "bug" => IssueType.Bug,
+            "suggestion" => IssueType.Suggestion,
+            "concern" => IssueType.Concern,
+            "workflow" => IssueType.Workflow,
+            _ when string.IsNullOrEmpty(normalized) => throw new ArgumentException("Issue type is required."),
+            _ => throw new ArgumentException($"Unknown issue type '{value}'"),
+        };
+    }
+
+    /// <summary>
+    /// Parses an issue severity string into an <see cref="IssueSeverity"/>. Null-safe:
+    /// null or empty input throws <see cref="ArgumentException"/> instead of
+    /// <see cref="NullReferenceException"/>.
+    /// </summary>
+    internal static IssueSeverity ParseIssueSeverity(string? value)
+    {
+        var normalized = value?.ToLowerInvariant().Trim() ?? "";
+        return normalized switch
+        {
+            "low" => IssueSeverity.Low,
+            "medium" => IssueSeverity.Medium,
+            "high" => IssueSeverity.High,
+            _ when string.IsNullOrEmpty(normalized) => throw new ArgumentException("Issue severity is required."),
+            _ => throw new ArgumentException($"Unknown severity '{value}'"),
+        };
+    }
 }

@@ -371,7 +371,7 @@ public class GoalBrainActorTests
             Assert.Same(compaction, configured.CompactionClient);
             Assert.Equal(
                 ["escalate_to_composer", "report_iteration_plan", "get_goal", "search_knowledge",
-                 "read_document", "traverse_graph", "get_current_time", "list_config_files", "read_config_file"],
+                 "read_document", "traverse_graph", "get_current_time", "list_config_files", "read_config_file", "raise_issue"],
                 configured.CustomTools.Select(tool => tool.Name));
             Assert.DoesNotContain(configured.CustomTools, tool => tool.Name == "original_tool");
         }
@@ -1109,14 +1109,14 @@ public class GoalBrainActorTests
         }
     }
     [Fact]
-    public async Task BuildTools_ReturnsNineTools()
+    public async Task BuildTools_ReturnsTenTools()
     {
         var dir = CreateTempDir();
         try
         {
             await using var actor = CreateActor(dir, FakeChatClient.Text("unused"));
             var tools = GetConfiguredOptions(actor).CustomTools;
-            Assert.Equal(9, tools.Count);
+            Assert.Equal(10, tools.Count);
         }
         finally { DeleteTempPath(dir); }
     }

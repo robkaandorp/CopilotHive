@@ -1202,6 +1202,7 @@ public sealed class DistributedBrainTests
         Assert.Contains("Improvers: Tell them to analyze results", systemPrompt);
         Assert.Contains("Use the testing phase results to verify that all tests pass", systemPrompt);
         Assert.Contains("progress-{goal-id}", systemPrompt);
+        Assert.Contains("raise_issue", systemPrompt);
     }
 
     // -- Target Repositories in Prompt Tests --

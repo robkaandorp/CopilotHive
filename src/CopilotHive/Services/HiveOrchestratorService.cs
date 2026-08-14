@@ -290,23 +290,6 @@ public sealed class HiveOrchestratorService(
         return (sessionId[..idx], sessionId[(idx + 1)..]);
     }
 
-    private static IssueType ParseIssueType(string value) => value.ToLowerInvariant().Trim() switch
-    {
-        "code_quality" or "codequality" => IssueType.CodeQuality,
-        "bug" => IssueType.Bug,
-        "suggestion" => IssueType.Suggestion,
-        "concern" => IssueType.Concern,
-        "workflow" => IssueType.Workflow,
-        _ => throw new ArgumentException($"Unknown issue type '{value}'"),
-    };
-    private static IssueSeverity ParseIssueSeverity(string value) => value.ToLowerInvariant().Trim() switch
-    {
-        "low" => IssueSeverity.Low,
-        "medium" => IssueSeverity.Medium,
-        "high" => IssueSeverity.High,
-        _ => throw new ArgumentException($"Unknown severity '{value}'"),
-    };
-
     /// <summary>
     /// Applies a task assignment to a worker: activates the task in the queue, marks the worker
     /// busy, and sets <see cref="ConnectedWorker.CurrentModel"/> from the task's requested model.
@@ -540,7 +523,7 @@ public sealed class HiveOrchestratorService(
                         IssueType parsedIssueType;
                         try
                         {
-                            parsedIssueType = ParseIssueType(issueType);
+                            parsedIssueType = IssueIdGenerator.ParseIssueType(issueType);
                         }
                         catch (ArgumentException ex)
                         {
@@ -551,7 +534,7 @@ public sealed class HiveOrchestratorService(
                         IssueSeverity parsedIssueSeverity;
                         try
                         {
-                            parsedIssueSeverity = ParseIssueSeverity(issueSeverity);
+                            parsedIssueSeverity = IssueIdGenerator.ParseIssueSeverity(issueSeverity);
                         }
                         catch (ArgumentException ex)
                         {

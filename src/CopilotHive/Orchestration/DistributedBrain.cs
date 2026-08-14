@@ -47,6 +47,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
     private readonly HiveConfigFile? _hiveConfig;
     private readonly LlmSessionRegistry? _sessionRegistry;
     private readonly ConfigRepoManager? _configRepo;
+    private readonly IIssueStore? _issueStore;
 
     /// <summary>
     /// Directory used for persistent Brain state (session files).
@@ -101,7 +102,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         HiveConfigFile? hiveConfig = null,
         LlmSessionRegistry? sessionRegistry = null,
         ConfigRepoManager? configRepo = null,
-        ReasoningEffort? reasoningEffort = null)
+        ReasoningEffort? reasoningEffort = null,
+        IIssueStore? issueStore = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -119,6 +121,7 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         _hiveConfig = hiveConfig;
         _sessionRegistry = sessionRegistry;
         _configRepo = configRepo;
+        _issueStore = issueStore;
         _configuredReasoningEffort = reasoningEffort;
         _reasoningEffort = reasoningEffort;
 
@@ -258,7 +261,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                     sessionRegistry: _sessionRegistry,
                     subAgentModels: _subAgentModels,
                     subAgentsEnabled: _subAgentsEnabled,
-                    configRepo: _configRepo);
+                    configRepo: _configRepo,
+                    issueStore: _issueStore);
             actor.Start();
 
             var connectMsg = BrainActorMessages.CreateConnectMessage();
