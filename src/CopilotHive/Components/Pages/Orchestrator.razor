@@ -31,31 +31,42 @@
 <h2 style="margin-top:1.5rem">Model Configuration</h2>
 <table>
     <thead>
-        <tr><th>Role</th><th>Model</th><th>Reasoning</th></tr>
+        <tr><th>Role</th><th>Model</th><th>Reasoning</th><th>Premium Model</th><th>Premium Reasoning</th></tr>
     </thead>
     <tbody>
         <tr>
             <td><span class="badge badge-yellow">brain</span></td>
-            <td style="font-family:monospace;font-size:0.85rem">@StripReasoning(_info.BrainModel)</td>
-            <td>@ReasoningBadge(_info.BrainModel)</td>
+            <td style="font-family:monospace;font-size:0.85rem">@_info.BrainModel</td>
+            <td>@ReasoningEffortOptions.Label(_info.BrainReasoningEffort)</td>
+            <td>—</td>
+            <td>—</td>
         </tr>
         <tr>
             <td><span class="badge badge-yellow">composer</span></td>
-            <td style="font-family:monospace;font-size:0.85rem">@StripReasoning(_info.ComposerModel)</td>
-            <td>@ReasoningBadge(_info.ComposerModel)</td>
+            <td style="font-family:monospace;font-size:0.85rem">@_info.ComposerModel</td>
+            <td>@ReasoningEffortOptions.Label(_info.ComposerReasoningEffort)</td>
+            <td>—</td>
+            <td>—</td>
         </tr>
-        @foreach (var (role, model) in _info.RoleModels)
+        @foreach (var role in _info.RoleModels.Keys)
         {
+            var roleKey = role.ToLowerInvariant();
+            var premiumModel = _info.RolePremiumModels.GetValueOrDefault(roleKey);
+            var hasPremium = !string.IsNullOrWhiteSpace(premiumModel);
             <tr>
                 <td><span class="badge badge-blue">@role</span></td>
-                <td style="font-family:monospace;font-size:0.85rem">@StripReasoning(model)</td>
-                <td>@ReasoningBadge(model)</td>
+                <td style="font-family:monospace;font-size:0.85rem">@_info.RoleModels.GetValueOrDefault(roleKey)</td>
+                <td>@ReasoningEffortOptions.Label(_info.RoleReasoningEfforts.GetValueOrDefault(roleKey))</td>
+                <td style="font-family:monospace;font-size:0.85rem">@(hasPremium ? premiumModel : "—")</td>
+                <td>@(hasPremium ? ReasoningEffortOptions.Label(_info.RolePremiumReasoningEfforts.GetValueOrDefault(roleKey)) : "—")</td>
             </tr>
         }
         <tr>
             <td><span class="badge badge-green">compaction</span></td>
-            <td style="font-family:monospace;font-size:0.85rem">@(string.IsNullOrEmpty(_info.CompactionModel) ? "(use main model)" : StripReasoning(_info.CompactionModel))</td>
-            <td>@ReasoningBadge(_info.CompactionModel ?? string.Empty)</td>
+            <td style="font-family:monospace;font-size:0.85rem">@(string.IsNullOrWhiteSpace(_info.CompactionModel) ? "(use main model)" : _info.CompactionModel)</td>
+            <td>—</td>
+            <td>—</td>
+            <td>—</td>
         </tr>
     </tbody>
 </table>
@@ -164,6 +175,7 @@ else
                     <th>Type</th>
                     <th>Goal</th>
                     <th>Model</th>
+                    <th>Reasoning</th>
                     <th>Context</th>
                     <th>Status</th>
                     <th>Last Activity</th>
@@ -185,6 +197,7 @@ else
                             }
                         </td>
                         <td>@session.Model</td>
+                        <td>@ReasoningEffortOptions.Label(session.ReasoningEffort)</td>
                         <td>
                             <div class="session-context-bar">
                                 <div class="session-context-track">
@@ -343,39 +356,6 @@ else
         if (ago.TotalMinutes < 60) return $"{(int)ago.TotalMinutes}m ago";
         return $"{(int)ago.TotalHours}h ago";
     }
-
-    private static readonly HashSet<string> KnownReasoningLevels = new(StringComparer.OrdinalIgnoreCase)
-        { "none", "low", "medium", "high", "extra_high" };
-
-    private static string StripReasoning(string model)
-    {
-        var lastColon = model.LastIndexOf(':');
-        if (lastColon <= 0 || lastColon == model.Length - 1) return model;
-        var suffix = model[(lastColon + 1)..];
-        return KnownReasoningLevels.Contains(suffix) ? model[..lastColon] : model;
-    }
-
-    private static RenderFragment ReasoningBadge(string model) => builder =>
-    {
-        var lastColon = model.LastIndexOf(':');
-        if (lastColon <= 0 || lastColon == model.Length - 1) return;
-        var suffix = model[(lastColon + 1)..];
-        if (!KnownReasoningLevels.Contains(suffix)) return;
-
-        var color = suffix.ToLowerInvariant() switch
-        {
-            "extra_high" => "var(--red)",
-            "high" => "var(--accent)",
-            "medium" => "var(--green)",
-            "low" => "var(--text-muted)",
-            _ => "var(--text-muted)",
-        };
-        builder.OpenElement(0, "span");
-        builder.AddAttribute(1, "class", "badge");
-        builder.AddAttribute(2, "style", $"background:{color};color:#fff;font-size:0.7rem");
-        builder.AddContent(3, suffix);
-        builder.CloseElement();
-    };
 
     public void Dispose() => State.OnStateChanged -= RefreshState;
 

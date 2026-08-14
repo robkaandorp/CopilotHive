@@ -27,6 +27,7 @@
                 <th>Worker ID</th>
                 <th>Role</th>
                 <th>Model</th>
+                <th>Reasoning</th>
                 <th>Ctx</th>
                 <th>Status</th>
                 <th>Current Task</th>
@@ -37,6 +38,7 @@
         <tbody>
             @foreach (var w in _snap.Workers)
             {
+                var modelStr = w.GetDisplayModel(_info.RoleModels);
                 <tr>
                     <td style="font-family:monospace;font-size:0.85rem">
                         <a href="/workers/@w.Id" style="color:var(--accent);text-decoration:none">@w.Id[..Math.Min(12, w.Id.Length)]</a>
@@ -52,16 +54,17 @@
                         }
                     </td>
                     <td style="font-family:monospace;font-size:0.85rem;color:var(--text-muted)">
-                        @{ var modelStr = w.GetDisplayModel(_info.RoleModels); }
-                        @if (modelStr is not null)
+                        @if (!string.IsNullOrEmpty(modelStr))
                         {
-                            @StripReasoning(modelStr)
-                            @ReasoningBadge(modelStr)
+                            @modelStr
                         }
                         else
                         {
                             <text>—</text>
                         }
+                    </td>
+                    <td style="font-size:0.85rem">
+                        @ReasoningLabelFor(w, modelStr)
                     </td>
                     <td style="font-family:monospace;font-size:0.85rem">
                         @if (w.IsBusy && w.ContextUsagePercent > 0)
@@ -124,38 +127,27 @@ else
         return $"{(int)ago.TotalHours}h {ago.Minutes}m ago";
     }
 
-    private static readonly HashSet<string> KnownReasoningLevels = new(StringComparer.OrdinalIgnoreCase)
-        { "none", "low", "medium", "high", "extra_high" };
-
-    private static string StripReasoning(string model)
+    /// <summary>
+    /// Resolves the reasoning-effort label for a worker row. The worker may be running either the
+    /// role's standard model or its premium model, so the displayed model decides which configured
+    /// reasoning effort applies. Anything else (unknown model, no model) renders as an em dash.
+    /// </summary>
+    private string ReasoningLabelFor(WorkerInfo w, string? displayedModel)
     {
-        var lastColon = model.LastIndexOf(':');
-        if (lastColon <= 0 || lastColon == model.Length - 1) return model;
-        var suffix = model[(lastColon + 1)..];
-        return KnownReasoningLevels.Contains(suffix) ? model[..lastColon] : model;
+        if (string.IsNullOrEmpty(displayedModel)) return "—";
+
+        var roleKey = w.Role.ToLowerInvariant();
+        var premiumModel = _info.RolePremiumModels.GetValueOrDefault(roleKey);
+        var standardModel = _info.RoleModels.GetValueOrDefault(roleKey);
+
+        if (string.Equals(displayedModel, premiumModel, StringComparison.OrdinalIgnoreCase))
+            return ReasoningEffortOptions.Label(_info.RolePremiumReasoningEfforts.GetValueOrDefault(roleKey));
+
+        if (string.Equals(displayedModel, standardModel, StringComparison.OrdinalIgnoreCase))
+            return ReasoningEffortOptions.Label(_info.RoleReasoningEfforts.GetValueOrDefault(roleKey));
+
+        return "—";
     }
-
-    private static RenderFragment ReasoningBadge(string model) => builder =>
-    {
-        var lastColon = model.LastIndexOf(':');
-        if (lastColon <= 0 || lastColon == model.Length - 1) return;
-        var suffix = model[(lastColon + 1)..];
-        if (!KnownReasoningLevels.Contains(suffix)) return;
-
-        var color = suffix.ToLowerInvariant() switch
-        {
-            "extra_high" => "var(--red)",
-            "high" => "var(--accent)",
-            "medium" => "var(--green)",
-            "low" => "var(--text-muted)",
-            _ => "var(--text-muted)",
-        };
-        builder.OpenElement(0, "span");
-        builder.AddAttribute(1, "class", "badge");
-        builder.AddAttribute(2, "style", $"background:{color};color:#fff;font-size:0.7rem;margin-left:0.5rem");
-        builder.AddContent(3, suffix);
-        builder.CloseElement();
-    };
 
     public void Dispose() => State.OnStateChanged -= RefreshState;
 }

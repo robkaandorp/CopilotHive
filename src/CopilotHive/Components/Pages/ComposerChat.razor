@@ -222,9 +222,9 @@ else
                     }
                 </select>
                 <select disabled="@Composer.IsStreaming" class="chat-model-select" @onchange="HandleReasoningChange">
-                    @foreach (var effort in ReasoningOptions)
+                    @foreach (var option in ReasoningEffortOptions.Options)
                     {
-                        <option value="@ReasoningEffortConverter.Format(effort)" selected="@(_selectedReasoning == effort)">@ReasoningLabel(effort)</option>
+                        <option value="@ReasoningEffortOptions.WireValue(option.Value)" selected="@(_selectedReasoning == option.Value)">@option.Label</option>
                     }
                 </select>
                 <button @onclick="ResetSession" disabled="@Composer.IsStreaming" class="chat-action-btn">
@@ -300,32 +300,6 @@ else
     private string? _attachmentError;
     private IJSObjectReference? _pasteModule;
     private DotNetObjectReference<ComposerChat>? _pasteDotNetRef;
-
-    /// <summary>
-    /// The reasoning levels offered by the dropdown, in ascending order.
-    /// </summary>
-    internal static readonly ReasoningEffort[] ReasoningOptions =
-    [
-        ReasoningEffort.None,
-        ReasoningEffort.Low,
-        ReasoningEffort.Medium,
-        ReasoningEffort.High,
-        ReasoningEffort.ExtraHigh,
-    ];
-
-    /// <summary>
-    /// Human-readable dropdown label for a reasoning level. The wire value stays the canonical
-    /// snake_case form produced by <see cref="ReasoningEffortConverter.Format(ReasoningEffort?)"/>.
-    /// </summary>
-    internal static string ReasoningLabel(ReasoningEffort effort) => effort switch
-    {
-        ReasoningEffort.None => "None",
-        ReasoningEffort.Low => "Low",
-        ReasoningEffort.Medium => "Medium",
-        ReasoningEffort.High => "High",
-        ReasoningEffort.ExtraHigh => "Extra High",
-        _ => throw new InvalidOperationException($"Unhandled reasoning effort '{effort}'.")
-    };
 
     /// <summary>
     /// JSON options for the API calls this page makes. They MUST match the server's global

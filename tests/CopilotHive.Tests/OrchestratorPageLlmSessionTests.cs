@@ -3,6 +3,8 @@ using System.Text;
 
 using CopilotHive.Dashboard;
 
+using Microsoft.Extensions.AI;
+
 namespace CopilotHive.Tests;
 
 /// <summary>
@@ -51,7 +53,7 @@ public sealed class OrchestratorPageLlmSessionTests
         sb.Append("<div class=\"card\" style=\"margin-top:1rem\">");
         sb.Append("<h2 style=\"font-size:1rem;font-weight:600;margin-bottom:0.75rem\">LLM Sessions</h2>");
         sb.Append("<table class=\"data-table\">");
-        sb.Append("<thead><tr><th>Type</th><th>Goal</th><th>Model</th><th>Context</th><th>Status</th><th>Last Activity</th></tr></thead>");
+        sb.Append("<thead><tr><th>Type</th><th>Goal</th><th>Model</th><th>Reasoning</th><th>Context</th><th>Status</th><th>Last Activity</th></tr></thead>");
         sb.Append("<tbody>");
 
         foreach (var session in sessions)
@@ -71,6 +73,7 @@ public sealed class OrchestratorPageLlmSessionTests
             sb.Append("</td>");
 
             sb.Append(CultureInfo.InvariantCulture, $"<td>{session.Model}</td>");
+            sb.Append(CultureInfo.InvariantCulture, $"<td>{ReasoningEffortOptions.Label(session.ReasoningEffort)}</td>");
 
             sb.Append("<td>");
             sb.Append("<div class=\"session-context-bar\">");
@@ -212,6 +215,89 @@ public sealed class OrchestratorPageLlmSessionTests
 
         Assert.Contains("<span style=\"color:var(--text-muted)\">—</span>", html);
         Assert.DoesNotContain("<a href=\"/goals/", html);
+    }
+
+    [Fact]
+    public void Section_IncludesReasoningHeader()
+    {
+        var session = new LlmSessionInfo
+        {
+            SessionId = "brain-master",
+            SessionType = LlmSessionType.Brain,
+            Model = "copilot/brain-model",
+            Status = "idle",
+            GoalId = null,
+            CurrentTokens = 0,
+            MaxTokens = 10_000,
+            LastActivity = DateTime.UtcNow,
+        };
+
+        var html = BuildSectionHtml([session]);
+
+        Assert.Contains("<th>Reasoning</th>", html);
+    }
+
+    [Fact]
+    public void SessionRow_ReasoningEffortHigh_RendersHigh()
+    {
+        var session = new LlmSessionInfo
+        {
+            SessionId = "brain-master",
+            SessionType = LlmSessionType.Brain,
+            Model = "copilot/brain-model",
+            Status = "idle",
+            GoalId = null,
+            CurrentTokens = 0,
+            MaxTokens = 10_000,
+            LastActivity = DateTime.UtcNow,
+            ReasoningEffort = ReasoningEffort.High,
+        };
+
+        var html = BuildSectionHtml([session]);
+
+        Assert.Contains("<td>High</td>", html);
+    }
+
+    [Fact]
+    public void SessionRow_NullReasoning_RendersEmDash()
+    {
+        var session = new LlmSessionInfo
+        {
+            SessionId = "brain-master",
+            SessionType = LlmSessionType.Brain,
+            Model = "copilot/brain-model",
+            Status = "idle",
+            GoalId = null,
+            CurrentTokens = 0,
+            MaxTokens = 10_000,
+            LastActivity = DateTime.UtcNow,
+            ReasoningEffort = null,
+        };
+
+        var html = BuildSectionHtml([session]);
+
+        Assert.Contains("<td>—</td>", html);
+    }
+
+    [Fact]
+    public void SessionRow_ReasoningEffortExtraHigh_RendersExtraHigh()
+    {
+        var session = new LlmSessionInfo
+        {
+            SessionId = "brain-master",
+            SessionType = LlmSessionType.Brain,
+            Model = "copilot/brain-model",
+            Status = "idle",
+            GoalId = null,
+            CurrentTokens = 0,
+            MaxTokens = 10_000,
+            LastActivity = DateTime.UtcNow,
+            ReasoningEffort = ReasoningEffort.ExtraHigh,
+        };
+
+        var html = BuildSectionHtml([session]);
+
+        Assert.Contains("<td>Extra High</td>", html);
     }
 
     // ── helper behavior ───────────────────────────────────────────────────────

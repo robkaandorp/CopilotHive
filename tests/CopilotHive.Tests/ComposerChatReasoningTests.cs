@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 
 using CopilotHive.Components.Pages;
+using CopilotHive.Dashboard;
 using CopilotHive.Services;
 
 using Microsoft.Extensions.AI;
@@ -129,7 +130,7 @@ public sealed class ComposerChatReasoningTests
                 ReasoningEffort.High,
                 ReasoningEffort.ExtraHigh,
             },
-            ComposerChat.ReasoningOptions);
+            ReasoningEffortOptions.Options.Select(o => o.Value));
     }
 
     [Theory]
@@ -140,13 +141,13 @@ public sealed class ComposerChatReasoningTests
     [InlineData(ReasoningEffort.ExtraHigh, "Extra High")]
     public void ReasoningLabel_UsesCapitalizedDisplayText(ReasoningEffort effort, string expected)
     {
-        Assert.Equal(expected, ComposerChat.ReasoningLabel(effort));
+        Assert.Equal(expected, ReasoningEffortOptions.Label(effort));
     }
 
     [Fact]
     public void ReasoningLabel_UnknownValue_Throws()
     {
-        Assert.Throws<InvalidOperationException>(() => ComposerChat.ReasoningLabel((ReasoningEffort)999));
+        Assert.Throws<InvalidOperationException>(() => ReasoningEffortOptions.Label((ReasoningEffort)999));
     }
 
     // ── Client JSON options must match the server's global converter ─────────

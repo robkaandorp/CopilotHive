@@ -1,7 +1,9 @@
 @page "/configuration"
 @using CopilotHive.Configuration
 @using CopilotHive.Dashboard
+@using CopilotHive.Services
 @using Markdig
+@using Microsoft.Extensions.AI
 @using System.Net.Http.Json
 @using System.Text.Json.Serialization
 @implements IDisposable
@@ -63,11 +65,10 @@ else
                         }
                     </select>
                     <select @bind="_orchestratorReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
-                        <option value="none">None</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="extra_high">Extra High</option>
+                        @foreach (var opt in ReasoningEffortOptions.Options)
+                        {
+                            <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
+                        }
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Composer</label>
@@ -78,11 +79,10 @@ else
                         }
                     </select>
                     <select @bind="_composerReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
-                        <option value="none">None</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="extra_high">Extra High</option>
+                        @foreach (var opt in ReasoningEffortOptions.Options)
+                        {
+                            <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
+                        }
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Coder</label>
@@ -93,11 +93,10 @@ else
                         }
                     </select>
                     <select @bind="_coderReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
-                        <option value="none">None</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="extra_high">Extra High</option>
+                        @foreach (var opt in ReasoningEffortOptions.Options)
+                        {
+                            <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
+                        }
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Premium Coder</label>
@@ -109,11 +108,10 @@ else
                         }
                     </select>
                     <select @bind="_coderPremiumReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
-                        <option value="none">None</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="extra_high">Extra High</option>
+                        @foreach (var opt in ReasoningEffortOptions.Options)
+                        {
+                            <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
+                        }
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Tester</label>
@@ -124,11 +122,10 @@ else
                         }
                     </select>
                     <select @bind="_testerReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
-                        <option value="none">None</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="extra_high">Extra High</option>
+                        @foreach (var opt in ReasoningEffortOptions.Options)
+                        {
+                            <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
+                        }
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Premium Tester</label>
@@ -140,11 +137,10 @@ else
                         }
                     </select>
                     <select @bind="_testerPremiumReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
-                        <option value="none">None</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="extra_high">Extra High</option>
+                        @foreach (var opt in ReasoningEffortOptions.Options)
+                        {
+                            <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
+                        }
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Reviewer</label>
@@ -155,11 +151,10 @@ else
                         }
                     </select>
                     <select @bind="_reviewerReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
-                        <option value="none">None</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="extra_high">Extra High</option>
+                        @foreach (var opt in ReasoningEffortOptions.Options)
+                        {
+                            <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
+                        }
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Premium Reviewer</label>
@@ -171,11 +166,10 @@ else
                         }
                     </select>
                     <select @bind="_reviewerPremiumReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
-                        <option value="none">None</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="extra_high">Extra High</option>
+                        @foreach (var opt in ReasoningEffortOptions.Options)
+                        {
+                            <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
+                        }
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Doc Writer</label>
@@ -186,11 +180,10 @@ else
                         }
                     </select>
                     <select @bind="_docwriterReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
-                        <option value="none">None</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="extra_high">Extra High</option>
+                        @foreach (var opt in ReasoningEffortOptions.Options)
+                        {
+                            <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
+                        }
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Premium Doc Writer</label>
@@ -202,11 +195,10 @@ else
                         }
                     </select>
                     <select @bind="_docwriterPremiumReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
-                        <option value="none">None</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="extra_high">Extra High</option>
+                        @foreach (var opt in ReasoningEffortOptions.Options)
+                        {
+                            <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
+                        }
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Improver</label>
@@ -217,11 +209,10 @@ else
                         }
                     </select>
                     <select @bind="_improverReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
-                        <option value="none">None</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="extra_high">Extra High</option>
+                        @foreach (var opt in ReasoningEffortOptions.Options)
+                        {
+                            <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
+                        }
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Premium Improver</label>
@@ -233,11 +224,10 @@ else
                         }
                     </select>
                     <select @bind="_improverPremiumReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
-                        <option value="none">None</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="extra_high">Extra High</option>
+                        @foreach (var opt in ReasoningEffortOptions.Options)
+                        {
+                            <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
+                        }
                     </select>
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Compaction model</label>
@@ -482,11 +472,10 @@ else
                             <label style="color:var(--text-muted);font-size:0.9rem">Reasoning Effort</label>
                             <select @bind="_newSubAgentModelReasoningEffort"
                                     style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
-                                <option value="none">None</option>
-                                <option value="low">Low</option>
-                                <option value="medium">Medium</option>
-                                <option value="high">High</option>
-                                <option value="extra_high">Extra High</option>
+                                @foreach (var opt in ReasoningEffortOptions.Options)
+                                {
+                                    <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
+                                }
                             </select>
 
                             <label style="color:var(--text-muted);font-size:0.9rem">Description</label>
@@ -545,11 +534,10 @@ else
                                         <td style="padding:0.5rem">
                                             <select @bind="_editSubAgentModelReasoningEffort"
                                                     style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;cursor:pointer">
-                                                <option value="none">None</option>
-                                                <option value="low">Low</option>
-                                                <option value="medium">Medium</option>
-                                                <option value="high">High</option>
-                                                <option value="extra_high">Extra High</option>
+                                                @foreach (var opt in ReasoningEffortOptions.Options)
+                                                {
+                                                    <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
+                                                }
                                             </select>
                                         </td>
                                         <td style="padding:0.5rem">
@@ -574,7 +562,7 @@ else
                                     {
                                         <td style="white-space:nowrap;padding:0.5rem;font-size:0.9rem">@sam.Name</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(sam.ContextWindow?.ToString() ?? "—")</td>
-                                        <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(sam.ReasoningEffort) ? "none" : sam.ReasoningEffort)</td>
+                                        <td style="padding:0.5rem;font-size:0.9rem">@ReasoningEffortOptions.Label(sam.ReasoningEffort)</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(string.IsNullOrEmpty(sam.Description) ? "—" : sam.Description)</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(sam.SupportsVision.HasValue ? (sam.SupportsVision.Value ? "true" : "false") : "—")</td>
                                         <td style="white-space:nowrap;padding:0.5rem;text-align:right">
@@ -996,6 +984,36 @@ else
     private const string WorkersTabName = "Workers";
     private const string ComposerTabName = "Composer";
 
+    /// <summary>
+    /// JSON options for every API call this page makes. They MUST match the server's global
+    /// converter (<c>AddHiveJsonOptions</c> in <c>Program.cs</c>) so snake_case enum values such
+    /// as <c>extra_high</c> round-trip through <see cref="ReasoningEffort"/> instead of being
+    /// carried as loose strings.
+    /// </summary>
+    private static readonly System.Text.Json.JsonSerializerOptions ApiJsonOptions =
+        new(System.Text.Json.JsonSerializerDefaults.Web)
+        {
+            Converters =
+            {
+                new JsonStringEnumConverter(System.Text.Json.JsonNamingPolicy.SnakeCaseLower, allowIntegerValues: false),
+            },
+        };
+
+    /// <summary>
+    /// Converts a dropdown wire value (<c>"none"</c>, <c>"extra_high"</c>, …) into a
+    /// <see cref="ReasoningEffort"/>. Empty input means "unset" and maps to <c>null</c>.
+    /// </summary>
+    private static ReasoningEffort? ParseReasoning(string? value) =>
+        string.IsNullOrEmpty(value) ? null : ReasoningEffortConverter.Parse(value);
+
+    /// <summary>
+    /// Converts a loaded <see cref="ReasoningEffort"/> into the wire value the
+    /// <c>&lt;select&gt;</c> elements bind to. An unset (null) effort falls back to <c>"none"</c>
+    /// so the dropdown always has a matching option selected.
+    /// </summary>
+    private static string WireOrNone(ReasoningEffort? effort) =>
+        ReasoningEffortOptions.WireValue(effort ?? ReasoningEffort.None);
+
     private sealed record ModelConfigResponse(
         [property: JsonPropertyName("orchestrator")]    string? Orchestrator,
         [property: JsonPropertyName("composer")]        string? Composer,
@@ -1003,10 +1021,10 @@ else
         [property: JsonPropertyName("workers")]         Dictionary<string, WorkerConfigDto>? Workers,
         [property: JsonPropertyName("availableModels")] List<ModelEntryDto>? AvailableModels,
         [property: JsonPropertyName("subAgentModels")]  List<ModelEntryDto>? SubAgentModels,
-        [property: JsonPropertyName("orchestratorReasoningEffort")] string? OrchestratorReasoningEffort,
-        [property: JsonPropertyName("composerReasoningEffort")] string? ComposerReasoningEffort,
-        [property: JsonPropertyName("workerReasoningEffort")] Dictionary<string, string?>? WorkerReasoningEffort,
-        [property: JsonPropertyName("workerPremiumReasoningEffort")] Dictionary<string, string?>? WorkerPremiumReasoningEffort);
+        [property: JsonPropertyName("orchestratorReasoningEffort")] ReasoningEffort? OrchestratorReasoningEffort,
+        [property: JsonPropertyName("composerReasoningEffort")] ReasoningEffort? ComposerReasoningEffort,
+        [property: JsonPropertyName("workerReasoningEffort")] Dictionary<string, ReasoningEffort?>? WorkerReasoningEffort,
+        [property: JsonPropertyName("workerPremiumReasoningEffort")] Dictionary<string, ReasoningEffort?>? WorkerPremiumReasoningEffort);
 
     private sealed record WorkerConfigDto(
         [property: JsonPropertyName("model")] string? Model,
@@ -1015,7 +1033,7 @@ else
     private sealed record ModelEntryDto(
         [property: JsonPropertyName("name")] string Name,
         [property: JsonPropertyName("contextWindow")] int? ContextWindow,
-        [property: JsonPropertyName("reasoningEffort")] string? ReasoningEffort,
+        [property: JsonPropertyName("reasoningEffort")] ReasoningEffort? ReasoningEffort,
         [property: JsonPropertyName("description")] string? Description,
         [property: JsonPropertyName("supportsVision")] bool? SupportsVision = null);
 
@@ -1253,7 +1271,7 @@ else
         _modelsLoading = true;
         try
         {
-            _modelsData = await HttpClient.GetFromJsonAsync<ModelConfigResponse>("/api/config/models");
+            _modelsData = await HttpClient.GetFromJsonAsync<ModelConfigResponse>("/api/config/models", ApiJsonOptions);
             if (_modelsData is not null)
             {
                 _orchestratorModel = _modelsData.Orchestrator ?? "";
@@ -1275,18 +1293,18 @@ else
                 _docwriterPremiumModel    = _modelsData.Workers?.GetValueOrDefault("docwriter")?.PremiumModel ?? "";
                 _improverPremiumModel     = _modelsData.Workers?.GetValueOrDefault("improver")?.PremiumModel ?? "";
 
-                _orchestratorReasoningEffort = _modelsData.OrchestratorReasoningEffort ?? "none";
-                _composerReasoningEffort     = _modelsData.ComposerReasoningEffort ?? "none";
-                _coderReasoningEffort        = _modelsData.WorkerReasoningEffort?.GetValueOrDefault("coder") ?? "none";
-                _testerReasoningEffort       = _modelsData.WorkerReasoningEffort?.GetValueOrDefault("tester") ?? "none";
-                _reviewerReasoningEffort     = _modelsData.WorkerReasoningEffort?.GetValueOrDefault("reviewer") ?? "none";
-                _docwriterReasoningEffort    = _modelsData.WorkerReasoningEffort?.GetValueOrDefault("docwriter") ?? "none";
-                _improverReasoningEffort     = _modelsData.WorkerReasoningEffort?.GetValueOrDefault("improver") ?? "none";
-                _coderPremiumReasoningEffort     = _modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("coder") ?? "none";
-                _testerPremiumReasoningEffort    = _modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("tester") ?? "none";
-                _reviewerPremiumReasoningEffort  = _modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("reviewer") ?? "none";
-                _docwriterPremiumReasoningEffort = _modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("docwriter") ?? "none";
-                _improverPremiumReasoningEffort  = _modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("improver") ?? "none";
+                _orchestratorReasoningEffort = WireOrNone(_modelsData.OrchestratorReasoningEffort);
+                _composerReasoningEffort     = WireOrNone(_modelsData.ComposerReasoningEffort);
+                _coderReasoningEffort        = WireOrNone(_modelsData.WorkerReasoningEffort?.GetValueOrDefault("coder"));
+                _testerReasoningEffort       = WireOrNone(_modelsData.WorkerReasoningEffort?.GetValueOrDefault("tester"));
+                _reviewerReasoningEffort     = WireOrNone(_modelsData.WorkerReasoningEffort?.GetValueOrDefault("reviewer"));
+                _docwriterReasoningEffort    = WireOrNone(_modelsData.WorkerReasoningEffort?.GetValueOrDefault("docwriter"));
+                _improverReasoningEffort     = WireOrNone(_modelsData.WorkerReasoningEffort?.GetValueOrDefault("improver"));
+                _coderPremiumReasoningEffort     = WireOrNone(_modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("coder"));
+                _testerPremiumReasoningEffort    = WireOrNone(_modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("tester"));
+                _reviewerPremiumReasoningEffort  = WireOrNone(_modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("reviewer"));
+                _docwriterPremiumReasoningEffort = WireOrNone(_modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("docwriter"));
+                _improverPremiumReasoningEffort  = WireOrNone(_modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("improver"));
             }
         }
         catch (Exception ex)
@@ -1328,25 +1346,25 @@ else
                         ["improver"]   = _improverPremiumModel,
                     },
                     compactionModel = _compactionModel,
-                    orchestratorReasoningEffort = _orchestratorReasoningEffort,
-                    composerReasoningEffort = _composerReasoningEffort,
-                    workerReasoningEffort = new Dictionary<string, string?>
+                    orchestratorReasoningEffort = ParseReasoning(_orchestratorReasoningEffort),
+                    composerReasoningEffort = ParseReasoning(_composerReasoningEffort),
+                    workerReasoningEffort = new Dictionary<string, ReasoningEffort?>
                     {
-                        ["coder"]     = _coderReasoningEffort,
-                        ["tester"]    = _testerReasoningEffort,
-                        ["reviewer"]  = _reviewerReasoningEffort,
-                        ["docwriter"] = _docwriterReasoningEffort,
-                        ["improver"]  = _improverReasoningEffort,
+                        ["coder"]     = ParseReasoning(_coderReasoningEffort),
+                        ["tester"]    = ParseReasoning(_testerReasoningEffort),
+                        ["reviewer"]  = ParseReasoning(_reviewerReasoningEffort),
+                        ["docwriter"] = ParseReasoning(_docwriterReasoningEffort),
+                        ["improver"]  = ParseReasoning(_improverReasoningEffort),
                     },
-                    workerPremiumReasoningEffort = new Dictionary<string, string?>
+                    workerPremiumReasoningEffort = new Dictionary<string, ReasoningEffort?>
                     {
-                        ["coder"]     = _coderPremiumReasoningEffort,
-                        ["tester"]    = _testerPremiumReasoningEffort,
-                        ["reviewer"]  = _reviewerPremiumReasoningEffort,
-                        ["docwriter"] = _docwriterPremiumReasoningEffort,
-                        ["improver"]  = _improverPremiumReasoningEffort,
+                        ["coder"]     = ParseReasoning(_coderPremiumReasoningEffort),
+                        ["tester"]    = ParseReasoning(_testerPremiumReasoningEffort),
+                        ["reviewer"]  = ParseReasoning(_reviewerPremiumReasoningEffort),
+                        ["docwriter"] = ParseReasoning(_docwriterPremiumReasoningEffort),
+                        ["improver"]  = ParseReasoning(_improverPremiumReasoningEffort),
                     },
-                }),
+                }, ApiJsonOptions),
                 System.Text.Encoding.UTF8,
                 "application/json");
 
@@ -1380,7 +1398,7 @@ else
         _backupsLoading = true;
         try
         {
-            _backups = await HttpClient.GetFromJsonAsync<List<BackupInfoResponse>>("/api/backup") ?? [];
+            _backups = await HttpClient.GetFromJsonAsync<List<BackupInfoResponse>>("/api/backup", ApiJsonOptions) ?? [];
             _backupError = null;
         }
         catch (Exception ex)
@@ -1436,7 +1454,7 @@ else
         _reposLoading = true;
         try
         {
-            _repositories = await HttpClient.GetFromJsonAsync<List<RepositoryDto>>("/api/config/repositories") ?? [];
+            _repositories = await HttpClient.GetFromJsonAsync<List<RepositoryDto>>("/api/config/repositories", ApiJsonOptions) ?? [];
             _repoError = null;
         }
         catch (Exception ex)
@@ -1452,7 +1470,7 @@ else
         _orchestratorLoading = true;
         try
         {
-            _orchestratorData = await HttpClient.GetFromJsonAsync<OrchestratorConfigResponse>("/api/config/orchestrator");
+            _orchestratorData = await HttpClient.GetFromJsonAsync<OrchestratorConfigResponse>("/api/config/orchestrator", ApiJsonOptions);
             if (_orchestratorData is not null)
             {
                 _orchMaxIterations = _orchestratorData.MaxIterations;
@@ -1475,7 +1493,7 @@ else
         _workersLoading = true;
         try
         {
-            _workersData = await HttpClient.GetFromJsonAsync<Dictionary<string, WorkerResponseDto>>("/api/config/workers");
+            _workersData = await HttpClient.GetFromJsonAsync<Dictionary<string, WorkerResponseDto>>("/api/config/workers", ApiJsonOptions);
             if (_workersData is not null)
             {
                 _coderContextWindow = _workersData.GetValueOrDefault("coder")?.ContextWindow ?? 0;
@@ -1497,7 +1515,7 @@ else
         _composerLoading = true;
         try
         {
-            _composerData = await HttpClient.GetFromJsonAsync<ComposerConfigResponse>("/api/config/composer");
+            _composerData = await HttpClient.GetFromJsonAsync<ComposerConfigResponse>("/api/config/composer", ApiJsonOptions);
             if (_composerData is not null)
             {
                 _composerMaxSteps = _composerData.MaxSteps;
@@ -1531,7 +1549,7 @@ else
                     verboseLogging = _orchVerboseLogging,
                     brainMaxSteps = _orchBrainMaxSteps,
                     branchCleanupDelayHours = _orchBranchCleanupDelayHours,
-                }),
+                }, ApiJsonOptions),
                 System.Text.Encoding.UTF8,
                 "application/json");
             var response = await HttpClient.PatchAsync("/api/config/orchestrator", body);
@@ -1570,7 +1588,7 @@ else
                     ["reviewer"] = _reviewerContextWindow,
                     ["docwriter"] = _docwriterContextWindow,
                     ["improver"] = _improverContextWindow,
-                }),
+                }, ApiJsonOptions),
                 System.Text.Encoding.UTF8,
                 "application/json");
             var response = await HttpClient.PatchAsync("/api/config/workers", body);
@@ -1605,7 +1623,7 @@ else
                 System.Text.Json.JsonSerializer.Serialize(new
                 {
                     maxSteps = _composerMaxSteps,
-                }),
+                }, ApiJsonOptions),
                 System.Text.Encoding.UTF8,
                 "application/json");
             var response = await HttpClient.PatchAsync("/api/config/composer", body);
@@ -1649,7 +1667,7 @@ else
                 release = new { mergeTo = string.IsNullOrWhiteSpace(_newRepoMergeTo) ? null : _newRepoMergeTo, tagBranch = string.IsNullOrWhiteSpace(_newRepoTagBranch) ? null : _newRepoTagBranch };
             }
             var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new { name = _newRepoName, url = _newRepoUrl, defaultBranch = branch, release }),
+                System.Text.Json.JsonSerializer.Serialize(new { name = _newRepoName, url = _newRepoUrl, defaultBranch = branch, release }, ApiJsonOptions),
                 System.Text.Encoding.UTF8, "application/json");
             var response = await HttpClient.PostAsync("/api/config/repositories", body);
             if (response.IsSuccessStatusCode)
@@ -1694,7 +1712,7 @@ else
         try
         {
             var branches = await HttpClient.GetFromJsonAsync<List<string>>(
-                $"/api/config/repositories/{Uri.EscapeDataString(repo.Name)}/branches", token);
+                $"/api/config/repositories/{Uri.EscapeDataString(repo.Name)}/branches", ApiJsonOptions, token);
             if (generation == _branchFetchGeneration)
             {
                 _repoBranches = branches;
@@ -1739,7 +1757,7 @@ else
                 tagBranch = string.IsNullOrWhiteSpace(_editRepoTagBranch) ? null : _editRepoTagBranch
             };
             var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new { name = _editingRepoName, url = _editRepoUrl, defaultBranch = branch, release }),
+                System.Text.Json.JsonSerializer.Serialize(new { name = _editingRepoName, url = _editRepoUrl, defaultBranch = branch, release }, ApiJsonOptions),
                 System.Text.Encoding.UTF8, "application/json");
             var response = await HttpClient.PutAsync($"/api/config/repositories/{Uri.EscapeDataString(_editingRepoName)}", body);
             if (response.IsSuccessStatusCode)
@@ -1808,7 +1826,7 @@ else
         _availableModelsSuccess = null;
         try
         {
-            _discoveredModels = await HttpClient.GetFromJsonAsync<List<DiscoveredModelDto>>("/api/config/models/discover") ?? [];
+            _discoveredModels = await HttpClient.GetFromJsonAsync<List<DiscoveredModelDto>>("/api/config/models/discover", ApiJsonOptions) ?? [];
             _discoveredModels = _discoveredModels.OrderBy(m => m.Name ?? m.Id, StringComparer.OrdinalIgnoreCase).ToList();
             _selectedDiscoveredIds.Clear();
             _showDiscoveryModal = true;
@@ -1925,7 +1943,7 @@ else
                     contextWindow = _editModelContextWindow,
                     description = editDescription,
                     supportsVision = _editModelSupportsVision,
-                }),
+                }, ApiJsonOptions),
                 System.Text.Encoding.UTF8,
                 "application/json");
 
@@ -2009,13 +2027,13 @@ else
                 contextWindow,
                 description,
                 supportsVision,
-            }),
+            }, ApiJsonOptions),
             System.Text.Encoding.UTF8,
             "application/json");
         return HttpClient.PostAsync("/api/config/available-models", body);
     }
 
-    private Task<HttpResponseMessage> PostSubAgentModelAsync(string name, int? contextWindow, string? reasoningEffort, string? description, bool? supportsVision)
+    private Task<HttpResponseMessage> PostSubAgentModelAsync(string name, int? contextWindow, ReasoningEffort? reasoningEffort, string? description, bool? supportsVision)
     {
         var body = new StringContent(
             System.Text.Json.JsonSerializer.Serialize(new
@@ -2025,7 +2043,7 @@ else
                 reasoningEffort,
                 description,
                 supportsVision,
-            }),
+            }, ApiJsonOptions),
             System.Text.Encoding.UTF8,
             "application/json");
         return HttpClient.PostAsync("/api/config/sub-agent-models", body);
@@ -2042,7 +2060,7 @@ else
         }
         try
         {
-            var reasoning = _newSubAgentModelReasoningEffort;
+            var reasoning = ParseReasoning(_newSubAgentModelReasoningEffort);
             var description = string.IsNullOrWhiteSpace(_newSubAgentModelDescription) ? null : _newSubAgentModelDescription;
             var response = await PostSubAgentModelAsync(_newSubAgentModelName, _newSubAgentModelContextWindow, reasoning, description, _newSubAgentModelSupportsVision);
             if (response.IsSuccessStatusCode)
@@ -2076,7 +2094,7 @@ else
     {
         _editingSubAgentModelName = model.Name;
         _editSubAgentModelContextWindow = model.ContextWindow;
-        _editSubAgentModelReasoningEffort = model.ReasoningEffort ?? "none";
+        _editSubAgentModelReasoningEffort = ReasoningEffortOptions.WireValue(model.ReasoningEffort ?? ReasoningEffort.None);
         _editSubAgentModelDescription = model.Description ?? "";
         _editSubAgentModelSupportsVision = model.SupportsVision;
         _subAgentModelsError = null;
@@ -2096,7 +2114,7 @@ else
         _subAgentModelsSuccess = null;
         try
         {
-            var reasoning = _editSubAgentModelReasoningEffort;
+            var reasoning = ParseReasoning(_editSubAgentModelReasoningEffort);
             var description = string.IsNullOrWhiteSpace(_editSubAgentModelDescription) ? null : _editSubAgentModelDescription;
             var body = new StringContent(
                 System.Text.Json.JsonSerializer.Serialize(new
@@ -2106,7 +2124,7 @@ else
                     reasoningEffort = reasoning,
                     description,
                     supportsVision = _editSubAgentModelSupportsVision,
-                }),
+                }, ApiJsonOptions),
                 System.Text.Encoding.UTF8,
                 "application/json");
 
