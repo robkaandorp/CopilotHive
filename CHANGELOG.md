@@ -1,3 +1,23 @@
+## [0.27.0] — 2026-08-14
+
+### Added
+
+- **Per-assignment reasoning effort** — Reasoning effort (`none`/`low`/`medium`/`high`/`extra_high`) is now a separate config field on every model assignment (orchestrator, workers, premium workers, composer, sub-agent models) instead of being encoded as a `:suffix` in model names. Config validation at startup ensures every model assignment has a valid `reasoning_effort`. Breaking config change — existing configs must add `reasoning_effort` fields. No migration. (`copilothive-reasoning-config-schema`, `copilothive-reasoning-worker-transport`, `copilothive-reasoning-brain-composer`, `copilothive-reasoning-api-persistence`, `copilothive-reasoning-suffix-removal`, `copilothive-reasoning-overload-cleanup`, `copilothive-reasoning-enum-api`)
+- **Reasoning effort in dashboard** — Configuration page now has separate reasoning effort dropdowns for every model assignment. Orchestrator page shows reasoning per role (standard + premium), per LLM session, and for Brain/Composer. Workers page shows reasoning per displayed model. Composer chat has an editable reasoning dropdown that live-updates the running Composer. (`copilothive-reasoning-dashboard-ui`, `copilothive-reasoning-session-dto`, `copilothive-reasoning-ui-fixes`)
+- **Brain config repo access** — The Brain now has read-only `list_config_files` and `read_config_file` tools to access the config repo's `agents/*.agents.md` files, enabling accurate improver prompts based on the actual config repo content. (`copilothive-brain-config-repo-tools`)
+- **Duplicate available_models crash fix** — `GetSubAgentModels()` no longer crashes on duplicate model names (last-wins). (`copilothive-reasoning-config-schema`)
+
+### Changed
+
+- **Reasoning effort is now an enum** — All API contracts, DTOs, and runtime code use `ReasoningEffort?` enum instead of `string?`. Global `JsonStringEnumConverter` with snake_case naming for JSON serialization. `string?` only in YAML config classes and gRPC proto. (`copilothive-reasoning-enum-api`)
+- **Model names are plain** — Model names no longer carry `:reasoningEffort` suffixes anywhere in the system. Model option values in dropdowns are plain names. (`copilothive-reasoning-suffix-removal`)
+- **Composer model switch requires reasoning** — `SwitchModelAsync` now requires both model and reasoning effort parameters. The Composer chat sends both together. (`copilothive-reasoning-enum-api`)
+- **Example agents.md files renamed** — The project repo's `agents/*.agents.md` files renamed to `*.agents.md.example` to avoid confusion with the config repo's live files. (`a7e80f0`)
+
+### Fixed
+
+- **Failed-merge iteration display** — Iterations that pass review but fail the squash merge are now properly persisted and shown in the dashboard iteration tab bar. `PipelineDriver.HandleMergeFailureAsync` now marks the Merging phase as failed, builds/persists the iteration summary, then starts the retry. (`copilothive-fix-merge-fail-iteration-display`)
+
 ## [0.26.0] — 2026-08-04
 
 ### Added
