@@ -2079,9 +2079,11 @@ public sealed class ConfigModelServiceTests : IDisposable
 
         // Cancel the live token while the commit is blocked on the gate.
         await cts.CancelAsync();
-        repo.ReleaseGate.TrySetResult(true);
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => saveTask);
+#pragma warning disable xUnit1051 // Timeout-only WaitAsync is intentional: a timeout must surface as TimeoutException, not OCE
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => saveTask.WaitAsync(TimeSpan.FromSeconds(10)));
+#pragma warning restore xUnit1051
 
         Assert.Equal(0, brain.UpdateModelCalls);
         Assert.Empty(repo.Commits);
