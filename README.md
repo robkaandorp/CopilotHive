@@ -203,6 +203,7 @@ Goals are stored in **SQLite** (`copilothive.db`) as the primary source of truth
 - **Dashboard elapsed time display** — Fixed the elapsed time display in the Active Goals table to freeze at the final value when goals complete, rather than continuing to increment
 - **Iteration failure color fix** — Iteration tabs and phase indicators now correctly show red/failed status when a reviewer requests changes or tests fail, instead of always displaying green
 - **Version Display** — the CopilotHive version (read from assembly `InformationalVersion` metadata) is shown in the Dashboard navigation bar and footer. This makes it easy to verify which build is running without inspecting logs or binary metadata.
+- **Issue Tracking** — Workers and the Brain can raise issues during goal execution via a `raise_issue` tool. The Composer manages issues conversationally through `create_issue`, `list_issues`, `get_issue`, and `update_issue` tools. Issues are structured records (type: bug/code_quality/suggestion/concern/workflow, severity: low/medium/high) with a triage lifecycle (open → triaged → acknowledged → in_progress → resolved → closed), stored in the database via EF Core. REST API at `/api/issues` (GET/POST/PATCH/DELETE) with filtering. Dashboard page at `/issues` with filterable table, triage dropdowns, and inline create form. Issues can be linked to goals with tri-state semantics (set/clear/unchanged).
 
 ## Contributing
 
