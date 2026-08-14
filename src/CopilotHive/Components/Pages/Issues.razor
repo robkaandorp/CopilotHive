@@ -116,7 +116,7 @@
                 @foreach (var issue in _issues)
                 {
                     var isExpanded = _expandedIds.Contains(issue.Id);
-                    <tr style="cursor:pointer" @onclick="() => ToggleDetail(issue.Id)">
+                    <tr style="cursor:pointer" @onclick="() => ToggleDetail(issue.Id, issue)">
                         <td>
                             <span style="font-weight:500">@issue.Title</span>
                             <div style="font-size:0.75rem;color:var(--text-muted)">@issue.Id</div>
@@ -150,31 +150,31 @@
                                 <div style="display:flex;flex-wrap:wrap;gap:1rem;margin-bottom:0.75rem;align-items:flex-end">
                                     <div>
                                         <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Status</div>
-                                        <select value="@ToSnakeCase(issue.Status)" @onchange="(ChangeEventArgs e) => UpdateStatus(issue, e)"
+                                        <select @bind="_statusSelect[issue.Id]" @bind:after="() => UpdateStatus(issue)"
                                                 style="padding:0.4rem 0.6rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem">
                                             @foreach (var s in Enum.GetValues<IssueStatus>())
                                             {
-                                                <option value="@ToSnakeCase(s)" selected="@(ToSnakeCase(s) == ToSnakeCase(issue.Status))">@s</option>
+                                                <option value="@ToSnakeCase(s)">@s</option>
                                             }
                                         </select>
                                     </div>
                                     <div>
                                         <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Severity</div>
-                                        <select value="@ToSnakeCase(issue.Severity)" @onchange="(ChangeEventArgs e) => UpdateSeverity(issue, e)"
+                                        <select @bind="_severitySelect[issue.Id]" @bind:after="() => UpdateSeverity(issue)"
                                                 style="padding:0.4rem 0.6rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem">
                                             @foreach (var s in Enum.GetValues<IssueSeverity>())
                                             {
-                                                <option value="@ToSnakeCase(s)" selected="@(ToSnakeCase(s) == ToSnakeCase(issue.Severity))">@s</option>
+                                                <option value="@ToSnakeCase(s)">@s</option>
                                             }
                                         </select>
                                     </div>
                                     <div>
                                         <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Type</div>
-                                        <select value="@ToSnakeCase(issue.Type)" @onchange="(ChangeEventArgs e) => UpdateType(issue, e)"
+                                        <select @bind="_typeSelect[issue.Id]" @bind:after="() => UpdateType(issue)"
                                                 style="padding:0.4rem 0.6rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem">
                                             @foreach (var t in Enum.GetValues<IssueType>())
                                             {
-                                                <option value="@ToSnakeCase(t)" selected="@(ToSnakeCase(t) == ToSnakeCase(issue.Type))">@t</option>
+                                                <option value="@ToSnakeCase(t)">@t</option>
                                             }
                                         </select>
                                     </div>
@@ -256,6 +256,9 @@ else if (_loaded)
     private string _repoFilter = "";
     private readonly HashSet<string> _expandedIds = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _errors = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _statusSelect = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _severitySelect = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _typeSelect = new(StringComparer.Ordinal);
     private bool _showCreateForm;
     private string _createError = "";
     private bool _loaded;
@@ -291,20 +294,28 @@ else if (_loaded)
         }
     }
 
-    private void ToggleDetail(string id)
+    private void ToggleDetail(string id, IssueResponse issue)
     {
         if (!_expandedIds.Add(id))
+        {
             _expandedIds.Remove(id);
+        }
+        else
+        {
+            _statusSelect[id] = ToSnakeCase(issue.Status);
+            _severitySelect[id] = ToSnakeCase(issue.Severity);
+            _typeSelect[id] = ToSnakeCase(issue.Type);
+        }
     }
 
-    private async Task UpdateStatus(IssueResponse issue, ChangeEventArgs e) =>
-        await UpdateField(issue, "status", e.Value?.ToString() ?? "");
+    private async Task UpdateStatus(IssueResponse issue)
+        => await UpdateField(issue, "status", _statusSelect[issue.Id]);
 
-    private async Task UpdateSeverity(IssueResponse issue, ChangeEventArgs e) =>
-        await UpdateField(issue, "severity", e.Value?.ToString() ?? "");
+    private async Task UpdateSeverity(IssueResponse issue)
+        => await UpdateField(issue, "severity", _severitySelect[issue.Id]);
 
-    private async Task UpdateType(IssueResponse issue, ChangeEventArgs e) =>
-        await UpdateField(issue, "type", e.Value?.ToString() ?? "");
+    private async Task UpdateType(IssueResponse issue)
+        => await UpdateField(issue, "type", _typeSelect[issue.Id]);
 
     private async Task UpdateField(IssueResponse issue, string field, string newValue)
     {
@@ -337,11 +348,27 @@ else if (_loaded)
             // that still match (e.g. triaging an open issue to resolved while
             // filtering by status=open must remove it from the view).
             await LoadIssues();
+
+            var refreshed = _issues.FirstOrDefault(i => i.Id == issue.Id);
+            if (refreshed is not null)
+            {
+                _statusSelect[issue.Id] = ToSnakeCase(refreshed.Status);
+                _severitySelect[issue.Id] = ToSnakeCase(refreshed.Severity);
+                _typeSelect[issue.Id] = ToSnakeCase(refreshed.Type);
+            }
         }
         else
         {
             var errorContent = await response.Content.ReadAsStringAsync();
             _errors[issue.Id] = $"Error {(int)response.StatusCode}: {errorContent}";
+
+            var current = _issues.FirstOrDefault(i => i.Id == issue.Id);
+            if (current is not null)
+            {
+                _statusSelect[issue.Id] = ToSnakeCase(current.Status);
+                _severitySelect[issue.Id] = ToSnakeCase(current.Severity);
+                _typeSelect[issue.Id] = ToSnakeCase(current.Type);
+            }
         }
     }
 
