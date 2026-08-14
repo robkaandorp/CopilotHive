@@ -1072,18 +1072,23 @@ public class ConfigRepoManagerTests : IDisposable
             await RunGitCommandAsync(clone2Dir, ["fetch", "origin"]);
             // merge will fail with a conflict — this puts the repo in a merging state.
             var (_, _) = await RunGitCommandRawAsync(clone2Dir, ["merge", "origin/HEAD"]);
-            // Verify we're in a merging state (git status shows "unmerged paths").
-            var (statusBefore, _) = await RunGitCommandRawAsync(clone2Dir, ["status"]);
-            Assert.Contains("unmerged", statusBefore, StringComparison.OrdinalIgnoreCase);
+            // Verify merge is in progress (MERGE_HEAD exists) and config.txt is unmerged.
+            var (mergeHead, _) = await RunGitCommandRawAsync(clone2Dir, ["rev-parse", "--verify", "MERGE_HEAD"]);
+            Assert.False(string.IsNullOrWhiteSpace(mergeHead), "Expected MERGE_HEAD to exist after conflicting merge");
+
+            var (unmergedFiles, _) = await RunGitCommandRawAsync(clone2Dir, ["diff", "--name-only", "--diff-filter=U"]);
+            Assert.Contains("config.txt", unmergedFiles.Trim(), StringComparison.OrdinalIgnoreCase);
 
             // Act — ResetToRemoteAsync should abort the merge and reset to remote.
             var manager = new ConfigRepoManager(bareDir, clone2Dir);
             await manager.ResetToRemoteAsync(TestContext.Current.CancellationToken);
 
             // Assert — repo is no longer in a merging state.
-            var (statusAfter, _) = await RunGitCommandRawAsync(clone2Dir, ["status"]);
-            Assert.DoesNotContain("unmerged", statusAfter, StringComparison.OrdinalIgnoreCase);
-            Assert.DoesNotContain("MERGING", statusAfter, StringComparison.OrdinalIgnoreCase);
+            var (mergeHeadAfter, _) = await RunGitCommandRawAsync(clone2Dir, ["rev-parse", "--verify", "MERGE_HEAD"]);
+            Assert.True(string.IsNullOrWhiteSpace(mergeHeadAfter), "MERGE_HEAD should not exist after reset");
+
+            var (unmergedAfter, _) = await RunGitCommandRawAsync(clone2Dir, ["diff", "--name-only", "--diff-filter=U"]);
+            Assert.Equal("", unmergedAfter.Trim());
 
             // The local content should now match the remote.
             var localContent = await File.ReadAllTextAsync(
@@ -1091,7 +1096,8 @@ public class ConfigRepoManagerTests : IDisposable
             Assert.Equal("remote change\n", localContent);
 
             // Status should be clean.
-            Assert.Contains("working tree clean", statusAfter, StringComparison.OrdinalIgnoreCase);
+            var (porcelainAfter, _) = await RunGitCommandRawAsync(clone2Dir, ["status", "--porcelain"]);
+            Assert.Equal("", porcelainAfter.Trim());
         }
         finally
         {
