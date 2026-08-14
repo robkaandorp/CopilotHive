@@ -1,3 +1,9 @@
+## [0.27.1] — 2026-08-14
+
+### Fixed
+
+- **Release JSON deserialization error** — The global `JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower)` added in v0.27.0 changed the server's wire format for unannotated enums (e.g. `ReleaseStatus.Released` → `"released"`), but several Razor pages deserialized responses without the matching converter, causing "The JSON value could not be converted to ReleaseStatus" errors when marking a release as Released. Fixed by creating a shared `JsonSerializerOptions` with the converter in `CopilotHive.Dashboard`, used by all affected pages (`ReleaseDetail.razor`, `Releases.razor`, `ComposerChat.razor`, `Configuration.razor`). (`copilothive-fix-release-json-deserialization`)
+
 ## [0.27.0] — 2026-08-14
 
 ### Added
