@@ -666,6 +666,7 @@ public sealed class Program
             app.MapHealthEndpoints(_serverStartTime, _version);
             app.MapGoalEndpoints();
             app.MapReleaseEndpoints();
+            app.MapIssueEndpoints();
             app.MapClarificationEndpoints();
             app.MapSessionEndpoints();
             app.MapBackupEndpoints();
