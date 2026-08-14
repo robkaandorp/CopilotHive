@@ -445,6 +445,43 @@ public sealed class CopilotHiveDbContextTests
     // ── 8. Table and column names match existing schema ───────────────────
 
     [Fact]
+    public void DbContext_IssuesTable_IsCreated()
+    {
+        using var ctx = CopilotHiveDbContext.CreateInMemory();
+        var conn = GetSqliteConnection(ctx);
+
+        var tableNames = GetAllTableNames(conn);
+        Assert.Contains("issues", tableNames);
+
+        var issueColumns = GetTableColumns(conn, "issues");
+        Assert.Contains("id", issueColumns);
+        Assert.Contains("type", issueColumns);
+        Assert.Contains("title", issueColumns);
+        Assert.Contains("description", issueColumns);
+        Assert.Contains("severity", issueColumns);
+        Assert.Contains("status", issueColumns);
+        Assert.Contains("repository_names", issueColumns);
+        Assert.Contains("source_goal_id", issueColumns);
+        Assert.Contains("source_role", issueColumns);
+        Assert.Contains("source_iteration", issueColumns);
+        Assert.Contains("created_at", issueColumns);
+        Assert.Contains("updated_at", issueColumns);
+        Assert.Contains("resolved_at", issueColumns);
+        Assert.Contains("linked_goal_id", issueColumns);
+
+        var issueIndexes = GetIndexes(conn, "issues");
+        Assert.Contains(issueIndexes, idx =>
+            idx.Name.Contains("idx_issues_status", StringComparison.OrdinalIgnoreCase) &&
+            idx.Columns.Contains("status", StringComparer.OrdinalIgnoreCase));
+        Assert.Contains(issueIndexes, idx =>
+            idx.Name.Contains("idx_issues_source_goal", StringComparison.OrdinalIgnoreCase) &&
+            idx.Columns.Contains("source_goal_id", StringComparer.OrdinalIgnoreCase));
+        Assert.Contains(issueIndexes, idx =>
+            idx.Name.Contains("idx_issues_created_at", StringComparison.OrdinalIgnoreCase) &&
+            idx.Columns.Contains("created_at", StringComparer.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void DbContext_TableAndColumnNamesMatchExistingSchema()
     {
         using var ctx = CopilotHiveDbContext.CreateInMemory();
@@ -698,6 +735,50 @@ public sealed class CopilotHiveDbContextTests
         Assert.Contains("goal_iterations", tableNames);
         Assert.Contains("pipelines", tableNames);
         Assert.Contains("conversation_entries", tableNames);
+        Assert.Contains("issues", tableNames);
+    }
+
+    /// <summary>
+    /// Verifies that <see cref="DatabaseMigration.EnsureSchemaUpToDate"/> creates the issues
+    /// table and its indexes on a fresh database. This exercises the migration path (not
+    /// <c>EnsureCreated</c>) so a regression in schema reconciliation is caught.
+    /// </summary>
+    [Fact]
+    public void EnsureSchema_FreshDb_CreatesIssuesTable()
+    {
+        using var ctx = CreateEmptyDbContext();
+        var conn = GetSqliteConnection(ctx);
+
+        // Sanity: no tables exist yet.
+        Assert.Empty(GetAllTableNames(conn));
+
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+
+        var tableNames = GetAllTableNames(conn);
+        Assert.Contains("issues", tableNames);
+
+        // Verify the issues table columns.
+        var issueColumns = GetTableColumns(conn, "issues");
+        Assert.Contains("id", issueColumns);
+        Assert.Contains("type", issueColumns);
+        Assert.Contains("title", issueColumns);
+        Assert.Contains("description", issueColumns);
+        Assert.Contains("severity", issueColumns);
+        Assert.Contains("status", issueColumns);
+        Assert.Contains("repository_names", issueColumns);
+        Assert.Contains("source_goal_id", issueColumns);
+        Assert.Contains("source_role", issueColumns);
+        Assert.Contains("source_iteration", issueColumns);
+        Assert.Contains("created_at", issueColumns);
+        Assert.Contains("updated_at", issueColumns);
+        Assert.Contains("resolved_at", issueColumns);
+        Assert.Contains("linked_goal_id", issueColumns);
+
+        // Verify the issues indexes are created.
+        var indexNames = GetAllIndexNames(conn);
+        Assert.Contains("idx_issues_status", indexNames);
+        Assert.Contains("idx_issues_source_goal", indexNames);
+        Assert.Contains("idx_issues_created_at", indexNames);
     }
 
     [Fact]

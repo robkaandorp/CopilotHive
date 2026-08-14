@@ -461,6 +461,12 @@ public sealed class Program
                     sp.GetRequiredService<PipelineStore>(),
                     dbPath));
 
+            // Issues: EF Core-backed issue store
+            builder.Services.AddSingleton<IIssueStore>(sp =>
+                new IssueStore(
+                    sp.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>(),
+                    sp.GetRequiredService<ILogger<IssueStore>>()));
+
             builder.Services.AddSingleton(sp =>
             {
                 var manager = new GoalManager();

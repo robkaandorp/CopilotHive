@@ -50,6 +50,9 @@ public sealed class CopilotHiveDbContext : DbContext
     /// <summary>Users table (single-user admin model).</summary>
     public DbSet<UserEntity> Users { get; set; } = null!;
 
+    /// <summary>Issues table.</summary>
+    public DbSet<Issue> Issues { get; set; } = null!;
+
     /// <summary>
     /// Creates a new context instance for dependency injection.
     /// </summary>
@@ -88,6 +91,7 @@ public sealed class CopilotHiveDbContext : DbContext
         ConfigureConversationEntry(modelBuilder.Entity<ConversationEntryEntity>());
         ConfigureTaskMapping(modelBuilder.Entity<TaskMappingEntity>());
         ConfigureUser(modelBuilder.Entity<UserEntity>());
+        ConfigureIssue(modelBuilder.Entity<Issue>());
     }
 
     private static void ConfigureUser(EntityTypeBuilder<UserEntity> entity)
@@ -109,6 +113,31 @@ public sealed class CopilotHiveDbContext : DbContext
         entity.Property(e => e.LastLoginAt).HasColumnName("last_login_at");
 
         entity.HasIndex(e => e.GitHubId).IsUnique();
+    }
+
+    private static void ConfigureIssue(EntityTypeBuilder<Issue> entity)
+    {
+        entity.ToTable("issues");
+
+        entity.HasKey(e => e.Id);
+        entity.Property(e => e.Id).HasColumnName("id");
+        entity.Property(e => e.Type).HasColumnName("type").IsRequired().HasConversion(LowercaseEnumConverter<IssueType>());
+        entity.Property(e => e.Title).HasColumnName("title").IsRequired();
+        entity.Property(e => e.Description).HasColumnName("description").IsRequired();
+        entity.Property(e => e.Severity).HasColumnName("severity").IsRequired().HasConversion(LowercaseEnumConverter<IssueSeverity>()).HasDefaultValue(IssueSeverity.Low);
+        entity.Property(e => e.Status).HasColumnName("status").IsRequired().HasConversion(LowercaseEnumConverter<IssueStatus>()).HasDefaultValue(IssueStatus.Open);
+        entity.Property(e => e.RepositoryNames).HasColumnName("repository_names").HasJsonConversion<List<string>>();
+        entity.Property(e => e.SourceGoalId).HasColumnName("source_goal_id");
+        entity.Property(e => e.SourceRole).HasColumnName("source_role");
+        entity.Property(e => e.SourceIteration).HasColumnName("source_iteration");
+        entity.Property(e => e.CreatedAt).HasColumnName("created_at").IsRequired().HasConversion(DateTimeToIsoConverter);
+        entity.Property(e => e.UpdatedAt).HasColumnName("updated_at").HasConversion(DateTimeToIsoConverter);
+        entity.Property(e => e.ResolvedAt).HasColumnName("resolved_at").HasConversion(DateTimeToIsoConverter);
+        entity.Property(e => e.LinkedGoalId).HasColumnName("linked_goal_id");
+
+        entity.HasIndex(e => e.Status).HasDatabaseName("idx_issues_status");
+        entity.HasIndex(e => e.SourceGoalId).HasDatabaseName("idx_issues_source_goal");
+        entity.HasIndex(e => e.CreatedAt).HasDatabaseName("idx_issues_created_at").IsDescending();
     }
 
     private static void ConfigureTaskMapping(EntityTypeBuilder<TaskMappingEntity> entity)
