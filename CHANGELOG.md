@@ -1,3 +1,23 @@
+## [0.28.0] — 2026-08-14
+
+### Added — Issue Tracking System
+
+- **Issue data model & persistence** — `Issue` entity with `IssueType`, `IssueSeverity`, `IssueStatus` enums, EF Core configuration, and `IssueStore` with full CRUD. (`copilothive-issue-data-model`)
+- **Worker `raise_issue` tool** — Workers can raise issues via the existing gRPC tool-call mechanism. (`copilothive-issue-worker-tool`)
+- **Brain `raise_issue` tool** — The Brain can raise issues during planning or review when it notices problems out of scope for the current goal. (`copilothive-issue-brain-tool`)
+- **REST API for issues** — `GET`, `POST`, `PATCH`, `DELETE` endpoints under `/api/issues` with filtering by type, severity, status, and repository. (`copilothive-issue-api`)
+- **Issues dashboard page** — `/issues` page with filterable table, detail expansion, triage controls (status/severity/type dropdowns), and inline create form. (`copilothive-issue-dashboard`)
+- **Composer issue-management tools** — `create_issue`, `list_issues`, `get_issue`, `update_issue` tools so the Composer can manage issues conversationally. (`copilothive-issue-composer-tools`)
+- **Goal-issue linking** — `update_issue` supports `linked_goal_id` with tri-state semantics (null=unchanged, empty=clear, non-empty=set). (`copilothive-issue-composer-linked-goal`)
+
+### Fixed
+
+- **Issue detail dropdown preselection** — Triage dropdowns in the Issues page now show the issue's actual values instead of the first/last option. Root cause was `ToSnakeCase(Enum)` serializing via the abstract `System.Enum` type (converter never applied, all values became `{}`). Fixed by making the helper generic. Also includes concurrent `LoadIssues` protection via generation counter and single-expansion editing. (`copilothive-fix-issue-dropdowns`, `copilothive-fix-issue-dropdowns-v2`, `copilothive-fix-issue-dropdowns-v3`, `copilothive-fix-issue-dropdowns-root-cause`)
+- **No-op retry iteration display** — Iterations where the coder produces no file changes now persist their iteration summary before the retry, so the dashboard shows correct iteration data. (`copilothive-fix-noop-retry-iteration-display`)
+- **Flaky merge-test CI failure** — `ResetToRemoteAsync_AbortsActiveMerge` test no longer depends on human-readable `git status` output containing "unmerged". (`copilothive-fix-merge-test-ci-flaky`)
+- **Flaky cancelled-commit test** — `SaveModelConfigAsync_LiveTokenCancelledDuringCommit` no longer races between cancellation and `ReleaseGate.TrySetResult`. Removed the `TrySetResult` call and added a bounded timeout. (`copilothive-fix-cancelled-commit-test`)
+- **Test parallelism crashes** — Added `xunit.runner.json` with `maxParallelThreads: 4` to prevent `BadImageFormatException`/SIGBUS crashes under high parallel load. (`copilothive-fix-test-parallelism`)
+
 ## [0.27.1] — 2026-08-14
 
 ### Fixed
