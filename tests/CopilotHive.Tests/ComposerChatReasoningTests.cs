@@ -161,7 +161,7 @@ public sealed class ComposerChatReasoningTests
     public void ApiJsonOptions_DeserializesSnakeCaseReasoningEffort()
     {
         var value = JsonSerializer.Deserialize<ReasoningEffort?>(
-            "\"extra_high\"", ComposerChat.ApiJsonOptions);
+            "\"extra_high\"", ReasoningEffortOptions.JsonOptions);
 
         Assert.Equal(ReasoningEffort.ExtraHigh, value);
     }
@@ -169,7 +169,7 @@ public sealed class ComposerChatReasoningTests
     [Fact]
     public void ApiJsonOptions_SerializesReasoningEffortAsSnakeCase()
     {
-        var json = JsonSerializer.Serialize(ReasoningEffort.ExtraHigh, ComposerChat.ApiJsonOptions);
+        var json = JsonSerializer.Serialize(ReasoningEffort.ExtraHigh, ReasoningEffortOptions.JsonOptions);
 
         Assert.Equal("\"extra_high\"", json);
     }
@@ -179,12 +179,12 @@ public sealed class ComposerChatReasoningTests
     {
         // allowIntegerValues: false — matches the server so numeric values are never coerced.
         Assert.Throws<JsonException>(() =>
-            JsonSerializer.Deserialize<ReasoningEffort>("3", ComposerChat.ApiJsonOptions));
+            JsonSerializer.Deserialize<ReasoningEffort>("3", ReasoningEffortOptions.JsonOptions));
     }
 
     [Fact]
     public void ApiJsonOptions_CarriesSnakeCaseStringEnumConverter()
     {
-        Assert.Contains(ComposerChat.ApiJsonOptions.Converters, c => c is JsonStringEnumConverter);
+        Assert.Contains(ReasoningEffortOptions.JsonOptions.Converters, c => c is JsonStringEnumConverter);
     }
 }

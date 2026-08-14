@@ -286,7 +286,7 @@ else if (_loaded)
         var response = await HttpClient.PostAsync("/api/releases/", body);
         if (response.IsSuccessStatusCode)
         {
-            var created = await response.Content.ReadFromJsonAsync<Release>();
+            var created = await response.Content.ReadFromJsonAsync<Release>(ReasoningEffortOptions.JsonOptions);
             if (created is not null)
             {
                 _allReleases.Insert(0, created);

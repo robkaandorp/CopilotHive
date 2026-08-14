@@ -1,3 +1,6 @@
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
 using CopilotHive.Services;
 using Microsoft.Extensions.AI;
 
@@ -9,6 +12,16 @@ namespace CopilotHive.Dashboard;
 /// </summary>
 public static class ReasoningEffortOptions
 {
+    /// <summary>
+    /// Shared JSON options matching the server's global enum converter so that
+    /// snake_case enum values (e.g. <c>"released"</c>, <c>"extra_high"</c>)
+    /// deserialize correctly on the client side.
+    /// </summary>
+    public static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower, allowIntegerValues: false) },
+    };
+
     /// <summary>
     /// The reasoning levels offered by the UI, in ascending order, with their display labels.
     /// </summary>

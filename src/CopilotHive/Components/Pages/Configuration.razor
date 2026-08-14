@@ -985,21 +985,6 @@ else
     private const string ComposerTabName = "Composer";
 
     /// <summary>
-    /// JSON options for every API call this page makes. They MUST match the server's global
-    /// converter (<c>AddHiveJsonOptions</c> in <c>Program.cs</c>) so snake_case enum values such
-    /// as <c>extra_high</c> round-trip through <see cref="ReasoningEffort"/> instead of being
-    /// carried as loose strings.
-    /// </summary>
-    private static readonly System.Text.Json.JsonSerializerOptions ApiJsonOptions =
-        new(System.Text.Json.JsonSerializerDefaults.Web)
-        {
-            Converters =
-            {
-                new JsonStringEnumConverter(System.Text.Json.JsonNamingPolicy.SnakeCaseLower, allowIntegerValues: false),
-            },
-        };
-
-    /// <summary>
     /// Converts a dropdown wire value (<c>"none"</c>, <c>"extra_high"</c>, …) into a
     /// <see cref="ReasoningEffort"/>. Empty input means "unset" and maps to <c>null</c>.
     /// </summary>
@@ -1271,7 +1256,7 @@ else
         _modelsLoading = true;
         try
         {
-            _modelsData = await HttpClient.GetFromJsonAsync<ModelConfigResponse>("/api/config/models", ApiJsonOptions);
+            _modelsData = await HttpClient.GetFromJsonAsync<ModelConfigResponse>("/api/config/models", ReasoningEffortOptions.JsonOptions);
             if (_modelsData is not null)
             {
                 _orchestratorModel = _modelsData.Orchestrator ?? "";
@@ -1364,7 +1349,7 @@ else
                         ["docwriter"] = ParseReasoning(_docwriterPremiumReasoningEffort),
                         ["improver"]  = ParseReasoning(_improverPremiumReasoningEffort),
                     },
-                }, ApiJsonOptions),
+                }, ReasoningEffortOptions.JsonOptions),
                 System.Text.Encoding.UTF8,
                 "application/json");
 
@@ -1398,7 +1383,7 @@ else
         _backupsLoading = true;
         try
         {
-            _backups = await HttpClient.GetFromJsonAsync<List<BackupInfoResponse>>("/api/backup", ApiJsonOptions) ?? [];
+            _backups = await HttpClient.GetFromJsonAsync<List<BackupInfoResponse>>("/api/backup", ReasoningEffortOptions.JsonOptions) ?? [];
             _backupError = null;
         }
         catch (Exception ex)
@@ -1454,7 +1439,7 @@ else
         _reposLoading = true;
         try
         {
-            _repositories = await HttpClient.GetFromJsonAsync<List<RepositoryDto>>("/api/config/repositories", ApiJsonOptions) ?? [];
+            _repositories = await HttpClient.GetFromJsonAsync<List<RepositoryDto>>("/api/config/repositories", ReasoningEffortOptions.JsonOptions) ?? [];
             _repoError = null;
         }
         catch (Exception ex)
@@ -1470,7 +1455,7 @@ else
         _orchestratorLoading = true;
         try
         {
-            _orchestratorData = await HttpClient.GetFromJsonAsync<OrchestratorConfigResponse>("/api/config/orchestrator", ApiJsonOptions);
+            _orchestratorData = await HttpClient.GetFromJsonAsync<OrchestratorConfigResponse>("/api/config/orchestrator", ReasoningEffortOptions.JsonOptions);
             if (_orchestratorData is not null)
             {
                 _orchMaxIterations = _orchestratorData.MaxIterations;
@@ -1493,7 +1478,7 @@ else
         _workersLoading = true;
         try
         {
-            _workersData = await HttpClient.GetFromJsonAsync<Dictionary<string, WorkerResponseDto>>("/api/config/workers", ApiJsonOptions);
+            _workersData = await HttpClient.GetFromJsonAsync<Dictionary<string, WorkerResponseDto>>("/api/config/workers", ReasoningEffortOptions.JsonOptions);
             if (_workersData is not null)
             {
                 _coderContextWindow = _workersData.GetValueOrDefault("coder")?.ContextWindow ?? 0;
@@ -1515,7 +1500,7 @@ else
         _composerLoading = true;
         try
         {
-            _composerData = await HttpClient.GetFromJsonAsync<ComposerConfigResponse>("/api/config/composer", ApiJsonOptions);
+            _composerData = await HttpClient.GetFromJsonAsync<ComposerConfigResponse>("/api/config/composer", ReasoningEffortOptions.JsonOptions);
             if (_composerData is not null)
             {
                 _composerMaxSteps = _composerData.MaxSteps;
@@ -1549,7 +1534,7 @@ else
                     verboseLogging = _orchVerboseLogging,
                     brainMaxSteps = _orchBrainMaxSteps,
                     branchCleanupDelayHours = _orchBranchCleanupDelayHours,
-                }, ApiJsonOptions),
+                }, ReasoningEffortOptions.JsonOptions),
                 System.Text.Encoding.UTF8,
                 "application/json");
             var response = await HttpClient.PatchAsync("/api/config/orchestrator", body);
@@ -1588,7 +1573,7 @@ else
                     ["reviewer"] = _reviewerContextWindow,
                     ["docwriter"] = _docwriterContextWindow,
                     ["improver"] = _improverContextWindow,
-                }, ApiJsonOptions),
+                }, ReasoningEffortOptions.JsonOptions),
                 System.Text.Encoding.UTF8,
                 "application/json");
             var response = await HttpClient.PatchAsync("/api/config/workers", body);
@@ -1623,7 +1608,7 @@ else
                 System.Text.Json.JsonSerializer.Serialize(new
                 {
                     maxSteps = _composerMaxSteps,
-                }, ApiJsonOptions),
+                }, ReasoningEffortOptions.JsonOptions),
                 System.Text.Encoding.UTF8,
                 "application/json");
             var response = await HttpClient.PatchAsync("/api/config/composer", body);
@@ -1667,7 +1652,7 @@ else
                 release = new { mergeTo = string.IsNullOrWhiteSpace(_newRepoMergeTo) ? null : _newRepoMergeTo, tagBranch = string.IsNullOrWhiteSpace(_newRepoTagBranch) ? null : _newRepoTagBranch };
             }
             var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new { name = _newRepoName, url = _newRepoUrl, defaultBranch = branch, release }, ApiJsonOptions),
+                System.Text.Json.JsonSerializer.Serialize(new { name = _newRepoName, url = _newRepoUrl, defaultBranch = branch, release }, ReasoningEffortOptions.JsonOptions),
                 System.Text.Encoding.UTF8, "application/json");
             var response = await HttpClient.PostAsync("/api/config/repositories", body);
             if (response.IsSuccessStatusCode)
@@ -1712,7 +1697,7 @@ else
         try
         {
             var branches = await HttpClient.GetFromJsonAsync<List<string>>(
-                $"/api/config/repositories/{Uri.EscapeDataString(repo.Name)}/branches", ApiJsonOptions, token);
+                $"/api/config/repositories/{Uri.EscapeDataString(repo.Name)}/branches", ReasoningEffortOptions.JsonOptions, token);
             if (generation == _branchFetchGeneration)
             {
                 _repoBranches = branches;
@@ -1757,7 +1742,7 @@ else
                 tagBranch = string.IsNullOrWhiteSpace(_editRepoTagBranch) ? null : _editRepoTagBranch
             };
             var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new { name = _editingRepoName, url = _editRepoUrl, defaultBranch = branch, release }, ApiJsonOptions),
+                System.Text.Json.JsonSerializer.Serialize(new { name = _editingRepoName, url = _editRepoUrl, defaultBranch = branch, release }, ReasoningEffortOptions.JsonOptions),
                 System.Text.Encoding.UTF8, "application/json");
             var response = await HttpClient.PutAsync($"/api/config/repositories/{Uri.EscapeDataString(_editingRepoName)}", body);
             if (response.IsSuccessStatusCode)
@@ -1826,7 +1811,7 @@ else
         _availableModelsSuccess = null;
         try
         {
-            _discoveredModels = await HttpClient.GetFromJsonAsync<List<DiscoveredModelDto>>("/api/config/models/discover", ApiJsonOptions) ?? [];
+            _discoveredModels = await HttpClient.GetFromJsonAsync<List<DiscoveredModelDto>>("/api/config/models/discover", ReasoningEffortOptions.JsonOptions) ?? [];
             _discoveredModels = _discoveredModels.OrderBy(m => m.Name ?? m.Id, StringComparer.OrdinalIgnoreCase).ToList();
             _selectedDiscoveredIds.Clear();
             _showDiscoveryModal = true;
@@ -1943,7 +1928,7 @@ else
                     contextWindow = _editModelContextWindow,
                     description = editDescription,
                     supportsVision = _editModelSupportsVision,
-                }, ApiJsonOptions),
+                }, ReasoningEffortOptions.JsonOptions),
                 System.Text.Encoding.UTF8,
                 "application/json");
 
@@ -2027,7 +2012,7 @@ else
                 contextWindow,
                 description,
                 supportsVision,
-            }, ApiJsonOptions),
+            }, ReasoningEffortOptions.JsonOptions),
             System.Text.Encoding.UTF8,
             "application/json");
         return HttpClient.PostAsync("/api/config/available-models", body);
@@ -2043,7 +2028,7 @@ else
                 reasoningEffort,
                 description,
                 supportsVision,
-            }, ApiJsonOptions),
+            }, ReasoningEffortOptions.JsonOptions),
             System.Text.Encoding.UTF8,
             "application/json");
         return HttpClient.PostAsync("/api/config/sub-agent-models", body);
@@ -2124,7 +2109,7 @@ else
                     reasoningEffort = reasoning,
                     description,
                     supportsVision = _editSubAgentModelSupportsVision,
-                }, ApiJsonOptions),
+                }, ReasoningEffortOptions.JsonOptions),
                 System.Text.Encoding.UTF8,
                 "application/json");
 

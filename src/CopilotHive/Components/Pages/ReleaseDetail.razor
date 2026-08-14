@@ -314,7 +314,6 @@ else if (_loaded)
     private string? _releaseError;
     private bool _isReleasing;
     private bool _executionFailed; // set only for 500 execution failures
-    private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
 
     // Tag edit state
     private string _editTag = "";
@@ -406,9 +405,9 @@ else if (_loaded)
             {
                 using var doc = JsonDocument.Parse(json);
                 if (doc.RootElement.TryGetProperty("release", out var releaseEl))
-                    _release = JsonSerializer.Deserialize<Release>(releaseEl.GetRawText(), JsonOpts);
+                    _release = JsonSerializer.Deserialize<Release>(releaseEl.GetRawText(), ReasoningEffortOptions.JsonOptions);
                 if (doc.RootElement.TryGetProperty("result", out var resultEl))
-                    _releaseResult = JsonSerializer.Deserialize<ReleaseExecutionResult>(resultEl.GetRawText(), JsonOpts);
+                    _releaseResult = JsonSerializer.Deserialize<ReleaseExecutionResult>(resultEl.GetRawText(), ReasoningEffortOptions.JsonOptions);
             }
             else if (response.StatusCode == HttpStatusCode.BadRequest)
             {

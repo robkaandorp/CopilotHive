@@ -301,21 +301,6 @@ else
     private IJSObjectReference? _pasteModule;
     private DotNetObjectReference<ComposerChat>? _pasteDotNetRef;
 
-    /// <summary>
-    /// JSON options for the API calls this page makes. They MUST match the server's global
-    /// converter (<c>ConfigureHttpJsonOptions</c> in <c>Program.cs</c>) so snake_case enum
-    /// values such as <c>extra_high</c> deserialize back into <see cref="ReasoningEffort"/>.
-    /// </summary>
-    internal static readonly JsonSerializerOptions ApiJsonOptions = CreateApiJsonOptions();
-
-    private static JsonSerializerOptions CreateApiJsonOptions()
-    {
-        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
-        options.Converters.Add(
-            new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower, allowIntegerValues: false));
-        return options;
-    }
-
     protected override async Task OnInitializedAsync()
     {
         PageHeader.SetTitle("💬 Composer");
@@ -855,7 +840,7 @@ else
     {
         try
         {
-            var response = await HttpClient.GetFromJsonAsync<ModelsResponse>("/api/composer/models", ApiJsonOptions);
+            var response = await HttpClient.GetFromJsonAsync<ModelsResponse>("/api/composer/models", ReasoningEffortOptions.JsonOptions);
             if (response?.Models is { Count: > 0 })
             {
                 _availableModels = response.Models;
@@ -878,7 +863,7 @@ else
     {
         try
         {
-            var response = await HttpClient.GetFromJsonAsync<CurrentModelResponse>("/api/composer/current-model", ApiJsonOptions);
+            var response = await HttpClient.GetFromJsonAsync<CurrentModelResponse>("/api/composer/current-model", ReasoningEffortOptions.JsonOptions);
             if (!string.IsNullOrWhiteSpace(response?.Model) && _availableModels.Contains(response.Model))
             {
                 _selectedModel = response.Model;
@@ -942,14 +927,14 @@ else
             // The current reasoning selection travels with the new model — the server requires
             // both and never infers reasoning from the model name.
             var response = await HttpClient.PostAsJsonAsync(
-                BuildSwitchUri(model, _selectedReasoning), (object?)null, ApiJsonOptions);
+                BuildSwitchUri(model, _selectedReasoning), (object?)null, ReasoningEffortOptions.JsonOptions);
             if (response.IsSuccessStatusCode)
             {
                 _selectedModel = model;
             }
             else
             {
-                var error = await response.Content.ReadFromJsonAsync<ErrorResponse>(ApiJsonOptions);
+                var error = await response.Content.ReadFromJsonAsync<ErrorResponse>(ReasoningEffortOptions.JsonOptions);
                 Console.Error.WriteLine($"[ComposerChat] Model switch failed: {error?.Error ?? response.ReasonPhrase}");
             }
         }
@@ -980,12 +965,12 @@ else
         try
         {
             var response = await HttpClient.PostAsJsonAsync(
-                BuildSwitchUri(_selectedModel, newReasoning), (object?)null, ApiJsonOptions);
+                BuildSwitchUri(_selectedModel, newReasoning), (object?)null, ReasoningEffortOptions.JsonOptions);
             _selectedReasoning = ResolveReasoningAfterSwitch(previous, newReasoning, response.IsSuccessStatusCode);
 
             if (!response.IsSuccessStatusCode)
             {
-                var error = await response.Content.ReadFromJsonAsync<ErrorResponse>(ApiJsonOptions);
+                var error = await response.Content.ReadFromJsonAsync<ErrorResponse>(ReasoningEffortOptions.JsonOptions);
                 Console.Error.WriteLine($"[ComposerChat] Reasoning switch failed: {error?.Error ?? response.ReasonPhrase}");
             }
         }
