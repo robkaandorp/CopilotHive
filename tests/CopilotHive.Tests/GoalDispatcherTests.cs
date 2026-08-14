@@ -1261,6 +1261,11 @@ public sealed class TaskCompletionServiceModelLoggingTests
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
         pipeline.AdvanceTo(GoalPhase.Coding);
+        // Initialize the pipeline state machine so the normal completion path (FilesChanged > 0,
+        // avoiding the no-op retry path) can transition out of Coding.
+        var plan = IterationPlan.Default();
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
 
         var taskId = $"task-{Guid.NewGuid():N}";
         pipelineManager.RegisterTask(taskId, goal.Id);
@@ -1276,6 +1281,7 @@ public sealed class TaskCompletionServiceModelLoggingTests
             Output = "Work completed.",
             Metrics = new TaskMetrics { Verdict = "PASS" },
             Model = "claude-sonnet-4-20250514",
+            GitStatus = new GitChangeSummary { FilesChanged = 1 },
         }, TestContext.Current.CancellationToken);
 
         // Assert - verify "model=claude-sonnet-4-20250514" appears in the task completed log
@@ -1297,6 +1303,11 @@ public sealed class TaskCompletionServiceModelLoggingTests
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
         pipeline.AdvanceTo(GoalPhase.Coding);
+        // Initialize the pipeline state machine so the normal completion path (FilesChanged > 0,
+        // avoiding the no-op retry path) can transition out of Coding.
+        var plan = IterationPlan.Default();
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
 
         var taskId = $"task-{Guid.NewGuid():N}";
         pipelineManager.RegisterTask(taskId, goal.Id);
@@ -1311,6 +1322,7 @@ public sealed class TaskCompletionServiceModelLoggingTests
             Status = TaskOutcome.Completed,
             Output = "Work completed.",
             Metrics = new TaskMetrics { Verdict = "PASS" },
+            GitStatus = new GitChangeSummary { FilesChanged = 1 },
         }, TestContext.Current.CancellationToken);
 
         // Assert - verify "model=unknown" appears when model is empty

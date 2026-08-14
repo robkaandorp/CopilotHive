@@ -165,11 +165,43 @@ internal sealed class PipelineDriver
                 "No-op detected: Coder for {GoalId} returned with 0 files changed — retrying with stronger prompt",
                 pipeline.GoalId);
 
-            if (!pipeline.IterationBudget.TryConsume())
+            // Mark the last Coding PhaseResult for the current iteration as failed FIRST —
+            // before any budget checks and before any terminal exit — so the iteration summary
+            // (built here on the retry path, or by FinalizeGoalAsync on the terminal path)
+            // includes the failed Coding phase with the no-op reason visible in the dashboard.
+            var codingEntry = pipeline.PhaseLog
+                .LastOrDefault(e => e.Name == GoalPhase.Coding && e.Iteration == pipeline.Iteration);
+            if (codingEntry is not null)
             {
+                codingEntry.Result = PhaseOutcome.Fail;
+                codingEntry.CompletedAt = DateTime.UtcNow;
+                codingEntry.WorkerOutput = "Coder produced no file changes (no-op)";
+            }
+
+            // If the iteration budget is exhausted there is no retry possible: fail the goal
+            // directly. The Coding phase was already marked failed above, so FinalizeGoalAsync's
+            // terminal summary includes it. Do NOT build/add/persist a snapshot here — that would
+            // create a duplicate summary when FinalizeGoalAsync runs.
+            if (pipeline.IterationBudget.IsExhausted)
+            {
+                pipeline.StateMachine.Fail();
+                pipeline.AdvanceTo(GoalPhase.Failed);
                 await _lifecycleService.MarkGoalFailedAsync(pipeline, "Coder produced no file changes after max iterations (no-op)", ct);
                 return;
             }
+
+            // Snapshot the ending (no-op) iteration BEFORE IterationBudget.TryConsume() —
+            // BuildIterationSummary filters PhaseLog by pipeline.Iteration, so calling it after
+            // TryConsume would snapshot the WRONG (new) iteration. Same pattern as HandleNewIterationAsync.
+            var iterationSummary = PipelineHelpers.BuildIterationSummary(pipeline);
+            pipeline.CompletedIterationSummaries.Add(iterationSummary);
+
+            // Persist the iteration summary to the goal source so the dashboard can read it.
+            var updateMeta = new GoalUpdateMetadata { IterationSummary = iterationSummary };
+            await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.InProgress, updateMeta, ct);
+
+            // Advance the iteration budget — guaranteed to succeed since IsExhausted was checked above.
+            pipeline.IterationBudget.TryConsume();
 
             var prevContext = !string.IsNullOrWhiteSpace(result.Metrics?.Summary)
                 ? result.Metrics.Summary
@@ -183,6 +215,15 @@ internal sealed class PipelineDriver
             var retryPrompt = _brain is not null
                 ? await _resolvePrompt(pipeline, GoalPhase.Coding, noOpContext, ct)
                 : $"Work on: {pipeline.Description}. {noOpContext}";
+
+            // PhaseLog: append a new entry for the retry Coding phase of the new iteration.
+            // Without this, CurrentPhaseEntry would still point at the failed no-op Coding entry
+            // and the retry worker's output/verdict would overwrite the no-op history.
+            var retryEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+            retryEntry.WorkerPrompt = retryPrompt;
+            retryEntry.BrainPrompt = PipelineHelpers.GetLastCraftPromptFromConversation(pipeline);
+            pipeline.PhaseLog.Add(retryEntry);
+
             await _dispatchToRole(pipeline, WorkerRole.Coder, retryPrompt, ct);
             return;
         }

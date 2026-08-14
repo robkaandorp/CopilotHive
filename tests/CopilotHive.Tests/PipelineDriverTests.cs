@@ -257,6 +257,369 @@ public sealed class PipelineDriverWorkerOutputTests
 }
 
 /// <summary>
+/// Tests that <see cref="PipelineDriver.DriveNextPhaseAsync"/>'s no-op coder retry path
+/// persists the no-op iteration summary (with Coding marked failed) BEFORE consuming the
+/// iteration budget, so the iteration stays visible in the dashboard tab bar — the same
+/// class of bug as the merge-fail iteration display issue fixed in v0.27.0.
+/// </summary>
+public sealed class PipelineDriverNoOpRetryTests
+{
+    // ── Test 1: no-op retry persists iteration summary with Coding = Fail ──
+
+    [Fact]
+    public async Task NoOpRetry_PersistsIterationSummaryWithCodingFail()
+    {
+        // Arrange: pipeline in Coding with a Coding PhaseResult for iteration 1, plus a
+        // craft-prompt conversation entry for the retry iteration (2) so the BrainPrompt
+        // forwarding on the retry entry is observable.
+        const string retryPrompt = "retry with stronger prompt";
+        const string craftPrompt = "Brain craft prompt for retry";
+        var (driver, pipeline, goalStore) = CreateNoOpDriver();
+        var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(codingEntry);
+
+        // GetLastCraftPromptFromConversation runs AFTER TryConsume() has advanced the pipeline
+        // to iteration 2, so the seed entry must carry the retry iteration number.
+        pipeline.Conversation.Add(new ConversationEntry("user", craftPrompt, 2, "craft-prompt"));
+
+        // Act: coder returns with 0 files changed → no-op retry path.
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-1",
+            Status = TaskOutcome.Completed,
+            Output = "I discussed the changes but made no edits.",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: the Coding PhaseResult was marked failed with the no-op reason.
+        Assert.Equal(PhaseOutcome.Fail, codingEntry.Result);
+        Assert.Equal("Coder produced no file changes (no-op)", codingEntry.WorkerOutput);
+        Assert.NotNull(codingEntry.CompletedAt);
+
+        // Assert: UpdateGoalStatusAsync was called while pipeline.Iteration was still the
+        // PRE-consume value (1). If the persist call were moved after
+        // IterationBudget.TryConsume(), pipeline.Iteration would be 2 at call time and this
+        // assertion would fail — proving the summary is persisted BEFORE the budget is consumed.
+        var inProgressUpdate = Assert.Single(goalStore.StatusUpdates, u => u.Status == GoalStatus.InProgress);
+        Assert.Equal(1, inProgressUpdate.IterationAtUpdate);
+
+        // Assert: the persisted summary carries the pre-consume iteration with Coding = Fail.
+        var summaryUpdate = inProgressUpdate.Metadata?.IterationSummary;
+        Assert.NotNull(summaryUpdate);
+        Assert.Equal(1, summaryUpdate!.Iteration);
+        var codingInSummary = Assert.Single(summaryUpdate.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal(PhaseOutcome.Fail, codingInSummary.Result);
+        Assert.Equal("Coder produced no file changes (no-op)", codingInSummary.WorkerOutput);
+
+        // Assert: the summary is also in CompletedIterationSummaries and the retry iteration started.
+        var completedSummary = Assert.Single(pipeline.CompletedIterationSummaries, s => s.Iteration == 1);
+        Assert.Equal(PhaseOutcome.Fail,
+            Assert.Single(completedSummary.Phases, p => p.Name == GoalPhase.Coding).Result);
+        Assert.Equal(2, pipeline.Iteration);
+
+        // Assert: a fresh Coding PhaseResult was added for the retry iteration with the exact
+        // retry prompt and the forwarded Brain craft prompt. Removing the WorkerPrompt/BrainPrompt
+        // assignments from PipelineDriver.cs would fail these assertions.
+        Assert.Equal(2, pipeline.PhaseLog.Count);
+        var retryEntry = pipeline.PhaseLog[1];
+        Assert.Equal(GoalPhase.Coding, retryEntry.Name);
+        Assert.Equal(2, retryEntry.Iteration);
+        Assert.Equal(1, retryEntry.Occurrence);
+        Assert.Equal(retryPrompt, retryEntry.WorkerPrompt);
+        Assert.Equal(craftPrompt, retryEntry.BrainPrompt);
+    }
+
+    // ── Test 2: budget-exhausted terminal path fails without duplicate summary ──
+
+    [Fact]
+    public async Task NoOpRetry_BudgetExhausted_FailsWithoutDuplicateSummary()
+    {
+        // Arrange: exhaust the iteration budget (maxIterations = 5 → IterationBudget allows 4)
+        // so the no-op path takes the terminal IsExhausted branch.
+        var (driver, pipeline, goalStore) = CreateNoOpDriver();
+        for (var i = 0; i < 4; i++)
+            pipeline.IterationBudget.TryConsume();
+        Assert.True(pipeline.IterationBudget.IsExhausted);
+
+        var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(codingEntry);
+
+        var summariesBefore = pipeline.CompletedIterationSummaries.Count;
+        var iterationBefore = pipeline.Iteration; // 5 after exhausting the iteration budget
+
+        // Act
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-2",
+            Status = TaskOutcome.Completed,
+            Output = "no changes made",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: the Coding PhaseResult was marked failed with the no-op reason BEFORE terminal
+        // exit, so FinalizeGoalAsync's summary includes the failed Coding phase.
+        Assert.Equal(PhaseOutcome.Fail, codingEntry.Result);
+        Assert.Equal("Coder produced no file changes (no-op)", codingEntry.WorkerOutput);
+        Assert.NotNull(codingEntry.CompletedAt);
+
+        // Assert: goal failed via the terminal path.
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        Assert.Equal(GoalPhase.Failed, pipeline.StateMachine.Phase);
+
+        // Assert: DriveNextPhaseAsync did NOT add a pre-retry snapshot to
+        // CompletedIterationSummaries — the only addition is the terminal summary from
+        // FinalizeGoalAsync (exactly one, not two).
+        Assert.Equal(summariesBefore, pipeline.CompletedIterationSummaries.Count - 1);
+        var summary = Assert.Single(pipeline.CompletedIterationSummaries);
+        Assert.Equal(iterationBefore, summary.Iteration);
+        Assert.Equal(PhaseOutcome.Fail,
+            Assert.Single(summary.Phases, p => p.Name == GoalPhase.Coding).Result);
+
+        // Assert: exactly ONE status update carried an IterationSummary (the Failed one from
+        // FinalizeGoalAsync) — the no-op path did NOT create an InProgress one.
+        var summaryUpdates = goalStore.StatusUpdates
+            .Where(u => u.Metadata?.IterationSummary is not null)
+            .ToList();
+        var failedUpdate = Assert.Single(summaryUpdates);
+        Assert.Equal(GoalStatus.Failed, failedUpdate.Status);
+    }
+
+    // ── Test 3: completed summary is not mutated by the retry's result ──
+
+    [Fact]
+    public async Task NoOpRetry_CompletedSummaryNotMutatedByRetry()
+    {
+        // Arrange: fake dispatch that immediately completes the retry coding task by writing
+        // the completion data onto the retry's PhaseResult (what DriveNextPhaseAsync would do
+        // when the retry worker reports back).
+        var (driver, pipeline, _) = CreateNoOpDriver((p, role, prompt, ct) =>
+        {
+            var retryEntry = p.CurrentPhaseEntry!;
+            retryEntry.Result = PhaseOutcome.Pass;
+            retryEntry.CompletedAt = DateTime.UtcNow;
+            retryEntry.WorkerOutput = "retry produced changes";
+            return Task.CompletedTask;
+        });
+
+        var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(codingEntry);
+
+        // Act
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-3",
+            Status = TaskOutcome.Completed,
+            Output = "no changes made",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: the CompletedIterationSummaries entry for the no-op iteration still has
+        // Coding = Fail with the no-op output — the retry's completion wrote to the NEW
+        // iteration-2 PhaseResult, not the failed iteration-1 entry captured in the summary.
+        var completedSummary = Assert.Single(pipeline.CompletedIterationSummaries, s => s.Iteration == 1);
+        var codingInSummary = Assert.Single(completedSummary.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal(PhaseOutcome.Fail, codingInSummary.Result);
+        Assert.Contains("no-op", codingInSummary.WorkerOutput);
+
+        // Assert: the PhaseLog holds two distinct Coding entries — the failed iteration-1 entry
+        // and the retry's iteration-2 entry (which the fake dispatch completed as Pass).
+        Assert.Equal(2, pipeline.PhaseLog.Count);
+        var failedEntry = pipeline.PhaseLog[0];
+        var retryEntry = pipeline.PhaseLog[1];
+        Assert.Equal(PhaseOutcome.Fail, failedEntry.Result);
+        Assert.Equal(1, failedEntry.Iteration);
+        Assert.Equal(PhaseOutcome.Pass, retryEntry.Result);
+        Assert.Equal(2, retryEntry.Iteration);
+        Assert.Equal("retry produced changes", retryEntry.WorkerOutput);
+
+        // Assert: the summary's Coding entry and the new PhaseLog entry are DISTINCT objects —
+        // the retry's completion could not have mutated the captured summary entry. Without the
+        // fresh iteration-2 PhaseResult in PipelineDriver.cs, CurrentPhaseEntry would still be
+        // the failed iteration-1 entry, the fake dispatch would write Pass onto it, and the
+        // summary (which references that same object) would show Pass — failing this assertion.
+        Assert.NotSame(codingInSummary, retryEntry);
+        // The summary's Coding entry references the failed iteration-1 PhaseResult (BuildIterationSummary
+        // copies entry references), so it MUST be the same object as the failed PhaseLog entry —
+        // which the retry entry (a distinct object) could not have mutated.
+        Assert.Same(codingInSummary, failedEntry);
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+
+    private static (PipelineDriver Driver, GoalPipeline Pipeline, IterationCapturingGoalStore Store) CreateNoOpDriver(
+        Func<GoalPipeline, WorkerRole, string?, CancellationToken, Task>? dispatchToRole = null)
+    {
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "No-op retry persistence test" };
+        var goalStore = new IterationCapturingGoalStore(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalStore);
+
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3, maxIterations: 5);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipeline.SetPlan(IterationPlan.Default());
+        goalStore.Pipeline = pipeline;
+
+        var lifecycleService = new GoalLifecycleService(goalManager, NullLogger<GoalLifecycleService>.Instance);
+
+        var driver = new PipelineDriver(
+            brain: new NoOpRetryFakeBrain(),
+            lifecycleService: lifecycleService,
+            goalManager: goalManager,
+            repoManager: new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            improvementAnalyzer: null,
+            agentsManager: null,
+            metricsTracker: null,
+            dispatchToRole: dispatchToRole ?? ((_, _, _, _) => Task.CompletedTask),
+            resolvePrompt: (_, _, _, _) => Task.FromResult("retry with stronger prompt"),
+            resolvePlan: (_, _, _) => Task.FromResult(PlanResult.Success(IterationPlan.Default())),
+            resolveRepositories: _ => [],
+            syncAgents: _ => Task.CompletedTask,
+            generateMergeCommitMessage: (_, _) => Task.FromResult("message"),
+            logger: NullLogger<PipelineDriver>.Instance);
+
+        return (driver, pipeline, goalStore);
+    }
+
+    /// <summary>
+    /// In-memory <see cref="IGoalStore"/> that records every status update together with the
+    /// pipeline's iteration counter sampled AT THE MOMENT of the call. This lets tests prove
+    /// whether an update happened before or after <see cref="GoalPipeline.IterationBudget"/>
+    /// was consumed: if the persist call were moved after <c>TryConsume()</c>, the captured
+    /// iteration would be the new (post-consume) number and the assertion would fail.
+    /// </summary>
+    private sealed class IterationCapturingGoalStore(Goal goal) : IGoalStore
+    {
+        /// <summary>Pipeline whose <see cref="GoalPipeline.Iteration"/> is sampled on each update.</summary>
+        internal GoalPipeline? Pipeline { get; set; }
+
+        /// <summary>All status updates in the order they were applied, with the iteration at call time.</summary>
+        internal List<(GoalStatus Status, GoalUpdateMetadata? Metadata, int IterationAtUpdate)> StatusUpdates { get; } = [];
+
+        public string Name => "iteration-capturing-store";
+
+        public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Goal>>(goal.Status == GoalStatus.Pending ? [goal] : []);
+
+        public Task UpdateGoalStatusAsync(
+            string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
+        {
+            lock (StatusUpdates)
+            {
+                StatusUpdates.Add((status, metadata, Pipeline?.Iteration ?? 0));
+            }
+
+            goal.Status = status;
+            if (metadata?.FailureReason is not null)
+                goal.FailureReason = metadata.FailureReason;
+            return Task.CompletedTask;
+        }
+
+        public Task<IReadOnlyList<Goal>> GetAllGoalsAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Goal>>([goal]);
+
+        public Task<Goal?> GetGoalAsync(string goalId, CancellationToken ct = default) =>
+            Task.FromResult(goalId == goal.Id ? goal : null);
+
+        public Task<Goal> CreateGoalAsync(Goal goalToCreate, CancellationToken ct = default) => Task.FromResult(goalToCreate);
+
+        public Task UpdateGoalAsync(Goal goalToUpdate, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<bool> DeleteGoalAsync(string goalId, CancellationToken ct = default) => Task.FromResult(false);
+
+        public Task<IReadOnlyList<Goal>> SearchGoalsAsync(
+            string query, GoalStatus? statusFilter = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Goal>>([]);
+
+        public Task<IReadOnlyList<Goal>> GetGoalsByStatusAsync(GoalStatus status, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Goal>>([]);
+
+        public Task AddIterationAsync(string goalId, IterationSummary summary, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(string goalId, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<IterationSummary>>([]);
+
+        public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default) =>
+            Task.FromResult(release);
+
+        public Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default) =>
+            Task.FromResult<Release?>(null);
+
+        public Task<IReadOnlyList<Release>> GetReleasesAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Release>>([]);
+
+        public Task UpdateReleaseAsync(Release release, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default) => Task.FromResult(false);
+
+        public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Goal>>([]);
+
+        public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(
+            string goalId, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
+
+        public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(
+            int? limit = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<(string, PersistedClarification)>>([]);
+    }
+
+    /// <summary>Minimal brain stub that returns the default plan.</summary>
+    private sealed class NoOpRetryFakeBrain : IDistributedBrain
+    {
+        public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+            Task.CompletedTask;
+
+        public Task<PlanResult> PlanIterationAsync(
+            GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(PlanResult.Success(IterationPlan.Default()));
+
+        public Task<PromptResult> CraftPromptAsync(
+            GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+
+        public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+
+        public Task EnsureBrainRepoAsync(
+            string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct) =>
+            Task.CompletedTask;
+
+        public Task<BrainResponse> AskQuestionAsync(
+            string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+            Task.FromResult(BrainResponse.Answer("proceed"));
+
+        public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public bool GoalSessionExists(string goalId) => false;
+
+        public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+            Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
+
+        public BrainStats? GetStats() => null;
+    }
+}
+
+/// <summary>
 /// Tests that <see cref="PipelineDriver.HandleMergeFailureAsync"/> marks the Merging phase as
 /// failed and persists the failed-merge iteration summary so it is visible in the dashboard
 /// iteration tab bar (mirrors the <see cref="PipelineDriver.HandleNewIterationAsync"/> pattern).
