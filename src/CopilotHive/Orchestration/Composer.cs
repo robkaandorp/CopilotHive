@@ -58,6 +58,17 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// name suffix). When non-null it takes precedence over suffix-parsed values.
     /// </summary>
     private readonly ReasoningEffort? _configuredReasoningEffort;
+    private readonly IIssueStore? _issueStore;
+
+    /// <summary>
+    /// Serializes the <c>update_issue</c> read-modify-write cycle. <see cref="Issue"/> has no
+    /// optimistic-concurrency token and <see cref="IIssueStore.UpdateIssueAsync"/> takes a full
+    /// replacement entity, so two overlapping partial updates that change different fields would
+    /// otherwise read the same snapshot and the later writer would clobber the earlier writer's
+    /// change with stale copied values. The lock is held from the initial read through the
+    /// authoritative update and re-fetch, and is always released in a <c>finally</c>.
+    /// </summary>
+    private readonly SemaphoreSlim _issueUpdateLock = new(1, 1);
 
     /// <summary>Models the Composer can switch between at runtime.</summary>
     public IReadOnlyList<string> AvailableModels => _agentService.AvailableModels;
@@ -113,6 +124,11 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - Delete draft or failed goals (delete_goal)
         - Cancel InProgress or Pending goals (cancel_goal)
         - Extend the iteration budget for failed goals that exhausted their max iterations (extend_goal_iterations)
+        - Manage issues reported by the user or discovered during execution (create_issue, list_issues, get_issue, update_issue)
+        - create_issue — create a new issue when the user reports a bug, code quality problem, suggestion, concern, or workflow issue
+        - list_issues — list and filter issues
+        - get_issue — get full issue details
+        - update_issue — triage or update an issue (change status, severity, type, title, description)
         - Inspect repository history (git_log, git_diff, git_show, git_branch, git_blame, git_fetch)
         - Fetch remote branches (git_fetch(repository, remote?, branch?) — default: origin. Use to access remote feature branches.)
         - List configured repositories (list_repositories)
@@ -304,7 +320,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         LlmSessionRegistry? sessionRegistry = null,
         GoalReadyNotifier? goalReadyNotifier = null,
         ComposerAttachmentService? attachmentService = null,
-        ReasoningEffort? reasoningEffort = null)
+        ReasoningEffort? reasoningEffort = null,
+        IIssueStore? issueStore = null)
     {
         _logger = logger;
         _goalStore = goalStore;
@@ -321,6 +338,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _goalReadyNotifier = goalReadyNotifier;
         _attachmentService = attachmentService;
         _configuredReasoningEffort = reasoningEffort;
+        _issueStore = issueStore;
 
         _systemPrompt = DefaultSystemPrompt;
         if (_ollamaApiKey is not null)
@@ -745,8 +763,38 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 "Explore the knowledge graph from a starting document, following links up to a given depth."));
         }
 
+        if (_issueStore is not null)
+        {
+            tools.Add(AIFunctionFactory.Create(CreateIssueAsync, "create_issue",
+                "Create a new issue when the user reports a bug, code quality problem, suggestion, concern, or workflow issue."));
+            tools.Add(AIFunctionFactory.Create(ListIssuesAsync, "list_issues",
+                "List issues, optionally filtered by status, type, and severity."));
+            tools.Add(AIFunctionFactory.Create(GetIssueAsync, "get_issue",
+                "Get full details for an issue by ID."));
+            tools.Add(AIFunctionFactory.Create(UpdateIssueAsync, "update_issue",
+                "Triage or update an issue: change status, severity, type, title, or description."));
+        }
+
         return tools;
     }
+
+    /// <summary>
+    /// Parses an issue status string into an <see cref="IssueStatus"/>. Null-safe:
+    /// null or empty input returns <c>null</c> (no filter). Unknown values throw
+    /// <see cref="ArgumentException"/>.
+    /// </summary>
+    private static IssueStatus? ParseIssueStatus(string? value) =>
+        string.IsNullOrEmpty(value) ? null :
+        value.ToLowerInvariant().Trim() switch
+        {
+            "open" => IssueStatus.Open,
+            "triaged" => IssueStatus.Triaged,
+            "acknowledged" => IssueStatus.Acknowledged,
+            "in_progress" or "inprogress" => IssueStatus.InProgress,
+            "resolved" => IssueStatus.Resolved,
+            "closed" => IssueStatus.Closed,
+            _ => throw new ArgumentException($"Unknown status '{value}'"),
+        };
 
     /// <summary>
     /// Presents a question to the user and suspends the streaming loop until an answer is received.
@@ -984,6 +1032,9 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             {
                 disposeEx = disposeEx is null ? ex : new AggregateException(disposeEx, ex);
             }
+
+            // Independent of the services above — dispose regardless of their outcome.
+            _issueUpdateLock.Dispose();
         }
 
         if (disposeEx is not null)

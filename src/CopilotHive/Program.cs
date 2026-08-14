@@ -347,7 +347,8 @@ public sealed class Program
                             ? composerConfig.ReasoningEffort
                             : config?.Orchestrator?.ReasoningEffort,
                         "composer.reasoning_effort",
-                        sp.GetService<ILogger<Composer>>()));
+                        sp.GetService<ILogger<Composer>>()),
+                    issueStore: sp.GetService<IIssueStore>());
             });
             builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 

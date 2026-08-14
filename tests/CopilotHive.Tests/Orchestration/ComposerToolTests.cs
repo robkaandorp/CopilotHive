@@ -6,6 +6,7 @@ using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -9007,5 +9008,1476 @@ public sealed class ComposerKnowledgeToolIntegrationTests : IDisposable
         var result2 = await _composer.TraverseGraphAsync("arch-ml-a", depth: 2, direction: "outgoing", cancellationToken: ct);
         Assert.Contains("arch-ml-b", result2);
         Assert.Contains("arch-ml-c", result2);
+    }
+}
+
+/// <summary>
+/// Tests for the Composer's issue management tools (create_issue, list_issues,
+/// get_issue, update_issue).
+/// </summary>
+public sealed class ComposerIssueToolTests : IDisposable
+{
+    private readonly CopilotHiveDbContext _dbContext;
+    private readonly GoalStore _goalStore;
+    private readonly IssueStore _issueStore;
+    private readonly Composer _composer;
+    private readonly Composer _composerWithoutIssueStore;
+
+    public ComposerIssueToolTests()
+    {
+        _dbContext = CopilotHiveDbContext.CreateInMemory();
+        _goalStore = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
+        _issueStore = new IssueStore(_dbContext, NullLogger<IssueStore>.Instance);
+
+        _composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _goalStore,
+            stateDir: Path.GetTempPath(),
+            issueStore: _issueStore);
+
+        _composerWithoutIssueStore = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _goalStore,
+            stateDir: Path.GetTempPath());
+    }
+
+    public void Dispose()
+    {
+        _dbContext.Dispose();
+    }
+
+    // ── create_issue ──
+
+    [Fact]
+    public async Task CreateIssue_ValidInput_CreatesIssue()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.CreateIssueAsync(
+            "bug", "Parser crashes on empty input", "The parser throws when given an empty string.",
+            severity: "high", repository_names: ["repo-a", "repo-b"], ct: ct);
+
+        Assert.Contains("Issue created:", result);
+
+        var id = result.Replace("Issue created: ", "").Trim();
+        var issue = await _issueStore.GetIssueAsync(id, ct);
+        Assert.NotNull(issue);
+        Assert.Equal(IssueType.Bug, issue!.Type);
+        Assert.Equal("Parser crashes on empty input", issue.Title);
+        Assert.Equal("The parser throws when given an empty string.", issue.Description);
+        Assert.Equal(IssueSeverity.High, issue.Severity);
+        Assert.Equal(IssueStatus.Open, issue.Status);
+        Assert.Equal(2, issue.RepositoryNames.Count);
+        Assert.Contains("repo-a", issue.RepositoryNames);
+        Assert.Contains("repo-b", issue.RepositoryNames);
+        Assert.Null(issue.SourceGoalId);
+        Assert.Null(issue.SourceRole);
+        Assert.Null(issue.SourceIteration);
+    }
+
+    [Fact]
+    public async Task CreateIssue_DefaultSeverity_IsLow()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.CreateIssueAsync("suggestion", "Add dark mode", "Nice to have", ct: ct);
+
+        Assert.Contains("Issue created:", result);
+
+        var id = result.Replace("Issue created: ", "").Trim();
+        var issue = await _issueStore.GetIssueAsync(id, ct);
+        Assert.NotNull(issue);
+        Assert.Equal(IssueSeverity.Low, issue!.Severity);
+    }
+
+    [Fact]
+    public async Task CreateIssue_NoRepositories_EmptyList()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.CreateIssueAsync("concern", "Security concern", "Details", ct: ct);
+
+        var id = result.Replace("Issue created: ", "").Trim();
+        var issue = await _issueStore.GetIssueAsync(id, ct);
+        Assert.NotNull(issue);
+        Assert.Empty(issue!.RepositoryNames);
+    }
+
+    [Fact]
+    public async Task CreateIssue_InvalidType_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.CreateIssueAsync("not-a-type", "Title", "Description", ct: ct);
+
+        Assert.Contains("Unknown issue type", result);
+    }
+
+    [Fact]
+    public async Task CreateIssue_InvalidSeverity_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.CreateIssueAsync("bug", "Title", "Description", severity: "extreme", ct: ct);
+
+        Assert.Contains("Unknown severity", result);
+    }
+
+    [Fact]
+    public async Task CreateIssue_NoIssueStore_ReturnsUnavailable()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composerWithoutIssueStore.CreateIssueAsync("bug", "Title", "Description", ct: ct);
+
+        Assert.Equal("Issue tracking not available.", result);
+    }
+
+    [Fact]
+    public async Task CreateIssue_CodeQualityAlias_Accepted()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.CreateIssueAsync("codequality", "Naming", "Inconsistent naming", ct: ct);
+
+        Assert.Contains("Issue created:", result);
+
+        var id = result.Replace("Issue created: ", "").Trim();
+        var issue = await _issueStore.GetIssueAsync(id, ct);
+        Assert.NotNull(issue);
+        Assert.Equal(IssueType.CodeQuality, issue!.Type);
+    }
+
+    // ── list_issues ──
+
+    [Fact]
+    public async Task ListIssues_Empty_ReturnsNoIssuesFound()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.ListIssuesAsync(ct: ct);
+
+        Assert.Equal("No issues found.", result);
+    }
+
+    [Fact]
+    public async Task ListIssues_ReturnsFormattedSnakeCaseList()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateIssueAsync("bug", "Crash on startup", "Desc one", severity: "high", ct: ct);
+        await _composer.CreateIssueAsync("code_quality", "Naming inconsistency", "Desc two", severity: "low", ct: ct);
+
+        var result = await _composer.ListIssuesAsync(ct: ct);
+
+        Assert.Contains("2 issue(s)", result);
+        Assert.Contains("bug", result);
+        Assert.Contains("code_quality", result);
+        Assert.Contains("high", result);
+        Assert.Contains("low", result);
+        Assert.Contains("open", result);
+        Assert.DoesNotContain("CodeQuality", result); // snake_case, not PascalCase
+    }
+
+    [Fact]
+    public async Task ListIssues_FilterByStatus_FiltersCorrectly()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateIssueAsync("bug", "Open bug", "Desc", ct: ct);
+        var created = await _composer.CreateIssueAsync("suggestion", "Resolved suggestion", "Desc", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+        await _composer.UpdateIssueAsync(id, status: "resolved", ct: ct);
+
+        var result = await _composer.ListIssuesAsync(status: "resolved", ct: ct);
+
+        Assert.Contains("1 issue(s)", result);
+        Assert.Contains("Resolved suggestion", result);
+        Assert.DoesNotContain("Open bug", result);
+    }
+
+    [Fact]
+    public async Task ListIssues_FilterByType_FiltersCorrectly()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateIssueAsync("bug", "Bug one", "Desc", ct: ct);
+        await _composer.CreateIssueAsync("suggestion", "Suggestion one", "Desc", ct: ct);
+
+        var result = await _composer.ListIssuesAsync(type: "bug", ct: ct);
+
+        Assert.Contains("1 issue(s)", result);
+        Assert.Contains("Bug one", result);
+        Assert.DoesNotContain("Suggestion one", result);
+    }
+
+    [Fact]
+    public async Task ListIssues_FilterBySeverity_FiltersCorrectly()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateIssueAsync("bug", "High bug", "Desc", severity: "high", ct: ct);
+        await _composer.CreateIssueAsync("bug", "Low bug", "Desc", severity: "low", ct: ct);
+
+        var result = await _composer.ListIssuesAsync(severity: "high", ct: ct);
+
+        Assert.Contains("1 issue(s)", result);
+        Assert.Contains("High bug", result);
+        Assert.DoesNotContain("Low bug", result);
+    }
+
+    [Fact]
+    public async Task ListIssues_InvalidStatus_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.ListIssuesAsync(status: "bogus", ct: ct);
+
+        Assert.Contains("Unknown status", result);
+    }
+
+    [Fact]
+    public async Task ListIssues_NoIssueStore_ReturnsUnavailable()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composerWithoutIssueStore.ListIssuesAsync(ct: ct);
+
+        Assert.Equal("Issue tracking not available.", result);
+    }
+
+    // ── get_issue ──
+
+    [Fact]
+    public async Task GetIssue_ExistingIssue_ReturnsAllFields()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync(
+            "workflow", "Deploy step missing", "The deploy step is missing from the pipeline.",
+            severity: "medium", repository_names: ["repo-x"], ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        var result = await _composer.GetIssueAsync(id, ct: ct);
+
+        Assert.Contains($"## Issue: {id}", result);
+        Assert.Contains("workflow", result);
+        Assert.Contains("Deploy step missing", result);
+        Assert.Contains("The deploy step is missing from the pipeline.", result);
+        Assert.Contains("medium", result);
+        Assert.Contains("open", result);
+        Assert.Contains("repo-x", result);
+        Assert.Contains("SourceGoalId", result);
+        Assert.Contains("SourceRole", result);
+        Assert.Contains("SourceIteration", result);
+        Assert.Contains("CreatedAt", result);
+        Assert.Contains("UpdatedAt", result);
+        Assert.Contains("ResolvedAt", result);
+        Assert.Contains("LinkedGoalId", result);
+    }
+
+    [Fact]
+    public async Task GetIssue_NotFound_ReturnsNotFound()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.GetIssueAsync("no-such-issue", ct: ct);
+
+        Assert.Equal("Issue 'no-such-issue' not found.", result);
+    }
+
+    [Fact]
+    public async Task GetIssue_NoIssueStore_ReturnsUnavailable()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composerWithoutIssueStore.GetIssueAsync("any-id", ct: ct);
+
+        Assert.Equal("Issue tracking not available.", result);
+    }
+
+    // ── update_issue ──
+
+    [Fact]
+    public async Task UpdateIssue_PartialUpdate_OnlyChangesProvidedFields()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync(
+            "bug", "Original title", "Original description", severity: "low", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        var result = await _composer.UpdateIssueAsync(id, status: "triaged", severity: "high", ct: ct);
+
+        Assert.Contains($"## Issue: {id}", result);
+        Assert.Contains("triaged", result);
+        Assert.Contains("high", result);
+        Assert.Contains("Original title", result);
+        Assert.Contains("Original description", result);
+        Assert.Contains("bug", result);
+
+        var issue = await _issueStore.GetIssueAsync(id, ct);
+        Assert.NotNull(issue);
+        Assert.Equal(IssueStatus.Triaged, issue!.Status);
+        Assert.Equal(IssueSeverity.High, issue.Severity);
+        Assert.Equal(IssueType.Bug, issue.Type);
+        Assert.Equal("Original title", issue.Title);
+        Assert.Equal("Original description", issue.Description);
+    }
+
+    [Fact]
+    public async Task UpdateIssue_ChangeTitleAndDescription_UpdatesBoth()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync("bug", "Old title", "Old description", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        var result = await _composer.UpdateIssueAsync(id, title: "New title", description: "New description", ct: ct);
+
+        Assert.Contains("New title", result);
+        Assert.Contains("New description", result);
+        Assert.DoesNotContain("Old title", result);
+        Assert.DoesNotContain("Old description", result);
+
+        var issue = await _issueStore.GetIssueAsync(id, ct);
+        Assert.NotNull(issue);
+        Assert.Equal("New title", issue!.Title);
+        Assert.Equal("New description", issue.Description);
+    }
+
+    [Fact]
+    public async Task UpdateIssue_ChangeType_UpdatesType()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync("bug", "Title", "Desc", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        var result = await _composer.UpdateIssueAsync(id, type: "suggestion", ct: ct);
+
+        Assert.Contains("suggestion", result);
+
+        var issue = await _issueStore.GetIssueAsync(id, ct);
+        Assert.NotNull(issue);
+        Assert.Equal(IssueType.Suggestion, issue!.Type);
+    }
+
+    [Fact]
+    public async Task UpdateIssue_NotFound_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.UpdateIssueAsync("no-such-issue", status: "resolved", ct: ct);
+
+        Assert.Equal("Issue 'no-such-issue' not found.", result);
+    }
+
+    [Fact]
+    public async Task UpdateIssue_InvalidStatus_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync("bug", "Title", "Desc", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        var result = await _composer.UpdateIssueAsync(id, status: "bogus", ct: ct);
+
+        Assert.Contains("Unknown status", result);
+    }
+
+    [Fact]
+    public async Task UpdateIssue_InvalidSeverity_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync("bug", "Title", "Desc", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        var result = await _composer.UpdateIssueAsync(id, severity: "bogus", ct: ct);
+
+        Assert.Contains("Unknown severity", result);
+    }
+
+    [Fact]
+    public async Task UpdateIssue_InvalidType_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync("bug", "Title", "Desc", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        var result = await _composer.UpdateIssueAsync(id, type: "bogus", ct: ct);
+
+        Assert.Contains("Unknown issue type", result);
+    }
+
+    [Fact]
+    public async Task UpdateIssue_NoIssueStore_ReturnsUnavailable()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composerWithoutIssueStore.UpdateIssueAsync("any-id", status: "resolved", ct: ct);
+
+        Assert.Equal("Issue tracking not available.", result);
+    }
+
+    [Fact]
+    public async Task UpdateIssue_Resolved_SetsResolvedAt()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync("bug", "Title", "Desc", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        var result = await _composer.UpdateIssueAsync(id, status: "resolved", ct: ct);
+
+        Assert.Contains("resolved", result);
+
+        var issue = await _issueStore.GetIssueAsync(id, ct);
+        Assert.NotNull(issue);
+        Assert.Equal(IssueStatus.Resolved, issue!.Status);
+        Assert.NotNull(issue.ResolvedAt);
+    }
+
+    [Fact]
+    public async Task UpdateIssue_InProgressAlias_Accepted()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync("bug", "Title", "Desc", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        var result = await _composer.UpdateIssueAsync(id, status: "inprogress", ct: ct);
+
+        Assert.Contains("in_progress", result);
+
+        var issue = await _issueStore.GetIssueAsync(id, ct);
+        Assert.NotNull(issue);
+        Assert.Equal(IssueStatus.InProgress, issue!.Status);
+    }
+
+    // ── ParseIssueStatus — all 6 values + alias + unknown ──
+    // ParseIssueStatus is private static; tested through update_issue which applies
+    // the parsed status to the persisted issue.
+
+    [Theory]
+    [InlineData("open", IssueStatus.Open)]
+    [InlineData("triaged", IssueStatus.Triaged)]
+    [InlineData("acknowledged", IssueStatus.Acknowledged)]
+    [InlineData("in_progress", IssueStatus.InProgress)]
+    [InlineData("resolved", IssueStatus.Resolved)]
+    [InlineData("closed", IssueStatus.Closed)]
+    public async Task ParseIssueStatus_AllStatusValues_ParseCorrectly(string status, IssueStatus expected)
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync("bug", "Title", "Desc", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        var result = await _composer.UpdateIssueAsync(id, status: status, ct: ct);
+
+        Assert.Contains($"## Issue: {id}", result);
+
+        var issue = await _issueStore.GetIssueAsync(id, ct);
+        Assert.NotNull(issue);
+        Assert.Equal(expected, issue!.Status);
+    }
+
+    [Fact]
+    public async Task ParseIssueStatus_InProgressAlias_ParsesToInProgress()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync("bug", "Title", "Desc", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        var result = await _composer.UpdateIssueAsync(id, status: "inprogress", ct: ct);
+
+        Assert.Contains("in_progress", result);
+
+        var issue = await _issueStore.GetIssueAsync(id, ct);
+        Assert.NotNull(issue);
+        Assert.Equal(IssueStatus.InProgress, issue!.Status);
+    }
+
+    [Theory]
+    [InlineData("bogus")]
+    [InlineData("unknown")]
+    [InlineData("cancelled")]
+    public async Task ParseIssueStatus_UnknownStatus_ReturnsErrorMessage(string status)
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync("bug", "Title", "Desc", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        var result = await _composer.UpdateIssueAsync(id, status: status, ct: ct);
+
+        Assert.Contains("Unknown status", result);
+    }
+
+    // ── list_issues — null/empty filters return all ──
+
+    [Fact]
+    public async Task ListIssues_NullFilters_ReturnsAllIssues()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateIssueAsync("bug", "Bug one", "Desc", severity: "high", ct: ct);
+        await _composer.CreateIssueAsync("suggestion", "Suggestion one", "Desc", severity: "low", ct: ct);
+        await _composer.CreateIssueAsync("concern", "Concern one", "Desc", severity: "medium", ct: ct);
+
+        // All filters omitted (null) → no filtering, all 3 issues returned.
+        var result = await _composer.ListIssuesAsync(ct: ct);
+
+        Assert.Contains("3 issue(s)", result);
+        Assert.Contains("Bug one", result);
+        Assert.Contains("Suggestion one", result);
+        Assert.Contains("Concern one", result);
+    }
+
+    [Fact]
+    public async Task ListIssues_EmptyStringFilters_ReturnsAllIssues()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateIssueAsync("bug", "Bug two", "Desc", severity: "high", ct: ct);
+        await _composer.CreateIssueAsync("suggestion", "Suggestion two", "Desc", severity: "low", ct: ct);
+
+        // Empty-string filters → treated as null → no filtering.
+        var result = await _composer.ListIssuesAsync(status: "", type: "", severity: "", ct: ct);
+
+        Assert.Contains("2 issue(s)", result);
+        Assert.Contains("Bug two", result);
+        Assert.Contains("Suggestion two", result);
+    }
+
+    // ── update_issue — re-fetches and returns updated details ──
+
+    [Fact]
+    public async Task UpdateIssue_ReFetchesAndReturnsUpdatedDetails()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync("bug", "Original", "Original desc", severity: "low", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        var result = await _composer.UpdateIssueAsync(id, status: "triaged", severity: "high", title: "Updated title", ct: ct);
+
+        // The returned details must reflect the updated values (re-fetched from the store).
+        Assert.Contains($"## Issue: {id}", result);
+        Assert.Contains("Updated title", result);
+        Assert.Contains("triaged", result);
+        Assert.Contains("high", result);
+        Assert.Contains("Original desc", result); // description unchanged
+
+        // Verify the store also reflects the changes (proves persistence + re-fetch).
+        var issue = await _issueStore.GetIssueAsync(id, ct);
+        Assert.NotNull(issue);
+        Assert.Equal(IssueStatus.Triaged, issue!.Status);
+        Assert.Equal(IssueSeverity.High, issue.Severity);
+        Assert.Equal("Updated title", issue.Title);
+        Assert.Equal("Original desc", issue.Description);
+        Assert.NotNull(issue.UpdatedAt);
+    }
+
+    // ── tool registration & system prompt ──
+
+    [Fact]
+    public void IssueTools_RegisteredWhenIssueStorePresent()
+    {
+        var tools = _composer.BuildComposerTools();
+        var names = tools.OfType<AIFunction>().Select(t => t.Name).ToList();
+
+        Assert.Contains("create_issue", names);
+        Assert.Contains("list_issues", names);
+        Assert.Contains("get_issue", names);
+        Assert.Contains("update_issue", names);
+    }
+
+    [Fact]
+    public void IssueTools_NotRegisteredWhenIssueStoreNull()
+    {
+        var tools = _composerWithoutIssueStore.BuildComposerTools();
+        var names = tools.OfType<AIFunction>().Select(t => t.Name).ToList();
+
+        Assert.DoesNotContain("create_issue", names);
+        Assert.DoesNotContain("list_issues", names);
+        Assert.DoesNotContain("get_issue", names);
+        Assert.DoesNotContain("update_issue", names);
+    }
+
+    [Fact]
+    public void SystemPrompt_DocumentsIssueTools()
+    {
+        var prompt = _composer.GetSystemPrompt();
+
+        Assert.Contains("create_issue", prompt);
+        Assert.Contains("list_issues", prompt);
+        Assert.Contains("get_issue", prompt);
+        Assert.Contains("update_issue", prompt);
+    }
+
+    [Fact]
+    public void CreateIssue_ToolHasDescriptionAttributes()
+    {
+        var tools = _composer.BuildComposerTools();
+        var createIssue = tools.OfType<AIFunction>().Single(t => t.Name == "create_issue");
+
+        Assert.NotNull(createIssue.Description);
+        Assert.Contains("issue", createIssue.Description, StringComparison.OrdinalIgnoreCase);
+
+        var parameters = createIssue.UnderlyingMethod!.GetParameters();
+        var typeParam = parameters.Single(p => p.Name == "type");
+        var titleParam = parameters.Single(p => p.Name == "title");
+        var descriptionParam = parameters.Single(p => p.Name == "description");
+        var severityParam = parameters.Single(p => p.Name == "severity");
+        var repoParam = parameters.Single(p => p.Name == "repository_names");
+
+        foreach (var p in new[] { typeParam, titleParam, descriptionParam, severityParam, repoParam })
+        {
+            var descriptionAttr = p.GetCustomAttributesData()
+                .First(a => a.AttributeType.FullName == "System.ComponentModel.DescriptionAttribute");
+            Assert.NotNull(descriptionAttr.ConstructorArguments[0].Value as string);
+        }
+    }
+}
+
+/// <summary>
+/// Removal-proof concurrency and forwarding tests for the Composer's issue tools.
+/// <para>
+/// These tests deliberately avoid asserting only on caller-supplied values or on final
+/// store state read back through a second query — assertions like that stay green even
+/// when the production re-fetch, the duplicate-ID retry, or the update serialization is
+/// deleted. Instead they use spy/capturing/gated <see cref="IIssueStore"/> fakes that
+/// return <em>different</em> data than the caller supplied, record the exact
+/// <see cref="CancellationToken"/> per call, and gate <c>GetIssueAsync</c> so two
+/// <c>update_issue</c> calls genuinely overlap.
+/// </para>
+/// </summary>
+public sealed class ComposerIssueToolConcurrencyTests
+{
+    private static Composer CreateComposer(IIssueStore issueStore, GoalStore goalStore) =>
+        new(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            goalStore,
+            stateDir: Path.GetTempPath(),
+            issueStore: issueStore);
+
+    // ── Test A1: create_issue end-to-end concurrent collision avoidance ──
+
+    /// <summary>
+    /// Two genuinely concurrent <c>create_issue</c> calls with the SAME title must both
+    /// succeed and yield DISTINCT IDs. Backed by a real <see cref="IssueStore"/> over a
+    /// file-based SQLite database so each EF context gets its own connection and the
+    /// unique-primary-key constraint is really enforced.
+    /// <para>
+    /// Determinism: a rendezvous decorator holds BOTH callers inside the ID-probe
+    /// <c>GetIssueAsync</c> until both have observed the slug as absent. Both therefore
+    /// select the identical slug and both reach <c>CreateIssueAsync</c> with it, so
+    /// SQLite's unique-key collision is guaranteed rather than scheduler-dependent —
+    /// the second caller can no longer "legitimately" pick <c>…-2</c>.
+    /// </para>
+    /// <para>
+    /// Removal-proof: with the production try/catch(<see cref="InvalidOperationException"/>)
+    /// retry deleted, the losing insert propagates instead of returning
+    /// "Issue created: …", so <c>Task.WhenAll</c> rethrows and this test fails.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task CreateIssue_TwoConcurrentCallsSameTitle_BothSucceedWithDistinctIds()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        using var db = new TempFileDbContextFactory();
+        using var goalDb = CopilotHiveDbContext.CreateInMemory();
+
+        var realStore = new IssueStore(db, NullLogger<IssueStore>.Instance);
+
+        // Hold both callers inside the ID probe until both have seen the slug absent.
+        using var rendezvous = new ProbeRendezvousIssueStore(realStore, participants: 2);
+
+        var goalStore = new GoalStore(goalDb, NullLogger<GoalStore>.Instance);
+        var composer = CreateComposer(rendezvous, goalStore);
+
+        // Dedicated threads (LongRunning), not pool threads, so both callers are
+        // guaranteed to be running simultaneously and can actually meet at the barrier.
+        var callA = Task.Factory.StartNew(
+            () => composer.CreateIssueAsync("bug", "Duplicate title race", "First report", ct: ct),
+            ct, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+
+        var callB = Task.Factory.StartNew(
+            () => composer.CreateIssueAsync("bug", "Duplicate title race", "Second report", ct: ct),
+            ct, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+
+        var results = await Task.WhenAll(callA, callB).WaitAsync(TimeSpan.FromSeconds(30), ct);
+
+        // Both probes really did observe the same absent slug…
+        Assert.Equal(2, rendezvous.ProbeArrivals);
+
+        // …and both really did attempt to insert under that identical slug, so the
+        // duplicate-key collision was genuinely exercised (not sidestepped by "-2").
+        Assert.Equal(2, rendezvous.CreateAttempts.Count(id => id == "duplicate-title-race"));
+
+        // Exactly one insert lost the race and was retried by the production catch.
+        Assert.Equal(1, rendezvous.DuplicateFailures);
+        Assert.Equal(3, rendezvous.CreateAttempts.Count); // 2 colliding + 1 GUID retry
+
+        Assert.All(results, r => Assert.StartsWith("Issue created: ", r));
+
+        var ids = results.Select(r => r.Replace("Issue created: ", "").Trim()).ToList();
+        Assert.Equal(2, ids.Distinct(StringComparer.Ordinal).Count());
+
+        // The winner kept the slug; the loser was retried onto a GUID-based ID.
+        Assert.Contains("duplicate-title-race", ids);
+        var retriedId = Assert.Single(ids, id => id != "duplicate-title-race");
+        Assert.StartsWith("issue-", retriedId);
+
+        // Both issues must actually be persisted.
+        foreach (var id in ids)
+            Assert.NotNull(await realStore.GetIssueAsync(id, ct));
+
+        var all = await realStore.GetIssuesAsync(ct: ct);
+        Assert.Equal(2, all.Count);
+    }
+
+    // ── Test A2: create_issue duplicate-ID retry (deterministic) ──
+
+    /// <summary>
+    /// Deterministic proof of the duplicate-ID retry: the fake store throws
+    /// <see cref="InvalidOperationException"/> on the FIRST <c>CreateIssueAsync</c>
+    /// (simulating another writer inserting the probed ID first). The tool must retry
+    /// with a GUID-based ID rather than surfacing the exception.
+    /// </summary>
+    [Fact]
+    public async Task CreateIssue_DuplicateIdRace_RetriesWithGuidIdAndSucceeds()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        using var goalDb = CopilotHiveDbContext.CreateInMemory();
+        var goalStore = new GoalStore(goalDb, NullLogger<GoalStore>.Instance);
+
+        var store = new RecordingIssueStore { ThrowOnCreateCount = 1 };
+        var composer = CreateComposer(store, goalStore);
+
+        var result = await composer.CreateIssueAsync(
+            "code_quality", "Naming is inconsistent", "Details here",
+            severity: "high", repository_names: ["repo-a", "repo-b"], ct: ct);
+
+        Assert.StartsWith("Issue created: ", result);
+        var id = result.Replace("Issue created: ", "").Trim();
+
+        // Retried with a GUID-based ID — not the slug that lost the race.
+        Assert.StartsWith("issue-", id);
+        Assert.NotEqual("naming-is-inconsistent", id);
+        Assert.Equal(32, id["issue-".Length..].Length);
+
+        // Two create attempts were made: the losing one and the retry.
+        Assert.Equal(2, store.CreateCalls.Count);
+
+        // Every field is preserved on the retry.
+        var retried = store.CreateCalls[^1];
+        Assert.Equal(id, retried.Id);
+        Assert.Equal(IssueType.CodeQuality, retried.Type);
+        Assert.Equal("Naming is inconsistent", retried.Title);
+        Assert.Equal("Details here", retried.Description);
+        Assert.Equal(IssueSeverity.High, retried.Severity);
+        Assert.Equal(IssueStatus.Open, retried.Status);
+        Assert.Equal(["repo-a", "repo-b"], retried.RepositoryNames);
+        Assert.Null(retried.SourceGoalId);
+        Assert.Null(retried.SourceRole);
+        Assert.Null(retried.SourceIteration);
+
+        // The issue really landed in the store under the retried ID.
+        Assert.NotNull(await store.GetIssueAsync(id, ct));
+    }
+
+    /// <summary>
+    /// When the retry itself also collides, the exception must surface rather than being
+    /// swallowed — the tool retries exactly once and does not loop forever.
+    /// </summary>
+    [Fact]
+    public async Task CreateIssue_RetryAlsoCollides_PropagatesException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        using var goalDb = CopilotHiveDbContext.CreateInMemory();
+        var goalStore = new GoalStore(goalDb, NullLogger<GoalStore>.Instance);
+
+        var store = new RecordingIssueStore { ThrowOnCreateCount = int.MaxValue };
+        var composer = CreateComposer(store, goalStore);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            composer.CreateIssueAsync("bug", "Always collides", "Details", ct: ct));
+
+        Assert.Equal(2, store.CreateCalls.Count);
+    }
+
+    // ── Test B: update_issue re-fetch proof ──
+
+    /// <summary>
+    /// Removal-proof re-fetch test. The spy returns DIFFERENT data on the second
+    /// <c>GetIssueAsync</c> (the re-fetch) than the caller ever supplied. The rendered
+    /// details must reflect that server-side data, which is only possible if production
+    /// really re-reads after the write. Deleting the re-fetch and returning
+    /// <c>FormatIssueDetails(updatedIssue)</c> makes every assertion below fail.
+    /// </summary>
+    [Fact]
+    public async Task UpdateIssue_ReturnsReFetchedData_NotLocallyConstructedIssue()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        using var goalDb = CopilotHiveDbContext.CreateInMemory();
+        var goalStore = new GoalStore(goalDb, NullLogger<GoalStore>.Instance);
+
+        var store = new RecordingIssueStore();
+        store.Seed(new Issue
+        {
+            Id = "refetch-proof",
+            Type = IssueType.Bug,
+            Title = "Original title",
+            Description = "Original description",
+            Severity = IssueSeverity.Low,
+            Status = IssueStatus.Open,
+            CreatedAt = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+        });
+
+        // The re-fetch (2nd GetIssueAsync) returns a server-side snapshot that shares the
+        // ID but differs in every rendered field from anything the caller passed in.
+        store.SecondGetResponse = new Issue
+        {
+            Id = "refetch-proof",
+            Type = IssueType.Workflow,
+            Title = "SERVER-SIDE-TITLE",
+            Description = "SERVER-SIDE-DESCRIPTION",
+            Severity = IssueSeverity.Medium,
+            Status = IssueStatus.Closed,
+            RepositoryNames = ["server-repo"],
+            SourceGoalId = "server-goal",
+            SourceRole = "server-role",
+            SourceIteration = 7,
+            CreatedAt = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+            UpdatedAt = new DateTime(2025, 6, 6, 6, 6, 6, DateTimeKind.Utc),
+            ResolvedAt = new DateTime(2025, 7, 7, 7, 7, 7, DateTimeKind.Utc),
+            LinkedGoalId = "server-linked-goal",
+        };
+
+        var composer = CreateComposer(store, goalStore);
+
+        var result = await composer.UpdateIssueAsync(
+            "refetch-proof", status: "triaged", severity: "high", title: "CALLER-TITLE", ct: ct);
+
+        // Production re-fetched: rendered output is the server snapshot…
+        Assert.Contains("SERVER-SIDE-TITLE", result);
+        Assert.Contains("SERVER-SIDE-DESCRIPTION", result);
+        Assert.Contains("workflow", result);
+        Assert.Contains("medium", result);
+        Assert.Contains("closed", result);
+        Assert.Contains("server-repo", result);
+        Assert.Contains("server-goal", result);
+        Assert.Contains("server-role", result);
+        Assert.Contains("server-linked-goal", result);
+        Assert.Contains("2025-06-06 06:06:06", result); // store-managed UpdatedAt
+        Assert.Contains("2025-07-07 07:07:07", result); // store-managed ResolvedAt
+
+        // …and NOT the locally constructed replacement entity.
+        Assert.DoesNotContain("CALLER-TITLE", result);
+        Assert.DoesNotContain("triaged", result);
+        Assert.DoesNotContain("high", result);
+
+        // Exactly one read before the write and one re-read after it.
+        Assert.Equal(2, store.GetIssueCalls.Count);
+        Assert.Single(store.UpdateCalls);
+        Assert.Equal(["GetIssueAsync", "UpdateIssueAsync", "GetIssueAsync"], store.CallLog);
+
+        // The write itself still carried the caller's values.
+        Assert.Equal("CALLER-TITLE", store.UpdateCalls[0].Title);
+        Assert.Equal(IssueStatus.Triaged, store.UpdateCalls[0].Status);
+        Assert.Equal(IssueSeverity.High, store.UpdateCalls[0].Severity);
+    }
+
+    // ── Test C: CancellationToken forwarding ──
+
+    /// <summary>
+    /// <c>create_issue</c> must forward the caller's token to the ID-probe
+    /// <c>GetIssueAsync</c> and to <c>CreateIssueAsync</c>. Uses a live (uncancelled)
+    /// token from a real source so the assertion cannot pass vacuously with
+    /// <see cref="CancellationToken.None"/>.
+    /// </summary>
+    [Fact]
+    public async Task CreateIssue_ForwardsCallerCancellationTokenToEveryStoreCall()
+    {
+        using var goalDb = CopilotHiveDbContext.CreateInMemory();
+        var goalStore = new GoalStore(goalDb, NullLogger<GoalStore>.Instance);
+
+        using var cts = new CancellationTokenSource();
+        var token = cts.Token;
+
+        var store = new RecordingIssueStore();
+        var composer = CreateComposer(store, goalStore);
+
+        var result = await composer.CreateIssueAsync("bug", "Token forwarding", "Details", ct: token);
+
+        Assert.StartsWith("Issue created: ", result);
+
+        Assert.NotEmpty(store.CapturedTokens);
+        Assert.All(store.CapturedTokens, t =>
+        {
+            Assert.Equal(token, t);
+            Assert.NotEqual(CancellationToken.None, t);
+        });
+
+        // The probe read and the create both happened, and both carried the token.
+        Assert.NotEmpty(store.GetIssueCalls);
+        Assert.NotEmpty(store.CreateCalls);
+    }
+
+    /// <summary>
+    /// <c>update_issue</c> must forward the caller's token to the initial
+    /// <c>GetIssueAsync</c>, to <c>UpdateIssueAsync</c>, and to the re-fetch
+    /// <c>GetIssueAsync</c>.
+    /// </summary>
+    [Fact]
+    public async Task UpdateIssue_ForwardsCallerCancellationTokenToReadWriteAndReFetch()
+    {
+        using var goalDb = CopilotHiveDbContext.CreateInMemory();
+        var goalStore = new GoalStore(goalDb, NullLogger<GoalStore>.Instance);
+
+        using var cts = new CancellationTokenSource();
+        var token = cts.Token;
+
+        var store = new RecordingIssueStore();
+        store.Seed(new Issue
+        {
+            Id = "token-update",
+            Type = IssueType.Bug,
+            Title = "Title",
+            Description = "Description",
+        });
+
+        var composer = CreateComposer(store, goalStore);
+
+        await composer.UpdateIssueAsync("token-update", status: "resolved", ct: token);
+
+        Assert.Equal(["GetIssueAsync", "UpdateIssueAsync", "GetIssueAsync"], store.CallLog);
+        Assert.Equal(3, store.CapturedTokens.Count);
+        Assert.All(store.CapturedTokens, t =>
+        {
+            Assert.Equal(token, t);
+            Assert.NotEqual(CancellationToken.None, t);
+        });
+    }
+
+    /// <summary>
+    /// <c>list_issues</c> and <c>get_issue</c> must forward the caller's token too.
+    /// </summary>
+    [Fact]
+    public async Task ListAndGetIssue_ForwardCallerCancellationToken()
+    {
+        using var goalDb = CopilotHiveDbContext.CreateInMemory();
+        var goalStore = new GoalStore(goalDb, NullLogger<GoalStore>.Instance);
+
+        using var cts = new CancellationTokenSource();
+        var token = cts.Token;
+
+        var store = new RecordingIssueStore();
+        store.Seed(new Issue
+        {
+            Id = "token-read",
+            Type = IssueType.Bug,
+            Title = "Title",
+            Description = "Description",
+        });
+
+        var composer = CreateComposer(store, goalStore);
+
+        await composer.ListIssuesAsync(ct: token);
+        await composer.GetIssueAsync("token-read", ct: token);
+
+        Assert.Equal(["GetIssuesAsync", "GetIssueAsync"], store.CallLog);
+        Assert.Equal(2, store.CapturedTokens.Count);
+        Assert.All(store.CapturedTokens, t =>
+        {
+            Assert.Equal(token, t);
+            Assert.NotEqual(CancellationToken.None, t);
+        });
+    }
+
+    // ── Test D: update_issue serialized read-modify-write ──
+
+    /// <summary>
+    /// Removal-proof serialization test proving the lock spans the READ.
+    /// <para>
+    /// Determinism (no delays, no elapsed-time reasoning):
+    /// call A is parked inside <c>UpdateIssueAsync</c> — i.e. it already holds the
+    /// semaphore and has completed its read. Call B is then invoked <em>directly</em>
+    /// (not via <c>Task.Run</c>): a C# async method runs synchronously up to its first
+    /// INCOMPLETE await, so by the time <c>UpdateIssueAsync</c> returns its task to us,
+    /// B has provably already reached <c>_issueUpdateLock.WaitAsync</c>. Its task being
+    /// incomplete is therefore positive proof of lock contention — B is blocked on the
+    /// semaphore, not merely unscheduled.
+    /// </para>
+    /// <para>
+    /// Removal-proof: the ordered call-log assertion requires B's <c>GetIssueAsync</c> to
+    /// come AFTER A's <c>UpdateIssueAsync</c>. With <c>_issueUpdateLock</c> deleted, B's
+    /// read executes immediately while A is parked, producing
+    /// <c>[Get, Get, Update, …]</c> instead of <c>[Get, Update, Get, Get, Update, Get]</c>,
+    /// and B's stale full-replacement write also clobbers A's severity.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task UpdateIssue_ConcurrentPartialUpdates_AreSerializedAndBothPersist()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        using var goalDb = CopilotHiveDbContext.CreateInMemory();
+        var goalStore = new GoalStore(goalDb, NullLogger<GoalStore>.Instance);
+
+        // Gate the FIRST write: A holds the lock (having already read) while B contends.
+        var store = new RecordingIssueStore { GateFirstUpdate = true };
+        store.Seed(new Issue
+        {
+            Id = "serialize-me",
+            Type = IssueType.Bug,
+            Title = "Title",
+            Description = "Description",
+            Severity = IssueSeverity.Low,
+            Status = IssueStatus.Open,
+        });
+
+        var composer = CreateComposer(store, goalStore);
+
+        // Call A changes only the severity; call B changes only the status.
+        var callA = composer.UpdateIssueAsync("serialize-me", severity: "high", ct: ct);
+
+        // A is inside the critical section, parked in UpdateIssueAsync holding the lock.
+        await store.FirstUpdateEntered.Task.WaitAsync(TimeSpan.FromSeconds(30), ct);
+        Assert.Single(store.GetIssueCalls); // A read; nobody else has.
+
+        // Invoke B DIRECTLY (no Task.Run): it runs synchronously until its first
+        // incomplete await, which is _issueUpdateLock.WaitAsync. Once this call returns,
+        // B has definitively reached the contention point.
+        var callB = composer.UpdateIssueAsync("serialize-me", status: "resolved", ct: ct);
+
+        // B is blocked ON THE SEMAPHORE — proven structurally, not by elapsed time.
+        Assert.False(callB.IsCompleted);
+
+        // The lock spans the read: B could not read while A holds the critical section.
+        Assert.Single(store.GetIssueCalls);
+
+        // Let A commit; B then proceeds against A's committed state.
+        store.ReleaseFirstUpdate();
+        var results = await Task.WhenAll(callA, callB).WaitAsync(TimeSpan.FromSeconds(30), ct);
+
+        Assert.All(results, r => Assert.Contains("## Issue: serialize-me", r));
+
+        // Neither writer clobbered the other: both partial updates survive.
+        var final = await store.GetIssueAsync("serialize-me", ct);
+        Assert.NotNull(final);
+        Assert.Equal(IssueSeverity.High, final!.Severity);   // from call A
+        Assert.Equal(IssueStatus.Resolved, final.Status);    // from call B
+
+        // Untouched fields are preserved throughout.
+        Assert.Equal("Title", final.Title);
+        Assert.Equal("Description", final.Description);
+        Assert.Equal(IssueType.Bug, final.Type);
+
+        // Exact ordering proof: B's read lands AFTER A's write, never before it.
+        Assert.Equal(2, store.UpdateCalls.Count);
+        Assert.Equal(
+            ["GetIssueAsync", "UpdateIssueAsync", "GetIssueAsync",   // call A: read, write, re-fetch
+             "GetIssueAsync", "UpdateIssueAsync", "GetIssueAsync",   // call B: read, write, re-fetch
+             "GetIssueAsync"],                                       // final assertion read
+            store.CallLog);
+    }
+
+    /// <summary>
+    /// The serialization lock must be released even when the update returns early through
+    /// a validation failure, otherwise every later <c>update_issue</c> would deadlock.
+    /// </summary>
+    [Fact]
+    public async Task UpdateIssue_ValidationFailure_StillReleasesLock()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        using var goalDb = CopilotHiveDbContext.CreateInMemory();
+        var goalStore = new GoalStore(goalDb, NullLogger<GoalStore>.Instance);
+
+        var store = new RecordingIssueStore();
+        store.Seed(new Issue
+        {
+            Id = "lock-release",
+            Type = IssueType.Bug,
+            Title = "Title",
+            Description = "Description",
+        });
+
+        var composer = CreateComposer(store, goalStore);
+
+        // Invalid status → early return from inside the critical section.
+        var failed = await composer.UpdateIssueAsync("lock-release", status: "bogus", ct: ct);
+        Assert.Contains("Unknown status", failed);
+
+        // Not-found → another early return from inside the critical section.
+        var missing = await composer.UpdateIssueAsync("does-not-exist", status: "resolved", ct: ct);
+        Assert.Equal("Issue 'does-not-exist' not found.", missing);
+
+        // The lock was released each time, so a subsequent update still completes promptly.
+        var ok = await composer
+            .UpdateIssueAsync("lock-release", status: "resolved", ct: ct)
+            .WaitAsync(TimeSpan.FromSeconds(10), ct);
+
+        Assert.Contains("resolved", ok);
+    }
+
+    // ── Fakes ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// An <see cref="IDbContextFactory{TContext}"/> backed by a temporary file-based SQLite
+    /// database. A file (rather than <c>:memory:</c>) is required because each created context
+    /// opens its OWN connection, which is what makes genuinely concurrent writes — and the
+    /// resulting primary-key collisions — reachable in a test.
+    /// </summary>
+    private sealed class TempFileDbContextFactory : IDbContextFactory<CopilotHiveDbContext>, IDisposable
+    {
+        private readonly string _path =
+            Path.Combine(Path.GetTempPath(), $"copilothive-issues-{Guid.NewGuid():N}.db");
+
+        public TempFileDbContextFactory()
+        {
+            using var ctx = CreateDbContext();
+            ctx.Database.EnsureCreated();
+        }
+
+        public CopilotHiveDbContext CreateDbContext()
+        {
+            var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite($"Data Source={_path};Cache=Shared")
+                .Options;
+            return new CopilotHiveDbContext(options);
+        }
+
+        public void Dispose()
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            try { File.Delete(_path); } catch { /* best-effort temp cleanup */ }
+        }
+    }
+
+    /// <summary>
+    /// In-memory <see cref="IIssueStore"/> spy that records every call (name, arguments and
+    /// the exact <see cref="CancellationToken"/>), can fail a configurable number of
+    /// <c>CreateIssueAsync</c> calls to simulate a duplicate-ID race, can return a
+    /// different snapshot on the second <c>GetIssueAsync</c> to prove re-fetching, and can
+    /// gate the first <c>GetIssueAsync</c> to force two updates to overlap.
+    /// </summary>
+    private sealed class RecordingIssueStore : IIssueStore
+    {
+        private readonly Dictionary<string, Issue> _issues = new(StringComparer.Ordinal);
+        private readonly Lock _sync = new();
+
+        /// <summary>Ordered log of store method names as they were invoked.</summary>
+        public List<string> CallLog { get; } = [];
+
+        /// <summary>Every <see cref="CancellationToken"/> the tools passed in, in call order.</summary>
+        public List<CancellationToken> CapturedTokens { get; } = [];
+
+        /// <summary>IDs passed to <c>GetIssueAsync</c>, in call order.</summary>
+        public List<string> GetIssueCalls { get; } = [];
+
+        /// <summary>Entities passed to <c>CreateIssueAsync</c>, in call order.</summary>
+        public List<Issue> CreateCalls { get; } = [];
+
+        /// <summary>Entities passed to <c>UpdateIssueAsync</c>, in call order.</summary>
+        public List<Issue> UpdateCalls { get; } = [];
+
+        /// <summary>Number of leading <c>CreateIssueAsync</c> calls that throw a duplicate error.</summary>
+        public int ThrowOnCreateCount { get; init; }
+
+        /// <summary>When set, the SECOND <c>GetIssueAsync</c> returns this instead of stored state.</summary>
+        public Issue? SecondGetResponse { get; set; }
+
+        /// <summary>When true, the first <c>GetIssueAsync</c> blocks until released.</summary>
+        public bool GateFirstGet { get; init; }
+
+        /// <summary>Completes once the first <c>GetIssueAsync</c> has been entered and parked.</summary>
+        public TaskCompletionSource FirstGetEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private readonly TaskCompletionSource _firstGetGate =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>
+        /// When true, the first <c>UpdateIssueAsync</c> blocks until released. This parks the
+        /// first caller inside the critical section AFTER it has completed its read, which is
+        /// what lets a second caller contend for the lock at a deterministic point.
+        /// </summary>
+        public bool GateFirstUpdate { get; init; }
+
+        /// <summary>Completes once the first <c>UpdateIssueAsync</c> has been entered and parked.</summary>
+        public TaskCompletionSource FirstUpdateEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private readonly TaskCompletionSource _firstUpdateGate =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private int _createAttempts;
+        private int _getIssueAttempts;
+        private int _updateAttempts;
+
+        /// <summary>Releases a gated first <c>GetIssueAsync</c>.</summary>
+        public void ReleaseFirstGet() => _firstGetGate.TrySetResult();
+
+        /// <summary>Releases a gated first <c>UpdateIssueAsync</c>.</summary>
+        public void ReleaseFirstUpdate() => _firstUpdateGate.TrySetResult();
+
+        /// <summary>Pre-populates the store without recording a call.</summary>
+        public void Seed(Issue issue)
+        {
+            lock (_sync)
+                _issues[issue.Id] = Clone(issue);
+        }
+
+        private static Issue Clone(Issue source) => new()
+        {
+            Id = source.Id,
+            Type = source.Type,
+            Title = source.Title,
+            Description = source.Description,
+            Severity = source.Severity,
+            Status = source.Status,
+            RepositoryNames = [.. source.RepositoryNames],
+            SourceGoalId = source.SourceGoalId,
+            SourceRole = source.SourceRole,
+            SourceIteration = source.SourceIteration,
+            CreatedAt = source.CreatedAt,
+            UpdatedAt = source.UpdatedAt,
+            ResolvedAt = source.ResolvedAt,
+            LinkedGoalId = source.LinkedGoalId,
+        };
+
+        private void Record(string method, CancellationToken ct)
+        {
+            lock (_sync)
+            {
+                CallLog.Add(method);
+                CapturedTokens.Add(ct);
+            }
+        }
+
+        public Task<IReadOnlyList<Issue>> GetAllIssuesAsync(CancellationToken ct = default)
+        {
+            Record(nameof(GetAllIssuesAsync), ct);
+            lock (_sync)
+                return Task.FromResult<IReadOnlyList<Issue>>(_issues.Values.Select(Clone).ToList());
+        }
+
+        public Task<IReadOnlyList<Issue>> GetIssuesAsync(
+            IssueStatus? status = null,
+            IssueType? type = null,
+            IssueSeverity? severity = null,
+            string? repository = null,
+            string? sourceGoalId = null,
+            CancellationToken ct = default)
+        {
+            Record(nameof(GetIssuesAsync), ct);
+            lock (_sync)
+            {
+                var query = _issues.Values.AsEnumerable();
+                if (status.HasValue) query = query.Where(i => i.Status == status.Value);
+                if (type.HasValue) query = query.Where(i => i.Type == type.Value);
+                if (severity.HasValue) query = query.Where(i => i.Severity == severity.Value);
+                if (sourceGoalId is not null) query = query.Where(i => i.SourceGoalId == sourceGoalId);
+                if (repository is not null)
+                {
+                    query = query.Where(i => i.RepositoryNames
+                        .Any(r => string.Equals(r, repository, StringComparison.OrdinalIgnoreCase)));
+                }
+                return Task.FromResult<IReadOnlyList<Issue>>(query.Select(Clone).ToList());
+            }
+        }
+
+        public async Task<Issue?> GetIssueAsync(string issueId, CancellationToken ct = default)
+        {
+            Record(nameof(GetIssueAsync), ct);
+
+            int attempt;
+            lock (_sync)
+            {
+                GetIssueCalls.Add(issueId);
+                attempt = ++_getIssueAttempts;
+            }
+
+            if (GateFirstGet && attempt == 1)
+            {
+                FirstGetEntered.TrySetResult();
+                await _firstGetGate.Task.WaitAsync(ct);
+            }
+
+            if (attempt == 2 && SecondGetResponse is not null)
+                return Clone(SecondGetResponse);
+
+            lock (_sync)
+                return _issues.TryGetValue(issueId, out var found) ? Clone(found) : null;
+        }
+
+        public Task<Issue> CreateIssueAsync(Issue issue, CancellationToken ct = default)
+        {
+            Record(nameof(CreateIssueAsync), ct);
+
+            int attempt;
+            lock (_sync)
+            {
+                CreateCalls.Add(Clone(issue));
+                attempt = ++_createAttempts;
+            }
+
+            if (attempt <= ThrowOnCreateCount)
+            {
+                throw new InvalidOperationException(
+                    $"Failed to create issue '{issue.Id}'; an issue with the same ID may already exist.");
+            }
+
+            lock (_sync)
+            {
+                if (!_issues.TryAdd(issue.Id, Clone(issue)))
+                {
+                    throw new InvalidOperationException(
+                        $"Failed to create issue '{issue.Id}'; an issue with the same ID may already exist.");
+                }
+            }
+
+            return Task.FromResult(issue);
+        }
+
+        public async Task UpdateIssueAsync(Issue issue, CancellationToken ct = default)
+        {
+            Record(nameof(UpdateIssueAsync), ct);
+
+            int attempt;
+            lock (_sync)
+                attempt = ++_updateAttempts;
+
+            // Park the first writer INSIDE the caller's critical section (it already holds
+            // the production lock and has completed its read), so a second caller can be
+            // observed contending for that lock at a deterministic point.
+            if (GateFirstUpdate && attempt == 1)
+            {
+                FirstUpdateEntered.TrySetResult();
+                await _firstUpdateGate.Task.WaitAsync(ct);
+            }
+
+            lock (_sync)
+            {
+                UpdateCalls.Add(Clone(issue));
+
+                if (!_issues.TryGetValue(issue.Id, out var existing))
+                    throw new InvalidOperationException($"Issue '{issue.Id}' not found in fake store.");
+
+                // Mirror IssueStore: copy mutable fields, preserve immutable ones,
+                // and manage the ResolvedAt / UpdatedAt transitions.
+                var wasTerminal = existing.Status is IssueStatus.Resolved or IssueStatus.Closed;
+                var isTerminal = issue.Status is IssueStatus.Resolved or IssueStatus.Closed;
+
+                if (isTerminal && !wasTerminal) existing.ResolvedAt = DateTime.UtcNow;
+                else if (!isTerminal) existing.ResolvedAt = null;
+
+                existing.Type = issue.Type;
+                existing.Title = issue.Title;
+                existing.Description = issue.Description;
+                existing.Severity = issue.Severity;
+                existing.Status = issue.Status;
+                existing.RepositoryNames = [.. issue.RepositoryNames];
+                existing.LinkedGoalId = issue.LinkedGoalId;
+                existing.UpdatedAt = DateTime.UtcNow;
+            }
+        }
+
+        public Task<bool> DeleteIssueAsync(string issueId, CancellationToken ct = default)
+        {
+            Record(nameof(DeleteIssueAsync), ct);
+            lock (_sync)
+                return Task.FromResult(_issues.Remove(issueId));
+        }
+    }
+
+    /// <summary>
+    /// Decorator over a REAL <see cref="IIssueStore"/> that forces a genuine duplicate-ID
+    /// collision instead of leaving it to chance.
+    /// <para>
+    /// <see cref="IssueIdGenerator"/> probes candidate IDs via <c>GetIssueAsync</c> and
+    /// picks the first absent one. Left unsynchronised, two callers usually run far enough
+    /// apart that the second observes the first's row and legitimately selects
+    /// <c>…-2</c> — no collision, and the production retry is never exercised. This
+    /// decorator holds every probing caller at a <see cref="Barrier"/> until all
+    /// participants have arrived, guaranteeing they all observe the same absent slug and
+    /// all attempt to insert it.
+    /// </para>
+    /// </summary>
+    private sealed class ProbeRendezvousIssueStore(IIssueStore inner, int participants)
+        : IIssueStore, IDisposable
+    {
+        private readonly Barrier _probeBarrier = new(participants);
+        private readonly Lock _sync = new();
+        private int _probeArrivals;
+        private int _duplicateFailures;
+
+        /// <summary>Number of callers that met at the probe barrier.</summary>
+        public int ProbeArrivals => Volatile.Read(ref _probeArrivals);
+
+        /// <summary>Number of inserts rejected by the store's duplicate-ID guard.</summary>
+        public int DuplicateFailures => Volatile.Read(ref _duplicateFailures);
+
+        /// <summary>IDs passed to <c>CreateIssueAsync</c>, in call order.</summary>
+        public List<string> CreateAttempts { get; } = [];
+
+        public Task<IReadOnlyList<Issue>> GetAllIssuesAsync(CancellationToken ct = default) =>
+            inner.GetAllIssuesAsync(ct);
+
+        public Task<IReadOnlyList<Issue>> GetIssuesAsync(
+            IssueStatus? status = null,
+            IssueType? type = null,
+            IssueSeverity? severity = null,
+            string? repository = null,
+            string? sourceGoalId = null,
+            CancellationToken ct = default) =>
+            inner.GetIssuesAsync(status, type, severity, repository, sourceGoalId, ct);
+
+        public async Task<Issue?> GetIssueAsync(string issueId, CancellationToken ct = default)
+        {
+            var result = await inner.GetIssueAsync(issueId, ct);
+
+            // Only the first probe of each caller (the bare slug, still absent) rendezvouses;
+            // barrier participants are finite, so later probes must not re-enter it.
+            if (result is null && Interlocked.Increment(ref _probeArrivals) <= participants)
+            {
+                // Both callers now hold the identical "absent" answer for the same slug.
+                _probeBarrier.SignalAndWait(ct);
+            }
+
+            return result;
+        }
+
+        public async Task<Issue> CreateIssueAsync(Issue issue, CancellationToken ct = default)
+        {
+            lock (_sync)
+                CreateAttempts.Add(issue.Id);
+
+            try
+            {
+                return await inner.CreateIssueAsync(issue, ct);
+            }
+            catch (InvalidOperationException)
+            {
+                Interlocked.Increment(ref _duplicateFailures);
+                throw;
+            }
+        }
+
+        public Task UpdateIssueAsync(Issue issue, CancellationToken ct = default) =>
+            inner.UpdateIssueAsync(issue, ct);
+
+        public Task<bool> DeleteIssueAsync(string issueId, CancellationToken ct = default) =>
+            inner.DeleteIssueAsync(issueId, ct);
+
+        public void Dispose() => _probeBarrier.Dispose();
     }
 }
