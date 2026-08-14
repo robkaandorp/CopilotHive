@@ -1,0 +1,465 @@
+@page "/issues"
+@using CopilotHive.Dashboard
+@using CopilotHive.Goals
+@using Markdig
+@using System.Text.Json
+@inject HttpClient HttpClient
+@inject NavigationManager Nav
+@inject PageHeaderState PageHeader
+
+<!-- Filter Bar -->
+<div class="filter-bar">
+    <select @bind="_typeFilter" @bind:after="LoadIssues">
+        <option value="">All types</option>
+        <option value="code_quality">Code Quality</option>
+        <option value="bug">Bug</option>
+        <option value="suggestion">Suggestion</option>
+        <option value="concern">Concern</option>
+        <option value="workflow">Workflow</option>
+    </select>
+
+    <select @bind="_severityFilter" @bind:after="LoadIssues">
+        <option value="">All severities</option>
+        <option value="low">Low</option>
+        <option value="medium">Medium</option>
+        <option value="high">High</option>
+    </select>
+
+    <select @bind="_statusFilter" @bind:after="LoadIssues">
+        <option value="">All statuses</option>
+        <option value="open">Open</option>
+        <option value="triaged">Triaged</option>
+        <option value="acknowledged">Acknowledged</option>
+        <option value="in_progress">In Progress</option>
+        <option value="resolved">Resolved</option>
+        <option value="closed">Closed</option>
+    </select>
+
+    <input type="text" placeholder="Filter by repository…" @bind="_repoFilter" @bind:event="oninput" @bind:after="LoadIssues" />
+
+    <span class="filter-count">@_issues.Count issue(s)</span>
+
+    <button class="approve-btn" style="margin-left:auto" @onclick="() => _showCreateForm = !_showCreateForm">
+        + New Issue
+    </button>
+</div>
+
+<!-- Inline Create Form -->
+@if (_showCreateForm)
+{
+    <div class="card" style="margin-bottom:1rem">
+        <div class="label" style="margin-bottom:0.5rem">New Issue</div>
+        <div style="display:flex;gap:0.75rem;flex-wrap:wrap;align-items:flex-end">
+            <div>
+                <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Type</div>
+                <select @bind="_createType" style="padding:0.5rem 0.75rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem">
+                    @foreach (var t in Enum.GetValues<IssueType>())
+                    {
+                        <option value="@t">@t</option>
+                    }
+                </select>
+            </div>
+            <div>
+                <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Title</div>
+                <input type="text" placeholder="Short summary" @bind="_createTitle"
+                       style="padding:0.5rem 0.75rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;min-width:220px" />
+            </div>
+            <div>
+                <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Severity</div>
+                <select @bind="_createSeverity" style="padding:0.5rem 0.75rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem">
+                    @foreach (var s in Enum.GetValues<IssueSeverity>())
+                    {
+                        <option value="@s">@s</option>
+                    }
+                </select>
+            </div>
+            <div>
+                <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Repositories (comma-separated)</div>
+                <input type="text" placeholder="e.g. CopilotHive, docs" @bind="_createRepos"
+                       style="padding:0.5rem 0.75rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;min-width:200px" />
+            </div>
+        </div>
+        <div style="margin-top:0.75rem">
+            <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Description</div>
+            <textarea @bind="_createDescription" placeholder="Detailed markdown description"
+                      style="width:100%;min-height:100px;padding:0.5rem 0.75rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;font-family:inherit;resize:vertical"></textarea>
+        </div>
+        <div style="margin-top:0.75rem;display:flex;gap:0.5rem;align-items:center">
+            <button class="approve-btn" @onclick="CreateIssue">Create</button>
+            <button style="background:var(--bg-card);border:1px solid var(--border);color:var(--text-muted);padding:0.4rem 0.85rem;border-radius:6px;cursor:pointer;font-size:0.85rem"
+                    @onclick="() => _showCreateForm = false">Cancel</button>
+            @if (!string.IsNullOrEmpty(_createError))
+            {
+                <span class="error-msg">@_createError</span>
+            }
+        </div>
+    </div>
+}
+
+<!-- Issues Table -->
+@if (_issues.Count > 0)
+{
+    <div class="goals-table-wrap">
+        <table class="goals-table">
+            <thead>
+                <tr>
+                    <th>Title</th>
+                    <th>Type</th>
+                    <th>Severity</th>
+                    <th>Status</th>
+                    <th>Repositories</th>
+                    <th>Source</th>
+                    <th>Created</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var issue in _issues)
+                {
+                    var isExpanded = _expandedIds.Contains(issue.Id);
+                    <tr style="cursor:pointer" @onclick="() => ToggleDetail(issue.Id)">
+                        <td>
+                            <span style="font-weight:500">@issue.Title</span>
+                            <div style="font-size:0.75rem;color:var(--text-muted)">@issue.Id</div>
+                        </td>
+                        <td><span class="badge @TypeBadge(issue.Type)">@issue.Type</span></td>
+                        <td><span class="badge @SeverityBadge(issue.Severity)">@issue.Severity</span></td>
+                        <td><span class="badge @StatusBadge(issue.Status)">@issue.Status</span></td>
+                        <td>
+                            @if (issue.RepositoryNames.Count > 0)
+                            {
+                                <div class="goal-repos">
+                                    @foreach (var repo in issue.RepositoryNames)
+                                    {
+                                        <span class="repo-tag">@repo</span>
+                                    }
+                                </div>
+                            }
+                            else
+                            {
+                                <span style="color:var(--text-muted)">—</span>
+                            }
+                        </td>
+                        <td style="color:var(--text-muted);font-size:0.85rem">@FormatSource(issue)</td>
+                        <td style="color:var(--text-muted);white-space:nowrap">@issue.CreatedAt.ToString("yyyy-MM-dd HH:mm")</td>
+                    </tr>
+                    @if (isExpanded)
+                    {
+                        <tr>
+                            <td colspan="7" style="background:var(--bg);padding:1rem">
+                                <!-- Triage controls -->
+                                <div style="display:flex;flex-wrap:wrap;gap:1rem;margin-bottom:0.75rem;align-items:flex-end">
+                                    <div>
+                                        <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Status</div>
+                                        <select value="@ToSnakeCase(issue.Status)" @onchange="(ChangeEventArgs e) => UpdateStatus(issue, e)"
+                                                style="padding:0.4rem 0.6rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem">
+                                            @foreach (var s in Enum.GetValues<IssueStatus>())
+                                            {
+                                                <option value="@ToSnakeCase(s)">@s</option>
+                                            }
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Severity</div>
+                                        <select value="@ToSnakeCase(issue.Severity)" @onchange="(ChangeEventArgs e) => UpdateSeverity(issue, e)"
+                                                style="padding:0.4rem 0.6rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem">
+                                            @foreach (var s in Enum.GetValues<IssueSeverity>())
+                                            {
+                                                <option value="@ToSnakeCase(s)">@s</option>
+                                            }
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Type</div>
+                                        <select value="@ToSnakeCase(issue.Type)" @onchange="(ChangeEventArgs e) => UpdateType(issue, e)"
+                                                style="padding:0.4rem 0.6rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem">
+                                            @foreach (var t in Enum.GetValues<IssueType>())
+                                            {
+                                                <option value="@ToSnakeCase(t)">@t</option>
+                                            }
+                                        </select>
+                                    </div>
+                                    <div style="margin-left:auto">
+                                        <button class="danger-btn" @onclick="() => DeleteIssue(issue)">🗑 Delete</button>
+                                    </div>
+                                </div>
+
+                                @if (_errors.TryGetValue(issue.Id, out var error))
+                                {
+                                    <span class="error-msg" style="margin-bottom:0.5rem">@error</span>
+                                }
+
+                                <!-- Issue details -->
+                                <div style="font-size:0.95rem;font-weight:600;margin-bottom:0.5rem">@issue.Title</div>
+                                <div class="chat-msg-content" style="margin-bottom:0.75rem">
+                                    @((MarkupString)RenderMarkdown(issue.Description))
+                                </div>
+                                <div style="display:flex;flex-wrap:wrap;gap:0.5rem 1.5rem;font-size:0.8rem;color:var(--text-muted)">
+                                    <span><strong>ID:</strong> @issue.Id</span>
+                                    <span><strong>Type:</strong> @issue.Type</span>
+                                    <span><strong>Severity:</strong> @issue.Severity</span>
+                                    <span><strong>Status:</strong> @issue.Status</span>
+                                    @if (issue.RepositoryNames.Count > 0)
+                                    {
+                                        <span><strong>Repositories:</strong> @string.Join(", ", issue.RepositoryNames)</span>
+                                    }
+                                    @if (issue.SourceGoalId is not null)
+                                    {
+                                        <span><strong>Source Goal:</strong> <a href="/goals/@Uri.EscapeDataString(issue.SourceGoalId)">@issue.SourceGoalId</a></span>
+                                    }
+                                    @if (!string.IsNullOrEmpty(issue.SourceRole))
+                                    {
+                                        <span><strong>Source Role:</strong> @issue.SourceRole</span>
+                                    }
+                                    @if (issue.SourceIteration.HasValue)
+                                    {
+                                        <span><strong>Source Iteration:</strong> @issue.SourceIteration.Value</span>
+                                    }
+                                    <span><strong>Created:</strong> @issue.CreatedAt.ToString("yyyy-MM-dd HH:mm")</span>
+                                    @if (issue.UpdatedAt.HasValue)
+                                    {
+                                        <span><strong>Updated:</strong> @issue.UpdatedAt.Value.ToString("yyyy-MM-dd HH:mm")</span>
+                                    }
+                                    @if (issue.ResolvedAt.HasValue)
+                                    {
+                                        <span><strong>Resolved:</strong> @issue.ResolvedAt.Value.ToString("yyyy-MM-dd HH:mm")</span>
+                                    }
+                                    @if (!string.IsNullOrEmpty(issue.LinkedGoalId))
+                                    {
+                                        <span><strong>Linked Goal:</strong> <a href="/goals/@Uri.EscapeDataString(issue.LinkedGoalId)">@issue.LinkedGoalId</a></span>
+                                    }
+                                </div>
+                            </td>
+                        </tr>
+                    }
+                }
+            </tbody>
+        </table>
+    </div>
+}
+else if (_loaded)
+{
+    <p style="color:var(--text-muted);margin-top:1rem">No issues found.</p>
+}
+
+@code {
+    private record IssueResponse(
+        string Id, IssueType Type, string Title, string Description,
+        IssueSeverity Severity, IssueStatus Status, List<string> RepositoryNames,
+        string? SourceGoalId, string? SourceRole, int? SourceIteration,
+        DateTime CreatedAt, DateTime? UpdatedAt, DateTime? ResolvedAt,
+        string? LinkedGoalId);
+
+    private List<IssueResponse> _issues = [];
+    private string _typeFilter = "";
+    private string _severityFilter = "";
+    private string _statusFilter = "";
+    private string _repoFilter = "";
+    private readonly HashSet<string> _expandedIds = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _errors = new(StringComparer.Ordinal);
+    private bool _showCreateForm;
+    private string _createError = "";
+    private bool _loaded;
+
+    private IssueType _createType = IssueType.Suggestion;
+    private string _createTitle = "";
+    private string _createDescription = "";
+    private IssueSeverity _createSeverity = IssueSeverity.Low;
+    private string _createRepos = "";
+
+    protected override async Task OnInitializedAsync()
+    {
+        PageHeader.SetTitle("🐛 Issues");
+        await LoadIssues();
+    }
+
+    private async Task LoadIssues()
+    {
+        var query = new Dictionary<string, string>();
+        if (!string.IsNullOrEmpty(_typeFilter)) query["type"] = _typeFilter;
+        if (!string.IsNullOrEmpty(_severityFilter)) query["severity"] = _severityFilter;
+        if (!string.IsNullOrEmpty(_statusFilter)) query["status"] = _statusFilter;
+        if (!string.IsNullOrEmpty(_repoFilter)) query["repository"] = _repoFilter;
+
+        var queryString = string.Join("&", query.Select(kv => $"{kv.Key}={Uri.EscapeDataString(kv.Value)}"));
+        var url = $"/api/issues{(string.IsNullOrEmpty(queryString) ? "" : "?" + queryString)}";
+
+        var response = await HttpClient.GetAsync(url);
+        if (response.IsSuccessStatusCode)
+        {
+            _issues = await response.Content.ReadFromJsonAsync<List<IssueResponse>>(ReasoningEffortOptions.JsonOptions) ?? [];
+            _loaded = true;
+        }
+    }
+
+    private void ToggleDetail(string id)
+    {
+        if (!_expandedIds.Add(id))
+            _expandedIds.Remove(id);
+    }
+
+    private async Task UpdateStatus(IssueResponse issue, ChangeEventArgs e) =>
+        await UpdateField(issue, "status", e.Value?.ToString() ?? "");
+
+    private async Task UpdateSeverity(IssueResponse issue, ChangeEventArgs e) =>
+        await UpdateField(issue, "severity", e.Value?.ToString() ?? "");
+
+    private async Task UpdateType(IssueResponse issue, ChangeEventArgs e) =>
+        await UpdateField(issue, "type", e.Value?.ToString() ?? "");
+
+    private async Task UpdateField(IssueResponse issue, string field, string newValue)
+    {
+        _errors.Remove(issue.Id);
+
+        object payload;
+        try
+        {
+            if (field == "status")
+                payload = new { status = ParseSnakeCase<IssueStatus>(newValue) };
+            else if (field == "severity")
+                payload = new { severity = ParseSnakeCase<IssueSeverity>(newValue) };
+            else if (field == "type")
+                payload = new { type = ParseSnakeCase<IssueType>(newValue) };
+            else
+                throw new InvalidOperationException($"Unknown field: {field}");
+        }
+        catch (ArgumentException)
+        {
+            _errors[issue.Id] = $"Invalid {field} value: {newValue}";
+            return;
+        }
+
+        var body = JsonSerializer.Serialize(payload, ReasoningEffortOptions.JsonOptions);
+        var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+        var response = await HttpClient.PatchAsync($"/api/issues/{Uri.EscapeDataString(issue.Id)}", content);
+        if (response.IsSuccessStatusCode)
+        {
+            // Re-query with the active filters so the list only shows issues
+            // that still match (e.g. triaging an open issue to resolved while
+            // filtering by status=open must remove it from the view).
+            await LoadIssues();
+        }
+        else
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            _errors[issue.Id] = $"Error {(int)response.StatusCode}: {errorContent}";
+        }
+    }
+
+    private async Task DeleteIssue(IssueResponse issue)
+    {
+        _errors.Remove(issue.Id);
+        var response = await HttpClient.DeleteAsync($"/api/issues/{Uri.EscapeDataString(issue.Id)}");
+        if (response.IsSuccessStatusCode)
+        {
+            _issues.RemoveAll(i => i.Id == issue.Id);
+            _expandedIds.Remove(issue.Id);
+        }
+        else
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            _errors[issue.Id] = $"Error {(int)response.StatusCode}: {errorContent}";
+        }
+    }
+
+    private async Task CreateIssue()
+    {
+        _createError = "";
+        if (string.IsNullOrWhiteSpace(_createTitle))
+        {
+            _createError = "Title is required.";
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(_createDescription))
+        {
+            _createError = "Description is required.";
+            return;
+        }
+
+        var requestBody = JsonSerializer.Serialize(new
+        {
+            type = _createType,
+            title = _createTitle.Trim(),
+            description = _createDescription,
+            severity = _createSeverity,
+            repositoryNames = _createRepos
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .ToList()
+        }, ReasoningEffortOptions.JsonOptions);
+
+        var content = new StringContent(requestBody, System.Text.Encoding.UTF8, "application/json");
+        var response = await HttpClient.PostAsync("/api/issues", content);
+        if (response.IsSuccessStatusCode)
+        {
+            // Re-query with the active filters so the created issue only appears
+            // if it matches the current filter state (e.g. creating a low/suggestion
+            // issue while filtering by high/bug must not show it).
+            await LoadIssues();
+            _createTitle = "";
+            _createDescription = "";
+            _createRepos = "";
+            _createType = IssueType.Suggestion;
+            _createSeverity = IssueSeverity.Low;
+            _showCreateForm = false;
+        }
+        else
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            _createError = $"Error {(int)response.StatusCode}: {errorContent}";
+        }
+    }
+
+    private static string FormatSource(IssueResponse issue)
+    {
+        if (issue.SourceGoalId is null) return "—";
+        var parts = new List<string> { issue.SourceGoalId };
+        if (!string.IsNullOrEmpty(issue.SourceRole)) parts.Add(issue.SourceRole);
+        if (issue.SourceIteration.HasValue) parts.Add($"iter {issue.SourceIteration.Value}");
+        return string.Join(" · ", parts);
+    }
+
+    private static string ToSnakeCase(Enum value) =>
+        JsonSerializer.Serialize(value, ReasoningEffortOptions.JsonOptions).Trim('"');
+
+    private static T ParseSnakeCase<T>(string value) where T : struct, Enum =>
+        Enum.Parse<T>(value.Replace("_", ""), ignoreCase: true);
+
+    private static string TypeBadge(IssueType t) => t switch
+    {
+        IssueType.Bug => "badge-red",
+        IssueType.CodeQuality => "badge-blue",
+        IssueType.Suggestion => "badge-green",
+        IssueType.Concern => "badge-yellow",
+        IssueType.Workflow => "badge-muted",
+        _ => "badge-muted",
+    };
+
+    private static string SeverityBadge(IssueSeverity s) => s switch
+    {
+        IssueSeverity.High => "badge-red",
+        IssueSeverity.Medium => "badge-yellow",
+        IssueSeverity.Low => "badge-muted",
+        _ => "badge-muted",
+    };
+
+    private static string StatusBadge(IssueStatus s) => s switch
+    {
+        IssueStatus.Open => "badge-yellow",
+        IssueStatus.Triaged => "badge-blue",
+        IssueStatus.Acknowledged => "badge-muted",
+        IssueStatus.InProgress => "badge-blue",
+        IssueStatus.Resolved => "badge-green",
+        IssueStatus.Closed => "badge-muted",
+        _ => "badge-muted",
+    };
+
+    private static readonly MarkdownPipeline MdPipeline = new MarkdownPipelineBuilder()
+        .UseAdvancedExtensions()
+        .DisableHtml()
+        .Build();
+
+    private static string RenderMarkdown(string content)
+    {
+        if (string.IsNullOrEmpty(content)) return "";
+        return Markdown.ToHtml(content, MdPipeline);
+    }
+}
