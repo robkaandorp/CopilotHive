@@ -154,7 +154,7 @@
                                                 style="padding:0.4rem 0.6rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem">
                                             @foreach (var s in Enum.GetValues<IssueStatus>())
                                             {
-                                                <option value="@ToSnakeCase(s)">@s</option>
+                                                <option value="@ToSnakeCase(s)" selected="@(ToSnakeCase(s) == ToSnakeCase(issue.Status))">@s</option>
                                             }
                                         </select>
                                     </div>
@@ -164,7 +164,7 @@
                                                 style="padding:0.4rem 0.6rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem">
                                             @foreach (var s in Enum.GetValues<IssueSeverity>())
                                             {
-                                                <option value="@ToSnakeCase(s)">@s</option>
+                                                <option value="@ToSnakeCase(s)" selected="@(ToSnakeCase(s) == ToSnakeCase(issue.Severity))">@s</option>
                                             }
                                         </select>
                                     </div>
@@ -174,7 +174,7 @@
                                                 style="padding:0.4rem 0.6rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem">
                                             @foreach (var t in Enum.GetValues<IssueType>())
                                             {
-                                                <option value="@ToSnakeCase(t)">@t</option>
+                                                <option value="@ToSnakeCase(t)" selected="@(ToSnakeCase(t) == ToSnakeCase(issue.Type))">@t</option>
                                             }
                                         </select>
                                     </div>
