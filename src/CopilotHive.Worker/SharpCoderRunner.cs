@@ -158,6 +158,7 @@ public sealed class SharpCoderRunner : IAgentRunner
             - When the goal description is ambiguous, files-to-change seem incomplete, or acceptance criteria conflict, call `request_clarification` instead of guessing.
             - Call `report_progress` at each meaningful step (e.g. "Reading files", "Building", "Tests passing", "Committing") so the user can follow your progress in real time.
             - Call `report_narrative` at the end of your work, before calling your report tool (report_code_changes, report_test_results, report_review_verdict, report_doc_changes). Write 2-5 sentences about what you tried, what worked, what you struggled with, and why. This helps the system learn and improve.
+            - Call `raise_issue` when you notice code quality problems, bugs, suggestions, concerns, or workflow issues that are out of scope for the current goal. Do not fix them yourself unless they directly block the goal.
             """;
 
         var roleSpecific = role switch
@@ -665,6 +666,21 @@ public sealed class SharpCoderRunner : IAgentRunner
                 },
                 "get_goal",
                 "Fetch the full goal description and acceptance criteria directly from the orchestrator."
+            ));
+
+            tools.Add(AIFunctionFactory.Create(
+                async ([Description("Issue type: code_quality, bug, suggestion, concern, workflow")] string type,
+                       [Description("Short title summarizing the issue")] string title,
+                       [Description("Detailed description of the issue")] string description,
+                       [Description("Severity: low, medium, high (default: low)")] string? severity = null) =>
+                {
+                    if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";
+                    _log.Info($"Tool call: raise_issue({type}: {title})");
+                    var response = await _toolBridge.RaiseIssueAsync(_currentTaskId, type, title, description, severity ?? "low", CancellationToken.None);
+                    return response;
+                },
+                "raise_issue",
+                "Raise an issue for things you notice that are out of scope for the current goal: code quality problems, bugs in existing code, suggestions, concerns, or workflow issues."
             ));
         }
 

@@ -21,9 +21,11 @@ public sealed class HiveOrchestratorService(
     ILogger<HiveOrchestratorService> logger,
     AgentsManager? agentsManager = null,
     IGoalStore? goalStore = null,
-    DashboardNotifier? dashboardNotifier = null) : HiveOrchestrator.HiveOrchestratorBase
+    DashboardNotifier? dashboardNotifier = null,
+    IIssueStore? issueStore = null) : HiveOrchestrator.HiveOrchestratorBase
 {
     private readonly DashboardNotifier? _dashboardNotifier = dashboardNotifier;
+    private readonly IIssueStore? _issueStore = issueStore;
 
     private readonly Dictionary<string, (DateTime LastNotify, bool WasBusy, int LastNotifiedCtx)> _heartbeatState = new();
     private readonly object _heartbeatLock = new();
@@ -288,6 +290,23 @@ public sealed class HiveOrchestratorService(
         return (sessionId[..idx], sessionId[(idx + 1)..]);
     }
 
+    private static IssueType ParseIssueType(string value) => value.ToLowerInvariant().Trim() switch
+    {
+        "code_quality" or "codequality" => IssueType.CodeQuality,
+        "bug" => IssueType.Bug,
+        "suggestion" => IssueType.Suggestion,
+        "concern" => IssueType.Concern,
+        "workflow" => IssueType.Workflow,
+        _ => throw new ArgumentException($"Unknown issue type '{value}'"),
+    };
+    private static IssueSeverity ParseIssueSeverity(string value) => value.ToLowerInvariant().Trim() switch
+    {
+        "low" => IssueSeverity.Low,
+        "medium" => IssueSeverity.Medium,
+        "high" => IssueSeverity.High,
+        _ => throw new ArgumentException($"Unknown severity '{value}'"),
+    };
+
     /// <summary>
     /// Applies a task assignment to a worker: activates the task in the queue, marks the worker
     /// busy, and sets <see cref="ConnectedWorker.CurrentModel"/> from the task's requested model.
@@ -471,6 +490,123 @@ public sealed class HiveOrchestratorService(
                         current_phase_instruction = currentPhaseInstruction,
                     });
                     break;
+
+                case "raise_issue":
+                    try
+                    {
+                        if (_issueStore is null)
+                        {
+                            resultJson = System.Text.Json.JsonSerializer.Serialize(
+                                new { error = "Issue tracking not available." });
+                            break;
+                        }
+
+                        // Parse arguments (type, title, description, severity with default "low")
+                        var issueArgs = System.Text.Json.JsonDocument.Parse(request.ArgumentsJson);
+                        var issueType = issueArgs.RootElement.TryGetProperty("type", out var typeEl)
+                            ? typeEl.GetString() ?? ""
+                            : "";
+                        var issueTitle = issueArgs.RootElement.TryGetProperty("title", out var titleEl)
+                            ? titleEl.GetString() ?? ""
+                            : "";
+                        var issueDescription = issueArgs.RootElement.TryGetProperty("description", out var descEl)
+                            ? descEl.GetString() ?? ""
+                            : "";
+                        var issueSeverity = issueArgs.RootElement.TryGetProperty("severity", out var sevEl)
+                            ? sevEl.GetString() ?? "low"
+                            : "low";
+
+                        // Validate required fields
+                        if (string.IsNullOrWhiteSpace(issueType))
+                        {
+                            resultJson = System.Text.Json.JsonSerializer.Serialize(
+                                new { error = "Missing required field: type" });
+                            break;
+                        }
+                        if (string.IsNullOrWhiteSpace(issueTitle))
+                        {
+                            resultJson = System.Text.Json.JsonSerializer.Serialize(
+                                new { error = "Missing required field: title" });
+                            break;
+                        }
+                        if (string.IsNullOrWhiteSpace(issueDescription))
+                        {
+                            resultJson = System.Text.Json.JsonSerializer.Serialize(
+                                new { error = "Missing required field: description" });
+                            break;
+                        }
+
+                        // Parse type/severity enums
+                        IssueType parsedIssueType;
+                        try
+                        {
+                            parsedIssueType = ParseIssueType(issueType);
+                        }
+                        catch (ArgumentException ex)
+                        {
+                            resultJson = System.Text.Json.JsonSerializer.Serialize(new { error = ex.Message });
+                            break;
+                        }
+
+                        IssueSeverity parsedIssueSeverity;
+                        try
+                        {
+                            parsedIssueSeverity = ParseIssueSeverity(issueSeverity);
+                        }
+                        catch (ArgumentException ex)
+                        {
+                            resultJson = System.Text.Json.JsonSerializer.Serialize(new { error = ex.Message });
+                            break;
+                        }
+
+                        // Source context from the pipeline and worker role
+                        var issuePipeline = pipelineManager.GetByTaskId(request.TaskId);
+                        var issueGoalId = issuePipeline?.GoalId;
+                        var issueRole = worker.Role.ToString().ToLowerInvariant();
+                        var issueIteration = issuePipeline?.Iteration;
+
+                        // Generate ID (slug-based with collision handling)
+                        var issueId = await IssueIdGenerator.GenerateAsync(issueTitle, _issueStore, ct);
+
+                        Issue BuildIssue(string id) => new()
+                        {
+                            Id = id,
+                            Type = parsedIssueType,
+                            Title = issueTitle,
+                            Description = issueDescription,
+                            Severity = parsedIssueSeverity,
+                            Status = IssueStatus.Open,
+                            RepositoryNames = issuePipeline?.Goal.RepositoryNames ?? [],
+                            SourceGoalId = issueGoalId,
+                            SourceRole = issueRole,
+                            SourceIteration = issueIteration,
+                        };
+
+                        var issue = BuildIssue(issueId);
+
+                        try
+                        {
+                            await _issueStore.CreateIssueAsync(issue, ct);
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            // Duplicate ID (race): retry with a GUID-based ID.
+                            issueId = $"issue-{Guid.NewGuid():N}";
+                            issue = BuildIssue(issueId);
+                            await _issueStore.CreateIssueAsync(issue, ct);
+                        }
+
+                        _dashboardNotifier?.NotifyStateChanged();
+                        resultJson = System.Text.Json.JsonSerializer.Serialize(
+                            new { acknowledged = true, issue_id = issueId });
+                        break;
+                    }
+                    catch (Exception)
+                    {
+                        // Malformed JSON, unexpected persistence errors, or retry failure:
+                        // propagate to the outer catch → Success = false.
+                        throw;
+                    }
 
                 default:
                     resultJson = System.Text.Json.JsonSerializer.Serialize(

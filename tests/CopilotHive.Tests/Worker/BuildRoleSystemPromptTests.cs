@@ -45,6 +45,25 @@ public sealed class BuildRoleSystemPromptTests
     }
 
     /// <summary>
+    /// The shared preamble must instruct workers to call <c>raise_issue</c> for
+    /// out-of-scope code quality problems, bugs, suggestions, concerns, or workflow issues.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    [InlineData(WorkerRole.Reviewer)]
+    [InlineData(WorkerRole.DocWriter)]
+    [InlineData(WorkerRole.Improver)]
+    public void BuildRoleSystemPrompt_AllRoles_ContainRaiseIssueGuidance(WorkerRole role)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
+
+        Assert.Contains("raise_issue", prompt);
+        Assert.Contains("code quality problems, bugs, suggestions, concerns, or workflow issues", prompt);
+        Assert.Contains("Do not fix them yourself unless they directly block the goal", prompt);
+    }
+
+    /// <summary>
     /// The <c>report_narrative</c> guidance lives in the shared preamble, so every role
     /// must receive the instruction regardless of which role-specific prompt is generated.
     /// </summary>

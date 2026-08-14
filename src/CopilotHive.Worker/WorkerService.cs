@@ -273,6 +273,29 @@ public sealed class WorkerService(
         }
     }
 
+    /// <inheritdoc/>
+    public async Task<string> RaiseIssueAsync(string taskId, string type, string title, string description, string severity, CancellationToken ct)
+    {
+        var requestId = Guid.NewGuid().ToString("N");
+        var tcs = new TaskCompletionSource<ToolCallResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingToolCalls[requestId] = tcs;
+
+        using var reg = ct.Register(() => tcs.TrySetCanceled());
+
+        try
+        {
+            await SendToolCallRequest(requestId, taskId, "raise_issue",
+                System.Text.Json.JsonSerializer.Serialize(new { type, title, description, severity }), ct);
+
+            var response = await tcs.Task;
+            return response.Success ? response.ResultJson : $"Error: {response.Error}";
+        }
+        finally
+        {
+            _pendingToolCalls.TryRemove(requestId, out _);
+        }
+    }
+
     private async Task SendToolCallRequest(string requestId, string taskId, string toolName, string argsJson, CancellationToken ct)
     {
         if (_stream is null || _assignedId is null)

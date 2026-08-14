@@ -30,4 +30,10 @@ public interface IToolCallBridge
     /// Returns id/status/description/repositories/priority as JSON.
     /// </summary>
     Task<string> GetGoalAsync(string taskId, string goalId, CancellationToken ct);
+
+    /// <summary>
+    /// Raise an issue (bug, suggestion, concern, etc.) with the orchestrator for tracking.
+    /// Returns the response JSON string (e.g. acknowledged/issue_id or an error).
+    /// </summary>
+    Task<string> RaiseIssueAsync(string taskId, string type, string title, string description, string severity, CancellationToken ct);
 }

@@ -49,6 +49,117 @@ public sealed class SharpCoderRunnerToolsTests
     }
 
     /// <summary>
+    /// When a tool bridge is set, <c>BuildCustomTools</c> must include a tool named
+    /// <c>raise_issue</c> with the expected description metadata.
+    /// </summary>
+    [Fact]
+    public void BuildCustomTools_WithToolBridge_ContainsRaiseIssueTool()
+    {
+        var runner = new SharpCoderRunner();
+        runner.SetToolBridge(new FakeToolBridge());
+
+        var tools = InvokeBuildCustomTools(runner);
+
+        var raiseIssueTool = Assert.Single(tools, t => t.Name == "raise_issue");
+        Assert.Contains("code quality", raiseIssueTool.Description, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// The raise_issue tool descriptor should expose the expected parameter names:
+    /// <c>type</c>, <c>title</c>, <c>description</c>, and <c>severity</c>.
+    /// </summary>
+    [Fact]
+    public void BuildCustomTools_WithToolBridge_RaiseIssueHasExpectedParameters()
+    {
+        var runner = new SharpCoderRunner();
+        runner.SetToolBridge(new FakeToolBridge());
+
+        var tools = InvokeBuildCustomTools(runner);
+        var raiseIssueTool = Assert.Single(tools, t => t.Name == "raise_issue");
+
+        var descriptor = raiseIssueTool.GetType().GetProperty("FunctionDescriptor")?.GetValue(raiseIssueTool);
+        Assert.NotNull(descriptor);
+
+        var expectedNames = descriptor!.GetType().GetProperty("ExpectedArgumentNames")?.GetValue(descriptor) as HashSet<string>;
+        Assert.NotNull(expectedNames);
+        Assert.Contains("type", expectedNames);
+        Assert.Contains("title", expectedNames);
+        Assert.Contains("description", expectedNames);
+        Assert.Contains("severity", expectedNames);
+    }
+
+    /// <summary>
+    /// Invoking the <c>raise_issue</c> tool must forward the exact arguments to the
+    /// tool bridge's <c>RaiseIssueAsync</c> and return the bridge's response JSON.
+    /// </summary>
+    [Fact]
+    public async Task RaiseIssueTool_Invocation_ForwardsArgumentsToBridgeAndReturnsResponse()
+    {
+        var bridge = new FakeToolBridge();
+        var runner = new SharpCoderRunner();
+        runner.SetToolBridge(bridge);
+        runner.SetCurrentTaskId("task-42");
+
+        var tools = InvokeBuildCustomTools(runner);
+        var raiseIssueTool = Assert.Single(tools, t => t.Name == "raise_issue");
+        var raiseIssueFunction = Assert.IsAssignableFrom<AIFunction>(raiseIssueTool);
+
+        var result = (await raiseIssueFunction.InvokeAsync(
+            new AIFunctionArguments
+            {
+                ["type"] = "code_quality",
+                ["title"] = "Parser naming",
+                ["description"] = "Poorly named variables",
+                ["severity"] = "medium",
+            },
+            TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        Assert.Equal("{\"acknowledged\":true,\"issue_id\":\"test-id\"}", result);
+        var call = Assert.Single(bridge.RaiseIssueCalls);
+        Assert.Equal("task-42", call.TaskId);
+        Assert.Equal("code_quality", call.Type);
+        Assert.Equal("Parser naming", call.Title);
+        Assert.Equal("Poorly named variables", call.Description);
+        Assert.Equal("medium", call.Severity);
+    }
+
+    /// <summary>
+    /// Invoking the <c>raise_issue</c> tool WITHOUT the severity parameter must
+    /// forward the default <c>"low"</c> severity to the tool bridge. This protects
+    /// the optional-severity default from regressing.
+    /// </summary>
+    [Fact]
+    public async Task RaiseIssueTool_Invocation_WithoutSeverity_DefaultsToLow()
+    {
+        var bridge = new FakeToolBridge();
+        var runner = new SharpCoderRunner();
+        runner.SetToolBridge(bridge);
+        runner.SetCurrentTaskId("task-42");
+
+        var tools = InvokeBuildCustomTools(runner);
+        var raiseIssueTool = Assert.Single(tools, t => t.Name == "raise_issue");
+        var raiseIssueFunction = Assert.IsAssignableFrom<AIFunction>(raiseIssueTool);
+
+        // Omit the severity argument entirely — the tool's default (null → "low") must apply.
+        var result = (await raiseIssueFunction.InvokeAsync(
+            new AIFunctionArguments
+            {
+                ["type"] = "bug",
+                ["title"] = "Parser crash",
+                ["description"] = "Crashes on empty input",
+            },
+            TestContext.Current.CancellationToken))?.ToString() ?? "";
+
+        Assert.Equal("{\"acknowledged\":true,\"issue_id\":\"test-id\"}", result);
+        var call = Assert.Single(bridge.RaiseIssueCalls);
+        Assert.Equal("task-42", call.TaskId);
+        Assert.Equal("bug", call.Type);
+        Assert.Equal("Parser crash", call.Title);
+        Assert.Equal("Crashes on empty input", call.Description);
+        Assert.Equal("low", call.Severity);
+    }
+
+    /// <summary>
     /// REGRESSION: BuildFileSizesTool must resolve the agents directory from the injected
     /// config-repo path, not from the hardcoded <c>/config-repo/agents</c> path. This lets
     /// CI/non-Docker environments run the worker improver flow with a temp config repo.
@@ -93,6 +204,8 @@ public sealed class SharpCoderRunnerToolsTests
 
     private sealed class FakeToolBridge : IToolCallBridge
     {
+        public List<(string TaskId, string Type, string Title, string Description, string Severity)> RaiseIssueCalls { get; } = [];
+
         public Task<string> RequestClarificationAsync(string taskId, string question, CancellationToken ct)
             => Task.FromResult(string.Empty);
 
@@ -104,5 +217,11 @@ public sealed class SharpCoderRunnerToolsTests
 
         public Task<string> GetGoalAsync(string taskId, string goalId, CancellationToken ct)
             => Task.FromResult(string.Empty);
+
+        public Task<string> RaiseIssueAsync(string taskId, string type, string title, string description, string severity, CancellationToken ct)
+        {
+            RaiseIssueCalls.Add((taskId, type, title, description, severity));
+            return Task.FromResult("{\"acknowledged\":true,\"issue_id\":\"test-id\"}");
+        }
     }
 }
