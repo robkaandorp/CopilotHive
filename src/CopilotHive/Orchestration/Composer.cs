@@ -128,7 +128,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - create_issue — create a new issue when the user reports a bug, code quality problem, suggestion, concern, or workflow issue
         - list_issues — list and filter issues
         - get_issue — get full issue details
-        - update_issue — triage or update an issue (change status, severity, type, title, description)
+        - update_issue — triage or update an issue (change status, severity, type, title, description, or linked goal)
         - Inspect repository history (git_log, git_diff, git_show, git_branch, git_blame, git_fetch)
         - Fetch remote branches (git_fetch(repository, remote?, branch?) — default: origin. Use to access remote feature branches.)
         - List configured repositories (list_repositories)
@@ -772,7 +772,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             tools.Add(AIFunctionFactory.Create(GetIssueAsync, "get_issue",
                 "Get full details for an issue by ID."));
             tools.Add(AIFunctionFactory.Create(UpdateIssueAsync, "update_issue",
-                "Triage or update an issue: change status, severity, type, title, or description."));
+                "Triage or update an issue: change status, severity, type, title, description, or linked goal."));
         }
 
         return tools;

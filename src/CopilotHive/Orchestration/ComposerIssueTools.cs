@@ -233,10 +233,10 @@ public sealed partial class Composer
     }
 
     /// <summary>
-    /// Triage or update an issue: change status, severity, type, title, or description.
+    /// Triage or update an issue: change status, severity, type, title, description, or linked goal.
     /// Only non-null fields are updated.
     /// </summary>
-    [Description("Triage or update an issue: change status, severity, type, title, or description. Only provided fields are changed.")]
+    [Description("Triage or update an issue: change status, severity, type, title, description, or linked goal. Only provided fields are changed.")]
     internal async Task<string> UpdateIssueAsync(
         [Description("Issue ID to update")] string issue_id,
         [Description("Optional new status: open, triaged, acknowledged, in_progress, resolved, closed")] string? status = null,
@@ -244,6 +244,7 @@ public sealed partial class Composer
         [Description("Optional new type: bug, suggestion, concern, code_quality, workflow")] string? type = null,
         [Description("Optional new title")] string? title = null,
         [Description("Optional new description")] string? description = null,
+        [Description("Optional linked goal ID. null = no change, empty string = clear, non-empty = set.")] string? linked_goal_id = null,
         CancellationToken ct = default)
     {
         if (_issueStore is null)
@@ -326,7 +327,7 @@ public sealed partial class Composer
                 CreatedAt = existing.CreatedAt,
                 UpdatedAt = existing.UpdatedAt,
                 ResolvedAt = existing.ResolvedAt,
-                LinkedGoalId = existing.LinkedGoalId,
+                LinkedGoalId = linked_goal_id is null ? existing.LinkedGoalId : (linked_goal_id.Length == 0 ? null : linked_goal_id),
             };
 
             await _issueStore.UpdateIssueAsync(updatedIssue, ct);

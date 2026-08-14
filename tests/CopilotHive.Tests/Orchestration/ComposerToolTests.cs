@@ -9584,6 +9584,64 @@ public sealed class ComposerIssueToolTests : IDisposable
         Assert.NotNull(issue.UpdatedAt);
     }
 
+    [Fact]
+    public async Task UpdateIssue_SetsLinkedGoalId()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync("bug", "Title", "Desc", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        var result = await _composer.UpdateIssueAsync(id, linked_goal_id: "some-goal", ct: ct);
+
+        Assert.Contains("some-goal", result);
+
+        var issue = await _issueStore.GetIssueAsync(id, ct);
+        Assert.NotNull(issue);
+        Assert.Equal("some-goal", issue!.LinkedGoalId);
+    }
+
+    [Fact]
+    public async Task UpdateIssue_ClearsLinkedGoalId()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync("bug", "Title", "Desc", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        // First set a linked goal, then clear it with an empty string.
+        await _composer.UpdateIssueAsync(id, linked_goal_id: "existing-goal", ct: ct);
+
+        var result = await _composer.UpdateIssueAsync(id, linked_goal_id: "", ct: ct);
+
+        Assert.Contains("(none)", result);
+
+        var issue = await _issueStore.GetIssueAsync(id, ct);
+        Assert.NotNull(issue);
+        Assert.Null(issue!.LinkedGoalId);
+    }
+
+    [Fact]
+    public async Task UpdateIssue_PreservesLinkedGoalIdWhenNull()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var created = await _composer.CreateIssueAsync("bug", "Title", "Desc", ct: ct);
+        var id = created.Replace("Issue created: ", "").Trim();
+
+        // Set a linked goal first.
+        await _composer.UpdateIssueAsync(id, linked_goal_id: "existing-goal", ct: ct);
+
+        // Omitted (null) linked_goal_id must not change the existing value.
+        var result = await _composer.UpdateIssueAsync(id, status: "triaged", ct: ct);
+
+        Assert.Contains("existing-goal", result);
+
+        var issue = await _issueStore.GetIssueAsync(id, ct);
+        Assert.NotNull(issue);
+        Assert.Equal("existing-goal", issue!.LinkedGoalId);
+    }
+
     // ── tool registration & system prompt ──
 
     [Fact]
