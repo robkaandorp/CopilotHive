@@ -115,7 +115,7 @@
             <tbody>
                 @foreach (var issue in _issues)
                 {
-                    var isExpanded = _expandedIds.Contains(issue.Id);
+                    var isExpanded = _expandedIssueId == issue.Id;
                     <tr style="cursor:pointer" @onclick="() => ToggleDetail(issue.Id, issue)">
                         <td>
                             <span style="font-weight:500">@issue.Title</span>
@@ -150,7 +150,7 @@
                                 <div style="display:flex;flex-wrap:wrap;gap:1rem;margin-bottom:0.75rem;align-items:flex-end">
                                     <div>
                                         <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Status</div>
-                                        <select @bind="_statusSelect[issue.Id]" @bind:after="() => UpdateStatus(issue)"
+                                        <select @bind="_editStatus" @bind:after="() => UpdateStatus(issue)"
                                                 style="padding:0.4rem 0.6rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem">
                                             @foreach (var s in Enum.GetValues<IssueStatus>())
                                             {
@@ -160,7 +160,7 @@
                                     </div>
                                     <div>
                                         <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Severity</div>
-                                        <select @bind="_severitySelect[issue.Id]" @bind:after="() => UpdateSeverity(issue)"
+                                        <select @bind="_editSeverity" @bind:after="() => UpdateSeverity(issue)"
                                                 style="padding:0.4rem 0.6rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem">
                                             @foreach (var s in Enum.GetValues<IssueSeverity>())
                                             {
@@ -170,7 +170,7 @@
                                     </div>
                                     <div>
                                         <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.25rem">Type</div>
-                                        <select @bind="_typeSelect[issue.Id]" @bind:after="() => UpdateType(issue)"
+                                        <select @bind="_editType" @bind:after="() => UpdateType(issue)"
                                                 style="padding:0.4rem 0.6rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem">
                                             @foreach (var t in Enum.GetValues<IssueType>())
                                             {
@@ -254,14 +254,15 @@ else if (_loaded)
     private string _severityFilter = "";
     private string _statusFilter = "";
     private string _repoFilter = "";
-    private readonly HashSet<string> _expandedIds = new(StringComparer.Ordinal);
+    private string? _expandedIssueId;
+    private string _editStatus = "";
+    private string _editSeverity = "";
+    private string _editType = "";
     private readonly Dictionary<string, string> _errors = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, string> _statusSelect = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, string> _severitySelect = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, string> _typeSelect = new(StringComparer.Ordinal);
     private bool _showCreateForm;
     private string _createError = "";
     private bool _loaded;
+    private int _loadGeneration;
 
     private IssueType _createType = IssueType.Suggestion;
     private string _createTitle = "";
@@ -277,6 +278,7 @@ else if (_loaded)
 
     private async Task LoadIssues()
     {
+        var generation = Interlocked.Increment(ref _loadGeneration);
         var query = new Dictionary<string, string>();
         if (!string.IsNullOrEmpty(_typeFilter)) query["type"] = _typeFilter;
         if (!string.IsNullOrEmpty(_severityFilter)) query["severity"] = _severityFilter;
@@ -289,33 +291,43 @@ else if (_loaded)
         var response = await HttpClient.GetAsync(url);
         if (response.IsSuccessStatusCode)
         {
-            _issues = await response.Content.ReadFromJsonAsync<List<IssueResponse>>(ReasoningEffortOptions.JsonOptions) ?? [];
+            var issues = await response.Content.ReadFromJsonAsync<List<IssueResponse>>(ReasoningEffortOptions.JsonOptions) ?? [];
+            if (generation != _loadGeneration)
+                return; // stale — discard
+            _issues = issues;
             _loaded = true;
+            if (_expandedIssueId is not null)
+            {
+                var issue = _issues.FirstOrDefault(i => i.Id == _expandedIssueId);
+                if (issue is not null)
+                {
+                    _editStatus = ToSnakeCase(issue.Status);
+                    _editSeverity = ToSnakeCase(issue.Severity);
+                    _editType = ToSnakeCase(issue.Type);
+                }
+            }
         }
     }
 
     private void ToggleDetail(string id, IssueResponse issue)
     {
-        if (!_expandedIds.Add(id))
+        _expandedIssueId = _expandedIssueId == id ? null : id;
+        if (_expandedIssueId is not null)
         {
-            _expandedIds.Remove(id);
-        }
-        else
-        {
-            _statusSelect[id] = ToSnakeCase(issue.Status);
-            _severitySelect[id] = ToSnakeCase(issue.Severity);
-            _typeSelect[id] = ToSnakeCase(issue.Type);
+            _editStatus = ToSnakeCase(issue.Status);
+            _editSeverity = ToSnakeCase(issue.Severity);
+            _editType = ToSnakeCase(issue.Type);
         }
     }
 
     private async Task UpdateStatus(IssueResponse issue)
-        => await UpdateField(issue, "status", _statusSelect[issue.Id]);
+        => await UpdateField(issue, "status", _editStatus);
 
     private async Task UpdateSeverity(IssueResponse issue)
-        => await UpdateField(issue, "severity", _severitySelect[issue.Id]);
+        => await UpdateField(issue, "severity", _editSeverity);
 
     private async Task UpdateType(IssueResponse issue)
-        => await UpdateField(issue, "type", _typeSelect[issue.Id]);
+        => await UpdateField(issue, "type", _editType);
 
     private async Task UpdateField(IssueResponse issue, string field, string newValue)
     {
@@ -349,12 +361,15 @@ else if (_loaded)
             // filtering by status=open must remove it from the view).
             await LoadIssues();
 
-            var refreshed = _issues.FirstOrDefault(i => i.Id == issue.Id);
-            if (refreshed is not null)
+            if (_expandedIssueId == issue.Id)
             {
-                _statusSelect[issue.Id] = ToSnakeCase(refreshed.Status);
-                _severitySelect[issue.Id] = ToSnakeCase(refreshed.Severity);
-                _typeSelect[issue.Id] = ToSnakeCase(refreshed.Type);
+                var refreshed = _issues.FirstOrDefault(i => i.Id == issue.Id);
+                if (refreshed is not null)
+                {
+                    _editStatus = ToSnakeCase(refreshed.Status);
+                    _editSeverity = ToSnakeCase(refreshed.Severity);
+                    _editType = ToSnakeCase(refreshed.Type);
+                }
             }
         }
         else
@@ -362,12 +377,15 @@ else if (_loaded)
             var errorContent = await response.Content.ReadAsStringAsync();
             _errors[issue.Id] = $"Error {(int)response.StatusCode}: {errorContent}";
 
-            var current = _issues.FirstOrDefault(i => i.Id == issue.Id);
-            if (current is not null)
+            if (_expandedIssueId == issue.Id)
             {
-                _statusSelect[issue.Id] = ToSnakeCase(current.Status);
-                _severitySelect[issue.Id] = ToSnakeCase(current.Severity);
-                _typeSelect[issue.Id] = ToSnakeCase(current.Type);
+                var current = _issues.FirstOrDefault(i => i.Id == issue.Id);
+                if (current is not null)
+                {
+                    _editStatus = ToSnakeCase(current.Status);
+                    _editSeverity = ToSnakeCase(current.Severity);
+                    _editType = ToSnakeCase(current.Type);
+                }
             }
         }
     }
@@ -379,7 +397,8 @@ else if (_loaded)
         if (response.IsSuccessStatusCode)
         {
             _issues.RemoveAll(i => i.Id == issue.Id);
-            _expandedIds.Remove(issue.Id);
+            if (_expandedIssueId == issue.Id)
+                _expandedIssueId = null;
         }
         else
         {
