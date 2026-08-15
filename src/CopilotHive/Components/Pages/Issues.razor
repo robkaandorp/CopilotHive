@@ -26,7 +26,7 @@
     </select>
 
     <select @bind="_statusFilter" @bind:after="LoadIssues">
-        <option value="">All statuses</option>
+        <option value="">Active (excl. closed)</option>
         <option value="open">Open</option>
         <option value="triaged">Triaged</option>
         <option value="acknowledged">Acknowledged</option>
@@ -118,8 +118,8 @@
                     var isExpanded = _expandedIssueId == issue.Id;
                     <tr style="cursor:pointer" @onclick="() => ToggleDetail(issue.Id, issue)">
                         <td>
-                            <span style="font-weight:500">@issue.Title</span>
-                            <div style="font-size:0.75rem;color:var(--text-muted)">@issue.Id</div>
+                            <div style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500" title="@issue.Title">@issue.Title</div>
+                            <div style="max-width:300px;font-size:0.75rem;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">@issue.Id</div>
                         </td>
                         <td><span class="badge @TypeBadge(issue.Type)">@issue.Type</span></td>
                         <td><span class="badge @SeverityBadge(issue.Severity)">@issue.Severity</span></td>
@@ -294,6 +294,8 @@ else if (_loaded)
             var issues = await response.Content.ReadFromJsonAsync<List<IssueResponse>>(ReasoningEffortOptions.JsonOptions) ?? [];
             if (generation != _loadGeneration)
                 return; // stale — discard
+            if (string.IsNullOrEmpty(_statusFilter))
+                issues = issues.Where(i => i.Status != IssueStatus.Closed).ToList();
             _issues = issues;
             _loaded = true;
             if (_expandedIssueId is not null)
