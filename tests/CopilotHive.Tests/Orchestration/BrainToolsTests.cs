@@ -1099,7 +1099,8 @@ public class BrainToolsTests
 
         public Task<IReadOnlyList<Issue>> GetIssuesAsync(
             IssueStatus? status = null, IssueType? type = null, IssueSeverity? severity = null,
-            string? repository = null, string? sourceGoalId = null, CancellationToken ct = default)
+            string? repository = null, string? sourceGoalId = null, string? linkedGoalId = null,
+            CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<Issue>>(Issues.Values.ToList());
 
         public Task<Issue?> GetIssueAsync(string issueId, CancellationToken ct = default)
@@ -1148,7 +1149,8 @@ public class BrainToolsTests
 
         public Task<IReadOnlyList<Issue>> GetIssuesAsync(
             IssueStatus? status = null, IssueType? type = null, IssueSeverity? severity = null,
-            string? repository = null, string? sourceGoalId = null, CancellationToken ct = default)
+            string? repository = null, string? sourceGoalId = null, string? linkedGoalId = null,
+            CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<Issue>>(Issues.Values.ToList());
 
         public Task<Issue?> GetIssueAsync(string issueId, CancellationToken ct = default)

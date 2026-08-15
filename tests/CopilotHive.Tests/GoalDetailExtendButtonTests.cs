@@ -256,4 +256,133 @@ public sealed class GoalDetailExtendButtonTests
     [Fact]
     public void ButtonText_NotExtending_ReturnsDefaultText() =>
         Assert.Equal("➕ Extend Iterations (+5)", GetExtendButtonText(false));
+
+    // ── Linked Issues backlink (source-file assertions, removal-proof) ──────
+
+    [Fact]
+    public void LinkedIssues_Markup_ContainsLinkedIssuesCard()
+    {
+        var source = ReadGoalDetailRazorSource();
+        Assert.Contains("Linked Issues", source);
+        Assert.Contains("_linkedIssues.Count > 0", source);
+        Assert.Contains("IssueStatusBadge(issue.Status)", source);
+        Assert.Contains("href=\"/issues\"", source);
+    }
+
+    [Fact]
+    public void LinkedIssues_Markup_IsPlacedAfterLinkedDocuments()
+    {
+        var source = ReadGoalDetailRazorSource();
+        var docsIndex = source.IndexOf("Linked Documents", StringComparison.Ordinal);
+        var issuesIndex = source.IndexOf("Linked Issues", StringComparison.Ordinal);
+        Assert.True(docsIndex >= 0, "Linked Documents card not found");
+        Assert.True(issuesIndex > docsIndex,
+            "Linked Issues card must appear after the Linked Documents card");
+    }
+
+    [Fact]
+    public void LinkedIssues_RefreshAsync_FetchesSourceAndLinkedQueries()
+    {
+        var source = ReadGoalDetailRazorSource();
+        Assert.Contains("source_goal_id=", source);
+        Assert.Contains("linked_goal_id=", source);
+        Assert.Contains("Uri.EscapeDataString(GoalId)", source);
+        Assert.Contains("GetFromJsonAsync<List<LinkedIssueInfo>>", source);
+    }
+
+    [Fact]
+    public void LinkedIssues_RefreshAsync_MergesAndDeduplicatesById()
+    {
+        var source = ReadGoalDetailRazorSource();
+        Assert.Contains("sourceIssues.Concat(linkedIssues)", source);
+        Assert.Contains("DistinctBy(i => i.Id)", source);
+    }
+
+    [Fact]
+    public void LinkedIssues_DeclaresRecordAndField()
+    {
+        var source = ReadGoalDetailRazorSource();
+        Assert.Contains("record LinkedIssueInfo(string Id, string Title, IssueType Type, IssueSeverity Severity, IssueStatus Status)", source);
+        Assert.Contains("List<LinkedIssueInfo> _linkedIssues = []", source);
+    }
+
+    [Fact]
+    public void LinkedIssues_HasStatusBadgeHelper()
+    {
+        var source = ReadGoalDetailRazorSource();
+        Assert.Contains("IssueStatusBadge(IssueStatus s)", source);
+        Assert.Contains("IssueStatus.Open => \"badge-yellow\"", source);
+        Assert.Contains("IssueStatus.Resolved => \"badge-green\"", source);
+        Assert.Contains("IssueStatus.Closed => \"badge-muted\"", source);
+    }
+
+    // ── Linked Issues merge/deduplication helper-logic tests ────────────────
+
+    /// <summary>
+    /// Mirrors the <c>LinkedIssueInfo</c> record declared in <c>GoalDetail.razor</c>.
+    /// </summary>
+    private sealed record LinkedIssueInfo(string Id, string Title, IssueType Type, IssueSeverity Severity, IssueStatus Status);
+
+    /// <summary>
+    /// Mirrors the merge/deduplication logic in <c>GoalDetail.razor</c>:
+    /// <c>sourceIssues.Concat(linkedIssues).DistinctBy(i =&gt; i.Id).ToList()</c>.
+    /// </summary>
+    private static List<LinkedIssueInfo> MergeLinkedIssues(
+        IEnumerable<LinkedIssueInfo> sourceIssues,
+        IEnumerable<LinkedIssueInfo> linkedIssues) =>
+        sourceIssues.Concat(linkedIssues).DistinctBy(i => i.Id).ToList();
+
+    private static LinkedIssueInfo MakeLinkedIssue(string id) =>
+        new(id, $"Title {id}", IssueType.Bug, IssueSeverity.Medium, IssueStatus.Open);
+
+    [Fact]
+    public void Merge_OnlySourceIssues_ReturnsAll()
+    {
+        var merged = MergeLinkedIssues(
+            [MakeLinkedIssue("a"), MakeLinkedIssue("b")],
+            []);
+        Assert.Equal(2, merged.Count);
+        Assert.Equal(["a", "b"], merged.Select(i => i.Id).ToList());
+    }
+
+    [Fact]
+    public void Merge_OnlyLinkedIssues_ReturnsAll()
+    {
+        var merged = MergeLinkedIssues(
+            [],
+            [MakeLinkedIssue("a"), MakeLinkedIssue("b")]);
+        Assert.Equal(2, merged.Count);
+        Assert.Equal(["a", "b"], merged.Select(i => i.Id).ToList());
+    }
+
+    [Fact]
+    public void Merge_IssueInBothQueries_AppearsOnce()
+    {
+        var merged = MergeLinkedIssues(
+            [MakeLinkedIssue("dup"), MakeLinkedIssue("only-source")],
+            [MakeLinkedIssue("dup"), MakeLinkedIssue("only-linked")]);
+        Assert.Equal(3, merged.Count);
+        Assert.Equal(1, merged.Count(i => i.Id == "dup"));
+        Assert.Contains(merged, i => i.Id == "only-source");
+        Assert.Contains(merged, i => i.Id == "only-linked");
+    }
+
+    [Fact]
+    public void Merge_NoIssues_ReturnsEmpty()
+    {
+        var merged = MergeLinkedIssues([], []);
+        Assert.Empty(merged);
+    }
+
+    [Fact]
+    public void Merge_FirstOccurrenceWins_ForDuplicateId()
+    {
+        // DistinctBy keeps the FIRST occurrence; the source query result wins.
+        var source = MakeLinkedIssue("dup");
+        var linked = new LinkedIssueInfo("dup", "Different title", IssueType.Suggestion, IssueSeverity.High, IssueStatus.Closed);
+        var merged = MergeLinkedIssues([source], [linked]);
+        Assert.Single(merged);
+        Assert.Equal("Title dup", merged[0].Title);
+        Assert.Equal(IssueType.Bug, merged[0].Type);
+    }
 }

@@ -539,7 +539,7 @@ public static class ApiEndpoints
         var issuesApi = app.MapGroup("/api/issues");
 
         issuesApi.MapGet("/", async (string? status, string? type, string? severity, string? repository,
-            string? source_goal_id, IIssueStore issueStore, CancellationToken ct) =>
+            string? source_goal_id, string? linked_goal_id, IIssueStore issueStore, CancellationToken ct) =>
         {
             // Query params use explicit snake_case parsing: reject numeric strings and
             // comma-combined values that Enum.TryParse may otherwise accept via bitwise OR.
@@ -594,7 +594,7 @@ public static class ApiEndpoints
             }
 
             var issues = await issueStore.GetIssuesAsync(
-                statusFilter, typeFilter, severityFilter, repository, source_goal_id, ct);
+                statusFilter, typeFilter, severityFilter, repository, source_goal_id, linked_goal_id, ct);
             return Results.Ok(issues.Select(ToResponse).ToList());
         });
 

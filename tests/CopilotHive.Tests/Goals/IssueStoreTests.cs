@@ -221,6 +221,28 @@ public sealed class IssueStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task GetIssues_FilterByLinkedGoalId()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var linked1 = MakeIssue("linked-issue-1");
+        linked1.LinkedGoalId = "goal-1";
+        await _store.CreateIssueAsync(linked1, ct);
+
+        var linked2 = MakeIssue("linked-issue-2");
+        linked2.LinkedGoalId = "goal-2";
+        await _store.CreateIssueAsync(linked2, ct);
+
+        var linked3 = MakeIssue("linked-issue-3");
+        linked3.LinkedGoalId = "goal-1";
+        await _store.CreateIssueAsync(linked3, ct);
+
+        var goal1 = await _store.GetIssuesAsync(linkedGoalId: "goal-1", ct: ct);
+
+        Assert.Equal(2, goal1.Count);
+        Assert.All(goal1, i => Assert.Equal("goal-1", i.LinkedGoalId));
+    }
+
+    [Fact]
     public async Task GetIssues_FilterByRepository_CaseInsensitive()
     {
         var ct = TestContext.Current.CancellationToken;

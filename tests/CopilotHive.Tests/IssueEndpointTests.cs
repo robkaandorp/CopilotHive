@@ -402,6 +402,46 @@ public class IssueEndpointTests
     }
 
     [Fact]
+    public async Task GetIssues_FilterByLinkedGoalIdOnly_ExcludesOtherGoal()
+    {
+        using var factory = CreateFactory();
+        using var client = factory.CreateClient();
+
+        // Two issues identical in every filter dimension except LinkedGoalId.
+        await client.PostAsync("/api/issues", JsonBody(CreateBody(
+            id: "linked-1-issue",
+            type: IssueType.Bug,
+            title: "Same title",
+            description: "Same description",
+            severity: IssueSeverity.Low,
+            repositoryNames: ["CopilotHive"])), TestContext.Current.CancellationToken);
+        await client.PostAsync("/api/issues", JsonBody(CreateBody(
+            id: "linked-2-issue",
+            type: IssueType.Bug,
+            title: "Same title",
+            description: "Same description",
+            severity: IssueSeverity.Low,
+            repositoryNames: ["CopilotHive"])), TestContext.Current.CancellationToken);
+
+        // Set LinkedGoalId via PATCH (the create request has no linkedGoalId field).
+        var patch1 = await client.PatchAsync("/api/issues/linked-1-issue",
+            JsonBody(PatchBody(linkedGoalId: "goal-1")), TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.OK, patch1.StatusCode);
+        var patch2 = await client.PatchAsync("/api/issues/linked-2-issue",
+            JsonBody(PatchBody(linkedGoalId: "goal-2")), TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.OK, patch2.StatusCode);
+
+        var response = await client.GetAsync("/api/issues?linked_goal_id=goal-1",
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await ReadJsonAsync(response);
+        Assert.Equal(JsonValueKind.Array, body.ValueKind);
+        Assert.Equal(1, body.GetArrayLength());
+        Assert.Equal("linked-1-issue", body[0].GetProperty("id").GetString());
+    }
+
+    [Fact]
     public async Task GetIssues_InvalidType_Returns400()
     {
         using var factory = CreateFactory();

@@ -198,7 +198,7 @@ public sealed partial class Composer
             }
         }
 
-        var issues = await _issueStore.GetIssuesAsync(statusFilter, typeFilter, severityFilter, null, null, ct);
+        var issues = await _issueStore.GetIssuesAsync(statusFilter, typeFilter, severityFilter, null, null, null, ct);
 
         if (issues.Count == 0)
             return "No issues found.";

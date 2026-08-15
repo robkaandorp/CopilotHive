@@ -4,6 +4,7 @@
 @using CopilotHive.Orchestration
 @using CopilotHive.Services
 @using Markdig
+@using System.Net.Http.Json
 @implements IDisposable
 @inject DashboardStateService State
 @inject ProgressReportService ProgressReports
@@ -223,6 +224,24 @@
                             {
                                 <li>
                                     <a href="/knowledge/@docId" class="goal-link">@docId</a>
+                                </li>
+                            }
+                        </ul>
+                    </div>
+                }
+
+                @* Linked Issues *@
+                @if (_linkedIssues.Count > 0)
+                {
+                    <div class="card" style="margin-bottom:0.75rem">
+                        <div class="label">Linked Issues</div>
+                        <ul style="margin:0.5rem 0 0 1.2rem;font-size:0.9rem">
+                            @foreach (var issue in _linkedIssues)
+                            {
+                                <li>
+                                    <a href="/issues" class="goal-link">@issue.Title</a>
+                                    <span class="badge @IssueStatusBadge(issue.Status)" style="margin-left:0.3rem;font-size:0.75rem">@issue.Status</span>
+                                    <div style="font-size:0.75rem;color:var(--text-muted)">@issue.Id · @issue.Type · @issue.Severity</div>
                                 </li>
                             }
                         </ul>
@@ -858,6 +877,8 @@ else
     private string _selectedReleaseId = "";
     private string? _releaseAssignError;
     private string? _goalReleaseId;
+    private record LinkedIssueInfo(string Id, string Title, IssueType Type, IssueSeverity Severity, IssueStatus Status);
+    private List<LinkedIssueInfo> _linkedIssues = [];
 
     protected override async Task OnInitializedAsync()
     {
@@ -933,6 +954,14 @@ else
         {
             _dependencyStatuses = new();
         }
+
+        // Fetch issues related to this goal (linked or source)
+        var sourceIssues = await HttpClient.GetFromJsonAsync<List<LinkedIssueInfo>>(
+            $"/api/issues?source_goal_id={Uri.EscapeDataString(GoalId)}", ReasoningEffortOptions.JsonOptions) ?? [];
+        var linkedIssues = await HttpClient.GetFromJsonAsync<List<LinkedIssueInfo>>(
+            $"/api/issues?linked_goal_id={Uri.EscapeDataString(GoalId)}", ReasoningEffortOptions.JsonOptions) ?? [];
+        // Merge and deduplicate by Id
+        _linkedIssues = sourceIssues.Concat(linkedIssues).DistinctBy(i => i.Id).ToList();
 
         // Load Planning releases for release-assignment dropdown (shown when goal is Completed and unassigned)
         var goalStatus = _detail?.Status ?? _storedGoal?.Status;
@@ -1047,6 +1076,17 @@ else
         GoalStatus.InProgress => "badge-blue",
         GoalStatus.Pending => "badge-yellow",
         GoalStatus.Draft => "badge-muted",
+        _ => "badge-muted",
+    };
+
+    private static string IssueStatusBadge(IssueStatus s) => s switch
+    {
+        IssueStatus.Open => "badge-yellow",
+        IssueStatus.Triaged => "badge-blue",
+        IssueStatus.Acknowledged => "badge-muted",
+        IssueStatus.InProgress => "badge-blue",
+        IssueStatus.Resolved => "badge-green",
+        IssueStatus.Closed => "badge-muted",
         _ => "badge-muted",
     };
 

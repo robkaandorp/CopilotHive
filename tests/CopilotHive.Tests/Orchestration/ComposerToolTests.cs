@@ -10334,6 +10334,7 @@ public sealed class ComposerIssueToolConcurrencyTests
             IssueSeverity? severity = null,
             string? repository = null,
             string? sourceGoalId = null,
+            string? linkedGoalId = null,
             CancellationToken ct = default)
         {
             Record(nameof(GetIssuesAsync), ct);
@@ -10344,6 +10345,7 @@ public sealed class ComposerIssueToolConcurrencyTests
                 if (type.HasValue) query = query.Where(i => i.Type == type.Value);
                 if (severity.HasValue) query = query.Where(i => i.Severity == severity.Value);
                 if (sourceGoalId is not null) query = query.Where(i => i.SourceGoalId == sourceGoalId);
+                if (linkedGoalId is not null) query = query.Where(i => i.LinkedGoalId == linkedGoalId);
                 if (repository is not null)
                 {
                     query = query.Where(i => i.RepositoryNames
@@ -10496,8 +10498,9 @@ public sealed class ComposerIssueToolConcurrencyTests
             IssueSeverity? severity = null,
             string? repository = null,
             string? sourceGoalId = null,
+            string? linkedGoalId = null,
             CancellationToken ct = default) =>
-            inner.GetIssuesAsync(status, type, severity, repository, sourceGoalId, ct);
+            inner.GetIssuesAsync(status, type, severity, repository, sourceGoalId, linkedGoalId, ct);
 
         public async Task<Issue?> GetIssueAsync(string issueId, CancellationToken ct = default)
         {

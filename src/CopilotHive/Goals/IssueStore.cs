@@ -72,6 +72,7 @@ public sealed class IssueStore : IIssueStore
         IssueSeverity? severity = null,
         string? repository = null,
         string? sourceGoalId = null,
+        string? linkedGoalId = null,
         CancellationToken ct = default)
     {
         var (db, ownsContext) = ResolveDbContext();
@@ -87,6 +88,8 @@ public sealed class IssueStore : IIssueStore
                 query = query.Where(e => e.Severity == severity.Value);
             if (sourceGoalId is not null)
                 query = query.Where(e => e.SourceGoalId == sourceGoalId);
+            if (linkedGoalId is not null)
+                query = query.Where(e => e.LinkedGoalId == linkedGoalId);
 
             var issues = await query
                 .OrderByDescending(e => e.CreatedAt)

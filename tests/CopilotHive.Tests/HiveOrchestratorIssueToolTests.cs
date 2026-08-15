@@ -699,6 +699,7 @@ public sealed class HiveOrchestratorIssueToolTests
             IssueSeverity? severity = null,
             string? repository = null,
             string? sourceGoalId = null,
+            string? linkedGoalId = null,
             CancellationToken ct = default)
         {
             var query = Issues.Values.AsEnumerable();
@@ -706,6 +707,7 @@ public sealed class HiveOrchestratorIssueToolTests
             if (type.HasValue) query = query.Where(i => i.Type == type.Value);
             if (severity.HasValue) query = query.Where(i => i.Severity == severity.Value);
             if (sourceGoalId is not null) query = query.Where(i => i.SourceGoalId == sourceGoalId);
+            if (linkedGoalId is not null) query = query.Where(i => i.LinkedGoalId == linkedGoalId);
             if (repository is not null)
                 query = query.Where(i => i.RepositoryNames.Any(r => string.Equals(r, repository, StringComparison.OrdinalIgnoreCase)));
             return Task.FromResult<IReadOnlyList<Issue>>(query.ToList());
@@ -776,6 +778,7 @@ public sealed class HiveOrchestratorIssueToolTests
             IssueSeverity? severity = null,
             string? repository = null,
             string? sourceGoalId = null,
+            string? linkedGoalId = null,
             CancellationToken ct = default)
         {
             var query = Issues.Values.AsEnumerable();
@@ -783,6 +786,7 @@ public sealed class HiveOrchestratorIssueToolTests
             if (type.HasValue) query = query.Where(i => i.Type == type.Value);
             if (severity.HasValue) query = query.Where(i => i.Severity == severity.Value);
             if (sourceGoalId is not null) query = query.Where(i => i.SourceGoalId == sourceGoalId);
+            if (linkedGoalId is not null) query = query.Where(i => i.LinkedGoalId == linkedGoalId);
             if (repository is not null)
                 query = query.Where(i => i.RepositoryNames.Any(r => string.Equals(r, repository, StringComparison.OrdinalIgnoreCase)));
             return Task.FromResult<IReadOnlyList<Issue>>(query.ToList());

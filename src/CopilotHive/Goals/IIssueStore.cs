@@ -18,6 +18,7 @@ public interface IIssueStore
         IssueSeverity? severity = null,
         string? repository = null,
         string? sourceGoalId = null,
+        string? linkedGoalId = null,
         CancellationToken ct = default);
 
     /// <summary>Returns a single issue by ID, or <c>null</c> if not found.</summary>
