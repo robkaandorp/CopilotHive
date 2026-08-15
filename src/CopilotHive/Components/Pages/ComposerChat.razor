@@ -78,10 +78,20 @@ else
 
                 @foreach (var msg in _messages)
                 {
-                    <div class="chat-msg chat-msg-@msg.Role">
-                        <div class="chat-msg-role">@(msg.Role == "user" ? "You" : "Composer")</div>
-                        <div class="chat-msg-content">@((MarkupString)FormatContent(msg.Content))</div>
-                    </div>
+                    @if (msg.Role == "system")
+                    {
+                        <div class="chat-msg chat-msg-system">
+                            <div class="chat-msg-role">System</div>
+                            <div class="chat-msg-content">@((MarkupString)FormatContent(msg.Content))</div>
+                        </div>
+                    }
+                    else
+                    {
+                        <div class="chat-msg chat-msg-@msg.Role">
+                            <div class="chat-msg-role">@(msg.Role == "user" ? "You" : "Composer")</div>
+                            <div class="chat-msg-content">@((MarkupString)FormatContent(msg.Content))</div>
+                        </div>
+                    }
                 }
 
                 @if (Composer.IsStreaming)
@@ -186,6 +196,10 @@ else
                 @if (!string.IsNullOrEmpty(_attachmentError))
                 {
                     <div class="chat-attach-error">@_attachmentError</div>
+                }
+                @if (!string.IsNullOrEmpty(_sendError))
+                {
+                    <div class="chat-attach-error">@_sendError</div>
                 }
                 <label class="chat-attach-btn">
                     📎
@@ -298,6 +312,7 @@ else
     private ComposerAttachment? _pending;
     private bool _uploading;
     private string? _attachmentError;
+    private string? _sendError;
     private IJSObjectReference? _pasteModule;
     private DotNetObjectReference<ComposerChat>? _pasteDotNetRef;
 
@@ -359,7 +374,17 @@ else
         _messages.Clear();
         foreach (var (role, content) in Composer.GetChatHistory())
         {
-            _messages.Add(new ChatMessage { Role = role, Content = content });
+            if (role == "user")
+            {
+                var (eventBlock, userMessage) = Composer.TrySplitEventBlock(content);
+                if (eventBlock is not null)
+                    _messages.Add(new ChatMessage { Role = "system", Content = eventBlock });
+                _messages.Add(new ChatMessage { Role = "user", Content = userMessage });
+            }
+            else
+            {
+                _messages.Add(new ChatMessage { Role = role, Content = content });
+            }
         }
     }
 
@@ -384,6 +409,8 @@ else
     {
         if (!CanSend) return;
 
+        _sendError = null;
+
         string text;
         if (_pending is not null)
         {
@@ -396,13 +423,26 @@ else
             text = _inputText.Trim();
         }
 
+        string? eventBlock = null;
+        try
+        {
+            eventBlock = Composer.SendMessageWithEvents(text);
+        }
+        catch (Exception ex)
+        {
+            _sendError = ex.Message;
+            StateHasChanged();
+            return;
+        }
+
+        if (eventBlock is not null)
+            _messages.Add(new ChatMessage { Role = "system", Content = eventBlock });
+
         _messages.Add(new ChatMessage { Role = "user", Content = text });
 
-        // Call Composer.SendMessage first. Only after it returns without throwing do we
+        // Call Composer.SendMessageWithEvents first. Only after it returns without throwing do we
         // perform destructive state transitions (MarkAsSent, clear pending/input/error).
         // This keeps _pending and _inputText intact for retry if the call fails.
-        Composer.SendMessage(text);
-
         if (_pending is not null)
         {
             AttachmentService.MarkAsSent(_pending);

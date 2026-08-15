@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 
@@ -18,9 +19,10 @@ using SharpCoder;
 namespace CopilotHive.Tests.Orchestration;
 
 /// <summary>
-/// Integration tests for <see cref="Composer.SendMessage"/> event-block prepending and
-/// event restoration on rejection. Uses a real <see cref="Composer"/> with a fake chat
-/// client injected via reflection (same pattern as <see cref="ComposerStreamingServiceTests"/>).
+/// Integration tests for <see cref="Composer.SendMessageWithEvents"/> event-block prepending,
+/// <see cref="Composer.TrySplitEventBlock"/> envelope splitting, and event restoration on
+/// rejection. Uses a real <see cref="Composer"/> with a fake chat client injected via
+/// reflection (same pattern as <see cref="ComposerStreamingServiceTests"/>).
 /// </summary>
 public sealed class ComposerEventIntegrationTests
 {
@@ -28,6 +30,18 @@ public sealed class ComposerEventIntegrationTests
         BindingFlags.Instance | BindingFlags.NonPublic;
 
     // ── Helpers ──
+
+    /// <summary>
+    /// Builds a length-delimited envelope-wrapped message exactly as
+    /// <see cref="Composer.SendMessageWithEvents"/> does: the envelope header (with the
+    /// invariant-culture event-block length) followed by the event block and closing
+    /// <c>}}</c>, then the user message.
+    /// </summary>
+    private static string Wrap(string? eventBlock, string userMessage)
+    {
+        var eventLen = eventBlock?.Length ?? 0;
+        return $"{Composer.EnvelopePrefix}{eventLen.ToString(CultureInfo.InvariantCulture)}{Composer.EnvelopeSeparator}{eventBlock ?? ""}{Composer.EnvelopeSuffix}{userMessage}";
+    }
 
     /// <summary>
     /// Uses reflection to inject a fake <see cref="IChatClient"/> into a
@@ -195,7 +209,7 @@ public sealed class ComposerEventIntegrationTests
         private void CaptureLastUser(IEnumerable<ChatMessage> messages)
         {
             // The messages enumerable is the session history; the last user message
-            // is the one Composer.SendMessage formatted and sent.
+            // is the one Composer.SendMessageWithEvents formatted and sent.
             ChatMessage? lastUser = null;
             foreach (var m in messages)
             {
@@ -221,7 +235,7 @@ public sealed class ComposerEventIntegrationTests
         Assert.False(streamingService.IsStreaming, "Streaming should have completed");
     }
 
-    // ── 1. Events present → formatted block prepended before user message ──
+    // ── 1. Events present → formatted block prepended before user message, inside envelope ──
 
     [Fact]
     public async Task SendMessage_WithPendingEvents_PrependsFormattedEventBlock()
@@ -247,14 +261,12 @@ public sealed class ComposerEventIntegrationTests
             var streamingService = GetStreamingService(composer);
             await WaitForStreamingCompleteAsync(streamingService);
 
-            // The captured user message must be EXACTLY the formatted event block followed by
-            // the separator and the original user text — full-string equality, no fragments.
-            var expected =
+            // The captured user message must be EXACTLY the envelope-wrapped event block
+            // followed by the original user text — full-string equality, no fragments.
+            var block =
                 "[System Events since your last message]\n" +
-                "- ✅ Goal 'my-goal' completed — Goal merged successfully\n" +
-                "\n" +
-                "[User message]\n" +
-                "Please review the latest changes";
+                "- ✅ Goal 'my-goal' completed — Goal merged successfully";
+            var expected = Wrap(block, "Please review the latest changes");
             Assert.NotNull(client.LastUserMessage);
             Assert.Equal(expected, client.LastUserMessage!);
 
@@ -267,7 +279,7 @@ public sealed class ComposerEventIntegrationTests
         }
     }
 
-    // ── 2. Multiple event types → each formatted per spec ──
+    // ── 2. Multiple event types → each formatted per spec, inside envelope ──
 
     [Fact]
     public async Task SendMessage_WithMultipleEventTypes_FormatsEachPerSpec()
@@ -297,18 +309,16 @@ public sealed class ComposerEventIntegrationTests
             await WaitForStreamingCompleteAsync(GetStreamingService(composer));
 
             // Full-string equality: exact header, each event line in FIFO order with the exact
-            // emoji, quoted ID, and em-dash, then the exact separator and original user text.
-            var expected =
+            // emoji, quoted ID, and em-dash, then the exact envelope suffix and original user text.
+            var block =
                 "[System Events since your last message]\n" +
                 "- ✅ Goal 'g-1' completed — Goal merged successfully\n" +
                 "- ❌ Goal 'g-2' failed — Build failed\n" +
                 "- \uD83D\uDE80 Goal 'g-3' dispatched\n" +
                 "- \uD83D\uDC1B Issue 'iss-1' raised — Bug found\n" +
                 "- ✅ Issue 'iss-2' resolved\n" +
-                "- \uD83D\uDCE6 Release 'r-1' completed — Released\n" +
-                "\n" +
-                "[User message]\n" +
-                "check status";
+                "- \uD83D\uDCE6 Release 'r-1' completed — Released";
+            var expected = Wrap(block, "check status");
             Assert.NotNull(client.LastUserMessage);
             Assert.Equal(expected, client.LastUserMessage!);
         }
@@ -349,18 +359,16 @@ public sealed class ComposerEventIntegrationTests
             await WaitForStreamingCompleteAsync(GetStreamingService(composer));
 
             // The exact multi-line block — any change to an emoji, field reference, header
-            // text, or separator in FormatEventBlock (or SendMessage) must fail this test.
-            var expected =
+            // text, or separator in FormatEventBlock (or SendMessageWithEvents) must fail this test.
+            var block =
                 "[System Events since your last message]\n" +
                 "- ✅ Goal 'goal-1' completed — Goal merged successfully\n" +
                 "- ❌ Goal 'goal-2' failed — Build failed\n" +
                 "- \uD83D\uDE80 Goal 'goal-3' dispatched\n" +
                 "- \uD83D\uDC1B Issue 'issue-1' raised — Bug found\n" +
                 "- ✅ Issue 'issue-2' resolved\n" +
-                "- \uD83D\uDCE6 Release 'release-1' completed — Released\n" +
-                "\n" +
-                "[User message]\n" +
-                "user text";
+                "- \uD83D\uDCE6 Release 'release-1' completed — Released";
+            var expected = Wrap(block, "user text");
             Assert.NotNull(client.LastUserMessage);
             Assert.Equal(expected, client.LastUserMessage!);
         }
@@ -370,10 +378,10 @@ public sealed class ComposerEventIntegrationTests
         }
     }
 
-    // ── 3. No events → message passed through unchanged ──
+    // ── 3. No events → message passed through, wrapped with E0 envelope ──
 
     [Fact]
-    public async Task SendMessage_WithNoPendingEvents_PassesMessageThroughUnchanged()
+    public async Task SendMessage_WithNoPendingEvents_WrapsWithEmptyEnvelope()
     {
         Composer? composer = null;
         CopilotHiveDbContext? dbContext = null;
@@ -396,9 +404,9 @@ public sealed class ComposerEventIntegrationTests
 
             await WaitForStreamingCompleteAsync(GetStreamingService(composer));
 
-            // The message must be passed through byte-for-byte unchanged.
+            // Every message is envelope-wrapped, even with zero events: {{CHV1:E0|}}<message>.
             Assert.NotNull(client.LastUserMessage);
-            Assert.Equal(original, client.LastUserMessage!);
+            Assert.Equal(Wrap(null, original), client.LastUserMessage!);
             Assert.DoesNotContain("[System Events", client.LastUserMessage!);
         }
         finally
@@ -446,10 +454,10 @@ public sealed class ComposerEventIntegrationTests
         }
     }
 
-    // ── 5. Subscriber null → no drain, message unchanged ──
+    // ── 5. Subscriber null → no drain, message wrapped with E0 envelope ──
 
     [Fact]
-    public async Task SendMessage_WithNullSubscriber_PassesMessageThroughUnchanged()
+    public async Task SendMessage_WithNullSubscriber_WrapsWithEmptyEnvelope()
     {
         Composer? composer = null;
         CopilotHiveDbContext? dbContext = null;
@@ -468,9 +476,9 @@ public sealed class ComposerEventIntegrationTests
 
             await WaitForStreamingCompleteAsync(GetStreamingService(composer));
 
-            // The message must be passed through unchanged.
+            // The message must be wrapped with the empty envelope (E0) even without a subscriber.
             Assert.NotNull(client.LastUserMessage);
-            Assert.Equal(original, client.LastUserMessage!);
+            Assert.Equal(Wrap(null, original), client.LastUserMessage!);
         }
         finally
         {
@@ -499,5 +507,292 @@ public sealed class ComposerEventIntegrationTests
         {
             await CleanupAsync(composer, dbContext, tmpDir);
         }
+    }
+
+    // ── 7. SendMessageWithEvents: return value and envelope behavior ──
+
+    [Fact]
+    public async Task SendMessageWithEvents_WithPendingEvents_ReturnsExactEventBlock()
+    {
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        ComposerEventSubscriber? subscriber = null;
+        var tmpDir = CreateTempDir();
+        try
+        {
+            var bus = new EventBus();
+            subscriber = new ComposerEventSubscriber(bus);
+            (composer, dbContext, _) = CreateComposer(tmpDir, subscriber: subscriber);
+
+            bus.Publish(new SystemEvent(EventType.GoalCompleted, "Goal merged successfully", GoalId: "my-goal"));
+
+            var client = new CapturingStreamingClient();
+            await InjectFakeChatClient(composer, client);
+
+            var result = composer.SendMessageWithEvents("Please review the latest changes");
+
+            await WaitForStreamingCompleteAsync(GetStreamingService(composer));
+
+            // The return value is the exact formatted event block.
+            var block =
+                "[System Events since your last message]\n" +
+                "- ✅ Goal 'my-goal' completed — Goal merged successfully";
+            Assert.Equal(block, result);
+
+            // The captured message is the envelope-wrapped block + user text.
+            Assert.Equal(Wrap(block, "Please review the latest changes"), client.LastUserMessage);
+
+            // Events were drained.
+            Assert.Empty(subscriber.PeekPendingEvents());
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir, subscriber);
+        }
+    }
+
+    [Fact]
+    public async Task SendMessageWithEvents_WithNoPendingEvents_ReturnsNull_AndWrapsWithE0()
+    {
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        ComposerEventSubscriber? subscriber = null;
+        var tmpDir = CreateTempDir();
+        try
+        {
+            var bus = new EventBus();
+            subscriber = new ComposerEventSubscriber(bus);
+            (composer, dbContext, _) = CreateComposer(tmpDir, subscriber: subscriber);
+
+            var client = new CapturingStreamingClient();
+            await InjectFakeChatClient(composer, client);
+
+            const string original = "no events here";
+            var result = composer.SendMessageWithEvents(original);
+
+            await WaitForStreamingCompleteAsync(GetStreamingService(composer));
+
+            // No pending events → return null, but the message is still wrapped with E0|}}.
+            Assert.Null(result);
+            Assert.Equal(Wrap(null, original), client.LastUserMessage);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir, subscriber);
+        }
+    }
+
+    [Fact]
+    public async Task SendMessageWithEvents_WhenNotConnected_Throws_RestoresEventsAndReThrows()
+    {
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        ComposerEventSubscriber? subscriber = null;
+        var tmpDir = CreateTempDir();
+        try
+        {
+            var bus = new EventBus();
+            subscriber = new ComposerEventSubscriber(bus);
+            (composer, dbContext, _) = CreateComposer(tmpDir, subscriber: subscriber);
+
+            // Publish events so they're buffered.
+            bus.Publish(new SystemEvent(EventType.GoalCompleted, "Goal merged successfully", GoalId: "goal-A"));
+            bus.Publish(new SystemEvent(EventType.GoalFailed, "Build broke", GoalId: "goal-B"));
+            Assert.Equal(2, subscriber.PeekPendingEvents().Count);
+
+            // Do NOT inject a chat client — the agent is null, so _streamingService.SendMessage
+            // throws. SendMessageWithEvents must restore the drained events and re-throw.
+            var ex = Assert.Throws<InvalidOperationException>(() => composer.SendMessageWithEvents("test message"));
+            Assert.Contains("not connected", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+            var restored = subscriber.PeekPendingEvents();
+            Assert.Equal(2, restored.Count);
+            Assert.Equal("goal-A", restored[0].GoalId);
+            Assert.Equal("goal-B", restored[1].GoalId);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir, subscriber);
+        }
+    }
+
+    [Fact]
+    public async Task SendMessage_Wrapper_SendsEnvelopedMessageWithEvents()
+    {
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        ComposerEventSubscriber? subscriber = null;
+        var tmpDir = CreateTempDir();
+        try
+        {
+            var bus = new EventBus();
+            subscriber = new ComposerEventSubscriber(bus);
+            (composer, dbContext, _) = CreateComposer(tmpDir, subscriber: subscriber);
+
+            bus.Publish(new SystemEvent(EventType.GoalCompleted, "Done", GoalId: "g-1"));
+
+            var client = new CapturingStreamingClient();
+            await InjectFakeChatClient(composer, client);
+
+            // SendMessage is a void wrapper — its return value is never used.
+            composer.SendMessage("hello");
+
+            await WaitForStreamingCompleteAsync(GetStreamingService(composer));
+
+            var block =
+                "[System Events since your last message]\n" +
+                "- ✅ Goal 'g-1' completed — Done";
+            Assert.Equal(Wrap(block, "hello"), client.LastUserMessage);
+            Assert.Empty(subscriber.PeekPendingEvents());
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir, subscriber);
+        }
+    }
+
+    // ── 8. TrySplitEventBlock: envelope splitting ──
+
+    [Fact]
+    public void TrySplitEventBlock_EnvelopeWithEvents_SplitsIntoEventBlockAndUserMessage()
+    {
+        var block =
+            "[System Events since your last message]\n" +
+            "- ✅ Goal 'g' completed — done";
+        var content = Wrap(block, "user message text");
+
+        var (eventBlock, userMessage) = Composer.TrySplitEventBlock(content);
+
+        Assert.Equal(block, eventBlock);
+        Assert.Equal("user message text", userMessage);
+    }
+
+    [Fact]
+    public void TrySplitEventBlock_EnvelopeWithE0_ReturnsNullEventBlockAndUserMessage()
+    {
+        var content = "{{CHV1:E0|}}just a message";
+
+        var (eventBlock, userMessage) = Composer.TrySplitEventBlock(content);
+
+        Assert.Null(eventBlock);
+        Assert.Equal("just a message", userMessage);
+    }
+
+    [Fact]
+    public void TrySplitEventBlock_LegacyPlainUserMessage_ReturnsNullAndOriginalContent()
+    {
+        const string content = "plain legacy message without envelope";
+
+        var (eventBlock, userMessage) = Composer.TrySplitEventBlock(content);
+
+        Assert.Null(eventBlock);
+        Assert.Equal(content, userMessage);
+    }
+
+    [Fact]
+    public async Task TrySplitEventBlock_ValidPrefixCollision_RoundTripsThroughSendMessageWithEvents()
+    {
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        ComposerEventSubscriber? subscriber = null;
+        var tmpDir = CreateTempDir();
+        try
+        {
+            var bus = new EventBus();
+            subscriber = new ComposerEventSubscriber(bus);
+            (composer, dbContext, _) = CreateComposer(tmpDir, subscriber: subscriber);
+
+            var client = new CapturingStreamingClient();
+            await InjectFakeChatClient(composer, client);
+
+            // The user sends text that looks like an envelope prefix as literal content.
+            const string literal = "{{CHV1:E3|abc}}hello";
+            var result = composer.SendMessageWithEvents(literal);
+
+            await WaitForStreamingCompleteAsync(GetStreamingService(composer));
+
+            // No pending events → null, and the message is wrapped with an E0 envelope so the
+            // literal prefix is protected: {{CHV1:E0|}}{{CHV1:E3|abc}}hello.
+            Assert.Null(result);
+            Assert.Equal(Wrap(null, literal), client.LastUserMessage);
+
+            // Splitting the wrapped message must NOT misclassify the literal prefix: the E0
+            // envelope is consumed and the literal text is returned as the user message.
+            var (eventBlock, userMessage) = Composer.TrySplitEventBlock(client.LastUserMessage!);
+            Assert.Null(eventBlock);
+            Assert.Equal(literal, userMessage);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir, subscriber);
+        }
+    }
+
+    [Fact]
+    public void TrySplitEventBlock_Malformed_PrefixButNoSeparator_ReturnsNullAndContent()
+    {
+        const string content = "{{CHV1:E0}}no separator";
+
+        var (eventBlock, userMessage) = Composer.TrySplitEventBlock(content);
+
+        Assert.Null(eventBlock);
+        Assert.Equal(content, userMessage);
+    }
+
+    [Fact]
+    public void TrySplitEventBlock_Malformed_OversizedLength_ReturnsNullAndContent()
+    {
+        const string content = "{{CHV1:E999999999|abc}}hello";
+
+        var (eventBlock, userMessage) = Composer.TrySplitEventBlock(content);
+
+        Assert.Null(eventBlock);
+        Assert.Equal(content, userMessage);
+    }
+
+    [Fact]
+    public void TrySplitEventBlock_EventBlockContainingMarkers_SplitsCorrectly()
+    {
+        // The block contains the envelope suffix and separator as literal text; because the
+        // envelope is length-delimited, splitting must still be exact.
+        var block =
+            "[System Events since your last message]\n" +
+            "- ✅ Goal 'x' done — contains }} and | markers";
+        var content = Wrap(block, "user text");
+
+        var (eventBlock, userMessage) = Composer.TrySplitEventBlock(content);
+
+        Assert.Equal(block, eventBlock);
+        Assert.Equal("user text", userMessage);
+    }
+
+    [Fact]
+    public void TrySplitEventBlock_EmptyUserMessageAfterEnvelope_ReturnsEventBlockAndEmpty()
+    {
+        var block =
+            "[System Events since your last message]\n" +
+            "- ✅ Goal 'x' completed — done";
+        var content = Wrap(block, "");
+
+        var (eventBlock, userMessage) = Composer.TrySplitEventBlock(content);
+
+        Assert.Equal(block, eventBlock);
+        Assert.Equal("", userMessage);
+    }
+
+    [Fact]
+    public void TrySplitEventBlock_RoundTrip_ArbitraryEventTextAndUserText_SplitsCorrectly()
+    {
+        var block =
+            "[System Events since your last message]\n" +
+            "- ✅ Goal 'multi' completed — line one\n" +
+            "- ❌ Goal 'multi' failed — line two with }} and |";
+        var userText = "arbitrary user text\nwith newlines and }} markers";
+        var content = Wrap(block, userText);
+
+        var (eventBlock, userMessage) = Composer.TrySplitEventBlock(content);
+
+        Assert.Equal(block, eventBlock);
+        Assert.Equal(userText, userMessage);
     }
 }

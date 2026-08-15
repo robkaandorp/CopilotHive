@@ -12,6 +12,7 @@ using SharpCoder;
 using SharpCoder.SubAgents;
 
 using System.ComponentModel;
+using System.Globalization;
 
 namespace CopilotHive.Orchestration;
 
@@ -71,6 +72,15 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// authoritative update and re-fetch, and is always released in a <c>finally</c>.
     /// </summary>
     private readonly SemaphoreSlim _issueUpdateLock = new(1, 1);
+
+    /// <summary>Envelope prefix for the length-delimited event-bus notification block (CHV1 protocol).</summary>
+    internal const string EnvelopePrefix = "{{CHV1:E";
+
+    /// <summary>Separator between the event-block length and the event block itself.</summary>
+    internal const string EnvelopeSeparator = "|";
+
+    /// <summary>Closing marker of the envelope.</summary>
+    internal const string EnvelopeSuffix = "}}";
 
     /// <summary>Models the Composer can switch between at runtime.</summary>
     public IReadOnlyList<string> AvailableModels => _agentService.AvailableModels;
@@ -492,16 +502,31 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// The streaming state is owned by the Composer service and survives component navigation.
     /// Subscribe to <see cref="OnStreamingUpdate"/> to receive updates.
     /// </summary>
-    public void SendMessage(string userMessage)
+    public void SendMessage(string userMessage) => SendMessageWithEvents(userMessage);
+
+    /// <summary>Sends a message, prepending any pending system events.
+    /// Returns the formatted event block prepended, or null if no events were pending.</summary>
+    public string? SendMessageWithEvents(string userMessage)
     {
         List<SystemEvent>? events = null;
+        string? eventBlock = null;
         if (_eventSubscriber is not null)
         {
             events = _eventSubscriber.DrainPendingEvents();
             if (events.Count > 0)
-                userMessage = $"{FormatEventBlock(events)}\n\n[User message]\n{userMessage}";
+                eventBlock = FormatEventBlock(events);
         }
-        try { _streamingService.SendMessage(userMessage); }
+
+        // Always prefix with envelope — every stored message starts with the prefix,
+        // so TrySplitEventBlock can unambiguously identify it at position 0.
+        var eventLen = eventBlock?.Length ?? 0;
+        var wrappedMessage = $"{EnvelopePrefix}{eventLen.ToString(CultureInfo.InvariantCulture)}{EnvelopeSeparator}{eventBlock ?? ""}{EnvelopeSuffix}{userMessage}";
+
+        try
+        {
+            _streamingService.SendMessage(wrappedMessage);
+            return eventBlock; // null if no events
+        }
         catch
         {
             if (events is not null && events.Count > 0 && _eventSubscriber is not null)
@@ -511,11 +536,44 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     }
 
     /// <summary>
+    /// Attempts to split a length-delimited envelope from a user message.
+    /// Returns (eventBlock, userMessage) if the content starts with the envelope prefix.
+    /// Returns (null, content) for plain user messages (legacy history without envelope).</summary>
+    internal static (string? EventBlock, string UserMessage) TrySplitEventBlock(string content)
+    {
+        if (!content.StartsWith(EnvelopePrefix, StringComparison.Ordinal))
+            return (null, content); // legacy or plain user message — no envelope
+
+        var sepIndex = content.IndexOf(EnvelopeSeparator, EnvelopePrefix.Length, StringComparison.Ordinal);
+        if (sepIndex < 0)
+            return (null, content); // malformed
+
+        var lengthStr = content[EnvelopePrefix.Length..sepIndex];
+        if (!int.TryParse(lengthStr, NumberStyles.None, CultureInfo.InvariantCulture, out var eventBlockLength) || eventBlockLength < 0)
+            return (null, content); // malformed
+
+        var eventBlockStart = sepIndex + EnvelopeSeparator.Length;
+        // Overflow-safe bounds check
+        if (eventBlockLength > content.Length - eventBlockStart)
+            return (null, content); // malformed or oversized length
+
+        var eventBlock = eventBlockLength == 0 ? null : content.Substring(eventBlockStart, eventBlockLength);
+        var afterEventBlock = eventBlockStart + eventBlockLength;
+
+        if (afterEventBlock + EnvelopeSuffix.Length > content.Length
+            || !content.AsSpan(afterEventBlock, EnvelopeSuffix.Length).SequenceEqual(EnvelopeSuffix))
+            return (null, content); // malformed
+
+        var userMessage = content[(afterEventBlock + EnvelopeSuffix.Length)..];
+        return (eventBlock, userMessage);
+    }
+
+    /// <summary>
     /// Formats a block of system events for prepending to a user message.
     /// </summary>
     /// <param name="events">The events to format.</param>
     /// <returns>A formatted markdown block describing the events.</returns>
-    private static string FormatEventBlock(List<SystemEvent> events)
+    internal static string FormatEventBlock(List<SystemEvent> events)
     {
         var lines = events.Select(e => e.Type switch
         {
