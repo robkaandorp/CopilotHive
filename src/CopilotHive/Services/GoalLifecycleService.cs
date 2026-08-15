@@ -23,6 +23,7 @@ internal sealed class GoalLifecycleService
     private readonly IDistributedBrain? _brain;
     private readonly DashboardNotifier? _dashboardNotifier;
     private readonly ILogger _logger;
+    private readonly IEventBus? _eventBus;
 
     public GoalLifecycleService(
         GoalManager goalManager,
@@ -31,7 +32,8 @@ internal sealed class GoalLifecycleService
         AgentsManager? agentsManager = null,
         ConfigRepoManager? configRepo = null,
         IDistributedBrain? brain = null,
-        DashboardNotifier? dashboardNotifier = null)
+        DashboardNotifier? dashboardNotifier = null,
+        IEventBus? eventBus = null)
     {
         _goalManager = goalManager;
         _logger = logger;
@@ -40,6 +42,7 @@ internal sealed class GoalLifecycleService
         _configRepo = configRepo;
         _brain = brain;
         _dashboardNotifier = dashboardNotifier;
+        _eventBus = eventBus;
     }
 
     public async Task MarkGoalCompletedAsync(GoalPipeline pipeline, CancellationToken ct)
@@ -133,6 +136,15 @@ internal sealed class GoalLifecycleService
         };
 
         await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, status, meta, ct);
+
+        // Publish the lifecycle event immediately after successful status persistence so the
+        // Composer is notified even if subsequent bookkeeping fails or is slow.
+        if (_eventBus is not null)
+            _eventBus.Publish(new SystemEvent(
+                Type: status == GoalStatus.Completed ? EventType.GoalCompleted : EventType.GoalFailed,
+                Message: status == GoalStatus.Completed ? "Goal merged successfully" : (failureReason ?? "Goal failed"),
+                GoalId: pipeline.GoalId));
+
         _dashboardNotifier?.NotifyStateChanged();
 
         pipeline.Metrics.Iteration = pipeline.Iteration;

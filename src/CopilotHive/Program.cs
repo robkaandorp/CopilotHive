@@ -125,6 +125,10 @@ public sealed class Program
             builder.Services.AddSingleton<ImprovementAnalyzer>();
             builder.Services.AddSingleton<GoalReadyNotifier>();
 
+            // Event bus: typed system events broadcast to subscribers (e.g. the Composer)
+            builder.Services.AddSingleton<IEventBus, EventBus>();
+            builder.Services.AddSingleton<ComposerEventSubscriber>();
+
             // Agents: AGENTS.md versioning and rollback
             var agentsDir = Environment.GetEnvironmentVariable("AGENTS_DIR") ?? Path.Combine(AppContext.BaseDirectory, "agents");
             if (!Directory.Exists(agentsDir))
@@ -348,7 +352,8 @@ public sealed class Program
                             : config?.Orchestrator?.ReasoningEffort,
                         "composer.reasoning_effort",
                         sp.GetService<ILogger<Composer>>()),
-                    issueStore: sp.GetService<IIssueStore>());
+                    issueStore: sp.GetService<IIssueStore>(),
+                    eventSubscriber: sp.GetService<ComposerEventSubscriber>());
             });
             builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 
@@ -602,6 +607,9 @@ public sealed class Program
             }
 
             // Wire up Composer
+            // Force construction of the event subscriber so its subscription is active
+            // before any goal lifecycle events can be published.
+            app.Services.GetService<ComposerEventSubscriber>();
             var composer = app.Services.GetService<Composer>();
             if (composer is not null)
             {

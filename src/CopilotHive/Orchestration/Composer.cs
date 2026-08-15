@@ -59,6 +59,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// </summary>
     private readonly ReasoningEffort? _configuredReasoningEffort;
     private readonly IIssueStore? _issueStore;
+    private readonly ComposerEventSubscriber? _eventSubscriber;
 
     /// <summary>
     /// Serializes the <c>update_issue</c> read-modify-write cycle. <see cref="Issue"/> has no
@@ -321,7 +322,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         GoalReadyNotifier? goalReadyNotifier = null,
         ComposerAttachmentService? attachmentService = null,
         ReasoningEffort? reasoningEffort = null,
-        IIssueStore? issueStore = null)
+        IIssueStore? issueStore = null,
+        ComposerEventSubscriber? eventSubscriber = null)
     {
         _logger = logger;
         _goalStore = goalStore;
@@ -339,6 +341,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _attachmentService = attachmentService;
         _configuredReasoningEffort = reasoningEffort;
         _issueStore = issueStore;
+        _eventSubscriber = eventSubscriber;
 
         _systemPrompt = DefaultSystemPrompt;
         if (_ollamaApiKey is not null)
@@ -488,7 +491,40 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// </summary>
     public void SendMessage(string userMessage)
     {
-        _streamingService.SendMessage(userMessage);
+        List<SystemEvent>? events = null;
+        if (_eventSubscriber is not null)
+        {
+            events = _eventSubscriber.DrainPendingEvents();
+            if (events.Count > 0)
+                userMessage = $"{FormatEventBlock(events)}\n\n[User message]\n{userMessage}";
+        }
+        try { _streamingService.SendMessage(userMessage); }
+        catch
+        {
+            if (events is not null && events.Count > 0 && _eventSubscriber is not null)
+                _eventSubscriber.RestoreEvents(events);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Formats a block of system events for prepending to a user message.
+    /// </summary>
+    /// <param name="events">The events to format.</param>
+    /// <returns>A formatted markdown block describing the events.</returns>
+    private static string FormatEventBlock(List<SystemEvent> events)
+    {
+        var lines = events.Select(e => e.Type switch
+        {
+            EventType.GoalCompleted    => $"- ✅ Goal '{e.GoalId}' completed — {e.Message}",
+            EventType.GoalFailed       => $"- ❌ Goal '{e.GoalId}' failed — {e.Message}",
+            EventType.GoalDispatched   => $"- 🚀 Goal '{e.GoalId}' dispatched",
+            EventType.IssueRaised      => $"- 🐛 Issue '{e.IssueId}' raised — {e.Message}",
+            EventType.IssueResolved    => $"- ✅ Issue '{e.IssueId}' resolved",
+            EventType.ReleaseCompleted => $"- 📦 Release '{e.ReleaseId}' completed — {e.Message}",
+            _                          => $"- {e.Type}: {e.Message}"
+        });
+        return $"[System Events since your last message]\n{string.Join('\n', lines)}";
     }
 
     /// <summary>
