@@ -1,3 +1,16 @@
+## [0.28.1] — 2026-08-15
+
+### Added
+
+- **Goal-to-issue backlinks** — The Goal Detail page now shows a "Linked Issues" card listing issues that reference the goal (via `SourceGoalId` or `LinkedGoalId`), with title, status badge, type, and severity. Issues are deduplicated by ID. The `GET /api/issues` endpoint and `IIssueStore.GetIssuesAsync` now support a `linked_goal_id` filter parameter. (`copilothive-goal-detail-issue-backlinks`)
+
+### Fixed
+
+- **Issue title column overflow** — Long issue titles (e.g. full unit test names) no longer push table columns off-screen. Titles are constrained to 300px with ellipsis truncation and a hover tooltip showing the full text. (`copilothive-fix-issues-overview`)
+- **Closed issues hidden by default** — The Issues page status filter now defaults to "Active (excl. closed)" instead of "All statuses". Closed issues only appear when the user explicitly selects "Closed" in the filter. (`copilothive-fix-issues-overview`)
+- **IssueStore persistence-error conflation** — `IssueStore.CreateIssueAsync` now only wraps primary-key constraint violations as `InvalidOperationException` (the documented duplicate-ID signal). Other `DbUpdateException`s propagate as 500 errors instead of being misleadingly reported as 409 "already exists". (`copilothive-fix-issuestore-persistence-conflation`)
+- **GoalDetail double refresh** — `GoalDetail.razor` no longer calls `RefreshAsync` twice on initial render, eliminating duplicated store queries and API requests on first load. (`copilothive-fix-goaldetail-double-refresh`)
+
 ## [0.28.0] — 2026-08-14
 
 ### Added — Issue Tracking System
