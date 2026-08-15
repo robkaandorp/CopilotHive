@@ -27,6 +27,7 @@ internal sealed class GoalDispatchService
     private readonly ConfigRepoManager? _configRepo;
     private readonly DashboardNotifier? _dashboardNotifier;
     private readonly ILogger _logger;
+    private readonly IEventBus? _eventBus;
 
     /// <summary>
     /// Initialises a new <see cref="GoalDispatchService"/>.
@@ -42,7 +43,8 @@ internal sealed class GoalDispatchService
         IGoalStore? goalStore,
         ConfigRepoManager? configRepo,
         DashboardNotifier? dashboardNotifier,
-        ILogger logger)
+        ILogger logger,
+        IEventBus? eventBus = null)
     {
         _goalManager = goalManager;
         _pipelineManager = pipelineManager;
@@ -55,6 +57,7 @@ internal sealed class GoalDispatchService
         _configRepo = configRepo;
         _dashboardNotifier = dashboardNotifier;
         _logger = logger;
+        _eventBus = eventBus;
     }
 
     /// <summary>
@@ -264,6 +267,13 @@ internal sealed class GoalDispatchService
 
         var firstRole = firstPhase.ToWorkerRole();
         await _taskDispatchService.DispatchToRole(pipeline, firstRole, firstPhasePrompt, ct);
+
+        // Only publish if a task was actually dispatched (ActiveTaskId is set).
+        if (!string.IsNullOrEmpty(pipeline.ActiveTaskId))
+            _eventBus?.Publish(new SystemEvent(
+                Type: EventType.GoalDispatched,
+                Message: pipeline.Description,
+                GoalId: pipeline.GoalId));
 
         _pipelineManager.PersistFull(pipeline);
     }

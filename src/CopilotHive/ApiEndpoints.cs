@@ -353,7 +353,7 @@ public static class ApiEndpoints
             }
         });
 
-        releasesApi.MapPatch("/{id}/status", async (string id, UpdateReleaseStatusRequest request, IGoalStore store, IServiceProvider services, HttpContext HttpContext, [FromServices] DashboardNotifier dashboardNotifier) =>
+        releasesApi.MapPatch("/{id}/status", async (string id, UpdateReleaseStatusRequest request, IGoalStore store, IServiceProvider services, HttpContext HttpContext, [FromServices] DashboardNotifier dashboardNotifier, [FromServices] IEventBus? eventBus = null) =>
         {
             var existing = await store.GetReleaseAsync(id);
             if (existing is null)
@@ -406,6 +406,11 @@ public static class ApiEndpoints
                 updated!.Status = ReleaseStatus.Released;
                 updated.ReleasedAt = DateTime.UtcNow;
                 await store.UpdateReleaseAsync(updated);
+
+                eventBus?.Publish(new SystemEvent(
+                    Type: EventType.ReleaseCompleted,
+                    Message: $"Release '{updated.Tag}' marked as Released",
+                    ReleaseId: updated.Id));
 
                 // Best-effort cleanup of transient progress/review knowledge documents for
                 // every goal in the release. Failures are logged and must never fail the release.
@@ -606,7 +611,7 @@ public static class ApiEndpoints
                 : Results.Ok(ToResponse(issue));
         });
 
-        issuesApi.MapPost("/", async (CreateIssueRequest request, IIssueStore issueStore, CancellationToken ct) =>
+        issuesApi.MapPost("/", async (CreateIssueRequest request, IIssueStore issueStore, CancellationToken ct, [FromServices] IEventBus? eventBus = null) =>
         {
             if (request.Type is null)
                 return Results.BadRequest(new { error = "Type is required." });
@@ -656,6 +661,10 @@ public static class ApiEndpoints
             try
             {
                 var created = await issueStore.CreateIssueAsync(issue, ct);
+                eventBus?.Publish(new SystemEvent(
+                    Type: EventType.IssueRaised,
+                    Message: created.Title,
+                    IssueId: created.Id));
                 return Results.Created($"/api/issues/{Uri.EscapeDataString(created.Id)}", ToResponse(created));
             }
             catch (InvalidOperationException)
@@ -664,11 +673,14 @@ public static class ApiEndpoints
             }
         });
 
-        issuesApi.MapPatch("/{id}", async (string id, UpdateIssueRequest request, IIssueStore issueStore, CancellationToken ct) =>
+        issuesApi.MapPatch("/{id}", async (string id, UpdateIssueRequest request, IIssueStore issueStore, CancellationToken ct, [FromServices] IEventBus? eventBus = null) =>
         {
             var existing = await issueStore.GetIssueAsync(id, ct);
             if (existing is null)
                 return Results.NotFound(new { error = $"Issue '{id}' not found." });
+
+            // Capture original status before mutation so we can detect a transition to terminal.
+            var previousStatus = existing.Status;
 
             // Title/Description, when provided, must be non-empty/whitespace.
             if (request.Title is not null && string.IsNullOrWhiteSpace(request.Title))
@@ -689,6 +701,18 @@ public static class ApiEndpoints
                 existing.LinkedGoalId = request.LinkedGoalId.Length == 0 ? null : request.LinkedGoalId;
 
             await issueStore.UpdateIssueAsync(existing, ct);
+
+            // Publish IssueResolved only on transition from non-terminal to terminal.
+            if (request.Status is not null
+                && request.Status.Value is IssueStatus.Resolved or IssueStatus.Closed
+                && previousStatus is not IssueStatus.Resolved and not IssueStatus.Closed)
+            {
+                eventBus?.Publish(new SystemEvent(
+                    Type: EventType.IssueResolved,
+                    Message: $"Issue '{id}' marked as {request.Status.Value}",
+                    IssueId: id,
+                    GoalId: existing.LinkedGoalId));
+            }
 
             // Re-fetch for accurate timestamps (UpdatedAt / ResolvedAt are store-managed).
             var updated = await issueStore.GetIssueAsync(id, ct);

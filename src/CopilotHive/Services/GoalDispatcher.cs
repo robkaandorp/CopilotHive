@@ -165,7 +165,8 @@ public sealed class GoalDispatcher : BackgroundService
         _goalDispatchService = new GoalDispatchService(
             _goalManager, _pipelineManager, _brain, _config,
             _taskDispatchService, _clarificationHandler, _knowledgeGraph,
-            _goalStore, _configRepo, _dashboardNotifier, _logger);
+            _goalStore, _configRepo, _dashboardNotifier, _logger,
+            eventBus);
 
         completionNotifier.OnTaskCompleted+= result => HandleTaskCompletionAsync(result);
     }
