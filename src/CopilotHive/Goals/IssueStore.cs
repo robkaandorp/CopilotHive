@@ -1,5 +1,6 @@
 using CopilotHive.Persistence;
 
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 
 namespace CopilotHive.Goals;
@@ -142,7 +143,13 @@ public sealed class IssueStore : IIssueStore
             }
             catch (DbUpdateException ex)
             {
-                throw new InvalidOperationException($"Failed to create issue '{issue.Id}'; an issue with the same ID may already exist.", ex);
+                // Only wrap primary-key constraint violations as InvalidOperationException
+                // (the documented duplicate-ID signal). Other DbUpdateExceptions (locking,
+                // I/O, schema, NOT NULL, CHECK, FOREIGN KEY) must propagate so the API
+                // returns 500, not a misleading 409 "already exists".
+                if (ex.InnerException is SqliteException { SqliteExtendedErrorCode: 1555 })
+                    throw new InvalidOperationException($"Failed to create issue '{issue.Id}'; an issue with the same ID may already exist.", ex);
+                throw;
             }
             finally
             {

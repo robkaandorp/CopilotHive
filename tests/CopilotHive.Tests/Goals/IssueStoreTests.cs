@@ -100,6 +100,15 @@ public sealed class IssueStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateIssue_NullTitle_ThrowsDbUpdateException_NotInvalidOperationException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var issue = MakeIssue();
+        issue.Title = null!; // NOT NULL constraint → SQLITE_CONSTRAINT_NOTNULL (extended code 1299)
+        await Assert.ThrowsAsync<DbUpdateException>(() => _store.CreateIssueAsync(issue, ct));
+    }
+
+    [Fact]
     public async Task CreateIssue_EmptyId_ThrowsArgumentException()
     {
         var issue = MakeIssue(id: "");

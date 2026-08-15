@@ -13,7 +13,6 @@ using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.Sqlite;
-using Microsoft.EntityFrameworkCore;
 
 namespace CopilotHive;
 
@@ -660,10 +659,6 @@ public static class ApiEndpoints
                 return Results.Created($"/api/issues/{Uri.EscapeDataString(created.Id)}", ToResponse(created));
             }
             catch (InvalidOperationException)
-            {
-                return Results.Conflict(new { error = $"Issue '{id}' already exists." });
-            }
-            catch (DbUpdateException)
             {
                 return Results.Conflict(new { error = $"Issue '{id}' already exists." });
             }
