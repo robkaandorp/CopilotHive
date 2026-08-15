@@ -1023,10 +1023,21 @@ public sealed class PlanRejectContractTests
             cts.Token, TestContext.Current.CancellationToken);
         await dispatcher.StartAsync(linked.Token);
 
-        // Poll until the dispatch loop has planned, failed and cleaned up the goal.
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (DateTime.UtcNow < deadline && goalStore.StatusUpdates.Count == 0)
-            await Task.Delay(50, TestContext.Current.CancellationToken);
+        // Wait for all asserted cleanup state to complete: Failed status persistence,
+        // pipeline removal, and session deletion. DeleteGoalSessionAsync is the last
+        // state mutation asserted by this test, so its completion means all assertions
+        // can be evaluated safely.
+        using var cleanupTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        using var cleanupLinked = CancellationTokenSource.CreateLinkedTokenSource(
+            cleanupTimeout.Token, TestContext.Current.CancellationToken);
+        try
+        {
+            await brain.CleanupCompleted.Task.WaitAsync(cleanupLinked.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Timeout or test cancellation — fall through to assertions which will fail with clear messages.
+        }
 
         // Every cleanup step ran to completion despite the cancelled caller token.
         var failures = goalStore.StatusUpdates.Where(u => u.Status == GoalStatus.Failed).ToList();
@@ -1378,6 +1389,9 @@ file sealed class CancellingOnPlanBrain : IDistributedBrain
     /// <summary>Tokens passed to <see cref="DeleteGoalSessionAsync"/>, in call order.</summary>
     internal List<CancellationToken> DeleteSessionTokens { get; } = [];
 
+    /// <summary>Signalled when cleanup (session deletion) has completed.</summary>
+    internal TaskCompletionSource CleanupCompleted { get; } = new();
+
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
     public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
@@ -1421,6 +1435,7 @@ file sealed class CancellingOnPlanBrain : IDistributedBrain
     {
         DeleteSessionTokens.Add(ct);
         DeletedSessions.Add(goalId);
+        CleanupCompleted.TrySetResult();
         return Task.CompletedTask;
     }
 
