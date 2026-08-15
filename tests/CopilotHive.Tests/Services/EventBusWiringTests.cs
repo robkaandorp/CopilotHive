@@ -94,7 +94,9 @@ public sealed class EventBusWiringTests
         // The Composer factory must receive the subscriber as the last argument. The
         // `eventSubscriber:` named-argument prefix plus the closing `);` of the factory
         // call is unique to that line — the startup resolution cannot satisfy it.
-        Assert.Contains("eventSubscriber: sp.GetService<ComposerEventSubscriber>());", source);
+        // (eventBus: is now the true last argument; the eventSubscriber: argument still
+        // must be present.)
+        Assert.Contains("eventSubscriber: sp.GetService<ComposerEventSubscriber>(),", source);
     }
 
     /// <summary>
@@ -117,7 +119,11 @@ public sealed class EventBusWiringTests
             "builder.Services.AddSingleton<IEventBus, EventBus>();",
             "builder.Services.AddSingleton<ComposerEventSubscriber>();",
             "app.Services.GetService<ComposerEventSubscriber>();",
-            "eventSubscriber: sp.GetService<ComposerEventSubscriber>());",
+            "eventSubscriber: sp.GetService<ComposerEventSubscriber>(),",
+            // Two adjacent lines: unique to the Composer factory (the DistributedBrain
+            // factory's eventBus line is indented differently and has no preceding
+            // eventSubscriber argument).
+            "eventSubscriber: sp.GetService<ComposerEventSubscriber>(),\n                    eventBus: sp.GetService<IEventBus>());",
         ];
 
         foreach (var fragment in fragments)

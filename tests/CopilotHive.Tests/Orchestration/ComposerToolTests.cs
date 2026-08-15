@@ -9022,19 +9022,22 @@ public sealed class ComposerIssueToolTests : IDisposable
     private readonly IssueStore _issueStore;
     private readonly Composer _composer;
     private readonly Composer _composerWithoutIssueStore;
+    private readonly RecordingEventBus _eventBus;
 
     public ComposerIssueToolTests()
     {
         _dbContext = CopilotHiveDbContext.CreateInMemory();
         _goalStore = new GoalStore(_dbContext, NullLogger<GoalStore>.Instance);
         _issueStore = new IssueStore(_dbContext, NullLogger<IssueStore>.Instance);
+        _eventBus = new RecordingEventBus();
 
         _composer = new Composer(
             "test-model",
             NullLogger<Composer>.Instance,
             _goalStore,
             stateDir: Path.GetTempPath(),
-            issueStore: _issueStore);
+            issueStore: _issueStore,
+            eventBus: _eventBus);
 
         _composerWithoutIssueStore = new Composer(
             "test-model",
@@ -9148,6 +9151,22 @@ public sealed class ComposerIssueToolTests : IDisposable
         var issue = await _issueStore.GetIssueAsync(id, ct);
         Assert.NotNull(issue);
         Assert.Equal(IssueType.CodeQuality, issue!.Type);
+    }
+
+    [Fact]
+    public async Task CreateIssue_PublishesIssueRaisedWithIssueId()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.CreateIssueAsync(
+            "bug", "Composer Publisher Title", "Composer Publisher Desc", ct: ct);
+
+        Assert.Contains("Issue created:", result);
+
+        var evt = Assert.Single(_eventBus.Published);
+        Assert.Equal(EventType.IssueRaised, evt.Type);
+        Assert.Equal("Composer Publisher Title", evt.Message);
+        Assert.Equal(evt.IssueId, result.Replace("Issue created: ", "").Trim());
     }
 
     // ── list_issues ──
@@ -9700,6 +9719,19 @@ public sealed class ComposerIssueToolTests : IDisposable
             var descriptionAttr = p.GetCustomAttributesData()
                 .First(a => a.AttributeType.FullName == "System.ComponentModel.DescriptionAttribute");
             Assert.NotNull(descriptionAttr.ConstructorArguments[0].Value as string);
+        }
+    }
+
+    /// <summary>A recording <see cref="IEventBus"/> that captures all published events.</summary>
+    private sealed class RecordingEventBus : IEventBus
+    {
+        public List<SystemEvent> Published { get; } = [];
+        public event Action<SystemEvent>? OnEvent;
+
+        public void Publish(SystemEvent evt)
+        {
+            Published.Add(evt);
+            OnEvent?.Invoke(evt);
         }
     }
 }

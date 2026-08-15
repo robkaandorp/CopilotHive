@@ -96,7 +96,8 @@ internal static class BrainTools
         ILogger logger,
         ConfigRepoManager? configRepo = null,
         IIssueStore? issueStore = null,
-        string? sourceGoalId = null)
+        string? sourceGoalId = null,
+        IEventBus? eventBus = null)
     {
         ArgumentNullException.ThrowIfNull(pipelineResolver);
         ArgumentNullException.ThrowIfNull(logger);
@@ -545,6 +546,12 @@ internal static class BrainTools
                         issue = BuildIssue($"{generatedId}-{Guid.NewGuid():N}");
                         await issueStore.CreateIssueAsync(issue, ct);
                     }
+
+                    eventBus?.Publish(new SystemEvent(
+                        Type: EventType.IssueRaised,
+                        Message: issue.Title,
+                        IssueId: issue.Id,
+                        GoalId: sourceGoalId));
 
                     return $"Issue created: {issue.Id}";
                 },

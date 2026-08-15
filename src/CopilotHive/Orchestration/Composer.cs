@@ -60,6 +60,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly ReasoningEffort? _configuredReasoningEffort;
     private readonly IIssueStore? _issueStore;
     private readonly ComposerEventSubscriber? _eventSubscriber;
+    private readonly IEventBus? _eventBus;
 
     /// <summary>
     /// Serializes the <c>update_issue</c> read-modify-write cycle. <see cref="Issue"/> has no
@@ -323,7 +324,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         ComposerAttachmentService? attachmentService = null,
         ReasoningEffort? reasoningEffort = null,
         IIssueStore? issueStore = null,
-        ComposerEventSubscriber? eventSubscriber = null)
+        ComposerEventSubscriber? eventSubscriber = null,
+        IEventBus? eventBus = null)
     {
         _logger = logger;
         _goalStore = goalStore;
@@ -342,6 +344,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _configuredReasoningEffort = reasoningEffort;
         _issueStore = issueStore;
         _eventSubscriber = eventSubscriber;
+        _eventBus = eventBus;
 
         _systemPrompt = DefaultSystemPrompt;
         if (_ollamaApiKey is not null)

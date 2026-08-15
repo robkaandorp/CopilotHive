@@ -209,7 +209,8 @@ public sealed class Program
                             config?.Orchestrator?.ReasoningEffort,
                             "orchestrator.reasoning_effort",
                             sp.GetService<ILogger<DistributedBrain>>()),
-                        issueStore: sp.GetService<IIssueStore>());
+                        issueStore: sp.GetService<IIssueStore>(),
+                        eventBus: sp.GetService<IEventBus>());
                 });
             }
 
@@ -353,7 +354,8 @@ public sealed class Program
                         "composer.reasoning_effort",
                         sp.GetService<ILogger<Composer>>()),
                     issueStore: sp.GetService<IIssueStore>(),
-                    eventSubscriber: sp.GetService<ComposerEventSubscriber>());
+                    eventSubscriber: sp.GetService<ComposerEventSubscriber>(),
+                    eventBus: sp.GetService<IEventBus>());
             });
             builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 

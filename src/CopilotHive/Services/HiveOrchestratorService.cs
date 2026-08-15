@@ -22,10 +22,12 @@ public sealed class HiveOrchestratorService(
     AgentsManager? agentsManager = null,
     IGoalStore? goalStore = null,
     DashboardNotifier? dashboardNotifier = null,
-    IIssueStore? issueStore = null) : HiveOrchestrator.HiveOrchestratorBase
+    IIssueStore? issueStore = null,
+    IEventBus? eventBus = null) : HiveOrchestrator.HiveOrchestratorBase
 {
     private readonly DashboardNotifier? _dashboardNotifier = dashboardNotifier;
     private readonly IIssueStore? _issueStore = issueStore;
+    private readonly IEventBus? _eventBus = eventBus;
 
     private readonly Dictionary<string, (DateTime LastNotify, bool WasBusy, int LastNotifiedCtx)> _heartbeatState = new();
     private readonly object _heartbeatLock = new();
@@ -580,6 +582,11 @@ public sealed class HiveOrchestratorService(
                         }
 
                         _dashboardNotifier?.NotifyStateChanged();
+                        _eventBus?.Publish(new SystemEvent(
+                            Type: EventType.IssueRaised,
+                            Message: issue.Title,
+                            IssueId: issue.Id,
+                            GoalId: issueGoalId));
                         resultJson = System.Text.Json.JsonSerializer.Serialize(
                             new { acknowledged = true, issue_id = issueId });
                         break;

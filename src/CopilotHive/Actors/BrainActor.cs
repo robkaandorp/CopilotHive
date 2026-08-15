@@ -42,6 +42,7 @@ internal sealed class BrainActor : Actor<IBrainMessage>
     private readonly bool _subAgentsEnabled;
     private readonly ConfigRepoManager? _configRepo;
     private readonly IIssueStore? _issueStore;
+    private readonly IEventBus? _eventBus;
     private ReasoningEffort? _reasoningEffort;
 
     private AgentSession? _masterSession;
@@ -70,7 +71,8 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         IReadOnlyList<SubAgentModelEntry>? subAgentModels = null,
         bool subAgentsEnabled = false,
         ConfigRepoManager? configRepo = null,
-        IIssueStore? issueStore = null)
+        IIssueStore? issueStore = null,
+        IEventBus? eventBus = null)
     {
         _modelOverride = modelOverride;
         _maxContextTokens = maxContextTokens;
@@ -91,6 +93,7 @@ internal sealed class BrainActor : Actor<IBrainMessage>
         _subAgentsEnabled = subAgentsEnabled;
         _configRepo = configRepo;
         _issueStore = issueStore;
+        _eventBus = eventBus;
     }
 
     /// <inheritdoc />
@@ -441,7 +444,8 @@ internal sealed class BrainActor : Actor<IBrainMessage>
             knowledgeGraph: _knowledgeGraph,
             parentTell: Tell,
             configRepo: _configRepo,
-            issueStore: _issueStore);
+            issueStore: _issueStore,
+            eventBus: _eventBus);
 
     private async Task DisposeChildQuietlyAsync(GoalBrainActor child)
     {

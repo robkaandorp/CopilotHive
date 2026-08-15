@@ -36,6 +36,7 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
     private readonly IIssueStore? _issueStore;
     private readonly Func<IBrainMessage, bool>? _parentTell;
     private readonly ReasoningEffort? _reasoningEffort;
+    private readonly IEventBus? _eventBus;
 
     private int _resourcesDisposed;
 
@@ -56,7 +57,8 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
         KnowledgeGraph? knowledgeGraph = null,
         Func<IBrainMessage, bool>? parentTell = null,
         ConfigRepoManager? configRepo = null,
-        IIssueStore? issueStore = null)
+        IIssueStore? issueStore = null,
+        IEventBus? eventBus = null)
     {
         ValidateGoalId(goalId);
 
@@ -76,6 +78,7 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
         _issueStore = issueStore;
         _parentTell = parentTell;
         _reasoningEffort = baseOptions.ReasoningEffort;
+        _eventBus = eventBus;
 
         try
         {
@@ -182,7 +185,7 @@ internal sealed class GoalBrainActor : Actor<IGoalBrainMessage>
                 },
                 "report_iteration_plan",
                 "Report your iteration plan — which phases to run and in what order."),
-            .. BrainTools.BuildDependencyTools(_goalStore, pipelineResolver, _knowledgeGraph, _logger, _configRepo, _issueStore, GoalId),
+            .. BrainTools.BuildDependencyTools(_goalStore, pipelineResolver, _knowledgeGraph, _logger, _configRepo, _issueStore, GoalId, _eventBus),
         ];
     }
 

@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Globalization;
 using System.Text;
 using CopilotHive.Goals;
+using CopilotHive.Services;
 
 namespace CopilotHive.Orchestration;
 
@@ -142,6 +143,11 @@ public sealed partial class Composer
         }
 
         _logger.LogInformation("Composer created issue '{IssueId}': {Title}", issue.Id, title);
+
+        _eventBus?.Publish(new SystemEvent(
+            Type: EventType.IssueRaised,
+            Message: issue.Title,
+            IssueId: issue.Id));
 
         return $"Issue created: {issue.Id}";
     }

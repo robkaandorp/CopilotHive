@@ -9,11 +9,15 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
+using CopilotHive.Shared.Grpc;
+using CopilotHive.Workers;
 
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+
+using DomainWorkerRole = CopilotHive.Workers.WorkerRole;
 
 namespace CopilotHive.Tests.Services;
 
@@ -145,6 +149,39 @@ public sealed class EventBusProducerTests
             Published.Add(evt);
             OnEvent?.Invoke(evt);
         }
+    }
+
+    /// <summary>Minimal in-memory <see cref="IIssueStore"/> for the orchestrator raise_issue tool.</summary>
+    private sealed class FakeIssueStore : IIssueStore
+    {
+        public Dictionary<string, Issue> Issues { get; } = new();
+
+        public Task<IReadOnlyList<Issue>> GetAllIssuesAsync(CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<Issue>>(Issues.Values.ToList());
+
+        public Task<IReadOnlyList<Issue>> GetIssuesAsync(
+            IssueStatus? status = null, IssueType? type = null, IssueSeverity? severity = null,
+            string? repository = null, string? sourceGoalId = null, string? linkedGoalId = null,
+            CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<Issue>>(Issues.Values.ToList());
+
+        public Task<Issue?> GetIssueAsync(string issueId, CancellationToken ct = default)
+            => Task.FromResult(Issues.TryGetValue(issueId, out var issue) ? issue : null);
+
+        public Task<Issue> CreateIssueAsync(Issue issue, CancellationToken ct = default)
+        {
+            Issues[issue.Id] = issue;
+            return Task.FromResult(issue);
+        }
+
+        public Task UpdateIssueAsync(Issue issue, CancellationToken ct = default)
+        {
+            Issues[issue.Id] = issue;
+            return Task.CompletedTask;
+        }
+
+        public Task<bool> DeleteIssueAsync(string issueId, CancellationToken ct = default)
+            => Task.FromResult(Issues.Remove(issueId));
     }
 
     private static GoalPipeline CreatePipeline(string goalId = "test-goal-1")
@@ -687,7 +724,86 @@ public sealed class EventBusProducerTests
         Assert.Equal(goal.Id, evt.GoalId);
     }
 
+    // ── HiveOrchestratorService producer: raise_issue ──────────────────────
+
+    [Fact]
+    public async Task RaiseIssueTool_PublishesIssueRaisedWithIssueIdAndGoalId()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var eventBus = new RecordingEventBus();
+        var (service, pipelineManager, pool) = CreateOrchestratorService(eventBus);
+
+        var worker = pool.RegisterWorker("worker-evt-1", []);
+        worker.Role = DomainWorkerRole.Coder;
+        var pipeline = CreatePipelineForTool(pipelineManager, "goal-evt-1", "task-evt-1");
+
+        await service.HandleToolCallRequestAsync(
+            worker,
+            new ToolCallRequest
+            {
+                RequestId = "req-evt-1",
+                TaskId = "task-evt-1",
+                ToolName = "raise_issue",
+                ArgumentsJson = """{"type":"bug","title":"Event Bus Title","description":"Event Bus Desc","severity":"low"}""",
+            },
+            ct);
+
+        var response = await worker.MessageChannel.Reader.ReadAsync(ct);
+        Assert.True(response.ToolResponse.Success);
+
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.IssueRaised, evt.Type);
+        Assert.Equal("Event Bus Title", evt.Message);
+        Assert.NotNull(evt.IssueId);
+        Assert.Equal("goal-evt-1", evt.GoalId);
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Builds a <see cref="HiveOrchestratorService"/> with a real <see cref="WorkerPool"/>,
+    /// <see cref="GoalPipelineManager"/> and the given <see cref="RecordingEventBus"/>
+    /// wired as the event bus.
+    /// </summary>
+    private static (HiveOrchestratorService Service, GoalPipelineManager PipelineManager, WorkerPool Pool)
+        CreateOrchestratorService(RecordingEventBus eventBus)
+    {
+        var pool = new WorkerPool();
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+        var completionNotifier = new TaskCompletionNotifier();
+        var goalManager = new GoalManager();
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            taskQueue,
+            new GrpcWorkerGateway(pool),
+            completionNotifier,
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
+
+        var service = new HiveOrchestratorService(
+            pool,
+            taskQueue,
+            pipelineManager,
+            completionNotifier,
+            dispatcher,
+            NullLogger<HiveOrchestratorService>.Instance,
+            issueStore: new FakeIssueStore(),
+            eventBus: eventBus);
+
+        return (service, pipelineManager, pool);
+    }
+
+    private static GoalPipeline CreatePipelineForTool(
+        GoalPipelineManager manager, string goalId, string taskId)
+    {
+        var goal = new Goal { Id = goalId, Description = "Test goal" };
+        var pipeline = manager.CreatePipeline(goal);
+        manager.RegisterTask(taskId, goalId);
+        pipeline.SetActiveTask(taskId);
+        return pipeline;
+    }
 
     private static StringContent JsonBody(object data) =>
         new(JsonSerializer.Serialize(data, JsonOpts), Encoding.UTF8, "application/json");

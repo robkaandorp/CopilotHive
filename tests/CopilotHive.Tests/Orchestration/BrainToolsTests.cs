@@ -18,9 +18,9 @@ public class BrainToolsTests
 
     private static AIFunction Tool(string name, IGoalStore? store = null, KnowledgeGraph? graph = null,
         Func<string, Task<GoalPipeline?>>? resolver = null, ConfigRepoManager? configRepo = null,
-        IIssueStore? issueStore = null, string? sourceGoalId = null) =>
+        IIssueStore? issueStore = null, string? sourceGoalId = null, IEventBus? eventBus = null) =>
         BrainTools.BuildDependencyTools(store, resolver ?? NoPipeline, graph, NullLogger.Instance, configRepo,
-            issueStore, sourceGoalId)
+            issueStore, sourceGoalId, eventBus)
             .Cast<AIFunction>().First(t => t.Name == name);
 
     private static async Task<string> InvokeAsync(AIFunction tool, AIFunctionArguments args) =>
@@ -38,7 +38,7 @@ public class BrainToolsTests
     [Fact]
     public void BuildDependencyTools_ReturnsEightNamedTools()
     {
-        var tools = BrainTools.BuildDependencyTools(null, NoPipeline, null, NullLogger.Instance, null);
+        var tools = BrainTools.BuildDependencyTools(null, NoPipeline, null, NullLogger.Instance, null, eventBus: null);
         Assert.Equal(
             ["get_goal", "search_knowledge", "read_document", "traverse_graph", "get_current_time", "list_config_files", "read_config_file", "raise_issue"],
             tools.Cast<AIFunction>().Select(t => t.Name));
@@ -486,7 +486,7 @@ public class BrainToolsTests
     [Fact]
     public void BrainTools_DoNotIncludeWriteTools()
     {
-        var tools = BrainTools.BuildDependencyTools(null, NoPipeline, null, NullLogger.Instance, null);
+        var tools = BrainTools.BuildDependencyTools(null, NoPipeline, null, NullLogger.Instance, null, eventBus: null);
         var names = tools.Cast<AIFunction>().Select(t => t.Name);
         Assert.DoesNotContain("edit_agents_md", names);
         Assert.DoesNotContain("update_agents_md", names);
@@ -621,7 +621,7 @@ public class BrainToolsTests
     public void RaiseIssue_ToolIsRegistered()
     {
         var store = new FakeIssueStore();
-        var tools = BrainTools.BuildDependencyTools(null, NoPipeline, null, NullLogger.Instance, null, store, "goal-x");
+        var tools = BrainTools.BuildDependencyTools(null, NoPipeline, null, NullLogger.Instance, null, store, "goal-x", eventBus: null);
         Assert.Contains("raise_issue", tools.Cast<AIFunction>().Select(t => t.Name));
     }
 
@@ -1069,6 +1069,29 @@ public class BrainToolsTests
         Assert.NotEqual(CancellationToken.None, store.LastCreateToken!.Value);
     }
 
+    [Fact]
+    public async Task RaiseIssue_PublishesIssueRaisedWithIssueIdAndGoalId()
+    {
+        var store = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var tool = Tool("raise_issue", issueStore: store, sourceGoalId: "g-1", eventBus: eventBus);
+        var result = await InvokeAsync(tool, new AIFunctionArguments
+        {
+            ["type"] = "bug",
+            ["title"] = "Publisher Title",
+            ["description"] = "Publisher Desc",
+            ["severity"] = "low",
+        });
+
+        Assert.StartsWith("Issue created:", result);
+
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.IssueRaised, evt.Type);
+        Assert.Equal("Publisher Title", evt.Message);
+        Assert.Equal(store.Issues.Single().Value.Id, evt.IssueId);
+        Assert.Equal("g-1", evt.GoalId);
+    }
+
     // ──────────────────────────────────────────────────────────
     //  Fake IIssueStore implementations for raise_issue tests
     // ──────────────────────────────────────────────────────────
@@ -1174,5 +1197,18 @@ public class BrainToolsTests
 
         public Task<bool> DeleteIssueAsync(string issueId, CancellationToken ct = default)
             => Task.FromResult(Issues.Remove(issueId));
+    }
+
+    /// <summary>A recording <see cref="IEventBus"/> that captures all published events.</summary>
+    private sealed class RecordingEventBus : IEventBus
+    {
+        public List<SystemEvent> Published { get; } = [];
+        public event Action<SystemEvent>? OnEvent;
+
+        public void Publish(SystemEvent evt)
+        {
+            Published.Add(evt);
+            OnEvent?.Invoke(evt);
+        }
     }
 }

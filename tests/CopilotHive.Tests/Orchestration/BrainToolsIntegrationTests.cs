@@ -37,7 +37,7 @@ public class BrainToolsIntegrationTests
         IGoalStore? store = null,
         KnowledgeGraph? graph = null,
         Func<string, Task<GoalPipeline?>>? resolver = null) =>
-        BrainTools.BuildDependencyTools(store, resolver ?? NoPipeline, graph, NullLogger.Instance)
+        BrainTools.BuildDependencyTools(store, resolver ?? NoPipeline, graph, NullLogger.Instance, eventBus: null)
             .Cast<AIFunction>().ToList();
 
     private static AIFunction Tool(string name,

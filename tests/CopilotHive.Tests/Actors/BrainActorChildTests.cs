@@ -120,14 +120,18 @@ public class BrainActorChildTests
         string model = "copilot/test-model",
         ReasoningEffort? reasoningEffort = null,
         string? workDirectory = null,
-        string? systemPrompt = null) =>
+        string? systemPrompt = null,
+        CopilotHive.Goals.IIssueStore? issueStore = null,
+        IEventBus? eventBus = null) =>
         new(model, 100_000, stateDir, NullLogger.Instance,
             chatClientFactory: chatClientFactory,
             injectedChatClient: injectedChatClient,
             compactionModel: compactionModel,
             reasoningEffort: reasoningEffort,
             workDirectory: workDirectory,
-            systemPrompt: systemPrompt);
+            systemPrompt: systemPrompt,
+            issueStore: issueStore,
+            eventBus: eventBus);
 
     private static async Task<bool> ConnectAsync(BrainActor actor)
     {
@@ -1470,5 +1474,162 @@ public class BrainActorChildTests
             StringComparison.Ordinal);
         Assert.Contains("Environment.SetEnvironmentVariable(\"GITHUB_TOKEN\", savedGithubToken)", source,
             StringComparison.Ordinal);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Event bus propagation chain: BrainActor → GoalBrainActor → BrainTools
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A recording <see cref="IEventBus"/> that captures all published events.
+    /// </summary>
+    private sealed class RecordingEventBus : IEventBus
+    {
+        public List<SystemEvent> Published { get; } = [];
+
+        event Action<SystemEvent>? IEventBus.OnEvent { add { } remove { } }
+
+        public void Publish(SystemEvent evt) => Published.Add(evt);
+    }
+
+    /// <summary>A minimal in-memory <see cref="IIssueStore"/> for propagation tests.</summary>
+    private sealed class FakeIssueStore : IIssueStore
+    {
+        public Dictionary<string, Issue> Issues { get; } = new();
+
+        public Task<IReadOnlyList<Issue>> GetAllIssuesAsync(CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<Issue>>(Issues.Values.ToList());
+
+        public Task<IReadOnlyList<Issue>> GetIssuesAsync(
+            IssueStatus? status = null, IssueType? type = null, IssueSeverity? severity = null,
+            string? repository = null, string? sourceGoalId = null, string? linkedGoalId = null,
+            CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<Issue>>(Issues.Values.ToList());
+
+        public Task<Issue?> GetIssueAsync(string issueId, CancellationToken ct = default)
+            => Task.FromResult(Issues.TryGetValue(issueId, out var issue) ? issue : null);
+
+        public Task<Issue> CreateIssueAsync(Issue issue, CancellationToken ct = default)
+        {
+            Issues[issue.Id] = issue;
+            return Task.FromResult(issue);
+        }
+
+        public Task UpdateIssueAsync(Issue issue, CancellationToken ct = default)
+        {
+            Issues[issue.Id] = issue;
+            return Task.CompletedTask;
+        }
+
+        public Task<bool> DeleteIssueAsync(string issueId, CancellationToken ct = default)
+            => Task.FromResult(Issues.Remove(issueId));
+    }
+
+    private static AIFunction GetChildTool(GoalBrainActor child, string name) =>
+        GetConfiguredOptions(child).CustomTools
+            .Cast<AIFunction>()
+            .First(t => t.Name == name);
+
+    /// <summary>
+    /// Propagates an <see cref="IEventBus"/> from the <see cref="BrainActor"/> to a forked
+    /// <see cref="GoalBrainActor"/>. Invoking the child's <c>raise_issue</c> tool must publish
+    /// an <c>IssueRaised</c> event on the parent's event bus. This is removal-proof: if the
+    /// BrainActor stops forwarding <c>eventBus</c> to the child, no event is published and the
+    /// test fails.
+    /// </summary>
+    [Fact]
+    public async Task EventBusPropagates_BrainActorToChild_RaiseIssuePublishesEvent()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var client = new FakeChatClient();
+            var eventBus = new RecordingEventBus();
+            var issueStore = new FakeIssueStore();
+
+            await using var actor = CreateActor(
+                dir, FakeFactory(client), issueStore: issueStore, eventBus: eventBus);
+            actor.Start();
+            await ConnectAsync(actor);
+            await ForkAsync(actor, "goal-evt-chain");
+
+            var children = GetChildActors(actor);
+            var child = children["goal-evt-chain"];
+
+            var tool = GetChildTool(child, "raise_issue");
+            var result = await tool.InvokeAsync(
+                new AIFunctionArguments
+                {
+                    ["type"] = "bug",
+                    ["title"] = "Chain Title",
+                    ["description"] = "Chain Desc",
+                    ["severity"] = "low",
+                },
+                TestContext.Current.CancellationToken);
+
+            Assert.StartsWith("Issue created:", result?.ToString());
+
+            var evt = Assert.Single(eventBus.Published);
+            Assert.Equal(EventType.IssueRaised, evt.Type);
+            Assert.Equal("Chain Title", evt.Message);
+            Assert.NotNull(evt.IssueId);
+            Assert.Equal("goal-evt-chain", evt.GoalId);
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    /// <summary>
+    /// The child actor's <c>_eventBus</c> field must reference the same instance passed to the
+    /// parent <see cref="BrainActor"/>. This directly proves the BrainActor→GoalBrainActor
+    /// forwarding link.
+    /// </summary>
+    [Fact]
+    public async Task EventBusPropagates_BrainActorToChild_SameInstanceForwarded()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var client = new FakeChatClient();
+            var eventBus = new RecordingEventBus();
+
+            await using var actor = CreateActor(
+                dir, FakeFactory(client), eventBus: eventBus);
+            actor.Start();
+            await ConnectAsync(actor);
+            await ForkAsync(actor, "goal-ref-chain");
+
+            var children = GetChildActors(actor);
+            var child = children["goal-ref-chain"];
+
+            var childEventBus = GetField<IEventBus?>(child, "_eventBus");
+            Assert.Same(eventBus, childEventBus);
+        }
+        finally { DeleteTempPath(dir); }
+    }
+
+    /// <summary>
+    /// When the parent has no event bus, the child's <c>_eventBus</c> must be null — proving
+    /// the absence is propagated (no silent fallback to a non-null default).
+    /// </summary>
+    [Fact]
+    public async Task EventBusPropagates_NoBus_ChildEventBusIsNull()
+    {
+        var dir = CreateTempDir();
+        try
+        {
+            var client = new FakeChatClient();
+
+            await using var actor = CreateActor(dir, FakeFactory(client));
+            actor.Start();
+            await ConnectAsync(actor);
+            await ForkAsync(actor, "goal-no-bus");
+
+            var children = GetChildActors(actor);
+            var child = children["goal-no-bus"];
+
+            var childEventBus = GetField<IEventBus?>(child, "_eventBus");
+            Assert.Null(childEventBus);
+        }
+        finally { DeleteTempPath(dir); }
     }
 }

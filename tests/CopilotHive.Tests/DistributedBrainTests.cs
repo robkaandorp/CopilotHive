@@ -2598,6 +2598,78 @@ public sealed class DistributedBrainTests
         }
         finally { DeleteDir(dir); }
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Event bus propagation: DistributedBrain → BrainActor
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A recording <see cref="IEventBus"/> that captures all published events.
+    /// </summary>
+    private sealed class RecordingEventBus : IEventBus
+    {
+        public List<SystemEvent> Published { get; } = [];
+
+        event Action<SystemEvent>? IEventBus.OnEvent { add { } remove { } }
+
+        public void Publish(SystemEvent evt) => Published.Add(evt);
+    }
+
+    /// <summary>
+    /// The <see cref="DistributedBrain"/> must forward the <see cref="IEventBus"/> to its
+    /// internal <see cref="CopilotHive.Actors.BrainActor"/>. This is removal-proof: if the
+    /// forwarding is removed, the BrainActor's <c>_eventBus</c> field is null.
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_PropagatesEventBusToBrainActor()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var eventBus = new RecordingEventBus();
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig(),
+                eventBus: eventBus);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                var actor = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
+                Assert.NotNull(actor);
+
+                var actorEventBus = typeof(CopilotHive.Actors.BrainActor)
+                    .GetField("_eventBus", NonPublicInstance)!.GetValue(actor);
+                Assert.Same(eventBus, actorEventBus);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    /// <summary>
+    /// When no event bus is supplied, the BrainActor's <c>_eventBus</c> must be null.
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_NoEventBus_BrainActorEventBusIsNull()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance,
+                stateDir: dir, chatClient: new FakeChatClient(), hiveConfig: ActorConfig());
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+
+                var actor = (CopilotHive.Actors.BrainActor?)GetBrainActor(brain);
+                Assert.NotNull(actor);
+
+                var actorEventBus = typeof(CopilotHive.Actors.BrainActor)
+                    .GetField("_eventBus", NonPublicInstance)!.GetValue(actor);
+                Assert.Null(actorEventBus);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
 }
 
 /// <summary>
