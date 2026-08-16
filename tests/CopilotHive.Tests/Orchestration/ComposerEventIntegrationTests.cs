@@ -378,6 +378,48 @@ public sealed class ComposerEventIntegrationTests
         }
     }
 
+    // ── 2c. Formatter mapping: CI event types → exact block text ──
+
+    [Fact]
+    public async Task SendMessage_FormatterMapping_CiEventTypes_ProducesExactBlock()
+    {
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        ComposerEventSubscriber? subscriber = null;
+        var tmpDir = CreateTempDir();
+        try
+        {
+            var bus = new EventBus();
+            subscriber = new ComposerEventSubscriber(bus);
+            (composer, dbContext, _) = CreateComposer(tmpDir, subscriber: subscriber);
+
+            // Publish one event of each CI event type in a fixed order.
+            bus.Publish(new SystemEvent(EventType.CiSucceeded, "All checks green", GoalId: "goal-1"));
+            bus.Publish(new SystemEvent(EventType.CiFailed, "Build broke on main", GoalId: "goal-2"));
+
+            var client = new CapturingStreamingClient();
+            await InjectFakeChatClient(composer, client);
+
+            composer.SendMessage("user text");
+
+            await WaitForStreamingCompleteAsync(GetStreamingService(composer));
+
+            // The exact multi-line block — any change to an emoji, field reference, header
+            // text, or separator in FormatEventBlock (or SendMessageWithEvents) must fail this test.
+            var block =
+                "[System Events since your last message]\n" +
+                "- ✅ CI passed for goal 'goal-1' — All checks green\n" +
+                "- ❌ CI failed for goal 'goal-2' — Build broke on main";
+            var expected = Wrap(block, "user text");
+            Assert.NotNull(client.LastUserMessage);
+            Assert.Equal(expected, client.LastUserMessage!);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir, subscriber);
+        }
+    }
+
     // ── 3. No events → message passed through, wrapped with E0 envelope ──
 
     [Fact]

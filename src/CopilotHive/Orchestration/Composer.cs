@@ -583,6 +583,8 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             EventType.IssueRaised      => $"- 🐛 Issue '{e.IssueId}' raised — {e.Message}",
             EventType.IssueResolved    => $"- ✅ Issue '{e.IssueId}' resolved",
             EventType.ReleaseCompleted => $"- 📦 Release '{e.ReleaseId}' completed — {e.Message}",
+            EventType.CiSucceeded      => $"- ✅ CI passed for goal '{e.GoalId}' — {e.Message}",
+            EventType.CiFailed         => $"- ❌ CI failed for goal '{e.GoalId}' — {e.Message}",
             _                          => $"- {e.Type}: {e.Message}"
         });
         return $"[System Events since your last message]\n{string.Join('\n', lines)}";

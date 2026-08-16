@@ -1904,4 +1904,130 @@ public sealed class HiveConfigFileTests
         Assert.NotSame(source.Composer, target.Composer);
         Assert.Equal("low", target.Composer!.ReasoningEffort);
     }
+
+    // ── CI monitoring: YAML round-trip and ReloadFrom ─────────────────────────
+
+    /// <summary>
+    /// The same serializer configuration used by production code in
+    /// <see cref="ConfigRepoManager"/> — underscored naming convention with
+    /// <c>OmitDefaults | OmitNull</c>.
+    /// </summary>
+    private static readonly ISerializer Serializer = new SerializerBuilder()
+        .WithNamingConvention(UnderscoredNamingConvention.Instance)
+        .ConfigureDefaultValuesHandling(DefaultValuesHandling.OmitDefaults | DefaultValuesHandling.OmitNull)
+        .Build();
+
+    [Fact]
+    public void RoundTrip_CiMonitoring_NonDefaultValues_SurviveSerializeAndDeserialize()
+    {
+        var original = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "ci-repo",
+                    Url = "https://github.com/org/ci-repo.git",
+                    DefaultBranch = "main",
+                    MonitorCi = true,
+                    CiTimeoutMinutes = 45
+                }
+            ]
+        };
+
+        var yaml = Serializer.Serialize(original);
+
+        // Non-default values must be emitted.
+        Assert.Contains("monitor_ci: true", yaml, StringComparison.Ordinal);
+        Assert.Contains("ci_timeout_minutes: 45", yaml, StringComparison.Ordinal);
+
+        var reloaded = Deserializer.Deserialize<HiveConfigFile>(yaml);
+        var repo = Assert.Single(reloaded.Repositories);
+        Assert.True(repo.MonitorCi);
+        Assert.Equal(45, repo.CiTimeoutMinutes);
+    }
+
+    [Fact]
+    public void RoundTrip_CiMonitoring_Defaults_OmittedOrSerializedPerClrDefault()
+    {
+        // MonitorCi = false is the CLR bool default → omitted from YAML.
+        // CiTimeoutMinutes = 30 is NOT the CLR int default (0) → serialized explicitly.
+        var original = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "default-repo",
+                    Url = "https://github.com/org/default-repo.git",
+                    DefaultBranch = "main",
+                    MonitorCi = false,
+                    CiTimeoutMinutes = 30
+                }
+            ]
+        };
+
+        var yaml = Serializer.Serialize(original);
+
+        Assert.DoesNotContain("monitor_ci", yaml, StringComparison.Ordinal);
+        Assert.Contains("ci_timeout_minutes: 30", yaml, StringComparison.Ordinal);
+
+        var reloaded = Deserializer.Deserialize<HiveConfigFile>(yaml);
+        var repo = Assert.Single(reloaded.Repositories);
+        Assert.False(repo.MonitorCi);
+        Assert.Equal(30, repo.CiTimeoutMinutes);
+    }
+
+    [Fact]
+    public void Deserialize_CiMonitoringKeysAbsent_UsesPropertyDefaults()
+    {
+        const string yaml = """
+            version: "1.0"
+            repositories:
+              - name: plain-repo
+                url: https://github.com/org/plain-repo.git
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        var repo = Assert.Single(config.Repositories);
+        Assert.False(repo.MonitorCi);
+        Assert.Equal(30, repo.CiTimeoutMinutes);
+    }
+
+    [Fact]
+    public void ReloadFrom_CopiesCiMonitoringFields()
+    {
+        var source = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "ci-repo",
+                    Url = "https://github.com/org/ci-repo.git",
+                    DefaultBranch = "main",
+                    MonitorCi = true,
+                    CiTimeoutMinutes = 45
+                }
+            ]
+        };
+
+        var target = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        target.ReloadFrom(source);
+
+        var repo = Assert.Single(target.Repositories);
+        Assert.NotSame(source.Repositories[0], repo);
+        Assert.True(repo.MonitorCi);
+        Assert.Equal(45, repo.CiTimeoutMinutes);
+
+        // Mutating the source after ReloadFrom must not affect the receiver.
+        source.Repositories[0].MonitorCi = false;
+        source.Repositories[0].CiTimeoutMinutes = 10;
+        Assert.True(repo.MonitorCi);
+        Assert.Equal(45, repo.CiTimeoutMinutes);
+    }
 }

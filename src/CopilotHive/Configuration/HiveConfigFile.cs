@@ -236,6 +236,8 @@ public sealed class HiveConfigFile
                 Name = r.Name,
                 Url = r.Url,
                 DefaultBranch = r.DefaultBranch,
+                MonitorCi = r.MonitorCi,
+                CiTimeoutMinutes = r.CiTimeoutMinutes,
                 Release = r.Release is null ? null : new ReleaseRepoConfig { MergeTo = r.Release.MergeTo, TagBranch = r.Release.TagBranch }
             }));
 

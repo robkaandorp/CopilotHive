@@ -15,6 +15,10 @@ public enum EventType
     IssueResolved,
     /// <summary>A release was marked as Released.</summary>
     ReleaseCompleted,
+    /// <summary>CI passed for a goal's repository.</summary>
+    CiSucceeded,
+    /// <summary>CI failed for a goal's repository.</summary>
+    CiFailed,
 }
 
 /// <summary>A typed system event with a human-readable message and optional entity references.</summary>
