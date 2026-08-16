@@ -15,6 +15,7 @@ namespace CopilotHive.Tests;
 /// Direct tests for <see cref="PipelineHelpers"/> — the extracted static helper methods.
 /// These verify that the extracted class is correct.
 /// </summary>
+[Collection("EnvVarMutation")]
 public sealed class PipelineHelpersTests
 {
     // ── BuildSquashCommitMessage ────────────────────────────────────────────

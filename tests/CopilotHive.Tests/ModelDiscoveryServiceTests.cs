@@ -5,6 +5,7 @@ using Moq;
 
 namespace CopilotHive.Tests;
 
+[Collection("EnvVarMutation")]
 public sealed class ModelDiscoveryServiceTests : IDisposable
 {
     private readonly string? _origGhToken;

@@ -16,6 +16,7 @@ namespace CopilotHive.Tests.Worker;
 /// task execution and saving it afterward. Verifies graceful error handling when the
 /// session client fails.
 /// </summary>
+[Collection("ConsoleOutput")]
 public sealed class TaskExecutorSessionTests
 {
     // ── Fakes ─────────────────────────────────────────────────────────────────
