@@ -1,3 +1,18 @@
+## [0.29.0] — 2026-08-16
+
+### Added
+
+- **Composer Event Bus** — A typed event bus (`IEventBus` / `EventBus`) that broadcasts system events (goal completed, goal failed, goal dispatched, issue raised, issue resolved, release completed) to subscribers. The `ComposerEventSubscriber` buffers events and delivers them to the Composer as a passive notification — pending events are prepended as a `[System Events since your last message]` block to the user's next chat message, shown as a muted "System" message in the chat UI. Events are produced by `GoalLifecycleService` (goal completed/failed), `GoalDispatchService` (goal dispatched), `ApiEndpoints` (issue raised/resolved, release completed), `HiveOrchestratorService` (worker-raised issues), `BrainTools` (Brain-raised issues), and `ComposerIssueTools` (Composer-created issues). (`copilothive-event-bus-core`, `copilothive-event-bus-api-producers`, `copilothive-event-bus-tool-producers`, `copilothive-event-bus-chat-ui`)
+
+### Changed
+
+- **NuGet dependencies updated** — Updated SharpCoder to 0.16.1 and all other NuGet packages to their latest stable versions. (`copilothive-update-nuget-v029`)
+
+### Fixed
+
+- **STATE_DIR test race** — `ProgressDocumentTests` intermittently failed because tests in different xUnit collections ran in parallel and could overwrite the process-wide `STATE_DIR` environment variable. Fixed by setting `maxParallelThreads: 1` in `xunit.runner.json` to fully serialize all tests. (`copilothive-fix-progressdoc-telemetry-isolation`)
+- **PlanRejectContractTests polling race** — The test's polling loop exited on the `InProgress` status update before `FailNewGoalAsync` recorded the `Failed` update. Fixed by replacing the poll with a `TaskCompletionSource` for deterministic synchronization on cleanup completion. (`copilothive-fix-planreject-test-timeout`)
+
 ## [0.28.1] — 2026-08-15
 
 ### Added
