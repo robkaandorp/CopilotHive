@@ -81,6 +81,7 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="dashboardNotifier">Optional dashboard notifier for state-change events.</param>
     /// <param name="goalReadyNotifier">Optional notifier used to wake the dispatcher when a goal becomes pending.</param>
     /// <param name="eventBus">Optional event bus for publishing system events.</param>
+    /// <param name="ciMonitor">Optional CI monitor service for post-merge CI status tracking.</param>
     public GoalDispatcher(
         GoalManager goalManager,
         GoalPipelineManager pipelineManager,
@@ -103,7 +104,8 @@ public sealed class GoalDispatcher : BackgroundService
         IGoalStore? goalStore = null,
         DashboardNotifier? dashboardNotifier = null,
         GoalReadyNotifier? goalReadyNotifier = null,
-        IEventBus? eventBus = null)
+        IEventBus? eventBus = null,
+        CiMonitorService? ciMonitor = null)
     {
         _repoManager = repoManager ?? throw new ArgumentNullException(nameof(repoManager));
         _goalManager = goalManager;
@@ -125,7 +127,7 @@ public sealed class GoalDispatcher : BackgroundService
         _clarificationHandler = new ClarificationHandler(brain, clarificationRouter, clarificationQueue, logger);
 
         _lifecycleService = new GoalLifecycleService(
-            goalManager, logger, metricsTracker, agentsManager, configRepo, brain, dashboardNotifier, eventBus);
+            goalManager, logger, metricsTracker, agentsManager, configRepo, brain, dashboardNotifier, eventBus, ciMonitor);
 
         _maintenance = new DispatcherMaintenance(
             pipelineManager, goalManager, taskQueue, workerGateway, brain,

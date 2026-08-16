@@ -24,6 +24,7 @@ internal sealed class GoalLifecycleService
     private readonly DashboardNotifier? _dashboardNotifier;
     private readonly ILogger _logger;
     private readonly IEventBus? _eventBus;
+    private readonly CiMonitorService? _ciMonitor;
 
     public GoalLifecycleService(
         GoalManager goalManager,
@@ -33,7 +34,8 @@ internal sealed class GoalLifecycleService
         ConfigRepoManager? configRepo = null,
         IDistributedBrain? brain = null,
         DashboardNotifier? dashboardNotifier = null,
-        IEventBus? eventBus = null)
+        IEventBus? eventBus = null,
+        CiMonitorService? ciMonitor = null)
     {
         _goalManager = goalManager;
         _logger = logger;
@@ -43,6 +45,7 @@ internal sealed class GoalLifecycleService
         _brain = brain;
         _dashboardNotifier = dashboardNotifier;
         _eventBus = eventBus;
+        _ciMonitor = ciMonitor;
     }
 
     public async Task MarkGoalCompletedAsync(GoalPipeline pipeline, CancellationToken ct)
@@ -144,6 +147,20 @@ internal sealed class GoalLifecycleService
                 Type: status == GoalStatus.Completed ? EventType.GoalCompleted : EventType.GoalFailed,
                 Message: status == GoalStatus.Completed ? "Goal merged successfully" : (failureReason ?? "Goal failed"),
                 GoalId: pipeline.GoalId));
+
+        // Fire-and-forget CI monitoring for completed goals with merge commits.
+        if (status == GoalStatus.Completed && !string.IsNullOrEmpty(mergeCommitHash)
+            && _ciMonitor is not null && pipeline.Goal.RepositoryNames.Count > 0)
+        {
+            var goalRepoNames = pipeline.Goal.RepositoryNames.ToList();
+            _ = Task.Run(async () =>
+            {
+                // No outer timeout — each MonitorMergeAsync has its own CiTimeoutMinutes.
+                // The task runs until all repos are done or their individual timeouts expire.
+                try { await _ciMonitor.MonitorGoalAsync(pipeline.GoalId, mergeCommitHash, goalRepoNames, CancellationToken.None); }
+                catch (Exception ex) { _logger.LogWarning(ex, "CI monitoring failed for goal {GoalId}", pipeline.GoalId); }
+            }, CancellationToken.None);
+        }
 
         _dashboardNotifier?.NotifyStateChanged();
 

@@ -394,6 +394,25 @@ public sealed class Program
                 client.Timeout = TimeSpan.FromSeconds(15);
             });
 
+            // HTTP client for GitHub API (CI monitoring)
+            builder.Services.AddHttpClient("github-api", client =>
+            {
+                client.BaseAddress = new Uri("https://api.github.com/");
+                client.Timeout = TimeSpan.FromSeconds(30);
+                client.DefaultRequestHeaders.Add("Accept", "application/vnd.github+json");
+                client.DefaultRequestHeaders.Add("User-Agent", "CopilotHive");
+            });
+
+            // CI monitoring: polls GitHub check-runs for completed goals' merge commits.
+            // No startup scan — deferred to a follow-up goal.
+            builder.Services.AddSingleton(sp => new CiMonitorService(
+                issueStore: sp.GetService<IIssueStore>(),
+                eventBus: sp.GetService<IEventBus>(),
+                config: sp.GetService<HiveConfigFile>(),
+                userService: sp.GetService<UserService>(),
+                httpClientFactory: sp.GetService<IHttpClientFactory>(),
+                logger: sp.GetService<ILogger<CiMonitorService>>()));
+
             // Dashboard: Blazor Server + real-time state aggregation
             builder.Services.AddSingleton<DashboardNotifier>();
             builder.Services.AddSingleton<DashboardStateService>();
