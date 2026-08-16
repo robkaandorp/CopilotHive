@@ -86,8 +86,13 @@ public sealed class GoalStore : IGoalStore
         var backupFileName = $"{dbFileName}.{timestamp}.bak";
         var backupPath = Path.Combine(backupDir, backupFileName);
 
-        using (var sourceConn = new SqliteConnection($"Data Source={dbPath}"))
-        using (var backupConn = new SqliteConnection($"Data Source={backupPath}"))
+        // Pooling=False ensures the native SQLite handle is released as soon as the
+        // connection is disposed, instead of lingering in Microsoft.Data.Sqlite's
+        // connection pool. Without this, a later File.Delete/File.Copy on the same
+        // path can fail with "file is being used by another process" (most visible
+        // on Windows, but the underlying pooling behavior is cross-platform).
+        using (var sourceConn = new SqliteConnection($"Data Source={dbPath};Pooling=False"))
+        using (var backupConn = new SqliteConnection($"Data Source={backupPath};Pooling=False"))
         {
             sourceConn.Open();
             backupConn.Open();
@@ -104,8 +109,17 @@ public sealed class GoalStore : IGoalStore
 
         foreach (var oldBackup in oldBackups)
         {
-            File.Delete(oldBackup);
-            _logger.LogDebug("Removed old backup {BackupPath}", oldBackup);
+            try
+            {
+                File.Delete(oldBackup);
+                _logger.LogDebug("Removed old backup {BackupPath}", oldBackup);
+            }
+            catch (IOException ex)
+            {
+                // Best-effort cleanup: a transient lock (e.g. antivirus scan, concurrent
+                // process) should not prevent GoalStore from starting up.
+                _logger.LogWarning(ex, "Failed to remove old backup {BackupPath}", oldBackup);
+            }
         }
     }
 

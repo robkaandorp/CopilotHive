@@ -3983,37 +3983,26 @@ public sealed class ComposerToolTests : IDisposable
     }
 
     /// <summary>
-    /// Resolves the absolute path to the real git binary via <c>which git</c>, falling back to
-    /// well-known locations. Used so a fake git wrapper can delegate non-intercepted commands.
+    /// Resolves the absolute path to the real git binary by scanning <c>PATH</c> directly (rather
+    /// than shelling out to <c>which</c>/<c>where</c>, which aren't universally available), so a
+    /// fake git wrapper can delegate non-intercepted commands to it. Works identically on Windows
+    /// and Unix-like systems.
     /// </summary>
     private static string ResolveRealGitPath()
     {
-        try
+        var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        var candidateNames = OperatingSystem.IsWindows() ? ["git.exe", "git.cmd"] : new[] { "git" };
+        foreach (var dir in pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
         {
-            var psi = new System.Diagnostics.ProcessStartInfo("which", "git")
+            foreach (var name in candidateNames)
             {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-            };
-            using var p = System.Diagnostics.Process.Start(psi)!;
-            var output = p.StandardOutput.ReadToEnd().Trim();
-            p.WaitForExit();
-            if (p.ExitCode == 0 && !string.IsNullOrWhiteSpace(output) && File.Exists(output))
-                return output;
-        }
-        catch
-        {
-            // Fall through to well-known locations.
+                var candidate = Path.Combine(dir, name);
+                if (File.Exists(candidate))
+                    return candidate;
+            }
         }
 
-        foreach (var candidate in new[] { "/usr/bin/git", "/usr/local/bin/git", "/bin/git" })
-        {
-            if (File.Exists(candidate))
-                return candidate;
-        }
-
-        // Last resort — assume it is on PATH by bare name.
+        // Last resort — assume it is resolvable via bare name on PATH.
         return "git";
     }
 
@@ -4140,6 +4129,11 @@ public sealed class ComposerToolTests : IDisposable
                     RedirectStandardError = true,
                     UseShellExecute = false,
                 };
+                // Some machines set safe.bareRepository=explicit globally, which blocks running
+                // git commands directly against a bare repo directory (as this test does to
+                // rewind the "remote" side). Override so it works regardless of host git config.
+                psi.ArgumentList.Add("-c");
+                psi.ArgumentList.Add("safe.bareRepository=all");
                 foreach (var a in args) psi.ArgumentList.Add(a);
                 using var p = System.Diagnostics.Process.Start(psi)!;
                 p.WaitForExit();
@@ -4154,6 +4148,8 @@ public sealed class ComposerToolTests : IDisposable
                     RedirectStandardError = true,
                     UseShellExecute = false,
                 };
+                psi.ArgumentList.Add("-c");
+                psi.ArgumentList.Add("safe.bareRepository=all");
                 foreach (var a in args) psi.ArgumentList.Add(a);
                 using var p = System.Diagnostics.Process.Start(psi)!;
                 var output = p.StandardOutput.ReadToEnd().Trim();
@@ -4410,7 +4406,7 @@ public sealed class ComposerToolTests : IDisposable
         // Locate the real git binary so the fake wrapper can delegate non-intercepted commands.
         var realGit = ResolveRealGitPath();
 
-        var originalPath = Environment.GetEnvironmentVariable("PATH");
+        var originalOverride = Environment.GetEnvironmentVariable("COPILOTHIVE_TEST_GIT_EXE");
         try
         {
             InitTempGitRepo(tmpDir);
@@ -4425,22 +4421,40 @@ public sealed class ComposerToolTests : IDisposable
             // assertions below fail — making this test removal-proof.
             var fakeGitDir = Path.Combine(tmpDir, "fakegit");
             Directory.CreateDirectory(fakeGitDir);
-            var fakeGitPath = Path.Combine(fakeGitDir, "git");
-            File.WriteAllText(fakeGitPath,
-                "#!/bin/bash\n" +
-                $"REAL_GIT={realGit}\n" +
-                "if [ \"$1\" = \"check-ref-format\" ] && [ \"$2\" = \"--branch\" ]; then\n" +
-                "    # Echo a normalized value that differs from the supplied branch.\n" +
-                "    echo \"normalized-$3\"\n" +
-                "    exit 0\n" +
-                "else\n" +
-                "    exec \"$REAL_GIT\" \"$@\"\n" +
-                "fi\n");
-            MakeExecutable(fakeGitPath);
 
-            // Prepend the fake git dir so TryRunGitAsync / RunGitAsync (which spawn "git" via PATH)
-            // pick it up. Child processes inherit this environment.
-            Environment.SetEnvironmentVariable("PATH", fakeGitDir + Path.PathSeparator + originalPath);
+            // .NET's Process.Start does not resolve extensionless names to .cmd/.bat files on
+            // Windows, so instead of relying on PATH search (which behaves differently per OS) we
+            // point ComposerGitTools directly at the fake script's full path via the
+            // COPILOTHIVE_TEST_GIT_EXE test-only override.
+            string fakeGitPath;
+            if (OperatingSystem.IsWindows())
+            {
+                fakeGitPath = Path.Combine(fakeGitDir, "git.cmd");
+                File.WriteAllText(fakeGitPath,
+                    "@echo off\r\n" +
+                    "if \"%1\"==\"check-ref-format\" if \"%2\"==\"--branch\" (\r\n" +
+                    "    echo normalized-%3\r\n" +
+                    "    exit /b 0\r\n" +
+                    ")\r\n" +
+                    $"\"{realGit}\" %*\r\n");
+            }
+            else
+            {
+                fakeGitPath = Path.Combine(fakeGitDir, "git");
+                File.WriteAllText(fakeGitPath,
+                    "#!/bin/bash\n" +
+                    $"REAL_GIT={realGit}\n" +
+                    "if [ \"$1\" = \"check-ref-format\" ] && [ \"$2\" = \"--branch\" ]; then\n" +
+                    "    # Echo a normalized value that differs from the supplied branch.\n" +
+                    "    echo \"normalized-$3\"\n" +
+                    "    exit 0\n" +
+                    "else\n" +
+                    "    exec \"$REAL_GIT\" \"$@\"\n" +
+                    "fi\n");
+                MakeExecutable(fakeGitPath);
+            }
+
+            Environment.SetEnvironmentVariable("COPILOTHIVE_TEST_GIT_EXE", fakeGitPath);
 
             var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
             var composer = new Composer(
@@ -4463,7 +4477,7 @@ public sealed class ComposerToolTests : IDisposable
         }
         finally
         {
-            Environment.SetEnvironmentVariable("PATH", originalPath);
+            Environment.SetEnvironmentVariable("COPILOTHIVE_TEST_GIT_EXE", originalOverride);
             TestHelpers.ForceDeleteDirectory(tmpDir);
         }
     }

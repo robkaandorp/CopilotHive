@@ -319,7 +319,7 @@ public static class BrainPromptBuilder
               Truncate(string.Join(" | ", pipeline.Conversation.Select(e => $"[{e.Role}] {e.Content}")), Constants.TruncationConversationSummary)
             : "";
 
-        return $$"""
+        var planningPrompt = $$"""
             {{(additionalContext is not null ? $"=== Additional context ===\n{additionalContext}\n=== End additional context ===\n\n" : "")}}Plan the workflow for iteration {{pipeline.Iteration}} of goal: {{pipeline.Description}}
 
             Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
@@ -389,6 +389,11 @@ public static class BrainPromptBuilder
             If the goal description is ambiguous or you need domain knowledge to plan properly,
             call the `escalate_to_composer` tool instead with a question and reason.
             """;
+
+        // Raw string literals preserve the source file's on-disk line endings verbatim, which
+        // vary by OS/checkout settings (e.g. CRLF on Windows via .gitattributes text=auto).
+        // Normalize to LF so the prompt content sent to the LLM is deterministic across platforms.
+        return planningPrompt.ReplaceLineEndings("\n");
     }
 
     /// <summary>

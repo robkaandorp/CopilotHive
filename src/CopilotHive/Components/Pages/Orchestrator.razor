@@ -329,9 +329,9 @@ else
 
     private static string FormatTokens(long tokens) => tokens switch
     {
-        >= 1_000_000 => $"{tokens / 1_000_000.0:F1}M",
-        >= 1_000 => $"{tokens / 1_000.0:F1}k",
-        _ => tokens.ToString(),
+        >= 1_000_000 => $"{(tokens / 1_000_000.0).ToString("F1", System.Globalization.CultureInfo.InvariantCulture)}M",
+        >= 1_000 => $"{(tokens / 1_000.0).ToString("F1", System.Globalization.CultureInfo.InvariantCulture)}k",
+        _ => tokens.ToString(System.Globalization.CultureInfo.InvariantCulture),
     };
 
     private static string FormatTokens(int tokens) => FormatTokens((long)tokens);

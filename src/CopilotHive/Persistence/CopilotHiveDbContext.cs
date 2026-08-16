@@ -305,9 +305,23 @@ public sealed class CopilotHiveDbContext : DbContext
             s => Enum.Parse<TEnum>(s, true));
     }
 
+    /// <summary>
+    /// Normalizes a <see cref="DateTime"/> to UTC regardless of the machine's local timezone,
+    /// so persisted timestamps are always canonical (no timezone-dependent drift on round-trip).
+    /// </summary>
+    private static DateTime NormalizeToUtc(DateTime value) => value.Kind switch
+    {
+        DateTimeKind.Utc => value,
+        DateTimeKind.Local => value.ToUniversalTime(),
+        _ => DateTime.SpecifyKind(value, DateTimeKind.Utc),
+    };
+
+    // Uses DateTimeStyles.RoundtripKind so a "Z"-suffixed value parses back with
+    // DateTimeKind.Utc instead of being silently converted to the local timezone
+    // offset (the default DateTime.ParseExact behavior without RoundtripKind).
     private static readonly ValueConverter DateTimeToIsoConverter = new ValueConverter<DateTime, string>(
-        d => d.ToString("O", CultureInfo.InvariantCulture),
-        s => DateTime.ParseExact(s, "O", CultureInfo.InvariantCulture));
+        d => NormalizeToUtc(d).ToString("O", CultureInfo.InvariantCulture),
+        s => NormalizeToUtc(DateTime.ParseExact(s, "O", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind)));
 }
 
 /// <summary>

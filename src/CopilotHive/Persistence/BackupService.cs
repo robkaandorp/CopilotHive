@@ -303,8 +303,13 @@ public sealed class BackupService
                 return false;
             }
 
-            using (var sourceConn = new SqliteConnection($"Data Source={dbPath}"))
-            using (var backupConn = new SqliteConnection($"Data Source={destPath}"))
+            // Pooling=False ensures the native SQLite handle is released as soon as the
+            // connection is disposed, instead of lingering in Microsoft.Data.Sqlite's
+            // connection pool. Without this, a later File.Copy/File.Delete on the same
+            // path can fail with "file is being used by another process" (most visible
+            // on Windows, but the underlying pooling behavior is cross-platform).
+            using (var sourceConn = new SqliteConnection($"Data Source={dbPath};Pooling=False"))
+            using (var backupConn = new SqliteConnection($"Data Source={destPath};Pooling=False"))
             {
                 sourceConn.Open();
                 backupConn.Open();

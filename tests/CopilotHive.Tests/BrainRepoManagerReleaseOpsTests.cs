@@ -888,6 +888,12 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        // Force LF endings and allow direct commands against bare repo directories regardless of
+        // the host's global git config, so these tests behave identically on any machine/OS.
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("core.autocrlf=false");
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("safe.bareRepository=all");
         foreach (var a in args) psi.ArgumentList.Add(a);
         using var p = Process.Start(psi)!;
         p.WaitForExit();
@@ -902,6 +908,10 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("core.autocrlf=false");
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("safe.bareRepository=all");
         foreach (var a in args) psi.ArgumentList.Add(a);
         using var p = Process.Start(psi)!;
         var output = p.StandardOutput.ReadToEnd();

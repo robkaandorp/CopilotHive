@@ -7,6 +7,18 @@ namespace CopilotHive.Orchestration;
 public sealed partial class Composer
 {
     /// <summary>
+    /// Name or full path of the git executable to invoke. Normally just <c>"git"</c> (resolved via
+    /// PATH), but can be overridden via the <c>COPILOTHIVE_TEST_GIT_EXE</c> environment variable so
+    /// tests can substitute a fake git binary/script without relying on PATH-search semantics that
+    /// differ across operating systems (e.g. .NET's <see cref="System.Diagnostics.Process.Start(System.Diagnostics.ProcessStartInfo)"/>
+    /// does not resolve extensionless names to <c>.cmd</c>/<c>.bat</c> files on Windows).
+    /// </summary>
+    private static string GitExecutable =>
+        Environment.GetEnvironmentVariable("COPILOTHIVE_TEST_GIT_EXE") is { Length: > 0 } overridePath
+            ? overridePath
+            : "git";
+
+    /// <summary>
     /// Runs a git command in the clone of <paramref name="repoName"/> and returns the output.
     /// Returns an error string if the repo manager is unavailable or the repo is not found.
     /// Output is truncated to <paramref name="maxLines"/> lines with a notice when truncated.
@@ -47,7 +59,7 @@ public sealed partial class Composer
             return $"Repository '{repoName}' not found. Available: {list}";
         }
 
-        var psi = new System.Diagnostics.ProcessStartInfo("git")
+        var psi = new System.Diagnostics.ProcessStartInfo(GitExecutable)
         {
             WorkingDirectory = clonePath,
             RedirectStandardOutput = true,
@@ -89,7 +101,7 @@ public sealed partial class Composer
     private static async Task<(int ExitCode, string Stdout, string Stderr)> TryRunGitAsync(
         string workDir, string[] args, CancellationToken ct)
     {
-        var psi = new System.Diagnostics.ProcessStartInfo("git")
+        var psi = new System.Diagnostics.ProcessStartInfo(GitExecutable)
         {
             WorkingDirectory = workDir,
             RedirectStandardOutput = true,

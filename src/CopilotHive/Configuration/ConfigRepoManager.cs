@@ -376,6 +376,11 @@ public class ConfigRepoManager
             UseShellExecute = false,
         };
 
+        // Force LF line endings regardless of the host's global/system git config
+        // (e.g. Windows commonly defaults core.autocrlf=true) so config file contents
+        // committed/read by the Brain are identical on any OS.
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("core.autocrlf=false");
         foreach (var arg in args)
             psi.ArgumentList.Add(arg);
 
@@ -408,6 +413,11 @@ public class ConfigRepoManager
             UseShellExecute = false,
         };
 
+        // Force LF line endings regardless of the host's global/system git config
+        // (e.g. Windows commonly defaults core.autocrlf=true) so config file contents
+        // committed/read by the Brain are identical on any OS.
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("core.autocrlf=false");
         foreach (var arg in args)
             psi.ArgumentList.Add(arg);
 

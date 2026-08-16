@@ -18,9 +18,9 @@ public sealed class OrchestratorPageLlmSessionTests
 
     private static string FormatTokens(long tokens) => tokens switch
     {
-        >= 1_000_000 => $"{tokens / 1_000_000.0:F1}M",
-        >= 1_000 => $"{tokens / 1_000.0:F1}k",
-        _ => tokens.ToString(),
+        >= 1_000_000 => $"{(tokens / 1_000_000.0).ToString("F1", CultureInfo.InvariantCulture)}M",
+        >= 1_000 => $"{(tokens / 1_000.0).ToString("F1", CultureInfo.InvariantCulture)}k",
+        _ => tokens.ToString(CultureInfo.InvariantCulture),
     };
 
     private static string GetSessionTypeIcon(LlmSessionType type) => type switch

@@ -483,14 +483,27 @@ public sealed class GitOperationsTests : IAsyncLifetime
         await CommitFileAsync("seed.txt", "seed\n");
 
         Directory.CreateDirectory(Path.Combine(_repoDir, "dir with space"));
-        var specialNames = new[]
-        {
-            "dir with space/plain space.txt",
-            "dir with space/qu\"ote.txt",
-            "back\\slash.txt",
-            "unicode-é-ünï.txt",
-            "single'quote.txt",
-        };
+
+        // '"' and '\' are reserved characters that the Windows filesystem layer rejects
+        // outright when creating a file (regardless of NUL-delimited git parsing), so they
+        // are exercised only on platforms where they are legal path characters. Space,
+        // non-ASCII, and single-quote characters are legal everywhere and still exercise
+        // the same NUL-delimited/verbatim-capture parsing path.
+        var specialNames = OperatingSystem.IsWindows()
+            ? new[]
+            {
+                "dir with space/plain space.txt",
+                "unicode-é-ünï.txt",
+                "single'quote.txt",
+            }
+            : new[]
+            {
+                "dir with space/plain space.txt",
+                "dir with space/qu\"ote.txt",
+                "back\\slash.txt",
+                "unicode-é-ünï.txt",
+                "single'quote.txt",
+            };
 
         foreach (var name in specialNames)
             await File.WriteAllTextAsync(Path.Combine(_repoDir, name), "content\n", TestContext.Current.CancellationToken);
@@ -518,10 +531,24 @@ public sealed class GitOperationsTests : IAsyncLifetime
     [Fact]
     public async Task GetGitStatusAsync_FilenameWithLeadingTrailingWhitespace_IsNotTrimmed()
     {
+        // Windows' own file APIs (including the git-for-Windows binary itself, which uses
+        // standard Win32 path resolution to open files during `git add`) strip trailing
+        // spaces from the final path component. The file can be created on disk via the
+        // "\\?\" extended-length-path escape, but native git then fails to open it with
+        // "No such file or directory" — a genuine OS/git limitation, not a parsing bug in
+        // GitOperations. The scenario is therefore only exercisable on non-Windows platforms.
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Skip("git-for-Windows cannot open/add a file whose name has a trailing space.");
+            return;
+        }
+
         await CommitFileAsync("seed.txt", "seed\n");
 
         const string paddedName = " padded name ";
-        await File.WriteAllTextAsync(Path.Combine(_repoDir, paddedName), "content\n", TestContext.Current.CancellationToken);
+        var paddedPath = Path.Combine(_repoDir, paddedName);
+
+        await File.WriteAllTextAsync(paddedPath, "content\n", TestContext.Current.CancellationToken);
         await RunAsync(_repoDir, "add -A");
         await RunAsync(_repoDir, "commit -m \"add padded name\"");
 

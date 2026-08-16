@@ -112,7 +112,10 @@ public sealed class EventBusWiringTests
         var programPath = Path.Combine(repoRoot, "src", "CopilotHive", "Program.cs");
         Assert.True(File.Exists(programPath), $"Program.cs not found at {programPath}");
 
-        var source = File.ReadAllText(programPath);
+        // Normalize to LF: Program.cs may be checked out with CRLF line endings (e.g. on
+        // Windows, per .gitattributes text=auto), but the multi-line fragment below is
+        // written with LF, so the raw file content must be normalized before comparison.
+        var source = File.ReadAllText(programPath).ReplaceLineEndings("\n");
 
         string[] fragments =
         [

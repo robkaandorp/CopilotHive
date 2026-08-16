@@ -1536,6 +1536,17 @@ public class ConfigRepoManagerTests : IDisposable
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        // Force LF line endings regardless of the host's global/system git config
+        // (e.g. Windows installs commonly default core.autocrlf=true) so these tests
+        // produce identical file contents on any OS.
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("core.autocrlf=false");
+        // Some machines set safe.bareRepository=explicit globally, which blocks
+        // running git commands directly against a bare repo directory (as these
+        // tests do to inspect the "remote" side). Override so tests work regardless
+        // of the host's global git config.
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("safe.bareRepository=all");
         foreach (var arg in args)
             psi.ArgumentList.Add(arg);
 
