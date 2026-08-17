@@ -810,15 +810,17 @@ else
                                             </select>
                                         </td>
                                         <td style="padding:0.5rem">
-                                            <label style="font-size:0.85rem;cursor:pointer">
-                                                <input type="checkbox" @bind="_editRepoMonitorCi" /> Monitor CI
-                                            </label>
-                                            @if (_editRepoMonitorCi)
-                                            {
-                                                <input type="number" @bind="_editRepoCiTimeout" min="1" max="120"
-                                                       style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:5rem;margin-left:0.5rem" />
-                                                <span style="color:var(--text-muted);font-size:0.8rem">min</span>
-                                            }
+                                            <div style="display:flex;align-items:center;gap:0.4rem;flex-wrap:nowrap">
+                                                <label style="display:flex;align-items:center;gap:0.25rem;white-space:nowrap;font-size:0.85rem;cursor:pointer">
+                                                    <input type="checkbox" @bind="_editRepoMonitorCi" /> Monitor CI
+                                                </label>
+                                                @if (_editRepoMonitorCi)
+                                                {
+                                                    <input type="number" @bind="_editRepoCiTimeout" min="1" max="120"
+                                                           style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:4rem" />
+                                                    <span style="color:var(--text-muted);font-size:0.8rem;white-space:nowrap">min</span>
+                                                }
+                                            </div>
                                         </td>
                                         <td style="padding:0.5rem;text-align:right">
                                             <button class="approve-btn" disabled="@_repoSaving" @onclick="SaveEditRepoAsync">💾 Save</button>
