@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -208,19 +210,29 @@ public sealed class CiMonitorServiceTests : IDisposable
         HiveConfigFile? config = null,
         IIssueStore? issueStore = null,
         IEventBus? eventBus = null,
-        ILogger<CiMonitorService>? logger = null)
+        ILogger<CiMonitorService>? logger = null,
+        IGoalStore? goalStore = null,
+        TimeSpan? startupScanWindow = null,
+        TimeSpan? timeoutOverride = null)
+    {
+        return new CiMonitorService(
+            goalStore: goalStore,
+            issueStore: issueStore,
+            eventBus: eventBus,
+            config: config ?? CreateConfig(CreateRepo()),
+            httpClientFactory: CreateFactory(handler),
+            logger: logger ?? NullLogger<CiMonitorService>.Instance,
+            pollInterval: PollInterval,
+            timeoutOverride: timeoutOverride ?? Timeout,
+            startupScanWindow: startupScanWindow);
+    }
+
+    private static IHttpClientFactory CreateFactory(ScriptedHttpMessageHandler handler)
     {
         var factory = new Mock<IHttpClientFactory>();
         factory.Setup(f => f.CreateClient(It.IsAny<string>()))
                .Returns(() => new HttpClient(handler, disposeHandler: false));
-        return new CiMonitorService(
-            issueStore: issueStore,
-            eventBus: eventBus,
-            config: config ?? CreateConfig(CreateRepo()),
-            httpClientFactory: factory.Object,
-            logger: logger ?? NullLogger<CiMonitorService>.Instance,
-            pollInterval: PollInterval,
-            timeoutOverride: Timeout);
+        return factory.Object;
     }
 
     private static string CheckRunsJson(int totalCount, params (string Name, string Status, string? Conclusion, string? Summary, string? Text)[] runs)
@@ -241,13 +253,22 @@ public sealed class CiMonitorServiceTests : IDisposable
         Content = new StringContent(body, Encoding.UTF8, "application/json")
     };
 
-    private static HttpResponseMessage ErrorResponse(HttpStatusCode status, string? retryAfter = null, string? rateLimitRemaining = null)
+    private static HttpResponseMessage ErrorResponse(
+        HttpStatusCode status,
+        string? retryAfter = null,
+        string? rateLimitRemaining = null,
+        string? rateLimitReset = null)
     {
         var response = new HttpResponseMessage(status);
+        // Retry-After is a strongly-typed header: Headers.Add would reject a malformed value
+        // outright, so tests could not reproduce the real-world "header present but garbage"
+        // response. TryAddWithoutValidation stores the raw value verbatim.
         if (retryAfter is not null)
-            response.Headers.Add("Retry-After", retryAfter);
+            Assert.True(response.Headers.TryAddWithoutValidation("Retry-After", retryAfter));
         if (rateLimitRemaining is not null)
             response.Headers.Add("X-RateLimit-Remaining", rateLimitRemaining);
+        if (rateLimitReset is not null)
+            response.Headers.Add("X-RateLimit-Reset", rateLimitReset);
         return response;
     }
 
@@ -1200,5 +1221,1086 @@ public sealed class CiMonitorServiceTests : IDisposable
 
         var evt = Assert.Single(eventBus.Published);
         Assert.Equal(EventType.CiSucceeded, evt.Type);
+    }
+
+    // ── Startup scan ───────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Records every <see cref="CiMonitorService.MonitorMergeAsync"/> launch (the startup scan's
+    /// fire-and-forget continuation) instead of performing it, so tests can assert whether
+    /// background monitoring was started and with which cancellation token.
+    /// </summary>
+    private sealed class MonitorRecordingService : CiMonitorService
+    {
+        private readonly TaskCompletionSource _firstCall = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public MonitorRecordingService(
+            IGoalStore? goalStore,
+            HiveConfigFile config,
+            IHttpClientFactory httpClientFactory,
+            IEventBus? eventBus = null,
+            TimeSpan? startupScanWindow = null)
+            : base(
+                goalStore: goalStore,
+                eventBus: eventBus,
+                config: config,
+                httpClientFactory: httpClientFactory,
+                pollInterval: PollInterval,
+                timeoutOverride: Timeout,
+                startupScanWindow: startupScanWindow)
+        {
+        }
+
+        public ConcurrentBag<(string GoalId, string Repo, string Sha, CancellationToken Token)> Monitored { get; } = [];
+
+        /// <summary>Completes as soon as the first monitoring launch is observed.</summary>
+        public Task FirstCall => _firstCall.Task;
+
+        public override Task MonitorMergeAsync(string goalId, string repoName, string mergeCommitSha, CancellationToken ct)
+        {
+            Monitored.Add((goalId, repoName, mergeCommitSha, ct));
+            _firstCall.TrySetResult();
+            return Task.CompletedTask;
+        }
+    }
+
+    private static MonitorRecordingService CreateRecordingService(
+        ScriptedHttpMessageHandler handler,
+        IGoalStore? goalStore,
+        HiveConfigFile? config = null,
+        IEventBus? eventBus = null,
+        TimeSpan? startupScanWindow = null) =>
+        new(goalStore, config ?? CreateConfig(CreateRepo()), CreateFactory(handler), eventBus, startupScanWindow);
+
+    private static Goal CompletedGoal(
+        string id = "goal-1",
+        string? mergeCommitHash = "abc123",
+        DateTime? completedAt = null,
+        GoalStatus status = GoalStatus.Completed,
+        params string[] repositoryNames) => new()
+        {
+            Id = id,
+            Description = "test goal",
+            Status = status,
+            MergeCommitHash = mergeCommitHash,
+            CompletedAt = completedAt ?? DateTime.UtcNow,
+            RepositoryNames = repositoryNames.Length == 0 ? ["test-repo"] : [.. repositoryNames],
+        };
+
+    private static InMemoryGoalStore StoreWith(params Goal[] goals)
+    {
+        var store = new InMemoryGoalStore();
+        foreach (var goal in goals)
+            store.AddGoal(goal);
+        return store;
+    }
+
+    /// <summary>
+    /// Waits long enough for a fire-and-forget monitoring launch to have been observed, so an
+    /// assertion that monitoring did NOT start is not merely winning a race.
+    /// </summary>
+    private static async Task AllowFireAndForgetToRunAsync() =>
+        await Task.Delay(250, TestContext.Current.CancellationToken);
+
+    [Fact]
+    public async Task StartupScanAsync_CompletedGoalCiSucceeded_PublishesCiSucceeded()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
+        var service = CreateService(handler, eventBus: eventBus, goalStore: StoreWith(CompletedGoal()));
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        Assert.Single(handler.Requests);
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.CiSucceeded, evt.Type);
+        Assert.Equal("goal-1", evt.GoalId);
+        Assert.Equal("test-repo", evt.Repository);
+    }
+
+    [Fact]
+    public async Task StartupScanAsync_CompletedGoalCiFailed_CreatesIssuesAndPublishesCiFailed()
+    {
+        var eventBus = new RecordingEventBus();
+        var issueStore = new FakeIssueStore();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "failure", "✗ MyApp.Tests.CalculatorTests.Add_TwoNumbers_ReturnsSum", null))));
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, goalStore: StoreWith(CompletedGoal()));
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.CiFailed, evt.Type);
+        Assert.Equal("goal-1", evt.GoalId);
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal("CI failure: MyApp.Tests.CalculatorTests.Add_TwoNumbers_ReturnsSum", issue.Title);
+        Assert.Equal("goal-1", issue.SourceGoalId);
+    }
+
+    /// <summary>
+    /// A commit whose checks are still running must hand off to background monitoring rather
+    /// than publishing a terminal event. The token handed to the launched monitor must be the
+    /// application-lifetime token the scan was given — not <see cref="CancellationToken.None"/> —
+    /// so shutdown stops the resumed monitoring.
+    /// </summary>
+    [Fact]
+    public async Task StartupScanAsync_CiStillRunning_StartsMonitoringWithScanToken()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "in_progress", null, null, null))));
+        var service = CreateRecordingService(handler, StoreWith(CompletedGoal()), eventBus: eventBus);
+
+        using var cts = new CancellationTokenSource();
+        await service.StartupScanAsync(cts.Token);
+        await service.FirstCall.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        var monitored = Assert.Single(service.Monitored);
+        Assert.Equal(("goal-1", "test-repo", "abc123"), (monitored.GoalId, monitored.Repo, monitored.Sha));
+        Assert.Equal(cts.Token, monitored.Token);
+        Assert.True(monitored.Token.CanBeCanceled);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Fact]
+    public async Task StartupScanAsync_NoChecksAndMergedLongAgo_SkipsMonitoring()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(CheckRunsJson(0)));
+        var goal = CompletedGoal(completedAt: DateTime.UtcNow.AddMinutes(-10));
+        var service = CreateRecordingService(handler, StoreWith(goal), eventBus: eventBus);
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+        await AllowFireAndForgetToRunAsync();
+
+        // The commit WAS probed — the skip is a decision about the result, not a no-op.
+        Assert.Single(handler.Requests);
+        Assert.Empty(service.Monitored);
+        Assert.Empty(eventBus.Published);
+    }
+
+    /// <summary>
+    /// Complement of the test above: the identical no-checks response for a just-merged commit
+    /// must start monitoring, proving the 5-minute grace period is what decides.
+    /// </summary>
+    [Fact]
+    public async Task StartupScanAsync_NoChecksAndRecentlyMerged_StartsMonitoring()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(CheckRunsJson(0)));
+        var goal = CompletedGoal(completedAt: DateTime.UtcNow.AddMinutes(-1));
+        var service = CreateRecordingService(handler, StoreWith(goal), eventBus: eventBus);
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+        await service.FirstCall.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        var monitored = Assert.Single(service.Monitored);
+        Assert.Equal("abc123", monitored.Sha);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Fact]
+    public async Task StartupScanAsync_401_SkipsWithoutMonitoring()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.Unauthorized));
+        var service = CreateRecordingService(handler, StoreWith(CompletedGoal()), eventBus: eventBus);
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+        await AllowFireAndForgetToRunAsync();
+
+        Assert.Single(handler.Requests);
+        Assert.Empty(service.Monitored);
+        Assert.Empty(eventBus.Published);
+    }
+
+    /// <summary>
+    /// Complement of the 401 test: a retryable status must resume monitoring rather than being
+    /// abandoned, so the two error classes cannot be collapsed into one branch.
+    /// </summary>
+    [Fact]
+    public async Task StartupScanAsync_5xx_StartsMonitoring()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.InternalServerError));
+        var service = CreateRecordingService(handler, StoreWith(CompletedGoal()), eventBus: eventBus);
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+        await service.FirstCall.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.Single(service.Monitored);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Fact]
+    public async Task StartupScanAsync_GoalWithoutMergeHash_NotScanned()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
+        var service = CreateService(handler, eventBus: eventBus, goalStore: StoreWith(CompletedGoal(mergeCommitHash: null)));
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        Assert.Empty(handler.Requests);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Fact]
+    public async Task StartupScanAsync_GoalCompletedOutsideWindow_NotScanned()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
+        var goal = CompletedGoal(completedAt: DateTime.UtcNow.AddMinutes(-30));
+        var service = CreateService(
+            handler, eventBus: eventBus, goalStore: StoreWith(goal), startupScanWindow: TimeSpan.FromMinutes(10));
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        Assert.Empty(handler.Requests);
+        Assert.Empty(eventBus.Published);
+    }
+
+    /// <summary>
+    /// The complement of the out-of-window test: the same goal inside the configured window IS
+    /// scanned, so an empty result cannot come from the scan being broken outright.
+    /// </summary>
+    [Fact]
+    public async Task StartupScanAsync_GoalCompletedInsideWindow_IsScanned()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
+        var goal = CompletedGoal(completedAt: DateTime.UtcNow.AddMinutes(-5));
+        var service = CreateService(
+            handler, eventBus: eventBus, goalStore: StoreWith(goal), startupScanWindow: TimeSpan.FromMinutes(10));
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        Assert.Single(handler.Requests);
+        Assert.Single(eventBus.Published);
+    }
+
+    [Theory]
+    [InlineData(GoalStatus.Failed)]
+    [InlineData(GoalStatus.InProgress)]
+    [InlineData(GoalStatus.Pending)]
+    public async Task StartupScanAsync_NonCompletedGoal_NotScanned(GoalStatus status)
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
+        var service = CreateService(handler, eventBus: eventBus, goalStore: StoreWith(CompletedGoal(status: status)));
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        Assert.Empty(handler.Requests);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Fact]
+    public async Task StartupScanAsync_MultipleGoals_EachScanned()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
+        var store = StoreWith(
+            CompletedGoal("goal-1", "sha-one"),
+            CompletedGoal("goal-2", "sha-two"));
+        var service = CreateService(handler, eventBus: eventBus, goalStore: store);
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        var urls = handler.Captured.Select(c => c.Url).ToList();
+        Assert.Equal(2, urls.Count);
+        Assert.Contains(urls, u => u.Contains("/commits/sha-one/"));
+        Assert.Contains(urls, u => u.Contains("/commits/sha-two/"));
+        Assert.Equal(2, eventBus.Published.Count);
+        Assert.Equal(["goal-1", "goal-2"], eventBus.Published.Select(e => e.GoalId).Order().ToList());
+    }
+
+    [Fact]
+    public async Task StartupScanAsync_MultiRepoGoal_EachPairProbed()
+    {
+        var eventBus = new RecordingEventBus();
+        var config = CreateConfig(
+            CreateRepo("repo-a", "https://github.com/org/repo-a"),
+            CreateRepo("repo-b", "https://github.com/org/repo-b"));
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
+        var goal = CompletedGoal("goal-1", "sha-a,sha-b", repositoryNames: ["repo-a", "repo-b"]);
+        var service = CreateService(handler, config: config, eventBus: eventBus, goalStore: StoreWith(goal));
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        var urls = handler.Captured.Select(c => c.Url).ToList();
+        Assert.Equal(2, urls.Count);
+        Assert.Contains(urls, u => u.Contains("/repos/org/repo-a/commits/sha-a/"));
+        Assert.Contains(urls, u => u.Contains("/repos/org/repo-b/commits/sha-b/"));
+        Assert.Equal(2, eventBus.Published.Count);
+        Assert.Equal(["repo-a", "repo-b"], eventBus.Published.Select(e => e.Repository).Order().ToList());
+    }
+
+    /// <summary>
+    /// Re-running the scan must not republish an already-published terminal event. The request
+    /// count proves the second scan really re-probed, so the single event comes from the event
+    /// dedup and not from the second scan being skipped wholesale.
+    /// </summary>
+    [Fact]
+    public async Task StartupScanAsync_RunTwice_PublishesCiSucceededOnce()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
+        var service = CreateService(handler, eventBus: eventBus, goalStore: StoreWith(CompletedGoal()));
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, handler.Requests.Count);
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.CiSucceeded, evt.Type);
+    }
+
+    [Fact]
+    public async Task StartupScanAsync_FailedCiRunTwice_PublishesCiFailedOnce()
+    {
+        var eventBus = new RecordingEventBus();
+        var issueStore = new FakeIssueStore();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "failure", "Build failed", null))));
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, goalStore: StoreWith(CompletedGoal()));
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, handler.Requests.Count);
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.CiFailed, evt.Type);
+    }
+
+    /// <summary>
+    /// A live <see cref="CiMonitorService.MonitorMergeAsync"/> holds the in-flight key for the
+    /// goal/commit/repository, so a concurrent startup scan that finds the same commit already
+    /// failed must create no issues and publish no event. The scan's own probe still happens,
+    /// so the skip is proven to come from the in-flight guard rather than from a missing probe.
+    /// </summary>
+    [Fact]
+    public async Task StartupScanAsync_InFlightMonitoring_SkipsIssuesAndEvent()
+    {
+        var eventBus = new RecordingEventBus();
+        var issueStore = new FakeIssueStore();
+        var requestCount = 0;
+        var monitorRequestStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseMonitor = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var handler = new ScriptedHttpMessageHandler(async _ =>
+        {
+            if (Interlocked.Increment(ref requestCount) == 1)
+            {
+                // The live monitor's request: park here so the in-flight key stays held while
+                // the startup scan runs.
+                monitorRequestStarted.TrySetResult();
+                await releaseMonitor.Task;
+                return OkResponse(CheckRunsJson(1, ("build", "in_progress", null, null, null)));
+            }
+            // The startup scan's request: CI has already failed.
+            return OkResponse(CheckRunsJson(1, ("build", "completed", "failure", "Build failed", null)));
+        });
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus, goalStore: StoreWith(CompletedGoal()));
+
+        using var monitorCts = new CancellationTokenSource();
+        var monitorTask = service.MonitorMergeAsync("goal-1", "test-repo", "abc123", monitorCts.Token);
+        await monitorRequestStarted.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        Assert.True(requestCount >= 2, $"The scan must have probed; only {requestCount} request(s) were made.");
+        Assert.Empty(issueStore.Issues);
+        Assert.Empty(eventBus.Published);
+
+        // Unblock the live monitor: cancelling first means its still-running result ends the
+        // loop without publishing anything of its own.
+        await monitorCts.CancelAsync();
+        releaseMonitor.TrySetResult();
+        await monitorTask;
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Fact]
+    public async Task StartupScanAsync_NullGoalStore_ReturnsEarly()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
+        var service = CreateService(handler, eventBus: eventBus, goalStore: null);
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        Assert.Empty(handler.Requests);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Fact]
+    public async Task StartupScanAsync_MonitorCiDisabled_NotScanned()
+    {
+        var eventBus = new RecordingEventBus();
+        var config = CreateConfig(CreateRepo(monitorCi: false));
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
+        var service = CreateService(handler, config: config, eventBus: eventBus, goalStore: StoreWith(CompletedGoal()));
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        Assert.Empty(handler.Requests);
+        Assert.Empty(eventBus.Published);
+    }
+
+    // ── Probe classification (internal ProbeCiStatusAsync) ─────────────────
+
+    private static async Task<CiProbeResult> ProbeAsync(ScriptedHttpMessageHandler handler)
+    {
+        var service = CreateService(handler);
+        using var client = new HttpClient(handler, disposeHandler: false);
+        return await service.ProbeCiStatusAsync("org", "test-repo", "abc123", client, TestContext.Current.CancellationToken);
+    }
+
+    /// <summary>Builds a check-runs response body from a raw <c>check_runs</c> array literal.</summary>
+    private static string RawCheckRunsJson(int totalCount, string checkRunsArrayJson) =>
+        $"{{\"total_count\":{totalCount},\"check_runs\":{checkRunsArrayJson}}}";
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_AllSuccess_ReturnsSucceededWithAllRuns()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(CheckRunsJson(2,
+            ("build", "completed", "success", null, null),
+            ("lint", "completed", "success", null, null))));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Succeeded, result.Status);
+        Assert.Equal(["build", "lint"], result.CheckRuns.Select(r => r.Name).Order().ToList());
+        Assert.Null(result.ErrorDetail);
+        Assert.Null(result.RetryAfter);
+    }
+
+    /// <summary>
+    /// Precedence: an incomplete run outranks an already-failed one. Classifying this as
+    /// <c>Failed</c> would publish a terminal event while CI is still running.
+    /// </summary>
+    [Fact]
+    public async Task ProbeCiStatusAsync_FailureAndInProgress_ReturnsStillRunning()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(CheckRunsJson(2,
+            ("build", "completed", "failure", "Build failed", null),
+            ("lint", "in_progress", null, null, null))));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.StillRunning, result.Status);
+        Assert.Equal(2, result.CheckRuns.Count);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_OneFailureAllCompleted_ReturnsFailedWithOnlyFailedRuns()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(CheckRunsJson(3,
+            ("build", "completed", "success", null, null),
+            ("test", "completed", "failure", "Tests failed", null),
+            ("lint", "completed", "success", null, null))));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Failed, result.Status);
+        var run = Assert.Single(result.CheckRuns);
+        Assert.Equal("test", run.Name);
+        Assert.Equal("Tests failed", run.OutputSummary);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_SomeNotCompleted_ReturnsStillRunningWithAllRuns()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(CheckRunsJson(3,
+            ("build", "completed", "success", null, null),
+            ("test", "queued", null, null, null),
+            ("lint", "in_progress", null, null, null))));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.StillRunning, result.Status);
+        Assert.Equal(3, result.CheckRuns.Count);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_AllSkipped_ReturnsSucceeded()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(CheckRunsJson(2,
+            ("build", "completed", "skipped", null, null),
+            ("lint", "completed", "skipped", null, null))));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Succeeded, result.Status);
+        Assert.Equal(2, result.CheckRuns.Count);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_ZeroChecks_ReturnsNoChecks()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(CheckRunsJson(0)));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.NoChecks, result.Status);
+        Assert.Empty(result.CheckRuns);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_401_ReturnsTerminalError()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.Unauthorized));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("401", result.ErrorDetail);
+        Assert.Null(result.RetryAfter);
+        Assert.Empty(result.CheckRuns);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_403WithRetryAfter_ReturnsRateLimitErrorWithRetryAfter()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            ErrorResponse(HttpStatusCode.Forbidden, retryAfter: "60"));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("403-rate-limit", result.ErrorDetail);
+        Assert.Equal(TimeSpan.FromSeconds(60), result.RetryAfter);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_403WithRateLimitReset_ReturnsRetryAfterUntilReset()
+    {
+        var resetEpoch = DateTimeOffset.UtcNow.AddSeconds(120).ToUnixTimeSeconds();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            ErrorResponse(HttpStatusCode.Forbidden, rateLimitRemaining: "0",
+                rateLimitReset: resetEpoch.ToString(CultureInfo.InvariantCulture)));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("403-rate-limit", result.ErrorDetail);
+        Assert.NotNull(result.RetryAfter);
+        Assert.InRange(result.RetryAfter!.Value, TimeSpan.FromSeconds(100), TimeSpan.FromSeconds(121));
+    }
+
+    /// <summary>A reset timestamp already in the past must clamp to zero, never a negative delay.</summary>
+    [Fact]
+    public async Task ProbeCiStatusAsync_403WithPastRateLimitReset_ClampsRetryAfterToZero()
+    {
+        var resetEpoch = DateTimeOffset.UtcNow.AddSeconds(-120).ToUnixTimeSeconds();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            ErrorResponse(HttpStatusCode.Forbidden, rateLimitRemaining: "0",
+                rateLimitReset: resetEpoch.ToString(CultureInfo.InvariantCulture)));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal("403-rate-limit", result.ErrorDetail);
+        Assert.Equal(TimeSpan.Zero, result.RetryAfter);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_403WithRateLimitRemainingOnly_ReturnsDefaultRetryAfter()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            ErrorResponse(HttpStatusCode.Forbidden, rateLimitRemaining: "0"));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("403-rate-limit", result.ErrorDetail);
+        Assert.Equal(TimeSpan.FromSeconds(60), result.RetryAfter);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_403WithoutRateLimitHeaders_ReturnsTerminalError()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.Forbidden));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("403", result.ErrorDetail);
+        Assert.Null(result.RetryAfter);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_429_ReturnsRetryableErrorWithRetryAfter()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            ErrorResponse(HttpStatusCode.TooManyRequests, retryAfter: "120"));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("429", result.ErrorDetail);
+        Assert.Equal(TimeSpan.FromSeconds(120), result.RetryAfter);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_5xx_ReturnsRetryableError()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.BadGateway));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("5xx", result.ErrorDetail);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_400_ReturnsOtherHttpError()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.BadRequest));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("other-http", result.ErrorDetail);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_TransportException_ReturnsTransportError()
+    {
+        var handler = new ScriptedHttpMessageHandler(
+            (Func<HttpRequestMessage, HttpResponseMessage>)(_ => throw new HttpRequestException("Simulated transport failure")));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("transport", result.ErrorDetail);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_MalformedJson_ReturnsMalformedError()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse("not valid json"));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("malformed", result.ErrorDetail);
+        Assert.Empty(result.CheckRuns);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_MissingCheckRunsArray_ReturnsMalformedError()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse("{\"total_count\":2}"));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("malformed", result.ErrorDetail);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_MissingTotalCount_ReturnsMalformedError()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse("{\"check_runs\":[{\"name\":\"build\",\"status\":\"completed\",\"conclusion\":\"success\"}]}"));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("malformed", result.ErrorDetail);
+    }
+
+    /// <summary>
+    /// One unusable run must not discard the usable ones: the valid run still decides the
+    /// outcome and the malformed entry is dropped rather than treated as a failure.
+    /// </summary>
+    [Fact]
+    public async Task ProbeCiStatusAsync_SomeRunsMalformed_UsesValidRunsAndSkipsMalformed()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(RawCheckRunsJson(3, """
+            [
+              {"status":"completed","conclusion":"failure"},
+              {"name":"no-status","conclusion":"failure"},
+              {"name":"build","status":"completed","conclusion":"success"}
+            ]
+            """)));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Succeeded, result.Status);
+        var run = Assert.Single(result.CheckRuns);
+        Assert.Equal("build", run.Name);
+    }
+
+    /// <summary>
+    /// Complement of the partially-malformed case: when NO run survives parsing, the response
+    /// carries no usable information and must be retried rather than reported as "no checks".
+    /// </summary>
+    [Fact]
+    public async Task ProbeCiStatusAsync_AllRunsMalformed_ReturnsMalformedError()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(RawCheckRunsJson(2, """
+            [
+              {"status":"completed","conclusion":"failure"},
+              {"name":"no-status","conclusion":"success"}
+            ]
+            """)));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("malformed", result.ErrorDetail);
+        Assert.Empty(result.CheckRuns);
+    }
+
+    [Fact]
+    public async Task ProbeCiStatusAsync_Pagination_FetchesAllPagesAndAggregatesRuns()
+    {
+        (string Name, string Status, string? Conclusion, string? Summary, string? Text)[] page1Runs = [.. Enumerable.Range(0, 100)
+            .Select(i => (Name: "check-" + i, Status: "completed", Conclusion: (string?)"success", Summary: (string?)null, Text: (string?)null))];
+        (string Name, string Status, string? Conclusion, string? Summary, string? Text)[] page2Runs = [.. Enumerable.Range(100, 50)
+            .Select(i => (Name: "check-" + i, Status: "completed", Conclusion: (string?)"success", Summary: (string?)null, Text: (string?)null))];
+
+        var handler = new ScriptedHttpMessageHandler(req =>
+            OkResponse(req.RequestUri!.ToString().Contains("&page=1", StringComparison.Ordinal)
+                ? CheckRunsJson(150, page1Runs)
+                : CheckRunsJson(150, page2Runs)));
+
+        var result = await ProbeAsync(handler);
+
+        var urls = handler.Captured.Select(c => c.Url).ToList();
+        Assert.Equal(2, urls.Count);
+        Assert.Contains("per_page=100", urls[0]);
+        Assert.Contains("page=1", urls[0]);
+        Assert.Contains("per_page=100", urls[1]);
+        Assert.Contains("page=2", urls[1]);
+        Assert.Equal(CiProbeStatus.Succeeded, result.Status);
+        Assert.Equal(150, result.CheckRuns.Count);
+    }
+
+    /// <summary>
+    /// Pagination must also aggregate across pages when deciding the outcome: a failure that
+    /// only appears on page 2 must still produce <c>Failed</c>.
+    /// </summary>
+    [Fact]
+    public async Task ProbeCiStatusAsync_FailureOnSecondPage_ReturnsFailed()
+    {
+        (string Name, string Status, string? Conclusion, string? Summary, string? Text)[] page1Runs = [.. Enumerable.Range(0, 100)
+            .Select(i => (Name: "check-" + i, Status: "completed", Conclusion: (string?)"success", Summary: (string?)null, Text: (string?)null))];
+        (string Name, string Status, string? Conclusion, string? Summary, string? Text)[] page2Runs =
+            [("late-check", "completed", "failure", "Boom", null)];
+
+        var handler = new ScriptedHttpMessageHandler(req =>
+            OkResponse(req.RequestUri!.ToString().Contains("&page=1", StringComparison.Ordinal)
+                ? CheckRunsJson(101, page1Runs)
+                : CheckRunsJson(101, page2Runs)));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Failed, result.Status);
+        var run = Assert.Single(result.CheckRuns);
+        Assert.Equal("late-check", run.Name);
+    }
+
+    // ── Regression: malformed rate-limit headers must stay retryable ───────
+
+    /// <summary>
+    /// A 403 whose <c>Retry-After</c> value is unparseable is still a rate-limit response:
+    /// detection must key on header PRESENCE. Classifying it as a terminal 403 would abandon
+    /// CI monitoring permanently because GitHub sent a garbage back-off value.
+    /// </summary>
+    [Theory]
+    [InlineData("not-a-number")]
+    [InlineData("")]
+    [InlineData("60s")]
+    [InlineData("-")]
+    public async Task ProbeCiStatusAsync_403WithMalformedRetryAfter_StaysRateLimitedWithDefaultWait(string retryAfter)
+    {
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            ErrorResponse(HttpStatusCode.Forbidden, retryAfter: retryAfter));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        // The malformed value must NOT downgrade the classification to terminal "403".
+        Assert.Equal("403-rate-limit", result.ErrorDetail);
+        Assert.Equal(TimeSpan.FromSeconds(60), result.RetryAfter);
+    }
+
+    /// <summary>
+    /// With a malformed <c>Retry-After</c> the reset header is still honoured for the wait
+    /// duration — parsing decides only HOW LONG to back off, never WHETHER to back off.
+    /// </summary>
+    [Fact]
+    public async Task ProbeCiStatusAsync_403MalformedRetryAfterWithReset_UsesResetForWait()
+    {
+        var resetEpoch = DateTimeOffset.UtcNow.AddSeconds(120).ToUnixTimeSeconds();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            ErrorResponse(HttpStatusCode.Forbidden, retryAfter: "not-a-number",
+                rateLimitReset: resetEpoch.ToString(CultureInfo.InvariantCulture)));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal("403-rate-limit", result.ErrorDetail);
+        Assert.NotNull(result.RetryAfter);
+        Assert.InRange(result.RetryAfter!.Value, TimeSpan.FromSeconds(100), TimeSpan.FromSeconds(121));
+    }
+
+    /// <summary>
+    /// Complement of the malformed-value tests: only a 403 carrying NEITHER header is terminal.
+    /// Together these prove presence — not parseability — is what separates the two branches.
+    /// </summary>
+    [Fact]
+    public async Task ProbeCiStatusAsync_403WithUnrelatedHeadersOnly_RemainsTerminal()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            ErrorResponse(HttpStatusCode.Forbidden, rateLimitRemaining: "42"));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal("403", result.ErrorDetail);
+        Assert.Null(result.RetryAfter);
+    }
+
+    /// <summary>
+    /// An epoch value beyond <see cref="DateTimeOffset"/>'s range parses as a number but would
+    /// throw inside <c>FromUnixTimeSeconds</c>. It must be rejected before that call so the
+    /// result-based error contract holds and the caller still gets a usable back-off.
+    /// </summary>
+    [Theory]
+    [InlineData("99999999999999")]
+    [InlineData("9223372036854775807")]
+    [InlineData("soon")]
+    public async Task ProbeCiStatusAsync_403WithUnusableReset_FallsBackToDefaultWait(string reset)
+    {
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            ErrorResponse(HttpStatusCode.Forbidden, rateLimitRemaining: "0", rateLimitReset: reset));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("403-rate-limit", result.ErrorDetail);
+        Assert.Equal(TimeSpan.FromSeconds(60), result.RetryAfter);
+    }
+
+    /// <summary>Every rate-limited RetryAfter must be usable as a delay — never negative.</summary>
+    [Theory]
+    [InlineData("0")]
+    [InlineData("1")]
+    [InlineData("1000000000")]
+    public async Task ProbeCiStatusAsync_403WithAnyReset_NeverReturnsNegativeRetryAfter(string reset)
+    {
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            ErrorResponse(HttpStatusCode.Forbidden, rateLimitRemaining: "0", rateLimitReset: reset));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal("403-rate-limit", result.ErrorDetail);
+        Assert.NotNull(result.RetryAfter);
+        Assert.True(result.RetryAfter!.Value >= TimeSpan.Zero,
+            $"RetryAfter must be non-negative; got {result.RetryAfter}.");
+    }
+
+    // ── Regression: malformed total_count must not escape the contract ─────
+
+    /// <summary>
+    /// <c>JsonValueKind.Number</c> does not guarantee <c>GetInt32()</c> succeeds: fractional and
+    /// out-of-range numbers throw, and a negative value corrupts the pagination arithmetic.
+    /// Every such value must surface as <c>Error("malformed")</c> rather than an exception
+    /// escaping the probe or a silent fallback to zero.
+    /// </summary>
+    [Theory]
+    [InlineData("-1")]           // negative → invalid pagination
+    [InlineData("-100")]
+    [InlineData("1.5")]          // fractional → GetInt32 throws
+    [InlineData("1e30")]         // out of Int32 range → GetInt32 throws
+    [InlineData("99999999999")]  // out of Int32 range
+    [InlineData("\"12\"")]       // string kind, not a number
+    [InlineData("null")]
+    [InlineData("true")]
+    public async Task ProbeCiStatusAsync_MalformedTotalCount_ReturnsMalformedError(string totalCountJson)
+    {
+        var body = $"{{\"total_count\":{totalCountJson},\"check_runs\":[{{\"name\":\"build\",\"status\":\"completed\",\"conclusion\":\"success\"}}]}}";
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(body));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Error, result.Status);
+        Assert.Equal("malformed", result.ErrorDetail);
+        Assert.Empty(result.CheckRuns);
+    }
+
+    /// <summary>
+    /// Complement of the malformed-total_count theory: a valid count on the same body shape
+    /// classifies normally, so the rejections above are about the value and not the payload.
+    /// </summary>
+    [Fact]
+    public async Task ProbeCiStatusAsync_ValidTotalCount_ClassifiesNormally()
+    {
+        var body = "{\"total_count\":1,\"check_runs\":[{\"name\":\"build\",\"status\":\"completed\",\"conclusion\":\"success\"}]}";
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(body));
+
+        var result = await ProbeAsync(handler);
+
+        Assert.Equal(CiProbeStatus.Succeeded, result.Status);
+        Assert.Equal("build", Assert.Single(result.CheckRuns).Name);
+    }
+
+    // ── Regression: dedup keys are repository-aware ────────────────────────
+
+    /// <summary>
+    /// Same goal AND same SHA in two different repositories must both be monitored: the
+    /// in-flight key includes the repository. The rendezvous forces both requests to be in
+    /// flight simultaneously, so dropping <c>Repo</c> from the key would make the second call
+    /// skip, leave the barrier unmet, and fail here rather than passing silently.
+    /// </summary>
+    [Fact]
+    public async Task MonitorGoalAsync_SameShaDifferentRepos_BothMonitoredConcurrently()
+    {
+        var eventBus = new RecordingEventBus();
+        var config = CreateConfig(
+            CreateRepo("repo-a", "https://github.com/org/repo-a"),
+            CreateRepo("repo-b", "https://github.com/org/repo-b"));
+
+        var inFlight = 0;
+        var bothInFlight = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handler = new ScriptedHttpMessageHandler(async _ =>
+        {
+            if (Interlocked.Increment(ref inFlight) == 2)
+                bothInFlight.TrySetResult(true);
+
+            // Neither request completes until BOTH arrived. If the in-flight key ignored the
+            // repository, the second call would be skipped and this barrier never met.
+            await bothInFlight.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            return OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null)));
+        });
+        var service = CreateService(handler, config: config, eventBus: eventBus);
+
+        // Identical SHA for both repositories — only the repository dimension separates them.
+        await service.MonitorGoalAsync("goal-1", "same-sha,same-sha", ["repo-a", "repo-b"], TestContext.Current.CancellationToken);
+
+        Assert.True(bothInFlight.Task.IsCompletedSuccessfully,
+            "Both repositories must be monitored for the same SHA; the in-flight key is not repository-aware.");
+        Assert.Equal(2, handler.Requests.Count);
+        // Event dedup must also be repository-aware: one CiSucceeded per repository.
+        Assert.Equal(2, eventBus.Published.Count);
+        Assert.All(eventBus.Published, e => Assert.Equal(EventType.CiSucceeded, e.Type));
+        Assert.Equal(["repo-a", "repo-b"], eventBus.Published.Select(e => e.Repository).Order().ToList());
+    }
+
+    /// <summary>
+    /// Failure flavour of the repository-dimension test: the same failing SHA in two
+    /// repositories must publish a <c>CiFailed</c> for each, and create issues attributed to
+    /// each repository. Dropping <c>Repo</c> from the published-event key would emit only one.
+    /// </summary>
+    [Fact]
+    public async Task MonitorGoalAsync_SameShaDifferentRepos_PublishesCiFailedPerRepository()
+    {
+        var eventBus = new RecordingEventBus();
+        var issueStore = new FakeIssueStore();
+        var config = CreateConfig(
+            CreateRepo("repo-a", "https://github.com/org/repo-a"),
+            CreateRepo("repo-b", "https://github.com/org/repo-b"));
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "failure", "Build failed", null))));
+        var service = CreateService(handler, config: config, issueStore: issueStore, eventBus: eventBus);
+
+        await service.MonitorGoalAsync("goal-1", "same-sha,same-sha", ["repo-a", "repo-b"], TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, eventBus.Published.Count);
+        Assert.All(eventBus.Published, e => Assert.Equal(EventType.CiFailed, e.Type));
+        Assert.Equal(["repo-a", "repo-b"], eventBus.Published.Select(e => e.Repository).Order().ToList());
+        Assert.Equal(2, issueStore.Issues.Count);
+        Assert.Equal(
+            ["repo-a", "repo-b"],
+            issueStore.Issues.Values.Select(i => i.RepositoryNames.Single()).Order().ToList());
+    }
+
+    /// <summary>
+    /// The complement that pins the key down: the SAME goal, SHA and repository must publish
+    /// only once. With the test above (different repositories → two events) this proves the key
+    /// distinguishes exactly on the repository dimension and not on nothing at all.
+    /// </summary>
+    [Fact]
+    public async Task MonitorMergeAsync_SameGoalShaAndRepoTwice_PublishesCiSucceededOnce()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
+        var service = CreateService(handler, eventBus: eventBus);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // Both calls really ran (the second was not skipped by the in-flight guard, which is
+        // released before it returns) — the single event comes from the published-event dedup.
+        Assert.Equal(2, handler.Requests.Count);
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.CiSucceeded, evt.Type);
+    }
+
+    /// <summary>
+    /// Startup-scan flavour: one goal whose SAME SHA landed in two repositories must be probed
+    /// and published per repository, so a repository-blind dedup key cannot pass.
+    /// </summary>
+    [Fact]
+    public async Task StartupScanAsync_SameShaDifferentRepos_PublishesPerRepository()
+    {
+        var eventBus = new RecordingEventBus();
+        var config = CreateConfig(
+            CreateRepo("repo-a", "https://github.com/org/repo-a"),
+            CreateRepo("repo-b", "https://github.com/org/repo-b"));
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
+        var goal = CompletedGoal("goal-1", "same-sha,same-sha", repositoryNames: ["repo-a", "repo-b"]);
+        var service = CreateService(handler, config: config, eventBus: eventBus, goalStore: StoreWith(goal));
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        var urls = handler.Captured.Select(c => c.Url).ToList();
+        Assert.Equal(2, urls.Count);
+        Assert.Contains(urls, u => u.Contains("/repos/org/repo-a/commits/same-sha/"));
+        Assert.Contains(urls, u => u.Contains("/repos/org/repo-b/commits/same-sha/"));
+        Assert.Equal(2, eventBus.Published.Count);
+        Assert.Equal(["repo-a", "repo-b"], eventBus.Published.Select(e => e.Repository).Order().ToList());
+    }
+
+    /// <summary>
+    /// Startup-scan failure flavour: the same failing SHA in two repositories must not have one
+    /// repository's issue creation suppressed by the other's in-flight key.
+    /// </summary>
+    [Fact]
+    public async Task StartupScanAsync_SameShaDifferentReposFailed_CreatesIssuesPerRepository()
+    {
+        var eventBus = new RecordingEventBus();
+        var issueStore = new FakeIssueStore();
+        var config = CreateConfig(
+            CreateRepo("repo-a", "https://github.com/org/repo-a"),
+            CreateRepo("repo-b", "https://github.com/org/repo-b"));
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "failure", "Build failed", null))));
+        var goal = CompletedGoal("goal-1", "same-sha,same-sha", repositoryNames: ["repo-a", "repo-b"]);
+        var service = CreateService(
+            handler, config: config, issueStore: issueStore, eventBus: eventBus, goalStore: StoreWith(goal));
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, eventBus.Published.Count);
+        Assert.All(eventBus.Published, e => Assert.Equal(EventType.CiFailed, e.Type));
+        Assert.Equal(2, issueStore.Issues.Count);
+        Assert.Equal(
+            ["repo-a", "repo-b"],
+            issueStore.Issues.Values.Select(i => i.RepositoryNames.Single()).Order().ToList());
     }
 }
