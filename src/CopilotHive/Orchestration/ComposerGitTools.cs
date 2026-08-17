@@ -6,17 +6,7 @@ namespace CopilotHive.Orchestration;
 
 public sealed partial class Composer
 {
-    /// <summary>
-    /// Name or full path of the git executable to invoke. Normally just <c>"git"</c> (resolved via
-    /// PATH), but can be overridden via the <c>COPILOTHIVE_TEST_GIT_EXE</c> environment variable so
-    /// tests can substitute a fake git binary/script without relying on PATH-search semantics that
-    /// differ across operating systems (e.g. .NET's <see cref="System.Diagnostics.Process.Start(System.Diagnostics.ProcessStartInfo)"/>
-    /// does not resolve extensionless names to <c>.cmd</c>/<c>.bat</c> files on Windows).
-    /// </summary>
-    private static string GitExecutable =>
-        Environment.GetEnvironmentVariable("COPILOTHIVE_TEST_GIT_EXE") is { Length: > 0 } overridePath
-            ? overridePath
-            : "git";
+    private const string GitExecutable = "git";
 
     /// <summary>
     /// Runs a git command in the clone of <paramref name="repoName"/> and returns the output.
@@ -122,6 +112,29 @@ public sealed partial class Composer
         await process.WaitForExitAsync(ct);
 
         return (process.ExitCode, stdoutTask.Result, stderrTask.Result);
+    }
+
+    /// <summary>
+    /// Applies the `git check-ref-format --branch` result to <paramref name="branch"/> and
+    /// returns an error message if the branch is invalid or was normalized to a different value
+    /// (which would otherwise cause git to silently fetch/act on a different ref than requested).
+    /// Returns <c>null</c> when <paramref name="branch"/> is accepted as-is.
+    /// </summary>
+    /// <remarks>
+    /// Extracted as a pure function (no process spawning) so the equality-guard behavior can be
+    /// unit-tested directly with synthetic exit codes/output, without needing to fake or spawn a
+    /// git executable.
+    /// </remarks>
+    internal static string? ValidateCheckRefFormatResult(string branch, int exitCode, string stdout, string stderr)
+    {
+        if (exitCode != 0)
+            return $"❌ Invalid branch '{branch}': {stderr.Trim()}";
+
+        var normalizedBranch = stdout.Trim();
+        if (!string.Equals(normalizedBranch, branch, StringComparison.Ordinal))
+            return $"❌ Invalid branch '{branch}': branch name was normalized to '{normalizedBranch}' — use the exact branch name.";
+
+        return null;
     }
 
     [Description("View commit history for a repository.")]
@@ -362,12 +375,9 @@ public sealed partial class Composer
 
             var (refExit, refStdout, refStderr) = await TryRunGitAsync(
                 clonePath, ["check-ref-format", "--branch", branch], cancellationToken);
-            if (refExit != 0)
-                return $"❌ Invalid branch '{branch}': {refStderr.Trim()}";
-
-            var normalizedBranch = refStdout.Trim();
-            if (!string.Equals(normalizedBranch, branch, StringComparison.Ordinal))
-                return $"❌ Invalid branch '{branch}': branch name was normalized to '{normalizedBranch}' — use the exact branch name.";
+            var rejection = ValidateCheckRefFormatResult(branch, refExit, refStdout, refStderr);
+            if (rejection is not null)
+                return rejection;
         }
 
         string[] args = !string.IsNullOrWhiteSpace(branch)
