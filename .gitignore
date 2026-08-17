@@ -22,3 +22,7 @@ copilothive-smoketest.db
 # Coverage artifacts
 coverage.cobertura.xml
 TestResults/
+
+## Test/build output
+*.log
+*.trx
