@@ -3834,6 +3834,11 @@ public sealed class ComposerToolTests : IDisposable
                 RedirectStandardError = true,
                 UseShellExecute = false,
             };
+            // Disable commit signing: a host with commit.gpgsign=true globally configured can
+            // make concurrent `git commit` calls (under high xUnit parallelism) contend for the
+            // GPG agent and intermittently fail with "gpg: signing failed: Not enough space".
+            psi.ArgumentList.Add("-c");
+            psi.ArgumentList.Add("commit.gpgsign=false");
             foreach (var a in args) psi.ArgumentList.Add(a);
             using var p = System.Diagnostics.Process.Start(psi)!;
             p.WaitForExit();
@@ -4132,8 +4137,11 @@ public sealed class ComposerToolTests : IDisposable
                 // Some machines set safe.bareRepository=explicit globally, which blocks running
                 // git commands directly against a bare repo directory (as this test does to
                 // rewind the "remote" side). Override so it works regardless of host git config.
+                // Also disable commit signing to avoid GPG agent contention under parallel test load.
                 psi.ArgumentList.Add("-c");
                 psi.ArgumentList.Add("safe.bareRepository=all");
+                psi.ArgumentList.Add("-c");
+                psi.ArgumentList.Add("commit.gpgsign=false");
                 foreach (var a in args) psi.ArgumentList.Add(a);
                 using var p = System.Diagnostics.Process.Start(psi)!;
                 p.WaitForExit();

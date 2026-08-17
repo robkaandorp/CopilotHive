@@ -339,6 +339,12 @@ public sealed class IterationShaIntegrationTests : IAsyncDisposable
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        // Disable commit signing: a host with commit.gpgsign=true globally configured can make
+        // many concurrent `git commit` calls (under high xUnit parallelism) contend for the GPG
+        // agent and intermittently fail with "gpg: signing failed: Not enough space" — these
+        // test commits don't need to be signed.
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("commit.gpgsign=false");
         foreach (var a in args) psi.ArgumentList.Add(a);
         using var p = Process.Start(psi)!;
         p.WaitForExit();
@@ -355,6 +361,8 @@ public sealed class IterationShaIntegrationTests : IAsyncDisposable
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("commit.gpgsign=false");
         foreach (var a in args) psi.ArgumentList.Add(a);
         using var p = Process.Start(psi)!;
         var output = p.StandardOutput.ReadToEnd();

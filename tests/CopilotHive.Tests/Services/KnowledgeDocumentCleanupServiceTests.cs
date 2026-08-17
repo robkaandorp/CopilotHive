@@ -49,6 +49,12 @@ public sealed class KnowledgeDocumentCleanupServiceTests : IDisposable
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        // Disable commit signing: a host with commit.gpgsign=true globally configured can make
+        // many concurrent `git commit` calls (under high xUnit parallelism) contend for the GPG
+        // agent and intermittently fail with "gpg: signing failed: Not enough space" — these
+        // test commits don't need to be signed.
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("commit.gpgsign=false");
         foreach (var arg in args)
             psi.ArgumentList.Add(arg);
 
@@ -72,6 +78,8 @@ public sealed class KnowledgeDocumentCleanupServiceTests : IDisposable
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("commit.gpgsign=false");
         foreach (var arg in args)
             psi.ArgumentList.Add(arg);
 

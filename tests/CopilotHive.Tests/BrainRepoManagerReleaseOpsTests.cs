@@ -890,10 +890,16 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
         };
         // Force LF endings and allow direct commands against bare repo directories regardless of
         // the host's global git config, so these tests behave identically on any machine/OS.
+        // Also disable commit signing: a host with commit.gpgsign=true globally configured can
+        // make many concurrent `git commit` calls (under high xUnit parallelism) contend for the
+        // GPG agent and intermittently fail with "gpg: signing failed: Not enough space" — these
+        // test commits don't need to be signed.
         psi.ArgumentList.Add("-c");
         psi.ArgumentList.Add("core.autocrlf=false");
         psi.ArgumentList.Add("-c");
         psi.ArgumentList.Add("safe.bareRepository=all");
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("commit.gpgsign=false");
         foreach (var a in args) psi.ArgumentList.Add(a);
         using var p = Process.Start(psi)!;
         p.WaitForExit();
@@ -912,6 +918,8 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
         psi.ArgumentList.Add("core.autocrlf=false");
         psi.ArgumentList.Add("-c");
         psi.ArgumentList.Add("safe.bareRepository=all");
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("commit.gpgsign=false");
         foreach (var a in args) psi.ArgumentList.Add(a);
         using var p = Process.Start(psi)!;
         var output = p.StandardOutput.ReadToEnd();
