@@ -218,7 +218,11 @@ public sealed class PlanRejectContractTests
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             cts.Token, TestContext.Current.CancellationToken);
         var run = dispatcher.StartAsync(linked.Token);
-        await Task.Delay(300, TestContext.Current.CancellationToken);
+        await WaitUntilAsync(
+            () => goalStore.StatusUpdates.Any(u => u.Status == GoalStatus.Failed)
+                && pipelineManager.GetByGoalId(goal.Id) is null
+                && brain.DeletedSessions.Contains(goal.Id),
+            TestContext.Current.CancellationToken);
         cts.Cancel();
         await Task.WhenAny(run, Task.Delay(1000, TestContext.Current.CancellationToken));
 
@@ -467,7 +471,11 @@ public sealed class PlanRejectContractTests
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             cts.Token, TestContext.Current.CancellationToken);
         var run = dispatcher.StartAsync(linked.Token);
-        await Task.Delay(300, TestContext.Current.CancellationToken);
+        await WaitUntilAsync(
+            () => goalStore.StatusUpdates.Any(u => u.Status == GoalStatus.Failed)
+                && pipelineManager.GetByGoalId(goal.Id) is null
+                && brain.DeletedSessions.Contains(goal.Id),
+            TestContext.Current.CancellationToken);
         cts.Cancel();
         await Task.WhenAny(run, Task.Delay(1000, TestContext.Current.CancellationToken));
 
@@ -516,7 +524,10 @@ public sealed class PlanRejectContractTests
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             cts.Token, TestContext.Current.CancellationToken);
         var run = dispatcher.StartAsync(linked.Token);
-        await Task.Delay(300, TestContext.Current.CancellationToken);
+        await WaitUntilAsync(
+            () => goalStore.StatusUpdates.Any(u => u.Status == GoalStatus.Failed)
+                && pipelineManager.GetByGoalId(goal.Id) is null,
+            TestContext.Current.CancellationToken);
         cts.Cancel();
         await Task.WhenAny(run, Task.Delay(1000, TestContext.Current.CancellationToken));
 
@@ -562,7 +573,10 @@ public sealed class PlanRejectContractTests
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             cts.Token, TestContext.Current.CancellationToken);
         var run = dispatcher.StartAsync(linked.Token);
-        await Task.Delay(300, TestContext.Current.CancellationToken);
+        await WaitUntilAsync(
+            () => pipelineManager.GetByGoalId(goal.Id) is null
+                && brain.DeletedSessions.Contains(goal.Id),
+            TestContext.Current.CancellationToken);
         cts.Cancel();
         await Task.WhenAny(run, Task.Delay(1000, TestContext.Current.CancellationToken));
 
@@ -1153,6 +1167,31 @@ public sealed class PlanRejectContractTests
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Polls <paramref name="condition"/> until it becomes true instead of sleeping a fixed
+    /// duration. <c>GoalDispatcher.StartAsync</c> (inherited from <c>BackgroundService</c>)
+    /// returns as soon as the loop has been kicked off, not once it has actually finished a
+    /// dispatch cycle — so the returned task cannot be awaited to know when cleanup has run.
+    /// A fixed <c>Task.Delay</c> before asserting is inherently racy under
+    /// CPU contention (e.g. higher xUnit parallelism): the delay may not be long enough on a
+    /// loaded machine, causing intermittent false failures. Polling for the actual observable
+    /// state removes that race on any system, timezone, or filesystem while still failing fast
+    /// (via <see cref="TimeoutException"/>) if the condition is never met, which would indicate
+    /// a real hang rather than a flake.
+    /// </summary>
+    private static async Task WaitUntilAsync(
+        Func<bool> condition, CancellationToken ct, TimeSpan? timeout = null)
+    {
+        var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(10));
+        while (!condition())
+        {
+            if (DateTime.UtcNow >= deadline)
+                throw new TimeoutException("Condition was not met within the timeout.");
+
+            await Task.Delay(10, ct);
+        }
+    }
 
     private static GoalPipeline CreatePipeline()
     {
