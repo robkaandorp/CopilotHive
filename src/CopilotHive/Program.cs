@@ -404,8 +404,8 @@ public sealed class Program
             });
 
             // CI monitoring: polls GitHub check-runs for completed goals' merge commits.
-            // No startup scan — deferred to a follow-up goal.
             builder.Services.AddSingleton(sp => new CiMonitorService(
+                goalStore: sp.GetService<IGoalStore>(),
                 issueStore: sp.GetService<IIssueStore>(),
                 eventBus: sp.GetService<IEventBus>(),
                 config: sp.GetService<HiveConfigFile>(),
@@ -631,6 +631,21 @@ public sealed class Program
             // Force construction of the event subscriber so its subscription is active
             // before any goal lifecycle events can be published.
             app.Services.GetService<ComposerEventSubscriber>();
+
+            // CI monitoring startup scan: reconciles CI state for goals merged while the
+            // orchestrator was down. Fire-and-forget so startup is never blocked, and bound
+            // to the application lifetime so shutdown stops it.
+            var ciMonitor = app.Services.GetService<CiMonitorService>();
+            if (ciMonitor is not null)
+            {
+                var appLifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+                _ = Task.Run(async () =>
+                {
+                    try { await ciMonitor.StartupScanAsync(appLifetime.ApplicationStopping); }
+                    catch (Exception ex) { logger.LogWarning(ex, "CI monitor startup scan failed"); }
+                }, appLifetime.ApplicationStopping);
+            }
+
             var composer = app.Services.GetService<Composer>();
             if (composer is not null)
             {
